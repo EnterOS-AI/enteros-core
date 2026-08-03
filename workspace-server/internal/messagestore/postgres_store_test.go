@@ -192,6 +192,34 @@ func TestChatHistory_ClassifiesDelegationResultAsSystem(t *testing.T) {
 	}
 }
 
+// TestChatHistory_ClassifiesSelfLifecycleAsSystem pins the 2026-07-25 live-bug
+// fix: the runtime stamps source_type "self-lifecycle" on its reprovision/
+// lifecycle wake. It is a routine self-turn, never a human turn, and MUST be
+// classified system/notice — before "self-lifecycle" was added to
+// selfSourceTypes it fell through as a genuine user message and rendered as a
+// blue user bubble.
+func TestChatHistory_ClassifiesSelfLifecycleAsSystem(t *testing.T) {
+	body := json.RawMessage(`{"params":{"metadata":{"source_type":"self-lifecycle"},"message":{"parts":[{"kind":"text","text":"lifecycle wake after reprovision"}]}}}`)
+	msgs := activityRowToChatMessages("row-lifecycle", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil)
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 system message, got %d", len(msgs))
+	}
+	if msgs[0].Role != "system" || msgs[0].SystemKind != "notice" {
+		t.Errorf("self-lifecycle classified role=%q kind=%q; want system/notice (must NEVER be a user bubble)", msgs[0].Role, msgs[0].SystemKind)
+	}
+}
+
+// TestSelfSourceTypes_PlatformWakeMarkers pins the SSOT membership the stall
+// watchdog and inbox-nudge sweeper depend on: their new self-source markers
+// MUST be recognized, or the wakes they stamp still leak as user bubbles.
+func TestSelfSourceTypes_PlatformWakeMarkers(t *testing.T) {
+	for _, st := range []string{"self-lifecycle", "self-stall", "self-nudge"} {
+		if !IsSelfSourceType(st) {
+			t.Errorf("IsSelfSourceType(%q) = false; want true (would leak as a blue user bubble)", st)
+		}
+	}
+}
+
 func TestChatHistory_NoUserMessageWhenRequestBodyNull(t *testing.T) {
 	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, nil, nil)
 	for _, m := range msgs {
@@ -650,28 +678,8 @@ func TestChatHistory_IsInternalSelfMessage_DelegationPrefix(t *testing.T) {
 	}
 }
 
-// =====================================================================
-// basename helper — mirrors canvas basename() semantics
-// =====================================================================
-
-func TestChatHistory_BasenameStripsSchemeAndPath(t *testing.T) {
-	cases := []struct {
-		in, want string
-	}{
-		{"workspace:/uploads/shot.png", "shot.png"},
-		{"workspace:/a/b/c/file.txt", "file.txt"},
-		{"https://example.com/path/file.csv", "file.csv"},
-		{"http://x/y", "y"},
-		{"", "file"},
-		{"workspace:", "file"}, // scheme-only collapses to "" → "file" sentinel, matches canvas basename
-	}
-	for _, tc := range cases {
-		got := basename(tc.in)
-		if got != tc.want {
-			t.Errorf("basename(%q) = %q want %q", tc.in, got, tc.want)
-		}
-	}
-}
+// basename moved to internal/a2aresp during the A2A-extraction SSOT
+// consolidation; its coverage now lives in a2aresp.TestBasename.
 
 // TestActivityRow_AgentMessageCarriesToolTrace (core#2636): the tool-use
 // chain must ride on the agent message so a chat reload re-renders it.

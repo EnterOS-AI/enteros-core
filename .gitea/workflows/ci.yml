@@ -326,6 +326,90 @@ jobs:
           echo "e2e_busy_inject positive-control tests executed and passed ✓"
 
       - if: ${{ needs.changes.outputs.platform == 'true' }}
+        name: mini-company org-template shape guard (blocking gate)
+        # The mini-company org template is the showcase tree the plugin-config
+        # programme demonstrates against, and its shape (7 agents, 4 levels) is a
+        # contract: re-parenting an agent changes delegation flow, and the tree is
+        # split one-file-per-agent so a renamed file breaks !include expansion.
+        #
+        # This guard was previously recorded as "proven" by
+        #   MINI_COMPANY_DIR=<checkout> go test ./internal/handlers/ -run TestMiniCompany -v
+        # but TestMiniCompany was never committed — that command printed
+        # "no tests to run" then "PASS", a vacuous green (same class as the
+        # e2e_busy_inject seam above, task #112). The test now exists; this step
+        # is the other half — a test no workflow names is never run
+        # (feedback_verify_new_test_is_wired_to_ci).
+        #
+        # The tree is cloned at the EXACT ref manifest.json pins, so the guard
+        # validates the pin itself rather than some other checkout. The repo is
+        # public, so no credential is needed.
+        #
+        # Non-vacuity: the test FAILS (never skips) when CI is set and the tree is
+        # absent, and we additionally require both "--- PASS:" lines here, so a
+        # rename or a build break cannot produce a silent zero-test pass.
+        working-directory: .
+        run: |
+          set -euo pipefail
+          ref="$(python3 -c "import json;print(next(t['ref'] for t in json.load(open('manifest.json'))['org_templates'] if t['name']=='mini-company'))")"
+          echo "manifest.json pins mini-company at ${ref}"
+          rm -rf /tmp/mini-company-guard
+          git init -q /tmp/mini-company-guard
+          git -C /tmp/mini-company-guard remote add origin \
+            https://git.moleculesai.app/molecule-ai/molecule-ai-org-template-mini-company.git
+          git -C /tmp/mini-company-guard fetch -q --depth 1 origin "${ref}"
+          git -C /tmp/mini-company-guard checkout -q FETCH_HEAD
+          cd workspace-server
+          MINI_COMPANY_DIR=/tmp/mini-company-guard \
+            go test -tags mini_company_guard ./internal/handlers/ -count=1 -v \
+            -run 'TestMiniCompanyOrgTemplate' 2>&1 | tee /tmp/test-mini-company.log
+          for t in TestMiniCompanyOrgTemplate_SevenAgents TestMiniCompanyOrgTemplate_FourLevelShape; do
+            if ! grep -q -- "--- PASS: $t" /tmp/test-mini-company.log; then
+              echo "::error::mini-company guard did not execute $t — vacuous pass (check the -run filter and that the pinned ref resolved)."
+              exit 1
+            fi
+          done
+          echo "mini-company org-template shape guard executed and passed ✓"
+
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
+        name: live org-template clone+resolve smoke (blocking gate)
+        # TestResolveYAMLIncludes_RealMoleculeDev clones the canonical
+        # molecule-ai-org-template-molecule-dev and runs the real !include /
+        # !external resolver against it. It USED to run implicitly in the
+        # default `go test` lanes, but its `git clone` + nested !external git
+        # fetch add UNBOUNDED, VARIABLE network time — under the diagnostic
+        # `go test -race -v -timeout 60s ./internal/handlers/...` step above,
+        # that variable time is what tipped the whole (already ~60s-under-race)
+        # package over the per-package cap, producing the recurring
+        # `panic: test timed out after 1m0s` flake. The test is now gated behind
+        # MOLECULE_LIVE_ORG_TEMPLATE=1 so the default lanes skip it instantly;
+        # the resolver logic stays covered there by the hermetic
+        # TestResolveYAMLIncludes_* fixture tests. This dedicated step restores
+        # the live smoke with a generous 5m timeout (no 60s cap, no -race), so
+        # network latency can never manufacture a timeout.
+        #
+        # Blocking is safe from network flakes: a clone/fetch failure or the
+        # deliberately-held-broken molecule-dev-department@v1.0.0 !external ref
+        # makes the test SKIP (t.Skip), not fail — it FAILS only on a genuine
+        # resolver/schema regression on the live composition, which is exactly
+        # the signal worth gating on.
+        #
+        # Non-vacuity: a `-run` filter that matches zero tests exits 0 with "no
+        # tests to run" — a vacuous green. We require the top-level result line
+        # (PASS or SKIP) to appear; its absence means the test was renamed or
+        # the filter is wrong, and fails this step.
+        env:
+          MOLECULE_LIVE_ORG_TEMPLATE: "1"
+        run: |
+          set -euo pipefail
+          go test -count=1 -timeout 5m -v ./internal/handlers/ \
+            -run '^TestResolveYAMLIncludes_RealMoleculeDev$' 2>&1 | tee /tmp/test-live-org.log
+          if ! grep -q -E '^(--- PASS|--- SKIP): TestResolveYAMLIncludes_RealMoleculeDev' /tmp/test-live-org.log; then
+            echo "::error::live org-template smoke did not execute TestResolveYAMLIncludes_RealMoleculeDev — vacuous pass (check the -run filter and that the test still exists)."
+            exit 1
+          fi
+          echo "live org-template clone+resolve smoke executed ✓"
+
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Race detection (advisory, non-blocking)
         # mc#1184: runs race detector as an advisory check so cold-runner
         # compile-time spikes don't block merges. Failures here surface in
@@ -588,6 +672,25 @@ jobs:
           # (mc#3244). Locks in: cold-start burst retries then succeeds, a mid-flap
           # resets the streak, persistent non-ready returns 1 (no hang/false green).
           bash tests/e2e/lib/test_cp_health_preflight.sh
+          # kind:trigger scheduler daemon wait policy (lib/trigger_daemon_wait.sh).
+          # Offline (injected health reader, zero real sleeps): proves the three
+          # outcomes the lib exists to distinguish — fire evidence passes
+          # immediately, a STALE heartbeat fails FAST (the wedged tick loop that
+          # made a workspace stop firing schedules while health still reported
+          # armed:N/errors:{}), and a live-but-not-yet-fired daemon runs to the
+          # backstop with a different message. Also pins that the backstop always
+          # EXCEEDS the delivery watchdog: the old 360s budget was shorter than
+          # the 600s timeout it waited on, so it could never observe a recovery.
+          bash tests/e2e/lib/test_trigger_daemon_wait_unit.sh
+          # Native-plugin source SSOT: the harness must not hardcode a pinned
+          # plugin source. WHICH source the scheduler installs from is owned by
+          # the SDK native-plugins registry (consumed by core via molcontracts /
+          # plugin_registry.go); the fallback pin that used to live in
+          # test_staging_full_saas.sh sat two minor versions behind it, silently,
+          # and was inert on top of that (secrets-injected MOLECULE_DECLARED_PLUGINS
+          # is overwritten at provision). Fixture-driven both directions, then run
+          # over the real tests/e2e tree as the standing gate.
+          bash tests/e2e/lib/test_scheduler_source_ssot_unit.sh
           # Active local-Docker staging teardown must validate the exact
           # synchronous CP purge receipt/audit and exact-org absence. Offline
           # mocked-curl cases pin success plus malformed receipt, failed purge,
@@ -611,6 +714,23 @@ jobs:
           # check missed. If a refactor weakens the gate to a shape check,
           # this step goes red on every PR.
           bash tests/e2e/test_completion_assert_unit.sh
+          # Anti-rot guard on the DELEGATION A2A POST's timeout budget. That
+          # call is raw curl (it authenticates as the PARENT WORKSPACE token,
+          # not the tenant admin) and so silently inherited CURL_COMMON's
+          # generic --max-time 30, while the parent leg overrides to 90s.
+          # `message/send` is synchronous — the POST waits out a full cold agent
+          # turn on a just-created child — so 30s took the REQUIRED ephemeral
+          # lane red twice on 2026-07-30 with curl_rc=28/http=000 (core#4961,
+          # core#4958). Offline, but NOT a grep: it extracts the delegation
+          # retry loop and EXECUTES it against a stub curl, then asserts on the
+          # EFFECTIVE --max-time (curl is last-flag-wins, and CURL_COMMON is an
+          # array expansion no grep can see through) and on the OBSERVED attempt
+          # count under a scripted rc=28. So dropping the override back to 30s,
+          # moving it BEFORE "${CURL_COMMON[@]}" (same text, 30s effective), or
+          # converting it into a retry-on-rc=28 (which would risk double-
+          # delivering a non-idempotent delegation) each go red on every PR.
+          # Every run also re-proves its own fail arms against two fixtures.
+          bash tests/e2e/test_deleg_a2a_timeout_unit.sh
           # #1994 byok-routing presence-probe (lib/workspace_env_presence.sh) —
           # the shared MOLECULE_LLM_USAGE_TOKEN presence contract used by 8c +
           # the concierge auth gate. Offline: stubs tenant_call and locks the
@@ -679,6 +799,16 @@ jobs:
           # no-match (or transient docker ps failure) as retryable under
           # errexit+pipefail instead of aborting the live staging harness.
           bash tests/e2e/lib/test_reconciler_container_unit.sh
+          # core#4980: a workspace status of `online` is not evidence that the
+          # container is up — they are separate events, and the self-host
+          # concierge lane (REQUIRED) reddened a comment-only PR by asserting
+          # `docker ps` the instant it read `online`. Offline (injected state
+          # reader, zero real sleeps): proves a late container is WAITED for and
+          # passes, an exited/dead one fails FAST on the first probe instead of
+          # burning the budget, and one that never appears fails at the bound
+          # with a DISTINCT message. Probe counts are asserted, so a regression
+          # that turns this into a can-only-pass sleep goes red here.
+          bash tests/e2e/lib/test_container_running_wait_unit.sh
           # core#4370: bounded idle-digest evidence polling and fail-closed
           # Docker preflight. Offline: proves missing Docker or an unreachable
           # daemon cannot silently skip E2E_IDLE_DIGEST_CHECK=on.

@@ -85,6 +85,16 @@ export { WORKSPACE_KIND } from "@/lib/workspace-kind";
 export interface WorkspaceNodeData extends Record<string, unknown> {
   name: string;
   status: string;
+  /** Greeting-first UI readiness (decoupled from serving status): true once the
+   *  agent's first-boot greeting has landed in chat. While status="online" but
+   *  greeted is false, the node renders a "warming up / composing greeting"
+   *  state instead of full "ready" — the workspace IS serving, it just hasn't
+   *  spoken yet. Set live by the AGENT_MESSAGE handler and, on reload, hydrated
+   *  from the GET /workspaces `greeted` field so an already-greeted workspace
+   *  doesn't flash warming. A per-node UI timeout also clears warming so a
+   *  workspace whose greeting never lands (greeting disabled, agent error) still
+   *  settles to ready. Absent on older builds → treat as greeted (no warming). */
+  greeted?: boolean;
   tier: number;
   agentCard: Record<string, unknown> | null;
   activeTasks: number;

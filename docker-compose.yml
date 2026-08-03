@@ -2,6 +2,19 @@
 include:
   - docker-compose.infra.yml
 
+# Bounded json-file logging shared by the long-running services below. Dozzle
+# reads container stdout via the json-file driver, so keeping that driver (with
+# rotation) means every container's logs stay COMPLETE in Dozzle AND capped on
+# disk at max 3 × 10m per container. Referenced with `logging: *default-logging`.
+# NOTE: YAML anchors do not cross the `include:` boundary — this applies only to
+# services defined in THIS file; infra services set their own in
+# docker-compose.infra.yml if desired.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   # --- Observability ---
   # Digest pins in this file are MULTI-ARCH manifest-list digests (amd64+arm64),
@@ -14,6 +27,7 @@ services:
   # with the defaults below.
   langfuse:
     image: langfuse/langfuse:2.95.11@sha256:85c278dcab96c15db94191a5c1664f85aba2d7fb6771a00e99681c902c4b7015
+    logging: *default-logging
     depends_on:
       langfuse-clickhouse:
         condition: service_healthy
@@ -82,6 +96,7 @@ services:
       # already uses context=. , this aligns local with CI.
       context: .
       dockerfile: workspace-server/Dockerfile
+    logging: *default-logging
     depends_on:
       postgres:
         condition: service_healthy
@@ -241,6 +256,7 @@ services:
     # same canonical registry path.
     # Local dev keeps working via the `build:` context below (docker compose build canvas).
     image: ${MOLECULE_CANVAS_IMAGE:-registry.moleculesai.app/molecule-ai/canvas}:${CANVAS_IMAGE_TAG:-latest}
+    logging: *default-logging
     build:
       context: ./canvas
       dockerfile: Dockerfile
@@ -343,6 +359,27 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+
+  # Dozzle — lightweight real-time log viewer for EVERY container on the
+  # daemon: each ws-<id> workspace runtime, all infra, tenants. Reads the
+  # Docker socket read-only; no DB, no agents, no config. Single-tenant
+  # observability without a Loki/Grafana stack. UI: http://127.0.0.1:3110.
+  # No DOZZLE_FILTER on purpose — show everything so nothing is hidden.
+  dozzle:
+    image: amir20/dozzle:latest@sha256:bc1ee4ba8d66c7fc0d03823a78486165fb219809f79eaf54cecf3114d647ab14
+    container_name: molecule-dozzle
+    logging: *default-logging
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "127.0.0.1:${DOZZLE_PORT:-3110}:8080"
+    environment:
+      DOZZLE_NO_ANALYTICS: "true"
+      # Keep more scrollback than the default so a full boot sequence is visible.
+      DOZZLE_TAILSIZE: "1000"
+    networks:
+      - molecule-core-net
+    restart: unless-stopped
 
 networks:
   molecule-core-net:

@@ -329,12 +329,17 @@ func expectCompleted(mock sqlmock.Sqlmock, id string, respBody interface{}) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
-// expectFailed sets up mock for MarkQueueItemFailed with a specific error message.
+// expectFailed sets up mock for MarkQueueItemFailed with a specific error
+// message. MarkQueueItemFailed now reads the resulting status back (RETURNING
+// status) so the drain can fire the never-silent first-boot fallback only on the
+// genuinely-terminal 'failed' transition — hence ExpectQuery, not ExpectExec.
+// Returns 'queued' (the non-terminal re-queue) so the drain's fallback branch
+// does NOT fire for the non-greet items these existing tests exercise.
 func expectFailed(mock sqlmock.Sqlmock, id string, errMsg string) {
-	mock.ExpectExec(
-		"UPDATE a2a_queue SET status = CASE WHEN attempts >= $2 THEN 'failed' ELSE 'queued' END, last_error = $3, dispatched_at = NULL WHERE id = $1").
+	mock.ExpectQuery(
+		"UPDATE a2a_queue SET status = CASE WHEN attempts >= $2 THEN 'failed' ELSE 'queued' END, last_error = $3, dispatched_at = NULL WHERE id = $1 RETURNING status").
 		WithArgs(id, 5, errMsg).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("queued"))
 }
 
 // expectTransientRetry sets up mock for MarkQueueItemTransientRetry. The
@@ -1346,5 +1351,163 @@ func TestSendRestartContext_ClearsPendingGate(t *testing.T) {
 	if restartContextInFlight(wsID) {
 		t.Error("restart-context gate LEAKED after sendRestartContext returned — this workspace's " +
 			"A2A queue would never drain again")
+	}
+}
+
+// ==================== rule-1 finding #1: never-silent terminal drop, driven END-TO-END through DrainQueueForWorkspace ====================
+//
+// The direct-call tests (first_boot_greeting_test.go) pin
+// deliverFirstBootFallbackOnTerminalDrop in isolation. These drive the SAME
+// guarantee through the real drain loop: a busy-queued self-first-boot-greet
+// item whose dispatch terminally fails/drops must land the static fallback via
+// the claim-on-delivery seam exactly once, while a NON-terminal re-queue must
+// deliver nothing (the fresh chat only gets the fallback when the real reply is
+// genuinely gone).
+
+// greetQueueItem builds a QueuedItem whose Body is a real self-first-boot-greet
+// payload (source_type=self-first-boot-greet, toolCount stamped) — the shape
+// DrainQueueForWorkspace hands to deliverFirstBootFallbackOnTerminalDrop.
+func greetQueueItem(t *testing.T, wsID string, toolCount int) *QueuedItem {
+	t.Helper()
+	body, err := buildFirstBootGreetPayload(wsID, toolCount)
+	if err != nil {
+		t.Fatalf("buildFirstBootGreetPayload: %v", err)
+	}
+	return &QueuedItem{
+		ID:          "qid-greet-001",
+		WorkspaceID: wsID,
+		CallerID:    sql.NullString{Valid: false}, // canvas/system path — no CanCommunicate check
+		Priority:    PriorityTask,
+		Body:        body,
+		Method:      sql.NullString{String: "message/send", Valid: true},
+		Attempts:    5, // at the cap — the realistic shape for the terminal 'failed' transition
+		EnqueuedAt:  time.Now(),
+	}
+}
+
+// expectMarkFailedStatus pins MarkQueueItemFailed's RETURNING-status read to a
+// specific resulting status ('failed' = terminal, 'queued' = non-terminal
+// re-queue). QueryMatcherEqual → exact SQL.
+func expectMarkFailedStatus(mock sqlmock.Sqlmock, id, errMsg, status string) {
+	mock.ExpectQuery(
+		"UPDATE a2a_queue SET status = CASE WHEN attempts >= $2 THEN 'failed' ELSE 'queued' END, last_error = $3, dispatched_at = NULL WHERE id = $1 RETURNING status").
+		WithArgs(id, 5, errMsg).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow(status))
+}
+
+// expectGreetClaimWonEq / expectGreetWriterSendEq pin the claim-on-delivery seam
+// the never-silent fallback drives (exact-SQL twins of the regex helpers in
+// first_boot_greeting_test.go, for the QueryMatcherEqual drain mock). A claim that
+// flips one row + a writer lookup(true) + INSERT proves the fallback was delivered
+// exactly once.
+func expectGreetClaimWonEq(mock sqlmock.Sqlmock, wsID string) {
+	mock.ExpectExec("UPDATE workspaces SET has_greeted = true WHERE id = $1 AND has_greeted = false").
+		WithArgs(wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+func expectGreetWriterSendEq(mock sqlmock.Sqlmock, wsID string) {
+	mock.ExpectQuery("SELECT name, talk_to_user_enabled FROM workspaces WHERE id = $1 AND status != 'removed'").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "talk_to_user_enabled"}).AddRow("Concierge", true))
+	mock.ExpectExec("INSERT INTO activity_logs (workspace_id, activity_type, method, summary, response_body, status) VALUES ($1, 'a2a_receive', 'notify', $2, $3::jsonb, 'ok')").
+		WithArgs(wsID, sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+}
+
+// TestDrainQueueForWorkspace_FirstBootGreet_TerminalFailDeliversFallback: a
+// self-first-boot-greet item whose dispatch fails and hits the 5-attempt cap
+// (MarkQueueItemFailed RETURNING 'failed') must deliver the static fallback via
+// the claim seam — the real greeting reply is gone and the sync greet path already
+// returned, so without this the fresh chat opens silent.
+func TestDrainQueueForWorkspace_FirstBootGreet_TerminalFailDeliversFallback(t *testing.T) {
+	item := greetQueueItem(t, "ws-greet-terminal", 45)
+	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	srv := agentServer(`{"error":"agent unreachable"}`, http.StatusBadGateway)
+	defer srv.Close()
+
+	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
+	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	// No recent heartbeat → 502 is treated as a dead-agent failure and routes
+	// through MarkQueueItemFailed (not the non-cap-burning transient retry).
+	expectRecentHeartbeatAbsent(mock, item.WorkspaceID)
+	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
+
+	// The cap is hit → 'failed' (terminal) → the never-silent fallback fires.
+	expectMarkFailedStatus(mock, item.ID, "agent unreachable", "failed")
+	expectGreetClaimWonEq(mock, item.WorkspaceID)
+	expectGreetWriterSendEq(mock, item.WorkspaceID)
+
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+	handler.asyncWG.Wait() // the fallback delivery runs on goAsync
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("terminal-fail fallback not delivered via the claim seam exactly once: %v", err)
+	}
+}
+
+// TestDrainQueueForWorkspace_FirstBootGreet_RequeueDoesNotDeliver is the negative
+// control: a self-first-boot-greet dispatch that fails but is RE-QUEUED
+// (MarkQueueItemFailed RETURNING 'queued', terminal=false) must NOT deliver the
+// fallback — the real greeting reply is still coming on the next drain, so firing
+// the static fallback now would double-greet. No claim, no writer, no delivery.
+func TestDrainQueueForWorkspace_FirstBootGreet_RequeueDoesNotDeliver(t *testing.T) {
+	item := greetQueueItem(t, "ws-greet-requeue", 45)
+	item.Attempts = 1 // below the cap
+	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	srv := agentServer(`{"error":"agent unreachable"}`, http.StatusBadGateway)
+	defer srv.Close()
+
+	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
+	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	expectRecentHeartbeatAbsent(mock, item.WorkspaceID)
+	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
+
+	// Non-terminal re-queue → the drain must NOT invoke the fallback seam. If it
+	// did, the unexpected claim/writer queries would fail ExpectationsWereMet.
+	expectMarkFailedStatus(mock, item.ID, "agent unreachable", "queued")
+
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+	handler.asyncWG.Wait()
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("re-queue must not deliver a fallback (no extra claim/writer queries expected): %v", err)
+	}
+}
+
+// TestDrainQueueForWorkspace_FirstBootGreet_SettlingCeilingDropDeliversFallback:
+// the OTHER terminal path — a self-first-boot-greet item that has been settling
+// past a2aSettlingRetryCeiling is DropQueueItemTerminal'd (not re-queued), and the
+// never-silent fallback must fire there too.
+func TestDrainQueueForWorkspace_FirstBootGreet_SettlingCeilingDropDeliversFallback(t *testing.T) {
+	item := greetQueueItem(t, "ws-greet-ceiling", 45)
+	// Settling far past the ceiling: the ceiling-drop branch (not transient retry).
+	item.SettlingSince = sql.NullTime{Time: time.Now().Add(-(a2aSettlingRetryCeiling + time.Minute)), Valid: true}
+	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	srv := agentServer(`<html>cloudflare error</html>`, http.StatusBadGateway)
+	defer srv.Close()
+
+	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
+	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	// Recent heartbeat → transient-gateway path is eligible, but the aged
+	// settling_since forces the TERMINAL ceiling drop instead of a retry.
+	expectRecentHeartbeatPresent(mock, item.WorkspaceID)
+	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
+
+	expectSettlingCeilingDrop(mock, item.ID, sqlmock.AnyArg())
+	expectGreetClaimWonEq(mock, item.WorkspaceID)
+	expectGreetWriterSendEq(mock, item.WorkspaceID)
+
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+	handler.asyncWG.Wait()
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("settling-ceiling drop fallback not delivered via the claim seam exactly once: %v", err)
 	}
 }

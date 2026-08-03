@@ -22,6 +22,10 @@ const (
 	workspaceDisplayMaxWidth      = 3840
 	workspaceDisplayMinHeight     = 600
 	workspaceDisplayMaxHeight     = 2160
+	// Desktop scale-to-zero idle bounds (seconds). 0 = unset/use default.
+	// Floor 30s avoids thrash; ceiling 24h caps a "never idle" misconfig.
+	workspaceDesktopIdleMinSeconds = 30
+	workspaceDesktopIdleMaxSeconds = 86400
 )
 
 type workspaceDisplayResponse struct {
@@ -154,17 +158,36 @@ func instanceTypeAllowedForProvider(provider, instanceType string) bool {
 	return ok
 }
 
-// workspaceComputeProviderAllowlist mirrors the controlplane cloud-provider SSOT
-// (controlplane internal/cloudprovider.Supported = {aws, hetzner, gcp}).
-// ws-server lives in a different repo and cannot import that package, so this is
-// a DELIBERATE mirror; TestValidateWorkspaceCompute_Provider pins the exact set
-// and this doc-comment names the SSOT, so a CP-side change forces a matching
-// change here (and the CP itself fail-closes an unwired provider with a 422).
-// "" = default (AWS) and is always accepted. This is the gate the switch-provider
-// flow reuses to reject a bad provider with a clean 400 before any CP round-trip.
-// DERIVED from workspaceComputeProvidersOrdered (the SSOT, core#2489) in init() so
-// the set the backend validates and the ordered list the canvas renders cannot
-// drift.
+// workspaceComputeProviderAllowlist is the set of provider values this validator
+// ACCEPTS. It is DERIVED in init() from the SDK cloud-provider SSOT: every
+// SELECTABLE provider (sdkcp.All / sdkcp.IDs()) plus each one's accepted wire
+// aliases. "" = default and is always accepted (handled before the lookup).
+//
+// THE BUG THIS FIXES. It used to derive from workspaceComputeProvidersOrdered,
+// i.e. sdkcp.CloudIDs(). CloudIDs is a COST grouping — the providers that carry
+// per-hour/per-GB cloud billing — and it deliberately excludes the local
+// self-hosted box, which has no cloud cost. The SDK has a test asserting
+// Molecules-Server must NOT be in CloudIDs(), and that test is CORRECT.
+//
+// Using a cost grouping as a VALIDATION allowlist made this validator reject
+// "molecules-server" with a 400 — the only substrate this platform actually
+// provisions (all prod organizations.provider rows are 'local'). The two sets
+// answer different questions:
+//
+//	CloudIDs() -> "which providers cost cloud money?"     (billing, instance types)
+//	IDs()/All  -> "which providers may a caller select?"  (validation)   <- this one
+//
+// The ALIASES matter as much as the ids: the CP re-provision path POSTs
+// provider="local", and workspace_set_compute_instance persists the BACKEND KEY,
+// so compute.provider on a real Molecules-Server row literally reads "local".
+//
+// Matching stays EXACT/case-sensitive (not sdkcp.IsValidID, which lowercases):
+// "AWS" and "MOLECULES-SERVER" must still 400, as TestValidateWorkspaceCompute_Provider
+// and TestValidateWorkspaceCompute_AcceptsMoleculesServer pin.
+//
+// NOTE this is deliberately a DIFFERENT set from workspaceComputeProvidersOrdered,
+// which stays cloud-only: that list drives the canvas machine-size catalog, and
+// the local box has no instance types. Do not "simplify" them back together.
 var workspaceComputeProviderAllowlist = map[string]struct{}{}
 
 // workspaceComputeProviderLabels is the human-readable label the canvas
@@ -309,8 +332,16 @@ func checkComputeSSOTConsistency(
 }
 
 func init() {
-	for _, p := range workspaceComputeProvidersOrdered {
-		workspaceComputeProviderAllowlist[p] = struct{}{}
+	// Validation allowlist = every SELECTABLE provider + its accepted wire
+	// aliases. Sourced from sdkcp.All (the full set), NOT from
+	// workspaceComputeProvidersOrdered (= sdkcp.CloudIDs(), the billable cloud
+	// subset) — see the allowlist's doc-comment for why that distinction is the
+	// whole bug.
+	for _, p := range sdkcp.All {
+		workspaceComputeProviderAllowlist[p.ID] = struct{}{}
+		for _, a := range p.Aliases {
+			workspaceComputeProviderAllowlist[a] = struct{}{}
+		}
 	}
 	// SSOT consistency check (core#2489, Researcher's RC #11736
 	// bidirectional-init fix): the production init guard delegates
@@ -331,12 +362,15 @@ func init() {
 
 func validateWorkspaceCompute(compute models.WorkspaceCompute) error {
 	// Provider first (so the instance-type check below can be provider-scoped).
-	// "" = default (AWS). CP fail-closes an unwired provider with a 422; validating
-	// here gives a clean 400 before the round-trip and is the gate reused by the
-	// switch-provider flow. Mirrors the controlplane cloudprovider SSOT.
+	// "" = default. CP fail-closes an unwired provider with a 422; validating here
+	// gives a clean 400 before the round-trip and is the gate reused by the
+	// switch-provider flow. The allowlist is the FULL selectable set from the SDK
+	// cloudprovider SSOT (ids + aliases), which is why the local Molecules-Server
+	// box — the substrate prod actually runs on — is accepted here.
 	if compute.Provider != "" {
 		if _, ok := workspaceComputeProviderAllowlist[compute.Provider]; !ok {
-			return fmt.Errorf("unsupported compute.provider (want aws|gcp|hetzner)")
+			return fmt.Errorf("unsupported compute.provider %q (want one of %s, or the aliases local|docker)",
+				compute.Provider, strings.Join(sdkcp.IDs(), "|"))
 		}
 	}
 	// Instance type must belong to the chosen provider (an AWS t3.* is invalid on
@@ -366,6 +400,9 @@ func validateWorkspaceCompute(compute models.WorkspaceCompute) error {
 	if err := validateWorkspaceDisplayDimensions(compute.Display.Width, compute.Display.Height); err != nil {
 		return err
 	}
+	if err := validateWorkspaceDisplayIdleTimeout(compute.Display.IdleTimeoutSeconds); err != nil {
+		return err
+	}
 	// internal#734: the durable-data choice. CP re-validates the same enum at
 	// its provision edge (IsValidDataPersistence → 400); validating here too
 	// gives the user a clear workspace-server error before the CP round-trip.
@@ -391,6 +428,9 @@ func validateWorkspaceDisplayConfig(display models.WorkspaceComputeDisplay) erro
 	if err := validateWorkspaceDisplayDimensions(display.Width, display.Height); err != nil {
 		return err
 	}
+	if err := validateWorkspaceDisplayIdleTimeout(display.IdleTimeoutSeconds); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -403,6 +443,18 @@ func validateWorkspaceDisplayDimensions(width, height int) error {
 	}
 	if height != 0 && (height < workspaceDisplayMinHeight || height > workspaceDisplayMaxHeight) {
 		return fmt.Errorf("compute.display.height must be between %d and %d", workspaceDisplayMinHeight, workspaceDisplayMaxHeight)
+	}
+	return nil
+}
+
+// validateWorkspaceDisplayIdleTimeout bounds the desktop scale-to-zero idle
+// threshold. 0 means unset (the provisioner uses the deployment default).
+func validateWorkspaceDisplayIdleTimeout(seconds int) error {
+	if seconds < 0 {
+		return fmt.Errorf("compute.display.idle_timeout_seconds must be non-negative")
+	}
+	if seconds != 0 && (seconds < workspaceDesktopIdleMinSeconds || seconds > workspaceDesktopIdleMaxSeconds) {
+		return fmt.Errorf("compute.display.idle_timeout_seconds must be between %d and %d", workspaceDesktopIdleMinSeconds, workspaceDesktopIdleMaxSeconds)
 	}
 	return nil
 }
@@ -451,6 +503,7 @@ func workspaceComputeIsZero(compute models.WorkspaceCompute) bool {
 		compute.Display.Width == 0 &&
 		compute.Display.Height == 0 &&
 		compute.Display.Protocol == "" &&
+		compute.Display.IdleTimeoutSeconds == 0 &&
 		// A provider- or persistence-only compute is NOT zero — it must
 		// round-trip so GET returns those fields (canvas provider badge +
 		// data-persistence selector both read them back).
@@ -481,6 +534,9 @@ func workspaceComputeJSON(compute models.WorkspaceCompute) (string, error) {
 	}
 	if compute.Display.Protocol != "" {
 		display["protocol"] = compute.Display.Protocol
+	}
+	if compute.Display.IdleTimeoutSeconds != 0 {
+		display["idle_timeout_seconds"] = compute.Display.IdleTimeoutSeconds
 	}
 	if len(display) > 0 {
 		out["display"] = display
@@ -655,6 +711,26 @@ func (h *WorkspaceHandler) Display(c *gin.Context) {
 		}
 	}
 	if compute.Display.Mode == "" || compute.Display.Mode == "none" {
+		// No LEGACY (EC2/DCV) display mode declared. But if the desktop-sidecar
+		// computer-use backend is wired, this workspace CAN show a desktop — an
+		// agent can drive a sidecar desktop on any workspace on demand, so a human
+		// must be able to watch/take over it too, without a separate per-workspace
+		// compute.display opt-in. Report available and let the human display path
+		// scale the sidecar up and proxy to its noVNC (design §8/§13). The frontend
+		// only needs available=true to render+connect; mode/protocol are labels.
+		if h.sidecarProv != nil {
+			c.JSON(http.StatusOK, workspaceDisplayResponse{
+				Available: true,
+				Mode:      "desktop-control",
+				Protocol:  "novnc",
+				// Fixed sidecar coordinate contract (design §3; matches the
+				// provisioner's desktopWidth/Height and the entrypoint default).
+				Width:  1280,
+				Height: 800,
+				Status: "ready",
+			})
+			return
+		}
 		c.JSON(http.StatusOK, workspaceDisplayResponse{
 			Available: false,
 			Reason:    "display_not_enabled",

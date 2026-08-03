@@ -58,6 +58,114 @@ trap cleanup EXIT
 
 log "=== template-asset-delivery gate — tenant image = PR build; template=$TEMPLATE ==="
 
+# ─── 0. satisfy the template's OWN required_env before provisioning ──────────
+#
+# The seo-agent template declares `runtime_config.required_env` (TENANT_NAME,
+# TENANT_DOMAIN, TENANT_DOMAIN_APEX, TENANT_DOMAIN_FULL, TENANT_TIMEZONE).
+# Preflight #5 (workspace_provision_shared.go) ABORTS the provision when any of
+# them is unset, so cpProv.Start never runs and
+# PersistConfigBundleHostSide (cp_provisioner.go) never writes the host-side
+# /configs mirror — the Files API then 404s and this gate reported
+# "config.yaml served only 0B ... delivery REGRESSION", which is a TRUE symptom
+# attached to the WRONG cause. There was no delivery regression: the workspace
+# never got as far as delivering.
+#
+# The self-host escape hatch that fills these with placeholders
+# (applySelfHostTenantDefaults) is gated on !PlatformManagedProxyConfigured(),
+# and the harness tenant sets MOLECULE_LLM_BASE_URL + MOLECULE_LLM_USAGE_TOKEN
+# to satisfy assertManagedTenantHasLLMEnv at boot — so the harness is a
+# PLATFORM-MANAGED tenant and must supply tenant identity itself, exactly as a
+# real operator does.
+#
+# This was invisible until now because the lane is PATH-GATED and had been
+# emitting a no-op pass without executing; the template gained required_env
+# while the gate was never actually running.
+#
+# DERIVED, not hardcoded: the list is read from the template's own config.yaml
+# (the manifest-pinned clone the workflow's "Pre-clone manifest deps" step
+# produces), so the next required var a template author adds is satisfied
+# automatically instead of re-breaking this gate. Values are obvious harness
+# fixtures — this gate asserts DELIVERY, not SEO behaviour.
+REPO_ROOT="$(cd "$HARNESS_ROOT/../.." && pwd)"
+TEMPLATE_CONFIG="${DELIVERY_TEMPLATE_CONFIG:-$REPO_ROOT/.tenant-bundle-deps/workspace-configs-templates/$TEMPLATE/config.yaml}"
+
+seed_required_env() {
+  if [ ! -f "$TEMPLATE_CONFIG" ]; then
+    log "  WARN: $TEMPLATE_CONFIG absent — cannot derive required_env; a provision abort will be reported below if the template needs any"
+    return 0
+  fi
+  # PyYAML is NOT in tests/harness/requirements.txt, so it cannot be assumed on
+  # the runner — and under `set -e` a failing command substitution would abort
+  # this whole script silently. Hence: yaml when available, a scalar-list
+  # fallback parser when not, `|| true` so neither path can kill the gate, and
+  # the seeded names logged so the parse is visible rather than trusted.
+  local names
+  names="$(python3 -c '
+import sys, re
+
+try:
+    text = open(sys.argv[1]).read()
+except Exception:
+    sys.exit(0)
+
+names = []
+try:
+    import yaml
+    doc = yaml.safe_load(text) or {}
+    names = ((doc.get("runtime_config") or {}).get("required_env") or [])
+except Exception:
+    # No PyYAML (or unparseable). runtime_config.required_env is a flat list of
+    # scalar names nested one level down, so a block scan is exact enough here
+    # and strictly better than skipping the seed and failing the provision.
+    in_rc = False
+    in_req = False
+    for line in text.splitlines():
+        if re.match(r"^runtime_config:\s*$", line):
+            in_rc, in_req = True, False
+            continue
+        if in_rc and re.match(r"^\S", line):      # dedent out of runtime_config
+            break
+        if in_rc and re.match(r"^\s{1,4}required_env:\s*$", line):
+            in_req = True
+            continue
+        if in_req:
+            m = re.match(r"^\s+-\s+([A-Za-z_][A-Za-z0-9_]*)\s*$", line)
+            if m:
+                names.append(m.group(1))
+            elif line.strip():                    # any other key ends the list
+                in_req = False
+
+print("\n".join(n for n in names if isinstance(n, str) and n.strip()))
+' "$TEMPLATE_CONFIG" 2>/dev/null || true)"
+  if [ -z "$names" ]; then
+    log "  template declares no runtime_config.required_env — nothing to seed"
+    return 0
+  fi
+  local n seeded=0
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    # A global secret is the operator-facing channel the preflight's own error
+    # message names ("or as Global secrets"), and it lands in envVars for every
+    # workspace this tenant provisions.
+    curl_alpha_admin -X POST "$BASE/admin/secrets" \
+      -d "{\"key\":\"$n\",\"value\":\"harness-$(echo "$n" | tr '[:upper:]_' '[:lower:]-')\"}" \
+      >/dev/null 2>&1 || log "  WARN: could not seed $n"
+    seeded=$((seeded+1))
+  done <<< "$names"
+  log "  seeded $seeded required_env value(s) from $TEMPLATE_CONFIG: $(echo "$names" | tr '\n' ' ')"
+}
+seed_required_env
+
+# provision_failure prints WHY the workspace never delivered, so a provision
+# abort can never again be misread as a delivery regression. Reads the DB
+# columns markProvisionFailed writes (status + last_sample_error) rather than
+# trusting an API field to be exposed.
+provision_failure() {
+  local wid="$1"
+  echo "--- workspace $wid provision state ---" >&2
+  psql_exec_alpha -c "SELECT status, coalesce(last_sample_error,'(none)') FROM workspaces WHERE id = '$wid'" 2>&1 | head -5 >&2 || true
+}
+
 # ─── 1. provision a fresh workspace THROUGH the tenant ───────────────────────
 BODY="{\"name\":\"tmpl-delivery-gate-$$\",\"tier\":2,\"runtime\":\"$RUNTIME\",\"template\":\"$TEMPLATE\",\"model\":\"$MODEL\"}"
 log "POST /workspaces  $BODY"
@@ -98,9 +206,14 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   sleep 5
 done
 
-# C.1 — size floor (the load-bearing #206 assertion).
-[ "$best" -gt "$MIN_CONFIG_BYTES" ] 2>/dev/null || \
-  fail "C: config.yaml served only ${best}B (<= ${MIN_CONFIG_BYTES}B) after ${DEADLINE_SECS}s — the docker-less read-back returned the 59B stub / an error, NOT the delivered bundle. The #206 host-side mirror is not being served (delivery REGRESSION)."
+# C.1 — size floor (the load-bearing #206 assertion). Print the provision state
+# FIRST: a 0B read-back has two very different causes — delivery regressed, or
+# the provision aborted and there was nothing to deliver — and the gate must
+# not name the wrong one.
+if ! [ "$best" -gt "$MIN_CONFIG_BYTES" ] 2>/dev/null; then
+  provision_failure "$WID"
+  fail "C: config.yaml served only ${best}B (<= ${MIN_CONFIG_BYTES}B) after ${DEADLINE_SECS}s. Read the workspace provision state printed above BEFORE concluding delivery regressed: status=failed with a last_sample_error means the provision aborted (e.g. missing required_env) and never reached the mirror; status=online/provisioning with no error means the #206 host-side mirror genuinely is not being served (delivery REGRESSION)."
+fi
 
 # C.2 — the served bytes are the REAL rendered config, not a stub message. Parse
 # the FULL JSON content in python (handles the multi-line YAML body correctly).

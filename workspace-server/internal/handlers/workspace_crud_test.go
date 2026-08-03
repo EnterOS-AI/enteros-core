@@ -54,11 +54,19 @@ func expectWorkspaceLiveTokenCount(mock sqlmock.Sqlmock, count int) {
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(count))
 }
 
+// expectWorkspaceDeleteLookup models Delete's opening row read. parent_id is
+// part of it because the audit anchor for a delete is resolved BEFORE anything
+// is destroyed (see auditDeleteAnchor) — reading it afterwards would be too
+// late on the purge path.
 func expectWorkspaceDeleteLookup(mock sqlmock.Sqlmock, id, name string, activeTasks int, status string) {
-	mock.ExpectQuery(`SELECT name, COALESCE\(active_tasks, 0\), status FROM workspaces WHERE id = \$1`).
+	expectWorkspaceDeleteLookupWithParent(mock, id, name, activeTasks, status, nil)
+}
+
+func expectWorkspaceDeleteLookupWithParent(mock sqlmock.Sqlmock, id, name string, activeTasks int, status string, parentID interface{}) {
+	mock.ExpectQuery(`SELECT name, COALESCE\(active_tasks, 0\), status, parent_id FROM workspaces WHERE id = \$1`).
 		WithArgs(id).
-		WillReturnRows(sqlmock.NewRows([]string{"name", "active_tasks", "status"}).
-			AddRow(name, activeTasks, status))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "active_tasks", "status", "parent_id"}).
+			AddRow(name, activeTasks, status, parentID))
 }
 
 // ---------- State ----------

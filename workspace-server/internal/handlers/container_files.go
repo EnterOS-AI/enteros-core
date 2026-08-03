@@ -11,9 +11,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/pkg/stdcopy"
 )
@@ -187,19 +187,28 @@ func buildContainerFilesTar(destPath string, files map[string]string) (*bytes.Bu
 		if path.IsAbs(clean) || strings.HasPrefix(clean, "..") {
 			return nil, fmt.Errorf("unsafe file path in archive: %s", name)
 		}
-		// Prepend destPath so relative paths land inside the volume mount.
-		// Use cleaned name so validation (which checks clean) and usage stay consistent.
-		archiveName := path.Join(destSlash, clean)
-		// Defence-in-depth: ensure the joined path doesn't escape destPath.
-		// This guards against a relative name containing ".." that survives
-		// the check above yet still climbs out of the destination once joined.
-		if !strings.HasPrefix(archiveName, destSlash+"/") && archiveName != destSlash {
+		// Validate against the JOINED path — defence-in-depth against a relative
+		// name containing ".." that survives the check above yet still climbs
+		// out of the destination once resolved.
+		joined := path.Join(destSlash, clean)
+		if !strings.HasPrefix(joined, destSlash+"/") && joined != destSlash {
 			return nil, fmt.Errorf("path escapes destination: %s", name)
 		}
 
-		// Create parent directories in tar (deduplicated)
+		// Entry names are RELATIVE to destPath, NOT prefixed with it.
+		//
+		// docker CopyToContainer(ctx, container, destPath, tar) extracts the
+		// archive WITH destPath AS ITS ROOT. Prefixing entry names with
+		// destPath therefore doubles it: an entry `/configs/config.yaml`
+		// extracted at `/configs` lands at `/configs/configs/config.yaml`, and
+		// the real file is never touched — while the call returns nil, so the
+		// Files API answered `{"status":"saved"}` for a save that did nothing.
+		// Verified against a live container before and after this fix.
+		archiveName := clean
+
+		// Create parent directories in tar (deduplicated), also relative.
 		dir := path.Dir(archiveName)
-		if dir != destSlash && !createdDirs[dir] {
+		if dir != "." && dir != "/" && !createdDirs[dir] {
 			tw.WriteHeader(&tar.Header{
 				Typeflag: tar.TypeDir,
 				Name:     dir + "/",

@@ -34,6 +34,15 @@ import (
 type CPProvisionerAPI interface {
 	Start(ctx context.Context, cfg WorkspaceConfig) (string, error)
 	Stop(ctx context.Context, workspaceID string) error
+	// EnsureImage asks the control plane to make this workspace's pinned image
+	// obtainable BEFORE the caller stops anything (core#5019, structural half).
+	//
+	// Deliberately on THIS interface rather than behind an optional type
+	// assertion on *CPProvisioner: the guard's whole value is that a restart
+	// path cannot reach Stop without having asked first, and an optional
+	// interface is exactly the shape that lets a fake — or a future second
+	// implementation — silently skip the question and still compile.
+	EnsureImage(ctx context.Context, req EnsureImageRequest) (EnsureImageResult, error)
 	// StopAndPrune is Stop + "erase the durable data volume" (internal#734),
 	// for the permanent-delete-with-erase flow ONLY. Restart/recreate use Stop.
 	StopAndPrune(ctx context.Context, workspaceID string) error
@@ -68,6 +77,18 @@ type CPProvisioner struct {
 	adminToken    string // X-Molecule-Admin-Token — per-tenant identity (controlplane #118/#130)
 	cpAdminAPIKey string // Authorization: Bearer — gates /cp/admin/* (read-only ops routes; distinct secret from sharedSecret)
 	httpClient    *http.Client
+	// provisionHTTPClient carries ONLY the provision POST. core#5019: a
+	// workspace adopting a newly promoted template pin is stopped before the
+	// CP is asked to provision it, and the CP cannot answer until it holds the
+	// pinned image (~7GB). Sharing the 120s budget meant a cold pull blew the
+	// deadline and left the workspace with no container at all.
+	provisionHTTPClient *http.Client
+	// ensureImageHTTPClient carries ONLY the ensure-image pre-flight (core#5019,
+	// structural half). Separate from provisionHTTPClient because the two bound
+	// different operations: this one may spend minutes making a ~7GB pinned image
+	// present BEFORE the workspace is stopped; the provision that follows it is
+	// then fast. See cpEnsureImageTimeout.
+	ensureImageHTTPClient *http.Client
 	// hostStateDir is the base dir for the host-side /configs mirror the Files
 	// API serves from when there is no docker.sock into the runtime container
 	// (#206 molecules-server). Empty disables the mirror (config still delivers
@@ -145,12 +166,14 @@ func NewCPProvisioner() (*CPProvisioner, error) {
 	}
 
 	return &CPProvisioner{
-		baseURL:       baseURL,
-		orgID:         orgID,
-		sharedSecret:  sharedSecret,
-		adminToken:    adminToken,
-		cpAdminAPIKey: cpAdminAPIKey,
-		httpClient:    &http.Client{Timeout: 120 * time.Second},
+		baseURL:               baseURL,
+		orgID:                 orgID,
+		sharedSecret:          sharedSecret,
+		adminToken:            adminToken,
+		cpAdminAPIKey:         cpAdminAPIKey,
+		httpClient:            &http.Client{Timeout: cpAPITimeout},
+		provisionHTTPClient:   &http.Client{Timeout: cpProvisionTimeout},
+		ensureImageHTTPClient: &http.Client{Timeout: cpEnsureImageTimeout},
 	}, nil
 }
 
@@ -162,6 +185,18 @@ func NewCPProvisioner() (*CPProvisioner, error) {
 // deployments without a real CP still work (those don't hit a CP that
 // enforces either gate). In prod both are set by the controlplane
 // bootstrap, so both headers land on every outbound call.
+// cpAPITimeout bounds the small JSON calls to the CP (status, stop, console).
+// They are request/response only and must not hang a caller.
+const cpAPITimeout = 120 * time.Second
+
+// cpProvisionTimeout bounds the provision POST. The CP may have to pull a
+// multi-GB workspace image before it can answer -- guaranteed right after a
+// template promote, when no host has the new digest yet. Measured: a cold
+// 7.05GB pull, then the identical call returned in 13s once the image was
+// local. This is deliberately generous; the failure it prevents is not a slow
+// restart but a workspace left down (core#5019).
+const cpProvisionTimeout = 20 * time.Minute
+
 func (p *CPProvisioner) provisionAuthHeaders(req *http.Request) {
 	if p.sharedSecret != "" {
 		req.Header.Set("Authorization", "Bearer "+p.sharedSecret)
@@ -376,13 +411,20 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 		InstanceType:    cfg.InstanceType,
 		DiskGB:          cfg.DiskGB,
 		DataPersistence: cfg.DataPersistence,
-		Provider:        cfg.Provider,
-		Kind:            kind,
-		Display:         cfg.Display,
-		PlatformURL:     cfg.PlatformURL,
-		Env:             env,
-		ConfigFiles:     configFiles,
-		TemplateAssets:  templateAssets,
+		// core#5025: resolved through the SAME seam as EnsureImage and Stop.
+		// cfg.Provider arrives from payload.Compute.Provider, which the canvas
+		// compute VALIDATOR drops whenever the persisted id is outside the
+		// cloud/billable picker set (the local Molecules-Server box is not in
+		// it) — so a workspace could be pre-warmed for the box named on its row
+		// and then provisioned with no provider at all. The pre-flight is only a
+		// guard if it resolves the box the provision actually builds.
+		Provider:       p.providerForWorkspace(ctx, cfg.WorkspaceID, cfg.Provider),
+		Kind:           kind,
+		Display:        cfg.Display,
+		PlatformURL:    cfg.PlatformURL,
+		Env:            env,
+		ConfigFiles:    configFiles,
+		TemplateAssets: templateAssets,
 	}
 
 	body, err := json.Marshal(req)
@@ -398,7 +440,12 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	httpReq.Header.Set("Content-Type", "application/json")
 	p.provisionAuthHeaders(httpReq)
 
-	resp, err := p.httpClient.Do(httpReq)
+	// Provisioning gets its own budget -- see cpProvisionTimeout.
+	provisionClient := p.provisionHTTPClient
+	if provisionClient == nil {
+		provisionClient = p.httpClient
+	}
+	resp, err := provisionClient.Do(httpReq)
 	if err != nil {
 		return "", fmt.Errorf("cp provisioner: send: %w", err)
 	}

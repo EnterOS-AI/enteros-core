@@ -64,6 +64,17 @@ func (h *AdminWorkspaceTokenHandler) Create(c *gin.Context) {
 	}
 
 	log.Printf("admin workspace tokens: issued token for workspace %s", workspaceID)
+
+	// Tamper-evident audit append: minting a bearer for a workspace is a
+	// privilege grant. Only the token's non-secret prefix is recorded — the
+	// plaintext is returned to the caller exactly once and must never enter
+	// the ledger.
+	RecordAuditEvent(c.Request.Context(), db.DB, auditEntryFromGin(c, workspaceID, AuditOpTokenMint, true, map[string]any{
+		"workspace_id": workspaceID,
+		"route":        "admin",
+		"token_prefix": auditTokenPrefix(token),
+	}))
+
 	c.JSON(http.StatusCreated, gin.H{
 		"auth_token":   token,
 		"workspace_id": workspaceID,

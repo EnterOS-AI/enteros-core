@@ -166,12 +166,22 @@ func (h *PluginsHandler) ReconcileWorkspacePlugins(ctx context.Context, workspac
 			log.Printf("Plugin reconcile: workspace=%s plugin=%s already on box (boot-installed) — recording tracking row only, no re-deliver/restart",
 				workspaceID, stage.PluginName)
 		} else {
-			// Platform concierge lifecycle guard: preserve idempotent delivery,
-			// but leave any required restart to an explicit operator action.
-			if suppressRestart {
+			// Deliver the bytes, but suppress the automatic restart when a
+			// restart would either interrupt a lifecycle or spin a loop:
+			//
+			//   - suppressRestart: the platform concierge is mid provisioning/
+			//     online lifecycle; a reconcile-restart bounces it back to
+			//     provisioning. Leave any restart to an explicit operator action.
+			//   - !BoxFetchable: a host-side-only source (local://) was pushed in
+			//     from the workspace-server. A restart re-provisions the box and
+			//     wipes /configs; the boot materializer cannot re-pull a host-side
+			//     source, so the next reconcile re-delivers and restarts again —
+			//     an infinite loop. Deliver, but defer activation to an explicit
+			//     restart (or the next boot-install once the source is on the box).
+			if suppressRestart || !stage.Source.BoxFetchable() {
 				stage.SuppressRestart = true
-				log.Printf("Plugin reconcile: workspace=%s plugin=%s not on box during platform concierge provisioning/online lifecycle — delivering WITHOUT automatic restart",
-					workspaceID, stage.PluginName)
+				log.Printf("Plugin reconcile: workspace=%s plugin=%s delivering WITHOUT automatic restart (concierge_lifecycle=%v box_fetchable=%v) — activation deferred to explicit restart",
+					workspaceID, stage.PluginName, suppressRestart, stage.Source.BoxFetchable())
 			}
 			if deliverErr := h.deliver(ctx, workspaceID, stage); deliverErr != nil {
 				stage.cleanup()
@@ -229,8 +239,13 @@ func (h *PluginsHandler) ReconcileWorkspacePlugins(ctx context.Context, workspac
 // NULL/empty baseline, or an immutable tag/sha pin never triggers a churny
 // re-deliver (and never an online↔provisioning restart bounce):
 //   - installedSHA == ""            → no content baseline to compare against
-//   - trackFromSource != "none"     → tag:/sha: pin, owned by the drift sweeper
+//   - immutable tag:/sha: pin       → owned by the drift sweeper
 //   - resolve error / empty result  → self-heals on a later beat, never churn
+//
+// The immutable-pin guard tests the tag:/sha: PREFIXES, not `trackFromSource
+// != "none"`. Those were equivalent only while bare refs mapped to "none";
+// once a branch pin became "ref:main" (core#4977) the old form would have
+// short-circuited exactly the branch pins this function exists to catch.
 //
 // Cost note: this adds one --depth=1 fetch per present branch-pinned plugin per
 // reconcile. The reconcile fires on transition-to-online (not a tight loop), and
@@ -240,7 +255,7 @@ func (h *PluginsHandler) pluginFragmentStale(ctx context.Context, sourceRaw, ins
 	if installedSHA == "" {
 		return false // no baseline — can't tell if it moved; never churn
 	}
-	if trackFromSource(sourceRaw) != "none" {
+	if isImmutablePin(trackFromSource(sourceRaw)) {
 		return false // tag:/sha: pin is immutable and owned by the drift sweeper
 	}
 	cur, err := resolveSourceSHA(ctx, h.sources, sourceRaw)
@@ -473,10 +488,28 @@ func (s *stageResult) cleanup() {
 	}
 }
 
+// isImmutablePin reports whether a tracked_ref value names content that cannot
+// move — a specific tag or a commit SHA. Those are the drift sweeper's domain
+// and never need a branch-tip fetch.
+//
+// "ref:<name>" is deliberately NOT immutable: it may name a branch whose tip
+// advances. (It may also name a bare tag, which simply resolves to the same
+// SHA forever and so reports no drift — costing one cheap fetch rather than a
+// missed update.)
+func isImmutablePin(trackedRef string) bool {
+	return strings.HasPrefix(trackedRef, "tag:") || strings.HasPrefix(trackedRef, "sha:")
+}
+
 // trackFromSource maps a source-contract ref to a workspace_plugins.tracked_ref
-// value. Only tag:/sha: refs are tracked; a branch ref (e.g. "#main") or no
-// ref → "none" (the sweeper can't meaningfully chase a branch tip via the
-// tracked_ref model).
+// value. "tag:"/"sha:" pins are carried through verbatim; any other ref
+// (a branch like "#main", or a bare tag name like "#v0.2.1") becomes
+// "ref:<name>". Only a source with NO ref fragment — or one that isn't a
+// parseable git-backed source, e.g. local:// — yields "none".
+//
+// Bare refs used to return "none", which put them below the drift sweeper's
+// `tracked_ref != 'none'` filter. Since nothing in production writes the
+// prefixed form, that meant the sweeper selected zero rows and silently
+// chased nothing (core#4977).
 func trackFromSource(source string) string {
 	src, err := plugins.ParseSource(source)
 	if err != nil {
@@ -493,5 +526,5 @@ func trackFromSource(source string) string {
 	if strings.HasPrefix(ref, "sha:") && len(ref) > 4 {
 		return ref
 	}
-	return "none"
+	return "ref:" + ref
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -409,14 +410,7 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	containerRuntime := h.restartRuntimeFromConfig(ctx, id, wsName, dbRuntime, body.ApplyTemplate)
 
 	// Reset to provisioning
-	if _, err := db.DB.ExecContext(ctx,
-		// Clear mcp_unloaded_since so the concierge warming clock (EV2 warm-fail +
-		// online not-ready grace, registry.go) starts fresh for this new provisioning
-		// episode — a stale stamp from a prior online-degrade would instantly re-degrade
-		// the box on its first post-restart beat (core#4457 cluster-2).
-		`UPDATE workspaces SET status = $1, url = '', mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2`, models.StatusProvisioning, id); err != nil {
-		log.Printf("Restart: failed to set provisioning status for %s: %v", id, err)
-	}
+	markProvisioningForRestart(ctx, id)
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), id, map[string]interface{}{
 		"name":    wsName,
 		"tier":    tier,
@@ -487,14 +481,109 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	h.goAsync(func() {
 		h.RestartWorkspaceAutoOpts(context.Background(), id, templatePath, configFiles, payload, resetClaudeSession)
 	})
-	// Claim the agent's session for the boot turn BEFORE spawning the sender:
-	// the drain is woken by the same heartbeat, so marking inside the goroutine
-	// would leave open the very window this closes. Cleared by sendRestartContext's
-	// defer on every exit path. See restartContextPending in restart_context.go.
-	markRestartContextPending(id)
-	h.goAsync(func() { h.sendRestartContext(id, restartData) })
+	// First-boot-vs-restart arbitration (RFC concierge rule 2): fire
+	// restart-context ONLY if this workspace has already been greeted (a real
+	// restart). A genuine first boot is skipped — the first-boot greeting owns
+	// that edge. Claims the per-restart concurrency gate BEFORE spawning the
+	// sender when it does fire (see fireRestartContextIfBooted / the drain-race
+	// note in restart_context.go).
+	h.fireRestartContextIfBooted(ctx, id, restartData)
 
 	c.JSON(http.StatusOK, gin.H{"status": "provisioning", "config_dir": configLabel, "reset_session": resetClaudeSession})
+}
+
+// markProvisioningForRestart moves a workspace into the provisioning state at
+// the START of a restart, before anything has been stopped.
+//
+// It deliberately does NOT clear `url` (core#5025 finding 2). The manual restart
+// handler runs this, answers 200, and only then dispatches — so at this point
+// nobody knows yet whether a stop will actually happen. The core#5019 pre-flight
+// can refuse, in which case the container is never touched and keeps serving on
+// exactly the address in that column. Clearing it here made a DECLINED restart
+// strictly worse than the outage it prevented: the heartbeat path writes status
+// and not url, so the workspace flipped back to 'online' with no address at all
+// — healthy-looking and unroutable, with no recovery short of another restart.
+//
+// The url is cleared where it becomes true — clearWorkspaceRouting, called from
+// the stop legs once the container is actually gone.
+//
+// Extracted so the restart entry points and the tests that pin this share ONE
+// statement rather than three copies that can drift a column apart.
+func markProvisioningForRestart(ctx context.Context, workspaceID string) {
+	if _, err := db.DB.ExecContext(ctx,
+		// Clear mcp_unloaded_since so the concierge warming clock (EV2 warm-fail +
+		// online not-ready grace, registry.go) starts fresh for this new provisioning
+		// episode — a stale stamp from a prior online-degrade would instantly re-degrade
+		// the box on its first post-restart beat (core#4457 cluster-2).
+		`UPDATE workspaces SET status = $1, mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2`,
+		models.StatusProvisioning, workspaceID); err != nil {
+		log.Printf("Restart: failed to set provisioning status for %s: %v", workspaceID, err)
+	}
+}
+
+// clearWorkspaceRouting drops everything that points callers at the container
+// that has JUST been destroyed: the persisted url and the cached A2A routing
+// keys. Called from the stop legs at the moment the stop has been issued —
+// never speculatively, because a workspace that was not stopped is still
+// reachable and must keep its address (core#5025 finding 2).
+func (h *WorkspaceHandler) clearWorkspaceRouting(ctx context.Context, workspaceID string) {
+	if db.DB == nil {
+		return
+	}
+	if _, err := db.DB.ExecContext(ctx,
+		`UPDATE workspaces SET url = '', updated_at = now() WHERE id = $1`, workspaceID); err != nil {
+		log.Printf("Restart: failed to clear url for %s: %v", workspaceID, err)
+	}
+	// core#3220: the old container is gone; clear any cached A2A routing keys
+	// so concurrent probes do not resolve to the dead URL while the workspace
+	// is reprovisioning.
+	db.ClearWorkspaceKeys(ctx, workspaceID)
+}
+
+// markRestartDeclined records the terminal outcome of a restart the platform
+// REFUSED to perform (core#5025 finding 3).
+//
+// A decline is not "nothing happened": the platform tried to recover a
+// workspace and could not obtain the image it would have needed. Before this,
+// the auto-restart cycle simply returned — no status write, no event, no row
+// change — so an unrecoverable restart was indistinguishable from one that was
+// never attempted, and the only trace was a log line on a box nobody tails.
+//
+// Deliberately NOT markProvisionFailed. Nothing failed to provision, and the
+// container is still running and still heartbeating: writing status='failed'
+// would misreport a live workspace and is the same class of confident lie as
+// finding 2's empty url. The signal is a durable event plus the
+// operator-visible error column the canvas already renders — visible, durable,
+// and true.
+func (h *WorkspaceHandler) markRestartDeclined(ctx context.Context, workspaceID, wsName, runtime, template string) {
+	msg := "restart declined — the pinned image for runtime=" + runtime +
+		" could not be made available, so the running container was left untouched (core#5019). " +
+		"The workspace is still serving its previous version; it will retry on the next restart."
+
+	// Nil-tolerant on both sinks: recording WHY a restart was refused must never
+	// itself panic the restart path. A handler wired without a broadcaster (or
+	// running before db.DB is set) still gets the log line above the call site.
+	if h.broadcaster != nil {
+		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceRestartDeclined), workspaceID, map[string]interface{}{
+			"name":     wsName,
+			"runtime":  runtime,
+			"template": template,
+			"error":    msg,
+			"reason":   "image_prewarm_declined",
+		})
+	}
+	if db.DB == nil {
+		return
+	}
+
+	// Status is deliberately untouched — see the doc comment. last_sample_error
+	// is the column the canvas surfaces for "what went wrong here", and it is
+	// what makes this distinguishable from a restart nobody ever ran.
+	if _, err := db.DB.ExecContext(ctx,
+		`UPDATE workspaces SET last_sample_error = $2, updated_at = now() WHERE id = $1`,
+		workspaceID, msg); err != nil {
+		log.Printf("markRestartDeclined: db update failed for %s: %v", workspaceID, err)
+	}
 }
 
 func (h *WorkspaceHandler) restartRuntimeFromConfig(ctx context.Context, id, wsName, dbRuntime string, applyTemplate bool) string {
@@ -972,12 +1061,29 @@ func coalesceRestart(workspaceID string, cycle func()) {
 // Docker path, so on SaaS (h.provisioner=nil) the auto-restart cycle silently
 // NPE'd before reaching the reprovision step — which is why every SaaS dead-
 // agent incident pre-this-fix required manual restart from canvas.
-func (h *WorkspaceHandler) stopForRestart(ctx context.Context, workspaceID string) {
+// It takes the PAYLOAD rather than loose runtime/template strings (core#5025):
+// the pre-flight below must resolve the same box the provision that follows will
+// build, and the payload is that single object. Passing the identity fields
+// separately is how the provider drifted away from the provision — the payload's
+// Compute.Provider was simply never read, so the wire named no backend at all
+// and the control plane resolved its default instead.
+func (h *WorkspaceHandler) stopForRestart(ctx context.Context, workspaceID string, payload models.CreateWorkspacePayload) bool {
 	backend := "none"
 	if h.provisioner != nil {
 		backend = "docker"
 	} else if h.cpProv != nil {
 		backend = "cp"
+	}
+	// core#5019 (structural half): PULL BEFORE STOPPING. Ask the control plane
+	// to make the pinned image obtainable BEFORE destroying the container. A
+	// refusal means we keep what the user still has — a running workspace —
+	// rather than trading it for an image that may never arrive.
+	//
+	// Placed above the pre_stop emit on purpose: a declined restart must not
+	// leave a restart.pre_stop marker in the wire log for a stop that never
+	// happened. Ops read that sequence to reconstruct incidents.
+	if !h.ensurePinnedImageBeforeStop(ctx, workspaceID, payload) {
+		return false
 	}
 	provlog.Event("restart.pre_stop", map[string]any{
 		"workspace_id": workspaceID,
@@ -989,12 +1095,177 @@ func (h *WorkspaceHandler) stopForRestart(ctx context.Context, workspaceID strin
 		h.cpStopWithRetry(ctx, workspaceID, "Auto-restart")
 	}
 
-	// core#3220: the old container is gone; clear any cached A2A routing keys
-	// so concurrent probes do not resolve to the dead URL while the workspace
-	// is reprovisioning. Cleared here (rather than in the caller) because this
-	// is the earliest point where the backend Stop has been issued and the
-	// cache is guaranteed stale.
-	db.ClearWorkspaceKeys(ctx, workspaceID)
+	// core#3220 + core#5025: the old container is gone, so drop everything that
+	// still points at it — the persisted url AND the cached A2A routing keys.
+	// Cleared here (rather than in the caller) because this is the earliest
+	// point where the backend Stop has been issued and both are guaranteed
+	// stale, and the LATEST point at which clearing them is still a lie: on the
+	// declined path above we returned without reaching this line, and the
+	// workspace kept its address because it kept its container.
+	h.clearWorkspaceRouting(ctx, workspaceID)
+	return true
+}
+
+// restartPrewarmBudget bounds the ENTIRE pre-flight — every retry and every
+// backoff between them — for one restart.
+//
+// It exists because of what the pre-flight HOLDS, not because of what it does.
+// Without a deadline the call inherits the ensure-image HTTP client's 20-minute
+// budget (deliberately generous: a cold ~7GB pull is the design point), and on
+// the auto-restart path that budget is spent holding the per-workspace
+// restart/provision gate. A registry that hangs would then look exactly like a
+// workspace whose lifecycle has stopped.
+//
+// It is bounded from BOTH sides, and the lower bound is the load-bearing one:
+//
+//   - Below provisioner.EnsureImageClientTimeout(), or it bounds nothing — the
+//     HTTP client would give up first and the gate would be held for the full
+//     client timeout anyway.
+//   - Comfortably above the measured cold-pull design point (the 7.05GB pull
+//     core#5019 was root-caused on). Too SMALL is not the safe direction it
+//     looks like: every restart would decline while a legitimate pull was still
+//     in progress, and a workspace could never adopt a newly promoted pin at
+//     all — the pre-flight would have turned "slow adoption" into "NO
+//     adoption", a worse failure than the one it prevents.
+//
+// Exceeding it declines, which is the cheap outcome: the container is untouched
+// and the next restart cycle asks again, by which time the pull has usually
+// landed. Package-level so tests can shrink it.
+var restartPrewarmBudget = 15 * time.Minute
+
+// ensurePinnedImageBeforeStop reports whether it is safe to destroy this
+// workspace's container — core#5019's structural fix.
+//
+// A "restart" is a full RE-PROVISION: the control plane reads runtime_image_pins
+// at provision time, so adopting a newly promoted pin means obtaining that image
+// (~7GB). Pre-fix the tenant stopped first and discovered the image was missing
+// second, which is why an unobtainable image cost the workspace its container
+// for ~10 minutes. #5020 widened the provision budget so a cold pull usually
+// FINISHES; it does nothing for a pull that cannot succeed at all — a bad
+// digest, a registry outage, a full disk. This is that half.
+//
+// Decision table, and which way each branch fails:
+//
+//	no CP provisioner              -> ALLOW  (self-host/Docker: the local
+//	                                  provisioner owns its own image, there is
+//	                                  no CP seam to ask and nothing to guard)
+//	CP confirms                    -> ALLOW
+//	CP has no such endpoint (404)  -> ALLOW  (deliberate fail-OPEN, see below)
+//	anything else                  -> DECLINE (fail-CLOSED)
+//
+// The 404 branch is the single deliberate fail-open. During a rollout a tenant
+// can run ahead of its control plane; failing closed there would wedge EVERY
+// restart on the fleet, which is a much larger outage than the one being fixed.
+// It is also self-limiting: the moment CP ships the endpoint the branch stops
+// being reachable. Every other outcome fails closed.
+//
+// Not a substitute for the CP-side pre-warm on promote — it is the backstop for
+// when that has not happened. The two are complementary: pre-warm makes the
+// common path fast, this makes the uncommon path non-destructive.
+func (h *WorkspaceHandler) ensurePinnedImageBeforeStop(ctx context.Context, workspaceID string, payload models.CreateWorkspacePayload) bool {
+	if h.cpProv == nil {
+		return true
+	}
+	runtime, template := payload.Runtime, payload.Template
+
+	// core#5025 finding 7: the pre-flight gets its OWN deadline. It used to run
+	// on context.Background() and lean on the 20-minute ensure-image HTTP client
+	// timeout, while holding the per-workspace restart/provision gate — so a
+	// hung pull froze every restart, heal and provision path for that workspace
+	// for twenty minutes. A slow pull is allowed to be slow; it is not allowed
+	// to be indistinguishable from a stopped lifecycle. Exceeding the budget
+	// DECLINES, which costs the user nothing: the container is still running and
+	// the next cycle retries, by which time the pull has usually landed.
+	ctx, cancel := context.WithTimeout(ctx, restartPrewarmBudget)
+	defer cancel()
+
+	req := provisioner.EnsureImageRequest{
+		WorkspaceID: workspaceID,
+		Runtime:     runtime,
+		Template:    template,
+		// core#5025: the provider the PROVISION will use, read off the same
+		// payload that provision receives. Left unset, the wire named no
+		// backend, the control plane resolved the SSOT default (aws), and it
+		// answered "not_applicable" — a 200 — for every workspace on the
+		// local-docker substrate. The tenant treats any 2xx as permission to
+		// stop, so the guard destroyed containers while logging success.
+		Provider: payload.Compute.Provider,
+	}
+
+	// core#5025 finding 4: bounded retry, on the SAME budget as the stop leg
+	// this pre-flight precedes. cpStopWithRetryErr retries because refusing to
+	// act strands the user with a workspace nobody can recover; refusing to
+	// pre-warm strands them identically, and harder — it refuses the restart
+	// outright. One-shot fail-closed meant a ~60s control-plane redeploy
+	// declined every restart on the fleet, and this deployment redeploys the
+	// control plane routinely.
+	//
+	// The two retry knobs are READ from the stop leg rather than re-declared, so
+	// the policies cannot drift into two different numbers that both look
+	// deliberate.
+	var err error
+	var res provisioner.EnsureImageResult
+	delay := cpStopRetryBaseDelay
+	for attempt := 1; attempt <= cpStopRetryAttempts; attempt++ {
+		res, err = h.cpProv.EnsureImage(ctx, req)
+		if err == nil {
+			log.Printf("Restart: %s pinned image ready before stop (runtime=%q template=%q status=%q ref=%q attempt=%d) — core#5019 pull-before-stop",
+				workspaceID, runtime, template, res.Status, res.ImageRef, attempt)
+			return true
+		}
+		if errors.Is(err, provisioner.ErrEnsureImageUnsupported) {
+			log.Printf("Restart: %s control plane has no ensure-image endpoint — proceeding with the pre-core#5019 stop-then-provision ordering (runtime=%q). Upgrade the control plane to close the cold-adoption window.",
+				workspaceID, runtime)
+			return true
+		}
+		// A refusal the control plane MEANT. Retrying returns the same answer
+		// and spends the budget doing it — this is the core#5019 bad-digest
+		// case, and it must decline fast, not slowly.
+		if errors.Is(err, provisioner.ErrEnsureImagePermanent) {
+			break
+		}
+		if attempt == cpStopRetryAttempts {
+			break
+		}
+		log.Printf("Restart: %s pre-warm attempt %d/%d failed (%v) — retrying in %s; a control plane that is momentarily unreachable says nothing about the image",
+			workspaceID, attempt, cpStopRetryAttempts, err, delay)
+		// Sleep with ctx awareness, exactly as cpStopWithRetryErr does: a
+		// budget that only bounds the CALLS and not the waits between them
+		// would still hold the caller for the full backoff chain.
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			err = fmt.Errorf("pre-warm budget %s exhausted after %d attempt(s): %w", restartPrewarmBudget, attempt, err)
+			return h.declineRestart(ctx, workspaceID, runtime, template, err)
+		case <-timer.C:
+		}
+		delay *= 2
+	}
+
+	return h.declineRestart(ctx, workspaceID, runtime, template, err)
+}
+
+// declineRestart is the single exit for "we will not destroy this container".
+//
+// One function rather than a copy at each exit: the budget-exhausted path and
+// the attempts-exhausted path must produce the SAME wire log, or an incident
+// reconstructed from provlog would show a decline for one cause and silence for
+// the other.
+//
+// LOUD by design. The prefix is stable so ops can grep it, and it is worded to
+// be distinguishable from an ordinary provision failure — nothing was broken
+// here, something was PREVENTED from breaking.
+func (h *WorkspaceHandler) declineRestart(_ context.Context, workspaceID, runtime, template string, err error) bool {
+	log.Printf("IMAGE-PREWARM-DECLINED restart workspace_id=%s runtime=%q template=%q err=%q — the workspace was NOT stopped; it keeps its running container (core#5019)",
+		workspaceID, runtime, template, err.Error())
+	provlog.Event("restart.image_prewarm_declined", map[string]any{
+		"workspace_id": workspaceID,
+		"runtime":      runtime,
+		"template":     template,
+		"error":        err.Error(),
+	})
+	return false
 }
 
 // cpStopRetryAttempts caps total Stop attempts (initial + retries). 3 catches
@@ -1222,7 +1493,26 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	// behaviour.
 	h.gracefulPreRestart(ctx, workspaceID)
 
-	h.stopForRestart(ctx, workspaceID)
+	// Payload built BEFORE the stop (core#5025), not after it. The pre-flight
+	// below has to name the box the provision will build, and that box is
+	// payload.Compute.Provider — which this function used to resolve only after
+	// the container was already gone. Constructing it here is what makes the two
+	// halves provably the same question.
+	payload := withStoredCompute(ctx, workspaceID, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime, Template: dbTemplate})
+
+	// core#5019: stopForRestart DECLINES when the pinned image cannot be made
+	// obtainable. The container is still running and still heartbeating, so the
+	// workspace stays exactly as the user left it — but a decline is not a
+	// no-op either (core#5025 finding 3): it is an unrecoverable restart, and
+	// leaving no status behind makes it indistinguishable from "nothing was
+	// tried". markRestartDeclined records the terminal, operator-visible
+	// outcome without pretending a provision failed.
+	if !h.stopForRestart(ctx, workspaceID, payload) {
+		log.Printf("Auto-restart: %s (%s) DECLINED — pinned image for runtime=%q template=%q could not be made available; the running container was left untouched (core#5019)",
+			wsName, workspaceID, dbRuntime, dbTemplate)
+		h.markRestartDeclined(ctx, workspaceID, wsName, dbRuntime, dbTemplate)
+		return
+	}
 
 	if _, err := db.DB.ExecContext(ctx,
 		// Clear mcp_unloaded_since — fresh warming clock for the new provisioning
@@ -1233,9 +1523,6 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), workspaceID, map[string]interface{}{
 		"name": wsName, "tier": tier, "runtime": dbRuntime, "template": dbTemplate,
 	})
-
-	// Runtime from DB — no more config file parsing
-	payload := withStoredCompute(ctx, workspaceID, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime, Template: dbTemplate})
 
 	// RFC#2843 #33 + SaaS restart re-stub fix: restore the persisted template
 	// and resolve its local template dir so the reprovision request carries both
@@ -1306,10 +1593,14 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	// Tracked via h.goAsync so tests can wait for it via h.asyncWG before
 	// closing the sqlmock. Without this, untracked goroutines hit the restored
 	// mock and cause "was not expected" errors in parallel CI execution (mc#1264).
-	// Same session claim as the Restart handler above — set before the spawn so
-	// the drain woken by this restart's first heartbeat already sees the gate.
-	markRestartContextPending(workspaceID)
-	h.goAsync(func() { h.sendRestartContext(workspaceID, restartData) })
+	//
+	// First-boot-vs-restart arbitration (RFC concierge rule 2): fire only for an
+	// already-greeted workspace (has_greeted marker) — a genuine first boot is
+	// skipped, the greeting owns that edge. Same session-claim ordering as the
+	// Restart handler: fireRestartContextIfBooted sets the per-restart gate
+	// before the spawn so the drain woken by this restart's first heartbeat
+	// already sees it.
+	h.fireRestartContextIfBooted(ctx, workspaceID, restartData)
 }
 
 // Pause handles POST /workspaces/:id/pause

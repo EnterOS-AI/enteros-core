@@ -36,10 +36,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/docker/docker/client"
+
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/codexauth"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/desktopgateway"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/envx"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/handlers"
@@ -87,6 +90,40 @@ func isSaaSDeployment() bool {
 		}
 	}
 	return strings.TrimSpace(os.Getenv("MOLECULE_ORG_ID")) != ""
+}
+
+// desktopDockerClient resolves the Docker client the desktop sidecar backend
+// should use, or nil if no Docker daemon is reachable. The desktop only needs a
+// Docker DAEMON — it is independent of how workspace boxes are provisioned:
+//
+//   - Self-host: the local box provisioner already holds a client; reuse it.
+//   - CP/SaaS tenant (box provisioner nil): build a client from the environment
+//     (docker.sock mounted or DOCKER_HOST set) and Ping it. If the tenant has
+//     local Docker access, the desktop runs exactly like self-host; if not, the
+//     desktop stays cleanly disabled (nil), never half-wired.
+//
+// This is the "CP works like self-host for display" path (until a k8s sidecar
+// backend lands, which is a drop-in SidecarProvisioner swap).
+func desktopDockerClient(prov *provisioner.Provisioner) *client.Client {
+	if prov != nil {
+		if c := prov.DockerClient(); c != nil {
+			return c
+		}
+	}
+	c, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		log.Printf("Desktop: no box provisioner and Docker client from env failed (%v) — desktop backend unavailable; mount /var/run/docker.sock or set DOCKER_HOST to enable computer-use on this tenant", err)
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.Ping(ctx); err != nil {
+		log.Printf("Desktop: Docker daemon not reachable (%v) — desktop backend unavailable; mount /var/run/docker.sock or set DOCKER_HOST to enable computer-use on this tenant", err)
+		_ = c.Close()
+		return nil
+	}
+	log.Println("Desktop: using a local Docker client from env (CP tenant → self-host-style desktop backend)")
+	return c
 }
 
 func main() {
@@ -359,6 +396,185 @@ func main() {
 	if cpProv != nil {
 		wh.SetCPProvisioner(cpProv)
 	}
+
+	// Desktop computer-use wiring (design decision B). ON BY DEFAULT wherever a
+	// local Docker provisioner exists — no enablement flag, no operator egress
+	// step. Isolation is STRUCTURAL: the provisioner puts each sidecar on an
+	// INTERNAL per-workspace network whose ONLY route out is a per-workspace
+	// egress proxy that denies private/link-local destinations (§6.1,
+	// cmd/desktop-egress-proxy). A compromised browser therefore cannot reach
+	// backend infra, the host, other tenants, or the cloud metadata service —
+	// safe by construction, so no MOLECULE_DESKTOP_ENABLED / EGRESS_CONFIRMED
+	// gate. Set MOLECULE_DESKTOP_DISABLE=true to opt OUT. CP/k8s backend is a
+	// separate follow-up.
+	// The desktop sidecar backend only needs a DOCKER DAEMON — independent of how
+	// workspace BOXES are provisioned. On self-host the local box provisioner holds
+	// a client; on a CP/SaaS tenant the box provisioner is nil, but the tenant may
+	// still have a local Docker client (docker.sock mounted or DOCKER_HOST set), in
+	// which case the desktop runs exactly like self-host (operator directive
+	// 2026-07-30: "CP works like self-host for display until the k8s backend
+	// lands"). desktopDockerClient resolves the right client or nil.
+	desktopDocker := desktopDockerClient(prov)
+	if desktopDocker != nil && envOr("MOLECULE_DESKTOP_DISABLE", "false") != "true" {
+		// The sidecar's control server derives its DESKTOP_CONTROL_TOKEN from this
+		// secret, and the gateway's TokenResolver derives the matching bearer from
+		// the SAME secret. If it's unset, DeriveDesktopControlToken returns "" and
+		// every sidecar's control server fails to boot — so the feature would read
+		// as ENABLED yet 502-churn containers with no loud error. Refuse to wire it
+		// (an explicit, safe no-op) and tell the operator WHY, instead of silently
+		// churning. Desktop stays default-on only when the secret is present.
+		// Single signing root for the whole desktop feature (per-sidecar control
+		// token here + display session/viewer tokens in the handlers). Resolved,
+		// not hand-set: DISPLAY_SESSION_SIGNING_SECRET override → else derived from
+		// SECRETS_ENCRYPTION_KEY (prod boot already requires it) → else the
+		// managed-tenant shared secret. See handlers.DesktopSigningRoot. This is
+		// only "" in a dev env with none of those set.
+		// §25.3 SECURITY — verify the isolation assumption the relaxed sidecar caps
+		// depend on. v3 grants the desktop passwordless sudo + Docker's default cap
+		// set + NO no-new-privileges, so cross-tenant isolation now relies on the
+		// daemon running userns-remap (so container-root != host-root). Nothing else
+		// enforces this, so query the daemon at startup: WARN loudly when remap is
+		// absent, and — if MOLECULE_DESKTOP_REQUIRE_USERNS=true — fail CLOSED by
+		// skipping only the desktop wiring (never a log.Fatal that takes down the
+		// whole platform, never a bare return that skips the rest of main).
+		usernsRemap := false
+		{
+			ictx, icancel := context.WithTimeout(context.Background(), 5*time.Second)
+			info, ierr := desktopDocker.Info(ictx)
+			icancel()
+			if ierr != nil {
+				log.Printf("Desktop: could not query Docker daemon security options (%v) — cannot verify userns-remap; proceeding, but confirm the daemon runs userns-remap for cross-tenant isolation (§25.3).", ierr)
+			} else {
+				for _, so := range info.SecurityOptions {
+					for _, field := range strings.Split(so, ",") {
+						switch strings.TrimSpace(field) {
+						case "name=userns", "name=rootless":
+							// rootless dockerd also maps container-root away from host-root.
+							usernsRemap = true
+						}
+					}
+				}
+			}
+		}
+		requireUserns := envOr("MOLECULE_DESKTOP_REQUIRE_USERNS", "false") == "true"
+		if !usernsRemap {
+			log.Printf("Desktop: WARNING — daemon userns-remap NOT detected. v3 grants the desktop passwordless sudo (container-root); WITHOUT userns-remap container-root == host-root, widening the container-escape surface (§25.3). Enable dockerd userns-remap, or set MOLECULE_DESKTOP_REQUIRE_USERNS=true to fail closed.")
+		}
+		desktopSecret := handlers.DesktopSigningRoot()
+		if desktopSecret == "" {
+			log.Println("Desktop: DISABLED — no signing root available (DISPLAY_SESSION_SIGNING_SECRET unset AND SECRETS_ENCRYPTION_KEY / MOLECULE_CP_SHARED_SECRET / PROVISION_SHARED_SECRET all unset), so the per-sidecar control token cannot be derived and every desktop sidecar would fail to boot. In prod SECRETS_ENCRYPTION_KEY is required, so this only trips in a misconfigured dev env.")
+		} else if requireUserns && !usernsRemap {
+			log.Println("Desktop: DISABLED — MOLECULE_DESKTOP_REQUIRE_USERNS=true but daemon userns-remap was not detected; refusing to wire the desktop backend (fail-closed §25.3). Enable dockerd userns-remap to turn the desktop back on.")
+		} else {
+			image := envOr("MOLECULE_DESKTOP_IMAGE", "registry.moleculesai.app/molecule-ai/molecule-desktop:latest")
+			// Optional operator seccomp override (absolute path). Empty → the
+			// provisioner's embedded Chromium-tuned default. A configured-but-
+			// unreadable path is fatal: silently falling back would ship a
+			// different isolation posture than the operator intended.
+			seccompProfile := ""
+			if pp := os.Getenv("MOLECULE_DESKTOP_SECCOMP_PROFILE"); pp != "" {
+				b, rerr := os.ReadFile(pp)
+				if rerr != nil {
+					log.Fatalf("Desktop: MOLECULE_DESKTOP_SECCOMP_PROFILE=%q unreadable: %v", pp, rerr)
+				}
+				seccompProfile = string(b)
+			}
+			// Memory ceiling for the sidecar (§10 OOM control). v3 is a FULL XFCE
+			// desktop that can run a browser + apt-installed apps (§25.2), so the old
+			// 2 GiB kiosk-browser cap is too tight — default 4 GiB, operator-overridable
+			// via MOLECULE_DESKTOP_MEMORY_BYTES for hosts that want more/less headroom.
+			desktopMemoryBytes := int64(4 << 30)
+			if mv := os.Getenv("MOLECULE_DESKTOP_MEMORY_BYTES"); mv != "" {
+				if parsed, perr := strconv.ParseInt(mv, 10, 64); perr == nil && parsed > 0 {
+					desktopMemoryBytes = parsed
+				} else {
+					log.Printf("Desktop: ignoring invalid MOLECULE_DESKTOP_MEMORY_BYTES=%q (want a positive integer byte count); using default %d", mv, desktopMemoryBytes)
+				}
+			}
+			sidecar := provisioner.NewLocalSidecarProvisioner(desktopDocker, image, "wsnet", 6070, 10*time.Second, desktopMemoryBytes, seccompProfile)
+			// B1: the provisioner derives DESKTOP_CONTROL_TOKEN from the SAME secret
+			// the gateway's TokenResolver uses, so the sidecar's control server and
+			// the gateway agree. B3: tell the provisioner which container is the
+			// platform so it joins each per-workspace network and can reach the
+			// sidecar by name (HOSTNAME is the Docker-set container id; override via
+			// MOLECULE_DESKTOP_PLATFORM_CONTAINER). Optional egress-network override
+			// for the proxy's internet leg (default "bridge").
+			sidecar.SetControlTokenSecret(desktopSecret)
+			sidecar.SetSelfContainerID(envOr("MOLECULE_DESKTOP_PLATFORM_CONTAINER", os.Getenv("HOSTNAME")))
+			if egnet := os.Getenv("MOLECULE_DESKTOP_EGRESS_NETWORK"); egnet != "" {
+				sidecar.SetEgressNetwork(egnet)
+			}
+			wh.SetSidecarProvisioner(sidecar)
+			store := handlers.NewDesktopLifecycleStore(db.DB)
+			gw := desktopgateway.New(
+				sidecar,
+				store, // LockChecker
+				store, // ActivityRecorder
+				func(_ context.Context, workspaceID string) (string, error) {
+					return provisioner.DeriveDesktopControlToken(desktopSecret, workspaceID), nil
+				},
+				nil,
+			)
+			// Mark a desktop 'running' on scale-up so the idle sweeper can find it
+			// to reap (§10) — without this, RunningDesktopWorkspaceIDs is always
+			// empty and 2GB sidecars never scale to zero.
+			gw.SetStateRecorder(store)
+			// Live human-viewer presence: a display session marks the desktop
+			// watched so the idle sweeper won't reap it under a human (the
+			// agent-activity timer alone misses human-only sessions).
+			gw.SetVNCPresenceRecorder(store)
+			wh.SetDesktopGateway(gw)
+
+			// Scale-to-zero: reap idle desktop sidecars (§10). Source = the store's
+			// running set; teardown = graceful StopDesktop THEN mark 'stopped' so
+			// RunningDesktopWorkspaceIDs stops returning it. The sweeper re-checks
+			// DesktopIsIdle immediately before each teardown, so a desktop that went
+			// active between the scan and the check is not reaped.
+			idleTimeout := desktopEnvDuration("MOLECULE_DESKTOP_IDLE_TIMEOUT_S", 15*time.Minute)
+			sweepInterval := desktopEnvDuration("MOLECULE_DESKTOP_SWEEP_INTERVAL_S", 60*time.Second)
+			idleSweeper := handlers.NewDesktopIdleSweeper(
+				store,
+				func(c context.Context, workspaceID string) error {
+					if err := sidecar.StopDesktop(c, workspaceID); err != nil {
+						return err
+					}
+					return store.SetState(c, workspaceID, "stopped", "")
+				},
+				idleTimeout,
+			)
+			go idleSweeper.Start(ctx, sweepInterval)
+
+			log.Printf("Desktop: computer-use ENABLED by default (structural egress isolation; set MOLECULE_DESKTOP_DISABLE=true to opt out). Idle reaper: timeout=%s, interval=%s", idleTimeout, sweepInterval)
+		}
+	}
+
+	// Wake-lifecycle owner (PR-D): route this handler's proactive-wake emitters
+	// (restart-context) through the desired-state owner so a fired restart-context
+	// records a wake_intent + bumps desired_generation and shares one idempotency
+	// key decision→dispatch→delivery→marker. Nil-safe: unwired, restart-context
+	// keeps its legacy per-workspace key verbatim.
+	wh.SetWakeHooks(wh.DecideWake, wh.MarkWakeDelivered)
+
+	// First-boot greeting hook (first_boot_greeting.go): drives a real agent turn
+	// so a freshly-onboarded agent greets the user in its own persona. Constructed
+	// HERE (rather than inside router.Setup) so the SAME greeter instance backs
+	// BOTH the registry's SetFirstBootGreeter (wired in router.Setup, handed in
+	// below) AND the wake re-drive re-emitter wired just below — and so the
+	// re-emit hook is set on wh BEFORE the WakeRedriveSweeper starts (the sweep is
+	// a no-op until it is, but wiring it up front removes any startup-order doubt).
+	greeter := handlers.FirstBootGreeter(
+		handlers.NewAgentMessageWriter(db.DB, broadcaster),
+		wh.ProxyA2ARequest,
+		// Greet-once stays owned by the has_greeted marker (workspaceHasGreeted +
+		// claimGreetDelivery); Decision.Fire is intentionally not a fire gate.
+		handlers.GreetWakeHooks{Decide: wh.DecideWake, Delivered: wh.MarkWakeDelivered},
+	)
+	// GENERATION LOOP RE-DRIVE (PR-F): wire the re-emit side of the re-drive onto
+	// wh. The re-emitter re-runs the greeter for a stuck greet — safe because
+	// greet-once stays owned by the has_greeted CAS, so a delivered greet re-runs
+	// to a no-op (never a double greeting); non-greet kinds are a no-op skip. The
+	// fleet-wide WakeRedriveSweeper (started below) is what drives it periodically.
+	wh.SetWakeReEmitter(handlers.WakeReEmitter(greeter))
 
 	// #2930: independent A2A queue sweeper so queued requests drain even when a
 	// workspace stops heartbeating (e.g., after a transient restart trigger).
@@ -672,6 +888,11 @@ func main() {
 	// REQUEST_NUDGE_SWEEPER_INTERVAL_S.
 	if !strings.EqualFold(os.Getenv("REQUEST_NUDGE_SWEEPER_DISABLED"), "true") {
 		nudgeSweeper := handlers.NewRequestNudgeSweeper(nil)
+		// Wake-lifecycle owner (PR-D): route the inbox nudge through the
+		// desired-state owner (same gate as the stall watchdog) so a fired nudge
+		// mints a wake_intent + bumps desired_generation and shares one idempotency
+		// key decision→dispatch→delivery→marker.
+		nudgeSweeper.SetWakeHooks(wh.DecideWake, wh.MarkWakeDelivered)
 		go supervised.RunWithRecover(ctx, "request-nudge-sweeper", nudgeSweeper.Start)
 	}
 
@@ -686,9 +907,30 @@ func main() {
 	// override via STALL_WATCHDOG_*_S. Disable via STALL_WATCHDOG_DISABLED=true.
 	if !strings.EqualFold(os.Getenv("STALL_WATCHDOG_DISABLED"), "true") {
 		stallWatchdog := handlers.NewStallWatchdog(nil, wh.RestartByID)
+		// Versioned-heartbeat GENERATION LOOP (PR-C): the stall probe is this PR's
+		// single live desired-generation bump point. Wiring the wake hooks makes a
+		// fired probe mint a wake_intent + bump desired_generation, which the
+		// heartbeat handler then hands down and settles on convergence.
+		stallWatchdog.SetWakeHooks(wh.DecideWake, wh.MarkWakeDelivered)
 		go supervised.RunWithRecover(ctx, "stall-watchdog", stallWatchdog.Start)
 	} else {
 		log.Printf("StallWatchdog: disabled via STALL_WATCHDOG_DISABLED")
+	}
+
+	// GENERATION LOOP RE-DRIVE (PR-F): fleet-wide periodic sweeper that re-emits
+	// STUCK wake intents (pending/dispatched that never delivered, or
+	// delivered-but-never-settled) through their existing idempotency key, bounded
+	// by a per-intent attempt cap (dropped after redriveMaxAttempts). One fleet
+	// query per tick finds the distinct workspaces with a stuck intent, then
+	// ReDriveStuckWakes drives each. No-op until the re-emit hook is wired
+	// (SetWakeReEmitter above) — so this is nil-safe by construction. Default 5min
+	// cadence; override via WAKE_REDRIVE_SWEEPER_INTERVAL_S; disable via
+	// WAKE_REDRIVE_SWEEPER_DISABLED=true.
+	if !strings.EqualFold(os.Getenv("WAKE_REDRIVE_SWEEPER_DISABLED"), "true") {
+		redriveSweeper := handlers.NewWakeRedriveSweeper(nil, wh.ReDriveStuckWakes, wh.WakeReEmitWired)
+		go supervised.RunWithRecover(ctx, "wake-redrive-sweeper", redriveSweeper.Start)
+	} else {
+		log.Printf("WakeRedriveSweeper: disabled via WAKE_REDRIVE_SWEEPER_DISABLED")
 	}
 
 	// Channel Manager — social channel integrations (Telegram, Slack, etc.)
@@ -711,7 +953,7 @@ func main() {
 		defer cancel()
 		return refreshTemplates(ctx)
 	}
-	r := router.Setup(hub, broadcaster, prov, platformURL, configsDir, templateCacheDir, hostStateDir, bootTokens, wh, channelMgr, memBundle, pluginRegistry, refreshTemplatesHTTP)
+	r, driftH := router.Setup(hub, broadcaster, prov, platformURL, configsDir, templateCacheDir, hostStateDir, bootTokens, wh, greeter, channelMgr, memBundle, pluginRegistry, refreshTemplatesHTTP)
 
 	// Plugin drift sweeper — periodic detection of upstream plugin version drift
 	// (core#123). Scans workspace_plugins rows where tracked_ref != 'none',
@@ -721,6 +963,27 @@ func main() {
 	// Nil prov: Docker not available (test harness / local dev without Docker).
 	go supervised.RunWithRecover(ctx, "plugin-drift-sweeper", func(c context.Context) {
 		plugins.StartPluginDriftSweeper(c, pluginRegistry)
+	})
+
+	// Degraded plugin-install sweeper (core#4997). The degraded rule already
+	// existed and already fired -- GET /admin/plugin-install-reports?status=degraded
+	// names the affected workspace and the failing source exactly -- but nothing
+	// consumed it, so a customer's declared plugin failed to install on every
+	// boot for five days and was found only by accident. This publishes the
+	// count as molecule_plugin_install_degraded_workspaces so a dashboard can
+	// alert on it. Read-only: it counts rows and never touches a workspace.
+	go supervised.RunWithRecover(ctx, "degraded-plugin-sweeper", func(c context.Context) {
+		handlers.StartDegradedPluginSweeper(c, db.DB)
+	})
+
+	// Plugin drift APPLIER — the deterministic consumer of the queue the
+	// sweeper above fills (core#4977). Without it, drift is detected and
+	// enqueued but nothing ever applies it: the only previous consumer was the
+	// concierge's `plugin-auto-update` agent cron, which is absent entirely on
+	// a tenant whose schedules were never seeded. Convergence is a correctness
+	// property and must not depend on an LLM agent choosing to act.
+	go supervised.RunWithRecover(ctx, "plugin-drift-applier", func(c context.Context) {
+		handlers.StartPluginDriftApplier(c, driftH)
 	})
 
 	// HTTP server with graceful shutdown.
@@ -773,6 +1036,22 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// desktopEnvDuration parses an integer-seconds env var into a Duration, falling
+// back to def on missing/invalid/non-positive input (a typo'd knob should run
+// with a sane default, not crash startup or silently disable the reaper).
+func desktopEnvDuration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		log.Printf("Desktop: invalid %s=%q, using default %s", key, v, def)
+		return def
+	}
+	return time.Duration(n) * time.Second
 }
 
 // resolveBindHost picks the listener interface for the HTTP server.

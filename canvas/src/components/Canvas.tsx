@@ -385,7 +385,11 @@ function CanvasInner() {
           role="status"
           aria-live="polite"
           aria-atomic="true"
-          className="sr-only"
+          // pointer-events-none: this is a screen-reader-only status region; it
+          // must never intercept canvas pointer events. Without it, it was one
+          // of the fixed overlays that stole workspace-node clicks during canvas
+          // load (the E2E Chat node-click flake).
+          className="sr-only pointer-events-none"
         >
           {liveAnnouncement || (
             nodes.filter((n) => !n.parentId).length === 0

@@ -201,3 +201,116 @@ func TestObservedRuntime(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Gate 1.5 REQUIRE-LIVE posture (GUARD_B_REQUIRE_CALLABLE)
+// ---------------------------------------------------------------------------
+//
+// The k8s design doc discharges Gate 1.5 by an OPERATOR running Guard B by hand
+// against the controlplane-test CP, and its acceptance bar is "a fresh org
+// provisions onto k8s AND its concierge answers a real provision_workspace call
+// — NOT a PONG". Nothing on that hand path sets E2E_ASSERT_MGMT_MCP_CALLABLE
+// (only the staging-tenant-cd deploy job does), so before this guard the verdict
+// returned ok=true on the presence-only branch: a GREEN that never made the tool
+// call. These cases lock that hole shut and prove the guard is not inert.
+
+func TestEvaluateMgmtMCPCallable_RequireCallableRefusesPresenceOnly(t *testing.T) {
+	const defaultRuntime = "hermes"
+	tools := []string{requiredVerb()}
+
+	// The exact probe an operator would produce on the Gate-1.5 hand path with
+	// GUARD_B_REQUIRE_CALLABLE unset: a perfectly healthy fresh concierge that was
+	// never asked to run the tool. Every observation-based check passes.
+	presenceOnly := MgmtMCPProbe{
+		ExpectedRuntime:          defaultRuntime,
+		ObservedRuntime:          defaultRuntime,
+		Status:                   "online",
+		MCPServerPresent:         true,
+		MCPServerPresentReported: true,
+		LoadedTools:              tools,
+		RequiredTool:             requiredVerb(),
+		AssertCallable:           false,
+		WorkerProvisioned:        false,
+	}
+
+	// FAIL-BEFORE (the historical behaviour this guard changes): without the
+	// require-live posture the SAME probe is a green. Asserting it here documents
+	// that the new RED below is caused by RequireCallable and nothing else.
+	if ok, reason := EvaluateMgmtMCPCallable(presenceOnly); !ok {
+		t.Fatalf("baseline: presence-only probe should still be OK when RequireCallable is unset (got RED: %s)", reason)
+	} else if !strings.Contains(reason, "presence-only") {
+		t.Fatalf("baseline reason %q should name the presence-only posture", reason)
+	}
+
+	// RED: same probe, require-live armed.
+	req := presenceOnly
+	req.RequireCallable = true
+	ok, reason := EvaluateMgmtMCPCallable(req)
+	if ok {
+		t.Fatalf("RequireCallable=true with AssertCallable=false must be RED — a presence-only run cannot discharge Gate 1.5 (got GREEN: %s)", reason)
+	}
+	for _, want := range []string{"GUARD_B_REQUIRE_CALLABLE", "NOT a PONG", "misconfiguration"} {
+		if !strings.Contains(reason, want) {
+			t.Fatalf("RED reason must NAME the cause; %q missing from %q", want, reason)
+		}
+	}
+
+	// GREEN: require-live armed AND the real A2A turn genuinely created the
+	// workspace. This is the only shape that discharges Gate 1.5.
+	green := req
+	green.AssertCallable = true
+	green.WorkerProvisioned = true
+	ok, reason = EvaluateMgmtMCPCallable(green)
+	if !ok {
+		t.Fatalf("require-live + a genuine callable turn must be GREEN (got RED: %s)", reason)
+	}
+	if !strings.Contains(reason, "genuinely CALLABLE") {
+		t.Fatalf("GREEN reason %q must state the callable proof ran", reason)
+	}
+
+	// RED: require-live armed, the turn WAS armed, but the workspace never
+	// appeared — the present-but-not-runnable class. Must still name callability,
+	// not the require-live misconfiguration (check 0 must not shadow check 5).
+	notRunnable := green
+	notRunnable.WorkerProvisioned = false
+	ok, reason = EvaluateMgmtMCPCallable(notRunnable)
+	if ok {
+		t.Fatalf("armed callable turn that produced no workspace must be RED (got GREEN: %s)", reason)
+	}
+	if !strings.Contains(reason, "not genuinely CALLABLE") {
+		t.Fatalf("RED reason %q must name present-but-not-callable, not the require-live misconfiguration", reason)
+	}
+}
+
+// TestGuardBMode locks the posture resolution: GUARD_B_REQUIRE_CALLABLE IMPLIES
+// the callable turn, so an operator who sets the one Gate-1.5 variable cannot
+// then receive a presence-only green; and setting only the deploy gate's
+// existing variable is unchanged (add-only).
+func TestGuardBMode(t *testing.T) {
+	cases := []struct {
+		name                    string
+		assertVal, requireVal   string
+		wantAssert, wantRequire bool
+	}{
+		{"both_unset__historical_local_default", "", "", false, false},
+		{"deploy_gate_only__unchanged", "1", "", true, false},
+		{"require_live_implies_assert", "", "1", true, true},
+		{"both_set", "1", "1", true, true},
+		{"permissive_truthy", "yes", "on", true, true},
+		{"explicit_false_is_off", "0", "false", false, false},
+		{"whitespace_and_case", " TRUE ", " Yes ", true, true},
+		{"garbage_is_off", "maybe", "later", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, r := GuardBMode(tc.assertVal, tc.requireVal)
+			if a != tc.wantAssert || r != tc.wantRequire {
+				t.Fatalf("GuardBMode(%q,%q) = (assert=%v require=%v), want (assert=%v require=%v)",
+					tc.assertVal, tc.requireVal, a, r, tc.wantAssert, tc.wantRequire)
+			}
+			if r && !a {
+				t.Fatalf("invariant violated: requireCallable must imply assertCallable")
+			}
+		})
+	}
+}

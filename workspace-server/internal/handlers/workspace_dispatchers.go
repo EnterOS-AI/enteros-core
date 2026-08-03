@@ -38,6 +38,7 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
 )
 
@@ -51,6 +52,40 @@ import (
 // deployments where no backend is available.
 func (h *WorkspaceHandler) HasProvisioner() bool {
 	return h.cpProv != nil || h.provisioner != nil
+}
+
+// desktopProvisioner returns the wired desktop-sidecar backend, or the
+// availability-gate backend when none is wired — so an unwired deployment sees
+// the desktop feature as ABSENT (DesktopRunning -> false,nil), never broken
+// (design §5, decision 4). This is the desktop analog of HasProvisioner /
+// the …Auto dispatch pattern.
+func (h *WorkspaceHandler) desktopProvisioner() provisioner.SidecarProvisioner {
+	if h.sidecarProv != nil {
+		return h.sidecarProv
+	}
+	return provisioner.NewUnavailableSidecarProvisioner()
+}
+
+// StartDesktopAuto scales the workspace's desktop sidecar from zero (idempotent)
+// and returns its reachable handle, routed through the wired backend.
+func (h *WorkspaceHandler) StartDesktopAuto(ctx context.Context, workspaceID string) (provisioner.DesktopHandle, error) {
+	return h.desktopProvisioner().StartDesktop(ctx, provisioner.WorkspaceConfig{WorkspaceID: workspaceID})
+}
+
+// StopDesktopAuto gracefully tears the desktop sidecar down (profile preserved).
+func (h *WorkspaceHandler) StopDesktopAuto(ctx context.Context, workspaceID string) error {
+	return h.desktopProvisioner().StopDesktop(ctx, workspaceID)
+}
+
+// DesktopRunningAuto reports whether the desktop sidecar is up.
+func (h *WorkspaceHandler) DesktopRunningAuto(ctx context.Context, workspaceID string) (bool, error) {
+	return h.desktopProvisioner().DesktopRunning(ctx, workspaceID)
+}
+
+// WipeDesktopProfileAuto destroys the persistent profile volume (revoke/wipe),
+// and is part of the permanent-delete-with-erase path (design §11).
+func (h *WorkspaceHandler) WipeDesktopProfileAuto(ctx context.Context, workspaceID string) error {
+	return h.desktopProvisioner().WipeProfile(ctx, workspaceID)
 }
 
 // IsSaaS reports whether the control-plane provisioner is wired. Hosted
@@ -422,6 +457,28 @@ func (h *WorkspaceHandler) RestartWorkspaceAuto(ctx context.Context, workspaceID
 // flag to operators — it reads ?reset_session=true from the query
 // string when an operator wants to force a fresh session.
 func (h *WorkspaceHandler) RestartWorkspaceAutoOpts(ctx context.Context, workspaceID, templatePath string, configFiles map[string][]byte, payload models.CreateWorkspacePayload, resetClaudeSession bool) bool {
+	// core#5019 (structural half): PULL BEFORE STOPPING. This path is the manual
+	// POST /workspaces/:id/restart — it has its OWN stop leg and does not route
+	// through stopForRestart, so the guard is repeated here rather than
+	// inherited. Ask CP to make the pinned image obtainable first; a refusal
+	// means we keep the running container instead of trading it for an image
+	// that may never arrive.
+	//
+	// core#5025 finding 7: run it BEFORE taking the per-workspace gate below.
+	// The pre-flight is a QUESTION, not a mutation — it starts no container and
+	// stops none — and it is the one step here that can legitimately take
+	// minutes. Holding the gate across it made a slow or hung pull freeze every
+	// restart, heal and provision path for that workspace, so a registry stall
+	// presented as a dead workspace. Nothing is serialised by taking the gate
+	// later: the gate exists to keep two Stop+Start cycles from racing on the
+	// same ws-<id>, and neither has begun yet.
+	if h.cpProv != nil && !h.ensurePinnedImageBeforeStop(ctx, workspaceID, payload) {
+		log.Printf("RestartWorkspaceAuto: %s DECLINED — pinned image for runtime=%q template=%q could not be made available; the running container was left untouched (core#5019)",
+			workspaceID, payload.Runtime, payload.Template)
+		h.markRestartDeclined(ctx, workspaceID, payload.Name, payload.Runtime, payload.Template)
+		return false
+	}
+
 	// Per-workspace restart/provision GATE: serializes the Stop+Start
 	// cycle for this ws-<id> against any concurrent programmatic
 	// RestartByID path (runRestartCycle). Without this gate, the
@@ -444,6 +501,11 @@ func (h *WorkspaceHandler) RestartWorkspaceAutoOpts(ctx context.Context, workspa
 	// documented in docs/architecture/backends.md.
 	if h.cpProv != nil {
 		h.cpStopWithRetry(ctx, workspaceID, "RestartWorkspaceAuto")
+		// core#5025 finding 2: the url is dropped HERE — after the stop has
+		// actually been issued — not by the HTTP handler on the way in. A
+		// declined pre-flight returns above without reaching this line, so a
+		// workspace that kept its container keeps its address.
+		h.clearWorkspaceRouting(ctx, workspaceID)
 		// resetClaudeSession is Docker-only — CP has no session state to clear.
 		// h.goAsync (not raw `go`) so the goroutine is TRACKED on h.asyncWG
 		// (shutdown/leak management + tests can waitAsyncForTest). The
@@ -459,6 +521,7 @@ func (h *WorkspaceHandler) RestartWorkspaceAutoOpts(ctx context.Context, workspa
 	if h.provisioner != nil {
 		// Docker.Stop has no retry — see docstring rationale.
 		h.provisioner.Stop(ctx, workspaceID)
+		h.clearWorkspaceRouting(ctx, workspaceID)
 		// h.goAsync for the same reason as the cpProv branch above — the
 		// per-workspace gate is held for the entire cycle (Stop done
 		// synchronously, then async provision that releases on completion).

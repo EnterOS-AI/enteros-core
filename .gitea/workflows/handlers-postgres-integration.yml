@@ -294,12 +294,16 @@ jobs:
           # fail if any didn't land — that would be a real regression we
           # want loud.
           # workspace_schedules added for the #2149 scheduler integration tests.
+          # workspace_plugin_install_reports added for the plugin-install-report
+          # suite: without it a silently-skipped migration 20260730060000 would make
+          # those tests fail on a confusing scan error instead of saying the table is
+          # missing — and this loop exists precisely so a skipped migration is loud.
           # workspace_auth_tokens + org_api_tokens added for the #2156
           # registry-auth TestIntegration_ suite (#2148). Without this
           # guard, a silently-skipped migration 020 (workspace_auth_tokens)
           # or 035 (org_api_tokens) would let the auth tests run against
           # missing tables and falsely green.
-          for tbl in delegations workspaces activity_logs pending_uploads workspace_schedules workspace_auth_tokens org_api_tokens; do
+          for tbl in delegations workspaces activity_logs pending_uploads workspace_schedules workspace_auth_tokens org_api_tokens workspace_plugin_install_reports; do
             if ! psql -h "${PG_HOST}" -U postgres -d molecule -tA \
                 -c "SELECT 1 FROM information_schema.tables WHERE table_name = '$tbl'" \
                 | grep -q 1; then
@@ -352,6 +356,116 @@ jobs:
           fi
           if [ "${npass:-0}" -eq 0 ]; then
             echo "::error::Handlers integration gate ran ZERO tests (0 '--- PASS:' lines) but go test still exited 0. A gate that runs no tests must NEVER report success. Check the -run regex ^TestIntegration_, the integration build tag on workspace-server/internal/handlers/*_integration_test.go, and that the suite did not skip wholesale on a missing INTEGRATION_DB_URL."
+            exit 1
+          fi
+
+      - if: needs.detect-changes.outputs.handlers == 'true'
+        name: Run live-container tests (MOLECULE_LIVE_DOCKER)
+        env:
+          MOLECULE_LIVE_DOCKER: "1"
+          # Unique per run for the same reason PG_NAME is: this workflow's
+          # concurrency group is keyed on the head SHA, so two handlers-touching
+          # PRs share one Docker daemon and a fixed box name would let each
+          # `docker rm -f` the other's container mid-test.
+          MOLECULE_LIVE_BOX_SUFFIX: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -uo pipefail
+          # The TestLiveBox_* suite proves things NO unit test can reach: that a
+          # tar actually EXTRACTS where we think it does, and that a settings
+          # file lands in a running container. It exists because
+          # buildContainerFilesTar doubled destPath and every save silently
+          # wrote to /configs/configs/... while the API answered
+          # {"status":"saved"} — a bug whose unit test asserted the tar SHAPE
+          # and therefore pinned the bug as the contract.
+          #
+          # Those tests were gated on MOLECULE_LIVE_DOCKER=1 and NO WORKFLOW SET
+          # IT, so they ran once by hand and never again. That is the same
+          # "artifact real, wiring absent" class as the path-gated
+          # template-delivery lane and the plugin gate meta-ci reported as
+          # `planned` for its entire life. One-shot evidence is not coverage.
+          #
+          # Anti-vacuous guard, mirroring the integration step above but with an
+          # EXTRA arm: these tests SKIP rather than fail when the env var is
+          # unset or the daemon is unreachable, so `go test` exits 0 on exactly
+          # the input this step exists to catch. A SKIP here is a FAILURE.
+          LOG=$(mktemp)
+          rc=0
+          # 2m, not 10m. The observed step time is ~4s and startLiveBoxFor already
+          # caps container readiness at 20s, so 10m buys nothing on a healthy run —
+          # it only pushes 5m+10m+5m past this job's timeout-minutes: 15, making a
+          # JOB-level kill newly reachable. That is strictly worse than a go-level
+          # timeout: it skips the `if: always()` stop-Postgres step and leaks a
+          # pg-handlers-* container, which the sweeper's ^ws- filter does not collect.
+          go test -timeout 2m -v ./internal/handlers/ -run '^TestLiveBox_' 2>&1 | tee "$LOG" || rc=$?
+          # Anchored at column 0 ON PURPOSE: `go test -v` indents SUBTEST results
+          # ("    --- PASS: Parent/child"). With a leading [[:space:]]* class, one
+          # function with six t.Run()s scores npass=7 and hands the floor below a
+          # free pass. Only top-level results count.
+          npass=$(grep -c -E '^--- PASS: TestLiveBox_' "$LOG" || true)
+          nskip=$(grep -c -E '^[[:space:]]*--- SKIP: TestLiveBox_' "$LOG" || true)
+          declared=$(grep -c '^func TestLiveBox_' ./internal/handlers/plugin_settings_writer_live_test.go || true)
+          if [ "${declared:-0}" -eq 0 ]; then
+            echo "::error::found ZERO 'func TestLiveBox_' declarations in internal/handlers/plugin_settings_writer_live_test.go — the file moved or was renamed, so this arm cannot check anything. Point it at the new path; do NOT delete it."
+            exit 1
+          fi
+          echo "TestLiveBox_: ${npass} passed, ${nskip} skipped, ${declared} declared"
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+          if [ "${nskip:-0}" -ne 0 ]; then
+            echo "::error::live-container gate SKIPPED ${nskip} test(s). A skip here means MOLECULE_LIVE_DOCKER did not take effect or the Docker daemon was unreachable — which is indistinguishable from a pass in the job summary, and is precisely the failure this gate exists to close."
+            exit 1
+          fi
+          # `npass -gt 0` is NOT enough, and this is not hypothetical: two of the
+          # seven TestLiveBox_* (UnsafeInstallNameNeverReachesTheBox,
+          # LiveWriteMatchesProvisionRenderByteForByte) never call
+          # liveDockerOrSkip — they are pure unit tests that happen to share the
+          # prefix. Refactor the five container tests away and this step scores
+          # npass=2 nskip=0 rc=0 and reports GREEN having started no container at
+          # all. Reproduced by execution, not argued: that is the same
+          # "artifact real, wiring absent" shape the step was written to close,
+          # reappearing inside the guard itself.
+          #
+          # So require a FLOOR, and name the one test that must have run.
+          # LIVE_MIN is the count of ALL TestLiveBox_* (7), NOT the count of
+          # Docker-gated ones (5). npass counts every matching PASS line, and two
+          # of the seven are pure unit tests, so a floor of 5 leaves exactly two
+          # tests of slack: drop RealWriterLandsSettingsOnARunningWorkspace and
+          # DeliverReportsWhenTheReloadDidNotConfirm — the two that drive the ACTUAL
+          # entry point including backend dispatch, not just the copy primitive —
+          # and the step still scores 5 and reports GREEN. Measured population and
+          # threshold population must be the same one.
+          LIVE_MIN=7
+          # Second, independent arm: EVERY TestLiveBox_* declared in the file must
+          # have produced a top-level PASS. The floor alone couples this gate to a
+          # constant someone has to remember to bump — a reviewer pointed out that
+          # when core#4923 lands its two extra live tests, npass becomes 9 and a
+          # floor of 7 silently reacquires two tests of slack. Deriving the expected
+          # count from the source removes that coupling: adding tests needs no edit
+          # here, and a test that is declared but never runs (a -run typo, a build
+          # tag, a rename) is caught even though the floor is satisfied.
+          #
+          # The hardcoded floor stays BECAUSE it does the opposite job: `declared`
+          # falls with a deletion, so on its own it would bless shrinking the suite
+          # to nothing. Deletion must remain a conscious edit to LIVE_MIN.
+          if [ "${npass:-0}" -lt "$declared" ]; then
+            echo "::error::live-container gate: ${declared} TestLiveBox_* are declared in plugin_settings_writer_live_test.go but only ${npass} produced a top-level PASS. A declared test did not run — check the -run regex, a build tag, or a rename."
+            exit 1
+          fi
+          if [ "${npass:-0}" -gt "$declared" ]; then
+            echo "::error::live-container gate: ${npass} top-level TestLiveBox_ PASS lines but only ${declared} declared in plugin_settings_writer_live_test.go. A TestLiveBox_* was added in ANOTHER file in this package, so 'declared' no longer describes the suite this step measures — move it, or widen the grep to cover both files."
+            exit 1
+          fi
+          if [ "${npass:-0}" -lt "$LIVE_MIN" ]; then
+            echo "::error::live-container gate saw ${npass} top-level '--- PASS: TestLiveBox_' line(s), expected ${LIVE_MIN} (every TestLiveBox_* in plugin_settings_writer_live_test.go). A test was removed or renamed without updating LIVE_MIN, or the -run regex no longer matches the suite. Note two of them are pure unit tests, so a nonzero count alone does not prove a container ever started."
+            exit 1
+          fi
+          # The canary: the specific regression guard for the #4922 doubled-destPath
+          # bug, where every save silently wrote to /configs/configs/... while the
+          # API answered {"status":"saved"}. If THIS test stops running, the gate
+          # has lost the thing it was built for, whatever the counts say.
+          if ! grep -q -E '^--- PASS: TestLiveBox_FilesAPISaveActuallyLandsOnTheBox' "$LOG"; then
+            echo "::error::live-container gate did not run TestLiveBox_FilesAPISaveActuallyLandsOnTheBox — the #4922 regression guard. If it was deliberately renamed, update this check to the new name; do NOT delete the check."
             exit 1
           fi
 

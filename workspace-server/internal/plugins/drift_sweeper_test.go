@@ -160,6 +160,60 @@ func TestPluginUpdateQueueRow_Struct(t *testing.T) {
 	}
 }
 
+// TestDriftSpecForTrackedRef_UnwrapsRefPrefix: a "ref:<name>" tracked_ref is
+// our storage encoding for a bare/moving ref. The spec handed to the resolver
+// must carry the BARE name — "#main", never "#ref:main".
+//
+// WHY THIS MATTERS (core#4977): "ref:" rows are the ones the sweeper newly
+// sweeps. If the prefix leaked into the spec, every one of them would ask the
+// forge for a ref literally named "ref:main", fail to resolve, and be logged
+// and skipped — the sweeper would look busy while converging nothing. That
+// failure mode is indistinguishable from the original bug at the symptom
+// level, so it gets its own pin.
+//
+// NON-VACUITY: the tag:/sha: rows assert the pass-through legs, so a fix that
+// unwrapped everything (stripping "tag:" too) fails here.
+func TestDriftSpecForTrackedRef_UnwrapsRefPrefix(t *testing.T) {
+	schemes := []string{"github", "gitea", "local"}
+	cases := []struct {
+		sourceRaw  string
+		trackedRef string
+		want       string
+	}{
+		// The regression: ref: must be unwrapped to a bare fragment.
+		{"gitea://org/repo#main", "ref:main", "org/repo#main"},
+		{"gitea://org/repo#v0.2.1", "ref:v0.2.1", "org/repo#v0.2.1"},
+
+		// tracked_ref is authoritative over a stale fragment in source_raw.
+		{"gitea://org/repo#old-branch", "ref:main", "org/repo#main"},
+
+		// Pass-through legs — the resolvers parse these prefixes themselves.
+		{"github://org/repo#tag:v1.0", "tag:v1.0", "org/repo#tag:v1.0"},
+		{"github://org/repo#sha:abc123", "sha:abc123", "org/repo#sha:abc123"},
+
+		// Source with no fragment at all still gets the tracked ref appended.
+		{"gitea://org/repo", "ref:main", "org/repo#main"},
+
+		// The EXACT row observed on the reno-stars tenant that reported
+		// core#4977. Synthetic org/repo pairs cannot catch an owner-name or
+		// hyphen-handling regression, and this is the shape a customer is
+		// actually running — SSOT §5: assert the production ref shapes, never
+		// only the convenient ones.
+		{
+			"gitea://RenoStarsAI-production-client/reno-stars-coordinator#main",
+			"ref:main",
+			"RenoStarsAI-production-client/reno-stars-coordinator#main",
+		},
+	}
+	for _, tc := range cases {
+		got := driftSpecForTrackedRef(tc.sourceRaw, tc.trackedRef, schemes)
+		if got != tc.want {
+			t.Errorf("driftSpecForTrackedRef(%q, %q) = %q, want %q",
+				tc.sourceRaw, tc.trackedRef, got, tc.want)
+		}
+	}
+}
+
 // TestPluginResolverInterface_StubResolver verifies that a stub resolver
 // satisfies the PluginResolver interface (the sweeper-side abstraction
 // over *Registry — distinct from the per-scheme SourceResolver in source.go).

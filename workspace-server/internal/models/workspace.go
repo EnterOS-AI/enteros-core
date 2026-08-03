@@ -22,26 +22,26 @@ type Workspace struct {
 	// org-level concierge (the platform agent) that sits at the org root and is
 	// the user's default A2A target. See migration
 	// 20260606000000_workspaces_kind + RFC docs/design/rfc-platform-agent.md.
-	Kind               string          `json:"kind" db:"kind"`
-	SourceBundleID     sql.NullString  `json:"source_bundle_id" db:"source_bundle_id"`
-	AgentCard          json.RawMessage `json:"agent_card" db:"agent_card"`
-	URL                sql.NullString  `json:"url" db:"url"`
-	ParentID           *string         `json:"parent_id" db:"parent_id"`
-	ForwardedTo        *string         `json:"forwarded_to" db:"forwarded_to"`
-	LastHeartbeatAt    *time.Time      `json:"last_heartbeat_at" db:"last_heartbeat_at"`
-	LastErrorRate      float64         `json:"last_error_rate" db:"last_error_rate"`
-	LastSampleError    sql.NullString  `json:"last_sample_error" db:"last_sample_error"`
-	ActiveTasks        int             `json:"active_tasks" db:"active_tasks"`
+	Kind            string          `json:"kind" db:"kind"`
+	SourceBundleID  sql.NullString  `json:"source_bundle_id" db:"source_bundle_id"`
+	AgentCard       json.RawMessage `json:"agent_card" db:"agent_card"`
+	URL             sql.NullString  `json:"url" db:"url"`
+	ParentID        *string         `json:"parent_id" db:"parent_id"`
+	ForwardedTo     *string         `json:"forwarded_to" db:"forwarded_to"`
+	LastHeartbeatAt *time.Time      `json:"last_heartbeat_at" db:"last_heartbeat_at"`
+	LastErrorRate   float64         `json:"last_error_rate" db:"last_error_rate"`
+	LastSampleError sql.NullString  `json:"last_sample_error" db:"last_sample_error"`
+	ActiveTasks     int             `json:"active_tasks" db:"active_tasks"`
 	// IsBusy is the self-healing successor to ActiveTasks (RFC #4402): a boolean
 	// "is the agent in a turn right now" fed by the heartbeat. During the B1→B4
 	// migration it is written on every beat — either from the runtime's own
 	// is_busy (B2+) or derived from active_tasks>0 (older runtimes). Consumers
 	// cut over to it in B3.
-	IsBusy             bool            `json:"is_busy" db:"is_busy"`
-	MaxConcurrentTasks int             `json:"max_concurrent_tasks" db:"max_concurrent_tasks"`
-	UptimeSeconds      int             `json:"uptime_seconds" db:"uptime_seconds"`
-	CreatedAt          time.Time       `json:"created_at" db:"created_at"`
-	UpdatedAt          time.Time       `json:"updated_at" db:"updated_at"`
+	IsBusy             bool      `json:"is_busy" db:"is_busy"`
+	MaxConcurrentTasks int       `json:"max_concurrent_tasks" db:"max_concurrent_tasks"`
+	UptimeSeconds      int       `json:"uptime_seconds" db:"uptime_seconds"`
+	CreatedAt          time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at" db:"updated_at"`
 	// DeliveryMode: "push" (synchronous to URL — default) or "poll" (logged
 	// to activity_logs, agent reads via GET /activity?since_id=). See
 	// migration 045 + RFC #2339.
@@ -116,10 +116,10 @@ type RegisterPayload struct {
 }
 
 type HeartbeatPayload struct {
-	WorkspaceID   string  `json:"workspace_id" binding:"required"`
-	ErrorRate     float64 `json:"error_rate"`
-	SampleError   string  `json:"sample_error"`
-	ActiveTasks   int     `json:"active_tasks"`
+	WorkspaceID string  `json:"workspace_id" binding:"required"`
+	ErrorRate   float64 `json:"error_rate"`
+	SampleError string  `json:"sample_error"`
+	ActiveTasks int     `json:"active_tasks"`
 	// IsBusy is the runtime's authoritative turn-in-flight flag (RFC #4402 B2),
 	// the self-healing successor to active_tasks. A POINTER so the three states
 	// stay distinct: absent/nil (older image that doesn't send it → the handler
@@ -129,15 +129,29 @@ type HeartbeatPayload struct {
 	// (`is_busy,omitempty`), so an old runtime simply omits it. B1 captured the
 	// column by deriving in SQL with no new bind arg; B2 adds this parsed field
 	// + the bump that puts is_busy in molcontracts.HeartbeatRequest.
-	IsBusy        *bool   `json:"is_busy,omitempty"`
-	UptimeSeconds int     `json:"uptime_seconds"`
-	CurrentTask   string  `json:"current_task"`
+	IsBusy        *bool  `json:"is_busy,omitempty"`
+	UptimeSeconds int    `json:"uptime_seconds"`
+	CurrentTask   string `json:"current_task"`
 	// MonthlySpend is cumulative USD spend for the current calendar month,
 	// denominated in cents (e.g. 1500 = $15.00). Zero means "no update" —
 	// the heartbeat handler never writes zero to avoid accidentally clearing
 	// a previously-reported spend value. Any non-zero value is clamped to
 	// [0, maxMonthlySpend] before the DB write. (#615)
 	MonthlySpend int64 `json:"monthly_spend"`
+	// ObservedGeneration is the last desired-state wake-lifecycle generation the
+	// runtime has reconciled (k8s-style observedGeneration). POINTER for tri-state:
+	// absent/nil = a runtime predating the versioned-heartbeat contract → no
+	// convergence claim (treated as 0). The heartbeat handler compares it to the
+	// workspace's desired_generation to detect whether the runtime has applied the
+	// current wake-lifecycle intent (wiring is a follow-up; parsed here so the
+	// SDK contract and this producer struct stay in lockstep). Optional in the
+	// SDK workspace-comms contract (observed_generation,omitempty).
+	ObservedGeneration *int64 `json:"observed_generation,omitempty"`
+	// SchemaVersion is the heartbeat-envelope version the runtime speaks, so core
+	// can detect a runtime on an older/newer wire contract. Optional
+	// (schema_version,omitempty); absent from runtimes predating the
+	// versioned-heartbeat contract.
+	SchemaVersion *string `json:"schema_version,omitempty"`
 	// RuntimeState is a self-reported runtime health flag separate from
 	// "is the heartbeat task firing at all". The heartbeat task lives in
 	// its own asyncio task and keeps pinging even when the agent runtime
@@ -258,6 +272,14 @@ type WorkspaceComputeDisplay struct {
 	Width    int    `json:"width,omitempty"`
 	Height   int    `json:"height,omitempty"`
 	Protocol string `json:"protocol,omitempty"`
+	// IdleTimeoutSeconds is the scale-to-zero threshold for the desktop
+	// sidecar: after this many seconds with no agent control-server activity
+	// (and no human VNC input), the desktop is torn down while its profile
+	// volume persists. 0 = use the deployment default. Desired config, so it
+	// lives in the compute jsonb; the CHURNING runtime lifecycle state
+	// (running/stopped, last_agent_activity_at, lease) lives in a side table
+	// off the hot workspaces row. See the design RFC §10, §12.
+	IdleTimeoutSeconds int `json:"idle_timeout_seconds,omitempty"`
 }
 
 type WorkspaceCompute struct {

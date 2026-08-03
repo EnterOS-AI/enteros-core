@@ -1,0 +1,114 @@
+# Dockerfile.desktop-sidecar — the per-workspace desktop the agent drives.
+#
+# Design RFC: docs/superpowers/specs/2026-07-27-agent-desktop-sidecar-design.md.
+# This image is the "wsdesk-<id>" sibling container (design §7, co-located): a
+# fixed-resolution X display running a window manager + Chromium + x11vnc/noVNC,
+# plus the Go control server (the agent's hands/eyes) built from
+# cmd/desktop-control-server.
+#
+# SECURITY (decision 1 / §6, relaxed per §25.3): this image is launched by the
+# provisioner ONTO A DEDICATED PER-WORKSPACE INTERNAL NETWORK (never the flat
+# molecule-core-net) and reaches the internet ONLY through the per-workspace
+# egress proxy — that structural network isolation is the PRIMARY boundary and is
+# UNCHANGED in v3. It runs as a non-root user (USER desktop) but, because v3 is a
+# real self-installing computer, WITH passwordless sudo, Docker's DEFAULT cap set
+# (NOT --cap-drop ALL) and WITHOUT no-new-privileges — see the provisioner's
+# desktopSecurityOpt/hostCfg (§25.3). Chromium's own sandbox stays ON. The control
+# server authenticates every inbound request (§6.5).
+#
+# Chromium sandbox mechanism (VERIFIED 2026-07-27, Docker 29.5.3): the entrypoint
+# does NOT pass --no-sandbox, so Chromium uses its unprivileged USER-NAMESPACE
+# sandbox — which needs clone(CLONE_NEWUSER) + a chroot setup that the stock
+# Docker seccomp profile blocks. The provisioner therefore applies a
+# Chromium-tuned seccomp profile (internal/provisioner/seccomp/) that re-allows
+# exactly those syscalls WITHOUT granting CAP_SYS_ADMIN — this is the ONE
+# SecurityOpt still set on the v3 sidecar. See internal/provisioner/seccomp/README.md.
+#
+# Build context: repo root. Publishing goes through the workflow-owned registry
+# pusher, same as Dockerfile.tenant.
+#
+#   docker buildx build --platform linux/amd64 \
+#     -f workspace-server/Dockerfile.desktop-sidecar \
+#     -t registry.moleculesai.app/molecule-ai/molecule-desktop:<sha> --load .
+
+ARG BASE_IMAGE_REGISTRY=registry.moleculesai.app/molecule-ai
+
+# ── Stage 1: build the control-server binary ─────────────────────────────
+# Same digest-pinned golang base as Dockerfile.tenant (mirrored into our
+# registry; identical @sha256 resolves byte-for-byte).
+FROM ${BASE_IMAGE_REGISTRY}/golang:1.25-alpine@sha256:c4ea15b4a7912716eb362a022e2b12317762eca387423760bc59c0f9ae69423c AS control-builder
+WORKDIR /app
+COPY workspace-server/go.mod workspace-server/go.sum ./
+# Bounded retry (#4968) — mirror of Dockerfile.tenant's go-builder; see that
+# file for the full rationale. The `exit 1` keeps a genuinely-down proxy
+# FAILING the build.
+RUN for i in 1 2 3; do \
+        go mod download && break; \
+        if [ "$i" -ge 3 ]; then \
+            echo "go mod download: FAILED after 3 attempts" >&2; \
+            exit 1; \
+        fi; \
+        echo "go mod download: attempt $i failed, retrying in $((i * 5))s" >&2; \
+        sleep $((i * 5)); \
+    done
+COPY workspace-server/ .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" \
+    -o /desktop-control-server ./cmd/desktop-control-server
+# The egress proxy runs from this SAME image (the provisioner starts a proxy
+# container with the `desktop-egress-proxy` command) — no separate image / extra
+# supply-chain artifact. It is the sidecar's only route off its internal network
+# and denies private/link-local destinations, making isolation structural.
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" \
+    -o /desktop-egress-proxy ./cmd/desktop-egress-proxy
+
+# ── Stage 2: runtime desktop ─────────────────────────────────────────────
+# NOTE: bookworm-slim MUST be digest-pinned and mirrored into
+# registry.moleculesai.app before production, per the Dockerfile.tenant
+# supply-chain policy. Left un-pinned here deliberately — a fabricated digest
+# would be worse than an explicit TODO. Track in the image-build pipeline task.
+FROM debian:bookworm-slim
+
+# Full XFCE desktop (design §25 v3 — a real, stateful computer, not a kiosk
+# browser). Xvfb software framebuffer (a GPU variant swaps this for Xorg+driver,
+# §25.6), the XFCE session (panel, app menu, taskbar, settings), Thunar (files,
+# pulled by xfce4), xfce4-terminal, a text editor (mousepad), Chromium, the
+# direct-capture + input tools (scrot/xdotool), the human VNC path, and `sudo`
+# so the agent/user can `apt install` anything (persists on the container's
+# writable layer, §25.1). The lean base keeps the image ~1–1.5 GB; Blender/GIMP/
+# LibreOffice/etc. are install-on-demand.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    xvfb x11-utils chromium x11vnc websockify novnc \
+    xfce4 xfce4-terminal mousepad sudo \
+    scrot xdotool xclip ca-certificates fonts-liberation dbus-x11 tini \
+  && rm -rf /var/lib/apt/lists/*
+
+# Non-root desktop user with PASSWORDLESS sudo (§25.3) so the desktop can
+# self-install software. Isolation is UNCHANGED — the per-workspace internal
+# network + egress proxy (§6.1) still contain it; only its OWN rootfs is
+# writable, and that layer PERSISTS across scale-to-zero (§25.1). With daemon
+# userns-remap (§6.2) this uid does not collide across tenants.
+RUN useradd -m -u 1000 -s /bin/bash desktop \
+  && mkdir -p /home/desktop/profile \
+  && chown -R desktop:desktop /home/desktop \
+  && echo "desktop ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/desktop \
+  && chmod 0440 /etc/sudoers.d/desktop
+
+COPY --from=control-builder /desktop-control-server /usr/local/bin/desktop-control-server
+COPY --from=control-builder /desktop-egress-proxy /usr/local/bin/desktop-egress-proxy
+COPY workspace-server/scripts/desktop-sidecar-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Fixed geometry (§3) — the SAME numbers the provisioner passes to the tool
+# declaration and the control server enforces. DISPLAY is the single X display.
+ENV DESKTOP_WIDTH=1280 \
+    DESKTOP_HEIGHT=800 \
+    DISPLAY=:99
+
+# 6080 = noVNC (human view, proxied+token-gated by the platform);
+# 6070 = control server (agent, authed per-sidecar).
+EXPOSE 6080 6070
+
+USER desktop
+# tini reaps the Xvfb/openbox/chromium/x11vnc children so a graceful SIGTERM
+# (§10) tears the whole tree down cleanly and Chromium flushes its profile.
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

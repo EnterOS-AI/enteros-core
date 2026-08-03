@@ -105,13 +105,13 @@ func TestWorkspaceDisplayControlAcquire_ClaimsUnlockedDisplay(t *testing.T) {
 	}
 }
 
-func TestDisplaySessionToken_RequiresDedicatedSigningSecret(t *testing.T) {
+func TestDisplaySessionToken_DisabledWithoutSigningRoot(t *testing.T) {
 	t.Setenv("ADMIN_TOKEN", "client-exposed-admin-token")
-	t.Setenv("DISPLAY_SESSION_SIGNING_SECRET", "")
+	clearDesktopSigningSources(t)
 	expiresAt := time.Now().Add(5 * time.Minute)
 
 	if token := signDisplaySessionToken("ws-display", "admin-token", expiresAt); token != "" {
-		t.Fatalf("signDisplaySessionToken minted token with no dedicated signing secret: %q", token)
+		t.Fatalf("signDisplaySessionToken minted token with no signing root: %q", token)
 	}
 
 	payload := "ws-display|admin-token|" + strconv.FormatInt(expiresAt.Unix(), 10)
@@ -182,7 +182,7 @@ func TestWorkspaceDisplayControlAcquire_RejectsMissingSessionSigningSecret(t *te
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-display/display/control/acquire", bytes.NewBufferString(`{"controller":"user","ttl_seconds":300}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 	attachDisplayControlAdminToken(t, c)
-	t.Setenv("DISPLAY_SESSION_SIGNING_SECRET", "")
+	clearDesktopSigningSources(t)
 
 	handler.AcquireDisplayControl(c)
 

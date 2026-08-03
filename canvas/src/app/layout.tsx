@@ -60,7 +60,7 @@ import {
 // — Next.js merges page metadata over layout metadata using
 // `title.template` for "<page> | Enter OS" composition.
 const SITE_URL =
-  process.env.NEXT_PUBLIC_SITE_URL ?? "https://app.moleculesai.app";
+  process.env.NEXT_PUBLIC_SITE_URL ?? "https://app.enteros.ai";
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),

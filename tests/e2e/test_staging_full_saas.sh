@@ -79,6 +79,32 @@
 #                                evidence for this long. This must cover both
 #                                the idle threshold and the runtime's real A2A/
 #                                LLM completion latency; it is not a cadence.
+#   E2E_SCHEDULER_TIMEOUT_SECS   the scheduler fire BACKSTOP (10d.4), default
+#                                3x the delivery watchdog below. It is a
+#                                never-hit safety net, NOT the thing that
+#                                decides a broken scheduler: the wait passes the
+#                                instant fire evidence appears and fails FAST
+#                                when the daemon's last_tick goes stale. It must
+#                                stay LARGER than the watchdog, or the wait
+#                                expires while a wedged fire is still being
+#                                re-queued for retry.
+#   E2E_DELEG_A2A_TIMEOUT_SECS   per-attempt curl budget for the DELEGATION
+#                                A2A POST (section 10), default 90 — matching
+#                                a2a_send_or_poll_queue's budget for the PARENT
+#                                leg. `message/send` is SYNCHRONOUS, so that
+#                                POST waits out a full cold agent turn on a
+#                                just-created child workspace. It overrides
+#                                CURL_COMMON's generic --max-time 30, which is
+#                                not enough: cold-call latency routinely exceeds
+#                                30s on the first request after workspace boot,
+#                                and inheriting it took the REQUIRED ephemeral
+#                                lane red twice on 2026-07-30 with
+#                                curl_rc=28 / http=000.
+#   E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS
+#                                default 600, mirroring the daemon's own
+#                                MOLECULE_TRIGGER_DELIVERY_WATCHDOG_SECONDS.
+#                                Only used to derive the backstop above; set it
+#                                here if you set it on the workspace.
 #
 # Exit codes:
 #   0  happy path
@@ -150,6 +176,11 @@ source "$(dirname "$0")/lib/collision-proof-slug.sh"
 # shellcheck source=lib/idle_digest_wait.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/idle_digest_wait.sh"
+# Signal-driven waits for the kind:trigger scheduler daemon (fire evidence vs a
+# wedged tick loop vs a live-but-not-yet-fired daemon). Unit-tested offline by
+# lib/test_trigger_daemon_wait_unit.sh.
+# shellcheck source=lib/trigger_daemon_wait.sh
+source "$(dirname "$0")/lib/trigger_daemon_wait.sh"
 # shellcheck source=lib/self_schedule_create_retry.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/self_schedule_create_retry.sh"
@@ -933,23 +964,49 @@ print(json.dumps(s))
   log "    idle-digest check ON: MOLECULE_IDLE_FIRE_SECONDS=${E2E_IDLE_FIRE_SECONDS:-30} injected into workspace secrets"
 fi
 
-# Scheduler autonomous-fire sub-step (P5c): with E2E_SCHEDULER_CHECK=on, declare
-# the molecule-scheduler kind:trigger plugin so the workspace boot-installs it
-# (per-workspace delivery — the runtime arms the daemon when the plugin is
-# present), and shrink the poll so a `* * * * *` schedule fires within the run.
-# Additive NON-LLM env only — same platform-managed guard rationale as the idle
-# block above. The plugin source is the public repo, fetched anonymously at boot.
+# Scheduler autonomous-fire sub-step (P5c): with E2E_SCHEDULER_CHECK=on, shrink
+# the trigger poll so a `* * * * *` schedule fires within the run. Additive
+# NON-LLM env only — same platform-managed guard rationale as the idle block
+# above.
+#
+# This block deliberately carries NO plugin-source literal and does NOT declare
+# the scheduler. Two independent reasons, either one sufficient:
+#
+#   1. A literal here is a DUPLICATE of the SSOT. WHICH source the scheduler
+#      installs from is owned by the SDK native-plugins registry
+#      (contracts/plugin/native-plugins.registry.json), consumed by core as the
+#      generated Go binding molcontracts through
+#      workspace-server/internal/handlers/plugin_registry.go
+#      (mustNativePluginSource(SchedulerPluginName) → SchedulerPluginSource).
+#      Nothing kept a copy in this file in step with it: the literal that used to
+#      sit here was still pinned two minor versions behind the registry, and the
+#      drift was invisible precisely because the declaration was also inert (2).
+#   2. The declaration was INERT. Declaring through the `secrets` channel does not
+#      survive provisioning: buildProvisionerConfig recomputes
+#      MOLECULE_DECLARED_PLUGINS from the declared-set SSOT (workspace_provision.go
+#      desiredPluginSources → envVars["MOLECULE_DECLARED_PLUGINS"]) and OVERWRITES
+#      whatever loadWorkspaceSecrets had seeded into that same map. This is the
+#      documented contract on CreateWorkspacePayload.Plugins, and the reason the
+#      10e digest block moved to the durable payload.plugins channel.
+#
+# What actually installs the scheduler is CORE: workspace_provision_shared.go
+# calls ensureSchedulerPluginDeclared on EVERY provision (default-on kill-switch
+# MOLECULE_DECLARE_SCHEDULER_PLUGIN), resolving the source from that same
+# registry. So 10d/10f/10g now gate the PRODUCTION declare path rather than a
+# test-injected one — if that path regresses, this e2e goes red, which is the
+# whole point of the step. A test that injects the thing it is meant to prove
+# proves the mechanism, never the value production actually uses.
+#
+# Guarded by lib/test_scheduler_source_ssot_unit.sh, which fails RED if any
+# pinned scheduler plugin source is reintroduced into tests/e2e/**/*.sh.
 if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
   SECRETS_JSON=$(SECRETS_JSON_IN="$SECRETS_JSON" python3 -c "
 import json, os
 s = json.loads(os.environ['SECRETS_JSON_IN'])
-src = os.environ.get('E2E_SCHEDULER_PLUGIN_SOURCE', 'gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.1.0')
-existing = s.get('MOLECULE_DECLARED_PLUGINS', '').strip()
-s['MOLECULE_DECLARED_PLUGINS'] = (existing + ',' + src).strip(',') if existing else src
 s['MOLECULE_TRIGGER_POLL_SECONDS'] = os.environ.get('E2E_TRIGGER_POLL_SECONDS', '10')
 print(json.dumps(s))
 ")
-  log "    scheduler check ON: declared molecule-scheduler + MOLECULE_TRIGGER_POLL_SECONDS=${E2E_TRIGGER_POLL_SECONDS:-10}"
+  log "    scheduler check ON: MOLECULE_TRIGGER_POLL_SECONDS=${E2E_TRIGGER_POLL_SECONDS:-10} (the molecule-scheduler plugin itself is declared by core at provision from the SDK native-plugins registry — this harness carries no source literal)"
 fi
 
 # Self-schedule tool sub-step (10f): with E2E_SELF_SCHEDULE_CHECK=on, additively
@@ -2308,7 +2365,32 @@ except Exception:
     # workspace, not as the tenant admin. Must still send X-Molecule-Org-Id
     # or TenantGuard 404s — previously missing, caused section 10 to
     # fail rc=22 despite everything upstream being correct (2026-04-21).
-    DELEG_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$TENANT_URL/workspaces/$CHILD_ID/a2a" \
+    # Override CURL_COMMON's --max-time 30 for THIS call only, matching the
+    # budget a2a_send_or_poll_queue uses for the PARENT leg (--max-time 90).
+    #
+    # `message/send` is SYNCHRONOUS: the response carries the child's finished
+    # reply, which this step then reads as result.parts[0].text. So this POST
+    # waits out a full agent turn on a freshly-created CHILD workspace — cold
+    # adapter start, TLS to the LLM endpoint, first prompt, first token. The
+    # comment on the parent leg records why 30s cannot cover that: cold-call
+    # latency "routinely exceeds 30s on the first request after workspace boot",
+    # with observed P95 ~25-30s.
+    #
+    # This leg is raw curl (see below) because it authenticates as the PARENT
+    # workspace token rather than the tenant admin, and in being hand-rolled it
+    # silently inherited the generic 30s cap that the parent leg overrides. The
+    # result was a REQUIRED gate failing as
+    #   Delegation A2A POST failed after 1 attempt(s) (curl_rc=28, http=000)
+    # twice on 2026-07-30 (core#4961 08:59, core#4958 11:08) — curl_rc=28 is
+    # "operation timed out", http=000 means no response was ever received.
+    #
+    # Deliberately a TIMEOUT fix, not a retry: the retry loop below is scoped to
+    # cold-start HTTP statuses, and rc=28 is MAYBE-PROCESSED — the child may be
+    # mid-turn — so re-POSTing risks double-delivering the delegation. This is
+    # the same reasoning lib/workspace_create_retry.sh encodes as
+    # "curl timeout 28 → no retry" for the non-idempotent create.
+    DELEG_CODE=$(curl "${CURL_COMMON[@]}" --max-time "${E2E_DELEG_A2A_TIMEOUT_SECS:-90}" \
+      -X POST "$TENANT_URL/workspaces/$CHILD_ID/a2a" \
       -H "Authorization: Bearer $PARENT_WS_TOKEN" \
       -H "X-Molecule-Org-Id: $ORG_ID" \
       "${TENANT_ROUTE_HDRS[@]}" \
@@ -2849,7 +2931,10 @@ fi
 # on, its fail arms are REACHABLE (create-4xx and never-fired are distinct hard
 # failures, each with capability/grid/health diagnostics).
 if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
-  _SCHED_TIMEOUT_SECS="${E2E_SCHEDULER_TIMEOUT_SECS:-360}"
+  # NOTE: there is deliberately no fixed fire budget here any more. The fire
+  # wait (10d.4) is signal-driven and derives its never-hit backstop from the
+  # daemon's own delivery watchdog; E2E_SCHEDULER_TIMEOUT_SECS still overrides
+  # that backstop for callers who set it.
   _SCHED_POLL_SECS="${E2E_SCHEDULER_POLL_SECS:-10}"
   # Bounded pre/post-create waits that CLOSE the #4448 arm race instead of hiding
   # it behind a longer fire timeout. cap-ready gates the create on the trigger
@@ -2857,7 +2942,7 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
   # create through the capability-advertisement lag until the schedule is CONFIRMED
   # on the runtime volume grid — so a create that silently mis-routed to the
   # retired DB (native-scheduler not advertised in core yet) is retried into place
-  # rather than firing nowhere for ${_SCHED_TIMEOUT_SECS}s (armed:0).
+  # rather than firing nowhere for the whole fire wait (armed:0).
   _SCHED_CAP_TIMEOUT_SECS="${E2E_SCHEDULER_CAP_TIMEOUT_SECS:-120}"
   _SCHED_CREATE_TIMEOUT_SECS="${E2E_SCHEDULER_CREATE_TIMEOUT_SECS:-120}"
   # A run-unique name so the durable history/grid probe can't match a stale entry
@@ -2944,6 +3029,11 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
     # and lands. A volume-routed create writes the grid synchronously, so once
     # id==name we only poll for file visibility (never re-create → never 409).
     _SCHED_GRID_EVIDENCE=""
+    # The container whose volume grid carries OUR schedule. The fire wait judges
+    # daemon liveness on THIS daemon — a sibling's healthy heartbeat says nothing
+    # about the one that owns the fire (in the run that motivated this, the two
+    # idle siblings ticked normally while the owner was frozen).
+    _SCHED_TARGET_SC=""
     scheduler_grid_has_entry() {
       local _sc _grid
       _SCHED_GRID_EVIDENCE=""
@@ -2952,6 +3042,7 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
         _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null)
         if printf '%s' "$_grid" | grep -Fq "$_SCHED_NAME"; then
           _SCHED_GRID_EVIDENCE="$_sc (schedules.yaml)"
+          _SCHED_TARGET_SC="$_sc"
           return 0
         fi
       done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
@@ -3041,15 +3132,34 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
       return 1
     }
 
-    log "    Scheduler: polling fire evidence for up to ${_SCHED_TIMEOUT_SECS}s (poll=${_SCHED_POLL_SECS}s)."
-    if idle_digest_wait "$_SCHED_TIMEOUT_SECS" "$_SCHED_POLL_SECS" scheduler_fire_probe; then
-      ok "    scheduler autonomously FIRED '$_SCHED_NAME' (evidence: $_SCHED_FIRED)"
-    else
-      scheduler_diagnostics
-      fail "Scheduler never fired '$_SCHED_NAME' within ${_SCHED_TIMEOUT_SECS}s — the grid/health/history diagnostics above name the broken leg: ABSENT grid = create didn't reach the volume (capability not advertised); ABSENT health = daemon not armed (plugin didn't boot-install); grid+health present but no history = daemon armed but the trigger lane never delivered (self-scheduler turn path)."
-    fi
+    # ── 10d.4 Fire wait — driven by the daemon's liveness signal ─────────────
+    # lib/trigger_daemon_wait.sh owns the policy (see its header for WHY a fixed
+    # budget was wrong here). Outcomes: 0 evidence, 2 the daemon stopped ticking
+    # while our schedule is armed (fail fast — more time cannot help), 1 the
+    # backstop elapsed while the daemon kept ticking (a different defect, so a
+    # different message). The backstop derives from the daemon's own delivery
+    # watchdog so it can never again be SHORTER than the thing it waits on.
+    _SCHED_STALE_SECS=$(trigger_daemon_stale_secs "$_SCHED_POLL_SECS")
+    _SCHED_BACKSTOP_SECS="${E2E_SCHEDULER_TIMEOUT_SECS:-$(TRIGGER_DAEMON_WATCHDOG_SECS="${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-600}" trigger_daemon_backstop_secs)}"
 
-    unset -f scheduler_capability_ready scheduler_create_once scheduler_grid_has_entry scheduler_fire_probe scheduler_diagnostics
+    log "    Scheduler: waiting for '$_SCHED_NAME' to fire — pass on fire evidence, FAIL FAST if ${_SCHED_TARGET_SC}'s last_tick goes stale (>${_SCHED_STALE_SECS}s), backstop ${_SCHED_BACKSTOP_SECS}s (poll=${_SCHED_POLL_SECS}s)."
+    _sched_rc=0
+    trigger_daemon_wait "$_SCHED_TARGET_SC" "$_SCHED_BACKSTOP_SECS" "$_SCHED_POLL_SECS"       "$_SCHED_STALE_SECS" scheduler_fire_probe || _sched_rc=$?
+    case "$_sched_rc" in
+      0)
+        ok "    scheduler autonomously FIRED '$_SCHED_NAME' (evidence: $_SCHED_FIRED)"
+        ;;
+      2)
+        scheduler_diagnostics
+        fail "Scheduler: the trigger daemon STOPPED TICKING. $_SCHED_TARGET_SC last wrote schedule-health.json ${TRIGGER_DAEMON_LAST_AGE}s ago (> ${_SCHED_STALE_SECS}s) while '$_SCHED_NAME' is armed on its own volume grid. A daemon at or after molecule-scheduler v0.2.1 / SDK 0.5.6 advances last_tick every poll even mid-delivery, so a frozen heartbeat is not slowness — the tick loop is wedged (alive-but-hung: the supervisor sees a live process and never restarts it, and health keeps reporting armed:N/errors:{}). Waiting longer cannot fix this. Check the workspace runs a daemon at that version or newer; an older one delivers INSIDE the tick and freezes exactly this way."
+        ;;
+      *)
+        scheduler_diagnostics
+        fail "Scheduler: '$_SCHED_NAME' never fired within the ${_SCHED_BACKSTOP_SECS}s backstop, yet the daemon kept ticking the whole time (last_tick age ${TRIGGER_DAEMON_LAST_AGE:-unknown}s) — so this is NOT the frozen-tick failure. The grid/health/history diagnostics above name the leg: grid+health present but no history = the daemon is armed and alive but the delivery lane never completed a self-scheduler turn."
+        ;;
+    esac
+
+    unset -f scheduler_capability_ready scheduler_create_once scheduler_grid_has_entry scheduler_fire_probe scheduler_tick_age_secs scheduler_diagnostics
   else
     fail "E2E_SCHEDULER_CHECK=on requires a usable Docker CLI and daemon to inspect fire evidence."
   fi
@@ -3129,7 +3239,10 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ] && [ "${E2E_SCHEDULE_DELIVER_CHECK:-on}
     # AgentMessageWriter; a distinct token so a stale row on a recycled container
     # cannot false-pass and the fire alone cannot produce it.
     _DLV_MARKER="E2E-SMTU-DELIVER-${E2E_RUN_ID:-local}"
-    _DLV_FIRE_TIMEOUT_SECS="${E2E_SCHEDULE_DELIVER_FIRE_TIMEOUT_SECS:-${E2E_SCHEDULER_TIMEOUT_SECS:-360}}"
+    # Backstop, not a budget: it must exceed the daemon's delivery watchdog for
+    # the same reason 10d's does (a 360s cap could expire while a wedged fire was
+    # still being re-queued for retry, so it could never observe the recovery).
+    _DLV_FIRE_TIMEOUT_SECS="${E2E_SCHEDULE_DELIVER_FIRE_TIMEOUT_SECS:-${E2E_SCHEDULER_TIMEOUT_SECS:-$(TRIGGER_DAEMON_WATCHDOG_SECS="${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-600}" trigger_daemon_backstop_secs)}}"
     # DELIVER window spans MULTIPLE fires: a `* * * * *` schedule re-fires every
     # minute and each fire is an INDEPENDENT chance for the model to invoke the
     # tool. Polling across ≥3 fire cycles absorbs the occasional turn where a
@@ -3183,10 +3296,21 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ] && [ "${E2E_SCHEDULE_DELIVER_CHECK:-on}
       done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
       return 1
     }
-    log "10g/11 Scheduler DELIVER: created '$_DLV_NAME' (http=$_DLV_CODE); verifying it reached the volume grid (up to ${_DLV_FIRE_TIMEOUT_SECS}s; poll=${_DLV_POLL_SECS}s)."
-    if ! idle_digest_wait "$_DLV_FIRE_TIMEOUT_SECS" "$_DLV_POLL_SECS" deliver_grid_has; then
+    # This wait stays on plain idle_digest_wait — NOT trigger_daemon_wait — and
+    # on a SHORT derived budget rather than the fire backstop it used to reuse.
+    # It is about CORE ROUTING, not daemon liveness: the grid is written by core's
+    # synchronous create forward, the daemon only reads it, and the owning
+    # container (the argument trigger_daemon_wait requires) is the OUTPUT of this
+    # probe, not an input. The 201 above is the routing signal and it has already
+    # arrived — the runtime persists the entry before core relays 201 — so this
+    # only absorbs our own `docker ps` + `docker exec` observation latency. See the
+    # "grid-landing wait" block in lib/trigger_daemon_wait.sh for the full
+    # rationale and lib/test_trigger_daemon_wait_unit.sh for the bounds.
+    _DLV_GRID_CONFIRM_SECS=$(schedule_grid_confirm_secs "$_DLV_POLL_SECS")
+    log "10g/11 Scheduler DELIVER: created '$_DLV_NAME' (http=$_DLV_CODE); confirming it reached the volume grid (up to ${_DLV_GRID_CONFIRM_SECS}s; poll=${_DLV_POLL_SECS}s)."
+    if ! idle_digest_wait "$_DLV_GRID_CONFIRM_SECS" "$_DLV_POLL_SECS" deliver_grid_has; then
       scheduler_deliver_diagnostics
-      fail "10g DELIVER: schedule '$_DLV_NAME' never reached the volume grid within ${_DLV_FIRE_TIMEOUT_SECS}s — the create 2xx'd but did not land on the daemon's grid (routing regression specific to the DELIVER schedule; 10d's identical create DID land)."
+      fail "10g DELIVER: schedule '$_DLV_NAME' never reached the volume grid within ${_DLV_GRID_CONFIRM_SECS}s — core relayed http=$_DLV_CODE, which it does ONLY after the runtime persisted the entry, so the grid should have been on disk before the first probe. Core's ack and the volume therefore disagree: the create routed to a different workspace than the one whose containers we can see, or the runtime acked without writing. Deterministic — a longer wait cannot fix it (10d's identical create DID land)."
     fi
     ok "    DELIVER schedule '$_DLV_NAME' on the volume grid (evidence: $_DLV_GRID_EVIDENCE)"
 
@@ -3204,10 +3328,19 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ] && [ "${E2E_SCHEDULE_DELIVER_CHECK:-on}
       done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
       return 1
     }
-    log "    DELIVER: polling FIRE evidence for '$_DLV_NAME' (up to ${_DLV_FIRE_TIMEOUT_SECS}s; poll=${_DLV_POLL_SECS}s)."
-    if ! idle_digest_wait "$_DLV_FIRE_TIMEOUT_SECS" "$_DLV_POLL_SECS" deliver_fire_probe; then
+    # Same signal-driven policy as 10d: this is the SAME daemon and the same
+    # failure mode, so it must not go back to guessing after a fixed budget.
+    # _DLV_GRID_EVIDENCE is the container whose grid carries THIS schedule.
+    _DLV_STALE_SECS=$(trigger_daemon_stale_secs "$_DLV_POLL_SECS")
+    log "    DELIVER: waiting for FIRE evidence for '$_DLV_NAME' — FAIL FAST if ${_DLV_GRID_EVIDENCE}'s last_tick goes stale (>${_DLV_STALE_SECS}s), backstop ${_DLV_FIRE_TIMEOUT_SECS}s (poll=${_DLV_POLL_SECS}s)."
+    _dlv_rc=0
+    trigger_daemon_wait "$_DLV_GRID_EVIDENCE" "$_DLV_FIRE_TIMEOUT_SECS" "$_DLV_POLL_SECS"       "$_DLV_STALE_SECS" deliver_fire_probe || _dlv_rc=$?
+    if [ "$_dlv_rc" = "2" ]; then
       scheduler_deliver_diagnostics
-      fail "10g DELIVER: schedule '$_DLV_NAME' reached the grid but the daemon never FIRED it within ${_DLV_FIRE_TIMEOUT_SECS}s (grid present, no history) — a FIRE-path failure surfaced on the DELIVER schedule; see 10d for the shared mechanism."
+      fail "10g DELIVER: the trigger daemon STOPPED TICKING — $_DLV_GRID_EVIDENCE last wrote schedule-health.json ${TRIGGER_DAEMON_LAST_AGE}s ago (> ${_DLV_STALE_SECS}s) with '$_DLV_NAME' armed on its grid. Same wedged-tick signature as 10d (see that step's message); more time cannot help."
+    elif [ "$_dlv_rc" != "0" ]; then
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: schedule '$_DLV_NAME' reached the grid but the daemon never FIRED it within the ${_DLV_FIRE_TIMEOUT_SECS}s backstop, while still ticking (last_tick age ${TRIGGER_DAEMON_LAST_AGE:-unknown}s) — grid present, no history: a FIRE-path failure surfaced on the DELIVER schedule; see 10d for the shared mechanism."
     fi
     ok "    DELIVER schedule FIRED (evidence: $_DLV_FIRED) — turn self-scheduled; now asserting it DELIVERED"
 
@@ -3250,8 +3383,19 @@ sys.exit(1)
       [ "$_rc" = "0" ] && _DLV_DELIVERED="activity a2a_receive/notify row carries '$_DLV_MARKER'"
       return "$_rc"
     }
-    log "    DELIVER: polling delivery ground-truth (activity a2a_receive/notify row with marker '$_DLV_MARKER') for up to ${_DLV_DELIVER_TIMEOUT_SECS}s across ~$(( _DLV_DELIVER_TIMEOUT_SECS / 60 )) fire cycles (poll=${_DLV_POLL_SECS}s)."
-    if idle_digest_wait "$_DLV_DELIVER_TIMEOUT_SECS" "$_DLV_POLL_SECS" deliver_probe; then
+    # This budget stays a real, reasoned window (multiple fire cycles absorb a
+    # nondeterministic model that acks in text without calling the tool) — it is
+    # NOT a blind guess like the fire waits were. But a wedged daemon must still
+    # fail fast rather than burn the whole window: no further fire can occur, so
+    # no further chance at the tool call exists.
+    log "    DELIVER: polling delivery ground-truth (activity a2a_receive/notify row with marker '$_DLV_MARKER') for up to ${_DLV_DELIVER_TIMEOUT_SECS}s across ~$(( _DLV_DELIVER_TIMEOUT_SECS / 60 )) fire cycles (poll=${_DLV_POLL_SECS}s; FAIL FAST if the daemon stops ticking)."
+    _dlv_deliver_rc=0
+    trigger_daemon_wait "$_DLV_GRID_EVIDENCE" "$_DLV_DELIVER_TIMEOUT_SECS" "$_DLV_POLL_SECS"       "$_DLV_STALE_SECS" deliver_probe || _dlv_deliver_rc=$?
+    if [ "$_dlv_deliver_rc" = "2" ]; then
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: the trigger daemon STOPPED TICKING mid-window — $_DLV_GRID_EVIDENCE last wrote schedule-health.json ${TRIGGER_DAEMON_LAST_AGE}s ago (> ${_DLV_STALE_SECS}s). No further fire can occur, so no further chance at the send_message_to_user call; the remaining window would have been dead time."
+    fi
+    if [ "$_dlv_deliver_rc" = "0" ]; then
       ok "    scheduler fired turn DELIVERED to the user via send_message_to_user (evidence: $_DLV_DELIVERED) — #4555 fire→deliver proven live on this real-LLM arm"
     else
       scheduler_deliver_diagnostics

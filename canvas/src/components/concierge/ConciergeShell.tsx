@@ -22,8 +22,9 @@ import { RequestsInbox } from "./RequestsInbox";
 import { MonitorPanel } from "@/components/monitor/MonitorPanel";
 import {
   IcHome, IcOrgMap, IcSettings, IcSearch, IcBell, IcSun, IcMoon, IcChevDown,
-  IcQueue, IcCaret, IcMolecule, IcCheck, IcChat,
+  IcQueue, IcCaret, IcMolecule, IcCheck, IcChat, IcLogs,
 } from "./icons";
+import { DOZZLE_URL } from "@/lib/dozzle";
 
 /* ── status → concept palette ─────────────────────────────────────────── */
 function statusInfo(status: string): { color: string; label: string } {
@@ -346,7 +347,18 @@ export function ConciergeShell() {
     platformRoot &&
     platformRoot.data.status === WORKSPACE_STATUS.Provisioning
   ) {
-    return <BootSequenceScreen node={platformRoot} />;
+    // Full-viewport wrapper: BootSequenceScreen sizes itself with `h-full`,
+    // which resolves to CONTENT height unless an ancestor has a resolved
+    // height. This shell renders straight into the page body (page.tsx), so
+    // without this the boot screen painted as a short top-anchored block with
+    // a dead black band under it instead of the fullscreen boot the design
+    // calls for. Same `fixed inset-0` treatment the pre-gate hold below and
+    // the SelfHostSetupScene mount already use.
+    return (
+      <div className="fixed inset-0" data-testid="concierge-boot-screen">
+        <BootSequenceScreen node={platformRoot} />
+      </div>
+    );
   }
 
   // Pre-gate hold: on a fresh self-host load the always-seeded platform root
@@ -401,6 +413,19 @@ export function ConciergeShell() {
             <span className={s.ico}><IcQueue /></span><span className={s.lbl}>Monitor</span>
           </button>
           <div className={s.spacer} />
+          {/* Dev-only escape hatch to raw container logs (Dozzle). External
+              link, not a TopView — it opens in a new tab rather than taking
+              over the rail's own view state. */}
+          <a
+            data-testid="nav-logs"
+            className={s.navbtn}
+            title="Logs — open Dozzle in a new tab"
+            href={DOZZLE_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <span className={s.ico}><IcLogs /></span><span className={s.lbl}>Logs</span>
+          </a>
           <button data-testid="nav-settings" className={`${s.navbtn} ${topView === "settings" ? s.active : ""}`} title="Settings" onClick={() => nav("settings")}>
             <span className={s.ico}><IcSettings /></span><span className={s.lbl}>Settings</span>
           </button>
