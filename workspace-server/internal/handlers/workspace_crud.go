@@ -785,6 +785,31 @@ func destructiveDeleteCounts(ctx context.Context, id string) (childCount int) {
 	return childCount
 }
 
+// clearWorkspaceInstanceIDAfterStop NULLs a workspace's instance_id once its
+// compute is confirmed stopped, so a cleanly-deleted workspace never enters the
+// CP orphan sweeper's queue in the first place.
+//
+// The statement intentionally mirrors the sweeper's own clearing UPDATE in
+// internal/registry/cp_orphan_sweeper.go — the sweeper's SELECT predicate and
+// both writers of this field must stay in sync. The sweeper remains the
+// backstop for the case this cannot cover: a stop that FAILED, whose row keeps
+// instance_id populated on purpose.
+//
+// Best-effort by contract. Teardown has already succeeded by the time we get
+// here, so a DB error must not fail the delete; it is logged and left to the
+// sweeper. Defensive against a nil global handle, matching cpSweepOnce.
+func (h *WorkspaceHandler) clearWorkspaceInstanceIDAfterStop(ctx context.Context, wsID string) {
+	if db.DB == nil {
+		return
+	}
+	if _, err := db.DB.ExecContext(ctx,
+		`UPDATE workspaces SET instance_id = NULL, updated_at = now() WHERE id = $1`,
+		wsID,
+	); err != nil {
+		log.Printf("CascadeDelete %s clear instance_id failed: %v — leaving row for orphan sweeper", wsID, err)
+	}
+}
+
 // CascadeDelete performs the cascade-removal sequence used by the HTTP
 // DELETE handler and by OrgImport's reconcile mode: walk descendants, mark
 // self+descendants 'removed' first (#73 race guard), stop containers / EC2s,
@@ -894,6 +919,20 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 			stopErrs = append(stopErrs, fmt.Errorf("stop %s: %w", wsID, err))
 			return
 		}
+		// Compute is confirmed stopped, so no live instance is attached any
+		// more — clear instance_id. Without this, a fully successful delete
+		// still left the row matching the CP orphan sweeper's queue predicate
+		// (status='removed' AND instance_id IS NOT NULL), so every deleted
+		// workspace entered the sweeper and needed a second, redundant CP
+		// round-trip to leave it again. When that round-trip returned non-2xx
+		// the row never left, and the sweeper retried it every 60s forever
+		// (prod, 2026-07-30 → 2026-08-03: four reno-stars workspaces).
+		//
+		// NOTE the ordering: this runs ONLY after a successful stop. The
+		// failure branch above deliberately returns with instance_id intact —
+		// that is the durable "possible leak, go re-drive it" signal the
+		// sweeper exists to consume, and it must stay.
+		h.clearWorkspaceInstanceIDAfterStop(cleanupCtx, wsID)
 		if h.provisioner != nil {
 			if err := h.provisioner.RemoveVolume(cleanupCtx, wsID); err != nil {
 				log.Printf("CascadeDelete %s volume removal warning: %v", wsID, err)
