@@ -90,6 +90,24 @@ jobs:
       # hostnames (ws-<id>:8000). Force false so the proxy keeps using the
       # host-mapped 127.0.0.1:<ephemeral_port> URL, which IS reachable.
       MOLECULE_IN_DOCKER: false
+      # core#5031: this job tags a STUB over
+      # molecule-local/workspace-template-claude-code:<template-HEAD-sha>-<arch>
+      # (+ :latest) — a name derived entirely from the world, so every process on
+      # this shared docker.sock computes it identically. The self-host schedules
+      # e2e does the same, and on core#5030 its cleanup restored the name while
+      # THIS job was still using it: the required lifecycle gate failed asserting
+      # on LLM credentials, which is nowhere near the cause.
+      #
+      # This token gives the job a PRIVATE tag namespace. JOB level, not step
+      # level: the platform-server started below RESOLVES the tag
+      # (provisioner/local_image_isolation.go) and the e2e script WRITES it, so
+      # both halves must read one variable or they drift.
+      #
+      # Only the STUB jobs get a token. lifecycle-real builds the genuine
+      # template for the same sha, so it writes content-identical bytes under the
+      # shared name — isolating it would force a cold 2.5GB rebuild every run to
+      # fix a race that job does not have.
+      MOLECULE_LOCAL_IMAGE_ISOLATION: e2e-${{ github.run_id }}-${{ github.run_attempt }}-lifestub
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5

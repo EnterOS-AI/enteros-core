@@ -92,6 +92,43 @@ RUNTIME="claude-code"
 # unreachable. This keeps the test correct without an annual sha bump.
 CACHE_REPO="molecule-local/workspace-template-${RUNTIME}"
 GITEA_BRANCH_API="${GITEA_BRANCH_API:-https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-ai-workspace-template-${RUNTIME}/branches/main}"
+
+# ---- core#5031: private tag namespace --------------------------------------
+# Every component of the cache tag above (runtime, template HEAD sha, arch) is
+# derived from the WORLD, so two concurrent jobs on one Docker daemon compute
+# the SAME name. That is fine for the provisioner, which writes the genuine
+# template there; it is NOT fine for this script, which writes a STUB. On
+# core#5030 the schedules e2e restored the tag to the real image while this
+# script was still using it, and the required lifecycle gate failed with
+# "Invalid API key" — an assertion that points at secrets, not at CI.
+#
+# MOLECULE_LOCAL_IMAGE_ISOLATION is the SINGLE source for the private suffix:
+# provisioner/local_image_isolation.go appends the same `--<token>` to both the
+# sha-pinned tag and `:latest`, so the platform we start resolves exactly what
+# we tag and no other job can name it. Unset (local dev) everything below is
+# byte-identical to before.
+LOCAL_IMAGE_ISOLATION="${MOLECULE_LOCAL_IMAGE_ISOLATION:-}"
+ISOLATION_SUFFIX=""
+if [ -n "$LOCAL_IMAGE_ISOLATION" ]; then
+  # Same rule as LocalImageIsolation() in Go. Fail CLOSED: a token the platform
+  # will reject must not silently degrade this script back onto the shared tag,
+  # because then the run believes it is isolated and is not.
+  case "$LOCAL_IMAGE_ISOLATION" in
+    [a-z0-9]*[!a-z0-9._-]*|[!a-z0-9]*)
+      echo "ERROR: MOLECULE_LOCAL_IMAGE_ISOLATION=$LOCAL_IMAGE_ISOLATION is not usable in a Docker tag" >&2
+      echo "       (must start with [a-z0-9]; only lower-case letters, digits, '.', '_', '-')" >&2
+      exit 2
+      ;;
+  esac
+  if [ "${#LOCAL_IMAGE_ISOLATION}" -gt 48 ]; then
+    echo "ERROR: MOLECULE_LOCAL_IMAGE_ISOLATION is ${#LOCAL_IMAGE_ISOLATION} chars; max 48" >&2
+    exit 2
+  fi
+  ISOLATION_SUFFIX="--${LOCAL_IMAGE_ISOLATION}"
+fi
+# The intermediate build tag is a third shared name — both e2e scripts build to
+# `molecule-local/stub-runtime:latest`. Isolate it too.
+STUB_IMAGE="molecule-local/stub-runtime:latest${ISOLATION_SUFFIX}"
 # Model + credential choice — three coupled constraints from workspace-server:
 #   * Create rejects a model NOT registered for the runtime
 #     (UNREGISTERED_MODEL_FOR_RUNTIME, provider-registry SSOT).
@@ -109,7 +146,7 @@ GITEA_BRANCH_API="${GITEA_BRANCH_API:-https://git.moleculesai.app/api/v1/repos/m
 LIFECYCLE_MODEL="${LIFECYCLE_MODEL:-claude-opus-4-7}"
 LIFECYCLE_LLM_KEY="${LIFECYCLE_LLM_KEY:-ANTHROPIC_API_KEY}"
 LIFECYCLE_LLM_VALUE="${LIFECYCLE_LLM_VALUE:-sk-ant-e2e-stub-dummy-not-a-real-key}"
-LATEST_TAG="${CACHE_REPO}:latest"
+LATEST_TAG="${CACHE_REPO}:latest${ISOLATION_SUFFIX}"
 
 # ---- LIFECYCLE_LLM: real-LLM round-trip mode -------------------------------
 # Default "" = the existing behaviour (stub or LLM-less real image).
@@ -288,9 +325,20 @@ cleanup() {
       "$(workspace_volume_name "$WSID")" >/dev/null 2>&1 || true
     echo "cleaned workspace $WSID + $(container_name "$WSID") container/volumes"
   fi
-  # Restore the cache tag to whatever it pointed at before we retagged it, so a
-  # stub run doesn't leave the real claude-code tag aliased to the stub.
-  if [ -n "$ORIG_CACHE_IMAGE_ID" ]; then
+  if [ -n "$ISOLATION_SUFFIX" ]; then
+    # core#5031: the tags are OURS. Nothing to restore — there is no previous
+    # image behind a name only this run ever wrote — so drop them instead.
+    # Deleting is what makes the isolation safe to repeat: an untagged private
+    # name cannot accumulate on the shared daemon, and `docker rmi` of a tag
+    # that another run never resolves cannot interfere with it.
+    for t in "$CACHE_TAG" "$LATEST_TAG" "$STUB_IMAGE"; do
+      [ -n "$t" ] && docker rmi "$t" >/dev/null 2>&1 || true
+    done
+    echo "dropped our private image tags (isolation=$LOCAL_IMAGE_ISOLATION)"
+  elif [ -n "$ORIG_CACHE_IMAGE_ID" ]; then
+    # No isolation (local developer run): restore the cache tag to whatever it
+    # pointed at before we retagged it, so a stub run doesn't leave the real
+    # claude-code tag aliased to the stub.
     docker tag "$ORIG_CACHE_IMAGE_ID" "$CACHE_TAG" >/dev/null 2>&1 || true
     echo "restored $CACHE_TAG -> ${ORIG_CACHE_IMAGE_ID:0:19}"
   fi
@@ -343,8 +391,12 @@ except Exception:
   else
     CACHE_ARCH_SUFFIX="$(go env GOARCH)"
   fi
-  CACHE_TAG="${CACHE_REPO}:${CACHE_SHA}-${CACHE_ARCH_SUFFIX}"
+  CACHE_TAG="${CACHE_REPO}:${CACHE_SHA}-${CACHE_ARCH_SUFFIX}${ISOLATION_SUFFIX}"
   echo "Resolved provisioner cache tag: $CACHE_TAG (gitea HEAD sha)"
+fi
+if [ -n "$ISOLATION_SUFFIX" ]; then
+  echo "core#5031: this run owns a PRIVATE image namespace (MOLECULE_LOCAL_IMAGE_ISOLATION=$LOCAL_IMAGE_ISOLATION);"
+  echo "           no concurrent job can resolve or restore these tags."
 fi
 
 # Record what the cache tag points at NOW (if anything) so cleanup can restore.
@@ -357,11 +409,11 @@ if [ "$LIFECYCLE_PROVISIONER_BUILDS" = "1" ]; then
   pass "provisioner-builds mode: leaving image resolution to RegistryModeLocal (real template build)"
 elif [ "$USING_STUB" -eq 1 ]; then
   echo "Building stub image from $STUB_DIR ..."
-  if ! docker build --platform=linux/amd64 -t molecule-local/stub-runtime:latest "$STUB_DIR" >/tmp/stub_build.log 2>&1; then
+  if ! docker build --platform=linux/amd64 -t "$STUB_IMAGE" "$STUB_DIR" >/tmp/stub_build.log 2>&1; then
     echo "FAIL: stub image build failed"; tail -20 /tmp/stub_build.log; exit 1
   fi
   pass "stub image built"
-  TARGET_IMAGE="molecule-local/stub-runtime:latest"
+  TARGET_IMAGE="$STUB_IMAGE"
   # Point BOTH the sha-pinned cache tag and :latest at the stub so the
   # provisioner's RegistryModeLocal cache-check (dockerHasTag) resolves to it
   # instead of cloning+building the template.
