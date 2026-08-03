@@ -156,6 +156,87 @@ func TestHostTokenFor_FileBaseURLHasNoCredential(t *testing.T) {
 	); got != "" {
 		t.Fatalf("file:// base must carry no credential: got %q", got)
 	}
+	// The load-bearing case: a file:// URL WITH an authority component parses
+	// to a real-looking host, so without the explicit scheme guard a token
+	// keyed to that host would be handed to a local-path fetch.
+	if got := HostTokenFor(
+		envOf("MOLECULE_GIT_TOKEN__GIT_EXAMPLE_COM=leaked-token"),
+		"file://git.example.com/repos", "",
+	); got != "" {
+		t.Fatalf("file:// with an authority must carry no credential: got %q", got)
+	}
+	// A bare local path likewise.
+	if got := HostTokenFor(
+		envOf("MOLECULE_TEMPLATE_REPO_TOKEN=template-pat"),
+		"/srv/bare-repos", "MOLECULE_TEMPLATE_REPO_TOKEN",
+	); got != "" {
+		t.Fatalf("bare local path must carry no credential: got %q", got)
+	}
+}
+
+func TestHostTokenFor_PortIsPartOfTheCredentialDomain(t *testing.T) {
+	// A forge on a non-default port is a DIFFERENT credential domain. If the
+	// port were stripped, a token minted for a dev forge on :8443 would be
+	// offered to whatever answers on :443 at the same hostname.
+	env := envOf(`MOLECULE_GIT_TOKENS={"git.example.com:8443":"ported-token"}`)
+
+	if got := HostTokenFor(env, "https://git.example.com:8443", ""); got != "ported-token" {
+		t.Fatalf("exact host:port must match: got %q", got)
+	}
+	if got := HostTokenFor(env, "https://git.example.com", ""); got != "" {
+		t.Fatalf("portless host must NOT match a ported credential: got %q", got)
+	}
+	if got := HostTokenFor(env, "https://git.example.com:9999", ""); got != "" {
+		t.Fatalf("different port must NOT match: got %q", got)
+	}
+
+	// ...and the converse: a portless credential is not offered to a ported host.
+	if got := HostTokenFor(
+		envOf("MOLECULE_GIT_TOKEN__GIT_EXAMPLE_COM=portless-token"),
+		"https://git.example.com:8443", "",
+	); got != "" {
+		t.Fatalf("portless credential must NOT match a ported host: got %q", got)
+	}
+}
+
+func TestHostTokenFor_UserinfoIsStrippedFromTheLookupHost(t *testing.T) {
+	env := envOf("MOLECULE_GIT_TOKEN__GIT_MOLECULESAI_APP=per-org-token")
+
+	// Userinfo in the base URL must not defeat the host match.
+	if got := HostTokenFor(env, "https://someuser@git.moleculesai.app", ""); got != "per-org-token" {
+		t.Errorf("userinfo defeated the host match: got %q", got)
+	}
+
+	// SECURITY: a host smuggled into the USERINFO must not win the match. The
+	// real host is what follows the '@', and that is what gets the credential.
+	if got := HostTokenFor(env, "https://git.moleculesai.app@evil.com", ""); got != "" {
+		t.Fatalf("SECURITY: credential offered to evil.com via userinfo smuggling: got %q", got)
+	}
+	if got := HostTokenFor(
+		envOf("MOLECULE_GIT_TOKEN__EVIL_COM=evil-token"),
+		"https://git.moleculesai.app@evil.com", "",
+	); got != "evil-token" {
+		t.Errorf("the real host should be the lookup key: got %q", got)
+	}
+
+	// Pins LAST-'@' (RFC 3986) rather than first: with the first, the result
+	// still contains an '@', matches no key, and the credential is dropped.
+	if got := HostTokenFor(env, "https://user@sub@git.moleculesai.app", ""); got != "per-org-token" {
+		t.Errorf("multi-'@' authority must resolve to the host after the LAST '@': got %q", got)
+	}
+}
+
+func TestHostTokenFor_NaiveDashFoldingWouldMisroute(t *testing.T) {
+	// The specific wrong implementation this guards: folding the host FORWARD
+	// with BOTH '.' and '-' mapped to '_'. That makes git.my-corp.com and
+	// git.my.corp.com collide on one key, so a credential for one forge is
+	// silently offered to the other.
+	if got := HostTokenFor(
+		envOf("MOLECULE_GIT_TOKEN__GIT_MY_CORP_COM=corp-token"),
+		"https://git.my-corp.com", "",
+	); got != "" {
+		t.Fatalf("dash-folding collision: token for git.my.corp.com offered to git.my-corp.com (got %q)", got)
+	}
 }
 
 // roundTripFunc lets a test serve a portless https host without a network.

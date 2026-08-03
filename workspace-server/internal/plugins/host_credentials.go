@@ -153,9 +153,18 @@ func envLookup(environ []string, want string) string {
 }
 
 // netlocOf reduces a URL to its netloc (host, INCLUDING any port), or returns a
-// bare host unchanged. Mirrors molecule_runtime plugin_sources._netloc: the port
-// is deliberately retained, because a forge on a non-default port is a distinct
-// credential domain.
+// bare host unchanged. The port is deliberately retained, matching
+// molecule_runtime plugin_sources._netloc: a forge on a non-default port is a
+// distinct credential domain, and collapsing :8443 onto :443 would offer a
+// dev-forge credential to whatever answers on the default port.
+//
+// ONE DELIBERATE DIVERGENCE from that mirror: userinfo is stripped. Python's
+// urlsplit().netloc KEEPS it, so a base URL carrying userinfo matches no host
+// there and silently offers no credential. Stripping is the more correct
+// reading of RFC 3986 (the host is what follows the LAST '@' in the authority)
+// and is why LastIndex is used here — with the FIRST '@', a multi-'@' authority
+// leaves an '@' in the result, which then matches no key and drops the
+// credential silently. Both are fail-closed; only LastIndex is correct.
 func netlocOf(urlOrHost string) string {
 	v := strings.TrimSpace(urlOrHost)
 	if v == "" {
