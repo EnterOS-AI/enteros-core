@@ -393,8 +393,16 @@ func TestMCPHandler_DelegateTaskAsync_RoutesThroughPlatformA2AProxy(t *testing.T
 	mock.ExpectExec(`UPDATE activity_logs`).
 		WithArgs("queued", "", callerID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// #4338: the target's response carries an ANSWER, so the goroutine's terminal write
+	// is `completed` (plus the response_body that check_task_status reads), not the
+	// `delivered` this expected before the completion writer existed. `delivered` is
+	// still what a queued ACK produces — see
+	// TestMCPHandler_DelegateTaskAsync_QueuedAckStaysDelivered.
 	mock.ExpectExec(`UPDATE activity_logs`).
-		WithArgs("delivered", "", callerID, sqlmock.AnyArg()).
+		WithArgs("completed", "", callerID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`(?s)UPDATE activity_logs.*response_body`).
+		WithArgs(sqlmock.AnyArg(), callerID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	called := make(chan struct{}, 1)
@@ -552,8 +560,13 @@ func TestMCPHandler_DelegateTaskAsync_WithAttachments(t *testing.T) {
 	mock.ExpectExec(`UPDATE activity_logs`).
 		WithArgs("queued", "", callerID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// #4338: an answering target now terminalizes as `completed` — see the sibling
+	// test above.
 	mock.ExpectExec(`UPDATE activity_logs`).
-		WithArgs("delivered", "", callerID, sqlmock.AnyArg()).
+		WithArgs("completed", "", callerID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`(?s)UPDATE activity_logs.*response_body`).
+		WithArgs(sqlmock.AnyArg(), callerID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	called := make(chan []byte, 1)
