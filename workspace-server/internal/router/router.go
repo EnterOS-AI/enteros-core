@@ -698,7 +698,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		//   C2: MCPRateLimiter caps tool calls at 120/min/token so a long-lived
 		//       opencode session cannot saturate the platform.
 		//   C3: commit_memory/recall_memory with scope=GLOBAL → permission error;
-		//       send_message_to_user excluded unless MOLECULE_MCP_ALLOW_SEND_MESSAGE=true.
+		//       send_message_to_user is included by default and excluded only where
+		//       the MOLECULE_MCP_ALLOW_SEND_MESSAGE kill-switch is set falsy.
 		mcpH := handlers.NewMCPHandler(db.DB, broadcaster, pushNotifier)
 		if memBundle != nil {
 			mcpH.WithMemoryV2(memBundle.Plugin, memBundle.Resolver)
