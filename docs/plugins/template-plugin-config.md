@@ -164,8 +164,14 @@ anything written there dies on the next reconcile.
 **Delivery is Create-path only.** Both call sites sit inside
 `WorkspaceHandler.Create` — the local-template leg and the SaaS fetched-bytes
 leg. Editing a template does **not** reach workspaces already provisioned from
-it; they need to be provisioned again. A live-edit path (layer 6) is not in
-`main`.
+it; they need to be provisioned again.
+
+The live-edit path (**layer 6**) IS in `main` and is **on by default** since
+core#5047: an operator override recorded through `PATCH .../plugin-settings`
+is re-overlaid onto the delivered bytes on every (re-)provision, so the edit
+survives on the box and not merely in the database. Operators can revert to
+pure template delivery without a redeploy by setting the kill-switch
+`MOLECULE_PLUGIN_SETTINGS_LAYERS` to `0`/`false`/`no`/`off`.
 
 On SaaS, the template's real bytes arrive through the Gitea asset channel rather
 than a local path, and both legs run. On key collision the **fetched** render
