@@ -478,15 +478,15 @@ jobs:
           # falls with a deletion, so on its own it would bless shrinking the suite
           # to nothing. Deletion must remain a conscious edit to LIVE_MIN.
           if [ "${npass:-0}" -lt "$declared" ]; then
-            echo "::error::live-container gate: ${declared} TestLiveBox_* are declared in plugin_settings_writer_live_test.go but only ${npass} produced a top-level PASS. A declared test did not run — check the -run regex, a build tag, or a rename."
+            echo "::error::live-container gate: ${declared} TestLiveBox_* are declared across ${LIVE_TEST_FILES} but only ${npass} produced a top-level PASS. A declared test did not run — check the -run regex, a build tag, or a rename."
             exit 1
           fi
           if [ "${npass:-0}" -gt "$declared" ]; then
-            echo "::error::live-container gate: ${npass} top-level TestLiveBox_ PASS lines but only ${declared} declared in plugin_settings_writer_live_test.go. A TestLiveBox_* was added in ANOTHER file in this package, so 'declared' no longer describes the suite this step measures — move it, or widen the grep to cover both files."
+            echo "::error::live-container gate: ${npass} top-level TestLiveBox_ PASS lines but only ${declared} declared across ${LIVE_TEST_FILES}. More top-level PASS lines than declarations should be impossible now that the package-wide cross-check above passed — re-read that arm before touching this one."
             exit 1
           fi
           if [ "${npass:-0}" -lt "$LIVE_MIN" ]; then
-            echo "::error::live-container gate saw ${npass} top-level '--- PASS: TestLiveBox_' line(s), expected ${LIVE_MIN} (every TestLiveBox_* in plugin_settings_writer_live_test.go). A test was removed or renamed without updating LIVE_MIN, or the -run regex no longer matches the suite. Note two of them are pure unit tests, so a nonzero count alone does not prove a container ever started."
+            echo "::error::live-container gate saw ${npass} top-level '--- PASS: TestLiveBox_' line(s), expected ${LIVE_MIN} (every TestLiveBox_* across ${LIVE_TEST_FILES}). A test was removed or renamed without updating LIVE_MIN, or the -run regex no longer matches the suite. Note two of them are pure unit tests, so a nonzero count alone does not prove a container ever started."
             exit 1
           fi
           # The canary: the specific regression guard for the #4922 doubled-destPath
