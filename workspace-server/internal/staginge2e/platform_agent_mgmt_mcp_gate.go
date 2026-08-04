@@ -240,3 +240,77 @@ func nonEmpty(s, def string) string {
 	}
 	return s
 }
+
+// ── The CREATED-ROW verdict (core#5052) ──────────────────────────────────────
+//
+// Guard B's callable proof asserts a DETERMINISTIC side effect: the concierge
+// ran provision_workspace and a real workspace row appeared. Until core#5052
+// the live test accepted that row on `name` + `kind` ALONE and never looked at
+// `status`, so a workspace that was created and then FAILED to provision still
+// reported "CALLABLE CONFIRMED". That is the exact vacuous-pass shape this gate
+// exists to refuse — the hardest gate in the repo was scoring a row's EXISTENCE
+// as proof of a working verb.
+//
+// The verdict below is deliberately narrow. The claim under test is "the verb
+// genuinely RAN", not "the workspace booted", so a row still mid-provision is
+// NOT a failure — provisioning is asynchronous and the concierge's obligation
+// ends when the row is created. What must never pass is a row that reached a
+// TERMINAL BAD state: `failed` (provision errored) or `removed` (rolled back).
+// Those prove the create did not survive, and a gate that green-lights them is
+// asserting nothing.
+//
+// kind is checked here too so both halves of the row verdict live in one pure,
+// unit-tested place rather than being split between the gate and the live test.
+
+// terminalBadWorkspaceStatuses are the statuses that PROVE a created workspace
+// did not survive its own provision. Kept as a list (not a set literal inline)
+// so the reason string can name exactly what was refused.
+var terminalBadWorkspaceStatuses = []string{"failed", "removed"}
+
+// ClassifyProvisionedWorkspace decides whether the row the concierge created in
+// response to the real A2A provision_workspace turn counts as PROOF that the
+// verb is genuinely callable.
+//
+//	kind   — the row's kind field ("" when the API did not surface it)
+//	status — the row's status field ("" when the API did not surface it)
+//
+// An unobserved (empty) field is tolerated rather than fatal, matching the rest
+// of this gate: the live test leans on the fields the tenant actually exposes
+// and never false-fails on one the API may omit.
+func ClassifyProvisionedWorkspace(kind, status string) (ok bool, reason string) {
+	if kind != "" && kind != "workspace" {
+		return false, fmt.Sprintf(
+			"the concierge created a row named as requested but with kind=%q (want \"workspace\") — that is not a real team-member create, so provision_workspace did not genuinely run",
+			kind)
+	}
+	if containsStr(terminalBadWorkspaceStatuses, status) {
+		return false, fmt.Sprintf(
+			"the concierge created the requested workspace but it reached TERMINAL status=%q — the row exists yet the provision did not survive, so scoring this as CALLABLE would be a vacuous pass (core#5052: the pre-fix gate matched on name+kind and never read status)",
+			status)
+	}
+	return true, fmt.Sprintf(
+		"the concierge created a real kind=%q workspace (status=%s) — provision_workspace genuinely ran",
+		nonEmpty(kind, "workspace"), nonEmpty(status, "<not surfaced>"))
+}
+
+// a2aTurnLogCap bounds the A2A turn body Guard B logs. It must stay well above
+// the runtime's own failure text so a red run is SELF-DIAGNOSING: hermes returns
+// `Model generated invalid tool call: <tool-id>` (the id itself already capped
+// at 80 chars upstream) inside a JSON-RPC message envelope of ~145 chars. The
+// previous cap of 200 sliced that apart mid-identifier and left every red run
+// unexplainable without a live reproduction.
+const a2aTurnLogCap = 4000
+
+// truncate bounds a body for logging, appending an ellipsis when it cuts.
+//
+// Lives here (untagged) so the tagged live tests and the untagged gate/unit
+// tests share ONE definition — the same reason containsStr lives here. It moved
+// out of the staging_e2e-tagged concierge_platform_test.go in core#5052 so
+// a2aTurnLogCap could be proved against a real failure body without a live
+// tenant.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}

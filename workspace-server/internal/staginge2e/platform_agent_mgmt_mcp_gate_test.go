@@ -314,3 +314,87 @@ func TestGuardBMode(t *testing.T) {
 		})
 	}
 }
+
+// TestClassifyProvisionedWorkspace is the FAIL-BEFORE proof for core#5052.
+//
+// Before the fix, findWorkspaceByName returned (id, kind) and the live test
+// scored ANY row whose name matched — including one that had already FAILED —
+// as "CALLABLE CONFIRMED". The `failed` and `removed` cases below are exactly
+// the rows the old logic green-lit; they MUST now be refused.
+func TestClassifyProvisionedWorkspace(t *testing.T) {
+	cases := []struct {
+		name    string
+		kind    string
+		status  string
+		wantOK  bool
+		wantSub string
+	}{
+		// The genuine pass: a real workspace that provisioned.
+		{"online workspace is callable proof", "workspace", "online", true, "genuinely ran"},
+		// Async provision is NOT a failure — the verb ran; booting is separate.
+		{"still provisioning is not a failure", "workspace", "provisioning", true, "genuinely ran"},
+		// Fields the API may omit must not false-fail (matches the rest of Guard B).
+		{"unobserved status tolerated", "workspace", "", true, "not surfaced"},
+		{"unobserved kind tolerated", "", "online", true, "genuinely ran"},
+
+		// ── THE VACUITY THIS FIX CLOSES ──
+		{"failed workspace is NOT callable proof", "workspace", "failed", false, "TERMINAL status=\"failed\""},
+		{"removed workspace is NOT callable proof", "workspace", "removed", false, "TERMINAL status=\"removed\""},
+
+		// Pre-existing kind guard, now co-located with the status guard.
+		{"non-workspace kind refused", "platform", "online", false, "not a real team-member create"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, reason := ClassifyProvisionedWorkspace(tc.kind, tc.status)
+			if ok != tc.wantOK {
+				t.Fatalf("ClassifyProvisionedWorkspace(%q,%q) ok=%v want %v (reason=%s)",
+					tc.kind, tc.status, ok, tc.wantOK, reason)
+			}
+			if !strings.Contains(reason, tc.wantSub) {
+				t.Errorf("ClassifyProvisionedWorkspace(%q,%q) reason=%q does not contain %q",
+					tc.kind, tc.status, reason, tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestClassifyProvisionedWorkspaceRefusesEveryTerminalBadStatus pins the refusal
+// list itself, so adding a terminal-bad status to the enum without teaching this
+// gate about it is visible rather than silent.
+func TestClassifyProvisionedWorkspaceRefusesEveryTerminalBadStatus(t *testing.T) {
+	for _, st := range terminalBadWorkspaceStatuses {
+		if ok, _ := ClassifyProvisionedWorkspace("workspace", st); ok {
+			t.Errorf("terminal-bad status %q was accepted as callable proof", st)
+		}
+	}
+}
+
+// TestA2ATurnLogCapSurvivesTheRuntimeFailureText pins the log cap against the
+// exact shape that defeated it (core#5052).
+//
+// The old cap was 200. The runtime answers a failed tool-use turn with
+// `Model generated invalid tool call: <tool-id>` wrapped in a JSON-RPC message
+// envelope; the envelope alone is ~145 chars, so 200 sliced the tool id — the
+// one field naming WHY the turn failed — apart mid-word. This test fails if the
+// cap ever regresses below a real sample of that response.
+func TestA2ATurnLogCapSurvivesTheRuntimeFailureText(t *testing.T) {
+	// A real red-run body, verbatim except for the id/messageId values.
+	sample := `{"id":"e2e-mcp-52efb491","jsonrpc":"2.0","result":{"kind":"message",` +
+		`"messageId":"aa7d2518-287b-45c5-82e2-9a2da30b9ca5","parts":[{"kind":"text",` +
+		`"text":"Model generated invalid tool call: mcp__molecule_platform__provision_workspace"}],` +
+		`"role":"agent"}}`
+
+	if got := truncate(sample, a2aTurnLogCap); got != sample {
+		t.Fatalf("a2aTurnLogCap=%d truncates a real failure body (len=%d) — the diagnostic would be lost again:\n%s",
+			a2aTurnLogCap, len(sample), got)
+	}
+	// Guard the regression directly: the OLD cap must be demonstrably too small,
+	// so this test is a fail-before proof and not a tautology.
+	if truncate(sample, 200) == sample {
+		t.Fatalf("sample is not long enough to prove the 200-char cap was lossy (len=%d)", len(sample))
+	}
+	if strings.Contains(truncate(sample, 200), "provision_workspace") {
+		t.Errorf("the 200-char cap unexpectedly preserved the tool id; sample no longer reproduces the blindness")
+	}
+}

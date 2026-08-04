@@ -331,25 +331,42 @@ func driveProvisionWorkspaceCallable(t *testing.T, host, token, orgID, platformI
 		// Wide per-call window: a cold concierge's first turn opens the LLM
 		// connection + loads the platform MCP subprocess before running the tool.
 		st, resp := doTenantJSONTimeout(t, "POST", url, token, orgID, payload, actBudget)
-		t.Logf("A2A provision_workspace turn → HTTP %d (worker=%s): %s", st, worker, truncate(resp, 200))
+		// core#5052: this used to truncate at 200 chars. The runtime's own
+		// failure text is `Model generated invalid tool call: <name>` wrapped in
+		// a JSON-RPC envelope, and the envelope alone is ~145 chars — so the one
+		// field that names WHY the turn failed (the rejected tool id) was cut off
+		// mid-word on every red run. Two separate investigations of this gate
+		// stalled on `mcp__molecule_…` with the rest destroyed by this call.
+		// The cap exists for log hygiene, not for redaction: make it wide enough
+		// that the diagnostic survives.
+		t.Logf("A2A provision_workspace turn → HTTP %d (worker=%s): %s", st, worker, truncate(resp, a2aTurnLogCap))
 	}
 	sendA2A()
 
 	deadline := time.Now().Add(actBudget)
 	nextNudge := time.Now().Add(75 * time.Second)
 	for time.Now().Before(deadline) {
-		if id, kind := findWorkspaceByName(t, host, token, orgID, worker); id != "" {
-			if kind != "" && kind != "workspace" {
-				t.Logf("callable turn produced %q with kind=%q (want workspace) — treating as not-a-real-create", worker, kind)
-				return false
-			}
+		if id, kind, status := findWorkspaceByName(t, host, token, orgID, worker); id != "" {
 			// Best-effort targeted cleanup of the worker the concierge created.
+			// Registered BEFORE the verdict so a row we then REFUSE (kind skew /
+			// terminal-failed) is still torn down rather than leaked into the org.
 			t.Cleanup(func() {
 				_, _ = doTenantJSON(t, "DELETE",
 					"https://"+host+"/workspaces/"+id+"?confirm=true", token, orgID, "")
 			})
-			t.Logf("CALLABLE CONFIRMED: concierge %s ran provision_workspace → workspace %q (id=%s) exists",
-				platformID, worker, id)
+			// core#5052: the row verdict is PURE and unit-tested
+			// (ClassifyProvisionedWorkspace / platform_agent_mgmt_mcp_gate_test.go).
+			// It reads `status` as well as `kind` — the pre-fix gate matched on
+			// name+kind only, so a workspace that was created and then FAILED
+			// still reported "CALLABLE CONFIRMED".
+			ok, reason := ClassifyProvisionedWorkspace(kind, status)
+			if !ok {
+				t.Logf("callable turn produced %q (id=%s kind=%q status=%q) but it is NOT callable proof: %s",
+					worker, id, kind, status, reason)
+				return false
+			}
+			t.Logf("CALLABLE CONFIRMED: concierge %s ran provision_workspace → workspace %q (id=%s kind=%q status=%q): %s",
+				platformID, worker, id, kind, status, reason)
 			return true
 		}
 		if time.Now().After(nextNudge) {
@@ -433,25 +450,32 @@ func a2aMessageSend(t *testing.T, text string) string {
 	return string(b)
 }
 
-// findWorkspaceByName returns (id, kind) of the workspace whose name == want in
-// GET /workspaces, or ("","") if absent. The list rows omit name from the shared
-// parseWorkspaceList row, so this does its own permissive decode.
-func findWorkspaceByName(t *testing.T, host, token, orgID, want string) (id, kind string) {
+// findWorkspaceByName returns (id, kind, status) of the workspace whose
+// name == want in GET /workspaces, or ("","","") if absent. The list rows omit
+// name from the shared parseWorkspaceList row, so this does its own permissive
+// decode.
+//
+// core#5052: `status` is returned as well as `kind`. It used to return only
+// (id, kind), which made Guard B's hardest assertion VACUOUS — a workspace the
+// concierge created that then FAILED to provision still satisfied "CALLABLE
+// CONFIRMED", because nothing ever read its status. The verdict itself lives in
+// the pure, unit-tested ClassifyProvisionedWorkspace.
+func findWorkspaceByName(t *testing.T, host, token, orgID, want string) (id, kind, status string) {
 	t.Helper()
 	hs, body := doTenantJSON(t, "GET", "https://"+host+"/workspaces", token, orgID, "")
 	if hs != http.StatusOK {
-		return "", ""
+		return "", "", ""
 	}
 	var raw []map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(body), &raw); err != nil {
-		return "", ""
+		return "", "", ""
 	}
 	for _, m := range raw {
 		if rawString(m["name"]) == want {
-			return rawString(m["id"]), rawString(m["kind"])
+			return rawString(m["id"]), rawString(m["kind"]), rawString(m["status"])
 		}
 	}
-	return "", ""
+	return "", "", ""
 }
 
 // doTenantJSONTimeout is doTenantJSON with a caller-set client timeout — an A2A
