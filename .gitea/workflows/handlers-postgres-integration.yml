@@ -455,7 +455,7 @@ jobs:
           # reappearing inside the guard itself.
           #
           # So require a FLOOR, and name the tests that must have run.
-          # LIVE_MIN is the count of ALL TestLiveBox_* (13), NOT the count of
+          # LIVE_MIN is the count of ALL TestLiveBox_* (14), NOT the count of
           # Docker-gated ones. npass counts every matching PASS line, and two
           # of them are pure unit tests, so a floor that excluded them leaves
           # exactly two tests of slack: drop RealWriterLandsSettingsOnARunningWorkspace and
@@ -463,8 +463,8 @@ jobs:
           # entry point including backend dispatch, not just the copy primitive —
           # and the step still scores 5 and reports GREEN. Measured population and
           # threshold population must be the same one.
-          # 9 write-side + 4 read-surface = 13.
-          LIVE_MIN=13
+          # 9 write-side + 5 read-surface = 14.
+          LIVE_MIN=14
           # Second, independent arm: EVERY TestLiveBox_* declared in the file must
           # have produced a top-level PASS. The floor alone couples this gate to a
           # constant someone has to remember to bump — a reviewer pointed out that
