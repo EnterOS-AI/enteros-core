@@ -94,7 +94,10 @@ set -euo pipefail
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
 SEO_TEMPLATE="${E2E_SEO_TEMPLATE:-seo-agent}"
-EXPECTED_MODEL="${E2E_EXPECTED_MODEL:-moonshot/kimi-k2.6}"
+# 2026-08-04: sdk#203 withdrew moonshot/* from every platform arm (suspended
+# vendor account), so the old default now 422s UNREGISTERED_MODEL_FOR_RUNTIME at
+# create. minimax/MiniMax-M2.7 is the SSOT default (MOLECULE_LLM_DEFAULT_MODEL).
+EXPECTED_MODEL="${E2E_EXPECTED_MODEL:-minimax/MiniMax-M2.7}"
 # The plugin the seo-agent template now DECLARES. Install name = last path
 # segment of the source contract; this source has NO subpath, so the name is the
 # repo name (workspace-server gitea resolver).

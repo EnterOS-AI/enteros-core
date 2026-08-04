@@ -102,8 +102,8 @@ assert_eq "platform path beats a stray BYOK key (no mask)"         "$got" "minim
 got=$(unset E2E_MODEL_SLUG; E2E_LLM_PATH=platform E2E_DEFAULT_PLATFORM_MODEL="minimax/MiniMax-M3" pick_model_slug claude-code)
 assert_eq "platform path honours E2E_DEFAULT_PLATFORM_MODEL"        "$got" "minimax/MiniMax-M3"
 
-got=$(unset E2E_DEFAULT_PLATFORM_MODEL; E2E_MODEL_SLUG="anthropic/claude-opus-4-7" E2E_LLM_PATH=platform pick_model_slug claude-code)
-assert_eq "E2E_MODEL_SLUG still wins over platform path"            "$got" "anthropic/claude-opus-4-7"
+got=$(unset E2E_DEFAULT_PLATFORM_MODEL; E2E_MODEL_SLUG="minimax/MiniMax-M3" E2E_LLM_PATH=platform pick_model_slug claude-code)
+assert_eq "E2E_MODEL_SLUG still wins over platform path"            "$got" "minimax/MiniMax-M3"
 
 # ── Override via E2E_MODEL_SLUG ──
 # When the operator sets E2E_MODEL_SLUG, the per-runtime dispatch is

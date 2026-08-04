@@ -320,9 +320,14 @@ SECRETS_JSON='{}'
 pv_platform_model_for_runtime() {
   if [ -n "${E2E_MODEL_SLUG:-}" ]; then printf '%s' "$E2E_MODEL_SLUG"; return 0; fi
   case "$1" in
-    claude-code) printf 'anthropic/claude-sonnet-4-6' ;;
-    hermes|openclaw) printf 'moonshot/kimi-k2.6' ;;
-    *) printf 'moonshot/kimi-k2.6' ;;
+    # 2026-08-04: sdk#203 narrowed every platform arm to minimax-only (the
+    # Moonshot vendor account is suspended and the anthropic/* platform ids were
+    # withdrawn under the same directive). Both former defaults now 422
+    # UNREGISTERED_MODEL_FOR_RUNTIME at create, so every runtime uses the ONE
+    # shared platform default here.
+    claude-code) printf 'minimax/MiniMax-M2.7' ;;
+    hermes|openclaw) printf 'minimax/MiniMax-M2.7' ;;
+    *) printf 'minimax/MiniMax-M2.7' ;;
   esac
 }
 

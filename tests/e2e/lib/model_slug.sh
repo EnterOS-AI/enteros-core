@@ -36,8 +36,11 @@
 #   because the generated config.yaml lacked the derived `provider: platform`.
 #
 #   E2E_LLM_PATH=platform selects a platform-managed model id (slash-namespaced,
-#   no tenant key — Molecule owns billing via the CP LLM proxy). The default is
-#   "moonshot/kimi-k2.6", the headline incident combo. Override the specific
+#   no tenant key — Molecule owns billing via the CP LLM proxy). The default
+#   MIRRORS the SSOT default (minimax/MiniMax-M2.7) — see the constant below.
+#   It was "moonshot/kimi-k2.6" (the headline incident combo) until sdk#203
+#   withdrew every moonshot/* id from the platform arms on 2026-08-04 (suspended
+#   vendor account); that id now 422s at create. Override the specific
 #   platform model with E2E_MODEL_SLUG. The provision branch in
 #   test_staging_full_saas.sh sends NO secrets for this path (platform-managed
 #   needs none), so the workspace must boot online purely on the proxy env the
