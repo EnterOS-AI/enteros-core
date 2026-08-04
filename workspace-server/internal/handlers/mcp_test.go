@@ -153,8 +153,14 @@ func TestMCPHandler_Initialize_ReturnsCapabilities(t *testing.T) {
 // tools/list
 // ─────────────────────────────────────────────────────────────────────────────
 
-func TestMCPHandler_ToolsList_ExcludesSendMessageByDefault(t *testing.T) {
-	_ = os.Unsetenv("MOLECULE_MCP_ALLOW_SEND_MESSAGE")
+// core#5047: send_message_to_user is shipped capability and is listed with
+// NOTHING configured. It was gated on MOLECULE_MCP_ALLOW_SEND_MESSAGE=="true",
+// a variable set in no tenant container and in no Infisical path, so for 15
+// weeks the tool was absent from every tools/list and no agent could find it.
+// This is the end-to-end (HTTP tools/list) counterpart of
+// TestMCPToolList_IncludesSendMessage_WhenEnvUnset.
+func TestMCPHandler_ToolsList_IncludesSendMessageByDefault(t *testing.T) {
+	unsetEnvForTest(t, "MOLECULE_MCP_ALLOW_SEND_MESSAGE")
 	h, _ := newMCPHandler(t)
 
 	w := mcpPost(t, h, "ws-1", map[string]interface{}{
@@ -171,14 +177,48 @@ func TestMCPHandler_ToolsList_ExcludesSendMessageByDefault(t *testing.T) {
 	result, _ := resp.Result.(map[string]interface{})
 	toolsRaw, _ := result["tools"].([]interface{})
 
+	if len(toolsRaw) == 0 {
+		t.Fatal("tool list is empty — the assertion below would pass vacuously")
+	}
+	found := false
 	for _, ti := range toolsRaw {
 		tool, _ := ti.(map[string]interface{})
 		if tool["name"] == "send_message_to_user" {
-			t.Error("send_message_to_user should be excluded when MOLECULE_MCP_ALLOW_SEND_MESSAGE is unset")
+			found = true
 		}
 	}
+	if !found {
+		t.Errorf("send_message_to_user missing from tools/list with MOLECULE_MCP_ALLOW_SEND_MESSAGE UNSET (%d tools listed)", len(toolsRaw))
+	}
+}
+
+// The operator kill-switch still works over the real HTTP surface.
+func TestMCPHandler_ToolsList_ExcludesSendMessageWhenKillSwitchSet(t *testing.T) {
+	t.Setenv("MOLECULE_MCP_ALLOW_SEND_MESSAGE", "false")
+	h, _ := newMCPHandler(t)
+
+	w := mcpPost(t, h, "ws-1", map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "tools/list",
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp mcpResponse
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	result, _ := resp.Result.(map[string]interface{})
+	toolsRaw, _ := result["tools"].([]interface{})
+
 	if len(toolsRaw) == 0 {
-		t.Error("tool list should not be empty")
+		t.Fatal("tool list is empty — the assertion below would pass vacuously")
+	}
+	for _, ti := range toolsRaw {
+		tool, _ := ti.(map[string]interface{})
+		if tool["name"] == "send_message_to_user" {
+			t.Error("send_message_to_user should be excluded when MOLECULE_MCP_ALLOW_SEND_MESSAGE is falsy")
+		}
 	}
 }
 
@@ -1110,30 +1150,65 @@ func TestMCPHandler_RecallMemory_GlobalScope_ScrubsInternalError(t *testing.T) {
 // tools/call — send_message_to_user
 // ─────────────────────────────────────────────────────────────────────────────
 
-func TestMCPHandler_SendMessageToUser_Blocked_WhenEnvNotSet(t *testing.T) {
-	_ = os.Unsetenv("MOLECULE_MCP_ALLOW_SEND_MESSAGE")
+// The operator kill-switch still refuses the CALL, not merely the listing —
+// an agent that hard-codes the tool name cannot route around a disabled
+// bridge.
+//
+// Asserted through dispatch rather than the HTTP surface on purpose: per
+// OFFSEC-001 tools/call flattens every failure to the constant "tool call
+// failed", so an HTTP-level `resp.Error != nil` check would pass on ANY
+// downstream error (and sqlmock cannot prove the absence of a write —
+// ExpectationsWereMet reports UNFULFILLED expectations, never unexpected
+// ones). dispatch returns the real error, so this pins the gate specifically.
+func TestMCPHandler_SendMessageToUser_Blocked_WhenKillSwitchSet(t *testing.T) {
+	t.Setenv("MOLECULE_MCP_ALLOW_SEND_MESSAGE", "off")
 	h, mock := newMCPHandler(t)
 	// No DB expectations — handler must abort before touching DB.
 
+	_, err := h.dispatch(context.Background(), "ws-1", "send_message_to_user",
+		map[string]interface{}{"message": "hello"})
+	if err == nil {
+		t.Fatal("expected a refusal when MOLECULE_MCP_ALLOW_SEND_MESSAGE is falsy")
+	}
+	if !strings.Contains(err.Error(), "MOLECULE_MCP_ALLOW_SEND_MESSAGE") {
+		t.Errorf("the refusal must name the kill-switch, otherwise this test passes on an unrelated failure; got %q", err)
+	}
+	if merr := mock.ExpectationsWereMet(); merr != nil {
+		t.Errorf("unexpected DB calls: %v", merr)
+	}
+
+	// ...and the same call over the real HTTP surface still errors (flattened
+	// to the constant message), so the kill-switch is not merely a list filter.
 	w := mcpPost(t, h, "ws-1", map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      13,
 		"method":  "tools/call",
 		"params": map[string]interface{}{
-			"name": "send_message_to_user",
-			"arguments": map[string]interface{}{
-				"message": "hello",
-			},
+			"name":      "send_message_to_user",
+			"arguments": map[string]interface{}{"message": "hello"},
 		},
 	})
-
 	var resp mcpResponse
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp.Error == nil {
-		t.Error("expected JSON-RPC error when MOLECULE_MCP_ALLOW_SEND_MESSAGE is unset")
+		t.Error("expected a JSON-RPC error from tools/call when the kill-switch is set")
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unexpected DB calls: %v", err)
+}
+
+// ...and with NOTHING configured the same call is NOT refused by the gate.
+// The negative control for the test above: it proves the refusal is the
+// kill-switch talking, not a permanently-broken tool.
+func TestMCPHandler_SendMessageToUser_NotGateBlocked_WhenEnvUnset(t *testing.T) {
+	unsetEnvForTest(t, "MOLECULE_MCP_ALLOW_SEND_MESSAGE")
+	h, _ := newMCPHandler(t)
+
+	// The call proceeds past the gate into the writer, which has no sqlmock
+	// expectations here and so fails on the DB — that is fine and expected.
+	// What must NOT appear is the gate's own refusal.
+	_, err := h.dispatch(context.Background(), "ws-1", "send_message_to_user",
+		map[string]interface{}{"message": "hello"})
+	if err != nil && strings.Contains(err.Error(), "MOLECULE_MCP_ALLOW_SEND_MESSAGE") {
+		t.Errorf("send_message_to_user was refused by the flag gate with the env var UNSET: %v", err)
 	}
 }
 

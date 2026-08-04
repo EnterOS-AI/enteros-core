@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/a2aresp"
@@ -614,9 +613,13 @@ func (h *MCPHandler) toolSendMessageToUser(ctx context.Context, workspaceID stri
 		return "", fmt.Errorf("message is required")
 	}
 
-	// Check send_message_to_user is enabled (C3).
-	if os.Getenv("MOLECULE_MCP_ALLOW_SEND_MESSAGE") != "true" {
-		return "", fmt.Errorf("send_message_to_user is not enabled on this MCP bridge (set MOLECULE_MCP_ALLOW_SEND_MESSAGE=true)")
+	// C3 posture. Enabled by default (core#5047); mcpSendMessageEnabled is the
+	// SINGLE read site shared with the tools/list filter so a caller can never
+	// see the tool listed and then be refused here (or vice versa). Only an
+	// operator kill-switch (MOLECULE_MCP_ALLOW_SEND_MESSAGE=0|false|no|off)
+	// reaches this branch.
+	if !mcpSendMessageEnabled() {
+		return "", fmt.Errorf("send_message_to_user is disabled on this MCP bridge (operator set MOLECULE_MCP_ALLOW_SEND_MESSAGE to a falsy value)")
 	}
 
 	// Single source of truth for chat-bearing agent → user messages —
@@ -641,9 +644,9 @@ func (h *MCPHandler) toolSendMessageToUser(ctx context.Context, workspaceID stri
 
 // toolRequestUserAction implements request_user_action — the agent raises a
 // tracked ask for the human user (it appears in the concierge Tasks list).
-// Mirrors the user_tasks REST Create handler. Unlike send_message_to_user it
-// is not gated behind MOLECULE_MCP_ALLOW_SEND_MESSAGE — raising an ask is
-// always allowed.
+// Mirrors the user_tasks REST Create handler. It carries no kill-switch of
+// its own — raising an ask is always allowed, even where an operator has
+// disabled send_message_to_user via MOLECULE_MCP_ALLOW_SEND_MESSAGE.
 func (h *MCPHandler) toolRequestUserAction(ctx context.Context, workspaceID string, args map[string]interface{}) (string, error) {
 	title, _ := args["title"].(string)
 	if title == "" {
