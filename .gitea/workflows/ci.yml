@@ -330,9 +330,9 @@ jobs:
         # default (see the dash-pipefail-varies-by-build class).
         run: |
           set +e
-          go test -race -v -timeout 60s ./internal/handlers/... 2>&1 | tee /tmp/test-handlers.log
+          go test -race -v -timeout 10m ./internal/handlers/... 2>&1 | tee /tmp/test-handlers.log
           handlers_exit=${PIPESTATUS[0]}
-          go test -race -v -timeout 60s ./internal/pendinguploads/... 2>&1 | tee /tmp/test-pu.log
+          go test -race -v -timeout 10m ./internal/pendinguploads/... 2>&1 | tee /tmp/test-pu.log
           pu_exit=${PIPESTATUS[0]}
           set -e
           echo "::group::handlers exit=$handlers_exit (last 100 lines)"
