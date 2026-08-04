@@ -102,12 +102,17 @@ func TestSetComputeInstance_EmptyProviderIs400(t *testing.T) {
 // came up fine. The alias "local" normalizes to molecules-server and PERSISTS
 // as the backend key "local" (what the CP teardown routing keys on) — with a
 // local-docker CONTAINER NAME as the instance id, not an EC2 i-* id.
+// SDK#199 (substrate rename stage 2, adopted here with the sdk/gen/go bump):
+// the persisted BACKEND KEY is now `enteros`, not `local`. `local`/`docker`
+// remain ACCEPTED aliases on the wire; only what we WRITE changed. The CP
+// already runs this SDK (migrations 069 widen + 070 backfill applied), so the
+// repoint lands a value the CP teardown router understands.
 func TestSetComputeInstance_MoleculesServerLocalRepoint(t *testing.T) {
 	h, mock := setupBootstrapHandler(t)
 
-	// The alias "local" must persist as the SDK backend key "local".
+	// The alias "local" must persist as the SDK backend key "enteros".
 	mock.ExpectExec(`UPDATE workspaces\s+SET instance_id = \$2`).
-		WithArgs("ws-local", "mol-ws-test5-a9f3044fa3f2", "local").
+		WithArgs("ws-local", "mol-ws-test5-a9f3044fa3f2", "enteros").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
@@ -128,13 +133,13 @@ func TestSetComputeInstance_MoleculesServerLocalRepoint(t *testing.T) {
 }
 
 // The canonical wire id "molecules-server" is accepted too and persists as the
-// same backend key "local" — proving validation/persistence both derive from
+// same backend key "enteros" — proving validation/persistence both derive from
 // the SDK SSOT, not a spelling-sensitive local hardcode.
 func TestSetComputeInstance_MoleculesServerCanonicalRepoint(t *testing.T) {
 	h, mock := setupBootstrapHandler(t)
 
 	mock.ExpectExec(`UPDATE workspaces\s+SET instance_id = \$2`).
-		WithArgs("ws-local", "mol-ws-test5-a9f3044fa3f2", "local").
+		WithArgs("ws-local", "mol-ws-test5-a9f3044fa3f2", "enteros").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()

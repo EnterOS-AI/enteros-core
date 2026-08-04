@@ -27,10 +27,33 @@ func TestValidateRegisteredModelForRuntime(t *testing.T) {
 	}
 	cases := []tc{
 		{
+			// The platform-billed slash form on the surviving minimax-only
+			// platform arm. Retargeted 2026-08-04 off `anthropic/claude-opus-4-7`,
+			// which sdk#203 WITHDREW (see withdrawn_platform_model_rejected below).
 			name:    "registered_platform_model_allowed",
 			runtime: "claude-code",
-			model:   "anthropic/claude-opus-4-7",
+			model:   "minimax/MiniMax-M2.7",
 			wantOK:  true,
+		},
+		{
+			// sdk#203 (2026-08-04): every runtime's platform arm is minimax-only.
+			// A withdrawn platform id must be REFUSED here — this is the create-time
+			// 422 UNREGISTERED_MODEL_FOR_RUNTIME that stops a customer provisioning
+			// a workspace onto the suspended Moonshot vendor account. It must NOT
+			// fall through to a BYOK arm (that would demand a tenant key the
+			// workspace does not have). Exhaustive per-runtime coverage lives in
+			// providers.TestDeriveProvider_PlatformArmsAreMinimaxOnly; this case
+			// pins the behaviour at the API boundary the customer actually hits.
+			name:    "withdrawn_platform_model_rejected",
+			runtime: "claude-code",
+			model:   "moonshot/kimi-k2.6",
+			wantOK:  false,
+		},
+		{
+			name:    "withdrawn_anthropic_platform_model_rejected",
+			runtime: "claude-code",
+			model:   "anthropic/claude-opus-4-7",
+			wantOK:  false,
 		},
 		{
 			name:    "registered_byok_model_allowed",

@@ -16,7 +16,7 @@ const SchemaVersion = 1
 // Fingerprint is a stable content hash of the generated projection (schema
 // version + provider catalog + runtime native sets). It changes iff the
 // registry DATA changes (comment-only YAML edits do not churn it).
-const Fingerprint = "8257c9c5785d6fc6"
+const Fingerprint = "cfa3a04f6c9e2a42"
 
 // GenProvider is the generated projection of one provider catalog entry —
 // the subset a downstream consumer needs to derive + display a provider.
@@ -86,7 +86,7 @@ var Runtimes = map[string][]GenRuntimeRef{
 		{Name: "anthropic-api", Models: []string{"claude-sonnet-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-haiku-4-5", "claude-sonnet-4-5", "anthropic:claude-sonnet-4-6", "anthropic:claude-opus-4-7", "anthropic:claude-opus-4-8", "anthropic:claude-haiku-4-5", "anthropic:claude-sonnet-4-5"}},
 		{Name: "kimi-coding", Models: []string{"kimi-for-coding", "kimi-k2.5", "kimi-k2"}},
 		{Name: "minimax", Models: []string{"MiniMax-M2", "MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3"}},
-		{Name: "platform", Models: []string{"anthropic/claude-opus-4-7", "anthropic/claude-opus-4-8", "anthropic/claude-sonnet-4-6", "moonshot/kimi-k2.6", "moonshot/kimi-k2.5", "minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3"}},
+		{Name: "platform", Models: []string{"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3"}},
 		{Name: "zai", Models: []string{}},
 		{Name: "deepseek", Models: []string{}},
 		{Name: "xiaomi-mimo", Models: []string{}},
@@ -94,12 +94,12 @@ var Runtimes = map[string][]GenRuntimeRef{
 	"codex": {
 		{Name: "openai-subscription", Models: []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"}},
 		{Name: "openai-api", Models: []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"}},
-		{Name: "platform", Models: []string{"openai/gpt-5.4", "openai/gpt-5.4-mini", "minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3"}},
+		{Name: "platform", Models: []string{"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3"}},
 		{Name: "byok-minimax", Models: []string{}},
 	},
 	"hermes": {
 		{Name: "kimi-coding", Models: []string{"kimi-coding/kimi-k2"}},
-		{Name: "platform", Models: []string{"moonshot/kimi-k2.6", "moonshot/kimi-k2.5", "minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3"}},
+		{Name: "platform", Models: []string{"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3"}},
 		{Name: "openrouter", Models: []string{}},
 		{Name: "huggingface", Models: []string{}},
 		{Name: "ai-gateway", Models: []string{}},
@@ -123,7 +123,7 @@ var Runtimes = map[string][]GenRuntimeRef{
 	},
 	"openclaw": {
 		{Name: "kimi-coding", Models: []string{"moonshot:kimi-k2.6", "moonshot:kimi-k2.5"}},
-		{Name: "platform", Models: []string{"moonshot/kimi-k2.6", "moonshot/kimi-k2.5", "minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3"}},
+		{Name: "platform", Models: []string{"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3"}},
 		{Name: "openrouter", Models: []string{}},
 		{Name: "custom", Models: []string{}},
 		{Name: "byok-openai", Models: []string{}},
