@@ -458,16 +458,24 @@ jobs:
         # molecule-ai-org-template-molecule-dev and runs the real !include /
         # !external resolver against it. It USED to run implicitly in the
         # default `go test` lanes, but its `git clone` + nested !external git
-        # fetch add UNBOUNDED, VARIABLE network time — under the diagnostic
-        # `go test -race -v -timeout 60s ./internal/handlers/...` step above,
-        # that variable time is what tipped the whole (already ~60s-under-race)
-        # package over the per-package cap, producing the recurring
-        # `panic: test timed out after 1m0s` flake. The test is now gated behind
-        # MOLECULE_LIVE_ORG_TEMPLATE=1 so the default lanes skip it instantly;
-        # the resolver logic stays covered there by the hermetic
+        # fetch add UNBOUNDED, VARIABLE network time — under what was then the
+        # `go test -race -v -timeout 60s ./internal/handlers/...` diagnostic step
+        # above, that variable time was blamed for tipping the whole (already
+        # "~60s-under-race") package over the per-package cap, producing the
+        # recurring `panic: test timed out after 1m0s`. The test is now gated
+        # behind MOLECULE_LIVE_ORG_TEMPLATE=1 so the default lanes skip it
+        # instantly; the resolver logic stays covered there by the hermetic
         # TestResolveYAMLIncludes_* fixture tests. This dedicated step restores
         # the live smoke with a generous 5m timeout (no 60s cap, no -race), so
         # network latency can never manufacture a timeout.
+        #
+        # CORRECTION: removing this test did NOT stop the panic — the diagnostic
+        # kept timing out on every run afterwards, naming a different (fast,
+        # network-free) test each time. The package needs ~99s under -race
+        # regardless; the 60s cap was the whole cause and network time was only
+        # what made it visible first. The cap is now 10m (see the race gate
+        # above). This step is still worth keeping on its own merits: it gives
+        # the live composition a bounded, race-free, network-tolerant lane.
         #
         # Blocking is safe from network flakes: a clone/fetch failure or the
         # deliberately-held-broken molecule-dev-department@v1.0.0 !external ref
