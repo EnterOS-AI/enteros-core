@@ -70,25 +70,36 @@ func insertMCPDelegationRow(ctx context.Context, db *sql.DB, workspaceID, target
 // asyncMCPCompletionWired is the #4338 INTERLOCK, and it is the single thing that
 // unlocks the Phase-2 flag flip.
 //
-// FALSE means: no code path moves an async MCP delegation from `in_progress` to
-// `completed`. The target does the work, answers, and the ledger row never hears
-// about it — so the sweeper deadline-fails it at 6h and tells the caller a
-// delegation that SUCCEEDED had failed.
+// FALSE meant: no code path moved an async MCP delegation from `in_progress` to
+// `completed`. The target did the work, answered, and the ledger row never heard about
+// it — so the sweeper deadline-failed it at 6h and told the caller a delegation that
+// SUCCEEDED had failed. WarnOnPartialDelegationRollout reads this constant at boot and
+// REFUSES TO START if DELEGATION_LEDGER_WRITE is on while it is false, which is what
+// made "do not flip the flag yet" enforceable instead of a comment somebody has to
+// remember to read.
 //
-// The completion writer is the Phase-3 agent-side cutover: the target must report its
-// result against the delegation_id (the drain stitch cannot do it — it matches
-// method='delegate_result', and MCP rows are method='delegate').
+// IT IS NOW TRUE, because #4338 landed:
 //
-// WHEN #4338 LANDS, FLIP THIS TO TRUE — and not before. WarnOnPartialDelegationRollout
-// reads it at boot and REFUSES TO START if DELEGATION_LEDGER_WRITE is on while this is
-// false. That refusal is the whole point: it makes "do not flip the flag yet"
-// enforceable instead of a comment somebody has to remember to read.
+//   - completeAsyncMCPDelegation (mcp_async_completion.go) terminalizes the successful
+//     async delegation AND pushes the caller's single delegate_result carrying the
+//     answer;
+//   - asyncMCPAnswer decides whether a 2xx is an ANSWER at all, so the platform's
+//     synthetic `queued` acks (poll-mode, boot-turn, busy/settling) do NOT terminalize
+//     anything and keep the previous `delivered` -> in_progress behaviour;
+//   - the FAILURE half (failAsyncMCPDelegation, core#4316) is untouched and still
+//     terminalizes-and-notifies. #4338's scope note is explicit that closing it by
+//     wiring only the completion path would leave the failure path silent. Both halves
+//     are wired; neither may be removed without putting this constant back to false.
 //
-// NOTE the FAILURE half of the async route is already wired and must stay that way —
-// see failAsyncMCPDelegation. #4338 is the COMPLETION half. Closing it by wiring only
-// the completion path would leave the failure path silent, which is the bug review
-// caught (N4). Both halves, or the interlock stays shut.
-const asyncMCPCompletionWired = false
+// Covered by TestIntegration_AsyncMCPCompletion_* and, as the negative control,
+// TestIntegration_AsyncMCPTargetNeverAnswers_DeadlineFailsAndNotifiesOnce — a target
+// that never answers must still deadline-fail and notify exactly once, or this
+// constant is lying about what was built.
+//
+// FLIPPING THIS DOES NOT ENABLE ANYTHING. It removes the boot refusal; the ledger and
+// the inbox push remain gated on their own flags, both still off everywhere. Enabling
+// them is a separate, deliberate step with its own canary.
+const asyncMCPCompletionWired = true
 
 // mcpDelegationRoute — WHICH TOOL is speaking. The map below MUST key on this and
 // not on the activity_logs string alone, because the two routes SHARE that string
@@ -128,6 +139,14 @@ func ledgerStatusForMCP(route mcpDelegationRoute, mcpStatus string) (string, boo
 		return "in_progress", true
 	case "delivered":
 		return "in_progress", true // async: target accepted, still working
+	case "completed":
+		// #4338. The ONLY status either route writes that means "the target answered
+		// and we are holding the answer". On the async route it is written by
+		// completeAsyncMCPDelegation and ONLY after asyncMCPAnswer has proved the
+		// response is a final answer rather than one of the platform's synthetic
+		// `queued` acks — so unlike `dispatched`, this word means the same thing on
+		// both routes and needs no route split.
+		return "completed", true
 	case "failed":
 		return "failed", true
 	}
@@ -137,6 +156,23 @@ func ledgerStatusForMCP(route mcpDelegationRoute, mcpStatus string) (string, boo
 func updateMCPDelegationStatus(ctx context.Context, db *sql.DB, route mcpDelegationRoute,
 	workspaceID, delegationID, status, errorDetail string,
 ) ReplyAuthority {
+	return updateMCPDelegationStatusWithResult(ctx, db, route, workspaceID, delegationID,
+		status, errorDetail, "")
+}
+
+// updateMCPDelegationStatusWithResult is updateMCPDelegationStatus plus the target's
+// ANSWER (#4338). Only the async completion path passes a non-empty resultPreview;
+// every other call site funnels through the wrapper above with "", so the statement
+// below — and the strict-sqlmock expectations pinned to it — are unchanged.
+//
+// The preview matters beyond decoration: `delegations.result_preview` is what the
+// operator dashboard and the digest show for a finished delegation, and the ledger's
+// same-status replay arm can only backfill a detail column it was actually given. A
+// completion that terminalizes without its result produces a row recording THAT a
+// delegation ended and never WHAT it returned.
+func updateMCPDelegationStatusWithResult(ctx context.Context, db *sql.DB, route mcpDelegationRoute,
+	workspaceID, delegationID, status, errorDetail, resultPreview string,
+) ReplyAuthority {
 	if _, err := db.ExecContext(ctx, `
 		UPDATE activity_logs
 		SET status = $1, error_detail = CASE WHEN $2 = '' THEN error_detail ELSE $2 END
@@ -145,6 +181,13 @@ func updateMCPDelegationStatus(ctx context.Context, db *sql.DB, route mcpDelegat
 		  AND request_body->>'delegation_id' = $4
 	`, status, errorDetail, workspaceID, delegationID); err != nil {
 		log.Printf("MCP Delegation %s: status update failed: %v", delegationID, err)
+	}
+
+	// #4338: persist the answer so check_task_status — the async agent's own polling
+	// route, which reads activity_logs.response_body — does not report `completed`
+	// with nothing in it.
+	if resultPreview != "" {
+		recordAsyncMCPResultBody(ctx, db, workspaceID, delegationID, resultPreview)
 	}
 
 	// ...AND MIRROR TO THE LEDGER.
@@ -157,7 +200,7 @@ func updateMCPDelegationStatus(ctx context.Context, db *sql.DB, route mcpDelegat
 	//
 	// Gated by recordLedgerStatus, so it stays a no-op while the ledger is dark.
 	if ledgerStatus, ok := ledgerStatusForMCP(route, status); ok {
-		return recordLedgerStatus(ctx, delegationID, ledgerStatus, errorDetail, "")
+		return recordLedgerStatus(ctx, delegationID, ledgerStatus, errorDetail, resultPreview)
 	}
 	// A status the ledger does not model — it was never consulted, so it cannot have
 	// arbitrated. Never ReplyNotMine: that would VETO a reply the ledger has no
@@ -530,26 +573,31 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 			return
 		}
 
-		// ⚠ PHASE-2 BLOCKER — THE ASYNC ROUTE HAS NO COMPLETION WRITER.
+		// #4338 — THE COMPLETION WRITER. This used to be an unconditional `delivered`
+		// write, and it was the LAST status any code wrote for an async MCP delegation:
+		// `delivered` mirrors to the ledger as `in_progress`, and nothing moved it on.
+		// With DELEGATION_LEDGER_WRITE on, every async delegation would then sit at
+		// in_progress until its 6h deadline and be deadline-FAILED by the sweeper —
+		// including the ones whose target had answered an hour in.
 		//
-		// This is the LAST status any code writes for an async MCP delegation. `delivered`
-		// mirrors to the ledger as `in_progress`: the target accepted the task and is
-		// working on it. Nothing ever moves it to `completed`.
+		// The answer is already in hand: A2A message/send is a request/response RPC, so
+		// respBody is the same body the SYNC route hands straight back to its caller.
+		// What was missing was reporting it against the delegation_id.
 		//
-		// The drain stitch cannot do it: it matches activity_logs rows with
-		// method='delegate_result', and these rows are method='delegate'. The agent-facing
-		// /delegations/:id/update endpoint could, but nothing calls it on this path today.
-		//
-		// So the moment DELEGATION_LEDGER_WRITE flips on, every async MCP delegation sits
-		// at in_progress until its 6h deadline, and the sweeper fires "Delegation failed"
-		// at the caller — including for delegations whose target finished the work an hour
-		// in. A mass false-failure event on the fleet's most-used delegation route.
-		//
-		// The ledger is DARK, so nothing fires today and this is safe to merge. But it is
-		// a HARD precondition on the Phase-2 flip: the async completion path must be wired
-		// first (Phase 3, the agent-side cutover — the target must report its result
-		// against the delegation_id). Tracked as its own issue; do NOT flip the flag until
-		// it closes.
+		// BUT A 2xx IS NOT ALWAYS AN ANSWER. proxyA2ARequest mints synthetic `queued`
+		// acks — poll-mode targets, a platform boot turn in flight, a busy/settling
+		// target whose message was enqueued for drain — and in every one of those the
+		// target has not read the message yet. Terminalizing an ack would fire
+		// "Delegation completed" with an EMPTY result before the work started, which is
+		// the same false notification this issue exists to prevent, pointed the other
+		// way. asyncMCPAnswer is the gate; when it says no we fall through to exactly
+		// the previous `delivered` behaviour and the delegation stays visible as
+		// awaiting-reply until the drain, the agent's own status POST, or the sweeper
+		// resolves it.
+		if answer, ok := asyncMCPAnswer(respBody); ok {
+			completeAsyncMCPDelegation(bgCtx, h.database, callerID, targetID, delegationID, answer)
+			return
+		}
 		updateMCPDelegationStatus(bgCtx, h.database, mcpAsyncRoute, callerID, delegationID, "delivered", "")
 	})
 
