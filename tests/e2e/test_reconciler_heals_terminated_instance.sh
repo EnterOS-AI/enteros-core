@@ -481,8 +481,10 @@ ws_field() {
 # sibling and avoids a config path that only this test would exercise.
 SECRETS_JSON='{}'
 # Platform-managed path (E2E_LLM_PATH=platform, the DEFAULT for this test):
-# the workspace boots on the CP LLM proxy with NO tenant key, model
-# moonshot/kimi-k2.6 — the exact create combo test_staging_full_saas.sh uses
+# the workspace boots on the CP LLM proxy with NO tenant key, on the SSOT
+# default model (minimax/MiniMax-M2.7 via lib/model_slug.sh; was
+# moonshot/kimi-k2.6 until sdk#203 withdrew it on 2026-08-04) — the exact
+# create combo test_staging_full_saas.sh uses
 # successfully. This test only needs the workspace to reach status=online so
 # it can kill the EC2 and assert the reconciler heals it; it does NOT exercise
 # a real LLM completion, so the platform path is both sufficient and the one

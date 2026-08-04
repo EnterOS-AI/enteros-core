@@ -37,7 +37,9 @@ source "$HARNESS_ROOT/_curl.sh"
 
 TEMPLATE="${DELIVERY_TEMPLATE:-seo-agent}"
 RUNTIME="${DELIVERY_RUNTIME:-claude-code}"
-MODEL="${DELIVERY_MODEL:-moonshot/kimi-k2.6}"
+# 2026-08-04: sdk#203 withdrew moonshot/* from the platform arms; the old
+# default now 422s at workspace-create. Use the SSOT platform default.
+MODEL="${DELIVERY_MODEL:-minimax/MiniMax-M2.7}"
 # config.yaml minimum size that proves the FULL bundle was served (not the ~59B
 # stub / an error envelope). seo-agent's rendered config.yaml is ~9.3 KiB; 1 KiB
 # is a generous floor that the stub can never reach.

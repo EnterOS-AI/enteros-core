@@ -31,7 +31,7 @@ import (
 func TestEnsureCreatedWorkspaceProviderPin(t *testing.T) {
 	const secretInsert = `INSERT INTO workspace_secrets`
 
-	t.Run("platform-managed child (moonshot/kimi-k2.6) gets LLM_PROVIDER=platform pinned", func(t *testing.T) {
+	t.Run("platform-managed child (minimax/MiniMax-M2.7) gets LLM_PROVIDER=platform pinned", func(t *testing.T) {
 		mock := setupTestDB(t)
 		// setProviderSecret writes the LLM_PROVIDER row directly (no preceding
 		// existence SELECT — Create owns the fresh row, there is nothing to respect).
@@ -39,7 +39,7 @@ func TestEnsureCreatedWorkspaceProviderPin(t *testing.T) {
 			WithArgs("ws-child", sqlmock.AnyArg(), sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
-		ensureCreatedWorkspaceProviderPin(context.Background(), "ws-child", "claude-code", "moonshot/kimi-k2.6", nil)
+		ensureCreatedWorkspaceProviderPin(context.Background(), "ws-child", "claude-code", "minimax/MiniMax-M2.7", nil)
 
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("platform-managed child was NOT pinned LLM_PROVIDER=platform (the create_workspace NOT_CONFIGURED bug): %v", err)
@@ -55,12 +55,12 @@ func TestEnsureCreatedWorkspaceProviderPin(t *testing.T) {
 		if err != nil || m == nil {
 			t.Fatalf("provider registry unavailable: %v", err)
 		}
-		prov, derr := m.DeriveProvider("claude-code", "moonshot/kimi-k2.6", nil)
+		prov, derr := m.DeriveProvider("claude-code", "minimax/MiniMax-M2.7", nil)
 		if derr != nil {
-			t.Fatalf("DeriveProvider(claude-code, moonshot/kimi-k2.6) failed: %v", derr)
+			t.Fatalf("DeriveProvider(claude-code, minimax/MiniMax-M2.7) failed: %v", derr)
 		}
 		if !prov.IsPlatform() {
-			t.Fatalf("registry SSOT changed: moonshot/kimi-k2.6 no longer derives to the platform provider (got %q) — the pin logic is keyed off this", prov.Name)
+			t.Fatalf("registry SSOT changed: minimax/MiniMax-M2.7 no longer derives to the platform provider (got %q) — the pin logic is keyed off this", prov.Name)
 		}
 		if prov.Name != providers.PlatformProviderName {
 			t.Errorf("derived provider name %q != %q (the value the helper pins)", prov.Name, providers.PlatformProviderName)

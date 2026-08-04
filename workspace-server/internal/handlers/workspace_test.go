@@ -979,11 +979,11 @@ func TestWorkspaceUpdate_RuntimeField(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 	// The PATCH-runtime compat-check reads the RESOLVED model from the
 	// MODEL workspace_secret (SSOT), not the workspaces.model column.
-	// moonshot/kimi-k2.6 is registered for claude-code in the harness's
+	// minimax/MiniMax-M2.7 is registered for claude-code in the harness's
 	// provider registry, so validation passes and the UPDATE proceeds.
 	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs("cccccccc-0006-0000-0000-000000000000").
-		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("moonshot/kimi-k2.6"), 0))
+		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("minimax/MiniMax-M2.7"), 0))
 	// The runtime UPDATE now runs inside the atomic model-reset+runtime tx
 	// (no reset here, so the tx wraps only the UPDATE).
 	mock.ExpectBegin()
@@ -1645,7 +1645,7 @@ func TestWorkspaceCreate_TemplateDefaultsMissingRuntimeAndModel(t *testing.T) {
 tier: 2
 runtime: hermes
 runtime_config:
-  model: moonshot/kimi-k2.6
+  model: minimax/MiniMax-M2.7
 `)
 	if err := os.WriteFile(filepath.Join(templateDir, "config.yaml"), cfg, 0o644); err != nil {
 		t.Fatalf("write cfg: %v", err)
@@ -1702,7 +1702,7 @@ func TestWorkspaceCreate_TemplateDefaultsLegacyTopLevelModel(t *testing.T) {
 	cfg := []byte(`name: Legacy Agent
 tier: 1
 runtime: hermes
-model: moonshot/kimi-k2.5
+model: minimax/MiniMax-M2.7-highspeed
 `)
 	if err := os.WriteFile(filepath.Join(templateDir, "config.yaml"), cfg, 0o644); err != nil {
 		t.Fatalf("write cfg: %v", err)
@@ -1759,7 +1759,7 @@ func TestWorkspaceCreate_CallerModelOverridesTemplateDefault(t *testing.T) {
 	}
 	cfg := []byte(`runtime: hermes
 runtime_config:
-  model: moonshot/kimi-k2.6
+  model: minimax/MiniMax-M2.7
 `)
 	if err := os.WriteFile(filepath.Join(templateDir, "config.yaml"), cfg, 0o644); err != nil {
 		t.Fatalf("write cfg: %v", err)
@@ -1789,10 +1789,10 @@ runtime_config:
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	// Caller overrides with a different hermes-valid model — registry permits
-	// both moonshot/kimi-k2.5 and moonshot/kimi-k2.6 for hermes (P4 PR-1 native
-	// set). The template default would have been moonshot/kimi-k2.6; caller
+	// both minimax/MiniMax-M2.7-highspeed and minimax/MiniMax-M2.7 for hermes (the shared
+	// minimax platform family). The template default would have been minimax/MiniMax-M2.7; caller
 	// picks kimi-k2.5 explicitly to prove the override actually fires.
-	body := `{"name":"Custom Hermes","template":"hermes-template","model":"moonshot/kimi-k2.5"}`
+	body := `{"name":"Custom Hermes","template":"hermes-template","model":"minimax/MiniMax-M2.7-highspeed"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 

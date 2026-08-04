@@ -30,11 +30,14 @@ func TestDeriveProvider_RealManifest(t *testing.T) {
 		expect  string // provider name DeriveProvider must return
 	}{
 		// --- kimi serving split (the central P0 data fix) ---------------
-		// Platform/proxy path: the moonshot-namespaced id routes to the
-		// `platform` provider (proxy -> moonshot upstream) for claude-code.
-		// This is the "kimi-k2.6 -> moonshot (proxy)" CTO decision expressed
-		// via the platform namespace.
-		{"claude-code platform moonshot/kimi-k2.6", "claude-code", "moonshot/kimi-k2.6", []string{"ANTHROPIC_API_KEY"}, "platform"},
+		// NOTE (sdk#203, adopted 2026-08-04): the platform/proxy leg of this
+		// split — `moonshot/kimi-k2.6` -> `platform` — is WITHDRAWN. The
+		// platform's Moonshot vendor account is suspended for non-payment, so
+		// the id was removed from every runtime's platform arm and now fails
+		// CLOSED. Its fail-closed behaviour is asserted in
+		// TestDeriveProvider_PlatformArmsAreMinimaxOnly below; the BYOK legs of
+		// the split (bare kimi-* -> kimi-coding gateway) are UNAFFECTED and
+		// keep their coverage here.
 		// BYOK gateway path: bare kimi ids route to the kimi-coding gateway
 		// (api.kimi.com/coding) for claude-code — "kimi-for-coding ->
 		// kimi-coding" CTO decision.
@@ -43,9 +46,16 @@ func TestDeriveProvider_RealManifest(t *testing.T) {
 		{"claude-code byok kimi-k2", "claude-code", "kimi-k2", []string{"KIMI_API_KEY"}, "kimi-coding"},
 
 		// --- platform-model -> platform (closed set) --------------------
-		{"claude-code platform anthropic ns", "claude-code", "anthropic/claude-opus-4-7", []string{"ANTHROPIC_API_KEY"}, "platform"},
-		{"codex platform openai ns", "codex", "openai/gpt-5.4", []string{"MOLECULE_LLM_USAGE_TOKEN"}, "platform"},
-		{"hermes platform moonshot ns", "hermes", "moonshot/kimi-k2.6", []string{"ANTHROPIC_API_KEY"}, "platform"},
+		// Retargeted onto the surviving minimax-only platform arms (sdk#203).
+		// The withdrawn anthropic/*, openai/* and moonshot/* platform ids that
+		// used to be asserted here now live in
+		// TestDeriveProvider_PlatformArmsAreMinimaxOnly as fail-closed cases,
+		// so the "platform ids resolve to the closed platform provider"
+		// invariant keeps a non-vacuous positive assertion on every runtime.
+		{"claude-code platform minimax ns", "claude-code", "minimax/MiniMax-M2.7", []string{"ANTHROPIC_API_KEY"}, "platform"},
+		{"codex platform minimax ns", "codex", "minimax/MiniMax-M2.7", []string{"MOLECULE_LLM_USAGE_TOKEN"}, "platform"},
+		{"hermes platform minimax ns", "hermes", "minimax/MiniMax-M2.7", []string{"ANTHROPIC_API_KEY"}, "platform"},
+		{"openclaw platform minimax ns", "openclaw", "minimax/MiniMax-M2.7", nil, "platform"},
 
 		// --- anthropic alias + authEnv disambiguation (oauth vs api) -----
 		// Bare aliases are OAuth-only when the OAuth token is the available
@@ -621,6 +631,107 @@ func TestCodexDerivesOnlyTemplateRegistryProviders(t *testing.T) {
 		}
 		if p.Name != "openai-subscription" {
 			t.Errorf("codex default for %q = %q, want openai-subscription (the OAuth subscription default)", model, p.Name)
+		}
+	}
+}
+
+// TestDeriveProvider_PlatformArmsAreMinimaxOnly is the create-time enforcement
+// proof for the 2026-08-04 platform-arm withdrawal (molecule-ai-sdk#203, mirrored
+// by molecule-controlplane#2850 and adopted into core by the sdk/gen/go bump that
+// carries it).
+//
+// WHY THIS TEST EXISTS: the platform's Moonshot vendor account is SUSPENDED for
+// non-payment — every `moonshot/*` platform call returns HTTP 429
+// exceeded_current_quota_error in ~200ms, 100% of the time. A paying client burned
+// 2,451 failed calls over 16h while every health signal read green, because the
+// ids stayed user-selectable and a workspace could be provisioned onto one and
+// then be permanently dead. The fix is only real if selection is REFUSED, so this
+// test asserts the refusal directly rather than trusting the YAML.
+//
+// It asserts BOTH directions so neither half can rot into a vacuous pass:
+//
+//	NEGATIVE — every withdrawn id FAILS CLOSED for its runtime. Crucially it must
+//	fail, not silently fall through to a BYOK arm by prefix match: a BYOK arm
+//	would demand a tenant key the workspace does not have, turning a refusal into
+//	a different late failure. DeriveProvider returning ANY provider here is a bug.
+//	This is the exact predicate handlers.validateRegisteredModelForRuntime keys
+//	off, so a failure here is a 422 UNREGISTERED_MODEL_FOR_RUNTIME at
+//	workspace-create — refused at selection, which is the intent.
+//
+//	POSITIVE — the surviving minimax family still derives the CLOSED `platform`
+//	provider on all four runtimes, so MOLECULE_LLM_DEFAULT_MODEL
+//	(minimax/MiniMax-M2.7) remains a legal platform-billed selection everywhere.
+//	Without this half, deleting the whole platform arm would also pass.
+//
+// Restoring an id (vendor account funded / directive lifted) re-arms this test:
+// move it from withdrawn to kept and the assertion flips with it.
+func TestDeriveProvider_PlatformArmsAreMinimaxOnly(t *testing.T) {
+	m, err := LoadManifest()
+	if err != nil {
+		t.Fatalf("LoadManifest() error = %v", err)
+	}
+
+	withdrawn := map[string][]string{
+		"claude-code": {
+			"anthropic/claude-opus-4-7",
+			"anthropic/claude-opus-4-8",
+			"anthropic/claude-sonnet-4-6",
+			"moonshot/kimi-k2.6",
+			"moonshot/kimi-k2.5",
+		},
+		"hermes":   {"moonshot/kimi-k2.6", "moonshot/kimi-k2.5"},
+		"codex":    {"openai/gpt-5.4", "openai/gpt-5.4-mini"},
+		"openclaw": {"moonshot/kimi-k2.6", "moonshot/kimi-k2.5"},
+	}
+	kept := []string{
+		"minimax/MiniMax-M2.7",
+		"minimax/MiniMax-M2.7-highspeed",
+		"minimax/MiniMax-M3",
+	}
+
+	for _, rt := range []string{"claude-code", "hermes", "codex", "openclaw"} {
+		for _, model := range withdrawn[rt] {
+			t.Run("withdrawn/"+rt+"/"+model, func(t *testing.T) {
+				// nil authEnv is the create-time shape: no tenant credential is
+				// known yet, so a fall-through to a BYOK arm would be the exact
+				// silent-misroute this withdrawal must prevent.
+				if got, err := m.DeriveProvider(rt, model, nil); err == nil {
+					t.Fatalf("DeriveProvider(%q, %q, nil) = %q, want an error — "+
+						"a withdrawn platform id must fail CLOSED (422 "+
+						"UNREGISTERED_MODEL_FOR_RUNTIME at workspace-create), "+
+						"never resolve to a provider", rt, model, got.Name)
+				}
+				// The registry's own menu must not carry it either — the
+				// exact-membership predicate the live create gate uses.
+				ids, err := m.ModelsForRuntime(rt)
+				if err != nil {
+					t.Fatalf("ModelsForRuntime(%q) error = %v", rt, err)
+				}
+				for _, id := range ids {
+					if id == model {
+						t.Fatalf("ModelsForRuntime(%q) still lists withdrawn id %q", rt, model)
+					}
+				}
+			})
+		}
+		for _, model := range kept {
+			t.Run("kept/"+rt+"/"+model, func(t *testing.T) {
+				got, err := m.DeriveProvider(rt, model, nil)
+				if err != nil {
+					t.Fatalf("DeriveProvider(%q, %q, nil) error = %v — the minimax "+
+						"platform family must stay selectable on every runtime",
+						rt, model, err)
+				}
+				if got.Name != "platform" {
+					t.Fatalf("DeriveProvider(%q, %q, nil) = %q, want %q — a minimax "+
+						"platform id must derive the CLOSED platform provider, not a "+
+						"tenant-key BYOK arm", rt, model, got.Name, "platform")
+				}
+				if !got.IsPlatform() {
+					t.Fatalf("DeriveProvider(%q, %q, nil) resolved %q with IsPlatform()=false — "+
+						"platform billing must not require a tenant key", rt, model, got.Name)
+				}
+			})
 		}
 	}
 }

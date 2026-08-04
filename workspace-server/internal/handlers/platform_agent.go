@@ -960,6 +960,19 @@ func (h *WorkspaceHandler) reconcileExistingConciergeModel(ctx context.Context, 
 	// envVars for this provision). This also covers a stale/unknown id that does
 	// not derive to the platform provider — left to the customer-pick path rather
 	// than auto-rewritten.
+	//
+	// KNOWN GAP, deliberately NOT closed here (2026-08-04, sdk#203 adoption): an
+	// id the registry has since WITHDRAWN (e.g. moonshot/kimi-k2.6 after the
+	// platform's Moonshot vendor account was suspended) also stops deriving to
+	// `platform`, so a concierge already stored on one is read here as a customer
+	// BYOK pick and FROZEN on a model that can no longer be served. Auto-rewriting
+	// every non-deriving id was tried and REJECTED: it also rewrites genuinely
+	// customer-chosen ids that happen to be unroutable for unrelated registry
+	// reasons (e.g. a colon-form `anthropic:claude-opus-4-8` on hermes), which is
+	// exactly the platform-overrides-customer violation the CTO directive forbids.
+	// Closing this properly needs a WITHDRAWN-vs-never-registered distinction the
+	// registry does not currently express. Blast radius today is zero: no live
+	// workspace is stored on a withdrawn id (verified 2026-08-04).
 	if !conciergeModelIsPlatformManaged(runtime, existing) {
 		return
 	}

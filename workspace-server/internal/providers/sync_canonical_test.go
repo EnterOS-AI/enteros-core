@@ -28,7 +28,12 @@ import (
 // canonicalRegistrySHA256 is the sha256 of the SDK llm-registry.yaml the binary
 // embeds via llmregistry.RawYAML. Bumped deliberately on each SDK registry
 // adoption (see file doc).
-const canonicalRegistrySHA256 = "afe74510fc295278a6e26922a832798c6d36f18cf026cdfae40cac0c48526395"
+// 2026-08-04 adoption: molecule-ai-sdk#203 (merged 1426a986) narrowed every
+// runtime's `platform` arm to minimax-only after the platform's Moonshot vendor
+// account was suspended for non-payment (moonshot/* platform calls 429 in
+// ~200ms, 100% of the time). Adopted here so core's create-time
+// validateRegisteredModelForRuntime and the canvas menu see the withdrawal.
+const canonicalRegistrySHA256 = "42f891573505c410dcef459bae20d615036226076544ae9e6fd58eb52d716254"
 
 func TestSyncedYAMLMatchesCanonicalSHA(t *testing.T) {
 	sum := sha256.Sum256(embeddedYAML)

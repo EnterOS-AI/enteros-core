@@ -374,21 +374,21 @@ runtime_config:
 }
 
 // TestEnsureDefaultConfig_StampsDerivedProvider pins RFC#340 Fix A: a
-// canvas-created claude-code workspace with model "moonshot/kimi-k2.6" must
+// canvas-created claude-code workspace with model "minimax/MiniMax-M2.7" must
 // have the manifest-derived provider stamped into config.yaml at BOTH the top
 // level and under runtime_config, so the cp#329 config-bundle the adapter
 // reads no longer leaves the runtime to slash-split "moonshot/..." → an
 // unregistered provider="moonshot" (the original NOT_CONFIGURED boot). The
-// canonical manifest exact-id-matches "moonshot/kimi-k2.6" to provider=platform.
+// canonical manifest exact-id-matches "minimax/MiniMax-M2.7" to provider=platform.
 func TestEnsureDefaultConfig_StampsDerivedProvider(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 
-	files, err := handler.ensureDefaultConfig("ws-moonshot", models.CreateWorkspacePayload{
-		Name:    "Kimi Agent",
+	files, err := handler.ensureDefaultConfig("ws-platform-model", models.CreateWorkspacePayload{
+		Name:    "Platform Model Agent",
 		Tier:    2,
 		Runtime: "claude-code",
-		Model:   "moonshot/kimi-k2.6",
+		Model:   "minimax/MiniMax-M2.7",
 	})
 	if err != nil {
 		t.Fatalf("ensureDefaultConfig failed: %v", err)
@@ -412,8 +412,8 @@ func TestEnsureDefaultConfig_StampsDerivedProvider(t *testing.T) {
 		t.Errorf("runtime_config.provider = %q, want platform\n%s", parsed.RuntimeConfig.Provider, files["config.yaml"])
 	}
 	// The claude-code model normalization still strips the slash prefix.
-	if parsed.Model != "kimi-k2.6" {
-		t.Errorf("top-level model = %q, want kimi-k2.6\n%s", parsed.Model, files["config.yaml"])
+	if parsed.Model != "MiniMax-M2.7" {
+		t.Errorf("top-level model = %q, want MiniMax-M2.7\n%s", parsed.Model, files["config.yaml"])
 	}
 }
 
@@ -1729,7 +1729,7 @@ func TestProvisionWorkspaceCP_NoInternalErrorsInBroadcast(t *testing.T) {
 		// one. The slash form derives the platform provider so the workspace
 		// routes platform (proxy env set) and reaches the downstream path this
 		// test exercises (the colon form would derive BYOK and abort).
-		Model: "anthropic/claude-opus-4-7",
+		Model: "minimax/MiniMax-M2.7",
 	})
 
 	if cap.lastData == nil {
@@ -1947,7 +1947,7 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed(t *testing.T) {
 		// one. The slash form derives the platform provider so the workspace
 		// routes platform (proxy env set) and reaches the downstream path this
 		// test exercises (the colon form would derive BYOK and abort).
-		Model: "anthropic/claude-opus-4-7",
+		Model: "minimax/MiniMax-M2.7",
 	})
 
 	if cap.lastData == nil {
@@ -2031,7 +2031,7 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_RetrySucceeds(t *testing.T) 
 		// one. The slash form derives the platform provider so the workspace
 		// routes platform (proxy env set) and reaches the downstream path this
 		// test exercises (the colon form would derive BYOK and abort).
-		Model: "anthropic/claude-opus-4-7",
+		Model: "minimax/MiniMax-M2.7",
 	})
 
 	// No failure broadcast should have fired.
