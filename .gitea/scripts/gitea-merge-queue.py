@@ -300,9 +300,16 @@ MERGE_STATUS_RETRY_DELAY_SECONDS = 0.5
 
 # Required contexts for push (main/staging) runs. The push CI uses the same
 # aggregator names with " (push)" suffix. Checking these explicitly instead of
-# the combined state avoids false-pause when non-blocking jobs (e.g. Platform
-# Go with continue-on-error: true due to mc#774) have failed — their failures
-# pollute the combined state but do not block merges.
+# the combined state avoids false-pause when a genuinely non-blocking job has
+# failed — such a failure pollutes the combined state but does not block merges.
+#
+# The example this comment used to cite ("Platform Go with continue-on-error:
+# true due to mc#774") is STALE and was actively misleading: mc#774 was closed
+# 2026-07-08 as CLOSE_STALE by org triage — not because the mask was retired —
+# and `platform-build` has carried `continue-on-error: false` since the RFC #219
+# Phase 4 flip. Platform (Go) IS blocking: it is a `needs:` of the `all-required`
+# sentinel, which is a branch-protection required context. Do not treat a red
+# Platform (Go) as ignorable on the strength of this comment.
 PUSH_REQUIRED_CONTEXTS_RAW = _env(
     "PUSH_REQUIRED_CONTEXTS",
     default="CI / all-required (push)",

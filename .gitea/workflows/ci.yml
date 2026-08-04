@@ -120,9 +120,12 @@ jobs:
     #   (1) 4x delegation_test.go sqlmock gaps (PR #669 / #634 fix-forward, closed).
     #   (2) TestMCPHandler_CommitMemory_GlobalScope_Blocked (mcp_test.go:433):
     #       OFFSEC-001 hardening collided with test assertion; tracked in mc#762.
-    # Fix-forward for (1) landed in PR #669. The mc#762 gap (2) is a separate
-    # issue — it does NOT block this flip because the test is already wrapped in
-    # the diagnostic step with its own continue-on-error: true (line 203).
+    # Fix-forward for (1) landed in PR #669. The mc#762 gap (2) was likewise
+    # fixed forward; the "it is wrapped in the diagnostic step's own
+    # continue-on-error: true" escape clause that used to sit here is GONE —
+    # that step-level mask was removed (see "Race + verbose per-package gate"
+    # below), so mcp_test.go is now gated by both the coverage lane and the
+    # race lane like every other test.
     # Flip confirmed by CI / Platform (Go) status = success on main HEAD 363905d3.
     continue-on-error: false
     # Job-level ceiling. The go test step below runs with a per-step 10m timeout;
@@ -266,26 +269,105 @@ jobs:
         name: Run golangci-lint
         run: $(go env GOPATH)/bin/golangci-lint run --timeout 3m ./...
       - if: ${{ needs.changes.outputs.platform == 'true' }}
-        name: Diagnostic — per-package verbose 60s
-        # DIAGNOSTIC ONLY (continue-on-error below): this step exists to dump
-        # verbose per-package output for triage, NOT to gate. The blocking gate
-        # is "Run tests with coverage (blocking gate)" immediately below. The
-        # `set +e` / swallowed exits here are intentional — do not "fix" them
-        # like a gate; the real gate is the next step.
+        name: Race + verbose per-package gate (blocking gate)
+        # WAS "Diagnostic — per-package verbose 60s": `set +e`, exits captured
+        # into `handlers_exit`/`pu_exit`, ECHOED into a `::group::` header and
+        # never asserted, under a step-level `continue-on-error: true`. Two
+        # independent defects, both fixed here.
+        #
+        # (1) THE STEP COULD NOT FAIL. Echoing an exit code is not asserting it,
+        #     and the step mask converted any failure to a green job anyway
+        #     (Gitea Quirk #10). NOTHING lints this: both
+        #     lint-no-coe-on-required.py and lint_continue_on_error_tracking.py
+        #     walk `jobs.<key>.continue-on-error` ONLY and deliberately skip
+        #     step-level masks ("Job-step continue-on-error is intentionally NOT
+        #     considered"), so the `mc#2654` tracker comment that sat on this
+        #     mask was validated by no gate at all — and mc#2654 has been CLOSED
+        #     since 2026-06-28. A required context that cannot fail reads as
+        #     coverage while providing none.
+        #
+        # (2) THE TIMEOUT WAS STRUCTURALLY IMPOSSIBLE, so the step had a 0% pass
+        #     rate. `internal/handlers` measures ~63s WITHOUT -race and ~99s WITH
+        #     it in this very job (main 5920b0066 / run 615037: "ok ... 62.589s"
+        #     in the coverage gate, "ok ... 98.899s" in the race lane). A
+        #     `-race -timeout 60s` run of that package can never reach its own
+        #     end: every run died on `panic: test timed out after 1m0s`. Checked
+        #     6/6 consecutive runs (615037, 614974, 614934, 614855, 614658,
+        #     614561): all six printed `handlers exit=1`, all six posted
+        #     `CI / Platform (Go)` = success.
+        #
+        #     It is a timeout artifact, NOT a hung test. The name under
+        #     `running tests:` differed in every one of the six runs
+        #     (TestFinalizeNonDispatchedDelegation_CleanupBudgetIsGenerousSharedBound 0s,
+        #     TestManifest_RefPinning_AllSHAsReachable 3s and 5s,
+        #     TestManifest_RefPinning_WorkspaceTemplatesIncludeConfigYAML 2s,
+        #     TestMCPPluginDeliveryContract_MCPServerAdaptorRoutesThroughPort 0s,
+        #     TestRequests_Respond_NoNotifyForUserRequester 0s) and each had a
+        #     tiny elapsed time — the alarm simply names whichever test was
+        #     executing at the 60s mark. The same packages are race-clean under
+        #     `-timeout 10m` in the advisory lane below, so there is no
+        #     concurrency defect to paper over; the cap was just 39s short.
+        #
+        # The timeout now matches the authoritative lanes (10m ≈ 6x the measured
+        # 99s) so the run can finish, and both exits are asserted BY NAME.
+        # Consequence: -race becomes BLOCKING for these two packages. The
+        # whole-tree `go test -race -timeout 10m ./...` step below stays
+        # advisory, so mc#1184 (cold-runner whole-tree race COMPILE of ~31
+        # packages taking 13-25 min) is not reversed — this step race-compiles
+        # two packages and measured 62s to the 60s alarm.
+        #
+        # Deleting the step instead was considered and rejected: the coverage
+        # gate below runs WITHOUT -race, so this is the only place these two
+        # packages are gated under the race detector, and the only place their
+        # per-test `-v` output is produced. That output is load-bearing — under
+        # the old 60s cap the package died before ever reaching, e.g., PR #5046's
+        # TestClearWorkspaceInstanceIDAfterStop_* (absent from run 614974's
+        # verbose log entirely), so "my tests ran" was unverifiable from CI.
+        #
+        # `${PIPESTATUS[0]}`, not `$?`: after `go test ... | tee`, `$?` is TEE's
+        # status. It read correctly only because this runner's default shell
+        # happens to carry `-o pipefail`. A gate must not depend on a shell
+        # default (see the dash-pipefail-varies-by-build class).
         run: |
           set +e
-          go test -race -v -timeout 60s ./internal/handlers/... 2>&1 | tee /tmp/test-handlers.log
-          handlers_exit=$?
-          go test -race -v -timeout 60s ./internal/pendinguploads/... 2>&1 | tee /tmp/test-pu.log
-          pu_exit=$?
+          go test -race -v -timeout 10m ./internal/handlers/... 2>&1 | tee /tmp/test-handlers.log
+          handlers_exit=${PIPESTATUS[0]}
+          go test -race -v -timeout 10m ./internal/pendinguploads/... 2>&1 | tee /tmp/test-pu.log
+          pu_exit=${PIPESTATUS[0]}
+          set -e
           echo "::group::handlers exit=$handlers_exit (last 100 lines)"
           tail -100 /tmp/test-handlers.log
           echo "::endgroup::"
           echo "::group::pendinguploads exit=$pu_exit (last 100 lines)"
           tail -100 /tmp/test-pu.log
           echo "::endgroup::"
-        # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-        continue-on-error: true
+
+          failed=""
+          # Non-vacuity: `go test` exits 0 with "no tests to run"/"[no test
+          # files]" if a package's tests stop compiling into the binary (build
+          # tag, rename, wrong path) — a green that executed nothing. Require at
+          # least one per-test verdict line from -v in each log.
+          if ! grep -qE '^--- (PASS|FAIL|SKIP): ' /tmp/test-handlers.log; then
+            failed="$failed internal/handlers(no-tests-executed)"
+            echo "::error::race+verbose gate executed ZERO tests in ./internal/handlers/... — vacuous pass (check the package path and that its _test.go files still compile in)."
+          fi
+          if ! grep -qE '^--- (PASS|FAIL|SKIP): ' /tmp/test-pu.log; then
+            failed="$failed internal/pendinguploads(no-tests-executed)"
+            echo "::error::race+verbose gate executed ZERO tests in ./internal/pendinguploads/... — vacuous pass (check the package path and that its _test.go files still compile in)."
+          fi
+          if [ "$handlers_exit" -ne 0 ]; then
+            failed="$failed internal/handlers(exit=$handlers_exit)"
+            echo "::error::race+verbose gate FAILED: go test -race -timeout 10m ./internal/handlers/... exited $handlers_exit. See the 'handlers exit=' group above for the last 100 lines."
+          fi
+          if [ "$pu_exit" -ne 0 ]; then
+            failed="$failed internal/pendinguploads(exit=$pu_exit)"
+            echo "::error::race+verbose gate FAILED: go test -race -timeout 10m ./internal/pendinguploads/... exited $pu_exit. See the 'pendinguploads exit=' group above for the last 100 lines."
+          fi
+          if [ -n "$failed" ]; then
+            echo "::error::Platform (Go) race+verbose gate failed for:$failed"
+            exit 1
+          fi
+          echo "race+verbose gate: internal/handlers + internal/pendinguploads passed under -race ✓"
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Run tests with coverage (blocking gate)
         # Removed -race from the blocking gate per #1184: cold runners
@@ -376,16 +458,24 @@ jobs:
         # molecule-ai-org-template-molecule-dev and runs the real !include /
         # !external resolver against it. It USED to run implicitly in the
         # default `go test` lanes, but its `git clone` + nested !external git
-        # fetch add UNBOUNDED, VARIABLE network time — under the diagnostic
-        # `go test -race -v -timeout 60s ./internal/handlers/...` step above,
-        # that variable time is what tipped the whole (already ~60s-under-race)
-        # package over the per-package cap, producing the recurring
-        # `panic: test timed out after 1m0s` flake. The test is now gated behind
-        # MOLECULE_LIVE_ORG_TEMPLATE=1 so the default lanes skip it instantly;
-        # the resolver logic stays covered there by the hermetic
+        # fetch add UNBOUNDED, VARIABLE network time — under what was then the
+        # `go test -race -v -timeout 60s ./internal/handlers/...` diagnostic step
+        # above, that variable time was blamed for tipping the whole (already
+        # "~60s-under-race") package over the per-package cap, producing the
+        # recurring `panic: test timed out after 1m0s`. The test is now gated
+        # behind MOLECULE_LIVE_ORG_TEMPLATE=1 so the default lanes skip it
+        # instantly; the resolver logic stays covered there by the hermetic
         # TestResolveYAMLIncludes_* fixture tests. This dedicated step restores
         # the live smoke with a generous 5m timeout (no 60s cap, no -race), so
         # network latency can never manufacture a timeout.
+        #
+        # CORRECTION: removing this test did NOT stop the panic — the diagnostic
+        # kept timing out on every run afterwards, naming a different (fast,
+        # network-free) test each time. The package needs ~99s under -race
+        # regardless; the 60s cap was the whole cause and network time was only
+        # what made it visible first. The cap is now 10m (see the race gate
+        # above). This step is still worth keeping on its own merits: it gives
+        # the live composition a bounded, race-free, network-tolerant lane.
         #
         # Blocking is safe from network flakes: a clone/fetch failure or the
         # deliberately-held-broken molecule-dev-department@v1.0.0 !external ref
