@@ -426,3 +426,76 @@ func TestLiveBox_FilesAPIContainmentHoldsOnARunningBox(t *testing.T) {
 	}
 	t.Logf("containment: %d escape attempts, all contained", checks)
 }
+
+// TestLiveBox_FilesAPIPluginsRootResolvesToTheInstalledTree covers the SECOND,
+// independent false-negative on this endpoint: `?root=/plugins`.
+//
+// `?path=plugins` and `?root=/plugins` name the same tree, and on the EIC leg
+// they resolve to the same place (#236 gave it resolveWorkspaceRootPath, which
+// maps /plugins -> <configBase>/plugins). The docker-exec leg never got that
+// indirection: it passed the ?root= through literally, `find /plugins` failed
+// because no such directory exists in a workspace container, and the handler
+// fell through to the host-side legs and answered `200 []`.
+//
+// Measured on a real box BEFORE the fix — same endpoint, same tree, two answers:
+//
+//	?path=plugins  -> 200 [registry.json, beta(dir), alpha(dir)]
+//	?root=/plugins -> 200 []
+//	docker exec ls /plugins -> No such file or directory
+//
+// `[]` for a populated tree is the exact shape of the 2026-08-02 incident, so
+// this asserts POSITIVELY on the seeded entries and hard-fails on empty first.
+func TestLiveBox_FilesAPIPluginsRootResolvesToTheInstalledTree(t *testing.T) {
+	cli := liveDockerOrSkip(t)
+	box := startLiveBox(t)
+	seedReadSurfaceBox(t, box)
+	h := &TemplatesHandler{docker: cli}
+
+	// Ground truth from the box, independent of the handler: /configs/plugins
+	// is populated and the bare /plugins does not exist.
+	out, err := exec.Command("docker", "exec", box, "sh", "-c",
+		"ls -A /configs/plugins | tr '\n' ' '").CombinedOutput()
+	if err != nil {
+		t.Fatalf("read ground truth from the box: %v: %s", err, out)
+	}
+	if !strings.Contains(string(out), "alpha") {
+		t.Fatalf("the box was not seeded as expected (/configs/plugins = %q) — "+
+			"the assertions below would prove nothing", out)
+	}
+
+	wireMockDBForListFiles(t, liveWorkspaceID)
+	code, body := callListFiles(t, h, liveWorkspaceID, "root=/plugins")
+	got := entries(listOrFatalOnEmpty(t, code, body,
+		"?root=/plugins against a container whose /configs/plugins holds 3 entries"))
+
+	checks := 0
+	for _, want := range []string{"alpha", "beta", "registry.json"} {
+		e := got.find(want)
+		if e == nil {
+			t.Errorf("?root=/plugins omitted %q. The plugins root must resolve to the "+
+				"INSTALLED tree (<configBase>/plugins), not the bare /plugins that does "+
+				"not exist in a workspace container. Listing was: %s", want, body)
+			continue
+		}
+		checks++
+		if want != "registry.json" && !e.Dir {
+			t.Errorf("%q must be listed with dir:true, got %+v", want, *e)
+		}
+	}
+	if checks == 0 {
+		t.Fatal("ZERO entries matched — ?root=/plugins proved nothing. Fix the root " +
+			"resolution; do not weaken this expectation.")
+	}
+
+	// The two spellings of the same tree must agree. This is the invariant that
+	// actually failed: one endpoint answering two ways by backend.
+	wireMockDBForListFiles(t, liveWorkspaceID)
+	code2, body2 := callListFiles(t, h, liveWorkspaceID, "root=/configs&path=plugins")
+	viaPath := entries(listOrFatalOnEmpty(t, code2, body2, "?root=/configs&path=plugins"))
+	if len(viaPath) != len(got) {
+		t.Errorf("?root=/plugins returned %d entries but ?root=/configs&path=plugins returned %d — "+
+			"the same tree must not depend on how it is addressed.\n  root=/plugins: %s\n  path=plugins: %s",
+			len(got), len(viaPath), body, body2)
+	}
+	t.Logf("?root=/plugins resolved to the installed tree: %d entries, %d assertions", len(got), checks)
+}

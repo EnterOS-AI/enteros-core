@@ -39,6 +39,49 @@ const (
 	filesSourceNone       = "none"
 )
 
+// containerConfigBase is the managed-config dir inside a local-docker
+// workspace CONTAINER. Unlike the EC2 layout it does NOT vary by runtime.
+const containerConfigBase = "/configs"
+
+// resolveContainerRootPath maps a Files-API ?root= onto its absolute path
+// inside a local-docker workspace container.
+//
+// THE BUG THIS FIXES. `?root=/plugins` listed the bare, literal `/plugins`,
+// which does not exist in a workspace container at all. `find` failed, the
+// handler logged "falling back to host" and fell through to the mirror /
+// template legs, and the caller got `200 []` — the same false-negative shape
+// as an absent subpath. Measured on a real container:
+//
+//	?path=plugins  -> 200 [registry.json, beta(dir), alpha(dir)]
+//	?root=/plugins -> 200 []          <- same tree, same endpoint
+//	docker exec ls /plugins -> No such file or directory
+//
+// Installed plugins live under <configBase>/plugins — the pull-model
+// materializer, the boot-installer and listPlugins all write there. The EIC
+// leg was given this indirection in #236 (resolveWorkspaceRootPath); the
+// docker leg never was, so one endpoint answered two different ways depending
+// on which backend served it.
+//
+// WHY NOT REUSE resolveWorkspaceRootPath. That resolver encodes the EC2 VM
+// layout, where each runtime owns /home/ubuntu/.<runtime>. A container's
+// config dir is /configs for EVERY runtime. Reusing it here would resolve
+// `?root=/configs` on an openclaw workspace to /home/ubuntu/.openclaw —
+// verified absent on a real box — breaking the one leg that currently works.
+// The `/plugins` indirection is the part that genuinely generalises; the
+// per-runtime prefix is not.
+//
+// Bare /plugins is only the read-only image-baked plugin REGISTRY
+// (PLUGINS_DIR -> LocalResolver), a separate code path never routed here.
+func resolveContainerRootPath(root string) string {
+	if root == "/plugins" {
+		// Deliberately string concatenation, not filepath.Join: this is a path
+		// INSIDE a Linux container being built by a server that may be
+		// compiled for Windows, where filepath.Join yields backslashes.
+		return containerConfigBase + "/plugins"
+	}
+	return root
+}
+
 // errListPathAbsent signals the requested ?path= does not exist under the
 // resolved backend root — a 404, distinct from an escape attempt (400).
 var errListPathAbsent = errors.New("list path absent")

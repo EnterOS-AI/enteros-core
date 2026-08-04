@@ -440,9 +440,14 @@ func (h *TemplatesHandler) ListFiles(c *gin.Context) {
 		}
 		depth = n
 	}
-	listPath := rootPath
+	// The docker-exec leg reads a CONTAINER, whose managed-config dir is
+	// /configs for every runtime. resolveContainerRootPath applies the one
+	// indirection that genuinely differs there — `/plugins` lives under
+	// <configBase>/plugins, not at the bare, nonexistent `/plugins`.
+	containerRoot := resolveContainerRootPath(rootPath)
+	listPath := containerRoot
 	if subPath != "" {
-		listPath = rootPath + "/" + subPath
+		listPath = containerRoot + "/" + subPath
 	}
 
 	var wsName, instanceID, runtime string
