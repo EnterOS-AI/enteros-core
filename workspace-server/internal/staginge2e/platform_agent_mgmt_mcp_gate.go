@@ -300,3 +300,17 @@ func ClassifyProvisionedWorkspace(kind, status string) (ok bool, reason string) 
 // previous cap of 200 sliced that apart mid-identifier and left every red run
 // unexplainable without a live reproduction.
 const a2aTurnLogCap = 4000
+
+// truncate bounds a body for logging, appending an ellipsis when it cuts.
+//
+// Lives here (untagged) so the tagged live tests and the untagged gate/unit
+// tests share ONE definition — the same reason containsStr lives here. It moved
+// out of the staging_e2e-tagged concierge_platform_test.go in core#5052 so
+// a2aTurnLogCap could be proved against a real failure body without a live
+// tenant.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}

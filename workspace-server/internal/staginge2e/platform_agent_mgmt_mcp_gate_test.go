@@ -369,3 +369,32 @@ func TestClassifyProvisionedWorkspaceRefusesEveryTerminalBadStatus(t *testing.T)
 		}
 	}
 }
+
+// TestA2ATurnLogCapSurvivesTheRuntimeFailureText pins the log cap against the
+// exact shape that defeated it (core#5052).
+//
+// The old cap was 200. The runtime answers a failed tool-use turn with
+// `Model generated invalid tool call: <tool-id>` wrapped in a JSON-RPC message
+// envelope; the envelope alone is ~145 chars, so 200 sliced the tool id — the
+// one field naming WHY the turn failed — apart mid-word. This test fails if the
+// cap ever regresses below a real sample of that response.
+func TestA2ATurnLogCapSurvivesTheRuntimeFailureText(t *testing.T) {
+	// A real red-run body, verbatim except for the id/messageId values.
+	sample := `{"id":"e2e-mcp-52efb491","jsonrpc":"2.0","result":{"kind":"message",` +
+		`"messageId":"aa7d2518-287b-45c5-82e2-9a2da30b9ca5","parts":[{"kind":"text",` +
+		`"text":"Model generated invalid tool call: mcp__molecule_platform__provision_workspace"}],` +
+		`"role":"agent"}}`
+
+	if got := truncate(sample, a2aTurnLogCap); got != sample {
+		t.Fatalf("a2aTurnLogCap=%d truncates a real failure body (len=%d) — the diagnostic would be lost again:\n%s",
+			a2aTurnLogCap, len(sample), got)
+	}
+	// Guard the regression directly: the OLD cap must be demonstrably too small,
+	// so this test is a fail-before proof and not a tautology.
+	if truncate(sample, 200) == sample {
+		t.Fatalf("sample is not long enough to prove the 200-char cap was lossy (len=%d)", len(sample))
+	}
+	if strings.Contains(truncate(sample, 200), "provision_workspace") {
+		t.Errorf("the 200-char cap unexpectedly preserved the tool id; sample no longer reproduces the blindness")
+	}
+}
