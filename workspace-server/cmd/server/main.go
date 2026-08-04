@@ -43,7 +43,6 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/desktopgateway"
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/envx"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/handlers"
 	memwiring "git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/wiring"
@@ -285,20 +284,23 @@ func main() {
 	hostStateDir := provisioner.ResolveWorkspaceStateBaseDir()
 
 	// CORE-served boot-config token delivery (the FINAL, platform-agnostic config
-	// path — no R2, no CP dependency). Dark by default: create the ONE shared
-	// token store only when MOLECULE_BOOT_CONFIG_ENABLE is truthy, and hand the
-	// SAME instance to the mint side (CPProvisioner) and the serve side
-	// (BootConfigHandler, wired in router.Setup) so they cannot drift. When nil,
-	// no token is minted and the boot-config endpoint 404s — byte-identical to a
-	// deployment that never had the feature.
+	// path — no R2, no CP dependency). ON by default (core#5047): create the ONE
+	// shared token store and hand the SAME instance to the mint side
+	// (CPProvisioner) and the serve side (BootConfigHandler, wired in
+	// router.Setup) so they cannot drift. An operator can still switch it off
+	// without a redeploy via MOLECULE_BOOT_CONFIG_ENABLE=0|false|no|off — the
+	// store is then nil, no token is minted and the boot-config endpoint 404s,
+	// byte-identical to a deployment that never had the feature.
 	var bootTokens *provisioner.BootConfigTokenStore
-	if envx.Bool("MOLECULE_BOOT_CONFIG_ENABLE", false) {
+	if bootConfigEnabled() {
 		ttl := provisioner.BootConfigTokenTTL
 		if d, derr := time.ParseDuration(strings.TrimSpace(os.Getenv("MOLECULE_BOOT_CONFIG_TTL"))); derr == nil && d > 0 {
 			ttl = d
 		}
 		bootTokens = provisioner.NewBootConfigTokenStore(ttl)
 		log.Printf("Boot-config token delivery: ENABLED (ttl=%s) — runtime fetches config from the tenant-server at boot (no R2, no CP)", ttl)
+	} else {
+		log.Printf("Boot-config token delivery: DISABLED via MOLECULE_BOOT_CONFIG_ENABLE — no token minted, /boot-config 404s")
 	}
 
 	var prov *provisioner.Provisioner

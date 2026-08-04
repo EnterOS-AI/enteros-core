@@ -98,10 +98,13 @@ func NewPluginsHandler(pluginsDir string, docker *client.Client, restartFunc fun
 	sources := plugins.NewRegistry()
 	sources.Register(plugins.NewLocalResolver(pluginsDir))
 	sources.Register(plugins.NewGithubResolver())
-	// gitea:// resolves a (private) Gitea repo subpath with PAT auth —
-	// the channel declared plugins use post-boot (RFC#2843). Reads its PAT
-	// from MOLECULE_TEMPLATE_REPO_TOKEN at Fetch time (CP PR#850 places it
-	// on every tenant box).
+	// gitea:// resolves a (private) Gitea repo subpath — the channel
+	// declared plugins use post-boot (RFC#2843). molecule-core#4997: its
+	// credential is resolved PER HOST at Fetch time (MOLECULE_GIT_TOKENS →
+	// MOLECULE_GIT_TOKEN__<HOST> → MOLECULE_TEMPLATE_REPO_TOKEN), so a repo
+	// the CUSTOMER owns and keeps private is read with that org's OWN
+	// read-only credential rather than the platform-wide template PAT —
+	// which must not be extended to third-party private repos.
 	sources.Register(plugins.NewGiteaResolver())
 	logInstallLimitsOnce(os.Stderr)
 	return &PluginsHandler{

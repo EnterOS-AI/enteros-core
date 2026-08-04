@@ -403,9 +403,37 @@ jobs:
           # free pass. Only top-level results count.
           npass=$(grep -c -E '^--- PASS: TestLiveBox_' "$LOG" || true)
           nskip=$(grep -c -E '^[[:space:]]*--- SKIP: TestLiveBox_' "$LOG" || true)
-          declared=$(grep -c '^func TestLiveBox_' ./internal/handlers/plugin_settings_writer_live_test.go || true)
-          if [ "${declared:-0}" -eq 0 ]; then
-            echo "::error::found ZERO 'func TestLiveBox_' declarations in internal/handlers/plugin_settings_writer_live_test.go — the file moved or was renamed, so this arm cannot check anything. Point it at the new path; do NOT delete it."
+          # The live suite spans MORE THAN ONE FILE: the WRITE proof
+          # (plugin_settings_writer_live_test.go) and the READ-surface proof
+          # (files_read_surface_live_test.go, the 2026-08-02 incident — a listing that
+          # reported ABSENCE when it meant COULD-NOT-LOOK). Enumerate them; a
+          # single-file `declared` would make `npass > declared` fire the moment
+          # the second file's tests ran, which is exactly the error the previous
+          # shape emitted and told the reader to fix by widening the grep.
+          LIVE_TEST_FILES="./internal/handlers/plugin_settings_writer_live_test.go ./internal/handlers/files_read_surface_live_test.go"
+          declared=0
+          for f in $LIVE_TEST_FILES; do
+            if [ ! -f "$f" ]; then
+              echo "::error::live-container gate: $f is missing — a file in the live suite moved or was renamed, so 'declared' no longer describes the suite. Point LIVE_TEST_FILES at the new path; do NOT delete the entry."
+              exit 1
+            fi
+            n=$(grep -c '^func TestLiveBox_' "$f" || true)
+            if [ "${n:-0}" -eq 0 ]; then
+              echo "::error::found ZERO 'func TestLiveBox_' declarations in $f — its tests were renamed away or the file was emptied, so this arm cannot check anything. Point LIVE_TEST_FILES at the new path; do NOT delete the entry."
+              exit 1
+            fi
+            declared=$((declared + n))
+          done
+          # Cross-check against the WHOLE package. If a TestLiveBox_* is declared
+          # in a file that is NOT in LIVE_TEST_FILES, `declared` silently
+          # understates the suite and the `npass > declared` arm below would fire
+          # with a confusing message. Catch it here and say what to do instead.
+          # grep -rh (no -c) prints the matching LINES across the tree; counting
+          # them with `wc -l` needs no `bc`/`paste`, which are not guaranteed in
+          # the job container.
+          pkgdeclared=$(grep -rh '^func TestLiveBox_' ./internal/handlers/ 2>/dev/null | wc -l | tr -d ' ')
+          if [ "${pkgdeclared:-0}" -ne "${declared:-0}" ]; then
+            echo "::error::live-container gate: ${pkgdeclared} 'func TestLiveBox_' declarations exist in internal/handlers/ but LIVE_TEST_FILES only accounts for ${declared}. A live test was added in an unenumerated file — add that file to LIVE_TEST_FILES (and bump LIVE_MIN) so the floor and the declared-count still describe the suite this step measures."
             exit 1
           fi
           echo "TestLiveBox_: ${npass} passed, ${nskip} skipped, ${declared} declared"
@@ -426,16 +454,17 @@ jobs:
           # "artifact real, wiring absent" shape the step was written to close,
           # reappearing inside the guard itself.
           #
-          # So require a FLOOR, and name the one test that must have run.
-          # LIVE_MIN is the count of ALL TestLiveBox_* (7), NOT the count of
-          # Docker-gated ones (5). npass counts every matching PASS line, and two
-          # of the seven are pure unit tests, so a floor of 5 leaves exactly two
-          # tests of slack: drop RealWriterLandsSettingsOnARunningWorkspace and
+          # So require a FLOOR, and name the tests that must have run.
+          # LIVE_MIN is the count of ALL TestLiveBox_* (14), NOT the count of
+          # Docker-gated ones. npass counts every matching PASS line, and two
+          # of them are pure unit tests, so a floor that excluded them leaves
+          # exactly two tests of slack: drop RealWriterLandsSettingsOnARunningWorkspace and
           # DeliverReportsWhenTheReloadDidNotConfirm — the two that drive the ACTUAL
           # entry point including backend dispatch, not just the copy primitive —
           # and the step still scores 5 and reports GREEN. Measured population and
           # threshold population must be the same one.
-          LIVE_MIN=7
+          # 9 write-side + 5 read-surface = 14.
+          LIVE_MIN=14
           # Second, independent arm: EVERY TestLiveBox_* declared in the file must
           # have produced a top-level PASS. The floor alone couples this gate to a
           # constant someone has to remember to bump — a reviewer pointed out that
@@ -449,15 +478,15 @@ jobs:
           # falls with a deletion, so on its own it would bless shrinking the suite
           # to nothing. Deletion must remain a conscious edit to LIVE_MIN.
           if [ "${npass:-0}" -lt "$declared" ]; then
-            echo "::error::live-container gate: ${declared} TestLiveBox_* are declared in plugin_settings_writer_live_test.go but only ${npass} produced a top-level PASS. A declared test did not run — check the -run regex, a build tag, or a rename."
+            echo "::error::live-container gate: ${declared} TestLiveBox_* are declared across ${LIVE_TEST_FILES} but only ${npass} produced a top-level PASS. A declared test did not run — check the -run regex, a build tag, or a rename."
             exit 1
           fi
           if [ "${npass:-0}" -gt "$declared" ]; then
-            echo "::error::live-container gate: ${npass} top-level TestLiveBox_ PASS lines but only ${declared} declared in plugin_settings_writer_live_test.go. A TestLiveBox_* was added in ANOTHER file in this package, so 'declared' no longer describes the suite this step measures — move it, or widen the grep to cover both files."
+            echo "::error::live-container gate: ${npass} top-level TestLiveBox_ PASS lines but only ${declared} declared across ${LIVE_TEST_FILES}. More top-level PASS lines than declarations should be impossible now that the package-wide cross-check above passed — re-read that arm before touching this one."
             exit 1
           fi
           if [ "${npass:-0}" -lt "$LIVE_MIN" ]; then
-            echo "::error::live-container gate saw ${npass} top-level '--- PASS: TestLiveBox_' line(s), expected ${LIVE_MIN} (every TestLiveBox_* in plugin_settings_writer_live_test.go). A test was removed or renamed without updating LIVE_MIN, or the -run regex no longer matches the suite. Note two of them are pure unit tests, so a nonzero count alone does not prove a container ever started."
+            echo "::error::live-container gate saw ${npass} top-level '--- PASS: TestLiveBox_' line(s), expected ${LIVE_MIN} (every TestLiveBox_* across ${LIVE_TEST_FILES}). A test was removed or renamed without updating LIVE_MIN, or the -run regex no longer matches the suite. Note two of them are pure unit tests, so a nonzero count alone does not prove a container ever started."
             exit 1
           fi
           # The canary: the specific regression guard for the #4922 doubled-destPath
@@ -468,6 +497,24 @@ jobs:
             echo "::error::live-container gate did not run TestLiveBox_FilesAPISaveActuallyLandsOnTheBox — the #4922 regression guard. If it was deliberately renamed, update this check to the new name; do NOT delete the check."
             exit 1
           fi
+          # Second canary: the READ surface (2026-08-02). The Files API listed
+          # config.yaml with a byte-exact size — and returned `[]` for
+          # ?path=plugins while /configs/plugins held 8 entries, with every
+          # directory missing from the root listing. An operator read that as
+          # "the files API cannot see hermes working directories, so no
+          # filesystem check exists" and moved to external artifacts only. The
+          # API reported ABSENCE when it meant COULD-NOT-LOOK. The counts above
+          # cannot tell you WHICH tests ran, so name the two that carry that
+          # proof: one asserts directories appear in a root listing, the other
+          # that a subdirectory listing is not empty.
+          for canary in \
+            TestLiveBox_FilesAPIListingSeesDirectoriesOnTheBox \
+            TestLiveBox_FilesAPISubdirectoryListingIsNotEmpty; do
+            if ! grep -q -E "^--- PASS: ${canary}" "$LOG"; then
+              echo "::error::live-container gate did not run ${canary} — the read-surface false-negative guard (2026-08-02 incident). If it was deliberately renamed, update this check to the new name; do NOT delete the check."
+              exit 1
+            fi
+          done
 
       # The scheduler integration gate (#2149) was retired with the core cron
       # scheduler itself (scheduler-as-trigger-plugin RFC, P4): internal/scheduler

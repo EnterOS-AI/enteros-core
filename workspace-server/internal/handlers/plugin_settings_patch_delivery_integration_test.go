@@ -9,12 +9,18 @@ package handlers
 //
 //	writeTemplateConfig (the only writer of `config`) is called ONLY from
 //	applyPluginSettingsLayers, which is gated on pluginSettingsLayersEnabled().
-//	The flag ships OFF. So on the default configuration — and on every
-//	workspace not yet re-provisioned after a flip — `config` is EMPTY.
-//	PatchPluginSettings then computes effectiveSettings(config={}, overrides)
-//	= the overrides ALONE and delivers that file WHOLESALE. Delivery is not
-//	flag-gated. Every template-supplied key the operator did not name in the
-//	PATCH is deleted from the box, and the API answers 200.
+//	Wherever that overlay has not run — an operator who set the
+//	MOLECULE_PLUGIN_SETTINGS_LAYERS kill-switch, or any workspace not yet
+//	re-provisioned since the overlay went on by default in core#5047 —
+//	`config` is EMPTY. PatchPluginSettings then computes
+//	effectiveSettings(config={}, overrides) = the overrides ALONE and delivers
+//	that file WHOLESALE. Delivery is not flag-gated. Every template-supplied
+//	key the operator did not name in the PATCH is deleted from the box, and
+//	the API answers 200.
+//
+// Each test therefore pins MOLECULE_PLUGIN_SETTINGS_LAYERS=off EXPLICITLY: the
+// `config`-unpopulated state is the scenario under reproduction, and it must
+// not silently stop being reproduced when the default posture changes.
 //
 // These tests drive the REAL handler over the REAL DB and read the bytes that
 // actually land on the workspace's /configs, through the docker-less host-side
@@ -118,7 +124,7 @@ func (f patchDeliveryFixture) onBox(t *testing.T) map[string]any {
 // THE ASSERTION. The default configuration (layers flag OFF, so `config` was
 // never populated) must not lose a key the operator did not touch.
 func TestIntegration_PluginSettings_PatchKeepsTemplateKeysWithConfigUnpopulated(t *testing.T) {
-	t.Setenv("MOLECULE_PLUGIN_SETTINGS_LAYERS", "") // the SHIPPING default
+	t.Setenv("MOLECULE_PLUGIN_SETTINGS_LAYERS", "off") // pins the `config`-unpopulated scenario
 	f := newPatchDeliveryFixture(t, map[string]any{
 		"poll_seconds": 30,
 		"timezone":     "UTC",
@@ -149,7 +155,7 @@ func TestIntegration_PluginSettings_PatchKeepsTemplateKeysWithConfigUnpopulated(
 // ...and the DB now carries the provenance to explain it, so GET can answer
 // "why is timezone UTC?" for a workspace that never ran with the flag on.
 func TestIntegration_PluginSettings_PatchSeedsConfigProvenanceFromTheBox(t *testing.T) {
-	t.Setenv("MOLECULE_PLUGIN_SETTINGS_LAYERS", "")
+	t.Setenv("MOLECULE_PLUGIN_SETTINGS_LAYERS", "off")
 	f := newPatchDeliveryFixture(t, map[string]any{"poll_seconds": 30, "timezone": "UTC"})
 
 	if code, body := f.patch(t, `{"set":{"poll_seconds":5}}`); code != http.StatusOK {
@@ -185,7 +191,7 @@ func TestIntegration_PluginSettings_PatchSeedsConfigProvenanceFromTheBox(t *test
 // for those keys. Seeding them as "template" would fabricate provenance, so
 // they are skipped while the untouched keys are still recovered.
 func TestIntegration_PluginSettings_SeedDoesNotCreditOverriddenKeysToTheTemplate(t *testing.T) {
-	t.Setenv("MOLECULE_PLUGIN_SETTINGS_LAYERS", "")
+	t.Setenv("MOLECULE_PLUGIN_SETTINGS_LAYERS", "off")
 	f := newPatchDeliveryFixture(t, map[string]any{"poll_seconds": 5, "timezone": "UTC"})
 	ctx := context.Background()
 
@@ -229,7 +235,7 @@ func TestIntegration_PluginSettings_SeedDoesNotCreditOverriddenKeysToTheTemplate
 // delivery is SKIPPED, and the response says so — rather than shipping an
 // override-only projection and calling it applied.
 func TestIntegration_PluginSettings_PatchRefusesToDeliverWhenItCannotReadTheBox(t *testing.T) {
-	t.Setenv("MOLECULE_PLUGIN_SETTINGS_LAYERS", "")
+	t.Setenv("MOLECULE_PLUGIN_SETTINGS_LAYERS", "off")
 	conn := settingsTestDB(t)
 	ws := seedSettingsWorkspace(t, conn)
 	declarePlugin(t, conn, ws, testPlugin)
@@ -271,7 +277,7 @@ func TestIntegration_PluginSettings_PatchRefusesToDeliverWhenItCannotReadTheBox(
 // is delivered normally. This is the control that keeps the guard above from
 // being an unconditional "never deliver".
 func TestIntegration_PluginSettings_PatchStillDeliversWhenTheBoxHasNoFileYet(t *testing.T) {
-	t.Setenv("MOLECULE_PLUGIN_SETTINGS_LAYERS", "")
+	t.Setenv("MOLECULE_PLUGIN_SETTINGS_LAYERS", "off")
 	f := newPatchDeliveryFixture(t, nil) // mirror dir exists, file absent
 	if err := os.MkdirAll(f.mirror, 0o755); err != nil {
 		t.Fatal(err)
@@ -291,7 +297,7 @@ func TestIntegration_PluginSettings_PatchStillDeliversWhenTheBoxHasNoFileYet(t *
 // AFTER patchOverrides had already committed — so the row persisted a value
 // that could never be delivered or overlaid again, behind a 200.
 func TestIntegration_PluginSettings_OversizedValueIsRefusedBeforeTheCommit(t *testing.T) {
-	t.Setenv("MOLECULE_PLUGIN_SETTINGS_LAYERS", "")
+	t.Setenv("MOLECULE_PLUGIN_SETTINGS_LAYERS", "off")
 	f := newPatchDeliveryFixture(t, map[string]any{"poll_seconds": 30})
 
 	huge := make([]byte, maxPluginSettingsBytes+1024)
