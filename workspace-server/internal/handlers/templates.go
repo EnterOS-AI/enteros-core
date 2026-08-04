@@ -425,11 +425,11 @@ func (h *TemplatesHandler) ListFiles(c *gin.Context) {
 		return
 	}
 	subPath := c.DefaultQuery("path", "")
-	if subPath != "" {
-		if err := validateRelPath(subPath); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid path"})
-			return
-		}
+	// Absolute ?path= stays rejected; see validateListSubPath for the decision
+	// and for why the message now names the root and the relative form.
+	if err := validateListSubPath(rootPath, subPath); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
 	depth := 1
 	if d := c.Query("depth"); d != "" {
@@ -487,6 +487,7 @@ func (h *TemplatesHandler) ListFiles(c *gin.Context) {
 		for _, e := range entries {
 			out = append(out, fileEntry(e))
 		}
+		c.Header(filesSourceHeader, filesSourceEIC)
 		c.JSON(http.StatusOK, out)
 		return
 	}
@@ -521,6 +522,7 @@ func (h *TemplatesHandler) ListFiles(c *gin.Context) {
 			if files == nil {
 				files = []fileEntry{}
 			}
+			c.Header(filesSourceHeader, filesSourceContainer)
 			c.JSON(http.StatusOK, files)
 			return
 		}
@@ -577,17 +579,19 @@ func (h *TemplatesHandler) ListFiles(c *gin.Context) {
 	// mirror and fall through to the template dir.
 	if mirror := h.hostSideConfigsRoot(rootPath, workspaceID); mirror != "" {
 		if fi, statErr := os.Stat(mirror); statErr == nil && fi.IsDir() {
-			walkRoot := mirror
-			if subPath != "" {
-				walkRoot = filepath.Join(mirror, subPath)
-			}
-			if _, err := os.Stat(walkRoot); err == nil {
+			walkRoot, err := resolveListWalkRoot(mirror, subPath)
+			if err == nil {
+				c.Header(filesSourceHeader, filesSourceHostMirror)
 				c.JSON(http.StatusOK, walkConfigTree(walkRoot))
 				return
 			}
-			// Mirror present but the requested subpath isn't in it — return empty
-			// rather than falling through to the (unrelated) template dir.
-			c.JSON(http.StatusOK, []fileEntry{})
+			// Mirror present but the requested subpath isn't in it. Report that
+			// as NOT FOUND, not as an empty listing: the mirror carries only the
+			// delivered config bundle, so `200 []` here reads as "the directory
+			// is empty" when the truth is "this backend cannot see it". That
+			// false negative is the defect. Never fall through to the
+			// (unrelated) template dir.
+			respondListPathError(c, rootPath, subPath, filesSourceHostMirror, err)
 			return
 		}
 	}
@@ -595,19 +599,51 @@ func (h *TemplatesHandler) ListFiles(c *gin.Context) {
 	// Fallback: host-side template dir (only for templates, not ws-* workspace volumes)
 	configDir := h.resolveTemplateDir(wsName)
 	if configDir == "" {
+		// No backend at all. A ROOT listing legitimately reports "no files"
+		// (an empty workspace is empty, and the canvas root load depends on
+		// this — see TestListFiles_FallbackToHost_NoTemplate). But an explicit
+		// ?path= asked about a SPECIFIC directory we cannot see, and answering
+		// `[]` there asserts something we do not know.
+		if subPath != "" {
+			c.JSON(http.StatusNotFound, gin.H{
+				"error": listPathNotFoundMessage(rootPath, subPath, filesSourceNone),
+			})
+			return
+		}
+		c.Header(filesSourceHeader, filesSourceNone)
 		c.JSON(http.StatusOK, []fileEntry{})
 		return
 	}
 
-	walkRoot := configDir
-	if subPath != "" {
-		walkRoot = filepath.Join(configDir, subPath)
-	}
-	if _, err := os.Stat(walkRoot); os.IsNotExist(err) {
-		c.JSON(http.StatusOK, []fileEntry{})
+	walkRoot, err := resolveListWalkRoot(configDir, subPath)
+	if err != nil {
+		respondListPathError(c, rootPath, subPath, filesSourceTemplate, err)
 		return
 	}
+	c.Header(filesSourceHeader, filesSourceTemplate)
 	c.JSON(http.StatusOK, walkConfigTree(walkRoot))
+}
+
+// respondListPathError maps a resolveListWalkRoot failure onto the wire.
+// An escape attempt is a 400 and is never downgraded to the 404 below, so a
+// probe cannot hide among ordinary misses.
+func respondListPathError(c *gin.Context, rootPath, subPath, source string, err error) {
+	switch {
+	case errors.Is(err, errListPathAbsent):
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": listPathNotFoundMessage(rootPath, subPath, source),
+		})
+	case errors.Is(err, errListPathIsFile):
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf(
+				"path %q under %s is a file, not a directory — read it with GET /workspaces/:id/files/%s",
+				subPath, rootPath, subPath),
+		})
+	default: // errListPathEscapes and anything unclassified
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("invalid path %q under root %s: path escapes the workspace root", subPath, rootPath),
+		})
+	}
 }
 
 // ReadFile handles GET /workspaces/:id/files/*path
