@@ -40,7 +40,30 @@ func TestNativeRegistry_SourcesByteIdenticalToRetiredConsts(t *testing.T) {
 		// classify_delivery_liveness and ABSOLUTE_CAP_SECONDS are all there and
 		// the retired MOLECULE_TRIGGER_DELIVERY_WATCHDOG_SECONDS is gone.
 		// Reaching core via sdk#206 -> gen/go/molcontracts/native_plugins_gen.go.
-		{SchedulerPluginName, SchedulerPluginSource, "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.2"},
+		//
+		// v0.2.2 -> v0.2.3 (2026-08-05, deliberate): v0.2.2 shipped a REGRESSION
+		// in the very watchdog the bump above was made for. The activity-aware
+		// watchdog cancels a delivery when the runtime's turn-lease snapshot
+		// reports idle_expired — but that lease is workspace-GLOBAL (created at
+		// container boot, re-armed per turn), so idle_seconds measures time since
+		// the workspace's last TOOL CALL, not since the delivery began. On any
+		// workspace quiet for longer than the 900s idle TTL the lease is ALREADY
+		// idle-expired at the instant a delivery starts, so the first 30s probe
+		// cancelled it, the fire re-queued as retryable, durable state never
+		// advanced, and the schedule sat in a permanent 30s cancel/retry loop.
+		// A live client workspace logged 24 consecutive timeout/cause:idle
+		// entries at exactly 30s intervals, all for one 11:30 slot.
+		//
+		// v0.2.3 honours a lease only when it was armed AFTER the delivery it
+		// reports on (turn_age_seconds < elapsed), gating the WHOLE snapshot
+		// rather than only idle_expired — absolute_cap_exceeded is measured from
+		// the same lease's own turn start and is judged first, so an idle-only
+		// gate would have reproduced the identical loop under cause:absolute_cap.
+		// Verified by ancestry and content, not by name: `git merge-base
+		// --is-ancestor 07680a1 v0.2.3` is TRUE, and v0.2.3 resolves to 7441d9c
+		// whose scheduler.py defines lease_is_attributable.
+		// Reaching core via sdk#209 -> gen/go/molcontracts/native_plugins_gen.go.
+		{SchedulerPluginName, SchedulerPluginSource, "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.3"},
 		{conciergePlatformMCPName, conciergePlatformMCPSource, "gitea://molecule-ai/molecule-ai-plugin-molecule-platform-mcp#main"},
 	}
 	for _, c := range cases {
