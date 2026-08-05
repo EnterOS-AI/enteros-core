@@ -87,13 +87,55 @@ func (h *PluginsHandler) Install(c *gin.Context) {
 		return
 	}
 
+	// Record the DECLARED intent (workspace_declared_plugins) BEFORE delivery,
+	// on EVERY delivery path — molecule-core#5071.
+	//
+	// This used to happen only on the PULL path (reMaterialize). On the docker-
+	// PUSH path the install wrote workspace_plugins (observed) and nothing else,
+	// so a re-pin left the workspace's DECLARED intent frozen at the OLD ref
+	// forever. That is not cosmetic:
+	//
+	//   - MOLECULE_DECLARED_PLUGINS (desiredPluginSources) unions declared with
+	//     installed and lets installed WIN on a destination collision, so the box
+	//     booted the new ref anyway — the drift was INVISIBLE while it lasted.
+	//   - ReconcileWorkspacePlugins iterates DECLARED and re-delivers d.SourceRaw
+	//     whenever the plugin is missing from the box or its fragment moved. On a
+	//     fresh/rebuilt config volume that silently REVERTS the workspace to the
+	//     stale pin — the user's change un-lands with no error anywhere.
+	//
+	// So the declaration is the SSOT for "what this workspace is supposed to
+	// run", and an explicit install IS a statement of intent. Recording it here,
+	// once, ahead of delivery, makes a re-pin durable across restart, reprovision
+	// and reconcile — which is what a caller asking for a version bump means.
+	//
+	// Ordering: resolveAndStage has already fetched and validated the source, so
+	// we never declare something unfetchable. Declaring BEFORE delivery is also
+	// the safe half of a partial failure: reconcile converges a declared-but-
+	// undelivered plugin, whereas a delivered-but-undeclared one is exactly the
+	// silent-revert bug above.
+	//
+	// This is NOT best-effort. recordDeclaredPlugin carries the privileged-plugin
+	// entitlement gate and is the intent SSOT; a failure here means we cannot
+	// promise the change will stick, so the install fails loudly instead of
+	// reporting success over a workspace that will revert on its next reconcile.
+	if err := recordDeclaredPlugin(ctx, workspaceID, result.PluginName, result.Source.Raw()); err != nil {
+		var he *httpErr
+		if errors.As(err, &he) {
+			c.JSON(he.Status, he.Body)
+			return
+		}
+		log.Printf("Plugin install: failed to declare %s (%s) for %s: %v", result.PluginName, result.Source.Raw(), workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin install failed"})
+		return
+	}
+
 	restartScheduled, err := h.deliverToContainer(ctx, workspaceID, result)
 	if errors.Is(err, errNoPushTarget) {
 		// Docker-less tenant (#206 / #230): the docker-push into the container is
 		// RETIRED. Deliver by PULL — declare the plugin and re-materialize so the
 		// runtime boot installer pulls it into /configs/plugins/<name>/. The box
 		// does the fetch; the agent never does (runtime-agnostic).
-		scheduled, rmErr := h.reMaterialize(ctx, workspaceID, result.PluginName, result.Source.Raw(), result.SuppressRestart)
+		scheduled, rmErr := h.reMaterialize(workspaceID, result.PluginName, result.SuppressRestart)
 		if rmErr != nil {
 			var he *httpErr
 			if errors.As(rmErr, &he) {

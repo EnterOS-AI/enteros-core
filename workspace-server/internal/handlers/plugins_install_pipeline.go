@@ -472,18 +472,17 @@ func (h *PluginsHandler) deliverToContainer(ctx context.Context, workspaceID str
 }
 
 // reMaterialize delivers a plugin by PULL (the docker-less path that replaces the
-// retired docker-push): it records the plugin in the workspace's DECLARED set
-// (workspace_declared_plugins) so the runtime's boot materializer
-// (molecule_runtime.plugin_sources) installs it into /configs/plugins/<name>/,
-// then triggers a restart so that boot runs. The AGENT never fetches; the box
-// pulls its declared plugins itself (runtime-agnostic contract). Returns whether
-// a restart was scheduled. recordDeclaredPlugin no-ops when the DB is unset (unit
-// tests) and enforces the privileged-plugin kind gate (a user can't declare the
-// platform MCP on a non-platform workspace).
-func (h *PluginsHandler) reMaterialize(ctx context.Context, workspaceID, pluginName, source string, suppressRestart bool) (bool, error) {
-	if err := recordDeclaredPlugin(ctx, workspaceID, pluginName, source); err != nil {
-		return false, err
-	}
+// retired docker-push): the runtime's boot materializer
+// (molecule_runtime.plugin_sources) installs the workspace's DECLARED plugins
+// into /configs/plugins/<name>/, so all this has to do is trigger a restart and
+// let that boot run. The AGENT never fetches; the box pulls its declared plugins
+// itself (runtime-agnostic contract). Returns whether a restart was scheduled.
+//
+// The declaration itself is NOT made here. It moved up into Install
+// (molecule-core#5071) so that EVERY delivery path — push and pull — records the
+// intent, not just this one; see the long note at that call site. Keeping a
+// second recordDeclaredPlugin here would only re-run the same idempotent upsert.
+func (h *PluginsHandler) reMaterialize(workspaceID, pluginName string, suppressRestart bool) (bool, error) {
 	if suppressRestart {
 		log.Printf("Plugin install (pull): %s → workspace %s — restart suppressed by caller (restart=false); boot-install picks it up on the next reprovision", pluginName, workspaceID)
 		return false, nil

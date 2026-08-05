@@ -44,6 +44,7 @@ func driveInstall(t *testing.T, body string) (*httptest.ResponseRecorder, int32)
 	mock, cleanup := withMockDB(t)
 	defer cleanup()
 	expectAllowlistAllowAll(mock)
+	expectDeclaredPluginUpsert(mock)
 
 	var restarts int32
 	h := NewPluginsHandler(registry, nil, func(string) {
@@ -133,6 +134,7 @@ func TestPluginInstall_RestartingReflectsActualScheduling(t *testing.T) {
 	mock, cleanup := withMockDB(t)
 	defer cleanup()
 	expectAllowlistAllowAll(mock)
+	expectDeclaredPluginUpsert(mock)
 
 	h := NewPluginsHandler(registry, nil, nil). // restartFunc NOT wired
 							WithRuntimeLookup(func(string) (string, error) { return "claude-code", nil }).

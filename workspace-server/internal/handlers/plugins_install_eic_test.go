@@ -38,6 +38,17 @@ func expectAllowlistAllowAll(mock sqlmock.Sqlmock) {
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 }
 
+// expectDeclaredPluginUpsert programs the workspace_declared_plugins upsert that
+// Install performs on EVERY delivery path — push and pull (molecule-core#5071).
+// Any test driving the full Install flow must program it: the declare is
+// load-bearing (a re-pin that isn't declared silently reverts on the next
+// reconcile), so a failure there now 500s the install rather than being
+// swallowed, and an unprogrammed sqlmock statement IS a failure.
+func expectDeclaredPluginUpsert(mock sqlmock.Sqlmock) {
+	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+}
+
 // stagePluginRegistry creates a single-plugin registry under dir so the
 // install handler's local resolver can find it. Returns the path to the
 // plugin dir for any caller that wants to assert tar contents.
@@ -175,6 +186,7 @@ func TestPluginInstall_SaaS_DispatchesToEIC(t *testing.T) {
 	mock, cleanup := withMockDB(t)
 	defer cleanup()
 	expectAllowlistAllowAll(mock)
+	expectDeclaredPluginUpsert(mock)
 
 	h := NewPluginsHandler(registry, nil, nil).
 		WithRuntimeLookup(func(string) (string, error) { return "claude-code", nil }).
@@ -236,6 +248,7 @@ func TestPluginInstall_SaaS_PropagatesEICError(t *testing.T) {
 	mock, cleanup := withMockDB(t)
 	defer cleanup()
 	expectAllowlistAllowAll(mock)
+	expectDeclaredPluginUpsert(mock)
 
 	stubInstallPluginViaEIC(t, func(ctx context.Context, instanceID, runtime, pluginName, stagedDir string) error {
 		return errors.New("ssh: tunnel exited 255")
@@ -280,6 +293,7 @@ func TestPluginInstall_NoBackends_DeliversByPull(t *testing.T) {
 	mock, cleanup := withMockDB(t)
 	defer cleanup()
 	expectAllowlistAllowAll(mock)
+	expectDeclaredPluginUpsert(mock)
 	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).WillReturnResult(sqlmock.NewResult(0, 1))
 
 	stubInstallPluginViaEIC(t, func(ctx context.Context, instanceID, runtime, pluginName, stagedDir string) error {
@@ -322,6 +336,7 @@ func TestPluginInstall_InstanceLookupError_DeliversByPull(t *testing.T) {
 	mock, cleanup := withMockDB(t)
 	defer cleanup()
 	expectAllowlistAllowAll(mock)
+	expectDeclaredPluginUpsert(mock)
 	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).WillReturnResult(sqlmock.NewResult(0, 1))
 
 	h := NewPluginsHandler(registry, nil, nil).
