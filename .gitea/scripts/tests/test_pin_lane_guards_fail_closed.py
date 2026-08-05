@@ -142,10 +142,25 @@ def test_sdk_pin_bump_push_identity_is_the_documented_narrow_bot():
     single scope string. Pin it to the identity the runbook documents.
     """
     step = _step_named(_load(SDK_PIN_BUMP), "Open the bump PR")
-    assert "molecule-sdk-pin-bot" in step["run"]
-    assert "molecule-runtime-release-bot" not in step["run"], (
+    # Assert on the EFFECTIVE lines only. The step's comments name the broader
+    # bot in order to explain why it is not used, so a substring search over the
+    # whole block would fail on its own rationale.
+    effective = [
+        line for line in step["run"].splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    identity_lines = [
+        line for line in effective
+        if "git config user." in line or "remote set-url" in line
+    ]
+    assert identity_lines, "no push identity configured in the PR step"
+    assert all(
+        "molecule-sdk-pin-bot" in line or "sdk-pin-bot@moleculesai.app" in line
+        for line in identity_lines
+    ), identity_lines
+    assert not any("molecule-runtime-release-bot" in line for line in identity_lines), (
         "molecule-runtime-release-bot has write on 13 other repos; this lane's "
-        "credential must not be minted on it"
+        f"credential must not be minted on it. offending: {identity_lines}"
     )
     runbook = REPO / "docs" / "runbooks" / "sdk-pin-bump-credential.md"
     assert runbook.is_file(), "the credential must stay documented, not become folklore"
