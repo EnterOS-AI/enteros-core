@@ -18,9 +18,15 @@ name: sdk-pin-bump
 #   3. go generate ./...            (regenerates the checked-in projection)
 #   4. move canonicalRegistrySHA256 to the observed sha
 #   5. run the providers tests
-#   6. open a PR on a bump/sdk-<sha12> branch
+#   6. open a PR on a bump/sdk-<sha12> branch, based on the ref it was
+#      dispatched on
 #
 # WHAT IT DELIBERATELY DOES NOT DO: merge. See "Review, not rubber-stamp" below.
+#
+# IT FAILS CLOSED. If SDK_PIN_BUMP_TOKEN is absent the lane goes RED. It used to
+# warn-and-skip and report success, which made "the pin was bumped" and "the lane
+# could not bump anything" the same green tick — see the guard step for the
+# incident and for why a skip is not defensible on a dispatch-only lane.
 #
 # NO workflow_dispatch inputs: lint-workflow-yaml.py forbids an `inputs:` block
 # ("derive parameters from tag name / env / external query"). Nothing is lost —
@@ -74,17 +80,42 @@ jobs:
           SDK_PIN_BUMP_TOKEN: ${{ secrets.SDK_PIN_BUMP_TOKEN }}
         run: |
           set -euo pipefail
-          # runtime#83 degrade pattern: an unprovisioned credential is a loud
-          # SKIP, never a red run and never a silent success.
+          # FAIL-CLOSED, and the reasoning matters because the previous shape was
+          # the exact opposite.
+          #
+          # This guard used to emit `::warning::… Skipping` and set skip=1, and
+          # every later step carried `if: steps.guard.outputs.skip == '0'`. The
+          # job then reported SUCCESS having done nothing. On 2026-08-05 12:19Z
+          # run 620174 was dispatched mid-release-chain, went green in 19s, and
+          # the pin bump was done by hand four minutes later (45a61bb). A green
+          # run is indistinguishable from a bump that happened — which is exactly
+          # how a forgotten pin stays invisible.
+          #
+          # WHY "SKIP" IS WRONG *HERE* SPECIFICALLY. This lane is
+          # `workflow_dispatch:`-only on molecule-core. Every run is a human (or
+          # the SDK side) explicitly asking for the pin to be bumped; there is no
+          # fork arm, no pull_request arm, and no context in which the right
+          # answer is "do nothing quietly". "Must not run here" would deserve a
+          # skip. "Cannot run at all" — which is what an unprovisioned push
+          # credential means — must be RED. The degrade-to-warning pattern is
+          # reserved for lanes with an arm that legitimately cannot hold the
+          # credential (a fork PR), and this lane has none.
+          #
+          # This is NOT a `skipped` check masquerading as green either: branch
+          # protection on main is status_check_contexts ["*"], where a skipped
+          # context returns 200 and satisfies the gate. Turning a dead lane into
+          # a skip would have been the same hole one level down. It is safe to go
+          # red: this workflow is dispatch-only and posts no commit status on
+          # anyone's PR (see the bp-exempt note above), so a red run blocks
+          # nothing except the false belief that the pin moved.
           if [ -z "${SDK_PIN_BUMP_TOKEN:-}" ]; then
-            echo "::warning::SDK_PIN_BUMP_TOKEN is not provisioned — cannot push a branch or open a PR. Skipping. Provision it (a push+PR credential that is NOT the reviewer account) to arm this lane."
-            echo "skip=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=0" >> "$GITHUB_OUTPUT"
+            echo "::error::SDK_PIN_BUMP_TOKEN is not provisioned — this lane cannot push a branch or open a PR, so it is FAILING rather than reporting a green no-op."
+            echo "::error::Provision it as an Actions secret named SDK_PIN_BUMP_TOKEN on molecule-ai/molecule-core (repo scope, not org scope: no other repo's lane uses it). It must be a Gitea PAT with write:repository, owned by an identity that has write on molecule-ai/molecule-core and is NOT in the reviewer set — the lane opens a PR it must not be able to approve."
+            exit 1
           fi
+          echo "::notice::bump credential present — proceeding."
 
       - name: Resolve molecule-ai-sdk@main head
-        if: ${{ steps.guard.outputs.skip == '0' }}
         id: sdk
         run: |
           set -euo pipefail
@@ -109,7 +140,6 @@ jobs:
           echo "::notice::molecule-ai-sdk@main = $head"
 
       - name: Bump, regenerate, move the checkpoint
-        if: ${{ steps.guard.outputs.skip == '0' }}
         id: work
         working-directory: workspace-server
         env:
@@ -134,17 +164,33 @@ jobs:
           echo "changed=1" >> "$GITHUB_OUTPUT"
 
       - name: Open the bump PR
-        if: ${{ steps.guard.outputs.skip == '0' && steps.work.outputs.changed == '1' }}
+        if: ${{ steps.work.outputs.changed == '1' }}
         env:
           SDK_PIN_BUMP_TOKEN: ${{ secrets.SDK_PIN_BUMP_TOKEN }}
           SHA12: ${{ steps.sdk.outputs.sha12 }}
           SDK_HEAD: ${{ steps.sdk.outputs.head }}
           REGISTRY_SHA: ${{ steps.work.outputs.registry_sha }}
+          BASE_REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          # The PR targets THE REF THIS LANE WAS DISPATCHED ON, not a hardcoded
+          # `main`. The commit is built from this checkout, so hardcoding the base
+          # meant a dispatch on any other ref proposed that ref's whole content
+          # into main under a "bump the pin" title. On a main dispatch BASE_REF is
+          # `main` and nothing changes; off main the branch name is suffixed so a
+          # verification dispatch cannot squat the real `bump/sdk-<sha12>` branch
+          # and make the next genuine bump take the "already proposed" exit below.
           branch="bump/sdk-${SHA12}"
+          if [ "${BASE_REF}" != "main" ]; then
+            slug=$(printf '%s' "${BASE_REF}" | tr -c 'A-Za-z0-9._-' '-')
+            branch="bump/sdk-${SHA12}-onto-${slug}"
+          fi
           code=$(curl -sS -A curl/8.4.0 -o /dev/null -w '%{http_code}' -H "Authorization: token ${SDK_PIN_BUMP_TOKEN}" "https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-core/branches/${branch}")
           if [ "$code" = "200" ]; then
+            # LEGITIMATE no-op, and structurally different from the credential
+            # green-skip this file used to carry: the lane did the whole job
+            # (resolved head, ran go get, regenerated, tested) and found the exact
+            # bump already proposed. Nothing is left undone or invisible.
             echo "::notice::${branch} already exists - bump already proposed."
             exit 0
           fi
@@ -157,11 +203,30 @@ jobs:
           git push origin "$branch"
           # Never run `git remote -v` past this line: it PRINTS the embedded token.
           payload="$(mktemp)"
-          python3 .gitea/scripts/sdk_pin_bump_helpers.py pr-payload "$payload" "$branch" "$SHA12" "$SDK_HEAD" "$REGISTRY_SHA"
+          python3 .gitea/scripts/sdk_pin_bump_helpers.py pr-payload "$payload" "$branch" "$SHA12" "$SDK_HEAD" "$REGISTRY_SHA" --base "${BASE_REF}"
           resp="$(mktemp)"
           code=$(curl -sS -A curl/8.4.0 -o "$resp" -w '%{http_code}' -X POST -H "Authorization: token ${SDK_PIN_BUMP_TOKEN}" -H 'Content-Type: application/json' --data-binary "@${payload}" "https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-core/pulls")
           if [ "$code" != "201" ]; then
             echo "::error::PR creation failed (HTTP ${code})"
             exit 1
           fi
-          echo "::notice::opened the SDK pin bump PR for ${SHA12}"
+          echo "::notice::opened the SDK pin bump PR for ${SHA12} onto ${BASE_REF}"
+
+      - name: Outcome
+        if: ${{ always() }}
+        env:
+          CHANGED: ${{ steps.work.outputs.changed }}
+          SDK_HEAD: ${{ steps.sdk.outputs.head }}
+        run: |
+          set -euo pipefail
+          # A green run must SAY which terminal state it reached. The old shape's
+          # worst property was not that it skipped — it was that "bumped",
+          # "already current" and "could not even try" all rendered as the same
+          # green tick in the run list.
+          if [ "${CHANGED:-}" = "1" ]; then
+            echo "sdk-pin-bump: BUMPED — opened a PR moving the pin to ${SDK_HEAD}." | tee -a "$GITHUB_STEP_SUMMARY"
+          elif [ "${CHANGED:-}" = "0" ]; then
+            echo "sdk-pin-bump: ALREADY CURRENT — pin is at molecule-ai-sdk@main (${SDK_HEAD}); no PR needed." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "sdk-pin-bump: FAILED before it could compare the pin — see the failing step above." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
