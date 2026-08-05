@@ -675,12 +675,45 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Run shellcheck on tests/e2e/*.sh and infra/scripts/*.sh
-        # shellcheck is pre-installed on ubuntu-latest runners (via apt).
+        # WAS: "shellcheck is pre-installed on ubuntu-latest runners (via apt)."
+        # That was FALSE on this fleet's ubuntu-latest, and the gate had
+        # therefore NEVER linted anything:
+        #
+        #   xargs: shellcheck: No such file or directory
+        #   exitcode '127': command not found
+        #
+        # The failure was invisible because of the detect-changes skip above.
+        # With no shell files changed the job posts success without running
+        # (correct); with shell files changed it ran and died at 127. So the
+        # gate reported success EXACTLY when it did nothing, and failed
+        # whenever it would have done work — which reads as a lint regression
+        # in the PR rather than a missing binary. See core#5067/#5068.
+        #
+        # Install it the same way test-ops-scripts.yml installs jq (the
+        # established convention here), and fail loudly if it is still absent
+        # afterwards so a future 127 can never again be mistaken for a lint
+        # finding.
+        #
         # infra/scripts/ is included because setup.sh + nuke.sh gate the
         # README quickstart — a shellcheck regression there silently breaks
         # new-user onboarding. scripts/ is intentionally excluded until its
         # pre-existing SC3040/SC3043 warnings are cleaned up.
+        #
+        # The --severity=warning bar is UNCHANGED, and is kept deliberately:
+        # measured over the exact 94-file glob, the tree is already clean at
+        # that bar (0 error, 0 warning). The 116 info + 1 style findings sit
+        # below it by design. So installing the binary is the whole fix — the
+        # gate starts enforcing the bar it always claimed to enforce, with no
+        # cleanup required and nothing widened.
         run: |
+          set -euo pipefail
+          command -v shellcheck >/dev/null 2>&1 \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+          command -v shellcheck >/dev/null 2>&1 || {
+            echo "::error::shellcheck is still not installed after apt-get — this gate cannot lint anything. Failing loudly rather than exiting 127 from xargs, which looks like a lint finding."
+            exit 1
+          }
+          shellcheck --version
           find tests/e2e infra/scripts -type f -name '*.sh' -print0 \
             | xargs -0 shellcheck --severity=warning
 
