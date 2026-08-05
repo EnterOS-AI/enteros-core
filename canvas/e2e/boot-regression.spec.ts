@@ -21,7 +21,6 @@
  */
 
 import { test, expect } from "@playwright/test";
-import type { Page } from "@playwright/test";
 import { startEchoRuntime, type EchoRuntime } from "./fixtures/echo-runtime";
 import {
   seedWorkspace,
@@ -29,15 +28,13 @@ import {
   cleanupWorkspace,
   type SeededWorkspace,
 } from "./fixtures/chat-seed";
-
-/** Enter the Org-map view so the Canvas (React Flow graph) mounts — same
- * helper as chat-desktop.spec.ts (the default view is the concierge shell,
- * where workspace nodes are not clickable). */
-async function enterMapView(page: Page): Promise<void> {
-  const btn = page.getByTestId("nav-map");
-  await expect(btn, "rail button nav-map missing").toBeVisible({ timeout: 10_000 });
-  await btn.click();
-}
+// This spec used to carry its OWN copy of enterMapView and then raw-click the
+// workspace node with `page.getByTestId(...).click()`. That bypassed
+// helpers/canvas.ts — the helper written specifically to stop clicking a React
+// Flow node while it is still animating into place — so every node click here
+// raced the canvas entrance and failed as "element is not stable" whenever the
+// runner was loaded. One copy of the helper, used by every spec.
+import { enterMapView, clickWorkspaceNode } from "./helpers/canvas";
 
 const PLATFORM_URL = process.env.E2E_PLATFORM_URL ?? "http://localhost:8080";
 
@@ -93,8 +90,7 @@ test("provisioning-phase BOOT_STEP renders on the boot screen", async ({ page })
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.goto("/");
   await enterMapView(page);
-  await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
-  await page.getByTestId(`workspace-node-${ws.name}`).click();
+  await clickWorkspaceNode(page, ws.name);
 
   // Pre-telemetry: the watchdog is attached but idle.
   await expect(page.getByText("waiting for boot telemetry")).toBeVisible({
@@ -144,12 +140,28 @@ test("agent /notify delivery reaches the canvas chat (self-initiated reply leg)"
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.goto("/");
   await enterMapView(page);
-  await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
-  await page.getByTestId(`workspace-node-${ws.name}`).click();
+  await clickWorkspaceNode(page, ws.name);
   await page.locator("#tab-chat").click();
   await page.waitForSelector("#panel-chat [data-testid='chat-panel']:visible", {
     timeout: 5_000,
   });
+
+  // The panel has now hydrated from GET /chat-history. From here on, cut that
+  // endpoint off so the LIVE WebSocket is the only path left that can put the
+  // bubble on screen.
+  //
+  // Without this the test did not test what it says it tests. useChatHistory
+  // runs a background reconcile against /chat-history every
+  // RECONCILE_INTERVAL_MS (10_000), so a notify whose live frame never reached
+  // this panel still rendered — about 9.9s later, from the DB. Measured on the
+  // pre-fix build: the AGENT_MESSAGE frame arrived in the page at +1414ms and
+  // the bubble appeared at +11291ms. The assertion budget below is 10s, so the
+  // suite was deciding pass/fail on which side of a 10s poll tick the reconcile
+  // landed — the E2E Chat flake — while reporting "reaches the canvas chat over
+  // the live WebSocket" either way. `reconcile()` swallows fetch errors by
+  // design (it is a background safety net), so aborting these requests cannot
+  // colour the UI; it only removes the fallback that was masking the live leg.
+  await page.route("**/chat-history**", (route) => route.abort());
 
   const message = `digest reply delivery e2e ${Date.now()}`;
   const res = await fetch(`${PLATFORM_URL}/workspaces/${ws.id}/notify`, {
@@ -163,5 +175,9 @@ test("agent /notify delivery reaches the canvas chat (self-initiated reply leg)"
   expect(res.status, "workspace-token notify must be accepted").toBe(200);
 
   const chat = page.locator("#panel-chat [data-testid='chat-panel']:visible");
-  await expect(chat.getByText(message)).toBeVisible({ timeout: 10_000 });
+  await expect(
+    chat.getByText(message),
+    "a workspace-token notify must reach THIS panel over the live WebSocket " +
+      "(/chat-history is blocked, so the 10s reconcile poll cannot deliver it)",
+  ).toBeVisible({ timeout: 10_000 });
 });
