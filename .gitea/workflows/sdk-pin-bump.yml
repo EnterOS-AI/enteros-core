@@ -1,0 +1,167 @@
+name: sdk-pin-bump
+
+# SDK consumer-pin bump OPENER — the leg that makes "bump the SDK pin" a CI
+# action instead of a hand-run `go get`.
+#
+# This is the SDK -> molecule-core analogue of workspace-runtime's
+# propagate_runtime_version.py (runtime -> template `.runtime-version`). The
+# difference in mechanism is forced by the artifact: a `.runtime-version` bump is
+# a one-line file write, so the runtime opener can use the Gitea contents API and
+# never clone. An SDK pin bump is NOT a one-line write — it must run `go get`,
+# regenerate internal/providers/gen/registry_gen.go, and move the paired
+# canonicalRegistrySHA256 checkpoint. That needs a Go toolchain, so this lane
+# lives in the CONSUMER repo and does the work in a real checkout.
+#
+# WHAT IT AUTOMATES (previously all by hand):
+#   1. resolve molecule-ai-sdk@main head
+#   2. go get go.moleculesai.app/sdk/gen/go@<head>
+#   3. go generate ./...            (regenerates the checked-in projection)
+#   4. move canonicalRegistrySHA256 to the observed sha
+#   5. run the providers tests
+#   6. open a PR on a bump/sdk-<sha12> branch
+#
+# WHAT IT DELIBERATELY DOES NOT DO: merge. See "Review, not rubber-stamp" below.
+#
+# NO workflow_dispatch inputs: lint-workflow-yaml.py forbids an `inputs:` block
+# ("derive parameters from tag name / env / external query"). Nothing is lost —
+# the only sensible target is SDK main head, which the job queries. That also
+# removes a footgun: nobody can dispatch this at an arbitrary sha.
+#
+# NO schedule/cron: molecule-core enforces a zero-cron ratchet
+# (lint_schedule_budget.py). The lane is dispatched — by a human, or by the SDK
+# side on merge to main. Pairing: sdk-pin-drift.yml is what makes a FORGOTTEN
+# dispatch visible (it goes red once the pin is stuck past the window), so the
+# absence of a cron does not reintroduce silent lag.
+
+on:
+  workflow_dispatch:
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-pin-bump
+  cancel-in-progress: false
+
+jobs:
+  # Dispatch-only producer lane: it opens a PR and posts no gating context on
+  # anyone else's commit.
+  # bp-exempt: dispatch-only producer lane, emits no pull_request/push context
+  bump:
+    name: Open an SDK pin bump PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: 'stable'
+          # cache:false — the self-hosted runners bind-mount a persistent
+          # GOCACHE/GOMODCACHE; actions/cache untars over the bind mount and
+          # corrupts it. Fleet-wide convention, enforced by lint_setup_go_cache.
+          cache: false
+          cache-dependency-path: workspace-server/go.sum
+
+      - name: Guard — bump credential present
+        id: guard
+        env:
+          SDK_PIN_BUMP_TOKEN: ${{ secrets.SDK_PIN_BUMP_TOKEN }}
+        run: |
+          set -euo pipefail
+          # runtime#83 degrade pattern: an unprovisioned credential is a loud
+          # SKIP, never a red run and never a silent success.
+          if [ -z "${SDK_PIN_BUMP_TOKEN:-}" ]; then
+            echo "::warning::SDK_PIN_BUMP_TOKEN is not provisioned — cannot push a branch or open a PR. Skipping. Provision it (a push+PR credential that is NOT the reviewer account) to arm this lane."
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve molecule-ai-sdk@main head
+        if: ${{ steps.guard.outputs.skip == '0' }}
+        id: sdk
+        run: |
+          set -euo pipefail
+          resp="$(mktemp)"
+          # lint-curl-status-capture shape: body to a tempfile via -o, status to
+          # the variable via -w, and NO or-else fallback in the subshell. A
+          # fallback there double-appends, because -w emits the status before
+          # curl returns non-zero.
+          code=$(curl -sS -A curl/8.4.0 --doh-url https://cloudflare-dns.com/dns-query \
+            -o "$resp" -w '%{http_code}' \
+            "https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-ai-sdk/branches/main")
+          if [ "$code" != "200" ]; then
+            echo "::error::could not resolve molecule-ai-sdk@main (HTTP $code)"; exit 1
+          fi
+          head=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit"]["id"])' "$resp")
+          case "$head" in
+            [0-9a-f]*) : ;;
+            *) echo "::error::implausible head sha: $head"; exit 1 ;;
+          esac
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "sha12=${head:0:12}" >> "$GITHUB_OUTPUT"
+          echo "::notice::molecule-ai-sdk@main = $head"
+
+      - name: Bump, regenerate, move the checkpoint
+        if: ${{ steps.guard.outputs.skip == '0' }}
+        id: work
+        working-directory: workspace-server
+        env:
+          SDK_HEAD: ${{ steps.sdk.outputs.head }}
+        run: |
+          set -euo pipefail
+          before=$(grep -oE 'sdk/gen/go v[^ ]+' go.mod || true)
+          GOFLAGS=-mod=mod go get "go.moleculesai.app/sdk/gen/go@${SDK_HEAD}"
+          after=$(grep -oE 'sdk/gen/go v[^ ]+' go.mod || true)
+          if [ "$before" = "$after" ]; then
+            echo "::notice::pin already at SDK main head - nothing to do."
+            echo "changed=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::notice::pin ${before} -> ${after}"
+          GOFLAGS=-mod=mod go generate ./...
+          newsha=$(python3 ../.gitea/scripts/sdk_pin_bump_helpers.py registry-sha)
+          python3 ../.gitea/scripts/sdk_pin_bump_helpers.py set-canonical-sha internal/providers/sync_canonical_test.go "$newsha"
+          echo "::notice::canonicalRegistrySHA256 -> ${newsha}"
+          GOFLAGS=-mod=mod go test ./internal/providers/...
+          echo "registry_sha=${newsha}" >> "$GITHUB_OUTPUT"
+          echo "changed=1" >> "$GITHUB_OUTPUT"
+
+      - name: Open the bump PR
+        if: ${{ steps.guard.outputs.skip == '0' && steps.work.outputs.changed == '1' }}
+        env:
+          SDK_PIN_BUMP_TOKEN: ${{ secrets.SDK_PIN_BUMP_TOKEN }}
+          SHA12: ${{ steps.sdk.outputs.sha12 }}
+          SDK_HEAD: ${{ steps.sdk.outputs.head }}
+          REGISTRY_SHA: ${{ steps.work.outputs.registry_sha }}
+        run: |
+          set -euo pipefail
+          branch="bump/sdk-${SHA12}"
+          code=$(curl -sS -A curl/8.4.0 -o /dev/null -w '%{http_code}' -H "Authorization: token ${SDK_PIN_BUMP_TOKEN}" "https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-core/branches/${branch}")
+          if [ "$code" = "200" ]; then
+            echo "::notice::${branch} already exists - bump already proposed."
+            exit 0
+          fi
+          git config user.email "molecule-runtime-release-bot@moleculesai.app"
+          git config user.name molecule-runtime-release-bot
+          git checkout -b "$branch"
+          git add workspace-server/go.mod workspace-server/go.sum workspace-server/internal/providers/gen/registry_gen.go workspace-server/internal/providers/sync_canonical_test.go
+          git commit -m "chore(sdk): bump sdk/gen/go pin to ${SHA12}"
+          git remote set-url origin "https://molecule-runtime-release-bot:${SDK_PIN_BUMP_TOKEN}@git.moleculesai.app/molecule-ai/molecule-core.git"
+          git push origin "$branch"
+          # Never run `git remote -v` past this line: it PRINTS the embedded token.
+          payload="$(mktemp)"
+          python3 .gitea/scripts/sdk_pin_bump_helpers.py pr-payload "$payload" "$branch" "$SHA12" "$SDK_HEAD" "$REGISTRY_SHA"
+          resp="$(mktemp)"
+          code=$(curl -sS -A curl/8.4.0 -o "$resp" -w '%{http_code}' -X POST -H "Authorization: token ${SDK_PIN_BUMP_TOKEN}" -H 'Content-Type: application/json' --data-binary "@${payload}" "https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-core/pulls")
+          if [ "$code" != "201" ]; then
+            echo "::error::PR creation failed (HTTP ${code})"
+            exit 1
+          fi
+          echo "::notice::opened the SDK pin bump PR for ${SHA12}"
