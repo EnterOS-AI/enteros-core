@@ -200,36 +200,98 @@ func TestWorkspaceCreate_MissingName(t *testing.T) {
 
 // ---------- workspace.go: Update with only parent_id ----------
 
-func TestWorkspaceUpdate_ParentID(t *testing.T) {
-	mock := setupTestDB(t)
-	setupTestRedis(t)
-	broadcaster := newTestBroadcaster()
-	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+// TestWorkspaceUpdate_ParentIDRejectionsWriteNothing pins the request-shape
+// rejections on the parent_id patch path.
+//
+// This REPLACES the previous TestWorkspaceUpdate_ParentID, which asserted that
+// `{"parent_id": X}` fired a bare `UPDATE workspaces SET parent_id` and
+// answered 200. That test pinned the BUG as the contract: the pre-fix handler
+// applied parent_id with no cycle check, no cross-org check, no existence
+// check on the target, and swallowed the error — so it answered 200 for a
+// self-parent, a cycle, a cross-org move, a non-existent parent and even
+// `"not-a-uuid"`. parent_id is the org boundary (see workspace_reparent.go),
+// so "the UPDATE fired" was never the property worth pinning.
+//
+// The behavioural guards live in workspace_reparent_integration_test.go
+// against real Postgres, because they are recursive CTEs over live rows and
+// their key assertion is that a REJECTED move left parent_id untouched —
+// neither of which sqlmock can express.
+//
+// What sqlmock proves well, and what this test keeps: the rejections that must
+// write NOTHING. With no ExpectExec registered, any stray statement becomes a
+// driver error, so "400/422 AND all expectations met" is a genuine proof that
+// no write was attempted.
+func TestWorkspaceUpdate_ParentIDRejectionsWriteNothing(t *testing.T) {
+	const wsID = "dddddddd-0001-0000-0000-000000000000"
+	const parentID = "dddddddd-0002-0000-0000-000000000000"
 
-	// #125 guard: handler now verifies the workspace exists before applying
-	// the UPDATE. Each PATCH test must mock the EXISTS probe first.
-	mock.ExpectQuery("SELECT EXISTS.*workspaces WHERE id").
-		WithArgs("dddddddd-0001-0000-0000-000000000000").
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
-	mock.ExpectExec("UPDATE workspaces SET parent_id").
-		WithArgs("dddddddd-0001-0000-0000-000000000000", "dddddddd-0002-0000-0000-000000000000").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Params = gin.Params{{Key: "id", Value: "dddddddd-0001-0000-0000-000000000000"}}
-	c.Set("caller_credential_class", "admin-token")
-	body := `{"parent_id":"dddddddd-0002-0000-0000-000000000000"}`
-	c.Request = httptest.NewRequest("PATCH", "/workspaces/ws-child", bytes.NewBufferString(body))
-	c.Request.Header.Set("Content-Type", "application/json")
-
-	handler.Update(c)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	cases := []struct {
+		name     string
+		body     string
+		wantCode int
+		wantJSON string // expected "code" field
+	}{
+		{
+			name:     "rename_and_move_together_is_ambiguous",
+			body:     `{"parent_id":"` + parentID + `","name":"Renamed"}`,
+			wantCode: http.StatusBadRequest,
+			wantJSON: reparentCodeAmbiguous,
+		},
+		{
+			name:     "parent_id_must_be_a_uuid",
+			body:     `{"parent_id":"not-a-uuid"}`,
+			wantCode: http.StatusBadRequest,
+			wantJSON: reparentCodeInvalid,
+		},
+		{
+			name:     "parent_id_must_not_be_a_number",
+			body:     `{"parent_id":12345}`,
+			wantCode: http.StatusBadRequest,
+			wantJSON: reparentCodeInvalid,
+		},
+		{
+			name:     "empty_string_is_not_null",
+			body:     `{"parent_id":""}`,
+			wantCode: http.StatusBadRequest,
+			wantJSON: reparentCodeInvalid,
+		},
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet expectations: %v", err)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := setupTestDB(t)
+			setupTestRedis(t)
+			broadcaster := newTestBroadcaster()
+			handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+			// #125 guard: the handler verifies existence before any field work,
+			// so every case reaches this probe.
+			mock.ExpectQuery("SELECT EXISTS.*workspaces WHERE id").
+				WithArgs(wsID).
+				WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+			// Deliberately NO ExpectExec and NO ExpectBegin: a write of any
+			// kind is an unmatched call and fails the run.
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Params = gin.Params{{Key: "id", Value: wsID}}
+			c.Set("caller_credential_class", "admin-token")
+			c.Request = httptest.NewRequest("PATCH", "/workspaces/"+wsID, bytes.NewBufferString(tc.body))
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			handler.Update(c)
+
+			if w.Code != tc.wantCode {
+				t.Fatalf("status=%d, want %d: %s", w.Code, tc.wantCode, w.Body.String())
+			}
+			var resp map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode %q: %v", w.Body.String(), err)
+			}
+			if resp["code"] != tc.wantJSON {
+				t.Errorf("code=%v, want %q (body %s)", resp["code"], tc.wantJSON, w.Body.String())
+			}
+		})
 	}
 }
 
