@@ -285,21 +285,57 @@ func applyReparent(ctx context.Context, database *sql.DB, workspaceID string, ra
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// 1. Lock the moved row and read its current parent.
-	var curParent sql.NullString
-	var curStatus string
-	err = tx.QueryRowContext(ctx,
-		`SELECT parent_id::text, status::text FROM workspaces WHERE id = $1 FOR UPDATE`, workspaceID,
-	).Scan(&curParent, &curStatus)
-	if errors.Is(err, sql.ErrNoRows) {
+	// 1. Lock BOTH endpoints up front, in a single statement ordered by id.
+	//
+	// Locking them separately (self, then target) is a deadlock: two
+	// concurrent moves that swap roles — A→child-of-B and B→child-of-A —
+	// each take the other's second lock first, and Postgres has to abort one.
+	// A single ORDER BY id ... FOR UPDATE gives every caller the same global
+	// lock order, so those two transactions serialise instead of colliding.
+	// (The pair is exactly the one the post-update re-walk in step 9 exists
+	// to catch, so it is worth not provoking it in the first place.)
+	//
+	// wantRoot has no target, so it locks only the moved row.
+	lockIDs := []string{workspaceID}
+	if !wantRoot && target != workspaceID {
+		lockIDs = append(lockIDs, target)
+	}
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id::text, parent_id::text, status::text
+		   FROM workspaces
+		  WHERE id = ANY($1::uuid[])
+		  ORDER BY id
+		    FOR UPDATE`, pq.Array(lockIDs))
+	if err != nil {
+		return nil, fmt.Errorf("reparent: lock rows: %w", err)
+	}
+	type wsRow struct {
+		parent sql.NullString
+		status string
+	}
+	locked := make(map[string]wsRow, 2)
+	for rows.Next() {
+		var id, status string
+		var parent sql.NullString
+		if err := rows.Scan(&id, &parent, &status); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("reparent: scan locked row: %w", err)
+		}
+		locked[id] = wsRow{parent: parent, status: status}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("reparent: iterate locked rows: %w", err)
+	}
+	rows.Close()
+
+	self, ok := locked[workspaceID]
+	if !ok {
 		return nil, reparentReject(http.StatusNotFound, reparentCodeNotFound, "workspace not found", nil)
 	}
-	if err != nil {
-		return nil, fmt.Errorf("reparent: lock workspace: %w", err)
-	}
 	oldParent := ""
-	if curParent.Valid {
-		oldParent = curParent.String
+	if self.parent.Valid {
+		oldParent = self.parent.String
 	}
 
 	// 2. parent_id: null. Idempotent when the workspace is ALREADY a root;
@@ -335,20 +371,14 @@ func applyReparent(ctx context.Context, database *sql.DB, workspaceID string, ra
 		return &reparentOutcome{Changed: false, OldParent: oldParent, NewParent: target, OrgRoot: root}, nil
 	}
 
-	// 5. Destination must exist and be live. Locked so it cannot be moved or
-	//    removed between this check and the commit.
-	var newParentStatus string
-	err = tx.QueryRowContext(ctx,
-		`SELECT status::text FROM workspaces WHERE id = $1 FOR UPDATE`, target,
-	).Scan(&newParentStatus)
-	if errors.Is(err, sql.ErrNoRows) {
+	// 5. Destination must exist and be live. Already locked in step 1, so it
+	//    cannot be moved or removed between here and the commit.
+	newParent, ok := locked[target]
+	if !ok {
 		return nil, reparentReject(http.StatusUnprocessableEntity, reparentCodeNotFound,
 			"target parent workspace does not exist", map[string]any{"parent_id": target})
 	}
-	if err != nil {
-		return nil, fmt.Errorf("reparent: lock target parent: %w", err)
-	}
-	if newParentStatus == "removed" {
+	if newParent.status == "removed" {
 		return nil, reparentReject(http.StatusUnprocessableEntity, reparentCodeNotFound,
 			"target parent workspace has been removed", map[string]any{"parent_id": target})
 	}

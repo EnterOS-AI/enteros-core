@@ -49,9 +49,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
@@ -481,6 +483,81 @@ func TestIntegration_WorkspaceReparent_CycleGuardPreventsAnUnwalkableTree(t *tes
 	}
 	if got := parentOf(t, conn, a); got != root {
 		t.Fatalf("parent_id MUTATED to %q; the handler committed the cycle the CTE cannot walk", got)
+	}
+}
+
+// TestIntegration_WorkspaceReparent_ConcurrentSwapCannotCreateACycle fires the
+// two moves that form a cycle ONLY when combined — A becomes a child of B while
+// B becomes a child of A — at the same time.
+//
+// Each request is individually legal against the pre-move tree, so a guard that
+// validated against a snapshot taken before the transaction would let both
+// through and commit a cycle between them. This is why every check in
+// applyReparent runs inside the transaction, after both endpoints are locked in
+// a single id-ordered statement, and why the post-update re-walk re-derives the
+// org root from the UPDATED rows before committing.
+//
+// The assertion is on the INVARIANT, not on which goroutine wins, so there is
+// no timing dependency and nothing to flake: whatever the scheduler does, at
+// most one move may commit and the tree must remain walkable.
+func TestIntegration_WorkspaceReparent_ConcurrentSwapCannotCreateACycle(t *testing.T) {
+	conn := integrationDB_Reparent(t)
+
+	root := seedWS(t, conn, "root", "")
+	a := seedWS(t, conn, "node-a", root)
+	b := seedWS(t, conn, "node-b", root)
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, errs[0] = applyReparent(context.Background(), conn, a, b)
+	}()
+	go func() {
+		defer wg.Done()
+		_, errs[1] = applyReparent(context.Background(), conn, b, a)
+	}()
+	wg.Wait()
+
+	succeeded := 0
+	for i, err := range errs {
+		if err == nil {
+			succeeded++
+			continue
+		}
+		var rej *reparentError
+		if !errors.As(err, &rej) {
+			// A deadlock or any other raw DB error would land here. The
+			// id-ordered lock in step 1 exists so this does not happen.
+			t.Fatalf("move %d failed with a NON-rejection error (deadlock?): %v", i, err)
+		}
+		if rej.Code != reparentCodeCycle {
+			t.Errorf("move %d rejected with %s, want %s (%s)", i, rej.Code, reparentCodeCycle, rej.Message)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("%d of 2 swap moves committed; exactly 1 must win", succeeded)
+	}
+
+	// The invariant: the tree is still walkable to the original root from
+	// both nodes. On a committed cycle this walk would not terminate.
+	for _, id := range []string{a, b} {
+		tx, err := conn.BeginTx(context.Background(), nil)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		gotRoot, ok, err := reparentOrgRoot(context.Background(), tx, id)
+		_ = tx.Rollback()
+		if err != nil {
+			t.Fatalf("resolve root of %s: %v", id, err)
+		}
+		if !ok {
+			t.Fatalf("parent_id chain from %s does not terminate — a cycle was committed", id)
+		}
+		if gotRoot != root {
+			t.Fatalf("org root of %s = %q, want %q", id, gotRoot, root)
+		}
 	}
 }
 
