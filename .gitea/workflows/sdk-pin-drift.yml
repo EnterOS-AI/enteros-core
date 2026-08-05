@@ -1,0 +1,107 @@
+name: sdk-pin-drift
+
+# SDK consumer-pin drift gate — the DETECTOR leg of the SDK -> molecule-core pin
+# pipeline (the sibling of workspace-runtime's check_consumer_runtime_drift.py on
+# the runtime -> template axis).
+#
+# SSOT: molecule-ai-sdk@main, module `go.moleculesai.app/sdk/gen/go`.
+# CONSUMER PIN: workspace-server/go.mod.
+#
+# WHAT WAS MISSING. The runtime -> template axis has an opener, a merger and a
+# detector. The SDK -> core axis had none of the three: nothing opened a bump PR
+# on an SDK merge, nothing merged one, and nothing ever went red when the pin
+# fell behind. The two gates that look adjacent do NOT cover staleness:
+#   * sync_canonical_test.go pins the sha of whatever the binary ALREADY embeds —
+#     hermetic and inverted, it fires on an unexpected change, never on lag.
+#   * verify-providers-gen.yml asserts the projection matches THE PINNED MODULE,
+#     whatever version that is. Also green on a stale pin.
+# On 2026-08-05 core sat on sdk#203 (platform arms narrowed to minimax-only)
+# while sdk#204 had already restored five healthy model ids. Five ids were
+# unselectable for new workspaces and every check in the repo was green.
+#
+# WHY IT IS NOT "RED ON ANY LAG". Branch protection on main is
+# `status_check_contexts: ["*"]`, so any context this workflow posts blocks EVERY
+# PR in the repo. Going red on a routine SDK merge would wedge molecule-core. The
+# script therefore mirrors classify_pin_drift's disposition and is RED only in
+# the one case a human must act on:
+#   pin == head                                   -> OK        (exit 0)
+#   lagging within the window                     -> ADVISORY  (exit 0)
+#   lagging beyond window, bump PR in flight      -> ADVISORY  (exit 0)
+#   lagging beyond window, NO bump PR  = STUCK    -> BLOCKING  (exit 1)
+#   undeterminable (API/network/token)            -> ADVISORY  (exit 0)
+# The window is SDK_PIN_MAX_LAG_HOURS (default 72h — spans a weekend, so a Friday
+# SDK merge does not go red on Saturday).
+#
+# Proof the gate fires: tests/test_check_sdk_pin_drift.py exercises the BLOCKING
+# row explicitly (`test_lag_beyond_window_with_no_bump_pr_BLOCKS`,
+# `test_main_returns_1_on_stuck_pin`), not just the happy path. A gate that has
+# never been observed to fail is not a gate.
+#
+# NO schedule/cron: molecule-core enforces a zero-cron ratchet
+# (lint_schedule_budget.py). PR + push + dispatch is strictly better here anyway —
+# drift is reported on every PR rather than once a night.
+#
+# NO paths: filter. This gate's verdict depends on the STATE OF ANOTHER REPO, so
+# it can change without any file in this PR changing. A paths filter would make
+# it structurally incapable of noticing the very drift it exists to catch. (It is
+# also a prerequisite for promoting it into required-contexts.txt later —
+# lint-required-no-paths forbids paths on required contexts.)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main, staging]
+  workflow_dispatch:
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-pin-drift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Soak-then-promote posture, same as cron-fixtures-ssot-drift and
+  # verify-providers-gen: this reports on every PR and push immediately, but
+  # promoting it into branch protection is a follow-up once it has soaked —
+  # a cross-repo signal that can gate all of core needs operator GO.
+  # bp-exempt: standalone soak-then-promote drift gate, not a declared BP context
+  drift:
+    name: SDK consumer pin vs molecule-ai-sdk main
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+
+      - name: Check SDK pin drift
+        env:
+          # The SDK repo is public, so the HEAD read needs no credential. The
+          # open-bump-PR query is same-repo, which the run-scoped token covers —
+          # so the gate is ARMED by default rather than permanently advisory. If
+          # the token is ever absent the script degrades to ADVISORY and says so
+          # (it never blocks on a signal it could not read).
+          SDK_PIN_DRIFT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SDK_PIN_MAX_LAG_HOURS: ${{ vars.SDK_PIN_MAX_LAG_HOURS || '72' }}
+          GITEA_HOST: https://git.moleculesai.app
+        run: |
+          set -euo pipefail
+          python3 .gitea/scripts/check_sdk_pin_drift.py \
+            --go-mod workspace-server/go.mod
+
+      - name: Self-test the gate's own disposition matrix
+        run: |
+          set -euo pipefail
+          # Runs in the same job deliberately: if the classifier regresses into
+          # "never blocks", THIS step goes red even though the step above is
+          # green. Without it a broken gate is indistinguishable from a healthy
+          # pin — the vacuous-pass failure mode this repo keeps re-learning.
+          python3 -m pip install --quiet pytest
+          python3 -m pytest tests/test_check_sdk_pin_drift.py -q

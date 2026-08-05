@@ -1,0 +1,147 @@
+name: promote-prod-tenant-pin
+
+# PRODUCTION molecule-tenant pin promotion as a REVIEWED PIPELINE STEP, replacing
+# a hand-run `curl POST /cp/admin/runtime-image/promote` from an operator laptop.
+#
+# WHAT WAS THERE BEFORE. Template repos auto-promote the STAGING pin from
+# publish-image.yml, deliberately staging-only ("Production pin changes require a
+# separate reviewed control-plane change"). For PRODUCTION there was no pipeline
+# at all: no core workflow ever POSTs to /cp/admin/runtime-image/promote, and
+# every core workflow's CP host is staging-api. The prod path was two hand-run
+# steps — the curl, and a separate hand-edit of the prod Infisical
+# LOCAL_TENANT_IMAGE secret. Missing the second is documented as the exact way
+# "prod broke every fresh org", and on 2026-08-05 it was drifted again: prod
+# LOCAL_TENANT_IMAGE pointed at `staging-7d78136`, a tag that returns 404 on BOTH
+# registry hosts.
+#
+# THIS DOES NOT ARM AUTO-DEPLOY. Read this before changing the gating:
+#   * There is NO push trigger. Dispatch only. Merging cannot promote prod.
+#   * The APPLY path additionally requires BOTH:
+#       - PROD_AUTO_DEPLOY_DISABLED unset/false (the existing freeze is HONOURED,
+#         never bypassed — this lane is not a side door around it), and
+#       - PROD_TENANT_PIN_PROMOTE_ARMED == 'true' (a second, explicit arming
+#         switch that is intentionally NOT provisioned).
+#     Both must be true. Under the current freeze posture the apply path cannot
+#     run, which is the intended state.
+#   * The DEFAULT path is PLAN-ONLY and needs neither. It resolves the target
+#     digest, reads the live pin back from the CP, and prints the exact diff and
+#     the exact command — an auditable, reviewable plan, with no mutation.
+# "Via CI" here means a gated, reviewed, auditable step. It does not mean deploy
+# on merge, and this file must not be edited into meaning that.
+#
+# NO workflow_dispatch inputs (lint-workflow-yaml forbids them). The target is
+# DERIVED: the molecule-tenant image built from the current main HEAD, i.e.
+# `<TENANT_IMAGE>:staging-<sha7(main)>`. That is deliberate — it makes "promote
+# prod" mean "promote what trunk says", and removes the footgun of dispatching an
+# arbitrary tag.
+#
+# It SHELLS OUT to scripts/deploy/advance-staging-tenant-pin.sh rather than
+# re-implementing the promote. That script already writes BOTH SSOTs (the
+# runtime_image_pins DB row AND the LOCAL_TENANT_IMAGE boot secret) and verifies
+# each write landed; it is env-parameterised, so prod is a matter of CP_BASE_URL
+# + INFISICAL_ENV, not a second copy of the logic.
+
+on:
+  workflow_dispatch:
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote-prod-tenant-pin
+  cancel-in-progress: false
+
+jobs:
+  # bp-exempt: dispatch-only production promote lane, emits no PR/push context
+  promote:
+    name: Promote the production molecule-tenant pin
+    runs-on: [docker-host, local-deploy]
+    timeout-minutes: 30
+    env:
+      PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}
+      PROMOTE_ARMED: ${{ vars.PROD_TENANT_PIN_PROMOTE_ARMED || '' }}
+      TENANT_IMAGE: ${{ vars.MOLECULE_TENANT_IMAGE || 'registry.moleculesai.app/molecule-ai/molecule-tenant' }}
+      CP_BASE_URL: ${{ vars.PROD_CP_BASE_URL || 'http://127.0.0.1:8092' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Resolve the target image from trunk
+        id: target
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse origin/main)"
+          echo "sha=${sha}"        >> "$GITHUB_OUTPUT"
+          echo "sha7=${sha:0:7}"   >> "$GITHUB_OUTPUT"
+          echo "tag=staging-${sha:0:7}" >> "$GITHUB_OUTPUT"
+          echo "::notice::target = ${TENANT_IMAGE}:staging-${sha:0:7} (main ${sha})"
+
+      - name: Decide plan vs apply
+        id: mode
+        run: |
+          set -euo pipefail
+          frozen=0
+          case "$(printf '%s' "${PROD_AUTO_DEPLOY_DISABLED:-}" | tr '[:upper:]' '[:lower:]')" in
+            1|true|yes|on|disabled|disable) frozen=1 ;;
+          esac
+          armed=0
+          [ "$(printf '%s' "${PROMOTE_ARMED:-}" | tr '[:upper:]' '[:lower:]')" = "true" ] && armed=1
+          if [ "$frozen" = "1" ]; then
+            echo "::notice::PROD_AUTO_DEPLOY_DISABLED is set — production freeze HONOURED. Plan only, no mutation."
+            echo "apply=0" >> "$GITHUB_OUTPUT"
+          elif [ "$armed" = "0" ]; then
+            echo "::notice::PROD_TENANT_PIN_PROMOTE_ARMED is not 'true' — plan only, no mutation."
+            echo "apply=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::APPLY path enabled: freeze is off AND the lane is armed. This WILL mutate the production pin and the LOCAL_TENANT_IMAGE boot SSOT."
+            echo "apply=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Plan — current pin vs target (no mutation)
+        env:
+          CP_ADMIN_API_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CP_ADMIN_API_TOKEN:-}" ]; then
+            echo "::warning::CP_ADMIN_API_TOKEN is not provisioned — cannot read the live pin. Skipping the plan."
+            exit 0
+          fi
+          # lint-curl-status-capture shape: body to a file, status to a var, no
+          # or-else fallback inside the subshell.
+          resp="${RUNNER_TEMP:-/tmp}/pins.json"
+          code=$(curl -sS -A curl/8.4.0 -o "$resp" -w '%{http_code}' \
+            -H "Authorization: Bearer ${CP_ADMIN_API_TOKEN}" \
+            "${CP_BASE_URL}/cp/admin/runtime-image")
+          if [ "$code" != "200" ]; then
+            echo "::error::could not read the live pin (HTTP $code)"; exit 1
+          fi
+          # An empty 200 body is a KNOWN silent-failure shape on this path.
+          if [ ! -s "$resp" ]; then
+            echo "::error::CP returned HTTP 200 with an EMPTY body — that is the known silent-failure shape, not an empty pin set. Refusing to plan against it."
+            exit 1
+          fi
+          python3 .gitea/scripts/prod_pin_plan.py "$resp" "${TENANT_IMAGE}:${TAG}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply — promote BOTH SSOTs and read back
+        if: ${{ steps.mode.outputs.apply == '1' }}
+        env:
+          CP_ADMIN_API_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+          INFISICAL_ENV: prod
+          TENANT_PIN_GIT_SHA: ${{ steps.target.outputs.sha }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # The existing script is the SSOT for how a promote is done: it writes
+          # the runtime_image_pins row AND the LOCAL_TENANT_IMAGE boot secret,
+          # and verifies each landed. Re-implementing it here is how the two
+          # halves drift apart again.
+          ./scripts/deploy/advance-staging-tenant-pin.sh \
+            --tag "${TAG}" --git-sha "${TENANT_PIN_GIT_SHA}"
