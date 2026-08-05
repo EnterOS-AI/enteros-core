@@ -194,12 +194,19 @@ jobs:
             echo "::notice::${branch} already exists - bump already proposed."
             exit 0
           fi
-          git config user.email "molecule-runtime-release-bot@moleculesai.app"
-          git config user.name molecule-runtime-release-bot
+          # Identity: molecule-sdk-pin-bot, whose ENTIRE write surface is this
+          # repository. Gitea PAT scopes are category-wide (`write:repository`
+          # means every repo the user can write), so the only way to narrow a
+          # push credential is to narrow the identity — see
+          # docs/runbooks/sdk-pin-bump-credential.md. It is deliberately NOT
+          # molecule-runtime-release-bot, which carries write on 13 template and
+          # runtime repos this lane has no business touching.
+          git config user.email "sdk-pin-bot@moleculesai.app"
+          git config user.name molecule-sdk-pin-bot
           git checkout -b "$branch"
           git add workspace-server/go.mod workspace-server/go.sum workspace-server/internal/providers/gen/registry_gen.go workspace-server/internal/providers/sync_canonical_test.go
           git commit -m "chore(sdk): bump sdk/gen/go pin to ${SHA12}"
-          git remote set-url origin "https://molecule-runtime-release-bot:${SDK_PIN_BUMP_TOKEN}@git.moleculesai.app/molecule-ai/molecule-core.git"
+          git remote set-url origin "https://molecule-sdk-pin-bot:${SDK_PIN_BUMP_TOKEN}@git.moleculesai.app/molecule-ai/molecule-core.git"
           git push origin "$branch"
           # Never run `git remote -v` past this line: it PRINTS the embedded token.
           payload="$(mktemp)"

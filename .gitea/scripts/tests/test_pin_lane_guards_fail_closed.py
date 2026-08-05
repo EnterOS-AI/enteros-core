@@ -133,6 +133,25 @@ def test_sdk_pin_bump_has_no_credential_derived_skip_gate():
         )
 
 
+def test_sdk_pin_bump_push_identity_is_the_documented_narrow_bot():
+    """The pushing identity is the ONLY thing that narrows this credential.
+
+    Gitea PAT scopes are category-wide: `write:repository` grants write to every
+    repo the owning user can write. So swapping the push identity back to a
+    broader bot silently widens the token's blast radius without changing a
+    single scope string. Pin it to the identity the runbook documents.
+    """
+    step = _step_named(_load(SDK_PIN_BUMP), "Open the bump PR")
+    assert "molecule-sdk-pin-bot" in step["run"]
+    assert "molecule-runtime-release-bot" not in step["run"], (
+        "molecule-runtime-release-bot has write on 13 other repos; this lane's "
+        "credential must not be minted on it"
+    )
+    runbook = REPO / "docs" / "runbooks" / "sdk-pin-bump-credential.md"
+    assert runbook.is_file(), "the credential must stay documented, not become folklore"
+    assert "molecule-sdk-pin-bot" in runbook.read_text(encoding="utf-8")
+
+
 def test_sdk_pin_bump_targets_the_dispatched_ref():
     """A dispatch off main must not propose that ref's content into main."""
     step = _step_named(_load(SDK_PIN_BUMP), "Open the bump PR")
