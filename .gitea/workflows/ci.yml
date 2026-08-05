@@ -213,6 +213,34 @@ jobs:
           # go-arch-lint "without types"). Fleet sweep after the cp ci.yml find.
           cache: false
       - if: ${{ needs.changes.outputs.platform == 'true' }}
+        # core#5064: pin the interpreter the runtime install below runs on.
+        #
+        # This job pip-installs molecule-ai-workspace-runtime so the
+        # MCPServerAdaptor contract tests exercise the REAL runtime. That
+        # install used the runner's bare `python3`. ubuntu-latest on this fleet
+        # ships Python 3.10.12, and the runtime's pyproject.toml declares
+        # `requires-python = ">=3.11"`, so pip refused outright:
+        #
+        #   ERROR: Package 'molecules-workspace-runtime' requires a different
+        #          Python: 3.10.12 not in '>=3.11'
+        #
+        # and reddened CI / Platform (Go) on main (run 620337 / job 916932,
+        # commit dd1841976). Nothing pinned the interpreter, so this job's
+        # Python floor was whatever the runner image happened to ship — a
+        # runner-image bump could re-break or silently mask it at any time.
+        #
+        # cache: pip is deliberately NOT set — there is no requirements.txt or
+        # lockfile at this path for setup-python to hash, and a cache miss on
+        # every run is worse than no cache.
+        #
+        # Guarded by .gitea/scripts/tests/test_platform_go_python_floor.py,
+        # which fails closed if this step is removed, reordered after the
+        # install, or pinned below the runtime's requires-python floor.
+        name: Set up Python (>= molecule-ai-workspace-runtime requires-python)
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         # CR2 #12653 fix: the previous step tried to `pip install` the runtime
         # wheel and used `|| true` to swallow install failures. With
         # AUTO_SYNC_TOKEN lacking the package-install scope (HTTP 401),
