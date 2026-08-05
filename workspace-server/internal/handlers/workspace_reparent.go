@@ -269,7 +269,7 @@ func reparentIsDescendant(ctx context.Context, tx *sql.Tx, workspaceID, candidat
 // check and commit a cycle between them. Locking both endpoints serialises
 // any pair of moves that share a node.
 //
-// The post-update re-walk (step 8) is the backstop for anything the
+// The post-update re-walk (step 9) is the backstop for anything the
 // pre-checks miss: it re-derives the org root FROM THE UPDATED ROWS and
 // rolls back unless the chain still terminates at the same root. A move that
 // cannot prove that property does not commit.
@@ -336,6 +336,16 @@ func applyReparent(ctx context.Context, database *sql.DB, workspaceID string, ra
 	oldParent := ""
 	if self.parent.Valid {
 		oldParent = self.parent.String
+	}
+
+	// 1b. A soft-deleted workspace is not an org-chart node. Delete() already
+	//     NULLs its children's parent_id, so re-attaching it to a live tree
+	//     would resurrect a removed row into the hierarchy — and it is exempt
+	//     from workspaces_parent_name_uniq (which is partial on
+	//     status != 'removed'), so it could land on a name already taken.
+	if self.status == "removed" {
+		return nil, reparentReject(http.StatusNotFound, reparentCodeNotFound,
+			"workspace has been removed", nil)
 	}
 
 	// 2. parent_id: null. Idempotent when the workspace is ALREADY a root;

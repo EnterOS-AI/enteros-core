@@ -754,6 +754,25 @@ func TestIntegration_WorkspaceReparent_InputGuards(t *testing.T) {
 		}
 	})
 
+	t.Run("removed_workspace_cannot_be_moved", func(t *testing.T) {
+		// Negative control for the removed_parent case above: same guard
+		// family, opposite end of the edge. A soft-deleted workspace is exempt
+		// from workspaces_parent_name_uniq, so re-attaching it could land on a
+		// name already taken under the destination.
+		gone := seedWS(t, conn, "gone", root)
+		if _, err := conn.ExecContext(context.Background(),
+			`UPDATE workspaces SET status = 'removed' WHERE id = $1`, gone); err != nil {
+			t.Fatalf("mark removed: %v", err)
+		}
+		w := doPatch_Workspace(t, gone, `{"parent_id":"`+other+`"}`)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("status=%d body=%s, want 404", w.Code, w.Body.String())
+		}
+		if got := parentOf(t, conn, gone); got != root {
+			t.Fatalf("parent_id MUTATED to %q on a removed workspace", got)
+		}
+	})
+
 	t.Run("non_uuid_parent", func(t *testing.T) {
 		w := doPatch_Workspace(t, team, `{"parent_id":"not-a-uuid"}`)
 		if w.Code != http.StatusBadRequest {
