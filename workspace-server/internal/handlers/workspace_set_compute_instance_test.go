@@ -102,15 +102,22 @@ func TestSetComputeInstance_EmptyProviderIs400(t *testing.T) {
 // came up fine. The alias "local" normalizes to molecules-server and PERSISTS
 // as the backend key "local" (what the CP teardown routing keys on) — with a
 // local-docker CONTAINER NAME as the instance id, not an EC2 i-* id.
-// SDK#199 (substrate rename stage 2, adopted here with the sdk/gen/go bump):
-// the persisted BACKEND KEY is now `enteros`, not `local`. `local`/`docker`
-// remain ACCEPTED aliases on the wire; only what we WRITE changed. The CP
-// already runs this SDK (migrations 069 widen + 070 backfill applied), so the
-// repoint lands a value the CP teardown router understands.
-func TestSetComputeInstance_MoleculesServerLocalRepoint(t *testing.T) {
+// SDK#199 (stage 2) made the persisted BACKEND KEY `enteros` rather than
+// `local`. SDK#200 (stage 3, adopted 2026-08-05 with the sdk/gen/go bump) then
+// DELETED the `local`/`docker` wire aliases entirely.
+//
+// So this test now pins BOTH halves of the repoint contract:
+//   * the surviving alias `enteros` still repoints and persists as `enteros`;
+//   * the retired spelling `local` is REFUSED (400) before any DB write.
+//
+// The second half is the one that matters operationally: a rejected repoint must
+// not reach the UPDATE. sqlmock cannot prove a negative write on its own — an
+// unexpected statement only returns an error to the caller — so the assertion is
+// that the mock has NO unmet expectations after a request that queued none.
+func TestSetComputeInstance_MoleculesServerRepoint(t *testing.T) {
 	h, mock := setupBootstrapHandler(t)
 
-	// The alias "local" must persist as the SDK backend key "enteros".
+	// The surviving alias "enteros" persists as the SDK backend key "enteros".
 	mock.ExpectExec(`UPDATE workspaces\s+SET instance_id = \$2`).
 		WithArgs("ws-local", "mol-ws-test5-a9f3044fa3f2", "enteros").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -119,16 +126,45 @@ func TestSetComputeInstance_MoleculesServerLocalRepoint(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "ws-local"}}
 	c.Request = httptest.NewRequest("POST", "/admin/workspaces/ws-local/set-compute-instance",
-		bytes.NewBufferString(`{"instance_id":"mol-ws-test5-a9f3044fa3f2","provider":"local"}`))
+		bytes.NewBufferString(`{"instance_id":"mol-ws-test5-a9f3044fa3f2","provider":"enteros"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	h.SetComputeInstance(c)
 
 	if w.Code != http.StatusOK {
-		t.Fatalf("want 200 for molecules-server (local) repoint, got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("want 200 for molecules-server (enteros) repoint, got %d: %s", w.Code, w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet: %v", err)
+	}
+}
+
+// Stage-3 fail-closed half: the retired spelling must be refused, and refused
+// BEFORE the UPDATE (no expectation is queued on the mock, so any attempted
+// write would surface as an unexpected-statement error).
+func TestSetComputeInstance_RetiredLocalSpellingRejected(t *testing.T) {
+	for _, retired := range []string{"local", "docker"} {
+		t.Run(retired, func(t *testing.T) {
+			h, mock := setupBootstrapHandler(t)
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Params = gin.Params{{Key: "id", Value: "ws-local"}}
+			c.Request = httptest.NewRequest("POST", "/admin/workspaces/ws-local/set-compute-instance",
+				bytes.NewBufferString(`{"instance_id":"mol-ws-test5-a9f3044fa3f2","provider":"`+retired+`"}`))
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			h.SetComputeInstance(c)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("want 400 for the retired spelling %q (sdk#200 deleted it; the "+
+					"prod organizations.provider CHECK no longer permits it), got %d: %s",
+					retired, w.Code, w.Body.String())
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("a rejected repoint must not touch the DB: %v", err)
+			}
+		})
 	}
 }
 

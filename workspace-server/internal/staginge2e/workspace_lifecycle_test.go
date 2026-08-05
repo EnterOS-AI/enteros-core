@@ -551,15 +551,51 @@ func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string) (orgID string) {
 		t.Fatalf("AdminCreate org: no id in response: %s", resp)
 	}
 	deadline := time.Now().Add(7 * time.Minute)
+	var lastListStatus int
+	lastInstance := "<never observed>"
 	for time.Now().Before(deadline) {
 		st, list := doJSON(t, "GET", cfg.cpBase+"/cp/admin/orgs", cfg.adminToken, "")
+		lastListStatus = st
+		if st == http.StatusOK {
+			if seen := orgInstanceStatus(list, slug); seen != "" {
+				lastInstance = seen
+			} else if strings.Contains(list, `"slug":"`+slug+`"`) {
+				lastInstance = "<row present, instance_status omitted>"
+			} else {
+				lastInstance = "<org row absent from admin list>"
+			}
+		}
 		if st == http.StatusOK && strings.Contains(list, `"slug":"`+slug+`"`) &&
 			orgInstanceStatus(list, slug) == "running" {
 			return id
 		}
 		time.Sleep(15 * time.Second)
 	}
-	t.Fatalf("org %s did not reach instance_status=running within timeout", slug)
+	// SELF-DIAGNOSING TIMEOUT (Guard B operability).
+	//
+	// This message used to be exactly "org %s did not reach instance_status=
+	// running within timeout" and NOTHING else. That single line is what the
+	// staging-tenant-cd HARD GATE printed on runs 616479 / 617016, and it named
+	// neither the last status the CP reported nor the reason provisioning stalled.
+	// The actual cause was a CP-side check-constraint rejection
+	// (organizations_provider_check, migration 071 vs a literal 'local' write) —
+	// a fact the control plane already knew and this gate simply never asked for.
+	// Two separate investigations of a red Guard B were spent re-deriving it by
+	// hand from a live reproduction, because the gate deleted its own evidence:
+	// the t.Cleanup teardown purges the org moments later, so by the time anyone
+	// reads the log the tenant it is asking about no longer exists.
+	//
+	// So: before failing, pull the two admin surfaces the CP already exposes for
+	// exactly this question and put them IN the failure. Both are best-effort —
+	// a diagnostics fetch that itself fails must never replace the real verdict,
+	// only annotate it.
+	t.Fatalf("org %s did not reach instance_status=running within 7m "+
+		"(last admin-list HTTP %d, last instance_status=%q).\n"+
+		"  CP tenant diagnostics: %s\n"+
+		"  CP boot-events:        %s",
+		slug, lastListStatus, lastInstance,
+		bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/diagnostics"),
+		bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/boot-events?limit=20"))
 	return ""
 }
 
@@ -1116,18 +1152,9 @@ func doTenantJSON(t *testing.T, method, url, token, orgID, body string) (int, st
 	return resp.StatusCode, readBody(resp)
 }
 
-func readBody(resp *http.Response) string {
-	buf := make([]byte, 0, 4096)
-	tmp := make([]byte, 4096)
-	for {
-		n, e := resp.Body.Read(tmp)
-		buf = append(buf, tmp[:n]...)
-		if e != nil || len(buf) > 1<<20 {
-			break
-		}
-	}
-	return string(buf)
-}
+// (readBody moved to admin_diagnostics.go — the untagged file — so the normal
+// `go test ./...` gate type-checks it and the untagged diagnostic path can
+// share the ONE body reader rather than growing a second copy.)
 
 // jsonField does a flat, dependency-free extraction of a top-level string field
 // value ("key":"value") — sufficient for the id/status/url fields we read.

@@ -106,13 +106,55 @@ func TestValidateWorkspaceCompute_Provider(t *testing.T) {
 // The assertion is deliberately on the SDK's local box (sdkcp.MoleculesServer and
 // its aliases), not on a literal, so it tracks the SSOT rather than a copy of it.
 func TestValidateWorkspaceCompute_AcceptsMoleculesServer(t *testing.T) {
-	// The canonical id and both accepted wire aliases must all validate: the CP
-	// re-provision path POSTs provider="local", and "docker" is the
-	// PROVISIONER_BACKEND spelling.
-	for _, id := range []string{sdkcp.MoleculesServer, "local", "docker"} {
+	// The canonical id and every alias the SDK STILL declares must validate. The
+	// alias list is read from the SSOT rather than written out here, so a stage-4
+	// alias change moves this test with it instead of rotting.
+	accepted := []string{sdkcp.MoleculesServer}
+	for _, p := range sdkcp.All {
+		if p.ID == sdkcp.MoleculesServer {
+			accepted = append(accepted, p.Aliases...)
+		}
+	}
+	for _, id := range accepted {
 		c := models.WorkspaceCompute{Provider: id}
 		if err := validateWorkspaceCompute(c); err != nil {
 			t.Errorf("provider=%q must be accepted — it is the substrate prod runs on: %v", id, err)
+		}
+	}
+
+	// SUBSTRATE RENAME STAGE 3 (molecule-ai-sdk#200, adopted 2026-08-05):
+	// "local" and "docker" are DELETED, not deprecated, and must now fail CLOSED.
+	//
+	// This flipped from an accept-assertion to a reject-assertion on evidence,
+	// not on the SDK's say-so — accepting a value the rest of the stack cannot
+	// store would just move the failure later:
+	//   * prod organizations.provider CHECK is already narrowed to
+	//     ('', aws, hetzner, gcp, enteros) by CP migration 071 — the DB itself
+	//     rejects 'local'/'docker', so a 200 here would be a lie.
+	//   * all 6 prod organization rows already read 'enteros' (migration 070
+	//     backfill), so nothing in prod still spells it the old way.
+	//   * molecule-controlplane already pins sdk#200 and carries explicit
+	//     retired-spelling handling (internal/cloudprovider/retired_spellings.go),
+	//     so core was the LAST consumer on stage 2.
+	// Accepting them at the API while the DB refuses them is strictly worse than
+	// failing closed early with a clear 400.
+	for _, id := range []string{"local", "docker"} {
+		c := models.WorkspaceCompute{Provider: id}
+		err := validateWorkspaceCompute(c)
+		if err == nil {
+			t.Errorf("provider=%q must be REJECTED — sdk#200 deleted the retired "+
+				"spellings and the prod organizations.provider CHECK no longer "+
+				"permits them; accepting here only defers the failure to the DB", id)
+			continue
+		}
+		// The rejection message must not advertise the value it just rejected.
+		if strings.Contains(err.Error(), id) && strings.Contains(err.Error(), "aliases") {
+			if idx := strings.Index(err.Error(), "aliases"); idx >= 0 &&
+				strings.Contains(err.Error()[idx:], id) {
+				t.Errorf("provider=%q was rejected but the error still lists it as an "+
+					"accepted alias — the message must derive its alias list from the "+
+					"SDK, not from prose: %v", id, err)
+			}
 		}
 	}
 

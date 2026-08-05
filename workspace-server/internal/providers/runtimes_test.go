@@ -117,8 +117,10 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 			"anthropic:claude-haiku-4-5", "anthropic:claude-sonnet-4-5",
 			// anthropic via platform proxy (namespaced) — WITHDRAWN 2026-08-04
 			// (sdk#203, minimax-only platform arms). Kept listed as a comment so
-			// restoring the arm re-arms this expectation verbatim:
-			//   "anthropic/claude-opus-4-7", "anthropic/claude-opus-4-8", "anthropic/claude-sonnet-4-6",
+			// RESTORED 2026-08-05 (sdk#204): these three were healthy all along
+			// (HTTP 200 through the metered proxy) and #203 withdrew them by
+			// mistake. Back on the menu verbatim, as the note above prescribed.
+			"anthropic/claude-opus-4-7", "anthropic/claude-opus-4-8", "anthropic/claude-sonnet-4-6",
 			// kimi (kimi-coding gateway, bare form only — colon-forms removed
 			// because claude-code's adapter cannot strip the moonshot: prefix;
 			// openclaw retains them natively, cp#521).
@@ -155,10 +157,10 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 		"codex": {
 			"gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
 			"gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2",
-			// openai via platform proxy — WITHDRAWN 2026-08-04 under the
-			// minimax-only platform directive (these ids were LIVE and healthy;
-			// sdk#203). Restore alongside the registry arm:
-			//   "openai/gpt-5.4", "openai/gpt-5.4-mini",
+			// openai via platform proxy — RESTORED 2026-08-05 (sdk#204). #203
+			// withdrew these under the minimax-only directive even though they
+			// were LIVE and healthy; the live probe confirmed HTTP 200 on both.
+			"openai/gpt-5.4", "openai/gpt-5.4-mini",
 			// minimax via platform proxy (task #83 platform default)
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
 		},
