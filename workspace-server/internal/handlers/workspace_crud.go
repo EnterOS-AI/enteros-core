@@ -555,8 +555,11 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		// with them, so the honest handling is to state the delta at the call
 		// site rather than let it be discovered later.
 		//
-		// org:<root> is deliberately absent from both lists: the same-org
-		// invariant means it cannot change.
+		// For an ordinary move org:<root> is absent from both lists because
+		// the same-org invariant means it cannot change. An ADOPTION is the
+		// one exception and DOES list it — the workspace trades a writable
+		// org:<self> for a read-only org:<newRoot> — which is why the lists
+		// are built in applyReparent rather than assumed here.
 		resp["reparented"] = gin.H{
 			"old_parent_id":     reparent.OldParent,
 			"new_parent_id":     reparent.NewParent,
@@ -575,10 +578,16 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		// than leave the drift unreported.
 		needsRestart = true
 
+		// adopted_into_org is carried here as well as in the response: an
+		// adoption is the only case where a workspace CHANGES ORG, so it is
+		// the single most security-relevant bit of the event. An auditor
+		// reading the ledger must not have to infer it by comparing
+		// old_parent_id against org_root_id.
 		RecordAuditEvent(ctx, db.DB, auditEntryFromGin(c, id, "workspace.reparent", true, map[string]any{
 			"old_parent_id":     reparent.OldParent,
 			"new_parent_id":     reparent.NewParent,
 			"org_root_id":       reparent.OrgRoot,
+			"adopted_into_org":  reparent.Adopted,
 			"namespaces_lost":   reparent.Lost,
 			"namespaces_gained": reparent.Gained,
 		}))

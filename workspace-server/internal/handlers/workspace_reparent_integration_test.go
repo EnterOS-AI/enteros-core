@@ -61,7 +61,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/namespace"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
 const reparentTestPrefix = "itest-reparent-"
@@ -590,15 +590,23 @@ func TestIntegration_WorkspaceReparent_ConcurrentDisjointMovesCannotCreateACycle
 }
 
 // TestIntegration_WorkspaceReparent_ConcurrentSwapCannotCreateACycle fires the
-// two moves that form a cycle ONLY when combined — A becomes a child of B while
+// two moves that form a cycle only when combined — A becomes a child of B while
 // B becomes a child of A — at the same time.
 //
-// Each request is individually legal against the pre-move tree, so a guard that
-// validated against a snapshot taken before the transaction would let both
-// through and commit a cycle between them. This is why every check in
-// applyReparent runs inside the transaction, after both endpoints are locked in
-// a single id-ordered statement, and why the post-update re-walk re-derives the
-// org root from the UPDATED rows before committing.
+// ⚠️ THIS TEST IS NOT EVIDENCE OF CONCURRENCY SAFETY. READ BEFORE TRUSTING IT.
+//
+// Both transactions lock the IDENTICAL set {A,B}, so ANY id-ordered
+// `FOR UPDATE` serialises them for free. It therefore passes whether or not
+// the guard actually works — it passed against the revision whose only
+// protection was locking the two endpoints, and that revision committed a
+// four-node cycle on the first round of the disjoint case.
+//
+// The real proof is
+// TestIntegration_WorkspaceReparent_ConcurrentDisjointMovesCannotCreateACycle
+// above, where the two transactions share NO rows and only the org-root lock
+// serialises them. Keep this one as a cheap regression case for the trivial
+// shape; do NOT cite it, extend it, or treat a green run here as coverage of
+// the mechanism.
 //
 // The assertion is on the INVARIANT, not on which goroutine wins, so there is
 // no timing dependency and nothing to flake: whatever the scheduler does, at
@@ -866,7 +874,14 @@ func TestIntegration_WorkspaceReparent_ChildlessRootIsAdoptedIntoTheOrg(t *testi
 		t.Fatalf("parent_id=%q, want %q", got, pollTarget)
 	}
 
-	rp := decodeBody(t, w)["reparented"].(map[string]any)
+	// Comma-ok, not a bare assertion: in a reverted/broken state `reparented`
+	// is absent and a bare assertion PANICS, which takes down the whole test
+	// binary and hides every other result in the package. Fail this test, not
+	// the run.
+	rp, ok := decodeBody(t, w)["reparented"].(map[string]any)
+	if !ok {
+		t.Fatalf("response has no `reparented` block: %s", w.Body.String())
+	}
 	if rp["adopted_into_org"] != true {
 		t.Errorf("adopted_into_org=%v, want true", rp["adopted_into_org"])
 	}
@@ -912,6 +927,101 @@ func TestIntegration_WorkspaceReparent_ChildlessRootIsAdoptedIntoTheOrg(t *testi
 	}
 	if !same {
 		t.Fatal("adopted workspace is not sameOrg with its new parent — CanCommunicate would still 403")
+	}
+}
+
+// TestIntegration_WorkspaceReparent_ChildlessCheckCannotBeRaced pins the
+// lock interaction that makes the adoption guard sound.
+//
+// Adoption is allowed only for a CHILDLESS root. If a child could be inserted
+// between the count and the write, an org WITH a subtree would be adopted —
+// exactly what the guard refuses — and the descendants would change org
+// silently.
+//
+// It cannot happen, and the reason is not obvious enough to leave implicit:
+// an `INSERT INTO workspaces (... parent_id = X)` must take `FOR KEY SHARE`
+// on row X to satisfy workspaces_parent_id_fkey, and applyReparent already
+// holds `FOR UPDATE` on X (the adoptee IS its own org root, so it is in the
+// lock set twice over). FOR UPDATE conflicts with FOR KEY SHARE, so the
+// inserting transaction blocks until the adoption commits.
+//
+// WHY THIS IS A DETERMINISTIC LOCK TEST AND NOT A CONCURRENT PROBE.
+// A 250-round "fire both at once" probe was written first and MEASURED: it
+// scored 0 adopted / 250 refused. The child INSERT is a single statement while
+// applyReparent must parse, BeginTx and walk the chain twice before it reaches
+// the lock, so the INSERT wins the head start essentially every time and the
+// probe never reaches the interleaving it claims to test. It would have sat in
+// the suite looking like coverage while asserting nothing about the lock. Do
+// not re-add it; drive the lock directly, as below.
+func TestIntegration_WorkspaceReparent_ChildlessCheckCannotBeRaced(t *testing.T) {
+	conn := integrationDB_Reparent(t)
+	ctx := context.Background()
+
+	adoptee := seedWS(t, conn, "lock-adoptee", "")
+
+	// Hold exactly the lock applyReparent's step 1 holds on the adoptee.
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	var lockedID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id::text FROM workspaces WHERE id = $1 FOR UPDATE`, adoptee).Scan(&lockedID); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("take FOR UPDATE: %v", err)
+	}
+
+	// A second connection tries to add a child. workspaces_parent_id_fkey
+	// forces it to take FOR KEY SHARE on the parent row, which conflicts with
+	// the FOR UPDATE above — so it must BLOCK, and with lock_timeout set it
+	// must fail with 55P03 lock_not_available rather than succeed.
+	other, err := sql.Open("postgres", requireIntegrationDBURL(t))
+	if err != nil {
+		t.Fatalf("open second conn: %v", err)
+	}
+	defer other.Close()
+	if _, err := other.ExecContext(ctx, `SET lock_timeout = '2s'`); err != nil {
+		t.Fatalf("set lock_timeout: %v", err)
+	}
+	childID := uuid.NewString()
+	_, insErr := other.ExecContext(ctx,
+		`INSERT INTO workspaces (id, name, parent_id, status) VALUES ($1, $2, $3, 'online')`,
+		childID, reparentTestPrefix+"lock-child", adoptee)
+	if insErr == nil {
+		_ = tx.Rollback()
+		t.Fatal("child INSERT SUCCEEDED while the parent row was held FOR UPDATE — " +
+			"the childless check CAN be raced, and adoption's descendant guard is not sound")
+	}
+	var pqErr *pq.Error
+	if !errors.As(insErr, &pqErr) || pqErr.Code.Name() != "lock_not_available" {
+		_ = tx.Rollback()
+		t.Fatalf("child INSERT failed with %v — expected a LOCK timeout (55P03). "+
+			"A different error means this test is no longer exercising the FK's FOR KEY SHARE.", insErr)
+	}
+	t.Logf("confirmed: child INSERT blocks on the adoptee's FOR UPDATE (%v)", pqErr.Code.Name())
+
+	// NEGATIVE CONTROL: exactly one thing changes — the lock is released.
+	// The same INSERT must now succeed. Without this the test would pass if
+	// the INSERT were failing for an unrelated reason (bad column, FK typo).
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	if _, err := other.ExecContext(ctx,
+		`INSERT INTO workspaces (id, name, parent_id, status) VALUES ($1, $2, $3, 'online')`,
+		childID, reparentTestPrefix+"lock-child", adoptee); err != nil {
+		t.Fatalf("child INSERT still failed after the lock was released: %v — "+
+			"the blocked INSERT above was not caused by the lock", err)
+	}
+
+	// And with a child present, adoption is refused — the guard the lock protects.
+	host := seedWS(t, conn, "lock-host", "")
+	_, adoptErr := applyReparent(ctx, conn, adoptee, host)
+	var rej *reparentError
+	if !errors.As(adoptErr, &rej) || rej.Code != reparentCodeCrossOrg {
+		t.Fatalf("adoption of a now-parented root: err=%v, want %s", adoptErr, reparentCodeCrossOrg)
+	}
+	if rej.Details["descendant_count"] == nil {
+		t.Errorf("refusal did not report descendant_count: %#v", rej.Details)
 	}
 }
 
@@ -1133,21 +1243,21 @@ func TestIntegration_WorkspaceReparent_CreateValidatesParentID(t *testing.T) {
 	}
 
 	t.Run("nonexistent_parent_rejected", func(t *testing.T) {
-		err := validateCreateParentID(ctx, conn, uuid.NewString())
+		err := validateCreateParentID(ctx, conn, nil, uuid.NewString())
 		var rej *reparentError
 		if !errors.As(err, &rej) || rej.Code != reparentCodeNotFound {
 			t.Fatalf("err=%v, want %s", err, reparentCodeNotFound)
 		}
 	})
 	t.Run("removed_parent_rejected", func(t *testing.T) {
-		err := validateCreateParentID(ctx, conn, dead)
+		err := validateCreateParentID(ctx, conn, nil, dead)
 		var rej *reparentError
 		if !errors.As(err, &rej) || rej.Code != reparentCodeNotFound {
 			t.Fatalf("err=%v, want %s", err, reparentCodeNotFound)
 		}
 	})
 	t.Run("non_uuid_parent_rejected", func(t *testing.T) {
-		err := validateCreateParentID(ctx, conn, "not-a-uuid")
+		err := validateCreateParentID(ctx, conn, nil, "not-a-uuid")
 		var rej *reparentError
 		if !errors.As(err, &rej) || rej.Code != reparentCodeInvalid {
 			t.Fatalf("err=%v, want %s", err, reparentCodeInvalid)
@@ -1157,13 +1267,57 @@ func TestIntegration_WorkspaceReparent_CreateValidatesParentID(t *testing.T) {
 	// must be accepted, and an absent parent_id must stay absent (the
 	// server-side default path below it must keep working).
 	t.Run("live_parent_accepted", func(t *testing.T) {
-		if err := validateCreateParentID(ctx, conn, root); err != nil {
+		if err := validateCreateParentID(ctx, conn, nil, root); err != nil {
 			t.Fatalf("live parent rejected: %v", err)
 		}
 	})
 	t.Run("empty_is_not_validated", func(t *testing.T) {
-		if err := validateCreateParentID(ctx, conn, ""); err != nil {
+		if err := validateCreateParentID(ctx, conn, nil, ""); err != nil {
 			t.Fatalf("empty parent_id must be a no-op, got: %v", err)
+		}
+	})
+
+	// ---- org scoping -----------------------------------------------------
+	// An ANCHORED org token may only create under a parent in its own org.
+	// This is the escalation the create path left open: AdminAuth admits an
+	// org-token, and creating under parent P grants team:P read+write
+	// retroactively.
+	otherRoot := seedWS(t, conn, "create-other-root", "")
+	otherChild := seedWS(t, conn, "create-other-child", otherRoot)
+
+	withOrgAnchor := func(anchor string) *gin.Context {
+		gin.SetMode(gin.TestMode)
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		if anchor != "" {
+			c.Set("org_id", anchor)
+		}
+		return c
+	}
+
+	t.Run("org_token_cannot_create_under_a_foreign_org", func(t *testing.T) {
+		err := validateCreateParentID(ctx, conn, withOrgAnchor(root), otherChild)
+		var rej *reparentError
+		if !errors.As(err, &rej) || rej.Code != reparentCodeCrossOrg {
+			t.Fatalf("err=%v, want %s", err, reparentCodeCrossOrg)
+		}
+		if rej.Status != http.StatusForbidden {
+			t.Errorf("status=%d, want 403", rej.Status)
+		}
+	})
+	// NEGATIVE CONTROL: same call, ONE field different — the anchor now names
+	// the parent's OWN org. Must be accepted. Without this the guard could be
+	// blanket-denying every anchored caller and still look correct above.
+	t.Run("org_token_can_create_within_its_own_org", func(t *testing.T) {
+		if err := validateCreateParentID(ctx, conn, withOrgAnchor(otherRoot), otherChild); err != nil {
+			t.Fatalf("same-org create rejected: %v", err)
+		}
+	})
+	// And an unanchored caller (ADMIN_TOKEN / cp-session) is unaffected —
+	// this is the arm that would have 403'd creation fleet-wide had the
+	// earlier "two namespaces" reasoning been acted on naively.
+	t.Run("unanchored_caller_is_unrestricted", func(t *testing.T) {
+		if err := validateCreateParentID(ctx, conn, withOrgAnchor(""), otherChild); err != nil {
+			t.Fatalf("unanchored caller rejected: %v", err)
 		}
 	})
 }

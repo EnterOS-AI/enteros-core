@@ -117,6 +117,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 )
@@ -296,19 +297,26 @@ func reparentIsDescendant(ctx context.Context, tx *sql.Tx, workspaceID, candidat
 // its tier-3 fallback), whereas the PATCH path requires admin-token or
 // cp-session.
 //
-// SCOPE — deliberately structural only. The obvious next step is "an
-// org-token caller may only create under a parent in ITS OWN org", and it is
-// NOT done here on purpose. `org_api_tokens.org_id` is written in TWO
-// namespaces across the codebase — the org-root WORKSPACE id, and the raw CP
-// org UUID that the concierge's managed-token mint passes. A naive
-// `orgRoot(parent) != callerOrg` comparison is therefore always unequal for
-// the concierge token and would 403 workspace creation fleet-wide; that exact
-// bug is documented at length in middleware.WorkspaceAuth (the "LIKE-FOR-LIKE
-// (the catastrophic bug this replaces)" comment) and the existing
-// requireOrgOwnership helper still does the naive comparison. Doing it right
-// needs the DeterministicPlatformAgentID mapping on both arms and its own
-// tests. That is a separate change, not a rider on this one.
-func validateCreateParentID(ctx context.Context, database *sql.DB, raw string) error {
+// ORG SCOPING. An ANCHORED org token may only create under a parent in its
+// OWN org. The anchor comparison goes through orgAnchorMatchesRoot (the same
+// helper the a2a caller classifier uses), which accepts BOTH namespaces
+// org_api_tokens.org_id is written in — the org-root workspace id, and the raw
+// CP org UUID mapped forward through DeterministicPlatformAgentID — so it
+// cannot 403 a concierge-minted token.
+//
+// (An earlier revision of this file declined to do this check at all, claiming
+// a namespace mismatch would 403 creation fleet-wide. That was wrong, and the
+// note is removed rather than softened: org_api_tokens.org_id carries
+// `REFERENCES workspaces(id)`, so the raw-CP-UUID form cannot be persisted in
+// the first place — verified on PG16, the insert fails
+// org_api_tokens_org_id_fkey. Using orgAnchorMatchesRoot makes the point moot
+// either way.)
+//
+// Callers WITHOUT an org anchor — ADMIN_TOKEN, cp-session, and unanchored
+// tokens — are unaffected: they are tenant-wide principals here, and
+// tightening them is a different decision from closing a cross-org hole.
+// Fails CLOSED on a lookup error, matching sameOrg's posture.
+func validateCreateParentID(ctx context.Context, database *sql.DB, c *gin.Context, raw string) error {
 	if raw == "" {
 		return nil
 	}
@@ -330,22 +338,46 @@ func validateCreateParentID(ctx context.Context, database *sql.DB, raw string) e
 		return reparentReject(http.StatusUnprocessableEntity, reparentCodeNotFound,
 			"parent workspace has been removed", map[string]any{"parent_id": raw})
 	}
+
+	anchor := ""
+	if c != nil {
+		anchor = c.GetString("org_id")
+	}
+	if anchor == "" {
+		return nil
+	}
+	parentRoot, rootErr := orgRootID(ctx, database, raw)
+	if rootErr != nil {
+		if errors.Is(rootErr, errNoOrgRoot) {
+			return reparentReject(http.StatusUnprocessableEntity, reparentCodeUnresolvable,
+				"the parent's org root cannot be resolved; refusing to create under it",
+				map[string]any{"parent_id": raw})
+		}
+		return fmt.Errorf("validate create parent org: %w", rootErr)
+	}
+	if !orgAnchorMatchesRoot(anchor, parentRoot) {
+		return reparentReject(http.StatusForbidden, reparentCodeCrossOrg,
+			"this org token is not authorized to create a workspace under a parent in a different org",
+			map[string]any{"parent_id": raw})
+	}
 	return nil
 }
 
 // applyReparent validates and applies a parent_id change as ONE transaction.
 //
-// Ordering matters: every check runs INSIDE the tx, after SELECT ... FOR
-// UPDATE on both the moved row and the destination parent. Validating
-// against a pre-transaction snapshot would let two concurrent PATCHes
-// (A→child-of-B and B→child-of-A) each pass an individually-correct cycle
-// check and commit a cycle between them. Locking both endpoints serialises
-// any pair of moves that share a node.
+// CONCURRENCY. Every check runs INSIDE the tx, after the locks taken in step
+// 1 — and the lock set is the endpoints PLUS THEIR ORG ROOTS. The org-root
+// lock is the mechanism; locking only the two endpoints is NOT sufficient and
+// was measured committing a four-node cycle (see step 1 for the disjoint
+// A→B2 / B→A2 case and why READ COMMITTED makes a post-hoc check powerless
+// against it).
 //
-// The post-update re-walk (step 9) is the backstop for anything the
-// pre-checks miss: it re-derives the org root FROM THE UPDATED ROWS and
-// rolls back unless the chain still terminates at the same root. A move that
-// cannot prove that property does not commit.
+// The post-update re-walk (step 9) is a BACKSTOP, not the mechanism: it
+// re-derives the org root FROM THE UPDATED ROWS and rolls back unless it is
+// the expected one, catching triggers, future column defaults, and anything
+// else the pre-checks do not model. It cannot catch a concurrent sibling
+// transaction, because under READ COMMITTED it cannot see uncommitted work —
+// which is exactly why the serialisation happens up front.
 func applyReparent(ctx context.Context, database *sql.DB, workspaceID string, raw any) (*reparentOutcome, error) {
 	target, wantRoot, perr := parseReparentTarget(raw)
 	if perr != nil {
@@ -587,6 +619,19 @@ func applyReparent(ctx context.Context, database *sql.DB, workspaceID string, ra
 	// response: it loses org WRITE (root-only) and its own team/org
 	// namespaces, and gains read of the destination org's corpus. That is
 	// inherent in joining an org, and it is admin-gated and audited.
+	// WHY THE CHILDLESS CHECK CANNOT BE RACED. A concurrent
+	// `INSERT INTO workspaces (... parent_id = <this workspace>)` must take
+	// `FOR KEY SHARE` on the parent row to satisfy workspaces_parent_id_fkey.
+	// Step 1 already holds `FOR UPDATE` on that same row (it is the adoptee,
+	// and it is its own org root), and FOR UPDATE conflicts with FOR KEY
+	// SHARE — so the inserting transaction blocks until this one commits, and
+	// a child cannot appear between the count below and the write. Verified
+	// with a 250-round probe (see the ChildlessCheckCannotBeRaced test).
+	//
+	// NOTE: a two-workspace org can never be adopted as a unit — its root
+	// always has a child, so the childless arm refuses it, and the child is
+	// not a root so it takes the ordinary same-org path. That is intended:
+	// moving such a pair is an org MERGE, which is what this refuses.
 	adoption := false
 	if oldRoot != targetRoot {
 		if oldParent == "" {
@@ -665,6 +710,19 @@ func applyReparent(ctx context.Context, database *sql.DB, workspaceID string, ra
 			`DELETE FROM org_plugin_allowlist WHERE org_id = $1`, workspaceID); err != nil {
 			return nil, fmt.Errorf("reparent: clear old org_plugin_allowlist: %w", err)
 		}
+		// requests.org_id is deliberately NOT migrated.
+		//
+		// It is a LISTING FILTER, not an ACL — ListPendingForOrg uses it to
+		// populate the org's "all agents' incoming" tab. Leaving it stamped
+		// with the old root can only HIDE the adoptee's historical requests
+		// from the new org's tab; it can never expose anything, because no
+		// query reaches rows through an org_id nobody resolves to any more.
+		//
+		// Migrating would be the riskier choice: it would surface requests
+		// raised while the workspace was its OWN org into the adopting org's
+		// shared inbox. That is the same call made for memory — history stays
+		// with the org it was created under — and it fails in the safe
+		// direction.
 	}
 
 	// 9. Post-update verification, from the UPDATED rows, still inside the tx.

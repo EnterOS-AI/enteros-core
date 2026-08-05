@@ -753,7 +753,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// an arbitrary parent is a privilege grant (team:<parent> read+write,
 	// retroactively) and for the scope note on org-scoping.
 	if payload.ParentID != nil {
-		if err := validateCreateParentID(ctx, db.DB, *payload.ParentID); err != nil {
+		if err := validateCreateParentID(ctx, db.DB, c, *payload.ParentID); err != nil {
 			var rej *reparentError
 			if errors.As(err, &rej) {
 				resp := gin.H{"error": rej.Message, "code": rej.Code}
