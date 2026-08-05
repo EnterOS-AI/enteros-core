@@ -65,10 +65,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # bp-exempt: standalone soak-then-promote drift gate — same posture as
-  # cron-fixtures-ssot-drift / verify-providers-gen. It reports on every PR and
-  # push immediately; promoting it into branch protection is a follow-up once it
-  # has soaked, because a cross-repo signal gating all of core needs operator GO.
+  # Soak-then-promote posture, same as cron-fixtures-ssot-drift and
+  # verify-providers-gen: this reports on every PR and push immediately, but
+  # promoting it into branch protection is a follow-up once it has soaked —
+  # a cross-repo signal that can gate all of core needs operator GO.
+  # bp-exempt: standalone soak-then-promote drift gate, not a declared BP context
   drift:
     name: SDK consumer pin vs molecule-ai-sdk main
     runs-on: ubuntu-latest

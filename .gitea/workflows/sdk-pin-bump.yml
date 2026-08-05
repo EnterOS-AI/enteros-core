@@ -47,8 +47,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # bp-exempt: dispatch-only producer lane; it opens a PR and posts no gating
-  # context on anyone else's commit.
+  # Dispatch-only producer lane: it opens a PR and posts no gating context on
+  # anyone else's commit.
+  # bp-exempt: dispatch-only producer lane, emits no pull_request/push context
   bump:
     name: Open an SDK pin bump PR
     runs-on: ubuntu-latest
