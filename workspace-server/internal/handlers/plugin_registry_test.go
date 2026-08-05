@@ -28,7 +28,19 @@ func TestNativeRegistry_SourcesByteIdenticalToRetiredConsts(t *testing.T) {
 		// armed:1/errors:{}), so a tenant's schedules stopped firing until the
 		// container was replaced. This literal is the frozen expectation, so
 		// bumping it here IS the review this gate exists to force.
-		{SchedulerPluginName, SchedulerPluginSource, "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.1"},
+		//
+		// v0.2.1 -> v0.2.2 (2026-08-05, deliberate): v0.2.1 was tagged on
+		// PRE-MERGE main, so the tag did NOT contain the delivery-liveness fix
+		// it was supposed to carry — `git merge-base --is-ancestor e000bd8
+		// v0.2.1` is FALSE, and TRUE only against v0.2.2. That is the whole
+		// reason this bump exists: the version string moved without the content
+		// moving, which is exactly the class of drift a byte-identical gate
+		// cannot see on its own (it compares refs, not what the ref resolves
+		// to). At v0.2.2 the content is present — probe_trigger_liveness,
+		// classify_delivery_liveness and ABSOLUTE_CAP_SECONDS are all there and
+		// the retired MOLECULE_TRIGGER_DELIVERY_WATCHDOG_SECONDS is gone.
+		// Reaching core via sdk#206 -> gen/go/molcontracts/native_plugins_gen.go.
+		{SchedulerPluginName, SchedulerPluginSource, "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.2"},
 		{conciergePlatformMCPName, conciergePlatformMCPSource, "gitea://molecule-ai/molecule-ai-plugin-molecule-platform-mcp#main"},
 	}
 	for _, c := range cases {
