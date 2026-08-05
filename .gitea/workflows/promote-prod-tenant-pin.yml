@@ -107,9 +107,23 @@ jobs:
           TAG: ${{ steps.target.outputs.tag }}
         run: |
           set -euo pipefail
+          # FAIL-CLOSED. The plan IS the default path's entire product: resolve
+          # the target digest, read the live pin back from the CP, print the diff.
+          # Without the token none of that happens, so the previous warn-and-exit-0
+          # made a dispatch that read nothing indistinguishable from a dispatch
+          # that confirmed prod was already on trunk. That is the same
+          # vacuous-green shape sdk-pin-bump carried (run 620174, 2026-08-05).
+          #
+          # Failing here is safe and cannot wedge anything: this lane is
+          # dispatch-only and posts no commit status on any PR, and going red on
+          # the PLAN step can never promote — the apply step is separately gated
+          # on PROD_AUTO_DEPLOY_DISABLED being unset AND
+          # PROD_TENANT_PIN_PROMOTE_ARMED == 'true', neither of which this change
+          # touches.
           if [ -z "${CP_ADMIN_API_TOKEN:-}" ]; then
-            echo "::warning::CP_ADMIN_API_TOKEN is not provisioned — cannot read the live pin. Skipping the plan."
-            exit 0
+            echo "::error::CP_ADMIN_API_TOKEN is not provisioned — this lane cannot read the live production pin, so it is FAILING rather than reporting a green plan it never produced."
+            echo "::error::Wire it the way staging-tenant-cd.yml does: read the PROD control-plane admin token from the Infisical SSOT (prod env, secretPath /shared/controlplane-admin) using INFISICAL_CI_CLIENT_ID / INFISICAL_CI_CLIENT_SECRET / INFISICAL_CI_PROJECT_ID, rather than minting a second copy as a long-lived Gitea Actions secret. Provisioning a prod CP admin credential to CI is an operator decision and is deliberately NOT done by the change that made this guard loud."
+            exit 1
           fi
           # lint-curl-status-capture shape: body to a file, status to a var, no
           # or-else fallback inside the subshell.
