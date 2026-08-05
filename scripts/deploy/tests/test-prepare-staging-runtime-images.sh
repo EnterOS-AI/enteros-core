@@ -364,9 +364,10 @@ set +e
 wrong_digest_output="$(MOCK_IMAGE_PRESENT=1 MOCK_INSPECT_MISMATCH=1 MOCK_PULL_MODE=always-fail run_gate)"
 wrong_digest_rc=$?
 set -e
-[[ $wrong_digest_rc -ne 0 ]] || fail "a mismatched local digest was accepted by the skip path"
+[[ $wrong_digest_rc -ne 0 ]] \
+  || fail "a mismatched local digest was accepted by the skip path: $wrong_digest_output"
 if ! grep -q '^pull ' "$DOCKER_LOG"; then
-  fail "a mismatched local digest skipped the pull instead of attempting it"
+  fail "a mismatched local digest skipped the pull instead of attempting it: $wrong_digest_output"
 fi
 
 # A failed pull must surface docker's own output. Job 916973 could only report
