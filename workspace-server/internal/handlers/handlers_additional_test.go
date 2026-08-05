@@ -28,7 +28,16 @@ func TestWorkspaceCreate_WithParentID(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 
-	parentID := "parent-ws-123"
+	// A REAL uuid: workspaces.id is `uuid`, and the create path now validates
+	// a caller-supplied parent_id before the INSERT (validateCreateParentID),
+	// so the old "parent-ws-123" placeholder is a 400. It would have failed
+	// the FK cast in a real database too — the placeholder only ever worked
+	// because sqlmock does not type-check arguments.
+	parentID := "dddddddd-0009-0000-0000-000000000000"
+	// The new pre-INSERT existence/status probe.
+	mock.ExpectQuery("SELECT status.*FROM workspaces WHERE id").
+		WithArgs(parentID).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("online"))
 	mock.ExpectBegin()
 	// Default tier is 3 (Privileged) — see workspace.go create-handler comment.
 	// delivery_mode defaults to "push" when payload omits it (#2339).
@@ -48,7 +57,7 @@ func TestWorkspaceCreate_WithParentID(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Child Agent","model":"minimax/MiniMax-M2.7","parent_id":"parent-ws-123"}`
+	body := `{"name":"Child Agent","model":"minimax/MiniMax-M2.7","parent_id":"` + parentID + `"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -290,6 +299,14 @@ func TestWorkspaceUpdate_ParentIDRejectionsWriteNothing(t *testing.T) {
 			}
 			if resp["code"] != tc.wantJSON {
 				t.Errorf("code=%v, want %q (body %s)", resp["code"], tc.wantJSON, w.Body.String())
+			}
+			// Restored from the test this replaced. It is what turns "no
+			// ExpectExec was registered" into an actual proof that no write
+			// was attempted: an unmatched statement leaves an expectation
+			// unmet (or fires an unexpected-call error), and both surface
+			// here rather than passing silently.
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet sqlmock expectations (a write may have been attempted): %v", err)
 			}
 		})
 	}

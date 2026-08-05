@@ -561,6 +561,7 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 			"old_parent_id":     reparent.OldParent,
 			"new_parent_id":     reparent.NewParent,
 			"org_root_id":       reparent.OrgRoot,
+			"adopted_into_org":  reparent.Adopted,
 			"namespaces_lost":   reparent.Lost,
 			"namespaces_gained": reparent.Gained,
 			"memories_migrated": false,

@@ -55,6 +55,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/namespace"
@@ -435,9 +436,12 @@ func TestIntegration_WorkspaceReparent_CycleGuardPreventsAnUnwalkableTree(t *tes
 		t.Fatalf("seed cycle: %v", err)
 	}
 
-	// The unbounded CTE cannot resolve this. Bounded by statement_timeout so
-	// the test terminates; without the timeout it runs until the backend is
-	// out of memory.
+	// orgRootSubtreeCTE is now DEPTH-BOUNDED (orgRootMaxChainDepth). Before
+	// that bound it did not terminate here at all — it ran until the statement
+	// was cancelled. It must now return NO ROW promptly, i.e. fail closed:
+	// "this chain has no resolvable org root" rather than a wrong answer or a
+	// hang. statement_timeout stays as a tripwire — if the bound were ever
+	// removed, this asserts a timeout error instead of ErrNoRows and fails.
 	txCtx := context.Background()
 	tx, err := conn.BeginTx(txCtx, nil)
 	if err != nil {
@@ -449,11 +453,12 @@ func TestIntegration_WorkspaceReparent_CycleGuardPreventsAnUnwalkableTree(t *tes
 	}
 	var unusedRoot string
 	err = tx.QueryRowContext(txCtx, orgRootSubtreeCTE, a).Scan(&unusedRoot)
-	if err == nil {
-		t.Fatalf("orgRootSubtreeCTE RESOLVED a cycle to %q — this test's premise is stale; "+
-			"if a cycle guard was added to that CTE, re-point this assertion at it", unusedRoot)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("orgRootSubtreeCTE on a cycle: root=%q err=%v — want sql.ErrNoRows. "+
+			"A timeout here means the depth bound was removed; a nil error means it resolved a cycle to a bogus root.",
+			unusedRoot, err)
 	}
-	t.Logf("confirmed: unbounded org-root CTE does not terminate on a cycle (%v)", err)
+	t.Logf("confirmed: bounded org-root CTE fails CLOSED on a cycle (%v)", err)
 
 	// The bounded walk this change introduced terminates and fails CLOSED.
 	tx2, err := conn.BeginTx(txCtx, nil)
@@ -483,6 +488,104 @@ func TestIntegration_WorkspaceReparent_CycleGuardPreventsAnUnwalkableTree(t *tes
 	}
 	if got := parentOf(t, conn, a); got != root {
 		t.Fatalf("parent_id MUTATED to %q; the handler committed the cycle the CTE cannot walk", got)
+	}
+}
+
+// TestIntegration_WorkspaceReparent_ConcurrentDisjointMovesCannotCreateACycle
+// is the concurrency test that actually exercises the mechanism.
+//
+// The sibling test below (A→B, B→A) is NOT evidence: both transactions lock the
+// IDENTICAL set {A,B}, so an id-ordered FOR UPDATE serialises them trivially and
+// the test would pass even with no protection at all beyond that ordering. It is
+// kept as a regression case, not as proof.
+//
+// This one uses DISJOINT lock sets, which is the shape that breaks a
+// lock-the-two-endpoints design:
+//
+//	R ─┬─ A ── A2
+//	   └─ B ── B2
+//
+//	T1: A.parent = B2   locks {A, B2}
+//	T2: B.parent = A2   locks {B, A2}
+//
+// The two sets share nothing, so nothing serialises them. Under READ COMMITTED
+// each transaction's post-update re-walk reads the OTHER's pre-commit row, sees
+// a chain that still terminates at R, and commits. The committed result is
+// A → B2 → B → A2 → A: a four-node cycle, from two individually-legal moves that
+// both returned 200 — and the unbounded org-root CTE then never terminates on
+// it, which is the exact DoS these guards exist to prevent.
+//
+// The fix is to serialise on the ORG ROOT: every move takes a FOR UPDATE on the
+// root of the org it is happening in, so any two moves that could possibly
+// interact contend on one row. Then the loser re-runs its descendant check
+// against the winner's COMMITTED tree and is correctly rejected as a cycle.
+//
+// Asserts the invariant, not which goroutine wins, so there is no timing
+// dependency.
+func TestIntegration_WorkspaceReparent_ConcurrentDisjointMovesCannotCreateACycle(t *testing.T) {
+	conn := integrationDB_Reparent(t)
+
+	// Repeat: a race that reproduces "sometimes" must not be able to hide
+	// behind one lucky scheduling. Pre-fix this fires within the first rounds.
+	for round := 0; round < 12; round++ {
+		func() {
+			root := seedWS(t, conn, fmt.Sprintf("r%d-root", round), "")
+			a := seedWS(t, conn, fmt.Sprintf("r%d-a", round), root)
+			b := seedWS(t, conn, fmt.Sprintf("r%d-b", round), root)
+			a2 := seedWS(t, conn, fmt.Sprintf("r%d-a2", round), a)
+			b2 := seedWS(t, conn, fmt.Sprintf("r%d-b2", round), b)
+
+			var wg sync.WaitGroup
+			errs := make([]error, 2)
+			start := make(chan struct{})
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				<-start
+				_, errs[0] = applyReparent(context.Background(), conn, a, b2)
+			}()
+			go func() {
+				defer wg.Done()
+				<-start
+				_, errs[1] = applyReparent(context.Background(), conn, b, a2)
+			}()
+			close(start)
+			wg.Wait()
+
+			for i, err := range errs {
+				if err == nil {
+					continue
+				}
+				var rej *reparentError
+				if !errors.As(err, &rej) {
+					t.Fatalf("round %d move %d: NON-rejection error (deadlock?): %v", round, i, err)
+				}
+			}
+
+			// THE invariant: every node's chain must still terminate at root.
+			// On a committed cycle the bounded walk returns ok=false — and the
+			// UNBOUNDED CTE that org_scope.go's sameOrg() uses would not
+			// terminate at all.
+			for _, id := range []string{a, b, a2, b2} {
+				tx, err := conn.BeginTx(context.Background(), nil)
+				if err != nil {
+					t.Fatalf("begin: %v", err)
+				}
+				gotRoot, ok, werr := reparentOrgRoot(context.Background(), tx, id)
+				_ = tx.Rollback()
+				if werr != nil {
+					t.Fatalf("round %d: walk %s: %v", round, id, werr)
+				}
+				if !ok || gotRoot != root {
+					pa, pb := parentOf(t, conn, a), parentOf(t, conn, b)
+					pa2, pb2 := parentOf(t, conn, a2), parentOf(t, conn, b2)
+					t.Fatalf("round %d: CYCLE COMMITTED — chain from %s does not terminate at root %s.\n"+
+						"  A =%s parent->%s\n  B =%s parent->%s\n  A2=%s parent->%s\n  B2=%s parent->%s\n"+
+						"  errs=%v",
+						round, id, root, a, pa, b, pb, a2, pa2, b2, pb2, errs)
+				}
+			}
+		}()
 	}
 }
 
@@ -561,6 +664,66 @@ func TestIntegration_WorkspaceReparent_ConcurrentSwapCannotCreateACycle(t *testi
 	}
 }
 
+// TestIntegration_WorkspaceReparent_OrgRootWalkIsBoundedOnACycle pins the depth
+// bound on orgRootSubtreeCTE.
+//
+// resolveOrgID was repointed onto orgRootID (to fix the depth-2 allowlist
+// bypass), and orgRootID's CTE had NO depth guard — so on a cyclic tree every
+// plugin check burned the entire statement_timeout and then fell through
+// checkOrgPluginAllowlist's fail-OPEN arm. The ACL outcome was no worse than
+// before (a cyclic tree was already allow-all), but the multi-second stall per
+// check was new, and self-inflicted.
+//
+// RED WITHOUT THE BOUND: this test times out / takes statement_timeout per call.
+// GREEN: the walk terminates promptly and fails CLOSED (errNoOrgRoot).
+func TestIntegration_WorkspaceReparent_OrgRootWalkIsBoundedOnACycle(t *testing.T) {
+	conn := integrationDB_Reparent(t)
+
+	root := seedWS(t, conn, "bound-root", "")
+	x := seedWS(t, conn, "bound-x", root)
+	y := seedWS(t, conn, "bound-y", x)
+	// Seed the cycle DIRECTLY (what the pre-fix unguarded UPDATE could commit).
+	if _, err := conn.ExecContext(context.Background(),
+		`UPDATE workspaces SET parent_id = $2 WHERE id = $1`, x, y); err != nil {
+		t.Fatalf("seed cycle: %v", err)
+	}
+
+	prev := db.DB
+	db.DB = conn
+	t.Cleanup(func() { db.DB = prev })
+
+	start := time.Now()
+	gotRoot, err := orgRootID(context.Background(), conn, y)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, errNoOrgRoot) {
+		t.Fatalf("orgRootID on a cycle: root=%q err=%v — want errNoOrgRoot (fail CLOSED)", gotRoot, err)
+	}
+	// The bound is what makes this fast. A statement_timeout-length stall is
+	// the failure this test exists to catch, so hold it to something no
+	// unbounded walk could ever achieve.
+	if elapsed > 2*time.Second {
+		t.Fatalf("orgRootID took %s on a cyclic chain — the walk is not bounded", elapsed)
+	}
+	t.Logf("bounded org-root walk on a cycle: %v in %s", err, elapsed)
+
+	// And the caller that motivated the change no longer stalls either.
+	start = time.Now()
+	blocked, reason := checkOrgPluginAllowlist(context.Background(), y, "rogue-plugin")
+	elapsed = time.Since(start)
+	if elapsed > 2*time.Second {
+		t.Fatalf("checkOrgPluginAllowlist took %s on a cyclic chain", elapsed)
+	}
+	t.Logf("allowlist check on a cyclic tree: blocked=%v reason=%q in %s (fails open by design)",
+		blocked, reason, elapsed)
+
+	// Repair so the suite's leaf-first cleanup can drain the rows.
+	if _, err := conn.ExecContext(context.Background(),
+		`UPDATE workspaces SET parent_id = $2 WHERE id = $1`, x, root); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 3. Cross-org — negative control varying exactly one input.
 // ---------------------------------------------------------------------------
@@ -616,19 +779,25 @@ func TestIntegration_WorkspaceReparent_CrossOrgRejected(t *testing.T) {
 		}
 	})
 
-	t.Run("adopting_a_foreign_root_is_rejected", func(t *testing.T) {
-		// The other direction: pull root2 (and its whole subtree) into org 1.
+	t.Run("adopting_a_root_WITH_descendants_is_rejected", func(t *testing.T) {
+		// root2 has team2 under it. Adopting it would silently re-home team2
+		// into org 1 — a workspace the caller never named. That is an org
+		// MERGE, not org assignment, and is refused.
 		w := doPatch_Workspace(t, root2, `{"parent_id":"`+team1+`"}`)
 		if w.Code != http.StatusUnprocessableEntity {
 			t.Fatalf("status=%d body=%s, want 422", w.Code, w.Body.String())
 		}
-		if code := decodeBody(t, w)["code"]; code != reparentCodeCrossOrg {
-			t.Errorf("code=%v, want %s", code, reparentCodeCrossOrg)
+		body := decodeBody(t, w)
+		if body["code"] != reparentCodeCrossOrg {
+			t.Errorf("code=%v, want %s", body["code"], reparentCodeCrossOrg)
+		}
+		if body["descendant_count"] == nil {
+			t.Errorf("rejection did not report the descendant count that caused it: %#v", body)
 		}
 		if got := parentOf(t, conn, root2); got != "" {
 			t.Fatalf("root2.parent_id MUTATED to %q; an org root was demoted into another org", got)
 		}
-		// team2 must still resolve to org 2.
+		// team2 must still resolve to org 2 — the whole point of the refusal.
 		got := nsNames(t, conn, team2)
 		if got[2] != "org:"+root2+"(writable=false)" {
 			t.Fatalf("team2 org namespace = %q, want org:%s — a subtree changed org", got[2], root2)
@@ -653,6 +822,97 @@ func TestIntegration_WorkspaceReparent_CrossOrgRejected(t *testing.T) {
 			t.Fatalf("org namespace changed on an ALLOWED same-org move: %q -> %q", before[2], after[2])
 		}
 	})
+}
+
+// TestIntegration_WorkspaceReparent_ChildlessRootIsAdoptedIntoTheOrg pins the
+// SHIPPED flow the first version of this guard broke.
+//
+// /registry/register's INSERT (registry.go:1094) omits parent_id, so every
+// self-registering runtime lands as its own parentless org root. Linking one
+// under an existing workspace afterwards is the only way it joins an org.
+// tests/e2e/test_poll_mode_e2e.sh does exactly this and went red on
+// WORKSPACE_REPARENT_CROSS_ORG when adoption was refused outright.
+//
+// This reproduces that shape in-process, and pins the org-anchor migration
+// that makes it safe.
+func TestIntegration_WorkspaceReparent_ChildlessRootIsAdoptedIntoTheOrg(t *testing.T) {
+	conn := integrationDB_Reparent(t)
+
+	// The e2e shape: two independently self-registered, parentless roots.
+	pollTarget := seedWS(t, conn, "poll-target", "")
+	caller := seedWS(t, conn, "caller", "")
+
+	// Give the adoptee an org anchor so the migration is actually exercised.
+	if _, err := conn.ExecContext(context.Background(),
+		`INSERT INTO org_plugin_allowlist (org_id, plugin_name, enabled_by) VALUES ($1, 'legacy-plugin', $2)`,
+		caller, "itest-admin"); err != nil {
+		t.Fatalf("seed adoptee allowlist: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = conn.ExecContext(context.Background(),
+			`DELETE FROM org_plugin_allowlist WHERE org_id = $1 OR org_id = $2`, caller, pollTarget)
+	})
+
+	before := nsNames(t, conn, caller)
+	if before[2] != "org:"+caller+"(writable=true)" {
+		t.Fatalf("precondition: adoptee should be its own root with WRITABLE org, got %v", before)
+	}
+
+	w := doPatch_Workspace(t, caller, `{"parent_id":"`+pollTarget+`"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("adoption: status=%d body=%s, want 200", w.Code, w.Body.String())
+	}
+	if got := parentOf(t, conn, caller); got != pollTarget {
+		t.Fatalf("parent_id=%q, want %q", got, pollTarget)
+	}
+
+	rp := decodeBody(t, w)["reparented"].(map[string]any)
+	if rp["adopted_into_org"] != true {
+		t.Errorf("adopted_into_org=%v, want true", rp["adopted_into_org"])
+	}
+	if rp["org_root_id"] != pollTarget {
+		t.Errorf("org_root_id=%v, want %s (the NEW org)", rp["org_root_id"], pollTarget)
+	}
+
+	// The privilege delta the endpoint must not hide: it loses org WRITE.
+	after := nsNames(t, conn, caller)
+	want := []string{
+		"workspace:" + caller + "(writable=true)",
+		"team:" + pollTarget + "(writable=true)",
+		"org:" + pollTarget + "(writable=false)",
+	}
+	if !sameStrings(after, want) {
+		t.Fatalf("namespaces after adoption = %v, want %v", after, want)
+	}
+
+	// ORG ANCHORS MIGRATED — not left pointing at a row that is no longer a
+	// root. This mirrors ensurePlatformAgent's behaviour.
+	var atOld, atNew int
+	if err := conn.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM org_plugin_allowlist WHERE org_id = $1`, caller).Scan(&atOld); err != nil {
+		t.Fatalf("count old anchors: %v", err)
+	}
+	if err := conn.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM org_plugin_allowlist WHERE org_id = $1 AND plugin_name = 'legacy-plugin'`,
+		pollTarget).Scan(&atNew); err != nil {
+		t.Fatalf("count new anchors: %v", err)
+	}
+	if atOld != 0 {
+		t.Errorf("%d org_plugin_allowlist row(s) still anchored to the adopted (no-longer-root) workspace", atOld)
+	}
+	if atNew != 1 {
+		t.Errorf("allowlist row did not migrate to the new org root (found %d)", atNew)
+	}
+
+	// And a2a/delegation now sees them as the same org, which is the point of
+	// the e2e flow this restores.
+	same, err := sameOrg(context.Background(), conn, caller, pollTarget)
+	if err != nil {
+		t.Fatalf("sameOrg: %v", err)
+	}
+	if !same {
+		t.Fatal("adopted workspace is not sameOrg with its new parent — CanCommunicate would still 403")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -846,6 +1106,64 @@ func TestIntegration_WorkspaceReparent_InputGuards(t *testing.T) {
 		}
 		if name != reparentTestPrefix+"team" {
 			t.Fatalf("name MUTATED to %q on a rejected combined patch", name)
+		}
+	})
+}
+
+// TestIntegration_WorkspaceReparent_CreateValidatesParentID covers the CREATE
+// path, which took a caller-supplied parent_id straight into the INSERT with
+// no validation at all.
+//
+// Create is the wider door: AdminAuth admits an org-token, and (when
+// ADMIN_TOKEN is unset) any workspace token through its tier-3 fallback —
+// whereas PATCH parent_id requires admin-token or cp-session. Creating under
+// parent P grants the new workspace read+write on team:P, retroactively.
+//
+// Structural validation only — see validateCreateParentID's scope note on why
+// org-scoping the create path is a separate change.
+func TestIntegration_WorkspaceReparent_CreateValidatesParentID(t *testing.T) {
+	conn := integrationDB_Reparent(t)
+	ctx := context.Background()
+
+	root := seedWS(t, conn, "create-root", "")
+	dead := seedWS(t, conn, "create-dead", root)
+	if _, err := conn.ExecContext(ctx,
+		`UPDATE workspaces SET status = 'removed' WHERE id = $1`, dead); err != nil {
+		t.Fatalf("mark removed: %v", err)
+	}
+
+	t.Run("nonexistent_parent_rejected", func(t *testing.T) {
+		err := validateCreateParentID(ctx, conn, uuid.NewString())
+		var rej *reparentError
+		if !errors.As(err, &rej) || rej.Code != reparentCodeNotFound {
+			t.Fatalf("err=%v, want %s", err, reparentCodeNotFound)
+		}
+	})
+	t.Run("removed_parent_rejected", func(t *testing.T) {
+		err := validateCreateParentID(ctx, conn, dead)
+		var rej *reparentError
+		if !errors.As(err, &rej) || rej.Code != reparentCodeNotFound {
+			t.Fatalf("err=%v, want %s", err, reparentCodeNotFound)
+		}
+	})
+	t.Run("non_uuid_parent_rejected", func(t *testing.T) {
+		err := validateCreateParentID(ctx, conn, "not-a-uuid")
+		var rej *reparentError
+		if !errors.As(err, &rej) || rej.Code != reparentCodeInvalid {
+			t.Fatalf("err=%v, want %s", err, reparentCodeInvalid)
+		}
+	})
+	// NEGATIVE CONTROLS: same function, one input different. A live parent
+	// must be accepted, and an absent parent_id must stay absent (the
+	// server-side default path below it must keep working).
+	t.Run("live_parent_accepted", func(t *testing.T) {
+		if err := validateCreateParentID(ctx, conn, root); err != nil {
+			t.Fatalf("live parent rejected: %v", err)
+		}
+	})
+	t.Run("empty_is_not_validated", func(t *testing.T) {
+		if err := validateCreateParentID(ctx, conn, ""); err != nil {
+			t.Fatalf("empty parent_id must be a no-op, got: %v", err)
 		}
 	})
 }

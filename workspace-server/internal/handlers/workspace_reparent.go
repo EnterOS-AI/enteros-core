@@ -60,11 +60,13 @@ package handlers
 //
 // THE INVARIANT THIS FILE ENFORCES
 // --------------------------------
-// A re-parent may NOT change any workspace's org. Formally: for every
-// workspace in the tree, orgRoot(w) is invariant across the operation.
+// No workspace that ALREADY BELONGS to an org may change org, and no move
+// may change the org of a workspace the caller did not name. Formally:
+// orgRoot(w) is invariant for every w, with exactly one exception —
+// a CHILDLESS ROOT joining an org (see ADOPTION below).
 //
-// That single rule does most of the work, and it is why the blast radius of
-// an ALLOWED move is exactly one namespace swap on exactly one workspace:
+// That rule is why the blast radius of an ordinary move is exactly one
+// namespace swap on exactly one workspace:
 //
 //   - cross-org moves are rejected, so org:<root> never changes — no
 //     retroactive read of another org's corpus, no sameOrg() flip, no
@@ -74,12 +76,26 @@ package handlers
 //     org:<oldRoot>, stop being sameOrg() with every former peer (breaking
 //     in-flight delegations at delivery), and the node gains WRITE on the
 //     org namespace, which is root-only by design.
-//   - demoting an existing root UNDER another tree is rejected by the same
-//     rule for free: a root's org is itself, so any move of it is by
-//     definition cross-org. Orgs can therefore be neither merged nor split
-//     through this endpoint.
 //   - descendants of the moved node keep their parent, and (by the rule)
 //     keep their root — so their namespace sets are untouched.
+//
+// ADOPTION — the one exception, and why refusing it was wrong
+// -----------------------------------------------------------
+// The first version of this guard refused EVERY root change and claimed
+// "demoting a root falls out for free". That was a mistake: it removed a
+// shipped capability. /registry/register's INSERT (registry.go:1094) omits
+// parent_id, so every self-registering runtime lands as its OWN parentless
+// org root, and linking it under an existing workspace afterwards is the
+// only way it ever joins an org — root promotion is refused and
+// create-under-parent is a different row. Refusing that stranded such
+// runtimes permanently.
+//
+// So a CHILDLESS root may be adopted into an org, on the terms
+// platform_agent.go's installer already uses: its org_api_tokens and
+// org_plugin_allowlist rows migrate in the SAME transaction. "Childless" is
+// the line between org ASSIGNMENT of an unaffiliated workspace and an org
+// MERGE — adopting a root WITH a subtree would silently re-home every
+// descendant, which a client-callable endpoint must not do.
 //
 // The residual, which is inherent and NOT hidden: moving between two teams
 // inside one org crosses the only intra-org privacy boundary there is, and
@@ -129,6 +145,7 @@ const (
 	reparentCodeNameConflict  = "WORKSPACE_REPARENT_NAME_CONFLICT"
 	reparentCodeAmbiguous     = "WORKSPACE_REPARENT_AMBIGUOUS_WITH_RENAME"
 	reparentCodeUnresolvable  = "WORKSPACE_REPARENT_ORG_UNRESOLVABLE"
+	reparentCodeConcurrent    = "WORKSPACE_REPARENT_CONCURRENT_MODIFICATION"
 )
 
 // reparentError carries the HTTP status and stable code for a rejected move.
@@ -147,7 +164,10 @@ func reparentReject(status int, code, msg string, details map[string]any) *repar
 
 // reparentOutcome describes an applied (or no-op) move.
 type reparentOutcome struct {
-	Changed   bool
+	Changed bool
+	// Adopted is true when this move brought a parentless workspace INTO an
+	// org (the one case where the org root legitimately changes).
+	Adopted   bool
 	OldParent string // "" when the workspace had no parent
 	NewParent string
 	OrgRoot   string
@@ -260,6 +280,59 @@ func reparentIsDescendant(ctx context.Context, tx *sql.Tx, workspaceID, candidat
 	return found, nil
 }
 
+// validateCreateParentID structurally validates a CALLER-SUPPLIED parent_id on
+// POST /workspaces.
+//
+// The create path took `payload.ParentID` straight into the INSERT with no
+// validation at all — no UUID check, no existence check, no status check. A
+// malformed value surfaced as a 500 from the FK or the type cast, and a
+// `removed` parent silently produced a child hanging off a soft-deleted row.
+//
+// This matters for the same reason the PATCH guard does: creating a workspace
+// under parent P grants the new workspace read+write on `team:P` — including
+// RETROACTIVE read of everything P's existing children ever wrote — plus read
+// of that subtree's `org:<root>`. Create is the wider door, because AdminAuth
+// admits an org-token (and, when ADMIN_TOKEN is unset, any workspace token via
+// its tier-3 fallback), whereas the PATCH path requires admin-token or
+// cp-session.
+//
+// SCOPE — deliberately structural only. The obvious next step is "an
+// org-token caller may only create under a parent in ITS OWN org", and it is
+// NOT done here on purpose. `org_api_tokens.org_id` is written in TWO
+// namespaces across the codebase — the org-root WORKSPACE id, and the raw CP
+// org UUID that the concierge's managed-token mint passes. A naive
+// `orgRoot(parent) != callerOrg` comparison is therefore always unequal for
+// the concierge token and would 403 workspace creation fleet-wide; that exact
+// bug is documented at length in middleware.WorkspaceAuth (the "LIKE-FOR-LIKE
+// (the catastrophic bug this replaces)" comment) and the existing
+// requireOrgOwnership helper still does the naive comparison. Doing it right
+// needs the DeterministicPlatformAgentID mapping on both arms and its own
+// tests. That is a separate change, not a rider on this one.
+func validateCreateParentID(ctx context.Context, database *sql.DB, raw string) error {
+	if raw == "" {
+		return nil
+	}
+	if _, err := uuid.Parse(raw); err != nil {
+		return reparentReject(http.StatusBadRequest, reparentCodeInvalid,
+			"parent_id is not a valid UUID", nil)
+	}
+	var status string
+	err := database.QueryRowContext(ctx,
+		`SELECT status::text FROM workspaces WHERE id = $1`, raw).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return reparentReject(http.StatusUnprocessableEntity, reparentCodeNotFound,
+			"parent workspace does not exist", map[string]any{"parent_id": raw})
+	}
+	if err != nil {
+		return fmt.Errorf("validate create parent: %w", err)
+	}
+	if status == "removed" {
+		return reparentReject(http.StatusUnprocessableEntity, reparentCodeNotFound,
+			"parent workspace has been removed", map[string]any{"parent_id": raw})
+	}
+	return nil
+}
+
 // applyReparent validates and applies a parent_id change as ONE transaction.
 //
 // Ordering matters: every check runs INSIDE the tx, after SELECT ... FOR
@@ -285,21 +358,67 @@ func applyReparent(ctx context.Context, database *sql.DB, workspaceID string, ra
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// 1. Lock BOTH endpoints up front, in a single statement ordered by id.
-	//
-	// Locking them separately (self, then target) is a deadlock: two
-	// concurrent moves that swap roles — A→child-of-B and B→child-of-A —
-	// each take the other's second lock first, and Postgres has to abort one.
-	// A single ORDER BY id ... FOR UPDATE gives every caller the same global
-	// lock order, so those two transactions serialise instead of colliding.
-	// (The pair is exactly the one the post-update re-walk in step 9 exists
-	// to catch, so it is worth not provoking it in the first place.)
-	//
-	// wantRoot has no target, so it locks only the moved row.
-	lockIDs := []string{workspaceID}
-	if !wantRoot && target != workspaceID {
-		lockIDs = append(lockIDs, target)
+	// 0. Find the org root of each endpoint with a BOUNDED, unlocked read, so
+	//    we know which root rows to serialise on.
+	rootSelfCandidate, selfRootOK, err := reparentOrgRoot(ctx, tx, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("reparent: pre-locate source org root: %w", err)
 	}
+	rootTargetCandidate := ""
+	if !wantRoot && target != workspaceID {
+		rootTargetCandidate, _, err = reparentOrgRoot(ctx, tx, target)
+		if err != nil {
+			return nil, fmt.Errorf("reparent: pre-locate target org root: %w", err)
+		}
+	}
+
+	// 1. Lock the endpoints AND THEIR ORG ROOTS, in one id-ordered statement.
+	//
+	// Locking only the two endpoints is NOT enough, and the obvious swap test
+	// (A→B, B→A) hides it: those two transactions lock the IDENTICAL set
+	// {A,B}, so id-ordering serialises them and everything looks fine. The
+	// shape that breaks it has DISJOINT lock sets:
+	//
+	//	R ─┬─ A ── A2        T1: A.parent = B2   locks {A, B2}
+	//	   └─ B ── B2        T2: B.parent = A2   locks {B, A2}
+	//
+	// Nothing is shared, so nothing serialises. Under READ COMMITTED each
+	// transaction's post-update re-walk reads the OTHER's pre-commit row,
+	// sees a chain that still ends at R, and commits — producing
+	// A → B2 → B → A2 → A. Reproduced on the first round against PG16: two
+	// individually-legal moves, both 200, one four-node cycle, and the
+	// unbounded org-root CTE then never terminates on it.
+	//
+	// A post-hoc verification step cannot fix this, because under READ
+	// COMMITTED there is no post-hoc moment at which either transaction can
+	// see the other's uncommitted write. The serialisation has to happen
+	// BEFORE the write, on a row both transactions must touch.
+	//
+	// The org root is that row. Every move takes a FOR UPDATE on the root of
+	// the org(s) it involves, so any two moves that could possibly interact
+	// contend on one row and run one after the other. The loser then re-runs
+	// its descendant check against the winner's COMMITTED tree and is
+	// correctly rejected as a cycle. Cross-org contention is nil: different
+	// orgs have different roots. Moves are rare and admin-gated, so a
+	// per-org write lock costs nothing real.
+	lockIDs := []string{workspaceID}
+	addLock := func(id string) {
+		if id == "" {
+			return
+		}
+		for _, existing := range lockIDs {
+			if existing == id {
+				return
+			}
+		}
+		lockIDs = append(lockIDs, id)
+	}
+	if !wantRoot && target != workspaceID {
+		addLock(target)
+	}
+	addLock(rootSelfCandidate)
+	addLock(rootTargetCandidate)
+
 	rows, err := tx.QueryContext(ctx,
 		`SELECT id::text, parent_id::text, status::text
 		   FROM workspaces
@@ -336,6 +455,19 @@ func applyReparent(ctx context.Context, database *sql.DB, workspaceID string, ra
 	oldParent := ""
 	if self.parent.Valid {
 		oldParent = self.parent.String
+	}
+
+	// 1a. The step-0 walk was UNLOCKED, so a concurrent move could have
+	//     restructured the tree between it and the lock — meaning we may hold
+	//     FOR UPDATE on a row that is no longer the org root, i.e. the wrong
+	//     mutex. Re-derive under the lock and bail if it moved. Failing the
+	//     request is right: the caller retries against a settled tree, and we
+	//     never proceed holding a lock that does not serialise us.
+	if recheck, ok2, rerr := reparentOrgRoot(ctx, tx, workspaceID); rerr != nil {
+		return nil, fmt.Errorf("reparent: re-derive source org root under lock: %w", rerr)
+	} else if ok2 != selfRootOK || recheck != rootSelfCandidate {
+		return nil, reparentReject(http.StatusConflict, reparentCodeConcurrent,
+			"the workspace tree changed while this move was being validated; retry", nil)
 	}
 
 	// 1b. A soft-deleted workspace is not an org-chart node. Delete() already
@@ -424,15 +556,68 @@ func applyReparent(ctx context.Context, database *sql.DB, workspaceID string, ra
 			"the target parent's org root cannot be resolved (its parent_id chain does not terminate); refusing to move into it",
 			map[string]any{"parent_id": target})
 	}
+	// ADOPTION — the one permitted exception to org-root invariance.
+	//
+	// The first version of this guard refused every root change and listed
+	// "demoting a root falls out for free" as a benefit. It is not free: it
+	// removed a SHIPPED capability. /registry/register's INSERT
+	// (registry.go:1094) omits parent_id, so EVERY self-registering runtime
+	// lands as its own parentless org root. Linking one under an existing
+	// workspace afterwards is the only way it ever joins an org — root
+	// promotion is refused, and create-under-parent is a different row. A
+	// blanket refusal stranded those runtimes permanently and reddened
+	// tests/e2e/test_poll_mode_e2e.sh, which does exactly this.
+	//
+	// So adoption is allowed, narrowly, on the terms platform_agent.go's
+	// installer already uses (it re-parents old roots and migrates their org
+	// anchors in the same transaction — see ensurePlatformAgent):
+	//
+	//   - the adopted workspace must BE a root (nothing else can change org)
+	//   - it must be CHILDLESS. That is the line between org ASSIGNMENT of an
+	//     unaffiliated workspace and an org MERGE. Adopting a root WITH a
+	//     subtree silently re-homes every descendant — changing their
+	//     org:<root>, their sameOrg() reachability and their plugin allowlist
+	//     — workspaces the caller never named. platform_agent may do that
+	//     because it is a one-time install operation on its own tenant; a
+	//     client-callable endpoint may not.
+	//   - its org anchors move WITH it, in this transaction (below), so
+	//     nothing is left pointing at a row that is no longer a root.
+	//
+	// What the adopted workspace gains is real and is reported in the
+	// response: it loses org WRITE (root-only) and its own team/org
+	// namespaces, and gains read of the destination org's corpus. That is
+	// inherent in joining an org, and it is admin-gated and audited.
+	adoption := false
 	if oldRoot != targetRoot {
-		// Covers three shapes at once: a genuine cross-tenant move, demoting
-		// an org root under another tree (a root's org is ITSELF, so
-		// oldRoot==workspaceID != targetRoot), and adopting a foreign root.
-		return nil, reparentReject(http.StatusUnprocessableEntity, reparentCodeCrossOrg,
-			"cross-org re-parent is not permitted: the target parent belongs to a different org root. "+
-				"The org boundary IS the parent_id chain, so this move would change which org's memories, peers, "+
-				"delegation targets and plugin allowlist this workspace resolves to.",
-			map[string]any{"org_root_id": oldRoot, "target_org_root_id": targetRoot, "parent_id": target})
+		if oldParent == "" {
+			var childCount int
+			if err := tx.QueryRowContext(ctx,
+				`SELECT count(*) FROM workspaces WHERE parent_id = $1 AND status != 'removed'`,
+				workspaceID).Scan(&childCount); err != nil {
+				return nil, fmt.Errorf("reparent: count children for adoption: %w", err)
+			}
+			if childCount > 0 {
+				return nil, reparentReject(http.StatusUnprocessableEntity, reparentCodeCrossOrg,
+					"this workspace is an org root WITH descendants; adopting it would move its entire subtree into "+
+						"another org, changing the org memories, peers and plugin allowlist of workspaces you did not name. "+
+						"Move or detach its children first.",
+					map[string]any{"org_root_id": oldRoot, "target_org_root_id": targetRoot,
+						"parent_id": target, "descendant_count": childCount})
+			}
+			adoption = true
+		} else {
+			return nil, reparentReject(http.StatusUnprocessableEntity, reparentCodeCrossOrg,
+				"cross-org re-parent is not permitted: the target parent belongs to a different org root. "+
+					"The org boundary IS the parent_id chain, so this move would change which org's memories, peers, "+
+					"delegation targets and plugin allowlist this workspace resolves to.",
+				map[string]any{"org_root_id": oldRoot, "target_org_root_id": targetRoot, "parent_id": target})
+		}
+	}
+	// The root this workspace must resolve to AFTER the write. Same as before
+	// for an ordinary move; the destination's root for an adoption.
+	expectedRootAfter := oldRoot
+	if adoption {
+		expectedRootAfter = targetRoot
 	}
 
 	// 8. Apply.
@@ -452,11 +637,44 @@ func applyReparent(ctx context.Context, database *sql.DB, workspaceID string, ra
 		return nil, fmt.Errorf("reparent: update: %w", err)
 	}
 
+	// 8b. Adoption only: move the org anchors WITH the workspace, in this
+	//     transaction. Mirrors ensurePlatformAgent (platform_agent.go), which
+	//     is the existing precedent for re-homing a root — including its
+	//     ON CONFLICT DO NOTHING dedup, because org_plugin_allowlist is
+	//     UNIQUE(org_id, plugin_name) and the destination org may already
+	//     allow the same plugin.
+	//
+	//     Without this, an adopted root's org_api_tokens.org_id and
+	//     org_plugin_allowlist.org_id keep pointing at a workspace that is no
+	//     longer a root — an org anchor for an org that no longer exists.
+	if adoption {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE org_api_tokens SET org_id = $1 WHERE org_id = $2`, targetRoot, workspaceID); err != nil {
+			return nil, fmt.Errorf("reparent: migrate org_api_tokens: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO org_plugin_allowlist (org_id, plugin_name, enabled_by, enabled_at)
+			SELECT $1, plugin_name, enabled_by, enabled_at
+			FROM org_plugin_allowlist
+			WHERE org_id = $2
+			ON CONFLICT (org_id, plugin_name) DO NOTHING
+		`, targetRoot, workspaceID); err != nil {
+			return nil, fmt.Errorf("reparent: migrate org_plugin_allowlist: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM org_plugin_allowlist WHERE org_id = $1`, workspaceID); err != nil {
+			return nil, fmt.Errorf("reparent: clear old org_plugin_allowlist: %w", err)
+		}
+	}
+
 	// 9. Post-update verification, from the UPDATED rows, still inside the tx.
-	//    Anything that got past steps 3-7 — a concurrent move we failed to
-	//    serialise, a trigger, a future column default — has to survive this
-	//    or the whole thing rolls back. This is the difference between "we
-	//    checked before writing" and "the committed state is provably sane".
+	//    Anything that got past the pre-checks — a trigger, a future column
+	//    default, a concurrent write we failed to serialise — has to survive
+	//    this or the whole thing rolls back. This is the difference between
+	//    "we checked before writing" and "the committed state is provably
+	//    sane". It is a BACKSTOP, not the concurrency mechanism: under READ
+	//    COMMITTED it cannot see an uncommitted sibling transaction, which is
+	//    why step 1 serialises on the org root instead of relying on this.
 	postRoot, ok, err := reparentOrgRoot(ctx, tx, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("reparent: post-verify: %w", err)
@@ -465,10 +683,10 @@ func applyReparent(ctx context.Context, database *sql.DB, workspaceID string, ra
 		return nil, reparentReject(http.StatusConflict, reparentCodeCycle,
 			"post-update verification failed: the parent_id chain no longer terminates at an org root; the move was rolled back", nil)
 	}
-	if postRoot != oldRoot {
+	if postRoot != expectedRootAfter {
 		return nil, reparentReject(http.StatusUnprocessableEntity, reparentCodeCrossOrg,
-			"post-update verification failed: the org root changed; the move was rolled back",
-			map[string]any{"org_root_id": oldRoot, "post_move_org_root_id": postRoot})
+			"post-update verification failed: the org root is not the expected one; the move was rolled back",
+			map[string]any{"expected_org_root_id": expectedRootAfter, "post_move_org_root_id": postRoot})
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -477,17 +695,21 @@ func applyReparent(ctx context.Context, database *sql.DB, workspaceID string, ra
 
 	out := &reparentOutcome{
 		Changed:   true,
+		Adopted:   adoption,
 		OldParent: oldParent,
 		NewParent: target,
-		OrgRoot:   oldRoot,
-		Lost:      []string{"team:" + oldParent},
+		OrgRoot:   expectedRootAfter,
 		Gained:    []string{"team:" + target},
 	}
-	// A workspace whose old parent was NULL cannot reach this point (step 7
-	// rejects it as cross-org), so oldParent is always a real id here. Keep
-	// the guard anyway rather than emit a "team:" with nothing after it.
-	if oldParent == "" {
-		out.Lost = nil
+	if adoption {
+		// It WAS a root, so resolver.go gave it team:<self> and a WRITABLE
+		// org:<self>. Both go away; it picks up the destination team and a
+		// read-only org. Spelling out all four is the point — this is the
+		// largest privilege delta the endpoint can produce.
+		out.Lost = []string{"team:" + workspaceID, "org:" + workspaceID + " (writable)"}
+		out.Gained = append(out.Gained, "org:"+targetRoot+" (read-only)")
+	} else {
+		out.Lost = []string{"team:" + oldParent}
 	}
 	return out, nil
 }
