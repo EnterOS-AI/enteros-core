@@ -35,7 +35,7 @@ func TestDeriveProvider_RealManifest(t *testing.T) {
 		// platform's Moonshot vendor account is suspended for non-payment, so
 		// the id was removed from every runtime's platform arm and now fails
 		// CLOSED. Its fail-closed behaviour is asserted in
-		// TestDeriveProvider_PlatformArmsAreMinimaxOnly below; the BYOK legs of
+		// TestDeriveProvider_PlatformArmMembership below; the BYOK legs of
 		// the split (bare kimi-* -> kimi-coding gateway) are UNAFFECTED and
 		// keep their coverage here.
 		// BYOK gateway path: bare kimi ids route to the kimi-coding gateway
@@ -46,12 +46,15 @@ func TestDeriveProvider_RealManifest(t *testing.T) {
 		{"claude-code byok kimi-k2", "claude-code", "kimi-k2", []string{"KIMI_API_KEY"}, "kimi-coding"},
 
 		// --- platform-model -> platform (closed set) --------------------
-		// Retargeted onto the surviving minimax-only platform arms (sdk#203).
-		// The withdrawn anthropic/*, openai/* and moonshot/* platform ids that
-		// used to be asserted here now live in
-		// TestDeriveProvider_PlatformArmsAreMinimaxOnly as fail-closed cases,
-		// so the "platform ids resolve to the closed platform provider"
-		// invariant keeps a non-vacuous positive assertion on every runtime.
+		// Retargeted onto the minimax platform arms, which are present on ALL
+		// FOUR runtimes — so this table keeps a non-vacuous positive assertion
+		// of "platform ids resolve to the closed platform provider" everywhere,
+		// independent of which vendor arms happen to be selectable.
+		// The anthropic/* and openai/* platform ids were withdrawn by sdk#203
+		// and RESTORED by sdk#204 (2026-08-05); only moonshot/* is still
+		// withdrawn. Both directions are asserted in
+		// TestDeriveProvider_PlatformArmMembership, which is the SSOT-tracking
+		// test — deliberately not duplicated here.
 		{"claude-code platform minimax ns", "claude-code", "minimax/MiniMax-M2.7", []string{"ANTHROPIC_API_KEY"}, "platform"},
 		{"codex platform minimax ns", "codex", "minimax/MiniMax-M2.7", []string{"MOLECULE_LLM_USAGE_TOKEN"}, "platform"},
 		{"hermes platform minimax ns", "hermes", "minimax/MiniMax-M2.7", []string{"ANTHROPIC_API_KEY"}, "platform"},
@@ -635,58 +638,101 @@ func TestCodexDerivesOnlyTemplateRegistryProviders(t *testing.T) {
 	}
 }
 
-// TestDeriveProvider_PlatformArmsAreMinimaxOnly is the create-time enforcement
-// proof for the 2026-08-04 platform-arm withdrawal (molecule-ai-sdk#203, mirrored
-// by molecule-controlplane#2850 and adopted into core by the sdk/gen/go bump that
-// carries it).
+// TestDeriveProvider_PlatformArmMembership is the create-time enforcement proof
+// for the platform-arm membership the SDK registry SSOT declares.
 //
-// WHY THIS TEST EXISTS: the platform's Moonshot vendor account is SUSPENDED for
-// non-payment — every `moonshot/*` platform call returns HTTP 429
-// exceeded_current_quota_error in ~200ms, 100% of the time. A paying client burned
-// 2,451 failed calls over 16h while every health signal read green, because the
-// ids stayed user-selectable and a workspace could be provisioned onto one and
-// then be permanently dead. The fix is only real if selection is REFUSED, so this
-// test asserts the refusal directly rather than trusting the YAML.
+// HISTORY. On 2026-08-04 molecule-ai-sdk#203 narrowed every runtime's `platform`
+// arm to minimax-only: the platform's Moonshot vendor account is SUSPENDED for
+// non-payment, every `moonshot/*` platform call returns HTTP 429
+// exceeded_current_quota_error in ~200ms 100% of the time, and a paying client
+// burned 2,451 failed calls over 16h while every health signal read green —
+// because the ids stayed user-selectable, so a workspace could be provisioned
+// onto one and be permanently dead. The fix is only real if selection is
+// REFUSED, so this test asserts the refusal directly rather than trusting YAML.
 //
-// It asserts BOTH directions so neither half can rot into a vacuous pass:
+// molecule-ai-sdk#204 (adopted 2026-08-05, sha 3fbf55ca…) CORRECTED that
+// narrowing: it had taken down five ids that were HEALTHY (all five probed HTTP
+// 200 through the metered proxy). They are RESTORED to `models`, and only the
+// two genuinely dead moonshot ids stay off the menu. This test moved with the
+// SSOT, exactly as its predecessor's closing note prescribed.
 //
-//	NEGATIVE — every withdrawn id FAILS CLOSED for its runtime. Crucially it must
-//	fail, not silently fall through to a BYOK arm by prefix match: a BYOK arm
-//	would demand a tenant key the workspace does not have, turning a refusal into
-//	a different late failure. DeriveProvider returning ANY provider here is a bug.
-//	This is the exact predicate handlers.validateRegisteredModelForRuntime keys
-//	off, so a failure here is a 422 UNREGISTERED_MODEL_FOR_RUNTIME at
+// It asserts THREE directions so no half can rot into a vacuous pass:
+//
+//	NEGATIVE — every still-withdrawn id FAILS CLOSED for its runtime. Crucially
+//	it must fail, not silently fall through to a BYOK arm by prefix match: a BYOK
+//	arm would demand a tenant key the workspace does not have, turning a refusal
+//	into a different late failure. DeriveProvider returning ANY provider here is
+//	a bug. This is the exact predicate handlers.validateRegisteredModelForRuntime
+//	keys off, so a failure here is a 422 UNREGISTERED_MODEL_FOR_RUNTIME at
 //	workspace-create — refused at selection, which is the intent.
 //
-//	POSITIVE — the surviving minimax family still derives the CLOSED `platform`
-//	provider on all four runtimes, so MOLECULE_LLM_DEFAULT_MODEL
-//	(minimax/MiniMax-M2.7) remains a legal platform-billed selection everywhere.
-//	Without this half, deleting the whole platform arm would also pass.
+//	RESTORED — each of the five ids #203 wrongly withdrew is SELECTABLE again:
+//	it derives the CLOSED `platform` provider AND appears in ModelsForRuntime
+//	(the canvas menu + the create gate's exact-membership predicate). This is the
+//	half that proves adopting #204 actually re-opened selection; under the #203
+//	pin every one of these sub-tests fails.
 //
-// Restoring an id (vendor account funded / directive lifted) re-arms this test:
-// move it from withdrawn to kept and the assertion flips with it.
-func TestDeriveProvider_PlatformArmsAreMinimaxOnly(t *testing.T) {
+//	KEPT — the minimax family still derives the CLOSED `platform` provider on all
+//	four runtimes, so MOLECULE_LLM_DEFAULT_MODEL (minimax/MiniMax-M2.7) remains a
+//	legal platform-billed selection everywhere. Without this half, deleting the
+//	whole platform arm would also pass.
+//
+// Restoring or withdrawing an id in the SDK re-arms this test: move it between
+// the maps below and the assertion flips with it.
+//
+// SCOPE LIMIT — #204 also introduced `withdrawn_models` ("unselectable but still
+// OWNED": an already-pinned workspace keeps the metered-proxy bearer and the
+// raw-vendor-key strip). parseManifest does not model that key and yaml.v3
+// ignores it, so core implements only the NOT-ON-THE-MENU half. That is what
+// this test asserts, and it is why the moonshot expectations are unchanged from
+// the #203 era. Do not read a green here as proof of the ownership semantic.
+func TestDeriveProvider_PlatformArmMembership(t *testing.T) {
 	m, err := LoadManifest()
 	if err != nil {
 		t.Fatalf("LoadManifest() error = %v", err)
 	}
 
+	// Still dead upstream: the suspended-account moonshot ids. sdk#204 moved
+	// these to `withdrawn_models`, which keeps them off the menu here.
 	withdrawn := map[string][]string{
+		"claude-code": {"moonshot/kimi-k2.6", "moonshot/kimi-k2.5"},
+		"hermes":      {"moonshot/kimi-k2.6", "moonshot/kimi-k2.5"},
+		"codex":       {},
+		"openclaw":    {"moonshot/kimi-k2.6", "moonshot/kimi-k2.5"},
+	}
+	// Wrongly withdrawn by #203, restored by #204 — must be selectable again.
+	restored := map[string][]string{
 		"claude-code": {
 			"anthropic/claude-opus-4-7",
 			"anthropic/claude-opus-4-8",
 			"anthropic/claude-sonnet-4-6",
-			"moonshot/kimi-k2.6",
-			"moonshot/kimi-k2.5",
 		},
-		"hermes":   {"moonshot/kimi-k2.6", "moonshot/kimi-k2.5"},
+		"hermes":   {},
 		"codex":    {"openai/gpt-5.4", "openai/gpt-5.4-mini"},
-		"openclaw": {"moonshot/kimi-k2.6", "moonshot/kimi-k2.5"},
+		"openclaw": {},
 	}
 	kept := []string{
 		"minimax/MiniMax-M2.7",
 		"minimax/MiniMax-M2.7-highspeed",
 		"minimax/MiniMax-M3",
+	}
+
+	// COVERAGE FLOOR — a table-driven test whose table silently empties reports
+	// success while asserting nothing (this repo has shipped several such
+	// gates). Pin the counts so emptying a map is a RED, not a quiet pass.
+	const (
+		wantWithdrawn = 6 // moonshot k2.6 + k2.5 on claude-code, hermes, openclaw
+		wantRestored  = 5 // the exact five ids sdk#204 restored
+	)
+	gotWithdrawn, gotRestored := 0, 0
+	for _, rt := range []string{"claude-code", "hermes", "codex", "openclaw"} {
+		gotWithdrawn += len(withdrawn[rt])
+		gotRestored += len(restored[rt])
+	}
+	if gotWithdrawn != wantWithdrawn || gotRestored != wantRestored {
+		t.Fatalf("test tables cover withdrawn=%d restored=%d, want %d/%d — "+
+			"a shrunken table would make this test pass while checking nothing",
+			gotWithdrawn, gotRestored, wantWithdrawn, wantRestored)
 	}
 
 	for _, rt := range []string{"claude-code", "hermes", "codex", "openclaw"} {
@@ -711,6 +757,48 @@ func TestDeriveProvider_PlatformArmsAreMinimaxOnly(t *testing.T) {
 					if id == model {
 						t.Fatalf("ModelsForRuntime(%q) still lists withdrawn id %q", rt, model)
 					}
+				}
+			})
+		}
+		for _, model := range restored[rt] {
+			t.Run("restored/"+rt+"/"+model, func(t *testing.T) {
+				// nil authEnv is the create-time shape, same as the negative
+				// half — a restored id must resolve WITHOUT a tenant credential,
+				// i.e. onto the closed platform arm, not a BYOK arm.
+				got, derr := m.DeriveProvider(rt, model, nil)
+				if derr != nil {
+					t.Fatalf("DeriveProvider(%q, %q, nil) error = %v — sdk#204 "+
+						"restored this id to the platform arm; it must be "+
+						"selectable at workspace-create again. A failure here "+
+						"means the sdk/gen/go pin is still on #203 (or older).",
+						rt, model, derr)
+				}
+				if got.Name != "platform" {
+					t.Fatalf("DeriveProvider(%q, %q, nil) = %q, want %q — a "+
+						"restored platform id must derive the CLOSED platform "+
+						"provider, not a tenant-key BYOK arm", rt, model, got.Name, "platform")
+				}
+				if !got.IsPlatform() {
+					t.Fatalf("DeriveProvider(%q, %q, nil) resolved %q with IsPlatform()=false — "+
+						"platform billing must not require a tenant key", rt, model, got.Name)
+				}
+				// Deriving is not enough: the create gate and the canvas menu
+				// both key off exact membership in ModelsForRuntime.
+				ids, merr := m.ModelsForRuntime(rt)
+				if merr != nil {
+					t.Fatalf("ModelsForRuntime(%q) error = %v", rt, merr)
+				}
+				found := false
+				for _, id := range ids {
+					if id == model {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Fatalf("ModelsForRuntime(%q) does not list restored id %q — "+
+						"it would derive but stay off the menu, so it is still "+
+						"not re-selectable for NEW workspaces (the exact #203 gap)", rt, model)
 				}
 			})
 		}
