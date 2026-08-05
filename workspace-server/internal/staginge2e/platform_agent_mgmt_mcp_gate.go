@@ -175,6 +175,35 @@ func EvaluateMgmtMCPCallable(p MgmtMCPProbe) (ok bool, reason string) {
 			strings.Join(p.LoadedTools, ","), p.RequiredTool)
 	}
 
+	// 4b. ZERO-EVIDENCE REFUSAL (the vacuous-pass guard).
+	//
+	//     Checks 3 and 4 are both conditional on the tenant having SURFACED the
+	//     signal they read: check 3 only fires when mcp_server_present was
+	//     reported, check 4 only when loaded_mcp_tools was non-empty. That is the
+	//     right tolerance individually — neither field is guaranteed by the
+	//     workspace API — but taken together they leave a hole: a probe in which
+	//     the tenant surfaced NEITHER signal walks past both checks and, on a
+	//     presence-only run, reaches the green return below having verified
+	//     nothing about the management MCP beyond status=online.
+	//
+	//     That is a pass:0/fail:0 verdict wearing a green coat, and it is exactly
+	//     the shape this gate exists to refuse. Note the observed staging fleet
+	//     ALREADY reports mcp_server_present=<absent> (the live gate logs
+	//     `present=false(reported=false)` on every green run), so check 3 is a
+	//     confirmed no-op in production and loaded_mcp_tools is the only positive
+	//     presence signal actually being read today. If the heartbeat producer
+	//     ever stops surfacing that one too, the presence half silently degrades
+	//     to "online, and nothing else was asked".
+	//
+	//     The deploy path is unaffected: staging-tenant-cd arms
+	//     E2E_ASSERT_MGMT_MCP_CALLABLE (and GUARD_B_REQUIRE_CALLABLE), so the
+	//     real A2A turn in check 5 is its positive evidence and this branch
+	//     cannot fire there. It closes the presence-ONLY hole, where there is no
+	//     backstop at all.
+	if !p.AssertCallable && !p.MCPServerPresentReported && len(p.LoadedTools) == 0 {
+		return false, "platform agent reached status=online but the tenant surfaced NEITHER mcp_server_present NOR a non-empty loaded_mcp_tools inventory, and this run did not arm the real A2A callable turn — the verdict would be based on ZERO positive evidence that the management MCP exists (a vacuous pass). Re-run with E2E_ASSERT_MGMT_MCP_CALLABLE=1 (or GUARD_B_REQUIRE_CALLABLE=1) so the callable turn supplies the evidence"
+	}
+
 	// 5. The CALLABLE proof (the whole point of Guard B): a real A2A tool-use turn
 	//    must have RUN provision_workspace and produced the workspace. Presence
 	//    without callability is exactly the flaw that let regressions through.
