@@ -42,21 +42,12 @@ const PLATFORM_URL = process.env.E2E_PLATFORM_URL ?? "http://localhost:8080";
 
 let echo: EchoRuntime;
 let ws: SeededWorkspace;
-let stopHeartbeat: (() => void) | undefined;
-
 test.beforeAll(async () => {
   echo = await startEchoRuntime();
   ws = await seedWorkspace(echo.baseURL);
-  // The delivery-while-unmounted specs below navigate between top-level views,
-  // which takes long enough for the platform's stale sweep to flip an
-  // un-heartbeated external workspace out of `online` — the SidePanel then
-  // renders the boot screen instead of the tab strip. Keep it genuinely alive
-  // rather than papering over the flip afterwards.
-  stopHeartbeat = startHeartbeat(ws.id, ws.authToken);
 });
 
 test.afterAll(async () => {
-  if (stopHeartbeat) stopHeartbeat();
   if (ws) await cleanupWorkspace(ws.id);
   if (echo) await echo.stop();
 });
@@ -334,7 +325,19 @@ function hydrationOf(page: Page): Promise<unknown> {
   );
 }
 
+/** Keep the seeded external workspace genuinely `online` for the duration of a
+ *  spec that navigates between top-level views. Those navigations take long
+ *  enough for the platform's stale sweep to flip an un-heartbeated external
+ *  workspace out of `online`, and the SidePanel then renders the boot screen
+ *  instead of the tab strip. Scoped per-test ON PURPOSE: a file-wide heartbeat
+ *  fights the provisioning spec above, which deliberately drives this same
+ *  workspace into `provisioning`. */
+function keepAlive(): () => void {
+  return startHeartbeat(ws.id, ws.authToken);
+}
+
 test("notify delivered while on Settings renders ONCE back on the map", async ({ page }) => {
+  const stopHeartbeat = keepAlive();
   // The path that hits ORDINARY agents, not just the concierge. Leaving the Org
   // map unmounts <Canvas/>, the SidePanel and therefore this workspace's
   // ChatTab, so the store has no consumer to hand the frame to.
@@ -351,11 +354,13 @@ test("notify delivered while on Settings renders ONCE back on the map", async ({
   const hydration = hydrationOf(page);
   await openMapChat(page);
   await expectExactlyOneBubble(page, message, hydration);
+  stopHeartbeat();
 });
 
 test("notify delivered with the SidePanel off chat renders ONCE in the Home chat", async ({
   page,
 }) => {
+  const stopHeartbeat = keepAlive();
   // Second unmount path, second remounting consumer. Switching the SidePanel to
   // a non-chat tab unmounts the ChatTab while staying on the map; the message is
   // then delivered with nothing mounted anywhere, and the HOME view's ChatTab —
@@ -378,4 +383,5 @@ test("notify delivered with the SidePanel off chat renders ONCE in the Home chat
     timeout: 15_000,
   });
   await expectExactlyOneBubble(page, message, hydration);
+  stopHeartbeat();
 });

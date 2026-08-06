@@ -161,6 +161,26 @@ async function collectHittabilityDiagnostic(page: Page, testId: string): Promise
       // @xyflow/react's stylesheet. If it is not, the stylesheet is missing
       // and EVERY canvas interaction is unreliable — say so explicitly.
       const bgPE = bg ? getComputedStyle(bg).pointerEvents : "(no .react-flow__background)";
+      // If the rule is NOT APPLIED, say whether the stylesheet is missing from
+      // the document entirely (a dev-server chunk that never arrived) or is
+      // present but somehow not in effect. Measured: the rule is part of the
+      // INITIAL document CSS — it is there before <Canvas/> ever mounts — so
+      // "present: false" points at chunk delivery, not at import placement.
+      let ruleSheets = 0;
+      let rulePresent = false;
+      for (const sheet of Array.from(document.styleSheets)) {
+        let rules: CSSRuleList | null = null;
+        try {
+          rules = sheet.cssRules;
+        } catch {
+          continue; // cross-origin sheet, not ours
+        }
+        if (!rules) continue;
+        ruleSheets++;
+        for (const r of Array.from(rules)) {
+          if (r.cssText.includes(".react-flow__background")) rulePresent = true;
+        }
+      }
       return [
         `node box = {x:${r.x.toFixed(1)} y:${r.y.toFixed(1)} w:${r.width.toFixed(1)} h:${r.height.toFixed(1)}}`,
         `hit target at node centre = ${describe(hit)}`,
@@ -169,6 +189,13 @@ async function collectHittabilityDiagnostic(page: Page, testId: string): Promise
             ? ""
             : "  <-- @xyflow/react/dist/style.css is NOT applied to this page; " +
               "the React Flow background is swallowing pointer events"),
+        `stylesheets = ${document.styleSheets.length} (${ruleSheets} readable), ` +
+          `.react-flow__background rule present = ${rulePresent}` +
+          (bgPE === "none"
+            ? ""
+            : rulePresent
+              ? "  <-- rule IS in the document but not in effect"
+              : "  <-- the stylesheet never reached this document (dev-server chunk delivery)"),
         `viewport transform = ${
           (document.querySelector(".react-flow__viewport") as HTMLElement | null)?.style.transform || "(none)"
         }`,
