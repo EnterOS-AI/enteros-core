@@ -188,16 +188,36 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 	// Wait for the concierge to reach status=online — which RCA #2970 makes
 	// UNREACHABLE unless its management MCP is present — collecting the row-reported
 	// signals (mcp_server_present, loaded_mcp_tools, runtime) into a probe.
-	deadline := time.Now().Add(15 * time.Minute)
+	//
+	// TERMINAL-SIGNAL WAIT (readiness_terminal_signal.go). This loop used to be
+	// positive-edge-only: it polled for status=="online" for a fixed 15 minutes,
+	// logged NOTHING in between, and then reported a timeout. Over the 278
+	// e2e-smoke verdicts in retention that produced 26 reds — the single largest
+	// Guard B failure cluster — and in 24 of them the last status was "failed":
+	// a verdict the control plane had published minutes earlier, with a reason,
+	// in the very body this loop was already parsing. The gate then purged the
+	// org, destroying its own evidence. Four multi-hour staging incidents were
+	// each investigated from logs that said only "never reached online WITHIN
+	// 15m".
+	//
+	// Now every poll yields one of three answers, a status TRANSITION is logged
+	// as it happens (the lifecycle wait always did this; that is why its reds
+	// were diagnosable and these were not), and a published terminal verdict
+	// ends the wait — after, and only after, it has outlived the control plane's
+	// own self-heal window, so a concierge the CP is still remediating is never
+	// called dead early.
+	watch := NewConciergeOnlineWatch(conciergeOnlineBudget,
+		ResolveTerminalSettle(os.Getenv(TerminalSettleEnv)))
 	var probe MgmtMCPProbe
 	probe.ExpectedRuntime = expectedRuntime
 	probe.RequiredTool = requiredTool
 	probe.AssertCallable = assertCallable
 	probe.RequireCallable = requireCallable
 	online := false
-	var lastStatus, lastPresent, lastTools string
-	for time.Now().Before(deadline) {
+	var lastPresent, lastTools, waitFailure string
+	for !online {
 		hs, body := doTenantJSON(t, "GET", "https://"+host+"/workspaces/"+platformID, token, orgID, "")
+		obs := Obs{ReadOK: hs == http.StatusOK}
 		if hs == http.StatusOK {
 			status := jsonField(body, "status")
 			present, presentReported := jsonBool(body, "mcp_server_present")
@@ -207,24 +227,44 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 			probe.MCPServerPresentReported = presentReported
 			probe.LoadedTools = tools
 			probe.ObservedRuntime = observedRuntime(body)
-			lastStatus = status
 			lastPresent = fmt.Sprintf("%v(reported=%v)", present, presentReported)
 			lastTools = strings.Join(tools, ",")
-
-			if status == "online" {
-				online = true
-				break
-			}
+			// last_sample_error is the control plane's OWN reason for a failed
+			// platform agent (markWorkspaceFailed writes it alongside the status
+			// flip; core#5035 kept it un-stripped on this endpoint precisely so a
+			// reader like this one can quote it).
+			obs.Status = status
+			obs.Detail = topLevelString(body, "last_sample_error")
 		}
-		time.Sleep(15 * time.Second)
+		step := watch.Observe(time.Now(), obs)
+		if step.Transitioned && step.Message != "" {
+			t.Logf("    %s mcp_server_present=%s loaded_mcp_tools=[%s]", step.Message, lastPresent, lastTools)
+		}
+		switch step.Decision {
+		case WaitReady:
+			online = true
+		case WaitFailTerminal, WaitFailBudget, WaitFailMisconfigured:
+			waitFailure = step.Message
+		default:
+			time.Sleep(15 * time.Second)
+			continue
+		}
+		if waitFailure != "" {
+			break
+		}
 	}
 	if !online {
-		t.Fatalf("platform agent %s never reached online WITHIN 15m "+
-			"(last status=%q mcp_server_present=%s loaded_mcp_tools=[%s]; required verb=%q).\n"+
-			"This is the test14 / broken-openclaw-pin failure mode: the concierge's mgmt-MCP plugin was "+
+		t.Fatalf("platform agent %s never came online.\n"+
+			"  %s\n"+
+			"  mcp_server_present=%s loaded_mcp_tools=[%s]; required verb=%q.\n"+
+			"  This is the test14 / broken-openclaw-pin failure mode: the concierge's mgmt-MCP plugin was "+
 			"not installed (e.g. a presign:// declared source the deployed runtime cannot resolve) → "+
-			"RCA #2970 fail-closed → the platform agent can never manage the org.",
-			platformID, lastStatus, lastPresent, lastTools, requiredTool)
+			"RCA #2970 fail-closed → the platform agent can never manage the org.\n"+
+			"  CP tenant diagnostics: %s\n"+
+			"  CP boot-events:        %s",
+			platformID, waitFailure, lastPresent, lastTools, requiredTool,
+			bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/diagnostics"),
+			bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/boot-events?limit=20"))
 	}
 
 	// core#5026 — the concierge reached online, so its boot-install report MUST be
