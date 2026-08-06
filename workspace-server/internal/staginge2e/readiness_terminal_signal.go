@@ -28,18 +28,31 @@ package staginge2e
 // snapshots of one rolling window, not two measurements.
 //
 //   - 35 of the genuine Guard B reds (60%) were filed as "boot/provision
-//     timeouts". They are NOT timeouts. In 24 of the 26 "concierge never online"
-//     reds the LAST OBSERVED STATUS WAS "failed" — 92.3%, and 39 of 41 (95.1%)
-//     once the sibling workspace-boot wait's identical failure is counted too.
-//     That is a verdict the control plane had already published, with a reason,
+//     timeouts". They are NOT timeouts: the LAST OBSERVED STATUS was already
+//     "failed" — a verdict the control plane had published, with a reason,
 //     minutes earlier. The gate sat on it for the rest of the 15 minutes and
 //     then reported a timeout.
+//
+//     QUOTE THE SLICING WITH THE NUMBER. The "concierge never online" count
+//     depends on how attempts are counted, and every slicing below is correct:
+//
+//         task-level, all attempts               32   (30 failed = 93.8%)
+//         dedup by job                           28   (26        = 92.9%)
+//         dedup by sha                           27   (25        = 92.6%)
+//         exclude retried-then-green             31   (29        = 93.5%)
+//         dedup by sha + exclude retried-green   26   (24        = 92.3%)
+//
+//     The spread is four retry attempts plus one job that passed on re-run. The
+//     conclusion is identical at every slicing, which is the point.
 //   - The budgets are not marginal, so raising or lowering them is irrelevant:
 //     on the 209 GREEN runs the concierge reached online in min 31s / p50 47s /
 //     p99 136s / MAX 137s against a 900s budget (6.6x the worst success; not one
 //     green ever exceeded 300s), and the org reached running in p50 31s / p99
 //     92s / max 249s against a 420s budget.
-//   - Across 2538 logged status observations yielding 999 transitions,
+//   - Across 2538 logged status observations — counting exactly the polled
+//     `[why] status="X" routable=Y` lines this wait emits, and NOT the 512
+//     `status → "X"` lines from the pause/hibernate helper nor the 41 verdict
+//     summaries — yielding 999 transitions,
 //     provisioning→online occurred 969 times (median 10s, max 112s) and
 //     provisioning→failed 9 times (median 92s, max 126s).
 //     `failed` has ZERO OUTBOUND TRANSITIONS OF ANY KIND — not just none to
@@ -402,10 +415,13 @@ func (w *ReadinessWatch) Observe(now time.Time, o Obs) WaitStep {
 			if strings.TrimSpace(o.Detail) != "" {
 				w.terminalDetail = o.Detail
 			}
-			if !w.everTerminal {
-				w.everTerminal = true
-				w.everTerminalAt = elapsed
-			}
+			// everTerminal* describe the MOST RECENT terminal run, not a mix of
+			// the first sighting's timestamp with the latest run's status and
+			// reason. Review 20599: reporting `at t+<first sighting>` beside the
+			// current run's reason produced a sentence contradicted by the trace
+			// printed next to it, on any subject that flapped.
+			w.everTerminal = true
+			w.everTerminalAt = w.terminalSince.Sub(w.start)
 			w.everTerminalStatus = o.Status
 			if strings.TrimSpace(o.Detail) != "" {
 				w.everTerminalDetail = o.Detail
@@ -418,6 +434,10 @@ func (w *ReadinessWatch) Observe(now time.Time, o Obs) WaitStep {
 		default:
 			// Left the terminal set — the control plane's self-heal is working,
 			// so forget the pending verdict and keep waiting on the real signal.
+			// everTerminal* are deliberately NOT cleared: the fact that a verdict
+			// was once published survives, because the budget arm must never
+			// claim "nothing was ever published" about a subject that recovered
+			// and then wedged. Only the PENDING run is forgotten.
 			w.terminalStatus = ""
 			w.terminalDetail = ""
 			w.terminalSince = time.Time{}
@@ -478,7 +498,7 @@ func (w *ReadinessWatch) terminalMessage(status string, held, elapsed time.Durat
 				"complete. This is a PUBLISHED FAILURE VERDICT — the control plane said this boot had failed and had not "+
 				"revised it by the time we stopped looking. It is NOT a 'nothing was published' timeout: the verdict and "+
 				"its reason are below.",
-			w.everTerminalAt.Truncate(time.Second), held.Truncate(time.Second), w.Budget, w.Settle)
+			w.terminalSince.Sub(w.start).Truncate(time.Second), held.Truncate(time.Second), w.Budget, w.Settle)
 	}
 	return fmt.Sprintf(
 		"%s reached TERMINAL status=%q %s "+

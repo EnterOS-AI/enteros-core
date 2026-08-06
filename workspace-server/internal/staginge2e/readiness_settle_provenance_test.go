@@ -42,6 +42,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -98,36 +99,49 @@ func durationConstFromSource(t fataller, dir, name string) (time.Duration, strin
 		t.Fatalf("cannot read %s to verify %s (err=%v, files=%d) — the drift guard must not pass when it "+
 			"cannot reach the source it is guarding", dir, name, err, len(files))
 	}
+	// EVERY declaration is collected, never just the first match in sort order.
+	//
+	// Review 20599: `parser.ParseFile(…, 0)` does not evaluate build constraints,
+	// and filepath.Glob returns sorted names, so a `//go:build ignore` decoy
+	// sorting before the real file would have won and the guard would have
+	// reported the DECOY's value — passing while the compiled constant said
+	// something else. That is a guard defeated by something other than the thing
+	// it guards, which is the whole defect class this package exists to refuse,
+	// so ambiguity is now a FAILURE rather than a silent first-wins choice.
+	//
+	// It is deliberately NOT solved by teaching this reader about build tags:
+	// then the reader would need to be right about constraint evaluation for the
+	// guard to be trustworthy. Refusing to answer when more than one declaration
+	// exists needs no such cleverness, and also catches the honest version of the
+	// same hazard — a genuine second declaration behind a build tag, where the
+	// value this gate depends on becomes configuration rather than a constant.
+	type decl struct {
+		val  time.Duration
+		file string
+	}
+	var found []decl
 	fset := token.NewFileSet()
 	for _, f := range files {
 		parsed, perr := parser.ParseFile(fset, f, nil, 0)
 		if perr != nil {
 			continue // an unparseable file elsewhere in the package is not our concern
 		}
-		var (
-			found bool
-			val   time.Duration
-			fail  string
-		)
+		var fail string
 		ast.Inspect(parsed, func(n ast.Node) bool {
-			if found {
-				return false
-			}
 			vs, ok := n.(*ast.ValueSpec)
-			if !ok || len(vs.Values) != 1 {
+			if !ok || len(vs.Values) != len(vs.Names) {
 				return true
 			}
-			for _, id := range vs.Names {
+			for i, id := range vs.Names {
 				if id.Name != name {
 					continue
 				}
-				d, derr := evalDurationExpr(vs.Values[0])
+				d, derr := evalDurationExpr(vs.Values[i])
 				if derr != "" {
 					fail = derr
 					return false
 				}
-				found, val = true, d
-				return false
+				found = append(found, decl{d, f})
 			}
 			return true
 		})
@@ -135,12 +149,23 @@ func durationConstFromSource(t fataller, dir, name string) (time.Duration, strin
 			t.Fatalf("found %s in %s but could not evaluate its value: %s. The drift guard must be updated to "+
 				"understand the new form rather than left silently passing.", name, f, fail)
 		}
-		if found {
-			return val, f
-		}
 	}
-	t.Fatalf("constant %s was NOT found anywhere in %s. It was renamed, moved or deleted — which is itself the "+
-		"drift this guard exists to catch, so this is a failure, not a skip.", name, dir)
+	switch len(found) {
+	case 1:
+		return found[0].val, found[0].file
+	case 0:
+		t.Fatalf("constant %s was NOT found anywhere in %s. It was renamed, moved or deleted — which is itself "+
+			"the drift this guard exists to catch, so this is a failure, not a skip.", name, dir)
+	default:
+		var where []string
+		for _, d := range found {
+			where = append(where, fmt.Sprintf("%s=%s", d.file, d.val))
+		}
+		t.Fatalf("constant %s is declared %d times in %s (%s). This reader does not evaluate build constraints, "+
+			"so it CANNOT know which one the compiler uses — and picking one would make the guard depend on file "+
+			"sort order rather than on the value it is guarding. Refusing to answer.",
+			name, len(found), dir, strings.Join(where, ", "))
+	}
 	return 0, ""
 }
 
@@ -277,4 +302,85 @@ func (f *fatalRecorder) Fatalf(format string, args ...any) {
 	f.failed = true
 	f.msg = fmt.Sprintf(format, args...)
 	panic("fatalRecorder: " + f.msg)
+}
+
+// A BUILD-EXCLUDED DECOY must defeat the guard's ANSWER, not the guard.
+//
+// Review 20599 found the one attack the reader did not survive: parser.ParseFile
+// with mode 0 ignores build constraints and filepath.Glob returns sorted names,
+// so a `//go:build ignore` file sorting before registry.go and carrying the OLD
+// value would win first-match and the guard would pass while the compiled
+// constant said something else. Contrived — Go rejects duplicate constants
+// unless one is build-excluded, so drift alone cannot produce it — but a guard
+// defeated by file sort order is exactly the shape this package refuses.
+//
+// The fixture is a real temp directory rather than a planted file in
+// internal/handlers, so the proof is permanent and cannot itself rot the
+// package it is guarding.
+func TestDurationConstFromSource_RefusesABuildExcludedDecoy(t *testing.T) {
+	dir := t.TempDir()
+	// "aaa_decoy.go" sorts BEFORE "registry.go", which is precisely the ordering
+	// that made first-match unsafe.
+	mustWrite(t, filepath.Join(dir, "aaa_decoy.go"), `//go:build ignore
+
+package handlers
+
+import "time"
+
+const managementMCPUnloadedGrace = 180 * time.Second
+`)
+	mustWrite(t, filepath.Join(dir, "registry.go"), `package handlers
+
+import "time"
+
+const managementMCPUnloadedGrace = 420 * time.Second
+`)
+
+	sub := &fatalRecorder{}
+	func() {
+		defer func() { recover() }()
+		durationConstFromSource(sub, dir, "managementMCPUnloadedGrace")
+	}()
+	if !sub.failed {
+		t.Fatalf("a build-excluded decoy carrying the OLD value silently won: the guard returned an answer "+
+			"instead of refusing. It would then pass while the compiled constant reads 420s (message: %q)", sub.msg)
+	}
+	if !strings.Contains(sub.msg, "declared 2 times") {
+		t.Fatalf("the refusal must name the ambiguity it found: %q", sub.msg)
+	}
+	// And it must have SEEN both values, so an operator can tell decoy from real.
+	for _, want := range []string{"3m0s", "7m0s"} {
+		if !strings.Contains(sub.msg, want) {
+			t.Fatalf("the refusal must report every declaration it found (missing %s): %q", want, sub.msg)
+		}
+	}
+}
+
+// The unambiguous case must still ANSWER — the refusal above is worthless if it
+// also fires on the normal single-declaration shape.
+func TestDurationConstFromSource_AnswersWhenThereIsExactlyOneDeclaration(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "aaa_unrelated.go"), `package handlers
+
+import "time"
+
+const somethingElse = 99 * time.Second
+`)
+	mustWrite(t, filepath.Join(dir, "registry.go"), `package handlers
+
+import "time"
+
+const managementMCPUnloadedGrace = 420 * time.Second
+`)
+	got, where := durationConstFromSource(t, dir, "managementMCPUnloadedGrace")
+	if got != 420*time.Second {
+		t.Fatalf("got %s from %s, want 7m0s", got, where)
+	}
+}
+
+func mustWrite(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write fixture %s: %v", path, err)
+	}
 }

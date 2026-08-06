@@ -210,3 +210,53 @@ func TestReadinessWatch_LeavingTheTerminalSetClearsThePendingReason(t *testing.T
 		t.Fatalf("a stale reason from an earlier, revised failure leaked into a later one: %s", msg)
 	}
 }
+
+// The late-verdict message must timestamp the verdict it is actually reporting.
+//
+// Review 20599: the `settled=false` branch read "at t+X" from everTerminalAt
+// (the FIRST-ever sighting of any terminal status) while "held it Y later" read
+// the CURRENT run. On a flap those are different events, so the message could
+// say "published at t+1m0s … and had not revised it" while its own trace, two
+// clauses later, showed the revision at t+2m0s.
+//
+// Strictly weaker than the blocker it resembles — the verdict is still named,
+// the reason still quoted, the trace still correct in the same output — and it
+// needs a flap, which retention has never produced. But it is the same species:
+// a sentence contradicted by the data printed beside it. Fixed rather than
+// documented.
+func TestReadinessWatch_LateVerdictTimestampsTheRunItIsReporting(t *testing.T) {
+	// failed@60s -> provisioning@120s -> failed@14m, on a 15m budget: the second
+	// terminal run cannot complete the 3m settle, so this takes the late branch.
+	seq := []statusAt{
+		{at: 0, status: "provisioning"},
+		{at: 60 * time.Second, status: "failed", detail: "first, transient"},
+		{at: 120 * time.Second, status: "provisioning"},
+		{at: 14 * time.Minute, status: "failed", detail: "second, the one being reported"},
+	}
+	w := NewConciergeOnlineWatch(conciergeBudget, TerminalSettleDefault)
+	got, _ := runWatchWait(w, seq, conciergePoll)
+
+	if got.ok {
+		t.Fatalf("must fail")
+	}
+	// It must timestamp the run it is reporting (t+14m), NOT the first sighting.
+	if strings.Contains(got.message, "at t+1m0s") {
+		t.Fatalf("the message timestamps the FIRST terminal sighting (t+1m0s) while reporting the CURRENT run, "+
+			"and its own trace shows the intervening recovery. A sentence contradicted by the data beside it.\nGot: %s",
+			got.message)
+	}
+	if !strings.Contains(got.message, "at t+14m0s") {
+		t.Fatalf("the message must timestamp the terminal run it is reporting (t+14m0s).\nGot: %s", got.message)
+	}
+	// The reason must be the CURRENT run's, not the stale first one.
+	if strings.Contains(got.message, "first, transient") {
+		t.Fatalf("stale reason from the earlier, revised failure leaked into the report.\nGot: %s", got.message)
+	}
+	if !strings.Contains(got.message, "second, the one being reported") {
+		t.Fatalf("the report must quote the CURRENT run's reason.\nGot: %s", got.message)
+	}
+	// And the trace must still show the flap, so the recovery is visible.
+	if strings.Count(w.Trace(), "failed@") != 2 {
+		t.Fatalf("the trace must record both terminal runs: %s", w.Trace())
+	}
+}
