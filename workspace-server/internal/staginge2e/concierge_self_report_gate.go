@@ -187,6 +187,63 @@ func A2AQueueTerminalStatus(status string) bool {
 	return false
 }
 
+// queueStatusOf reads the `status` field of a queue-status body. Anything
+// unparseable is "" — which A2AQueueTerminalStatus treats as NOT terminal, so
+// an unreadable body makes the poller keep waiting rather than record silence.
+func queueStatusOf(body string) string {
+	var env struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(body), &env); err != nil {
+		return ""
+	}
+	return env.Status
+}
+
+// SelfReportFetch reads one queue row. It returns the HTTP status and body in
+// the shape doTenantJSONTimeout produces, where a TRANSPORT FAILURE is
+// (0, "") — never a panic, never a fatal.
+type SelfReportFetch func(queueID string) (httpStatus int, body string)
+
+// CollectSelfReportBodies gathers the concierge's actual replies for a provision
+// turn by following the queue ids the tenant handed back, and appends them to
+// the bodies already in hand.
+//
+// It is the pure core of the live collector so the property the gate depends on
+// is TESTABLE without a tenant: **this can only ever abstain.** There is no
+// error return and no fatal path. A fetch that transport-fails, 404s, 403s, or
+// never leaves an in-flight status contributes nothing; the result is simply
+// fewer bodies, which makes ParseConciergeClaim report Observed=false and
+// ReconcileProvisionClaim abstain. A diagnostic read must never be able to fail
+// a deploy gate.
+//
+// budget is a SINGLE TOTAL wall-clock allowance shared across every queue id,
+// not a per-id one. With ~6 nudges a per-id budget would silently multiply into
+// double-digit minutes added to a hard prod gate; the shared deadline bounds the
+// whole collection instead.
+//
+// waited() is called after each unsuccessful attempt (the live caller sleeps
+// there; a test counts). expired() reports whether the shared budget is spent.
+func CollectSelfReportBodies(bodies, queueIDs []string, fetch SelfReportFetch, expired func() bool, waited func(queueID string)) []string {
+	for _, qid := range queueIDs {
+		for {
+			if expired() {
+				return bodies
+			}
+			st, body := fetch(qid)
+			if st == 200 && A2AQueueTerminalStatus(queueStatusOf(body)) {
+				bodies = append(bodies, body)
+				break
+			}
+			if expired() {
+				return bodies
+			}
+			waited(qid)
+		}
+	}
+	return bodies
+}
+
 // ── Claim detection ─────────────────────────────────────────────────────────
 
 // refusalMarkers veto a claim outright. Every one of these is a VERBATIM
@@ -224,13 +281,32 @@ var creationVerbs = []string{"created", "provisioned"}
 
 // negationRe kills a creation verb inside its own clause: "not created",
 // "could not be provisioned", "failed to be created", "never created",
-// "no workspace was created".
+// "no workspace was created", "Nothing was created", "I created none today",
+// "the create was aborted / rejected".
 //
 // Matched as WHOLE WORDS, not substrings — "no" must not fire on "new
 // workspace", which is the single most common word in a genuine claim. The
 // leading alternative catches the "n't" clitic, which normaliseReply leaves
 // attached ("wasn't", "couldn't").
-var negationRe = regexp.MustCompile(`(?:n't|\b(?:no|not|never|cannot|cant|unable|without|fail|failed|fails|failing)\b)`)
+//
+// Checked over the WHOLE clause window (both sides of the verb), because a
+// negation can trail it: "Previously created workspaces are listed below; I
+// created none today."
+var negationRe = regexp.MustCompile(`(?:n't|\b(?:no|not|none|nothing|never|cannot|cant|unable|without|fail|failed|fails|failing|abort|aborted|reject|rejects|rejected|rejection|refus|refused|declined)\b)`)
+
+// futureModalRe kills a creation verb that is an INTENTION, a PROPOSAL or a
+// QUESTION rather than a completed act:
+//
+//	"The workspace will be created once you confirm the model."
+//	"Should I go ahead so the workspace gets created?"
+//	"Do you want me to have a workspace created?"
+//	"I'm going to have the workspace created now."
+//
+// Checked ONLY over the text BEFORE the verb, which is where intent language
+// sits. That precision matters: a genuine claim routinely trails future tense
+// after the verb — "has been created and will be online shortly" — and vetoing
+// on the whole window would silently stop detecting real claims.
+var futureModalRe = regexp.MustCompile(`(?:\bwill\s+be\b|\bwill\s+get\b|\bgoing\s+to\b|\bshould\s+i\b|\bshall\s+i\b|\bcan\s+i\b|\bdo\s+you\s+want\b|\bwould\s+you\s+like\b|\bonce\s+you\b|\bafter\s+you\b|\bif\s+you\s+confirm\b|\bplease\s+confirm\b|\bgets?\s+created\b|\bgets?\s+provisioned\b|\bto\s+be\s+created\b|\bto\s+be\s+provisioned\b)`)
 
 // claimWindowBefore/After bound the clause examined around a creation verb.
 // Wide enough to span "The new workspace has been successfully provisioned",
@@ -283,9 +359,15 @@ func ReplyClaimsWorkspaceCreated(text string) bool {
 			if !strings.Contains(window, "workspace") {
 				continue
 			}
-			if !negationRe.MatchString(window) {
-				return true
+			if negationRe.MatchString(window) {
+				continue
 			}
+			// Intent/proposal/question, not a completed act. Pre-window only —
+			// see futureModalRe.
+			if futureModalRe.MatchString(n[lo:at]) {
+				continue
+			}
+			return true
 		}
 	}
 	return false
@@ -379,8 +461,33 @@ func ParseConciergeClaim(bodies []string) ConciergeClaim {
 // only that the SELF-REPORT raised no additional objection. The row check
 // (EvaluateMgmtMCPCallable check 5) still runs and still decides.
 func ReconcileProvisionClaim(claim ConciergeClaim, rowFound bool, rowID string) (ok bool, reason string) {
+	// Normalise the row id ONCE, so every branch below compares the same thing
+	// and a whitespace-only id can never masquerade as a surfaced one.
+	rowID = strings.TrimSpace(rowID)
+
 	if !claim.Observed {
 		return true, "the concierge's self-report was NOT OBSERVED (only a transport acknowledgement was returned) — nothing to reconcile; the created row remains the sole evidence"
+	}
+
+	// A ROW THAT EXISTS BUT WAS REFUSED IS NOT A FABRICATION.
+	//
+	// rowFound is the CLASSIFIED verdict, not "a row is present": a workspace
+	// the concierge really did create and that then reached a terminal-bad
+	// status (or came back with the wrong kind) arrives here as rowFound=false
+	// WITH a real rowID, because ClassifyProvisionedWorkspace refused it. The
+	// agent's report was then accurate about the act — it did create the row —
+	// and calling that "REPORTED SUCCESS for a workspace it never created" is
+	// simply false. The turn is still RED, via check 5 and with the reason
+	// ClassifyProvisionedWorkspace already produced; the self-report just has
+	// no additional objection to add.
+	//
+	// Naming an honest failure as a fabrication would reintroduce exactly the
+	// indistinguishability this file exists to remove, only pointing the other
+	// way.
+	if !rowFound && rowID != "" {
+		return true, fmt.Sprintf(
+			"the concierge DID create a workspace (row id=%s) which was then refused on its own merits (terminal status / wrong kind) — the self-report is not a fabrication and adds no objection; the row verdict decides",
+			rowID)
 	}
 
 	// G9. The whole point of this file.
@@ -394,30 +501,36 @@ func ReconcileProvisionClaim(claim ConciergeClaim, rowFound bool, rowID string) 
 			quoteReplies(claim.Texts))
 	}
 
+	if !claim.ClaimsCreated {
+		return true, "the concierge's self-report makes no claim of having created the workspace — nothing to reconcile; the created row remains the sole evidence"
+	}
+
+	// NULL-ID VACUITY GUARD — placed BEFORE the identity branch, not after.
+	//
+	// Both branches below need a comparable id on BOTH sides. Deciding that
+	// first, in one place, means:
+	//   - "" == "" can never reach the RECONCILED branch (compared nothing), and
+	//   - a blank/whitespace id can never reach the MISREPORTED branch either,
+	//     where `rowID != ""` on an unnormalised value would have manufactured a
+	//     mismatch against a row id that was never really surfaced.
+	// comparableIDs drops blank entries so an id list of [""] counts as none.
+	claimedIDs := comparableIDs(claim.ClaimedWorkspaceIDs)
+	if len(claimedIDs) == 0 || rowID == "" {
+		return true, "the concierge reported success and a matching workspace row exists, but no workspace id could be compared on BOTH sides (the reply published none, or the row did not surface one) — the claim is consistent as far as it is checkable, and NOT reconciled on identity"
+	}
+
 	// The identity half: the row landed, but the agent PUBLISHED a different id.
 	// A caller holding the reported id is holding a handle to nothing.
-	if claim.ClaimsCreated && rowFound && rowID != "" && len(claim.ClaimedWorkspaceIDs) > 0 &&
-		!containsStr(claim.ClaimedWorkspaceIDs, rowID) {
+	if !containsStr(claimedIDs, rowID) {
 		return false, fmt.Sprintf(
 			"MISREPORTED WORKSPACE IDENTITY: the concierge created a workspace (row id=%s) but its own reply "+
 				"publishes workspace id(s) [%s], none of which is the row it created. A row existing under the "+
 				"requested NAME satisfied the pre-existing callable check, so this shape was previously GREEN — "+
 				"yet every consumer of the reported id addresses a resource that does not exist. The agent's "+
 				"words were: %s",
-			rowID, strings.Join(claim.ClaimedWorkspaceIDs, ","), quoteReplies(claim.Texts))
+			rowID, strings.Join(claimedIDs, ","), quoteReplies(claim.Texts))
 	}
 
-	if !claim.ClaimsCreated {
-		return true, "the concierge's self-report makes no claim of having created the workspace — nothing to reconcile; the created row remains the sole evidence"
-	}
-	// NULL-ID VACUITY GUARD. Reaching "RECONCILED" requires BOTH sides to be
-	// present: a published id AND a row id. An absent published id, an absent
-	// row id, or an empty-string id on either side must land here — never in the
-	// match branch below, where "" == "" would report a reconciliation that
-	// compared nothing.
-	if len(claim.ClaimedWorkspaceIDs) == 0 || rowID == "" || onlyEmptyIDs(claim.ClaimedWorkspaceIDs) {
-		return true, "the concierge reported success and a matching workspace row exists, but no workspace id could be compared on BOTH sides (the reply published none, or the row did not surface one) — the claim is consistent as far as it is checkable, and NOT reconciled on identity"
-	}
 	return true, fmt.Sprintf(
 		"the concierge reported success and the workspace id it published (%s) is the row that actually landed — self-report RECONCILED against the resource",
 		rowID)
@@ -440,14 +553,16 @@ func quoteReplies(texts []string) string {
 
 const selfReportQuoteCap = 1200
 
-// onlyEmptyIDs reports whether a claimed-id list carries nothing comparable —
-// the list is empty or every entry is blank. Part of the null-id vacuity guard:
-// a blank id must never satisfy a comparison against a blank row id.
-func onlyEmptyIDs(ids []string) bool {
+// comparableIDs drops blank/whitespace entries from a claimed-id list. Part of
+// the null-id vacuity guard: a blank id is not an identity claim, so a list of
+// [""] must count as NO published id rather than as one that happens to equal
+// an unsurfaced row id.
+func comparableIDs(ids []string) []string {
+	out := make([]string, 0, len(ids))
 	for _, id := range ids {
-		if strings.TrimSpace(id) != "" {
-			return false
+		if s := strings.TrimSpace(id); s != "" {
+			out = append(out, s)
 		}
 	}
-	return true
+	return out
 }

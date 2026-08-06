@@ -69,6 +69,24 @@ var honestFailureReplies = []string{
 	"",
 	"   ",
 	"\n\t\n",
+
+	// ── ADVERSARIAL (pool review of #5089) ──────────────────────────────────
+	// Seven strings the first cut of the detector OVERFIRED on. Each is an
+	// honest non-claim, and mislabelling one as G9 would reintroduce exactly
+	// the indistinguishability this check exists to remove — only pointing the
+	// other way. Pinned here so they are covered by the corpus, not merely
+	// patched in the matcher.
+	//
+	// (i) trailing/leading absolute negations the word-boundary list missed:
+	"Nothing was created; the workspace request was dropped.",
+	"The model was never selected, so nothing was provisioned.",
+	"Previously created workspaces are listed below; I created none today.",
+	// (ii) future tense / intention — not a completed act:
+	"The workspace will be created once you confirm the model.",
+	"I'm going to have the workspace created now.",
+	// (iii) proposals and questions — asking is not asserting:
+	"Should I go ahead so the workspace gets created?",
+	"Do you want me to have a workspace created?",
 }
 
 // successClaimReplies are real replies from Guard B runs in which the agent
@@ -91,6 +109,14 @@ var successClaimReplies = []string{
 	"Workspace provisioned successfully. The new workspace is booting.",
 	"The workspace was successfully provisioned. Here are the details.",
 	"Done. Workspace `e2e-mcp-callable-75762365` is provisioned.",
+
+	// The counterpart to the future-tense vetoes above: a COMPLETED act that
+	// merely trails future tense must still be a claim. This is why the
+	// modal/future veto reads only the text BEFORE the verb — vetoing on the
+	// whole clause would stop detecting real fabrications, which is the failure
+	// direction that actually costs something.
+	"The workspace has been created and will be online shortly.",
+	"Workspace created successfully. I'm going to add a second one next.",
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +271,105 @@ func TestQueuedA2AQueueID_FollowsTheModernAckPath(t *testing.T) {
 	}
 }
 
+// TestCollectSelfReportBodies_CanOnlyEverAbstain is the proof for the live
+// path's stated contract: a queue read that fails can never fail the gate.
+//
+// The original collector polled through doTenantJSON, which calls t.Fatalf on a
+// transport error — so a flapping tenant would have killed the whole deploy
+// gate from inside a diagnostic, and the "best-effort" comment above it was
+// simply false. The loop now lives here, has no error return and no fatal path,
+// and the live caller passes doTenantJSONTimeout (which answers a transport
+// failure with (0, "")).
+func TestCollectSelfReportBodies_CanOnlyEverAbstain(t *testing.T) {
+	const good = `{"queue_id":"q1","status":"completed","response_body":{"jsonrpc":"2.0","result":{"kind":"message","parts":[{"kind":"text","text":"Workspace created successfully."}],"role":"agent"}}}`
+
+	never := func() bool { return false }
+	noop := func(string) {}
+
+	t.Run("transport_failure_contributes_nothing_and_does_not_fatal", func(t *testing.T) {
+		calls := 0
+		// (0, "") is exactly what doTenantJSONTimeout returns on a transport error.
+		fetch := func(string) (int, string) { calls++; return 0, "" }
+		budget := 4
+		expired := func() bool { budget--; return budget <= 0 }
+
+		got := CollectSelfReportBodies(nil, []string{"q1", "q2"}, fetch, expired, noop)
+		if len(got) != 0 {
+			t.Fatalf("a transport failure must contribute no bodies, got %v", got)
+		}
+		if calls == 0 {
+			t.Fatal("the fetch was never called — this test would pass vacuously")
+		}
+		// And the end-to-end consequence: ABSTAIN, not a failure.
+		claim := ParseConciergeClaim(got)
+		if claim.Observed {
+			t.Fatal("no readable body must mean Observed=false")
+		}
+		if ok, reason := ReconcileProvisionClaim(claim, false, ""); !ok {
+			t.Fatalf("an unreadable self-report must ABSTAIN, never object: %s", reason)
+		} else if !strings.Contains(reason, "NOT OBSERVED") {
+			t.Fatalf("the abstention must say the report was not observed; got %q", reason)
+		}
+	})
+
+	t.Run("http_errors_contribute_nothing", func(t *testing.T) {
+		for _, st := range []int{401, 403, 404, 500, 502} {
+			budget := 3
+			expired := func() bool { budget--; return budget <= 0 }
+			got := CollectSelfReportBodies(nil, []string{"q1"},
+				func(string) (int, string) { return st, `{"error":"nope"}` }, expired, noop)
+			if len(got) != 0 {
+				t.Fatalf("HTTP %d must contribute no bodies, got %v", st, got)
+			}
+		}
+	})
+
+	t.Run("in_flight_row_is_not_scored_as_silence", func(t *testing.T) {
+		// A row that never leaves 'dispatched' must be polled until the budget
+		// runs out, then abstain — never recorded as a terminal empty answer.
+		polls := 0
+		budget := 5
+		expired := func() bool { budget--; return budget <= 0 }
+		got := CollectSelfReportBodies(nil, []string{"q1"},
+			func(string) (int, string) { polls++; return 200, `{"queue_id":"q1","status":"dispatched"}` },
+			expired, noop)
+		if len(got) != 0 {
+			t.Fatalf("an in-flight row must contribute nothing, got %v", got)
+		}
+		if polls < 2 {
+			t.Fatalf("the poller gave up after %d attempt(s) — it must keep waiting on a non-terminal status", polls)
+		}
+	})
+
+	t.Run("the_budget_is_shared_across_queue_ids_not_per_id", func(t *testing.T) {
+		// Six queue ids (a realistic nudge count) against a permanently
+		// in-flight row must consume ONE allowance, not six.
+		waits := 0
+		budget := 4
+		expired := func() bool { budget--; return budget <= 0 }
+		CollectSelfReportBodies(nil, []string{"q1", "q2", "q3", "q4", "q5", "q6"},
+			func(string) (int, string) { return 200, `{"status":"queued"}` },
+			expired, func(string) { waits++ })
+		if waits > 2 {
+			t.Fatalf("a shared budget must bound the WHOLE collection; it waited %d times across 6 ids", waits)
+		}
+	})
+
+	t.Run("a_readable_terminal_row_is_collected", func(t *testing.T) {
+		// The discriminator: the abstention cases above would all pass on a
+		// collector that always returned nothing.
+		got := CollectSelfReportBodies(nil, []string{"q1"},
+			func(string) (int, string) { return 200, good }, never, noop)
+		if len(got) != 1 {
+			t.Fatalf("a completed queue row must be collected, got %v", got)
+		}
+		claim := ParseConciergeClaim(got)
+		if !claim.Observed || !claim.ClaimsCreated {
+			t.Fatalf("the collected reply must parse into an observed claim: %+v", claim)
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // The verdict
 // ---------------------------------------------------------------------------
@@ -355,9 +480,17 @@ func TestReconcileProvisionClaim_G9(t *testing.T) {
 
 // TestReconcileProvisionClaim_NullIDNeverCountsAsAMatch is the explicit
 // null-id non-vacuity proof demanded of any check that compares a claimed id
-// against a row: an empty claimed id and an empty row id must not satisfy each
-// other.
+// against a row.
+//
+// Widened after pool review: the docstring claimed more than the test covered
+// (only the ("","") pair was exercised). It now sweeps every blank/real
+// combination on BOTH sides, including WHITESPACE ids — the shape that, with
+// the pre-review `rowID != ""` test and the guard sitting AFTER the identity
+// branch, manufactured a spurious MISREPORTED WORKSPACE IDENTITY.
 func TestReconcileProvisionClaim_NullIDNeverCountsAsAMatch(t *testing.T) {
+	const real = "90d7c02f-a563-4c60-b4c6-f2d81333dddb"
+	const other = "deadbeef-0000-4000-8000-000000000001"
+
 	// An empty string must never be extracted as a claimed id in the first
 	// place — that is the mechanism by which "" == "" could ever be reached.
 	for _, txt := range []string{"Workspace ID:", "Workspace ID: ", "Workspace created successfully."} {
@@ -365,15 +498,107 @@ func TestReconcileProvisionClaim_NullIDNeverCountsAsAMatch(t *testing.T) {
 			t.Fatalf("ClaimedWorkspaceIDs(%q) = %v — an absent id must yield NO claimed id", txt, ids)
 		}
 	}
-	// And a hand-built claim carrying an empty id must not be reported as a
-	// reconciled match against an empty row id.
-	empty := ConciergeClaim{Observed: true, ClaimsCreated: true, ClaimedWorkspaceIDs: []string{""}, Texts: []string{"Workspace created successfully."}}
-	ok, reason := ReconcileProvisionClaim(empty, true, "")
-	if !ok {
-		t.Fatalf("unexpected RED: %s", reason)
+
+	blanks := []string{"", " ", "\t", "\n", "   \t "}
+	claimOf := func(ids ...string) ConciergeClaim {
+		return ConciergeClaim{Observed: true, ClaimsCreated: true, ClaimedWorkspaceIDs: ids,
+			Texts: []string{"Workspace created successfully."}}
 	}
-	if strings.Contains(reason, "RECONCILED") {
-		t.Fatalf("an empty id must NOT be reported as reconciled against an empty row id; got %q", reason)
+
+	// blank/blank, blank/real, real/blank — none may RED, and none may claim a
+	// reconciliation, because nothing was compared.
+	for _, b := range blanks {
+		for _, pair := range []struct {
+			name           string
+			claimed, rowID string
+		}{
+			{"blank claimed, blank row", b, b},
+			{"blank claimed, real row", b, real},
+			{"real claimed, blank row", real, b},
+		} {
+			ok, reason := ReconcileProvisionClaim(claimOf(pair.claimed), true, pair.rowID)
+			if !ok {
+				t.Fatalf("%s (claimed=%q row=%q): a blank id must never RED — nothing was compared: %s",
+					pair.name, pair.claimed, pair.rowID, reason)
+			}
+			if strings.Contains(reason, "RECONCILED") {
+				t.Fatalf("%s (claimed=%q row=%q): a blank id must NOT be reported as reconciled; got %q",
+					pair.name, pair.claimed, pair.rowID, reason)
+			}
+			if strings.Contains(reason, "MISREPORTED") {
+				t.Fatalf("%s (claimed=%q row=%q): a blank id must NOT manufacture an identity mismatch; got %q",
+					pair.name, pair.claimed, pair.rowID, reason)
+			}
+		}
+	}
+
+	// The discriminator: with a comparable id on BOTH sides the branches DO
+	// fire, so the sweep above is not passing because the code is inert.
+	if ok, reason := ReconcileProvisionClaim(claimOf(real), true, real); !ok || !strings.Contains(reason, "RECONCILED") {
+		t.Fatalf("real/real must reconcile (ok=%v reason=%q)", ok, reason)
+	}
+	if ok, reason := ReconcileProvisionClaim(claimOf(other), true, real); ok || !strings.Contains(reason, "MISREPORTED") {
+		t.Fatalf("real/real mismatch must RED (ok=%v reason=%q)", ok, reason)
+	}
+	// A blank entry alongside a real one must not dilute either verdict.
+	if ok, reason := ReconcileProvisionClaim(claimOf("", real), true, real); !ok || !strings.Contains(reason, "RECONCILED") {
+		t.Fatalf("a blank entry beside the real id must still reconcile (ok=%v reason=%q)", ok, reason)
+	}
+	// A row id surfaced with surrounding whitespace is the SAME id.
+	if ok, reason := ReconcileProvisionClaim(claimOf(real), true, "  "+real+"  "); !ok || !strings.Contains(reason, "RECONCILED") {
+		t.Fatalf("a padded row id must normalise, not mismatch (ok=%v reason=%q)", ok, reason)
+	}
+}
+
+// TestReconcileProvisionClaim_CreatedThenRefusedIsNotAFabrication closes the
+// mislabel found in pool review.
+//
+// rowFound is the CLASSIFIED verdict, not "a row is present". A workspace the
+// concierge really did create that then reached a terminal-bad status arrives
+// as rowFound=false WITH a real rowID, because ClassifyProvisionedWorkspace
+// refused it. Reporting that as "REPORTED SUCCESS for a workspace it never
+// created" is factually wrong: the agent did create it. The turn stays RED —
+// via check 5, with the reason the row classifier already produced — but the
+// self-report must not be the thing that names it, and must not name it wrongly.
+func TestReconcileProvisionClaim_CreatedThenRefusedIsNotAFabrication(t *testing.T) {
+	const rowID = "90d7c02f-a563-4c60-b4c6-f2d81333dddb"
+	claim := ParseConciergeClaim([]string{
+		`{"jsonrpc":"2.0","result":{"kind":"message","parts":[{"kind":"text","text":"Workspace created successfully.\n\n**New workspace ID:** ` + rowID + `"}],"role":"agent"}}`,
+	})
+
+	// Sanity: this IS the row-refused shape the live test produces.
+	if ok, _ := ClassifyProvisionedWorkspace("workspace", "failed"); ok {
+		t.Fatal("fixture is wrong: a terminal-failed row must be refused")
+	}
+
+	ok, reason := ReconcileProvisionClaim(claim, false, rowID)
+	if !ok {
+		t.Fatalf("a created-then-refused row must not make the self-report object: %s", reason)
+	}
+	if strings.Contains(reason, "FABRICATED") {
+		t.Fatalf("a row the concierge DID create must never be called a fabrication; got %q", reason)
+	}
+	if !strings.Contains(reason, "refused on its own merits") {
+		t.Fatalf("the abstention must name why it abstained; got %q", reason)
+	}
+
+	// And the turn is still RED overall — through check 5, unchanged.
+	p := guardBHealthyProbe(rowID)
+	p.WorkerProvisioned = false
+	p.Claim = claim
+	ok, reason = EvaluateMgmtMCPCallable(p)
+	if ok {
+		t.Fatalf("a refused row must still fail the gate: %s", reason)
+	}
+	if !strings.Contains(reason, "not genuinely CALLABLE") {
+		t.Fatalf("the RED must come from the row check, not the self-report; got %q", reason)
+	}
+
+	// The discriminator: with NO row id at all, the same claim IS a fabrication.
+	// Without this the test above would pass on a function that never reds.
+	ok, reason = ReconcileProvisionClaim(claim, false, "")
+	if ok || !strings.Contains(reason, "G9 FABRICATED SELF-REPORT") {
+		t.Fatalf("claim with no row whatsoever must still be G9 (ok=%v reason=%q)", ok, reason)
 	}
 }
 

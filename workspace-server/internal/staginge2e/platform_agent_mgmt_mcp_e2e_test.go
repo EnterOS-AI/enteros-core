@@ -420,32 +420,48 @@ func driveProvisionWorkspaceCallable(t *testing.T, host, token, orgID, platformI
 // must never fail the test on its own — the row is still the evidence, and a
 // gate that reddened because a diagnostic endpoint was slow would be worse than
 // the hole it closes.
+//
+// TWO THINGS MAKE THAT PROPERTY REAL RATHER THAN ASPIRATIONAL:
+//
+//   - the read uses doTenantJSONTimeout, NOT doTenantJSON. doTenantJSON calls
+//     t.Fatalf on a transport error, so a slow or flapping tenant would kill the
+//     whole gate from inside a diagnostic — the exact opposite of the stated
+//     contract, and multiplied by up to one call per nudge. doTenantJSONTimeout
+//     logs and returns (0, ""), which this collector treats as "nothing to add".
+//
+//   - the loop itself lives in CollectSelfReportBodies (untagged), which has no
+//     error return and no fatal path at all, and is unit-tested against a fetch
+//     that only ever transport-fails.
+//
+// The budget is ONE TOTAL allowance shared across every queue id, not per id:
+// a turn can accumulate ~6 nudges, and a per-id budget would have added
+// double-digit minutes to a hard prod gate.
 func collectConciergeSelfReport(t *testing.T, host, token, orgID, platformID string, bodies, queueIDs []string) ConciergeClaim {
 	t.Helper()
 
 	budget := durationOr("E2E_SELF_REPORT_POLL_SECS", 120*time.Second)
-	for _, qid := range queueIDs {
+	deadline := time.Now().Add(budget)
+	perCall := 30 * time.Second
+
+	fetch := func(qid string) (int, string) {
 		url := "https://" + host + "/workspaces/" + platformID + "/a2a/queue/" + qid
-		deadline := time.Now().Add(budget)
-		for {
-			hs, body := doTenantJSON(t, "GET", url, token, orgID, "")
-			if hs == http.StatusOK {
-				status := jsonField(body, "status")
-				if A2AQueueTerminalStatus(status) {
-					t.Logf("self-report: queue %s status=%s → %s", qid, status, truncate(body, a2aTurnLogCap))
-					bodies = append(bodies, body)
-					break
-				}
-			}
-			if time.Now().After(deadline) {
-				t.Logf("self-report: queue %s did not reach a terminal status within %s (last HTTP %d) — the agent's answer is UNOBSERVED for this turn", qid, budget, hs)
-				break
-			}
-			time.Sleep(5 * time.Second)
+		// NOT doTenantJSON — see the contract note above.
+		st, body := doTenantJSONTimeout(t, "GET", url, token, orgID, "", perCall)
+		if st == http.StatusOK && A2AQueueTerminalStatus(queueStatusOf(body)) {
+			t.Logf("self-report: queue %s reached a terminal status → %s", qid, truncate(body, a2aTurnLogCap))
 		}
+		return st, body
 	}
+	expired := func() bool { return time.Now().After(deadline) }
+	waited := func(string) { time.Sleep(5 * time.Second) }
+
+	before := len(queueIDs)
+	bodies = CollectSelfReportBodies(bodies, queueIDs, fetch, expired, waited)
 
 	claim := ParseConciergeClaim(bodies)
+	if !claim.Observed {
+		t.Logf("self-report: NOT OBSERVED after polling %d queue id(s) within %s — the reconciliation abstains and the created row remains the sole evidence", before, budget)
+	}
 	for i, txt := range claim.Texts {
 		t.Logf("self-report reply[%d]: %s", i, truncate(strings.Join(strings.Fields(txt), " "), a2aTurnLogCap))
 	}
