@@ -43,7 +43,12 @@ name: E2E Chat
 # failure mode has no mechanism.
 #
 # What this costs / what it changes:
-#   - `next build` is added to the job (~1–2 min). Job timeout stays 15m.
+#   - `next build` is added to the job. MEASURED on this runner: 23-27s
+#     across 9 runs; a whole green job is ~2.0 min wall (it was ~2.0 min
+#     on the dev lane, which paid a comparable cold Turbopack compile).
+#     timeout-minutes stays 15 and was NOT raised: the worst case seen
+#     here is a totally broken canvas (every click times out at 30s),
+#     which finished RED in 11.7 min.
 #   - NEXT_PUBLIC_* are INLINED AT BUILD TIME by Next.js, so the build MUST
 #     run AFTER the platform port and admin token are chosen. The build step
 #     asserts the inline actually happened — a bundle built with the wrong
