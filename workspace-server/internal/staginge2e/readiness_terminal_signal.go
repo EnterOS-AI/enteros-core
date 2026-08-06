@@ -416,10 +416,19 @@ func (w *ReadinessWatch) Observe(now time.Time, o Obs) WaitStep {
 			// A DIFFERENT terminal status restarts the settle: the subject is
 			// still moving, so the control plane has not settled on a verdict.
 			if w.terminalStatus != o.Status {
+				// A NEW terminal run starts: reset EVERYTHING that describes a
+				// run, together, in one place. Review 20602 found the reason
+				// fields surviving across runs because they were only ever
+				// overwritten on a non-empty Detail — so a second run reporting
+				// no reason inherited the first run's, and the report paired run
+				// 2's timestamp with run 1's reason. Resetting the whole group
+				// on the same condition is what makes that unrepresentable
+				// rather than merely currently-correct.
 				w.terminalStatus = o.Status
 				w.terminalSince = now
+				w.terminalDetail = ""
+				w.lastTerminalDetail = ""
 			}
-			// Keep the most informative reason we have ever seen for it.
 			if strings.TrimSpace(o.Detail) != "" {
 				w.terminalDetail = o.Detail
 			}

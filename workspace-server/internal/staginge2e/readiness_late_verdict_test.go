@@ -260,3 +260,112 @@ func TestReadinessWatch_LateVerdictTimestampsTheRunItIsReporting(t *testing.T) {
 		t.Fatalf("the trace must record both terminal runs: %s", w.Trace())
 	}
 }
+
+// ── The lastTerminal* trio must describe ONE run, field by field ────────────
+//
+// Review 20602. The previous collapse pinned lastTerminalRunAt but left the
+// other two members of the group underdetermined, so the SAME class of bug this
+// file has now been bitten by twice survived in two more places:
+//
+//   - lastTerminalStatus was written on every terminal observation, so freezing
+//     it at the first run was invisible to every existing test — they all flap
+//     between `failed` and `failed`, where first and current are equal.
+//   - lastTerminalDetail was only overwritten on a NON-EMPTY Detail, so a second
+//     run that reports no reason inherits the first run's, and the report pairs
+//     run 2's timestamp with run 1's reason.
+//
+// Both need a flap, and `failed` has zero outbound transitions across all of
+// retention, so neither is reachable on today's fleet. They are fixed anyway:
+// the whole thesis of this file is that a message must not contradict the data
+// printed beside it, and "unreachable today" is exactly the reasoning that would
+// have left the late-verdict blocker unfixed.
+
+// A second terminal run that reports NO reason must not inherit the first run's.
+func TestReadinessWatch_ASecondTerminalRunDoesNotInheritTheFirstRunsReason(t *testing.T) {
+	seq := []statusAt{
+		{at: 0, status: "provisioning"},
+		{at: 60 * time.Second, status: "failed", detail: "REASON-A-from-the-first-run"},
+		{at: 120 * time.Second, status: "provisioning"},
+		{at: 300 * time.Second, status: "failed"}, // second run, no reason reported
+		{at: 400 * time.Second, status: "awaiting_agent"},
+	}
+	w := NewConciergeOnlineWatch(conciergeBudget, TerminalSettleDefault)
+	got, _ := runWatchWait(w, seq, conciergePoll)
+
+	if got.ok {
+		t.Fatalf("wedged in awaiting_agent must fail")
+	}
+	if strings.Contains(got.message, "REASON-A-from-the-first-run") {
+		t.Fatalf("the report pairs the SECOND run's timestamp with the FIRST run's reason — a sentence "+
+			"contradicted by the run it claims to describe.\nGot: %s", got.message)
+	}
+	// It must still timestamp the run it names.
+	if !strings.Contains(got.message, "at t+5m0s") {
+		t.Fatalf("the report must timestamp the most recent terminal run (t+5m0s).\nGot: %s", got.message)
+	}
+}
+
+// M16: freezing lastTerminalStatus at the first run. Invisible while every flap
+// in the suite goes failed -> failed; caught by flapping between two DIFFERENT
+// terminal statuses.
+func TestReadinessWatch_ReportsTheMostRecentTerminalStatusNotTheFirst(t *testing.T) {
+	seq := []statusAt{
+		{at: 0, status: "provisioning"},
+		{at: 60 * time.Second, status: "failed", detail: "first run was a failure"},
+		{at: 120 * time.Second, status: "provisioning"},
+		{at: 300 * time.Second, status: "removed", detail: "second run was a removal"},
+		{at: 400 * time.Second, status: "awaiting_agent"},
+	}
+	w := NewConciergeOnlineWatch(conciergeBudget, TerminalSettleDefault)
+	got, _ := runWatchWait(w, seq, conciergePoll)
+
+	if got.ok {
+		t.Fatalf("wedged in awaiting_agent must fail")
+	}
+	if !strings.Contains(got.message, `terminal status="removed"`) {
+		t.Fatalf("the report must name the MOST RECENT terminal status (removed at t+5m0s), not the first one "+
+			"ever seen.\nGot: %s", got.message)
+	}
+	if strings.Contains(got.message, `terminal status="failed"`) {
+		t.Fatalf("the report names the FIRST terminal status while timestamping the second run.\nGot: %s", got.message)
+	}
+	if !strings.Contains(got.message, "second run was a removal") {
+		t.Fatalf("the report must quote the most recent run's reason.\nGot: %s", got.message)
+	}
+}
+
+// Within ONE terminal run, the LATEST reason wins. The control plane can refine
+// last_sample_error while the status stays put — a generic message replaced by
+// the specific root cause — and the report should carry the better one. Together
+// with the cross-run reset above, this is what makes lastTerminalDetail fully
+// determined rather than merely currently-correct.
+//
+// The sequence is revised BEFORE the settle completes on purpose. An earlier
+// draft let the settle expire first, which renders terminalDetail instead of
+// lastTerminalDetail — so it tested the wrong field, the mutation survived, and
+// the test still passed. Exercising the branch you mean to pin is part of the
+// assertion.
+func TestReadinessWatch_WithinOneTerminalRunTheLatestReasonWins(t *testing.T) {
+	seq := []statusAt{
+		{at: 0, status: "provisioning"},
+		{at: 60 * time.Second, status: "failed", detail: "EARLY-generic-heartbeat-denied"},
+		{at: 100 * time.Second, status: "failed", detail: "LATE-specific-root-cause"},
+		{at: 150 * time.Second, status: "awaiting_agent"}, // revised before the settle, then wedges
+	}
+	w := NewConciergeOnlineWatch(conciergeBudget, TerminalSettleDefault)
+	got, _ := runWatchWait(w, seq, conciergePoll)
+
+	if got.ok {
+		t.Fatalf("wedged in awaiting_agent must fail")
+	}
+	if !strings.Contains(got.message, "REVISED") {
+		t.Fatalf("this sequence must reach the revised-verdict arm (the one that reads lastTerminalDetail); "+
+			"if it does not, the test is pinning the wrong field.\nGot: %s", got.message)
+	}
+	if !strings.Contains(got.message, "LATE-specific-root-cause") {
+		t.Fatalf("the report must carry the LATEST reason the control plane gave for this run.\nGot: %s", got.message)
+	}
+	if strings.Contains(got.message, "EARLY-generic-heartbeat-denied") {
+		t.Fatalf("the report carries a superseded reason.\nGot: %s", got.message)
+	}
+}
