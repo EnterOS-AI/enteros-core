@@ -35,15 +35,22 @@ name: E2E Chat
 # compilation. Observed 2 failures in 4 runs on core#5079
 # (623210 ✗, 623299 ✓, 623425 ✗, 622625 ✓).
 #
-# `next build` emits immutable, content-hashed CSS files that are plain
-# `<link rel="stylesheet">` elements in the INITIAL document (verified:
-# /?m=chat references all four built CSS files, and the one carrying
-# `.react-flow__background{…pointer-events:none…}` is among them). There is
-# no on-demand chunk compilation and no HMR chunk delivery to lose, so the
-# failure mode has no mechanism.
+# `next build` emits immutable, content-hashed CSS files that are NAMED by
+# the initial document — this one as `<link rel="preload" as="style">` plus
+# an RSC-payload stylesheet entry React inserts at hydration. (Checked
+# against a real build: the only plain `<link rel="stylesheet">` tags in the
+# initial HTML are the two LAYOUT sheets.) There is no on-demand chunk
+# compilation left, which removes the COMPILATION mechanism behind the flake.
+#
+# It does NOT remove every mechanism, and this file will not pretend
+# otherwise. A stylesheet request that is merely SLOW makes React suspend the
+# subtree (`pointer-events: none`, no unstyled window); a request that FAILS
+# makes React render anyway, reproducing the same unstyled window. Measured
+# over this lane’s own runs: ~1 occurrence in 29 production-build runs
+# against 3 in 30 dev runs. Substantially more reliable, not immune.
 #
 # What this costs / what it changes:
-#   - `next build` is added to the job. MEASURED on this runner: 23-27s
+#   - `next build` is added to the job. MEASURED on this runner: 23-29s
 #     across 9 runs; a whole green job is ~2.0 min wall (it was ~2.0 min
 #     on the dev lane, which paid a comparable cold Turbopack compile).
 #     timeout-minutes stays 15 and was NOT raised: the worst case seen
@@ -370,6 +377,22 @@ jobs:
           # --- Prove the build is the build we asked for -------------------
           # A wrong-but-bootable bundle is the failure mode a production
           # build introduces, so assert the inlining instead of trusting it.
+          #
+          # Each assertion first proves its own INPUT is non-empty. `set -u`
+          # only catches an UNSET variable; an EMPTY one sails straight
+          # through and turns `grep -qF "$X"` into a match-everything no-op
+          # that reports success. A guard that passes on empty input is
+          # exactly the vacuous-pass class this lane exists to keep out of
+          # the tree, so it must not live in the lane’s own guards. Both
+          # cases have an empty-input proof recorded on the PR.
+          if [ -z "${PLATFORM_PORT:-}" ]; then
+            echo "::error::PLATFORM_PORT is empty — 'Pick platform port' did not run, and the inlining check below would collapse to a search for the bare '127.0.0.1:' prefix. Refusing to assert vacuously."
+            exit 1
+          fi
+          if [ -z "${NEXT_PUBLIC_ADMIN_TOKEN:-}" ]; then
+            echo "::error::NEXT_PUBLIC_ADMIN_TOKEN is empty — 'Set deterministic admin token' did not run, and grepping for the empty string matches EVERY file, so the check below would pass having asserted nothing."
+            exit 1
+          fi
           if ! grep -rqF "127.0.0.1:${PLATFORM_PORT}" .next/static/chunks; then
             echo "::error::NEXT_PUBLIC_PLATFORM_URL (127.0.0.1:${PLATFORM_PORT}) was not inlined into the client bundle — the canvas would call the wrong platform. Check step ordering: the build must run after 'Pick platform port'."
             exit 1
@@ -403,6 +426,7 @@ jobs:
       - name: Start canvas (production server, background)
         working-directory: canvas
         run: |
+          set -euo pipefail
           # Single node process (not an `npx` wrapper), so the pid we record
           # is the pid the cleanup step actually kills.
           #
@@ -444,18 +468,38 @@ jobs:
             exit 1
           fi
 
-          # End-to-end proof that the React Flow stylesheet is REACHABLE from
-          # the served app, not merely present on disk: the served document
-          # must link it, and fetching it must 200. This is precisely the
-          # condition whose absence produced the flake this lane was
-          # converted to eliminate.
+          # --- React Flow stylesheet: NAMED by the document, and SERVED ----
+          #
+          # Read this as exactly what it checks, no more. Next does NOT emit
+          # this file as a plain `<link rel="stylesheet">` in the initial
+          # HTML — it emits `<link rel="preload" as="style">` plus an
+          # RSC-payload entry that React turns into a stylesheet during
+          # hydration. (The only plain stylesheet links in the initial
+          # document are the two LAYOUT sheets.) So these assertions prove
+          # AVAILABILITY: the document names the exact hashed asset, the
+          # server serves it, and it carries the rule. They do NOT prove the
+          # rule ends up APPLIED in the browser — a sheet that is named,
+          # fetched, and then never applied still passes here. What catches
+          # that is the suite itself, which cannot click the canvas when the
+          # rule is not in effect.
+          #
+          # Non-empty first: grepping for the empty string matches every
+          # file, so an empty RF_CSS_PATH would make the document check a
+          # no-op that reports success.
+          if [ -z "${RF_CSS_PATH:-}" ]; then
+            echo "::error::RF_CSS_PATH is empty — the build step did not export it. The document check below would search for the empty string, which matches every file. Refusing to assert vacuously."
+            exit 1
+          fi
           set +e
           curl -s -o /tmp/canvas-doc.html -w '%{http_code}' "http://localhost:${CANVAS_PORT}/?m=chat" > /tmp/canvas-doc.code
           curl -s -o /tmp/canvas-rf.css -w '%{http_code}' "http://localhost:${CANVAS_PORT}${RF_CSS_PATH}" > /tmp/canvas-rf.code
           set -e
           RF_CODE=$(cat /tmp/canvas-rf.code 2>/dev/null || echo "000")
-          if ! grep -qF "$(basename "${RF_CSS_PATH}")" /tmp/canvas-doc.html; then
-            echo "::error::The served /?m=chat document does not reference ${RF_CSS_PATH} — React Flow would render unstyled and swallow every canvas click."
+          # Anchor on the full href, not the bare basename: that pins the
+          # match to the real preload link rather than any incidental
+          # occurrence of the hash.
+          if ! grep -qF 'href="'"${RF_CSS_PATH}"'"' /tmp/canvas-doc.html; then
+            echo "::error::The served /?m=chat document does not name ${RF_CSS_PATH} — the page would never fetch the React Flow stylesheet and the canvas background would swallow every click."
             exit 1
           fi
           if [ "$RF_CODE" != "200" ]; then
@@ -466,7 +510,7 @@ jobs:
             echo "::error::${RF_CSS_PATH} served but does not contain the .react-flow__background rule."
             exit 1
           fi
-          echo "React Flow stylesheet linked from the document and served OK (${RF_CSS_PATH})"
+          echo "React Flow stylesheet named by the document and served OK (${RF_CSS_PATH})"
 
       - name: Run Playwright E2E tests
         working-directory: canvas
