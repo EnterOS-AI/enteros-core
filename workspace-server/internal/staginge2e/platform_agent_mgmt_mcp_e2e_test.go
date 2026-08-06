@@ -206,8 +206,7 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 	// ends the wait — after, and only after, it has outlived the control plane's
 	// own self-heal window, so a concierge the CP is still remediating is never
 	// called dead early.
-	watch := NewConciergeOnlineWatch(conciergeOnlineBudget,
-		ResolveTerminalSettle(os.Getenv(TerminalSettleEnv)))
+	watch := DeployConciergeOnlineWatch()
 	var probe MgmtMCPProbe
 	probe.ExpectedRuntime = expectedRuntime
 	probe.RequiredTool = requiredTool

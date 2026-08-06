@@ -393,7 +393,14 @@ func TestReadinessWatch_RefusesAConfigurationThatCouldNeverFail(t *testing.T) {
 // The shipped watches must actually be sound — the guard above is worthless if
 // the real configurations trip it.
 func TestReadinessWatch_ShippedConfigurationsAreSound(t *testing.T) {
+	// The EXACT configurations the deploy gate constructs — budgets and
+	// env-resolved settle included — not look-alikes built from test literals.
+	// If these were only reachable under the staging_e2e tag this proof could
+	// not see them, and a shipped watch that can never fail would go unnoticed.
 	for _, w := range []*ReadinessWatch{
+		DeployConciergeOnlineWatch(),
+		DeployOrgInstanceRunningWatch("e2e-mcp-x"),
+		DeployWorkspaceOnlineRoutableWatch("initial boot", 15*time.Minute),
 		NewConciergeOnlineWatch(conciergeBudget, TerminalSettleDefault),
 		NewWorkspaceOnlineRoutableWatch("initial boot", conciergeBudget, TerminalSettleDefault),
 		NewOrgInstanceRunningWatch("e2e-mcp-x", 7*time.Minute, TerminalSettleDefault),

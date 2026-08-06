@@ -302,8 +302,7 @@ func waitForWorkspaceStatus(t *testing.T, host, token, orgID, wsID, want string,
 // observation ends the wait and the row's own last_sample_error is quoted.
 func waitForWorkspaceOnlineRoutable(t *testing.T, host, token, orgID, wsID string, timeout time.Duration, why string) {
 	t.Helper()
-	watch := NewWorkspaceOnlineRoutableWatch(why, timeout,
-		ResolveTerminalSettle(os.Getenv(TerminalSettleEnv)))
+	watch := DeployWorkspaceOnlineRoutableWatch(why, timeout)
 	for {
 		hs, body := doTenantJSON(t, "GET", "https://"+host+"/workspaces/"+wsID, token, orgID, "")
 		st := topLevelString(body, "status")
@@ -575,8 +574,7 @@ func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string) (orgID string) {
 	// seconds with ITS reason instead of 7 minutes of polling and a stopwatch.
 	// A terminal status must persist past the CP's own self-heal window before
 	// it is believed, so this can never out-run a retry the CP is running.
-	watch := NewOrgInstanceRunningWatch(slug, orgProvisionBudget,
-		ResolveTerminalSettle(os.Getenv(TerminalSettleEnv)))
+	watch := DeployOrgInstanceRunningWatch(slug)
 	var lastListStatus int
 	lastInstance := "<never observed>"
 	for {

@@ -105,6 +105,7 @@ package staginge2e
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -483,4 +484,36 @@ func NewOrgInstanceRunningWatch(slug string, budget, settle time.Duration) *Read
 		Settle:   settle,
 		Budget:   budget,
 	}
+}
+
+// ── The SHIPPED watches (what the live, staging_e2e-tagged waits construct) ──
+//
+// The constructors above take their budget and settle explicitly so a unit test
+// can drive them on a fake clock. These three bake the values the deploy gate
+// actually runs with, in ONE untagged place, so:
+//
+//   - no wall-clock number appears at a live call site (a budget can never drift
+//     between the two tests that wait on the same thing);
+//   - the env resolution happens once, through the fail-safe resolver, instead
+//     of being re-typed at each site where a typo would silently disable it;
+//   - and the exact configurations the deploy gate uses are reachable from the
+//     untagged unit gate, which asserts they are sound (a watch that could never
+//     fail is refused). Under a build tag they would be invisible to that proof.
+
+// DeployConciergeOnlineWatch is the Guard B concierge wait as shipped.
+func DeployConciergeOnlineWatch() *ReadinessWatch {
+	return NewConciergeOnlineWatch(conciergeOnlineBudget, ResolveTerminalSettle(os.Getenv(TerminalSettleEnv)))
+}
+
+// DeployOrgInstanceRunningWatch is the adminCreateOrg org-provision wait as shipped.
+func DeployOrgInstanceRunningWatch(slug string) *ReadinessWatch {
+	return NewOrgInstanceRunningWatch(slug, orgProvisionBudget, ResolveTerminalSettle(os.Getenv(TerminalSettleEnv)))
+}
+
+// DeployWorkspaceOnlineRoutableWatch is the workspace boot/restart wait as
+// shipped. Its budget stays a caller argument because the lifecycle test passes
+// the same value at several distinct phases and the argument is what keeps them
+// in step.
+func DeployWorkspaceOnlineRoutableWatch(subject string, budget time.Duration) *ReadinessWatch {
+	return NewWorkspaceOnlineRoutableWatch(subject, budget, ResolveTerminalSettle(os.Getenv(TerminalSettleEnv)))
 }
