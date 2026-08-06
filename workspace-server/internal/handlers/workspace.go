@@ -747,6 +747,28 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// workspace when the org has no platform-agent — so tenants provisioned
 	// without a concierge (e.g. JRS's lone SEO Agent) nest new workspaces under
 	// that root instead of scattering them as bare-root siblings.
+	// Validate a CALLER-SUPPLIED parent_id before it reaches the INSERT. Only
+	// the explicit value is checked — the defaulted one below is server-derived
+	// from this same table. See validateCreateParentID for why creating under
+	// an arbitrary parent is a privilege grant (team:<parent> read+write,
+	// retroactively) and for the scope note on org-scoping.
+	if payload.ParentID != nil {
+		if err := validateCreateParentID(ctx, db.DB, c, *payload.ParentID); err != nil {
+			var rej *reparentError
+			if errors.As(err, &rej) {
+				resp := gin.H{"error": rej.Message, "code": rej.Code}
+				for k, v := range rej.Details {
+					resp[k] = v
+				}
+				c.JSON(rej.Status, resp)
+				return
+			}
+			log.Printf("Create workspace: parent_id validation error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate parent workspace"})
+			return
+		}
+	}
+
 	if payload.ParentID == nil {
 		if rootID := defaultCreateParentID(ctx); rootID != "" {
 			payload.ParentID = &rootID

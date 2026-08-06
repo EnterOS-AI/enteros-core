@@ -228,6 +228,54 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		return
 	}
 
+	// parent_id is applied FIRST and as a guarded, single-transaction
+	// operation (workspace_reparent.go). See that file's header for the
+	// privilege analysis; the short version is that `workspaces` has no
+	// org_id column, so parent_id IS the org boundary that memory ACLs,
+	// sameOrg() delegation routing, peer discovery and org-token auth all
+	// derive from. It ran here for years as an unvalidated
+	// `UPDATE workspaces SET parent_id = $2` whose error was swallowed by a
+	// log.Printf, so a rejected write still answered 200 "updated".
+	//
+	// Applied BEFORE the name/role/tier writes below so a rejected move
+	// leaves NOTHING written — those are independent non-transactional
+	// statements, and returning after them would half-apply the request.
+	rawParent, patchingParent := body["parent_id"]
+	var reparent *reparentOutcome
+	if patchingParent {
+		// A combined rename+move is ambiguous against
+		// workspaces_parent_name_uniq — the collision check would run
+		// against the OLD name while the caller expects the new one — and
+		// cannot be made atomic with the untransacted name write below.
+		// Reject rather than pick an order and be silently wrong.
+		if _, alsoRenaming := body["name"]; alsoRenaming {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "parent_id and name cannot be changed in the same request; issue them as two PATCHes",
+				"code":  reparentCodeAmbiguous,
+			})
+			return
+		}
+		out, err := applyReparent(ctx, db.DB, id, rawParent)
+		if err != nil {
+			var rej *reparentError
+			if errors.As(err, &rej) {
+				resp := gin.H{"error": rej.Message, "code": rej.Code}
+				for k, v := range rej.Details {
+					resp[k] = v
+				}
+				log.Printf("Update: PATCH parent_id on %s REJECTED (%s): %s", id, rej.Code, rej.Message)
+				c.JSON(rej.Status, resp)
+				return
+			}
+			// A real DB failure. Must NOT fall through to 200 the way the
+			// pre-fix log.Printf did.
+			log.Printf("Update parent_id error for %s: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to re-parent workspace"})
+			return
+		}
+		reparent = out
+	}
+
 	if name, ok := body["name"]; ok {
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET name = $2, updated_at = now() WHERE id = $1`, id, name); err != nil {
 			log.Printf("Update name error for %s: %v", id, err)
@@ -241,11 +289,6 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	if tier, ok := body["tier"]; ok {
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET tier = $2, updated_at = now() WHERE id = $1`, id, tier); err != nil {
 			log.Printf("Update tier error for %s: %v", id, err)
-		}
-	}
-	if parentID, ok := body["parent_id"]; ok {
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET parent_id = $2, updated_at = now() WHERE id = $1`, id, parentID); err != nil {
-			log.Printf("Update parent_id error for %s: %v", id, err)
 		}
 	}
 	if collapsed, ok := body["collapsed"]; ok {
@@ -501,6 +544,54 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	}
 
 	resp := gin.H{"status": "updated"}
+	if reparent != nil && reparent.Changed {
+		// The move is a PRIVILEGE change, not a cosmetic one: the workspace
+		// drops read+write on the old team namespace and gains read+write on
+		// the new one — including RETROACTIVE read of everything the
+		// destination team ever wrote, because memory_records.namespace is a
+		// string frozen at write time in a datastore this process reaches
+		// only over HTTP (see workspace_reparent.go). Nothing can migrate
+		// those rows without dragging the OLD siblings' shared memories along
+		// with them, so the honest handling is to state the delta at the call
+		// site rather than let it be discovered later.
+		//
+		// For an ordinary move org:<root> is absent from both lists because
+		// the same-org invariant means it cannot change. An ADOPTION is the
+		// one exception and DOES list it — the workspace trades a writable
+		// org:<self> for a read-only org:<newRoot> — which is why the lists
+		// are built in applyReparent rather than assumed here.
+		resp["reparented"] = gin.H{
+			"old_parent_id":     reparent.OldParent,
+			"new_parent_id":     reparent.NewParent,
+			"org_root_id":       reparent.OrgRoot,
+			"adopted_into_org":  reparent.Adopted,
+			"namespaces_lost":   reparent.Lost,
+			"namespaces_gained": reparent.Gained,
+			"memories_migrated": false,
+			"memories_migrated_note": "memories written under the old team namespace stay there and remain " +
+				"readable by the former siblings; they are NOT moved",
+		}
+		// The container was provisioned with a PARENT_ID env var
+		// (workspace_provision_shared.go) that is now stale and is only
+		// rebuilt on the next provision/restart. No in-repo runtime reads it,
+		// but a restart is the only thing that refreshes it, so say so rather
+		// than leave the drift unreported.
+		needsRestart = true
+
+		// adopted_into_org is carried here as well as in the response: an
+		// adoption is the only case where a workspace CHANGES ORG, so it is
+		// the single most security-relevant bit of the event. An auditor
+		// reading the ledger must not have to infer it by comparing
+		// old_parent_id against org_root_id.
+		RecordAuditEvent(ctx, db.DB, auditEntryFromGin(c, id, "workspace.reparent", true, map[string]any{
+			"old_parent_id":     reparent.OldParent,
+			"new_parent_id":     reparent.NewParent,
+			"org_root_id":       reparent.OrgRoot,
+			"adopted_into_org":  reparent.Adopted,
+			"namespaces_lost":   reparent.Lost,
+			"namespaces_gained": reparent.Gained,
+		}))
+	}
 	if needsRestart {
 		resp["needs_restart"] = true
 	}
