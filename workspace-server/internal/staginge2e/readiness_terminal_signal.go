@@ -310,10 +310,18 @@ type ReadinessWatch struct {
 	// verdict" about a subject whose published verdict is printed two lines up
 	// in the same message (review 20596, blocker 2). A report that contradicts
 	// its own data is worse than the stopwatch this file replaced.
+	//
+	// The lastTerminal* trio describe ONE run — the most recent — and are the
+	// SINGLE source for every timestamp, status and reason a message quotes
+	// about a terminal verdict. They used to be a mix (first sighting's
+	// timestamp beside the latest run's status and reason), which on a
+	// flapping subject printed a timestamp its own trace contradicted
+	// (review 20599). Keeping them as one group is what makes that
+	// unrepresentable rather than merely currently-correct.
 	everTerminal       bool
-	everTerminalStatus string
-	everTerminalDetail string
-	everTerminalAt     time.Duration
+	lastTerminalStatus string
+	lastTerminalDetail string
+	lastTerminalRunAt  time.Duration
 }
 
 // validate refuses a watch whose terminal arm could never fire. Returns "" when
@@ -421,10 +429,10 @@ func (w *ReadinessWatch) Observe(now time.Time, o Obs) WaitStep {
 			// current run's reason produced a sentence contradicted by the trace
 			// printed next to it, on any subject that flapped.
 			w.everTerminal = true
-			w.everTerminalAt = w.terminalSince.Sub(w.start)
-			w.everTerminalStatus = o.Status
+			w.lastTerminalRunAt = w.terminalSince.Sub(w.start)
+			w.lastTerminalStatus = o.Status
 			if strings.TrimSpace(o.Detail) != "" {
-				w.everTerminalDetail = o.Detail
+				w.lastTerminalDetail = o.Detail
 			}
 			if held := now.Sub(w.terminalSince); held >= w.Settle {
 				step.Decision = WaitFailTerminal
@@ -498,7 +506,7 @@ func (w *ReadinessWatch) terminalMessage(status string, held, elapsed time.Durat
 				"complete. This is a PUBLISHED FAILURE VERDICT — the control plane said this boot had failed and had not "+
 				"revised it by the time we stopped looking. It is NOT a 'nothing was published' timeout: the verdict and "+
 				"its reason are below.",
-			w.terminalSince.Sub(w.start).Truncate(time.Second), held.Truncate(time.Second), w.Budget, w.Settle)
+			w.lastTerminalRunAt.Truncate(time.Second), held.Truncate(time.Second), w.Budget, w.Settle)
 	}
 	return fmt.Sprintf(
 		"%s reached TERMINAL status=%q %s "+
@@ -528,8 +536,8 @@ func (w *ReadinessWatch) budgetMessage(elapsed time.Duration) string {
 			"The control plane DID publish terminal status=%q at t+%s and then REVISED it (its self-heal path worked), "+
 				"after which the subject wedged in the non-terminal state above and stayed there. So this is not a clean "+
 				"STUCK: something failed, recovered, and then stalled. Reason recorded at the time: %s. ",
-			w.everTerminalStatus, w.everTerminalAt.Truncate(time.Second),
-			nonEmpty(strings.TrimSpace(w.everTerminalDetail), "<the control plane surfaced no reason field>"))
+			w.lastTerminalStatus, w.lastTerminalRunAt.Truncate(time.Second),
+			nonEmpty(strings.TrimSpace(w.lastTerminalDetail), "<the control plane surfaced no reason field>"))
 	} else {
 		body = "The control plane never published a terminal verdict about it either. " +
 			"This is STUCK, not FAILED — the subject is wedged in a non-terminal state with nothing said about it, " +
