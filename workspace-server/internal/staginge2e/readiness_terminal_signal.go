@@ -49,15 +49,24 @@ package staginge2e
 //     p99 136s / MAX 137s against a 900s budget (6.6x the worst success; not one
 //     green ever exceeded 300s), and the org reached running in p50 31s / p99
 //     92s / max 249s against a 420s budget.
-//   - Across 2538 logged status observations — counting exactly the polled
-//     `[why] status="X" routable=Y` lines this wait emits, and NOT the 512
-//     `status → "X"` lines from the pause/hibernate helper nor the 41 verdict
-//     summaries — yielding 999 transitions,
+//   - Across ~2500 logged status observations yielding 999 transitions,
 //     provisioning→online occurred 969 times (median 10s, max 112s) and
 //     provisioning→failed 9 times (median 92s, max 126s).
 //     `failed` has ZERO OUTBOUND TRANSITIONS OF ANY KIND — not just none to
 //     online: in each of the 9 cases the row was then observed continuously for
 //     the remaining ~13.5 minutes of the budget and never moved anywhere.
+//
+//     CORPUS, because the count moves with it: 469 job logs from the two
+//     `e2e-smoke` workflows (staging-tenant-cd.yml + local-cp-deploy-pipeline
+//     .yml), measured 2026-08-06, counting exactly the polled
+//     `[why] status="X" routable=Y` lines this wait emits — not the
+//     `status → "X"` lines from the pause/hibernate helper and not the
+//     `last status=` / `last instance_status=` verdict summaries, neither of
+//     which is an observation. A WIDER corpus (more workflows also drive
+//     adminCreateOrg and the concierge waits) yields more: an independent sweep
+//     counted 2558. The transition counts and the zero-outbound-transitions
+//     result are invariant across both, and adding observations can only add
+//     transitions — which is the only thing here the argument rests on.
 //
 // So nothing here is SLOW; things are DEAD, and the gate refuses to look at the
 // death certificate. That is why the cluster was mis-triaged as a timing
