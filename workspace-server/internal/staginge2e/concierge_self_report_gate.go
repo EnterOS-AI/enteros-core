@@ -90,10 +90,13 @@ type ConciergeClaim struct {
 //     {"queue_id":...,"status":"completed","response_body":<shape 1>}
 //  3. the transport ack, which carries NO reply
 //     {"queued":true,"queue_id":...} / {"status":"queued"} / {"delivery_mode":...}
+//
+// Only the two fields that can CARRY an utterance are decoded. Shape 3 is
+// recognised by the absence of both, which is deliberately the default: a body
+// we do not understand is "no reply observed", never "the agent said nothing
+// wrong".
 type a2aReplyEnvelope struct {
 	Result       *a2aMessageResult `json:"result"`
-	Status       string            `json:"status"`
-	Queued       *bool             `json:"queued"`
 	ResponseBody json.RawMessage   `json:"response_body"`
 }
 
@@ -219,19 +222,14 @@ var refusalMarkers = []string{
 // an intention is not a claim of completion.
 var creationVerbs = []string{"created", "provisioned"}
 
-// negationsNearVerb kill a creation verb inside its own clause: "not created",
+// negationRe kills a creation verb inside its own clause: "not created",
 // "could not be provisioned", "failed to be created", "never created",
 // "no workspace was created".
 //
-// Matched as WHOLE WORDS (negationRe), not substrings — "no" must not fire on
-// "new workspace", which is the single most common word in a genuine claim.
-var negationsNearVerb = []string{
-	"no", "not", "never", "cannot", "cant", "unable", "without",
-	"fail", "failed", "fails", "failing",
-}
-
-// negationRe matches any negation token as a whole word, plus the "n't" clitic
-// (which normaliseReply leaves attached: "wasn't", "couldn't").
+// Matched as WHOLE WORDS, not substrings — "no" must not fire on "new
+// workspace", which is the single most common word in a genuine claim. The
+// leading alternative catches the "n't" clitic, which normaliseReply leaves
+// attached ("wasn't", "couldn't").
 var negationRe = regexp.MustCompile(`(?:n't|\b(?:no|not|never|cannot|cant|unable|without|fail|failed|fails|failing)\b)`)
 
 // claimWindowBefore/After bound the clause examined around a creation verb.
