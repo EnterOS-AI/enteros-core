@@ -18,25 +18,33 @@ package staginge2e
 //	waitForWorkspaceOnlineRoutable     polled status=="online"           for 15m
 //	                                   likewise.
 //
-// Consequence, measured over the 278 e2e-smoke verdicts in Gitea retention
-// (2026-07-06 → 08-06, staging-tenant-cd.yml):
+// Consequence, measured over the e2e-smoke verdicts in Gitea retention
+// (staging-tenant-cd.yml).
 //
-//   - 35 of the 58 genuine Guard B reds (60%) were filed as "boot/provision
+// QUOTE THESE WITH A DATE: the window ROLLS. The same query returned 278
+// verdicts (209 green / 69 red) on 2026-08-06 and 268 (201 / 67) a few hours
+// later; the difference is exactly the 10 OLDEST rows (8 green + 2 red,
+// 2026-07-06 10:06 → 07-07 10:44) aged out by Gitea's log pruning. Two
+// snapshots of one rolling window, not two measurements.
+//
+//   - 35 of the genuine Guard B reds (60%) were filed as "boot/provision
 //     timeouts". They are NOT timeouts. In 24 of the 26 "concierge never online"
-//     reds the LAST OBSERVED STATUS WAS "failed" — a verdict the control plane
-//     had already published, with a reason, minutes earlier. The gate sat on it
-//     for the rest of the 15 minutes and then reported a timeout.
+//     reds the LAST OBSERVED STATUS WAS "failed" — 92.3%, and 39 of 41 (95.1%)
+//     once the sibling workspace-boot wait's identical failure is counted too.
+//     That is a verdict the control plane had already published, with a reason,
+//     minutes earlier. The gate sat on it for the rest of the 15 minutes and
+//     then reported a timeout.
 //   - The budgets are not marginal, so raising or lowering them is irrelevant:
 //     on the 209 GREEN runs the concierge reached online in min 31s / p50 47s /
 //     p99 136s / MAX 137s against a 900s budget (6.6x the worst success; not one
 //     green ever exceeded 300s), and the org reached running in p50 31s / p99
 //     92s / max 249s against a 420s budget.
-//   - Across 999 workspace status transitions logged by the lifecycle test,
+//   - Across 2538 logged status observations yielding 999 transitions,
 //     provisioning→online occurred 969 times (median 10s, max 112s) and
 //     provisioning→failed 9 times (median 92s, max 126s).
-//     failed→online occurred ZERO times — in each of the 9 cases the row was
-//     then observed continuously for the remaining ~13.5 minutes of the budget
-//     and never moved.
+//     `failed` has ZERO OUTBOUND TRANSITIONS OF ANY KIND — not just none to
+//     online: in each of the 9 cases the row was then observed continuously for
+//     the remaining ~13.5 minutes of the budget and never moved anywhere.
 //
 // So nothing here is SLOW; things are DEAD, and the gate refuses to look at the
 // death certificate. That is why the cluster was mis-triaged as a timing
