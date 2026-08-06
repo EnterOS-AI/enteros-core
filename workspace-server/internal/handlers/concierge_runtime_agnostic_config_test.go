@@ -193,8 +193,20 @@ func TestApplyConciergeProvisionConfig_ComposesRuntimeNativeConfigForEveryRuntim
 		runtime string
 		model   string // an existing platform-managed model for the runtime
 	}{
+		// hermes is the DEFAULT concierge runtime (defaultConciergeRuntime), so it is
+		// the runtime every freshly created org's platform agent actually boots on.
+		// It was absent from this table for the entire life of the default-flip
+		// (56807a6fc added it to the pure-compose test above but NOT here), which left
+		// the full provision hook — the seam that must deliver prompts/concierge.md
+		// alongside the config that REFERENCES it — unexercised on the one runtime
+		// that ships. A persona-less hermes concierge reached production as a result.
+		{"hermes", "minimax/MiniMax-M2.7"},
 		{"openclaw", "minimax/MiniMax-M2.7"},
-		{"claude-code", "moonshot/kimi-k2.6"},
+		// minimax, not moonshot: the platform-managed concierge model resolves to
+		// the minimax namespace (TestApplyConciergeProvisionConfig_MoleculeModelResolvesMinimaxNotMoonshot
+		// pins that). A moonshot pin here was stale and diverged this table from the
+		// model the claude-code concierge actually gets.
+		{"claude-code", "minimax/MiniMax-M2.7"},
 		{"codex", "minimax/MiniMax-M2.7"},
 	}
 
@@ -254,6 +266,75 @@ func TestApplyConciergeProvisionConfig_ComposesRuntimeNativeConfigForEveryRuntim
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Errorf("%q: unmet sqlmock expectations: %v", tc.runtime, err)
+			}
+		})
+	}
+}
+
+// TestApplyConciergeProvisionConfig_NeverDeclaresAnUndeliveredPersonaFile is the
+// regression guard for the persona-less concierge that reached production.
+//
+// THE BUG: composeConciergeRuntimeConfig ALWAYS grafts
+// `prompt_files: [prompts/concierge.md]` for a non-claude-code runtime, but the
+// persona FILE was delivered only `if len(persona) > 0`. The two were never
+// coupled, so when no persona could be resolved the concierge received a
+// config.yaml pointing at a file that was not in /configs. The runtime loaded
+// NOTHING for its role and booted with its BASE RUNTIME identity — observed live
+// on a hermes concierge (`/configs/prompts/` did not exist while config.yaml
+// line 391 declared `prompts/concierge.md`): it introduced itself as the base
+// template's "self-improving AI agent", had no Org Concierge role, and told the
+// user it had no management MCP even though all 54 verbs were registered. The
+// old code ALSO logged the "persona grafted per convention" success line on that
+// branch, so the only operator signal reported green on the exact failure.
+//
+// THE INVARIANT (runtime-agnostic, holds for every runtime): the delivered
+// config must NEVER declare a prompt file that is absent from the delivered
+// configFiles. Either the persona is delivered AND declared, or neither.
+func TestApplyConciergeProvisionConfig_NeverDeclaresAnUndeliveredPersonaFile(t *testing.T) {
+	for _, runtime := range []string{"hermes", "openclaw", "codex", "claude-code"} {
+		t.Run(runtime, func(t *testing.T) {
+			// Fixtures WITHOUT platform-agent/prompts/concierge.md — the live
+			// template-cache-miss shape that produces an unresolvable persona.
+			dir := t.TempDir()
+			writeConciergeBaseFixtures(t, dir)
+			if err := os.RemoveAll(filepath.Join(dir, "platform-agent")); err != nil {
+				t.Fatal(err)
+			}
+			h := &WorkspaceHandler{configsDir: dir}
+
+			composed, err := h.composeConciergeRuntimeConfig(runtime)
+			if err != nil {
+				t.Fatalf("composeConciergeRuntimeConfig(%q): %v", runtime, err)
+			}
+			// Sanity: for a non-claude-code runtime the graft IS present pre-strip,
+			// so this test cannot pass vacuously by never grafting in the first place.
+			if runtime != claudeCodeRuntime {
+				if pf := parseComposedPromptFiles(t, composed); len(pf) != 1 || pf[0] != conciergePersonaPromptPath {
+					t.Fatalf("%q: precondition failed — compose did not graft %q (got %v); this test would be vacuous",
+						runtime, conciergePersonaPromptPath, pf)
+				}
+			}
+
+			// No persona resolvable → the graft must be stripped.
+			stripped, serr := stripConciergePersonaGraft(composed)
+			if serr != nil {
+				t.Fatalf("%q: stripConciergePersonaGraft: %v", runtime, serr)
+			}
+			out := map[string][]byte{"config.yaml": stripped}
+
+			// THE INVARIANT: anything named in prompt_files must be delivered.
+			for _, declared := range parseComposedPromptFiles(t, stripped) {
+				if body, ok := out[declared]; !ok || len(body) == 0 {
+					t.Errorf("%q: config declares prompt_files entry %q but it was NOT delivered — the concierge boots with no persona",
+						runtime, declared)
+				}
+			}
+			// The rest of the runtime-native config must survive the strip.
+			if got := parseTopLevelRuntime(stripped); got != runtime {
+				t.Errorf("%q: strip damaged the config — runtime = %q", runtime, got)
+			}
+			if abort := runtimeSeedMismatchAbort(runtime, "", map[string][]byte{"config.yaml": stripped}); abort != nil {
+				t.Errorf("%q: strip made the config trip the seed-mismatch guard: %s", runtime, abort.Msg)
 			}
 		})
 	}
