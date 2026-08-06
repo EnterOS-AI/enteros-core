@@ -309,6 +309,14 @@ export function MobileChat({
     }
   }, [messages]);
 
+  // Register as a live consumer for as long as this chat is mounted — see
+  // useChatSocket for why the store must not buffer without one.
+  useEffect(() => {
+    const { retainAgentMessages, releaseAgentMessages } = useCanvasStore.getState();
+    retainAgentMessages(agentId);
+    return () => releaseAgentMessages(agentId);
+  }, [agentId]);
+
   // Consume any agent messages that arrived while history was loading.
   const initialConsumeDoneRef = useRef(false);
   useEffect(() => {

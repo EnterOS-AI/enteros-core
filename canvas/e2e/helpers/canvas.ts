@@ -105,10 +105,15 @@ export async function waitForNodeHittable(page: Page, testId: string): Promise<v
         // comparing against the previous frame detects a settled box. With
         // polling:"raf" these are consecutive animation frames — the same
         // definition of "stable" Playwright's own actionability check uses.
-        const store = window as unknown as { __molNodeBox?: string };
+        // Keyed BY testId: two concurrent waits on the same page (e.g. a spec
+        // that settles two nodes) would otherwise overwrite each other's
+        // previous-frame box and each read the other's, so both could report
+        // "settled" on a frame where neither was.
+        const store = window as unknown as { __molNodeBox?: Record<string, string> };
+        if (!store.__molNodeBox) store.__molNodeBox = {};
         const key = [r.x, r.y, r.width, r.height].map((n) => n.toFixed(2)).join(",");
-        const settled = store.__molNodeBox === key;
-        store.__molNodeBox = key;
+        const settled = store.__molNodeBox[id] === key;
+        store.__molNodeBox[id] = key;
         if (!settled) return false;
         const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
         return !!hit && (hit === el || el.contains(hit));
@@ -116,8 +121,31 @@ export async function waitForNodeHittable(page: Page, testId: string): Promise<v
       testId,
       { timeout: 15_000, polling: "raf" },
     );
-  } catch {
-    const diag = await page.evaluate((id: string) => {
+  } catch (waitErr) {
+    // The diagnostic below is best-effort: it runs against a page that has
+    // just failed a wait, so it can itself throw (navigation, closed context).
+    // Never let that swallow the real timeout — that would turn a precise
+    // failure into an unrelated one.
+    let diag: string;
+    try {
+      diag = await collectHittabilityDiagnostic(page, testId);
+    } catch (diagErr) {
+      diag =
+        `(diagnostic unavailable: ${diagErr instanceof Error ? diagErr.message : String(diagErr)})\n  ` +
+        `original wait failure: ${waitErr instanceof Error ? waitErr.message : String(waitErr)}`;
+    }
+    throw new Error(
+      `workspace node "${testId}" never became hittable (box settled across two frames AND ` +
+        `elementFromPoint at its centre resolving to the node) within 15s.\n  ${diag}`,
+    );
+  }
+}
+
+/** Measure WHY a node is not hittable: its box, what is actually at its centre,
+ *  and whether React Flow's stylesheet is in effect. Split out so the caller can
+ *  guard it — see waitForNodeHittable. */
+async function collectHittabilityDiagnostic(page: Page, testId: string): Promise<string> {
+  return page.evaluate((id: string) => {
       const el = document.querySelector(`[data-testid="${id}"]`) as HTMLElement | null;
       const bg = document.querySelector(".react-flow__background") as HTMLElement | null;
       const describe = (n: Element | null) =>
@@ -145,12 +173,7 @@ export async function waitForNodeHittable(page: Page, testId: string): Promise<v
           (document.querySelector(".react-flow__viewport") as HTMLElement | null)?.style.transform || "(none)"
         }`,
       ].join("\n  ");
-    }, testId);
-    throw new Error(
-      `workspace node "${testId}" never became hittable (box settled across two frames AND ` +
-        `elementFromPoint at its centre resolving to the node) within 15s.\n  ${diag}`,
-    );
-  }
+  }, testId);
 }
 
 /**
@@ -166,4 +189,34 @@ export async function clickWorkspaceNode(page: Page, workspaceName: string): Pro
   await settleCanvas(page);
   await waitForNodeHittable(page, testId);
   await page.getByTestId(testId).click();
+}
+
+/**
+ * Select a workspace node only if it is not ALREADY selected.
+ *
+ * The node is a toggle: it carries `aria-pressed`, and clicking a selected node
+ * DESELECTS it and closes the SidePanel. `selectedNodeId` survives a top-view
+ * change, so after `Settings -> Org map` the panel is already open with
+ * `aria-pressed="true"` — an unconditional `clickWorkspaceNode` there closes the
+ * panel instead of opening it. Any spec that navigates away from the map and
+ * back must use this, not `clickWorkspaceNode`.
+ *
+ * `aria-pressed` is the app's own published selection state, so this reads the
+ * real signal rather than guessing from elapsed time or from the panel's
+ * presence.
+ */
+export async function ensureWorkspaceNodeSelected(page: Page, workspaceName: string): Promise<void> {
+  const testId = `workspace-node-${workspaceName}`;
+  await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
+  await settleCanvas(page);
+  const node = page.getByTestId(testId);
+  await expect(node, `workspace node ${testId} missing`).toBeVisible({ timeout: 10_000 });
+  if ((await node.getAttribute("aria-pressed")) === "true") return;
+  await waitForNodeHittable(page, testId);
+  await node.click();
+  await expect(node, `clicking ${testId} did not select it`).toHaveAttribute(
+    "aria-pressed",
+    "true",
+    { timeout: 10_000 },
+  );
 }
