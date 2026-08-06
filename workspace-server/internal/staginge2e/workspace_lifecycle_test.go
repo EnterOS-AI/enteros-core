@@ -290,10 +290,9 @@ func waitForWorkspaceStatus(t *testing.T, host, token, orgID, wsID, want string,
 
 // waitForWorkspaceOnlineRoutable polls until status=online AND url is non-empty.
 // A routable url is the real "the agent is reachable" signal the SDK uses — an
-// online row without a url is not yet serveable.
-// waitForWorkspaceOnlineRoutable waits for a workspace to become online AND
-// routable, ending the moment the control plane publishes a terminal verdict
-// instead of polling out the whole budget (readiness_terminal_signal.go).
+// online row without a url is not yet serveable. It ends the moment the control
+// plane publishes a terminal verdict instead of polling out the whole budget
+// (readiness_terminal_signal.go).
 //
 // This loop is where the defect was FIRST visible: because it logs every status
 // transition it recorded, nine times in retention, the exact shape the Guard B
