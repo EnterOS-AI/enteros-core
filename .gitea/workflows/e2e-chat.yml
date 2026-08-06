@@ -399,11 +399,18 @@ jobs:
         working-directory: canvas
         run: |
           # Single node process (not an `npx` wrapper), so the pid we record
-          # is the pid the cleanup step actually kills. HOSTNAME is left
-          # unset -> server.js defaults to 0.0.0.0, the same bind `next dev`
-          # used, so `http://localhost:${CANVAS_PORT}` resolves as before.
+          # is the pid the cleanup step actually kills.
+          #
+          # HOSTNAME MUST be set explicitly. Next's standalone server.js does
+          # `process.env.HOSTNAME || '0.0.0.0'`, and on this runner HOSTNAME
+          # is the container's own name — the server then bound
+          # `http://robot-2:35783` and every `localhost` probe got HTTP 000
+          # (observed: run 623567). Pin the loopback address the rest of this
+          # lane already uses (Postgres/Redis/platform all bind 127.0.0.1);
+          # `localhost` resolves to it on this runner, which is exactly how
+          # the dev server was being reached before.
           cd .next/standalone
-          PORT="${CANVAS_PORT}" node server.js > ../../canvas.log 2>&1 &
+          PORT="${CANVAS_PORT}" HOSTNAME=127.0.0.1 node server.js > ../../canvas.log 2>&1 &
           echo $! > ../../canvas.pid
           cd ../..
           # Readiness is the real signal, not a sleep: poll the exact route
