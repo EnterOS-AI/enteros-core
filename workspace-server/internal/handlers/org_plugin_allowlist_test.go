@@ -362,10 +362,10 @@ func TestPutAllowlist_InsertFails(t *testing.T) {
 func TestResolveOrgID_OrgRoot(t *testing.T) {
 	mock := setupTestDB(t)
 
-	// workspace has no parent → it IS the org root
-	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
+	// chain terminates at the workspace itself → it IS the org root
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
 		WithArgs("ws-root").
-		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow("ws-root"))
 
 	got, err := resolveOrgID(context.Background(), "ws-root")
 	if err != nil {
@@ -374,15 +374,24 @@ func TestResolveOrgID_OrgRoot(t *testing.T) {
 	if got != "ws-root" {
 		t.Errorf("expected ws-root, got %q", got)
 	}
+
+	// Guard against a VACUOUS pass: checkOrgPluginAllowlist fails OPEN on a
+	// resolve error, so a drifted query shape would silently return
+	// "not blocked" and satisfy an allow-expecting assertion while proving
+	// nothing. Requiring every expectation to have fired makes the stub
+	// shape itself part of the contract.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
 }
 
 func TestResolveOrgID_WithParent(t *testing.T) {
 	mock := setupTestDB(t)
 
-	// workspace has a parent → parent is the org root
-	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
+	// depth-1 child → the chain terminates at ws-parent, the org root
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
 		WithArgs("ws-child").
-		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow("ws-parent"))
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow("ws-parent"))
 
 	got, err := resolveOrgID(context.Background(), "ws-child")
 	if err != nil {
@@ -391,12 +400,21 @@ func TestResolveOrgID_WithParent(t *testing.T) {
 	if got != "ws-parent" {
 		t.Errorf("expected ws-parent, got %q", got)
 	}
+
+	// Guard against a VACUOUS pass: checkOrgPluginAllowlist fails OPEN on a
+	// resolve error, so a drifted query shape would silently return
+	// "not blocked" and satisfy an allow-expecting assertion while proving
+	// nothing. Requiring every expectation to have fired makes the stub
+	// shape itself part of the contract.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
 }
 
 func TestResolveOrgID_NotFound(t *testing.T) {
 	mock := setupTestDB(t)
 
-	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
 		WithArgs("ws-ghost").
 		WillReturnError(sql.ErrNoRows)
 
@@ -407,17 +425,24 @@ func TestResolveOrgID_NotFound(t *testing.T) {
 	if got != "" {
 		t.Errorf("expected empty string for not-found workspace, got %q", got)
 	}
-}
 
-// ─── checkOrgPluginAllowlist ───────────────────────────────────────────────
+	// Guard against a VACUOUS pass: checkOrgPluginAllowlist fails OPEN on a
+	// resolve error, so a drifted query shape would silently return
+	// "not blocked" and satisfy an allow-expecting assertion while proving
+	// nothing. Requiring every expectation to have fired makes the stub
+	// shape itself part of the contract.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
 
 func TestCheckOrgPluginAllowlist_AllowAll_EmptyList(t *testing.T) {
 	mock := setupTestDB(t)
 
-	// resolveOrgID: no parent → ws-1 is org root
-	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
+	// resolveOrgID: chain terminates at ws-1 → ws-1 is the org root
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
 		WithArgs("ws-1").
-		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow("ws-1"))
 
 	// plugin NOT in list
 	mock.ExpectQuery(`SELECT EXISTS`).
@@ -433,15 +458,24 @@ func TestCheckOrgPluginAllowlist_AllowAll_EmptyList(t *testing.T) {
 	if blocked {
 		t.Errorf("expected not blocked (allow-all), got blocked: %s", reason)
 	}
+
+	// Guard against a VACUOUS pass: checkOrgPluginAllowlist fails OPEN on a
+	// resolve error, so a drifted query shape would silently return
+	// "not blocked" and satisfy an allow-expecting assertion while proving
+	// nothing. Requiring every expectation to have fired makes the stub
+	// shape itself part of the contract.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
 }
 
 func TestCheckOrgPluginAllowlist_Allowed_OnList(t *testing.T) {
 	mock := setupTestDB(t)
 
-	// resolveOrgID: no parent
-	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
+	// resolveOrgID: ws-1 is the org root
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
 		WithArgs("ws-1").
-		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow("ws-1"))
 
 	// plugin IS in the allowlist
 	mock.ExpectQuery(`SELECT EXISTS`).
@@ -452,15 +486,24 @@ func TestCheckOrgPluginAllowlist_Allowed_OnList(t *testing.T) {
 	if blocked {
 		t.Errorf("expected not blocked (on list), got blocked: %s", reason)
 	}
+
+	// Guard against a VACUOUS pass: checkOrgPluginAllowlist fails OPEN on a
+	// resolve error, so a drifted query shape would silently return
+	// "not blocked" and satisfy an allow-expecting assertion while proving
+	// nothing. Requiring every expectation to have fired makes the stub
+	// shape itself part of the contract.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
 }
 
 func TestCheckOrgPluginAllowlist_Blocked_NotOnList(t *testing.T) {
 	mock := setupTestDB(t)
 
-	// resolveOrgID: no parent
-	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
+	// resolveOrgID: ws-1 is the org root
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
 		WithArgs("ws-1").
-		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow("ws-1"))
 
 	// plugin NOT in the list
 	mock.ExpectQuery(`SELECT EXISTS`).
@@ -479,15 +522,28 @@ func TestCheckOrgPluginAllowlist_Blocked_NotOnList(t *testing.T) {
 	if reason == "" {
 		t.Error("expected non-empty reason when blocked")
 	}
+
+	// Guard against a VACUOUS pass: checkOrgPluginAllowlist fails OPEN on a
+	// resolve error, so a drifted query shape would silently return
+	// "not blocked" and satisfy an allow-expecting assertion while proving
+	// nothing. Requiring every expectation to have fired makes the stub
+	// shape itself part of the contract.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
 }
 
-func TestCheckOrgPluginAllowlist_ChildWorkspace_UsesParentOrg(t *testing.T) {
+func TestCheckOrgPluginAllowlist_ChildWorkspace_UsesOrgRoot(t *testing.T) {
 	mock := setupTestDB(t)
 
-	// resolveOrgID: ws-child has parent ws-parent
-	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
+	// resolveOrgID walks to the ORG ROOT. On this depth-1 tree the root and
+	// the direct parent are the same row (ws-parent), which is exactly why
+	// the pre-fix direct-parent lookup passed this test while being wrong
+	// for any deeper tree — see resolveOrgID's doc comment and the depth-2
+	// coverage in workspace_reparent_integration_test.go.
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
 		WithArgs("ws-child").
-		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow("ws-parent"))
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow("ws-parent"))
 
 	// allowlist check uses parent org ID (ws-parent)
 	mock.ExpectQuery(`SELECT EXISTS`).
@@ -498,13 +554,22 @@ func TestCheckOrgPluginAllowlist_ChildWorkspace_UsesParentOrg(t *testing.T) {
 	if blocked {
 		t.Errorf("expected not blocked (on parent's allowlist), got blocked: %s", reason)
 	}
+
+	// Guard against a VACUOUS pass: checkOrgPluginAllowlist fails OPEN on a
+	// resolve error, so a drifted query shape would silently return
+	// "not blocked" and satisfy an allow-expecting assertion while proving
+	// nothing. Requiring every expectation to have fired makes the stub
+	// shape itself part of the contract.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
 }
 
 func TestCheckOrgPluginAllowlist_FailOpen_OnResolveError(t *testing.T) {
 	mock := setupTestDB(t)
 
 	// DB error during resolveOrgID → fail-open
-	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
 		WithArgs("ws-1").
 		WillReturnError(sql.ErrConnDone)
 
@@ -512,14 +577,23 @@ func TestCheckOrgPluginAllowlist_FailOpen_OnResolveError(t *testing.T) {
 	if blocked {
 		t.Error("expected fail-open (not blocked) on DB error during resolveOrgID")
 	}
+
+	// Guard against a VACUOUS pass: checkOrgPluginAllowlist fails OPEN on a
+	// resolve error, so a drifted query shape would silently return
+	// "not blocked" and satisfy an allow-expecting assertion while proving
+	// nothing. Requiring every expectation to have fired makes the stub
+	// shape itself part of the contract.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
 }
 
 func TestCheckOrgPluginAllowlist_FailOpen_OnExistsError(t *testing.T) {
 	mock := setupTestDB(t)
 
-	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
 		WithArgs("ws-1").
-		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow("ws-1"))
 
 	// DB error on EXISTS check → fail-open
 	mock.ExpectQuery(`SELECT EXISTS`).
@@ -530,14 +604,23 @@ func TestCheckOrgPluginAllowlist_FailOpen_OnExistsError(t *testing.T) {
 	if blocked {
 		t.Error("expected fail-open (not blocked) on DB error during EXISTS check")
 	}
+
+	// Guard against a VACUOUS pass: checkOrgPluginAllowlist fails OPEN on a
+	// resolve error, so a drifted query shape would silently return
+	// "not blocked" and satisfy an allow-expecting assertion while proving
+	// nothing. Requiring every expectation to have fired makes the stub
+	// shape itself part of the contract.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
 }
 
 func TestCheckOrgPluginAllowlist_FailOpen_OnCountError(t *testing.T) {
 	mock := setupTestDB(t)
 
-	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
 		WithArgs("ws-1").
-		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow("ws-1"))
 
 	mock.ExpectQuery(`SELECT EXISTS`).
 		WithArgs("ws-1", "any-plugin").
@@ -552,9 +635,16 @@ func TestCheckOrgPluginAllowlist_FailOpen_OnCountError(t *testing.T) {
 	if blocked {
 		t.Error("expected fail-open (not blocked) on DB error during COUNT check")
 	}
-}
 
-// ─── requireCallerOwnsOrg regression tests (F1094 / #1200) ─────────────────
+	// Guard against a VACUOUS pass: checkOrgPluginAllowlist fails OPEN on a
+	// resolve error, so a drifted query shape would silently return
+	// "not blocked" and satisfy an allow-expecting assertion while proving
+	// nothing. Requiring every expectation to have fired makes the stub
+	// shape itself part of the contract.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
 
 func TestRequireCallerOwnsOrg_NotOrgTokenCaller(t *testing.T) {
 	w := httptest.NewRecorder()
