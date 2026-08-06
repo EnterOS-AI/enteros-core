@@ -448,23 +448,34 @@ func TestResolveTerminalSettle_CannotBeDisabledFromTheEnvironment(t *testing.T) 
 	}
 }
 
-// The settle default is the control plane's OWN self-heal window for this
-// signal (handlers.managementMCPUnloadedGrace / db.LivenessTTL, both 180s).
-// Pinned so a silent drift here cannot make the gate out-run the remediation it
-// is watching.
-func TestTerminalSettleDefault_MatchesTheControlPlaneSelfHealWindow(t *testing.T) {
-	const cpSelfHealWindow = 180 * time.Second // registry.go managementMCPUnloadedGrace, db.LivenessTTL
-	if TerminalSettleDefault != cpSelfHealWindow {
-		t.Fatalf("TerminalSettleDefault=%s but the control plane's self-heal window is %s — the gate must never declare a terminal verdict faster than the remediation it observes",
-			TerminalSettleDefault, cpSelfHealWindow)
-	}
-	// ...and it must have real headroom over the measured distribution: the
-	// slowest GREEN concierge boot in 209 retention runs was 137s and the
-	// slowest observed provisioning->failed transition was 126s.
+// The settle default must have real headroom over the MEASURED distribution.
+//
+// This is the empirical half of the settle's justification. The PROVENANCE half
+// — that the value is the control plane's own self-heal window rather than a
+// number chosen here — lives in readiness_settle_provenance_test.go and is
+// bound to the real upstream constants.
+//
+// It used to also compare TerminalSettleDefault against a package-local literal
+// `cpSelfHealWindow = 180 * time.Second` and call that a drift guard. It was
+// not: both sides were literals in this package, so moving the real upstream
+// constants left it perfectly green (review 20596 demonstrated exactly that).
+// A check that cannot observe what it claims to guard is the vacuous-pass shape
+// this whole gate exists to refuse, so it is gone rather than weakened.
+func TestTerminalSettleDefault_HasHeadroomOverTheMeasuredDistribution(t *testing.T) {
+	// The slowest GREEN concierge boot across 209 retention runs was 137s and
+	// the slowest observed provisioning->failed transition was 126s, so a
+	// terminal status that persists past this window cannot be a healthy boot
+	// still in progress.
 	const slowestGreenBoot = 137 * time.Second
 	if TerminalSettleDefault <= slowestGreenBoot {
 		t.Fatalf("settle %s must exceed the slowest observed healthy boot %s, or a slow-but-healthy boot could be called dead",
 			TerminalSettleDefault, slowestGreenBoot)
+	}
+	// And it must leave the terminal arm room to fire inside the real budgets.
+	for _, w := range []*ReadinessWatch{DeployConciergeOnlineWatch(), DeployOrgInstanceRunningWatch("x")} {
+		if w.Settle >= w.Budget {
+			t.Fatalf("watch %q: settle %s leaves no room inside budget %s", w.Subject, w.Settle, w.Budget)
+		}
 	}
 }
 

@@ -282,6 +282,17 @@ type ReadinessWatch struct {
 	terminalSince  time.Time
 	firstSeenAt    time.Time
 	trace          []string
+
+	// everTerminal* remember that a terminal verdict was OBSERVED AT ALL,
+	// independently of whether the current run is still in it. Without this the
+	// budget arm could assert "the control plane never published a terminal
+	// verdict" about a subject whose published verdict is printed two lines up
+	// in the same message (review 20596, blocker 2). A report that contradicts
+	// its own data is worse than the stopwatch this file replaced.
+	everTerminal       bool
+	everTerminalStatus string
+	everTerminalDetail string
+	everTerminalAt     time.Duration
 }
 
 // validate refuses a watch whose terminal arm could never fire. Returns "" when
@@ -383,9 +394,17 @@ func (w *ReadinessWatch) Observe(now time.Time, o Obs) WaitStep {
 			if strings.TrimSpace(o.Detail) != "" {
 				w.terminalDetail = o.Detail
 			}
+			if !w.everTerminal {
+				w.everTerminal = true
+				w.everTerminalAt = elapsed
+			}
+			w.everTerminalStatus = o.Status
+			if strings.TrimSpace(o.Detail) != "" {
+				w.everTerminalDetail = o.Detail
+			}
 			if held := now.Sub(w.terminalSince); held >= w.Settle {
 				step.Decision = WaitFailTerminal
-				step.Message = w.terminalMessage(o.Status, held, elapsed)
+				step.Message = w.terminalMessage(o.Status, held, elapsed, true)
 				return step
 			}
 		default:
@@ -398,6 +417,25 @@ func (w *ReadinessWatch) Observe(now time.Time, o Obs) WaitStep {
 	}
 
 	if elapsed >= w.Budget {
+		// LATE VERDICT (review 20596, blocker 2). The settle is evaluated above,
+		// so a verdict published within the final `Settle` of the wait can never
+		// finish settling. It must NOT therefore be reported as "nothing was
+		// published" — the watch saw it, the trace prints it, and the control
+		// plane's reason is in hand. Report it as the terminal verdict it is,
+		// and say plainly that the budget, not the control plane, ended the
+		// observation.
+		//
+		// The window this covers is large where it matters most: 20% of the
+		// concierge budget and 43% of the org budget, and green orgs reach
+		// running in up to 4m09s — right at the org boundary. G2's nine reds
+		// never recorded WHEN `failed` was published, so this tail is unmeasured
+		// rather than known-empty, and a gate must not assert what it did not
+		// check.
+		if w.terminalStatus != "" {
+			step.Decision = WaitFailTerminal
+			step.Message = w.terminalMessage(w.terminalStatus, now.Sub(w.terminalSince), elapsed, false)
+			return step
+		}
 		step.Decision = WaitFailBudget
 		step.Message = w.budgetMessage(elapsed)
 		return step
@@ -408,26 +446,68 @@ func (w *ReadinessWatch) Observe(now time.Time, o Obs) WaitStep {
 
 // terminalMessage names the PUBLISHED failure verdict. Deliberately worded so
 // it can never be mistaken for a timeout.
-func (w *ReadinessWatch) terminalMessage(status string, held, elapsed time.Duration) string {
+//
+// settled distinguishes the two ways the wait can end on a terminal status:
+//
+//	settled=true   the status was held for the FULL self-heal window, so the
+//	               control plane had every opportunity to revise it and did not.
+//	settled=false  the verdict was published so late that the budget expired
+//	               first. It is still a published verdict and still carries the
+//	               control plane's reason — but the observation was cut short by
+//	               OUR clock, not concluded by the control plane, and the message
+//	               must say so rather than overclaim a completed settle.
+func (w *ReadinessWatch) terminalMessage(status string, held, elapsed time.Duration, settled bool) string {
+	var confirmation string
+	if settled {
+		confirmation = fmt.Sprintf(
+			"and HELD it for %s (>= the control plane's own %s self-heal window) after %s of waiting. "+
+				"This is a PUBLISHED FAILURE VERDICT, not a slow boot — the control plane decided this boot would not "+
+				"survive and never revised it.",
+			held.Truncate(time.Second), w.Settle, elapsed.Truncate(time.Second))
+	} else {
+		confirmation = fmt.Sprintf(
+			"at t+%s and was still holding it %s later when the %s budget expired before the %s self-heal window could "+
+				"complete. This is a PUBLISHED FAILURE VERDICT — the control plane said this boot had failed and had not "+
+				"revised it by the time we stopped looking. It is NOT a 'nothing was published' timeout: the verdict and "+
+				"its reason are below.",
+			w.everTerminalAt.Truncate(time.Second), held.Truncate(time.Second), w.Budget, w.Settle)
+	}
 	return fmt.Sprintf(
-		"%s reached TERMINAL status=%q and HELD it for %s (>= the control plane's own %s self-heal window) after %s of waiting. "+
-			"This is a PUBLISHED FAILURE VERDICT, not a slow boot — the control plane decided this boot would not survive and never revised it. "+
+		"%s reached TERMINAL status=%q %s "+
 			"Control-plane reason: %s. Observed status trace: %s. "+
-			"(Waiting out the remaining budget would have added nothing: across the e2e retention window a workspace that reached %q never once returned to %q.)",
-		nonEmpty(w.Subject, "subject"), status, held.Truncate(time.Second), w.Settle, elapsed.Truncate(time.Second),
+			"(Waiting longer is unlikely to help: across the e2e retention window a workspace that reached %q never once returned to %q.)",
+		nonEmpty(w.Subject, "subject"), status, confirmation,
 		nonEmpty(strings.TrimSpace(w.terminalDetail), "<the control plane surfaced no reason field>"),
 		w.Trace(), status, w.Ready)
 }
 
-// budgetMessage names the OTHER failure mode: nothing was ever published.
+// budgetMessage names the OTHER failure mode: the subject is wedged in a
+// NON-terminal state at the moment the budget expires.
+//
+// It has two forms, because "no verdict right now" and "no verdict ever" are
+// different facts and only one of them is safe to assert. When the control plane
+// DID publish a verdict earlier and then revised it (its self-heal working) and
+// the subject subsequently wedged somewhere else, the report must carry that
+// history — erasing it would hide the most diagnostic thing that happened.
 func (w *ReadinessWatch) budgetMessage(elapsed time.Duration) string {
-	return fmt.Sprintf(
-		"%s never reached %q within %s AND the control plane never published a terminal verdict about it either "+
-			"(last status=%q; terminal statuses watched: [%s]). "+
-			"This is STUCK, not FAILED — the subject is wedged in a non-terminal state with nothing said about it, which is a different bug from a published failure. "+
-			"Observed status trace: %s.",
+	head := fmt.Sprintf(
+		"%s never reached %q within %s (last status=%q; terminal statuses watched: [%s]). ",
 		nonEmpty(w.Subject, "subject"), w.Ready, w.Budget, nonEmpty(w.lastStatus, "<never read>"),
-		strings.Join(w.Terminal, ","), w.Trace())
+		strings.Join(w.Terminal, ","))
+	var body string
+	if w.everTerminal {
+		body = fmt.Sprintf(
+			"The control plane DID publish terminal status=%q at t+%s and then REVISED it (its self-heal path worked), "+
+				"after which the subject wedged in the non-terminal state above and stayed there. So this is not a clean "+
+				"STUCK: something failed, recovered, and then stalled. Reason recorded at the time: %s. ",
+			w.everTerminalStatus, w.everTerminalAt.Truncate(time.Second),
+			nonEmpty(strings.TrimSpace(w.everTerminalDetail), "<the control plane surfaced no reason field>"))
+	} else {
+		body = "The control plane never published a terminal verdict about it either. " +
+			"This is STUCK, not FAILED — the subject is wedged in a non-terminal state with nothing said about it, " +
+			"which is a different bug from a published failure. "
+	}
+	return head + body + "Observed status trace: " + w.Trace() + "."
 }
 
 // ── The two configured watches ───────────────────────────────────────────────
