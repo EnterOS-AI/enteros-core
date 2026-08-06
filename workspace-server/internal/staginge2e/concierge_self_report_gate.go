@@ -456,10 +456,18 @@ func ParseConciergeClaim(bodies []string) ConciergeClaim {
 // ok=false means the deploy candidate must not fan out: the agent's report and
 // the world disagree.
 //
-// The three abstentions below are all "the report adds nothing", never "the
-// report substitutes for the row": ok=true here does not mean the turn passed,
-// only that the SELF-REPORT raised no additional objection. The row check
-// (EvaluateMgmtMCPCallable check 5) still runs and still decides.
+// EVERY ok=true return below is an abstention, not a pass. Each one means "the
+// report adds nothing" — never "the report substitutes for the row". The row
+// check (EvaluateMgmtMCPCallable check 5) still runs and still decides, so a
+// missing row stays RED no matter what the agent said. There are exactly two
+// ways out with ok=false, and both require the agent to have ASSERTED
+// something: a claim with no row at all (G9), and a claim whose published id is
+// not the row it created.
+//
+// (This comment previously said "the three abstentions below" and had fallen
+// out of date — the kind of docstring-claims-more-than-the-code drift this file
+// exists to refuse. Stated as an invariant now so it cannot go stale by
+// counting.)
 func ReconcileProvisionClaim(claim ConciergeClaim, rowFound bool, rowID string) (ok bool, reason string) {
 	// Normalise the row id ONCE, so every branch below compares the same thing
 	// and a whitespace-only id can never masquerade as a surfaced one.

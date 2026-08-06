@@ -602,6 +602,79 @@ func TestReconcileProvisionClaim_CreatedThenRefusedIsNotAFabrication(t *testing.
 	}
 }
 
+// TestReconcileProvisionClaim_OnlyTwoWaysToObject enumerates the whole input
+// space of the reconciliation and pins the invariant its docstring states, so
+// the comment cannot drift away from the code (the drift that already happened
+// once with "the three abstentions below").
+//
+// The invariant: ok=false is reachable ONLY when the agent actually ASSERTED
+// something, and only in the two named shapes. Everything else abstains.
+func TestReconcileProvisionClaim_OnlyTwoWaysToObject(t *testing.T) {
+	const real = "90d7c02f-a563-4c60-b4c6-f2d81333dddb"
+	const other = "deadbeef-0000-4000-8000-000000000001"
+
+	idSets := map[string][]string{
+		"none": nil, "blank": {"  "}, "row": {real}, "other": {other}, "both": {other, real},
+	}
+	rowIDs := map[string]string{"blank": "", "ws": "  ", "row": real}
+
+	reds := 0
+	total := 0
+	for _, observed := range []bool{false, true} {
+		for _, claims := range []bool{false, true} {
+			for idName, ids := range idSets {
+				for _, rowFound := range []bool{false, true} {
+					for ridName, rid := range rowIDs {
+						total++
+						c := ConciergeClaim{Observed: observed, ClaimsCreated: claims,
+							ClaimedWorkspaceIDs: ids, Texts: []string{"some reply"}}
+						ok, reason := ReconcileProvisionClaim(c, rowFound, rid)
+						if ok {
+							continue
+						}
+						reds++
+						// (1) an objection requires an observed assertion.
+						if !observed || !claims {
+							t.Fatalf("objected without an observed claim (observed=%v claims=%v ids=%s rowFound=%v rowID=%s): %s",
+								observed, claims, idName, rowFound, ridName, reason)
+						}
+						// (2) exactly two named shapes, nothing else.
+						isG9 := strings.Contains(reason, "G9 FABRICATED SELF-REPORT")
+						isID := strings.Contains(reason, "MISREPORTED WORKSPACE IDENTITY")
+						if isG9 == isID {
+							t.Fatalf("an objection must be exactly one of the two named shapes (ids=%s rowFound=%v rowID=%s): %s",
+								idName, rowFound, ridName, reason)
+						}
+						// (3) G9 requires that NO row exists at all — a refused row
+						//     carries an id and must never be called a fabrication.
+						if isG9 && (rowFound || strings.TrimSpace(rid) != "") {
+							t.Fatalf("G9 claimed while a row existed (rowFound=%v rowID=%q): %s", rowFound, rid, reason)
+						}
+						// (4) an identity objection requires a comparable id on BOTH
+						//     sides — never a blank on either.
+						if isID {
+							if strings.TrimSpace(rid) == "" {
+								t.Fatalf("identity objection with a blank row id (%q): %s", rid, reason)
+							}
+							if len(comparableIDs(ids)) == 0 {
+								t.Fatalf("identity objection with no comparable published id (%s): %s", idName, reason)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	// The enumeration must actually reach both objections, or it proves nothing.
+	if total < 100 {
+		t.Fatalf("the enumeration is too small to be meaningful (%d cases)", total)
+	}
+	if reds == 0 {
+		t.Fatal("no input in the whole space objected — the reconciliation is inert")
+	}
+	t.Logf("enumerated %d combinations, %d objections, all within the two named shapes", total, reds)
+}
+
 // ---------------------------------------------------------------------------
 // Wiring into the ONE Guard B verdict + the negative control
 // ---------------------------------------------------------------------------
