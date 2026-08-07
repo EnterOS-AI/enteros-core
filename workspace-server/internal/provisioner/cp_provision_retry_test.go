@@ -350,3 +350,110 @@ func TestRetryableProvisionStatus(t *testing.T) {
 		})
 	}
 }
+
+// --- A control-plane redeploy is the longest transient on this hop ---------
+//
+// Regression coverage for the staging failure of 2026-08-07 (controlplane#2908
+// run 628216 job 927298). Staging CD recreated molecule-cp-staging while a
+// tenant was provisioning; the CP answered nothing for ~17.7s, the 3-attempt
+// budget expired in 9s, and the workspace was marked failed permanently — four
+// seconds before the provision route came back up.
+
+// cpDownFor returns a CP that fails `downFor` attempts with the gateway's
+// 502 (a bare "502 Bad Gateway", exactly what the tenant saw — note there is no
+// JSON {"error":...} field, because the CP process is not the one answering)
+// and then serves a normal 201.
+func cpDownFor(downFor int, seen *int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		*seen++
+		if *seen <= downFor {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("502 Bad Gateway\n"))
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"instance_id":"i-after-cp-restart","state":"running"}`))
+	}
+}
+
+// The provision must survive a CP that is unreachable across several attempts
+// and then returns. With the previous budget of 3 this failed outright.
+func TestStart_SurvivesAControlPlaneRestart(t *testing.T) {
+	shrinkRetryBudget(t)
+
+	var seen int
+	srv := httptest.NewServer(cpDownFor(cpProvisionRetryAttempts-1, &seen))
+	defer srv.Close()
+
+	id, err := newTestCPProvisioner(srv.URL).Start(context.Background(), testWorkspaceConfig())
+	if err != nil {
+		t.Fatalf("a CP that returns after a restart must still yield a box, got: %v", err)
+	}
+	if id != "i-after-cp-restart" {
+		t.Errorf("instance_id = %q, want the box created on the recovering attempt", id)
+	}
+	if seen != cpProvisionRetryAttempts {
+		t.Errorf("attempts = %d, want %d — the budget must be spent, not abandoned early", seen, cpProvisionRetryAttempts)
+	}
+}
+
+// measuredCPRestartOutage is the wall-clock gap between the old CP container
+// being stopped (19:21:12.797) and the new one having registered the provision
+// route (19:21:27.300), from deploy job 927326. The budget must outlast it, or
+// a routine deploy destroys in-flight provisions again.
+const measuredCPRestartOutage = 14*time.Second + 503*time.Millisecond
+
+// The PRODUCTION constants — not a shrunk test budget — must cover a real CP
+// redeploy. This is the assertion that would have caught the regression; every
+// other test in this file passes at attempts=3.
+func TestProvisionRetryBudgetOutlastsAControlPlaneRestart(t *testing.T) {
+	var total time.Duration
+	delay := cpProvisionRetryBaseDelay
+	for attempt := 1; attempt < cpProvisionRetryAttempts; attempt++ {
+		total += delay
+		delay *= 2
+		if delay > cpProvisionRetryMaxDelay {
+			delay = cpProvisionRetryMaxDelay
+		}
+	}
+	if total <= measuredCPRestartOutage {
+		t.Fatalf("total provision backoff %s does not outlast a measured CP restart (%s) — "+
+			"a deploy landing mid-provision will fail the workspace permanently", total, measuredCPRestartOutage)
+	}
+}
+
+// The doubling must saturate rather than run away: an uncapped 6th attempt
+// would sleep 32s in one gap, longer than the outage being waited out.
+func TestProvisionRetryDelayIsCapped(t *testing.T) {
+	delay := cpProvisionRetryBaseDelay
+	for attempt := 1; attempt < cpProvisionRetryAttempts; attempt++ {
+		delay *= 2
+		if delay > cpProvisionRetryMaxDelay {
+			delay = cpProvisionRetryMaxDelay
+		}
+		if delay > cpProvisionRetryMaxDelay {
+			t.Fatalf("delay %s exceeded the cap %s at attempt %d", delay, cpProvisionRetryMaxDelay, attempt)
+		}
+	}
+}
+
+// A deterministic rejection must STILL fail on the first attempt. Widening the
+// budget must not turn a fast, correct rejection into a 34s stall.
+func TestStart_DeterministicRejectionStillFailsFastAtTheWiderBudget(t *testing.T) {
+	shrinkRetryBudget(t)
+
+	var seen int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen++
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"error":"RUNTIME_PIN_MISSING"}`))
+	}))
+	defer srv.Close()
+
+	if _, err := newTestCPProvisioner(srv.URL).Start(context.Background(), testWorkspaceConfig()); err == nil {
+		t.Fatal("a deterministic rejection must fail the provision")
+	}
+	if seen != 1 {
+		t.Errorf("attempts = %d, want 1 — a 422 fails identically forever and must not burn the budget", seen)
+	}
+}
