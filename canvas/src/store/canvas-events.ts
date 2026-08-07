@@ -93,6 +93,10 @@ export function handleCanvasEvent(
     edges: Edge[];
     selectedNodeId: string | null;
     agentMessages: Record<string, Array<{ id: string; content: string; timestamp: string; messageId?: string; attachments?: Array<{ name: string; uri: string; mimeType?: string; size?: number }> }>>;
+    /** Per-workspace count of mounted chat views. Gates whether an agent push is
+     *  buffered into `agentMessages` at all — see the store's `agentMessages`
+     *  doc comment for why an unconsumed queue is a duplicate waiting to happen. */
+    agentMessageConsumers: Record<string, number>;
   },
   set: (partial: Record<string, unknown>) => void,
 ): void {
@@ -482,7 +486,15 @@ export function handleCanvasEvent(
       // Skip when both content and attachments are empty — pure-noise
       // event we don't want to render as a blank bubble.
       if (content || (attachments && attachments.length > 0)) {
-        const { agentMessages } = get();
+        const { agentMessages, agentMessageConsumers } = get();
+        // Buffer ONLY for a workspace that currently has a mounted chat view.
+        // With no consumer the entry would sit in the store until some chat
+        // view mounts later, and that view ALSO hydrates the persisted copy
+        // from GET /chat-history — the user then sees the message twice. The
+        // platform has already persisted it, so dropping here loses nothing.
+        // (The `greeted` node flag below is UNCONDITIONAL: it is node UI state,
+        // not a chat hand-off, and must flip whether or not anyone is looking.)
+        const hasConsumer = (agentMessageConsumers[msg.workspace_id] ?? 0) > 0;
         const existing = agentMessages[msg.workspace_id] || [];
         const messageId = typeof msg.payload.message_id === "string" ? msg.payload.message_id : undefined;
         // Mark the node greeted: a real agent→user message means the agent has
@@ -504,19 +516,23 @@ export function handleCanvasEvent(
             : {};
         set({
           ...nodesPatch,
-          agentMessages: {
-            ...agentMessages,
-            [msg.workspace_id]: [
-              ...existing,
-              {
-                id: crypto.randomUUID(),
-                content,
-                timestamp: new Date().toISOString(),
-                messageId,
-                ...(attachments && attachments.length > 0 ? { attachments } : {}),
-              },
-            ],
-          },
+          ...(hasConsumer
+            ? {
+                agentMessages: {
+                  ...agentMessages,
+                  [msg.workspace_id]: [
+                    ...existing,
+                    {
+                      id: crypto.randomUUID(),
+                      content,
+                      timestamp: new Date().toISOString(),
+                      messageId,
+                      ...(attachments && attachments.length > 0 ? { attachments } : {}),
+                    },
+                  ],
+                },
+              }
+            : {}),
         });
       }
       break;
@@ -595,10 +611,14 @@ export function handleCanvasEvent(
           (responseBody.result ?? responseBody) as Record<string, unknown>,
         );
         if (text || attachments.length > 0) {
-          const { agentMessages } = get();
+          const { agentMessages, agentMessageConsumers } = get();
+          // Same live-hand-off rule as AGENT_MESSAGE above: no mounted chat
+          // view for this workspace => drop it, the persisted copy is
+          // authoritative and the next mount hydrates it.
+          const hasConsumer = (agentMessageConsumers[msg.workspace_id] ?? 0) > 0;
           const existing = agentMessages[msg.workspace_id] || [];
           const messageId = typeof msg.payload.message_id === "string" ? msg.payload.message_id : undefined;
-          set({
+          if (hasConsumer) set({
             agentMessages: {
               ...agentMessages,
               [msg.workspace_id]: [
