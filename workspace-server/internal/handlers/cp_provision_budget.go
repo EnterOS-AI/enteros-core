@@ -124,6 +124,16 @@ func cpCreatePrewarmBudget(total time.Duration) time.Duration {
 // SINGLE ATTEMPT by design. CPProvisioner.EnsureImage carries no retry loop of
 // its own, and adding one here would spend the pre-flight budget on a question
 // whose answer the provision leg is about to ask again anyway.
+//
+// On the RESTART path this runs a second time, after ensurePinnedImageBeforeStop
+// already asked. That is deliberate, not an oversight. EnsureImage is documented
+// idempotent — an image already present short-circuits on the local digest check
+// without touching the registry — so the repeat costs one cheap round trip, and
+// it is asked at a strictly better moment: the first call answered BEFORE the
+// container was destroyed, this one answers immediately before the provision
+// that needs it. Suppressing it would mean threading "already asked" state
+// through every path into provisionWorkspaceCP, which is the shape that let the
+// create path go unguarded in the first place.
 func (h *WorkspaceHandler) ensurePinnedImageBeforeProvision(ctx context.Context, workspaceID string, payload models.CreateWorkspacePayload, budget time.Duration) string {
 	if h.cpProv == nil {
 		return ""
