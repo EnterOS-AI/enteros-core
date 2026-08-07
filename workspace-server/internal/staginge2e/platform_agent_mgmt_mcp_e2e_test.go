@@ -433,6 +433,17 @@ func driveProvisionWorkspaceCallable(t *testing.T, host, token, orgID, platformI
 //     error return and no fatal path at all, and is unit-tested against a fetch
 //     that only ever transport-fails.
 //
+// PRECISELY WHAT IS AND IS NOT GUARANTEED (round-2 review). doTenantJSONTimeout
+// is not fatal-free: it t.Fatalf's if tenantTopoFromURL rejects the URL or if
+// http.NewRequest cannot build the request — and http.NewRequest DOES reject a
+// control character in a URL. So the guarantee is not "this helper can never
+// fatal"; it is that no input reaching it here can make it fatal. Of the URL's
+// three parts, host and platformID are fixed for the run and already used by
+// every other call in this test, and the queue id — the only value that varies
+// and the only one taken from tenant JSON — is validated to an opaque token by
+// QueuedA2AQueueID before it is ever concatenated. A queue id that is not a
+// plain token is dropped at parse time and never followed.
+//
 // The budget is ONE TOTAL allowance shared across every queue id, not per id:
 // a turn can accumulate ~6 nudges, and a per-id budget would have added
 // double-digit minutes to a hard prod gate.

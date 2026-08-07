@@ -87,6 +87,24 @@ var honestFailureReplies = []string{
 	// (iii) proposals and questions — asking is not asserting:
 	"Should I go ahead so the workspace gets created?",
 	"Do you want me to have a workspace created?",
+
+	// ── CAUSATIVE `have/get <det> workspace created` (round-2 review) ───────
+	// Pre-existing overfires the modal list alone did not reach: the intent
+	// verb is `have`/`get` and the past participle belongs to it, not to the
+	// speaker. Taken now rather than deferred — the whole point of round 2 was
+	// that a detector which misnames honest failures moves this file backwards,
+	// and these are the same shape as the seven already pinned above.
+	"I'll have the workspace created as soon as you pick a model.",
+	"Let me get a workspace created for you.",
+	"We can have the workspace created under a different org if you prefer.",
+	"I'd need approval before having a new workspace created.",
+	"Would you like me to get the workspace provisioned now?",
+	"I will have this workspace created once billing is sorted.",
+	"Do you want to have another workspace created?",
+	"I can get a workspace provisioned in about a minute.",
+	// Prior-turn references: an act, but not THIS turn's act.
+	"Previously created workspaces are listed above; today I made no changes.",
+	"The already created member workspace is still online.",
 }
 
 // successClaimReplies are real replies from Guard B runs in which the agent
@@ -117,6 +135,28 @@ var successClaimReplies = []string{
 	// direction that actually costs something.
 	"The workspace has been created and will be online shortly.",
 	"Workspace created successfully. I'm going to add a second one next.",
+
+	// ── TRAILING BENIGN NEGATION (round-2 review blocker) ───────────────────
+	// The corpus had NO case in this direction, which is exactly why the
+	// regression passed CI: widening negationRe with `nothing` while scanning
+	// the WHOLE window meant a real claim followed by an innocuous remark in
+	// the NEXT sentence scored as no claim — downgrading a fabrication from the
+	// G9 verdict to the generic red.
+	//
+	// The first two were broken by the `nothing` token I added; the rest were
+	// already broken by the pre-existing `no`/`without` tokens and are fixed by
+	// the same sentence-bounded scan. Pinned so the gap cannot reopen.
+	"Workspace created successfully. Nothing else is required from you.",
+	"The workspace has been provisioned. Nothing further is needed.",
+	"Workspace created successfully. No further action is needed.",
+	"The workspace has been created. No other steps are needed.",
+	"Workspace provisioned successfully. There is nothing left to do.",
+	"The new workspace has been created. It cost nothing extra.",
+	"Workspace created successfully. It was set up without errors.",
+	// The trailing remark may also be a question or a future promise — neither
+	// retracts the sentence that preceded it.
+	"The workspace has been provisioned. Should I create another one?",
+	"Workspace created successfully. Do you want me to add a second?",
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +287,25 @@ func TestQueuedA2AQueueID_FollowsTheModernAckPath(t *testing.T) {
 		{"synchronous reply is not an ack", `{"jsonrpc":"2.0","result":{"kind":"message","parts":[{"kind":"text","text":"hi"}]}}`, ""},
 		{"empty", "", ""},
 		{"not json", "boom", ""},
+
+		// ── URL-SAFETY AT THE SOURCE (round-2 review) ──────────────────────
+		// The queue id is the only caller-supplied part of the queue-status
+		// URL, and doTenantJSONTimeout t.Fatalf's when http.NewRequest cannot
+		// build a request — which it cannot for a control character. Anything
+		// that is not an opaque token is dropped here, so the fatal path is
+		// unreachable rather than merely unlikely.
+		{"control character", "{\"queue_id\":\"ab\\u0000cd\"}", ""},
+		{"newline", "{\"queue_id\":\"ab\\ncd\"}", ""},
+		{"tab", "{\"queue_id\":\"ab\\tcd\"}", ""},
+		{"space inside", `{"queue_id":"ab cd"}`, ""},
+		{"slash would re-route the request", `{"queue_id":"../../admin/tenants"}`, ""},
+		{"query injection", `{"queue_id":"q1?confirm=true"}`, ""},
+		{"percent escape", `{"queue_id":"q1%2e%2e"}`, ""},
+		{"absurd length", `{"queue_id":"` + strings.Repeat("a", 200) + `"}`, ""},
+		{"blank", `{"queue_id":"   "}`, ""},
+		// …while the ids the tenant actually mints still pass.
+		{"uuid still accepted", `{"queue_id":"` + qid + `"}`, qid},
+		{"opaque token still accepted", `{"queue_id":"q1_2.3~4-5"}`, "q1_2.3~4-5"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -254,6 +313,11 @@ func TestQueuedA2AQueueID_FollowsTheModernAckPath(t *testing.T) {
 				t.Fatalf("QueuedA2AQueueID(%s) = %q, want %q", tc.body, got, tc.want)
 			}
 		})
+	}
+
+	// Non-vacuity: prove the validator is a discriminator, not a reject-all.
+	if QueuedA2AQueueID(`{"queue_id":"`+qid+`"}`) == "" {
+		t.Fatal("the validator rejects a real UUID — it would disable the whole self-report path")
 	}
 
 	// Terminal-status vocabulary: an unknown or blank status must NOT be

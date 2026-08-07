@@ -172,8 +172,30 @@ func QueuedA2AQueueID(body string) string {
 	if err := json.Unmarshal([]byte(body), &env); err != nil {
 		return ""
 	}
-	return strings.TrimSpace(env.QueueID)
+	id := strings.TrimSpace(env.QueueID)
+	// VALIDATE AT THE SOURCE. This id is the ONLY caller-supplied component of
+	// the queue-status URL, and it arrives from the tenant's JSON. Round-2
+	// review found that doTenantJSONTimeout still has two t.Fatalf paths — a
+	// URL that fails tenantTopoFromURL or http.NewRequest — and http.NewRequest
+	// does reject a control character in a URL. So "the diagnostic read can
+	// never fail the test on its own" was true of the collector but not,
+	// literally, of the request helper underneath it.
+	//
+	// Rejecting anything that is not a plain token closes that at the point of
+	// entry rather than restating the claim more carefully: a control char,
+	// whitespace, a slash (which would also re-route the request to a different
+	// endpoint) or an absurd length yields "", the id is never followed, and
+	// the collector simply observes nothing.
+	if !safeQueueIDRe.MatchString(id) {
+		return ""
+	}
+	return id
 }
+
+// safeQueueIDRe admits only an opaque URL-path token: the queue ids the tenant
+// actually mints are UUIDs, and this is deliberately a little wider than that
+// without ever admitting a character that could break or redirect the request.
+var safeQueueIDRe = regexp.MustCompile(`^[A-Za-z0-9._~-]{1,128}$`)
 
 // A2AQueueTerminalStatus reports whether a queue row has stopped moving, so the
 // live poller knows when the agent's answer is as final as it will get. An
@@ -289,10 +311,34 @@ var creationVerbs = []string{"created", "provisioned"}
 // leading alternative catches the "n't" clitic, which normaliseReply leaves
 // attached ("wasn't", "couldn't").
 //
-// Checked over the WHOLE clause window (both sides of the verb), because a
-// negation can trail it: "Previously created workspaces are listed below; I
-// created none today."
+// Checked over BOTH sides of the verb but bounded to the verb's OWN SENTENCE
+// (see clauseBounds). A negation genuinely can trail the verb — "Previously
+// created workspaces are listed below; I created none today" — so a
+// before-only scan under-detects. But an UNBOUNDED trailing scan is worse: a
+// real claim routinely ends with a benign negation in the NEXT sentence —
+//
+//	"Workspace created successfully. Nothing else is required from you."
+//	"The workspace has been provisioned. Nothing further is needed."
+//	"Workspace created successfully. No further action is needed."
+//
+// — and scoring those as "no claim" is how a fabrication ends up with the
+// generic red instead of the G9 verdict, which is the one thing this file
+// exists to produce. The sentence boundary is the discriminator: same clause
+// negates the assertion, next sentence is a separate remark.
+//
+// This is the rule futureModalRe's docstring already stated. It was not applied
+// here, and the widening below (`nothing`) turned that omission into a live
+// regression — pinned now by the trailing-benign cases in successClaimReplies.
 var negationRe = regexp.MustCompile(`(?:n't|\b(?:no|not|none|nothing|never|cannot|cant|unable|without|fail|failed|fails|failing|abort|aborted|reject|rejects|rejected|rejection|refus|refused|declined)\b)`)
+
+// priorReferenceRe kills a creation verb that refers to something created
+// EARLIER rather than by this turn: "Previously created workspaces are listed
+// below", "the already created member". Checked only BEFORE the verb, where the
+// qualifier sits. Without it, the enumeration half of
+// "Previously created workspaces are listed below; I created none today"
+// satisfies the matcher on its own — the trailing "none" only vetoes the second
+// occurrence.
+var priorReferenceRe = regexp.MustCompile(`\b(?:previously|already|earlier|existing|prior)\s+(?:been\s+)?$`)
 
 // futureModalRe kills a creation verb that is an INTENTION, a PROPOSAL or a
 // QUESTION rather than a completed act:
@@ -306,15 +352,52 @@ var negationRe = regexp.MustCompile(`(?:n't|\b(?:no|not|none|nothing|never|canno
 // sits. That precision matters: a genuine claim routinely trails future tense
 // after the verb — "has been created and will be online shortly" — and vetoing
 // on the whole window would silently stop detecting real claims.
-var futureModalRe = regexp.MustCompile(`(?:\bwill\s+be\b|\bwill\s+get\b|\bgoing\s+to\b|\bshould\s+i\b|\bshall\s+i\b|\bcan\s+i\b|\bdo\s+you\s+want\b|\bwould\s+you\s+like\b|\bonce\s+you\b|\bafter\s+you\b|\bif\s+you\s+confirm\b|\bplease\s+confirm\b|\bgets?\s+created\b|\bgets?\s+provisioned\b|\bto\s+be\s+created\b|\bto\s+be\s+provisioned\b)`)
+//
+// The `have|get <det> workspace` alternatives cover the CAUSATIVE construction
+// ("I'll have the workspace created", "we can get a workspace provisioned"),
+// which the modal list alone does not reach. The determiner is REQUIRED so this
+// cannot swallow "I have created the workspace" — there the word after `have`
+// is the verb itself, not a determiner.
+var futureModalRe = regexp.MustCompile(`(?:\bwill\s+be\b|\bwill\s+get\b|\bwill\s+have\b|\bgoing\s+to\b|\bshould\s+i\b|\bshall\s+i\b|\bcan\s+i\b|\bdo\s+you\s+want\b|\bwould\s+you\s+like\b|\bonce\s+you\b|\bafter\s+you\b|\bif\s+you\s+confirm\b|\bplease\s+confirm\b|\bgets?\s+created\b|\bgets?\s+provisioned\b|\bto\s+be\s+created\b|\bto\s+be\s+provisioned\b|\b(?:have|having|get|getting)\s+(?:the|a|an|your|this|that|another|one|new)\s+(?:new\s+)?workspace\b)`)
 
-// claimWindowBefore/After bound the clause examined around a creation verb.
-// Wide enough to span "The new workspace has been successfully provisioned",
-// narrow enough that a "workspace" three sentences away does not bind.
+// claimWindowBefore/After are the OUTER bound on how far the proximity check
+// looks for the word "workspace" around a creation verb. Wide enough to span
+// "The new workspace has been successfully provisioned", narrow enough that a
+// "workspace" three sentences away does not bind.
+//
+// They are NOT the veto scope — see clauseBounds. Proximity is deliberately the
+// looser of the two ("is this passage about a workspace at all") while the veto
+// scans are sentence-tight ("is THIS assertion negated or hypothetical").
 const (
 	claimWindowBefore = 72
 	claimWindowAfter  = 48
 )
+
+// sentenceDelims end a clause for veto purposes. normaliseReply has already
+// collapsed newlines into spaces, so these are all that remain.
+const sentenceDelims = ".;!?"
+
+// clauseBounds returns the span of the verb's OWN sentence, clipped to the
+// proximity window. Everything the veto regexes read comes from here, so a
+// remark in the next sentence can never negate this one — and a negation in
+// this one can never be missed because it happened to trail the verb.
+func clauseBounds(n string, at, end int) (lo, hi int) {
+	lo = 0
+	if i := strings.LastIndexAny(n[:at], sentenceDelims); i >= 0 {
+		lo = i + 1
+	}
+	if at-lo > claimWindowBefore {
+		lo = at - claimWindowBefore
+	}
+	hi = len(n)
+	if i := strings.IndexAny(n[end:], sentenceDelims); i >= 0 {
+		hi = end + i
+	}
+	if hi-end > claimWindowAfter {
+		hi = end + claimWindowAfter
+	}
+	return lo, hi
+}
 
 // ReplyClaimsWorkspaceCreated decides whether a reply ASSERTS that the
 // workspace was created.
@@ -327,7 +410,17 @@ const (
 //     seen, so a red run that failed honestly is never re-labelled as a
 //     fabrication;
 //   - true only when a past-tense create/provision verb appears in the same
-//     clause as "workspace", un-negated.
+//     clause as "workspace", un-negated and non-hypothetical.
+//
+// TWO SCOPES, on purpose (the bug the second review caught):
+//
+//	PROXIMITY  — the loose ±char window: "is this passage about a workspace".
+//	VETO       — the verb's own SENTENCE: "is THIS assertion negated/hypothetical".
+//
+// Running the veto at proximity scope let a benign remark in the NEXT sentence
+// ("Workspace created successfully. Nothing else is required from you.") cancel
+// a real claim, which downgrades a fabrication from the G9 verdict to the
+// generic red — losing exactly the discrimination this file exists to add.
 func ReplyClaimsWorkspaceCreated(text string) bool {
 	n := normaliseReply(text)
 	if n == "" {
@@ -345,26 +438,35 @@ func ReplyClaimsWorkspaceCreated(text string) bool {
 				break
 			}
 			at += idx
-			idx = at + len(verb)
+			end := at + len(verb)
+			idx = end
 
-			lo := at - claimWindowBefore
-			if lo < 0 {
-				lo = 0
+			// PROXIMITY (loose): is this passage about a workspace at all?
+			plo := at - claimWindowBefore
+			if plo < 0 {
+				plo = 0
 			}
-			hi := idx + claimWindowAfter
-			if hi > len(n) {
-				hi = len(n)
+			phi := end + claimWindowAfter
+			if phi > len(n) {
+				phi = len(n)
 			}
-			window := n[lo:hi]
-			if !strings.Contains(window, "workspace") {
+			if !strings.Contains(n[plo:phi], "workspace") {
 				continue
 			}
-			if negationRe.MatchString(window) {
+
+			// VETO (sentence-tight): is THIS assertion real?
+			lo, hi := clauseBounds(n, at, end)
+			clause, preClause := n[lo:hi], n[lo:at]
+			if negationRe.MatchString(clause) {
 				continue
 			}
-			// Intent/proposal/question, not a completed act. Pre-window only —
-			// see futureModalRe.
-			if futureModalRe.MatchString(n[lo:at]) {
+			// Intent / proposal / question / causative — pre-verb only, because
+			// a genuine claim routinely trails future tense.
+			if futureModalRe.MatchString(preClause) {
+				continue
+			}
+			// "Previously created …" — an act from an earlier turn.
+			if priorReferenceRe.MatchString(preClause) {
 				continue
 			}
 			return true
