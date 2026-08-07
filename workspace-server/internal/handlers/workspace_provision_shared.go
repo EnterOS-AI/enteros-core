@@ -523,71 +523,101 @@ func (h *WorkspaceHandler) mintWorkspaceSecrets(ctx context.Context, workspaceID
 	h.issueAndInjectInboundSecret(ctx, workspaceID, cfg)
 }
 
-// provisionFailureWriteBudget bounds the context markProvisionFailed recovers
-// when its caller's has already failed. Matches the 10s the other
-// fresh-context failure paths use (logProvisionPanic, the no-backend branch in
-// provisionWorkspaceAuto) — enough for one broadcast plus one UPDATE, and short
-// enough that a shutting-down process is not held open by a write nobody is
-// waiting for.
+// provisionFailureWriteBudget is the TOTAL wall-clock markProvisionFailed may
+// spend recording a terminal verdict, across both of its legs. Matches the 10s
+// the other fresh-context failure paths use (logProvisionPanic, the no-backend
+// branch in provisionWorkspaceAuto).
 var provisionFailureWriteBudget = 10 * time.Second
 
-// provisionFailureWriteContext returns the context markProvisionFailed should
-// actually write on, plus its cancel.
+// provisionFailureRecordReserve is the slice of that budget the DURABLE WRITE is
+// guaranteed, no matter what the broadcast leg does.
 //
-// A LIVE context is returned UNCHANGED. The caller's deadline and cancellation
-// are load-bearing everywhere else and must keep governing; detaching
-// unconditionally would quietly convert every bounded failure write into an
-// unbounded one.
+// The two legs run in SERIES, so one shared budget lets the first consume all of
+// it — the identical hazard cpCreatePrewarmBudget guards for the pre-warm and
+// the provision POST, and the same answer applies. A broadcast fanning out to a
+// wedged subscriber must not be able to spend the write's time, because the
+// column is the durable record and the event is a notification the canvas can
+// also obtain by re-reading the row.
+var provisionFailureRecordReserve = 4 * time.Second
+
+// provisionFailureLegContext returns a bounded context for ONE leg of
+// markProvisionFailed, plus its cancel.
 //
-// A context that has ALREADY FAILED is replaced. This is not defensive
-// programming — it is the only case that matters, because the failures with the
-// most specific reason to report are precisely the ones whose context is the
+// It is ALWAYS detached from the caller, live caller or not. An earlier version
+// checked ctx.Err() once and passed a live caller straight through, which is a
+// check-then-USE race: the context is live at the check, dies during the
+// broadcast, and the UPDATE that follows is dropped by database/sql exactly as
+// if it had been dead all along. Deciding up front cannot close that window
+// because the decision and the write are not the same instant. Not deciding at
+// all does.
+//
+// The reason this matters more here than almost anywhere else: the failures with
+// the most specific reason to report are precisely the ones whose context is the
 // thing that failed. database/sql checks the context BEFORE it reaches the
-// driver, so ExecContext on a dead context returns ctx.Err() without executing:
-// the row keeps status='provisioning', last_sample_error stays NULL, and the
-// operation destroys the evidence of itself. A ceiling with no verdict in the
-// column is the same invisibility as a constant message, reached by a different
-// route.
+// driver, so a dead context means the row keeps status='provisioning' and
+// last_sample_error stays NULL — the operation destroys the evidence of itself,
+// and a ceiling with no verdict in the column is the same invisibility as a
+// constant message reached by another route.
 //
-// context.WithoutCancel keeps request-scoped VALUES (so anything reading them
-// downstream still works) while dropping the expiry, and the fresh WithTimeout
-// puts the write straight back under a bound — recovering from a dead deadline
-// must not mean running with none.
-func provisionFailureWriteContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	if ctx.Err() == nil {
-		return ctx, func() {}
-	}
-	return context.WithTimeout(context.WithoutCancel(ctx), provisionFailureWriteBudget)
+// Immunity is paired with a BOUND, never granted alone: context.WithoutCancel
+// keeps request-scoped values while dropping the caller's expiry, and the fresh
+// WithTimeout puts the leg straight back under a deadline. Surviving a dead
+// deadline must not mean running with none — that would be a worse bug than the
+// one being fixed, on a shutting-down process.
+func provisionFailureLegContext(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), budget)
 }
 
 // markProvisionFailed is the standard "abort with message" path used
 // by both provision modes. Wraps the broadcast + DB update in one
 // call so the failure shape stays consistent across modes.
 //
-// Survives its own caller's deadline — see provisionFailureWriteContext. Both
-// the broadcast and the UPDATE run on the recovered context, because a canvas
-// that never receives the event is as blind as a column that never receives the
-// message.
+// ORDER IS DELIBERATE: the durable write goes FIRST, on its own reserved slice
+// of the budget, and the broadcast follows on the remainder. If only one of the
+// two can happen, it must be the write — the column is what a customer's card
+// and the gate both read, and the canvas can still learn of the failure by
+// re-reading the row, whereas nothing recovers a verdict that was never
+// persisted. Writing first also removes a small window in which the canvas was
+// told "failed" while a re-read still said "provisioning".
+//
+// Neither leg can be cancelled by the caller (see provisionFailureLegContext),
+// because the caller of this function is very often a context that has just
+// died — or is about to, mid-call.
 func (h *WorkspaceHandler) markProvisionFailed(ctx context.Context, workspaceID, msg string, extra map[string]interface{}) {
 	if err := ctx.Err(); err != nil {
-		log.Printf("markProvisionFailed: %s — caller context already failed (%v); recording the failure on a fresh %s context so the reason is not lost with it",
-			workspaceID, err, provisionFailureWriteBudget)
+		log.Printf("markProvisionFailed: %s — caller context already failed (%v); recording the verdict on fresh contexts so the reason is not lost with it",
+			workspaceID, err)
 	}
-	ctx, cancel := provisionFailureWriteContext(ctx)
-	defer cancel()
-
 	if extra == nil {
 		extra = map[string]interface{}{"error": msg}
 	} else if _, hasErr := extra["error"]; !hasErr {
 		extra["error"] = msg
 	}
-	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisionFailed), workspaceID, extra)
-	if _, dbErr := db.DB.ExecContext(ctx,
+
+	// Leg 1 — the durable record, on its guaranteed reserve.
+	writeCtx, cancelWrite := provisionFailureLegContext(ctx, provisionFailureRecordReserve)
+	_, dbErr := db.DB.ExecContext(writeCtx,
 		`UPDATE workspaces SET status = $3, last_sample_error = $2, updated_at = now() WHERE id = $1`,
-		workspaceID, msg, models.StatusFailed); dbErr != nil {
-		// Non-fatal: the broadcast already fired, the operator sees the
-		// failure event in the canvas. The DB row stays at whatever
-		// status it had — provisioning event log is the source of truth.
-		log.Printf("markProvisionFailed: db update failed for %s: %v", workspaceID, dbErr)
+		workspaceID, msg, models.StatusFailed)
+	cancelWrite()
+	if dbErr != nil {
+		// LOUD: with the write ordered first and immune to the caller's
+		// cancellation, a failure here is a real database problem, not the
+		// context race this path used to lose to. The broadcast below is the
+		// remaining chance the operator learns anything at all.
+		log.Printf("markProvisionFailed: db update FAILED for %s (%v) — the workspace row does NOT carry the reason %q; the broadcast below is the only surviving record",
+			workspaceID, dbErr, msg)
+	}
+
+	// Leg 2 — the notification, on whatever the write did not need.
+	bcCtx, cancelBC := provisionFailureLegContext(ctx, provisionFailureWriteBudget-provisionFailureRecordReserve)
+	defer cancelBC()
+	if bcErr := h.broadcaster.RecordAndBroadcast(bcCtx, string(events.EventWorkspaceProvisionFailed), workspaceID, extra); bcErr != nil {
+		// Previously discarded. That made the ONE leg whose failure was
+		// invisible the same leg this function's own comment leaned on to claim
+		// the operator had been told. A claim resting on an unobserved outcome
+		// is exactly what this path had too much of already.
+		log.Printf("markProvisionFailed: provision-failure broadcast FAILED for %s: %v — the canvas was NOT notified; the workspace row above is the surviving record",
+			workspaceID, bcErr)
 	}
 }
