@@ -90,21 +90,43 @@ case "${1:-} ${2:-}" in
     fi
     ;;
   "pull "*)
+    # Presence is PER-REF: marking a global "pulled" flag would let the first
+    # runtime's successful pull make every later runtime look already-present,
+    # silently skipping their pulls.
+    pull_ref="${!#}"
+    pulled_marker="${PULLED_STATE:?}-$(printf '%s' "$pull_ref" | tr -c 'A-Za-z0-9' '_')"
     case "${MOCK_PULL_MODE:-success}" in
-      success) exit 0 ;;
-      always-fail) exit 1 ;;
+      success) : > "$pulled_marker"; exit 0 ;;
+      always-fail) printf 'mock: simulated pull failure\n' >&2; exit 1 ;;
       fail-once)
-        if [[ ! -e "${PULL_STATE:?}" ]]; then : > "$PULL_STATE"; exit 1; fi
+        if [[ ! -e "${PULL_STATE:?}" ]]; then
+          : > "$PULL_STATE"
+          printf 'mock: simulated first-attempt pull failure\n' >&2
+          exit 1
+        fi
+        : > "$pulled_marker"
         exit 0
         ;;
     esac
     ;;
   "image inspect")
+    # Model local presence honestly. The readiness script now probes for the
+    # exact RepoDigest BEFORE pulling and skips a redundant pull, so a mock that
+    # unconditionally reports "present" would make every pull test vacuous —
+    # the pull would never run and always-fail/fail-once would silently pass.
+    #
+    #   MOCK_IMAGE_PRESENT=1 -> the digest is already on the daemon (skip path)
+    #   otherwise            -> absent until a pull has succeeded
     ref="${!#}"
     if [[ "${MOCK_INSPECT_MISMATCH:-0}" == "1" ]]; then
       printf 'registry.example.test/molecule-ai/workspace-template-wrong@sha256:%064d\n' 0
-    else
+    elif [[ "${MOCK_IMAGE_PRESENT:-0}" == "1" \
+         || -e "${PULLED_STATE:?}-$(printf '%s' "$ref" | tr -c 'A-Za-z0-9' '_')" ]]; then
       printf '%s\n' "$ref"
+    else
+      # docker exits non-zero for an image that is not present locally.
+      echo "Error: No such image: $ref" >&2
+      exit 1
     fi
     ;;
   *) echo "unexpected docker invocation: $*" >&2; exit 97 ;;
@@ -148,6 +170,9 @@ CURL_LOG="$TMP_DIR/curl.log"
 DOCKER_LOG="$TMP_DIR/docker.log"
 TIMEOUT_LOG="$TMP_DIR/timeout.log"
 PULL_STATE="$TMP_DIR/pull-state"
+# Set by the mock once a pull SUCCEEDS, so `image inspect` can model "absent
+# until pulled" rather than unconditionally reporting the image present.
+PULLED_STATE="$TMP_DIR/pulled-state"
 INFISICAL_ID='fixture-client-id'
 INFISICAL_SECRET='fixture-client-secret-must-not-leak'
 ACCESS_TOKEN='fixture-access-token-must-not-leak'
@@ -182,14 +207,14 @@ run_gate() {
   : > "$CURL_LOG"
   : > "$DOCKER_LOG"
   : > "$TIMEOUT_LOG"
-  rm -f "$PULL_STATE"
+  rm -f "$PULL_STATE" "$PULLED_STATE"-*
   EXPECTED_INFISICAL_ID="$INFISICAL_ID" \
     EXPECTED_INFISICAL_SECRET="$INFISICAL_SECRET" \
     EXPECTED_ACCESS_TOKEN="$ACCESS_TOKEN" \
     EXPECTED_CP_TOKEN="$CP_TOKEN" \
     REAL_NODE="$REAL_NODE" CATALOG_FIXTURE="$CATALOG" PINS_FIXTURE="$PINS" \
     CURL_LOG="$CURL_LOG" DOCKER_LOG="$DOCKER_LOG" TIMEOUT_LOG="$TIMEOUT_LOG" \
-    PULL_STATE="$PULL_STATE" MOCK_REMOTE_HOST="$REMOTE_HOST" \
+    PULL_STATE="$PULL_STATE" PULLED_STATE="$PULLED_STATE" MOCK_REMOTE_HOST="$REMOTE_HOST" \
     DOCKER_HOST="${TEST_DOCKER_HOST:-$REMOTE_HOST}" \
     MOLECULE_PROD_DOCKER_HOST="${TEST_EXPECTED_DOCKER_HOST:-$REMOTE_HOST}" \
     DOCKER_CONTEXT="${TEST_DOCKER_CONTEXT:-}" DOCKER_TLS_VERIFY="${TEST_TLS_VERIFY:-1}" \
@@ -310,5 +335,52 @@ delay_output="$(MOCK_PULL_MODE=always-fail TEST_READINESS_TIMEOUT=10 TEST_RETRY_
 set -e
 [[ $delay_rc -ne 0 && "$delay_output" == *"retry delay would exhaust"* ]] \
   || fail "retry delay was not charged against the global deadline: $delay_output"
+
+# core#5065 — an exact RepoDigest already on the daemon must NOT be re-pulled.
+#
+# The gate's contract is "the exact promoted RepoDigest is present on the
+# provisioner daemon"; the pull is only the means to that end. Re-pulling a
+# digest that is already present adds nothing the gate asserts and buys a hard
+# dependency on the Cloudflare tunnel to the home-PC registry origin, which
+# cannot carry the 1.438GB hermes layer (job 916973 burned both attempts).
+#
+# always-fail proves the skip is real: if the pull were still attempted the gate
+# would fail, so a PASS here can only come from the skip path.
+write_good_pins
+skip_output="$(MOCK_IMAGE_PRESENT=1 MOCK_PULL_MODE=always-fail run_gate)" \
+  || fail "already-present exact digest was not skipped: $skip_output"
+if grep -q '^pull ' "$DOCKER_LOG"; then
+  fail "already-present exact digest still reached docker pull"
+fi
+[[ "$skip_output" == *"skipping redundant pull"* ]] \
+  || fail "skip path did not announce itself: $skip_output"
+[[ "$skip_output" == *"verified runtime=hermes"* ]] \
+  || fail "skip path did not still RepoDigest-verify: $skip_output"
+
+# The skip must be keyed on the EXACT ref. A daemon holding a DIFFERENT digest
+# for the same repository must still pull, then fail closed on verification —
+# otherwise the skip would rubber-stamp a stale image.
+set +e
+wrong_digest_output="$(MOCK_IMAGE_PRESENT=1 MOCK_INSPECT_MISMATCH=1 MOCK_PULL_MODE=always-fail run_gate)"
+wrong_digest_rc=$?
+set -e
+[[ $wrong_digest_rc -ne 0 ]] \
+  || fail "a mismatched local digest was accepted by the skip path: $wrong_digest_output"
+if ! grep -q '^pull ' "$DOCKER_LOG"; then
+  fail "a mismatched local digest skipped the pull instead of attempting it: $wrong_digest_output"
+fi
+
+# A failed pull must surface docker's own output. Job 916973 could only report
+# `rc=1` because docker's tty progress made the whole pull one >64KiB log line
+# that Gitea truncated, discarding the real error.
+set +e
+diag_output="$(MOCK_PULL_MODE=always-fail run_gate 2>&1)"
+diag_rc=$?
+set -e
+[[ $diag_rc -ne 0 ]] || fail "always-fail pull unexpectedly succeeded"
+[[ "$diag_output" == *"mock: simulated pull failure"* ]] \
+  || fail "docker pull output was not surfaced on failure: $diag_output"
+[[ "$diag_output" == *"docker pull output for runtime="* ]] \
+  || fail "pull-failure diagnostic header missing: $diag_output"
 
 echo "PASS: Core staging CD pre-pulls the CP-projected exact runtime digests on the guarded local-deploy daemon"

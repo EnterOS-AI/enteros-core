@@ -33,6 +33,19 @@ export function useChatSocket(
   const callbacksRef = useRef(callbacks);
   callbacksRef.current = callbacks;
 
+  // Register as a live consumer for this workspace for as long as this chat
+  // view is mounted. The store only buffers agent pushes for workspaces with a
+  // retained consumer and discards the queue when the last one releases, so a
+  // message delivered while every chat view is unmounted is dropped instead of
+  // being replayed on top of the copy the next mount hydrates from
+  // /chat-history. Must retain BEFORE the consume effect below so the very
+  // first frame after mount is buffered.
+  useEffect(() => {
+    const { retainAgentMessages, releaseAgentMessages } = useCanvasStore.getState();
+    retainAgentMessages(workspaceId);
+    return () => releaseAgentMessages(workspaceId);
+  }, [workspaceId]);
+
   // Agent push messages from global store
   const pendingAgentMsgs = useCanvasStore((s) => s.agentMessages[workspaceId]);
   useEffect(() => {

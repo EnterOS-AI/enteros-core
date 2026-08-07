@@ -415,9 +415,33 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 			if runtime == claudeCodeRuntime {
 				configFiles["system-prompt.md"] = persona
 			}
+			log.Printf("Provisioner: concierge %s composed runtime-native /configs for runtime=%q (persona grafted per convention, name=%q, %d config file(s))",
+				workspaceID, runtime, name, len(configFiles))
+		} else {
+			// NO persona resolved. composeConciergeRuntimeConfig ALWAYS grafts
+			// prompt_files: [prompts/concierge.md] for a non-claude-code runtime, so
+			// shipping `composed` now would declare a prompt file we did not deliver:
+			// the runtime loads NOTHING for its role and the concierge boots with its
+			// BASE RUNTIME identity (observed live on a hermes concierge: it introduced
+			// itself as the base template's "self-improving AI agent", had no Org
+			// Concierge role, and told the user it had no management MCP even though
+			// all 54 verbs were registered). Two things must hold here:
+			//
+			//   1. NEVER declare a prompt file that is not in configFiles. Strip the
+			//      graft so the delivered config is at least self-consistent (the
+			//      runtime falls back to its documented default) instead of silently
+			//      dangling.
+			//   2. Say so LOUDLY. The old code logged the "persona grafted" success
+			//      line on this branch too, so the one signal an operator had reported
+			//      GREEN on the exact failure it was meant to catch.
+			log.Printf("Provisioner: ERROR concierge %s runtime=%q — NO persona resolved (platform-agent template %q unavailable in configs/cache); stripping the prompt_files graft so the config does not reference an undelivered file. The concierge will boot WITHOUT its Org Concierge identity",
+				workspaceID, runtime, conciergePersonaPromptPath)
+			if stripped, serr := stripConciergePersonaGraft(composed); serr != nil {
+				log.Printf("Provisioner: concierge %s could not strip the prompt_files graft (%v) — shipping the composed config as-is", workspaceID, serr)
+			} else {
+				configFiles["config.yaml"] = stripped
+			}
 		}
-		log.Printf("Provisioner: concierge %s composed runtime-native /configs for runtime=%q (persona grafted per convention, name=%q, %d config file(s))",
-			workspaceID, runtime, name, len(configFiles))
 	}
 	return configFiles
 }
@@ -514,6 +538,56 @@ func (h *WorkspaceHandler) composeConciergeRuntimeConfig(runtime string) ([]byte
 		out = withSched
 	}
 	return out, nil
+}
+
+// stripConciergePersonaGraft removes the prompt_files graft that
+// composeConciergeRuntimeConfig unconditionally adds for a non-claude-code
+// runtime. It is used on the ONE path where that graft cannot be honored: no
+// persona bytes were resolved, so prompts/concierge.md will NOT be delivered.
+// Declaring a prompt file that is absent from /configs makes the runtime load
+// nothing for its role — the concierge then boots with its BASE RUNTIME identity
+// and no Org Concierge persona.
+//
+// Returns the re-marshaled config with the key removed; the composed bytes
+// unchanged when nothing was grafted (the claude-code path); or an error, in
+// which case the caller ships the composed config as-is — an unloadable
+// config.yaml bricks boot, so a dangling reference is still preferred over a
+// broken document (same boot-safety rule as graftConciergeSchedules).
+func stripConciergePersonaGraft(composed []byte) ([]byte, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(composed, &doc); err != nil {
+		return nil, fmt.Errorf("parse composed concierge config: %w", err)
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("composed concierge config is not a YAML mapping")
+	}
+	if !yamlMappingDelete(doc.Content[0], "prompt_files") {
+		return composed, nil // nothing grafted (claude-code) — ship unchanged.
+	}
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return nil, fmt.Errorf("marshal stripped concierge config: %w", err)
+	}
+	var probe map[string]interface{}
+	if err := yaml.Unmarshal(out, &probe); err != nil {
+		return nil, fmt.Errorf("stripped concierge config fails to re-parse: %w", err)
+	}
+	return out, nil
+}
+
+// yamlMappingDelete removes key from a mapping node, reporting whether it was
+// present (companion to yamlMappingGet/yamlMappingSet).
+func yamlMappingDelete(m *yaml.Node, key string) bool {
+	if m == nil || m.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			m.Content = append(m.Content[:i], m.Content[i+2:]...)
+			return true
+		}
+	}
+	return false
 }
 
 // graftConciergeSchedules grafts the platform-agent template's top-level

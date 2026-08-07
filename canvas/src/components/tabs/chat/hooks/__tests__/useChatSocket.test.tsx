@@ -28,6 +28,24 @@ vi.mock("@/store/canvas", () => {
       mockAgentMessages[workspaceId] = [];
       return msgs;
     },
+    // A mounted chat view retains the workspace's live hand-off queue and
+    // releases it on unmount; the last release DROPS anything undrained, so a
+    // frame delivered while nothing is mounted can never be replayed on top of
+    // the copy the next mount hydrates from /chat-history.
+    agentMessageConsumers: {} as Record<string, number>,
+    retainAgentMessages: (workspaceId: string) => {
+      state.agentMessageConsumers[workspaceId] =
+        (state.agentMessageConsumers[workspaceId] ?? 0) + 1;
+    },
+    releaseAgentMessages: (workspaceId: string) => {
+      const remaining = (state.agentMessageConsumers[workspaceId] ?? 0) - 1;
+      if (remaining > 0) {
+        state.agentMessageConsumers[workspaceId] = remaining;
+        return;
+      }
+      delete state.agentMessageConsumers[workspaceId];
+      delete mockAgentMessages[workspaceId];
+    },
   };
   const hook = (selector?: (s: typeof state) => unknown) =>
     selector ? selector(state) : state;
