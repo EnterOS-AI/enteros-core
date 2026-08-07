@@ -14,19 +14,33 @@ package handlers
 //
 // The 3-minute context beat all of them. It cancelled the provision POST, the
 // control plane's `docker pull` was torn down WITH it (the CP derives the pull
-// context from the request), and the CP logged, verbatim:
+// context from the request), and the CP logged — this line verbatim from
+// molecule-cp-PROD, 2026-08-01 00:10:09 UTC:
 //
-//	workspace provision (enteros): local workspace provision: image resolution:
-//	pinned workspace image "registry.moleculesai.app/molecule-ai/
-//	workspace-template-hermes@sha256:87e3c7d1…" is not available locally and
+//	workspace provision (local): local workspace provision: image resolution:
+//	pinned workspace image "registry.enteros.ai/…/
+//	workspace-template-hermes@sha256:beeceb1a…" is not available locally and
 //	pull failed: context canceled
 //
-// `context canceled`, not `context deadline exceeded`, is the tell: the CP's
-// own 30-minute cap did not fire — its PARENT did, and the parent is the
-// tenant's request. workspace-template-hermes is 6.89 GB. A workspace created
-// within a few minutes of a runtime-image promote could not transfer the layer
-// delta in 3 minutes, so it was marked terminally `failed` — most recently
-// 2026-08-06 06:57:23, and on 2026-08-01 00:10:09 for a real customer.
+// That is workspace c4ebf3dc-96f9-402d-a8f5-8f248b662481, org
+// 6372abfc-0673-459c-8bdd-c7864f6c9016 = reno-stars: a confirmed CUSTOMER hit,
+// and the ONLY prod occurrence in the 168h Loki window (prod 1, staging 8). The
+// staging line the classifier test below is built from is the same failure on
+// the other plane — `workspace provision (enteros)`,
+// registry.moleculesai.app/…@sha256:87e3c7d1…, 2026-08-06 06:57:23. Do not read
+// the staging recurrence as ongoing prod recurrence; it is not.
+//
+// `context canceled` is a POSITIVE discriminator, not merely the absence of a
+// timeout. dockerPullStallAware has three mutually exclusive terminal branches:
+// a parent cancellation surfaces ctx.Err(), the 30-minute cap surfaces
+// `pull exceeded absolute cap 30m0s`, and the watchdog surfaces `pull stalled`.
+// Only the first yields `context canceled` — and a separate staging failure that
+// genuinely reads `pull stalled` corroborates that the other branches do report
+// themselves distinctly.
+//
+// workspace-template-hermes is 6.89 GB. A workspace created within a few minutes
+// of a runtime-image promote could not transfer the layer delta in 3 minutes, so
+// it was marked terminally `failed`.
 //
 // Retrying is NOT the fix and these tests do not test one: a retry re-pulls
 // 6.89 GB into the same 3-minute wall.
@@ -390,7 +404,11 @@ func TestProvisionWorkspaceCP_TransientPrewarmFailureStillProvisions(t *testing.
 //	            type, an AMI id, VPC/subnet ids and a host path; none may reach
 //	            last_sample_error.
 //
-// The error text is the control plane's REAL prose, copied from CP stdout.
+// The error text is the control plane's REAL prose, copied from CP stdout — the
+// STAGING occurrence (2026-08-06, registry.moleculesai.app, sha256:87e3c7d1…),
+// which is byte-identical in shape to the prod one and is the line the
+// classifier's phrases were derived from. See the file header for the prod
+// instance and for why the two must not be conflated.
 func TestProvisionWorkspaceCP_ImageFailureIsSpecificAndSanitised(t *testing.T) {
 	leaky := errors.New(`cp provisioner: provision failed (500): local workspace provision: image resolution: ` +
 		`pinned workspace image "registry.moleculesai.app/molecule-ai/workspace-template-hermes@sha256:87e3c7d1c372418cc97b58a685ac209beb29d66edb8e6d19f97570e2c89a2a03" ` +
@@ -443,12 +461,21 @@ func TestProvisionWorkspaceCP_RuntimePinMissingIsItsOwnBucket(t *testing.T) {
 	assertNoLeak(t, lastErr, broadcast)
 }
 
-// TestProvisionWorkspaceCP_CeilingBoundaryIsReported answers "what does the
-// caller see at the boundary?". At the new 20-minute ceiling the ctx — not the
-// pull — is what fires, and the handler must publish that as its own bucket
-// rather than as an image problem. A budget with no legible boundary behaviour
-// is just a longer silence.
-func TestProvisionWorkspaceCP_CeilingBoundaryIsReported(t *testing.T) {
+// TestProvisionWorkspaceCP_CeilingBoundaryIsClassified covers the CLASSIFYING
+// half of "what does the caller see at the boundary?" — the ctx, not the pull,
+// is what fires, and it must land in its own bucket rather than be mistaken for
+// an image problem.
+//
+// It proves classification ONLY. It injects context.DeadlineExceeded as a VALUE
+// while the provision context is still alive, which is not the boundary: at the
+// real ceiling the context is EXPIRED, and that is a materially different
+// situation for everything downstream of the classifier. The DELIVERY half —
+// that the classified reason actually reaches last_sample_error once the
+// deadline has blown — is TestMarkProvisionFailed_DeliversThroughAnExpiredContext
+// and TestCeilingReasonReachesTheColumn below. Keeping the two apart is the
+// point: a test that only ever runs on a live context cannot see the gap where
+// the message is computed correctly and then silently dropped.
+func TestProvisionWorkspaceCP_CeilingBoundaryIsClassified(t *testing.T) {
 	cp := &budgetProbeCPProv{startErr: fmt.Errorf(
 		`cp provisioner: send: Post "https://cp.example/cp/workspaces/provision": %w`, context.DeadlineExceeded)}
 	lastErr, broadcast := runCreateProvision(t, "ws-reason-4", createPayload("ws-reason-4", "hermes"), cp, true)
@@ -530,5 +557,144 @@ func assertNoLeak(t *testing.T, lastSampleError string, broadcast map[string]int
 				t.Errorf("leaked %q in %q", m, v)
 			}
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 4. THE BOUNDARY, FOR REAL: DELIVERY THROUGH AN EXPIRED CONTEXT
+// ---------------------------------------------------------------------------
+
+// expiredContext returns a context whose deadline has already passed — the
+// state every caller of markProvisionFailed is in when the failure being
+// reported IS the deadline.
+func expiredContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	t.Cleanup(cancel)
+	if ctx.Err() == nil {
+		t.Fatal("expiredContext handed back a live context")
+	}
+	return ctx
+}
+
+// TestMarkProvisionFailed_DeliversThroughAnExpiredContext is the mechanism.
+//
+// database/sql checks the context BEFORE it reaches the driver, so an
+// ExecContext on a dead context returns ctx.Err() without executing. Every
+// failure whose cause is the deadline therefore arrived here holding the one
+// context guaranteed to refuse the write: the row kept status='provisioning',
+// last_sample_error stayed NULL, and the workspace with the most specific
+// reason to report was the one that reported nothing.
+//
+// This is the "evidence deleted by the operation you are investigating" shape,
+// and it is why a reason constant is not worth anything until the write that
+// carries it survives the thing it describes.
+func TestMarkProvisionFailed_DeliversThroughAnExpiredContext(t *testing.T) {
+	mock := setupTestDB(t)
+	var got string
+	mock.ExpectExec(`UPDATE workspaces SET status =`).
+		WithArgs(sqlmock.AnyArg(), captureLastSampleError{got: &got}, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	h := NewWorkspaceHandler(&captureBroadcaster{}, nil, "http://localhost:8080", t.TempDir())
+	h.markProvisionFailed(expiredContext(t), "ws-expired-1", "a reason worth keeping", nil)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("the failure was never written: %v", err)
+	}
+	if got != "a reason worth keeping" {
+		t.Errorf("last_sample_error = %q, want the reason the caller passed", got)
+	}
+}
+
+// TestCeilingReasonReachesTheColumn is the headline case, assembled from the two
+// REAL functions rather than from mocks: at the ceiling, cpProvisionFailureReason
+// classifies the deadline error and markProvisionFailed must deliver that
+// classification on the expired context the ceiling leaves behind.
+//
+// Without it the whole third change is unreachable exactly where it was written
+// to help — the improved message would be computed perfectly and then dropped,
+// leaving the customer with a failed workspace and no reason. That is the same
+// invisibility as the constant this PR removes, arriving by a different route.
+func TestCeilingReasonReachesTheColumn(t *testing.T) {
+	mock := setupTestDB(t)
+	var got string
+	mock.ExpectExec(`UPDATE workspaces SET status =`).
+		WithArgs(sqlmock.AnyArg(), captureLastSampleError{got: &got}, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// The error shape the provision client produces when the budget is spent.
+	boundaryErr := fmt.Errorf(
+		`cp provisioner: send: Post "https://cp.example/cp/workspaces/provision": %w`, context.DeadlineExceeded)
+
+	h := NewWorkspaceHandler(&captureBroadcaster{}, nil, "http://localhost:8080", t.TempDir())
+	h.markProvisionFailed(expiredContext(t), "ws-ceiling-1", cpProvisionFailureReason(boundaryErr), nil)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("the ceiling verdict never reached the column: %v", err)
+	}
+	if got != provisionFailedBudgetExhausted {
+		t.Errorf("last_sample_error = %q, want %q", got, provisionFailedBudgetExhausted)
+	}
+}
+
+// TestProvisionFailureWriteContext_LiveContextPassesThroughUnchanged is the
+// negative control, varying exactly one input — whether the caller's context has
+// failed.
+//
+// A LIVE context must be handed back AS IS. The recovery exists for a context
+// that is already dead; a version that detached unconditionally would silently
+// discard every caller's deadline and cancellation, converting bounded failure
+// writes into unbounded ones on a shutting-down process. That would be a strictly
+// worse bug than the one being fixed, and it would look identical in a test that
+// only ever passes an expired context.
+func TestProvisionFailureWriteContext_LiveContextPassesThroughUnchanged(t *testing.T) {
+	type key struct{}
+	want := time.Now().Add(7 * time.Minute)
+	live, cancel := context.WithDeadline(context.WithValue(context.Background(), key{}, "v"), want)
+	defer cancel()
+
+	got, gotCancel := provisionFailureWriteContext(live)
+	defer gotCancel()
+
+	if got != live {
+		t.Error("a live caller context was replaced — its deadline and cancellation must keep governing")
+	}
+	if dl, ok := got.Deadline(); !ok || !dl.Equal(want) {
+		t.Errorf("deadline = %v (ok=%v), want the caller's %v", dl, ok, want)
+	}
+}
+
+// TestProvisionFailureWriteContext_ExpiredIsRecoveredButStillBounded pins BOTH
+// halves of the recovery, because either alone is a bug: a replacement that is
+// not usable writes nothing, and a replacement with no deadline is an unbounded
+// write nobody is waiting for.
+//
+// It also pins value propagation. context.WithoutCancel is chosen over a bare
+// context.Background() precisely so request-scoped values survive; swapping it
+// for Background() would pass a test that only checked liveness.
+func TestProvisionFailureWriteContext_ExpiredIsRecoveredButStillBounded(t *testing.T) {
+	type key struct{}
+	dead, cancel := context.WithDeadline(
+		context.WithValue(context.Background(), key{}, "carried"), time.Now().Add(-time.Second))
+	defer cancel()
+	if dead.Err() == nil {
+		t.Fatal("precondition: the caller context should have failed")
+	}
+
+	got, gotCancel := provisionFailureWriteContext(dead)
+	defer gotCancel()
+
+	if got.Err() != nil {
+		t.Fatalf("the recovered context is already dead (%v) — the write would still be dropped", got.Err())
+	}
+	dl, ok := got.Deadline()
+	if !ok {
+		t.Error("the recovered context has NO deadline — recovering from a dead deadline must not mean running with none")
+	} else if remaining := time.Until(dl); remaining <= 0 || remaining > provisionFailureWriteBudget {
+		t.Errorf("recovered budget = %s, want (0, %s]", remaining, provisionFailureWriteBudget)
+	}
+	if got.Value(key{}) != "carried" {
+		t.Error("request-scoped values were dropped — context.WithoutCancel exists to keep them")
 	}
 }

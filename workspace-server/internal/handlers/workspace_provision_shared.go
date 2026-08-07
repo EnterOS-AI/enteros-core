@@ -42,6 +42,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
@@ -522,10 +523,59 @@ func (h *WorkspaceHandler) mintWorkspaceSecrets(ctx context.Context, workspaceID
 	h.issueAndInjectInboundSecret(ctx, workspaceID, cfg)
 }
 
+// provisionFailureWriteBudget bounds the context markProvisionFailed recovers
+// when its caller's has already failed. Matches the 10s the other
+// fresh-context failure paths use (logProvisionPanic, the no-backend branch in
+// provisionWorkspaceAuto) — enough for one broadcast plus one UPDATE, and short
+// enough that a shutting-down process is not held open by a write nobody is
+// waiting for.
+var provisionFailureWriteBudget = 10 * time.Second
+
+// provisionFailureWriteContext returns the context markProvisionFailed should
+// actually write on, plus its cancel.
+//
+// A LIVE context is returned UNCHANGED. The caller's deadline and cancellation
+// are load-bearing everywhere else and must keep governing; detaching
+// unconditionally would quietly convert every bounded failure write into an
+// unbounded one.
+//
+// A context that has ALREADY FAILED is replaced. This is not defensive
+// programming — it is the only case that matters, because the failures with the
+// most specific reason to report are precisely the ones whose context is the
+// thing that failed. database/sql checks the context BEFORE it reaches the
+// driver, so ExecContext on a dead context returns ctx.Err() without executing:
+// the row keeps status='provisioning', last_sample_error stays NULL, and the
+// operation destroys the evidence of itself. A ceiling with no verdict in the
+// column is the same invisibility as a constant message, reached by a different
+// route.
+//
+// context.WithoutCancel keeps request-scoped VALUES (so anything reading them
+// downstream still works) while dropping the expiry, and the fresh WithTimeout
+// puts the write straight back under a bound — recovering from a dead deadline
+// must not mean running with none.
+func provisionFailureWriteContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx.Err() == nil {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), provisionFailureWriteBudget)
+}
+
 // markProvisionFailed is the standard "abort with message" path used
 // by both provision modes. Wraps the broadcast + DB update in one
 // call so the failure shape stays consistent across modes.
+//
+// Survives its own caller's deadline — see provisionFailureWriteContext. Both
+// the broadcast and the UPDATE run on the recovered context, because a canvas
+// that never receives the event is as blind as a column that never receives the
+// message.
 func (h *WorkspaceHandler) markProvisionFailed(ctx context.Context, workspaceID, msg string, extra map[string]interface{}) {
+	if err := ctx.Err(); err != nil {
+		log.Printf("markProvisionFailed: %s — caller context already failed (%v); recording the failure on a fresh %s context so the reason is not lost with it",
+			workspaceID, err, provisionFailureWriteBudget)
+	}
+	ctx, cancel := provisionFailureWriteContext(ctx)
+	defer cancel()
+
 	if extra == nil {
 		extra = map[string]interface{}{"error": msg}
 	} else if _, hasErr := extra["error"]; !hasErr {
