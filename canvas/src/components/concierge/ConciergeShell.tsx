@@ -586,8 +586,37 @@ export function ConciergeShell() {
                   </div>
                   <div className={s.embedChat}>
                     {/* key=chatId remounts ChatTab on selection change so the
-                        history/composer state never bleeds between agents. */}
-                    <ChatTab key={chatId} workspaceId={chatId} data={chatNode.data} />
+                        history/composer state never bleeds between agents.
+
+                        MOUNT-GATED on the Home view being active — the same
+                        `{topView === "..." && ...}` gate the Org-map view
+                        already uses for <Canvas/> below. `.view` is a bare
+                        display:none swap, so WITHOUT this gate the Home
+                        ChatTab stays mounted and live while the user is on
+                        the Org map. Because resolveHomeChatTarget follows
+                        `selectedNodeId`, selecting a workspace node on the
+                        map re-points this hidden ChatTab at the SAME
+                        workspace as the visible SidePanel ChatTab — two live
+                        subscribers for one workspace.
+
+                        useChatSocket delivers a live AGENT_MESSAGE via
+                        useCanvasStore.consumeAgentMessages(), which DELETES
+                        the queue on read. Whichever of the two effects ran
+                        first won; when the hidden one won, the visible panel
+                        never saw the message at all and it only surfaced
+                        ~10s later via useChatHistory's RECONCILE_INTERVAL_MS
+                        poll. That is the E2E Chat
+                        "agent /notify delivery reaches the canvas chat"
+                        flake (assertion budget 10s vs ~9.9s delivery), and
+                        for a real user it is a self-initiated agent message
+                        (digest reply, send_message_to_user, proactive
+                        update) taking up to 10 seconds to appear.
+
+                        A display:none panel must not consume live state on
+                        behalf of the panel the user is actually looking at. */}
+                    {topView === "home" && (
+                      <ChatTab key={chatId} workspaceId={chatId} data={chatNode.data} />
+                    )}
                   </div>
                 </section>
               ) : (

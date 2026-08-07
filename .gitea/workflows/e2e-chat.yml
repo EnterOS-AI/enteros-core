@@ -9,10 +9,75 @@ name: E2E Chat
 #   1. Ephemeral Postgres + Redis (docker, unique container names)
 #   2. workspace-server built from source, started with
 #      MOLECULE_ENV=development with fail-closed ADMIN_TOKEN auth
-#   3. canvas dev server (npm run dev) on :3000
+#   3. canvas served from a PRODUCTION build (`next build` + the
+#      `output: "standalone"` node server — the same artifact
+#      canvas/Dockerfile ships), NOT `next dev --turbopack`. See
+#      "Why a production build" below.
 #   4. Playwright tests create workspaces via API, point them at an
 #      in-process echo runtime, and exercise the full send/receive
 #      round-trip through the browser.
+#
+# Why a production build (2026-08-05, core#5079 blocker)
+# ------------------------------------------------------
+# This lane used `npx next dev --turbopack`. It failed non-deterministically
+# in ONE mode: React Flow rendered UNSTYLED, so `.react-flow__background`
+# kept its browser-default `pointer-events: auto` and swallowed every click
+# on the canvas; specs died with `<rect …> from <svg data-testid=
+# "rf__background"> subtree intercepts pointer events`. Diagnostics captured
+# on a stuck page (run 623425, job 921290):
+#
+#     react-flow background pointer-events = auto
+#     stylesheets = 1 (1 readable), .react-flow__background rule present = false
+#     viewport transform = translate(314px, -204px) scale(2)
+#
+# i.e. a Turbopack CSS chunk never arrived and the page NEVER recovered.
+# Document requests were returning in 40–77 ms, so it was not slow
+# compilation. Observed 2 failures in 4 runs on core#5079
+# (623210 ✗, 623299 ✓, 623425 ✗, 622625 ✓).
+#
+# `next build` emits immutable, content-hashed CSS files that are NAMED by
+# the initial document — this one as `<link rel="preload" as="style">` plus
+# an RSC-payload stylesheet entry React inserts at hydration. (Checked
+# against a real build: the only plain `<link rel="stylesheet">` tags in the
+# initial HTML are the two LAYOUT sheets.) There is no on-demand chunk
+# compilation left, which removes the COMPILATION mechanism behind the flake.
+#
+# It does NOT remove every mechanism, and this file will not pretend
+# otherwise. A stylesheet request that is merely SLOW makes React suspend the
+# subtree (`pointer-events: none`, no unstyled window); a request that FAILS
+# makes React render anyway, reproducing the same unstyled window. Measured
+# over this lane’s own runs: ~1 occurrence in 29 production-build runs
+# against 3 in 30 dev runs. Substantially more reliable, not immune.
+#
+# What this costs / what it changes:
+#   - `next build` is added to the job. MEASURED on this runner: 23-29s
+#     across 9 runs; a whole green job is ~2.0 min wall (it was ~2.0 min
+#     on the dev lane, which paid a comparable cold Turbopack compile).
+#     timeout-minutes stays 15 and was NOT raised: the worst case seen
+#     here is a totally broken canvas (every click times out at 30s),
+#     which finished RED in 11.7 min.
+#   - NEXT_PUBLIC_* are INLINED AT BUILD TIME by Next.js, so the build MUST
+#     run AFTER the platform port and admin token are chosen. The build step
+#     asserts the inline actually happened — a bundle built with the wrong
+#     port starts fine and fails subtly.
+#   - NO build cache is added. The bundle embeds per-run values (platform
+#     port, per-run admin token), so a restored bundle would be a WRONG
+#     bundle that still boots. `actions/setup-node`'s npm cache (lockfile
+#     keyed) is the only cache here and is unchanged.
+#   - The suite now runs against the PRODUCTION CSP from src/middleware.ts
+#     (`NODE_ENV=production` → nonce + strict-dynamic + a connect-src
+#     allowlist) instead of the permissive dev CSP (`connect-src *`). That
+#     is the policy real users get; a CSP regression is now caught here.
+#   - `next build` type-checks and lints (next.config.ts leaves
+#     eslint.ignoreDuringBuilds / typescript.ignoreBuildErrors at false, as
+#     production wants), so a canvas type/lint error now reds this lane too.
+#     That mirrors what canvas/Dockerfile and publish-canvas-image.yml
+#     already do; nothing was loosened to accommodate it.
+#
+# Nothing in the suite depended on dev-only behaviour: no spec references
+# fast refresh, the Next dev error overlay, source maps, or NODE_ENV. The
+# `MOLECULE_ENV=development` the specs DO assert on belongs to the Go
+# platform-server and is untouched by this change.
 #
 # Parallel-safety: same pattern as e2e-api.yml — per-run container names
 # and ephemeral host ports so concurrent jobs on the host-network runner
@@ -292,25 +357,96 @@ jobs:
           fi
           npx playwright install --with-deps chromium
 
-      - name: Start canvas dev server (background)
+      - name: Build canvas (production bundle)
         working-directory: canvas
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
         run: |
+          set -euo pipefail
+          # NEXT_PUBLIC_* are INLINED INTO THE CLIENT BUNDLE BY `next build`.
+          # They are NOT read at runtime, so this step must run AFTER "Pick
+          # platform port" and "Set deterministic admin token" — building
+          # first and exporting later yields a bundle that boots happily and
+          # talks to the wrong port / presents the wrong bearer token.
           export NEXT_PUBLIC_PLATFORM_URL="http://127.0.0.1:${PLATFORM_PORT}"
           export NEXT_PUBLIC_WS_URL="ws://127.0.0.1:${PLATFORM_PORT}/ws"
-          npx next dev --turbopack -p "${CANVAS_PORT}" > canvas.log 2>&1 &
-          echo $! > canvas.pid
-          # Readiness must wait for the actual chat route to *compile*, not
-          # just for the dev server to bind the port. `next dev --turbopack`
-          # accepts the TCP connection well before it has compiled a route
-          # on first request, so a bare `curl /` can 200 (or hang) while the
-          # page the tests load is still building. We therefore probe the
-          # real route the specs navigate to (`/?m=chat`) and require a 2xx,
-          # which only happens once Turbopack has finished the first
-          # compile. The previous 30s budget was also too tight for a cold
-          # Turbopack first-compile on a loaded docker-host runner — the
-          # `Canvas did not start in 30s` flake. Raise to 120s (job
-          # timeout-minutes is 15, so this is comfortably bounded) and probe
-          # every 2s.
+          start=$(date +%s)
+          npx next build
+          echo "next build completed in $(( $(date +%s) - start ))s"
+
+          # --- Prove the build is the build we asked for -------------------
+          # A wrong-but-bootable bundle is the failure mode a production
+          # build introduces, so assert the inlining instead of trusting it.
+          #
+          # Each assertion first proves its own INPUT is non-empty. `set -u`
+          # only catches an UNSET variable; an EMPTY one sails straight
+          # through and turns `grep -qF "$X"` into a match-everything no-op
+          # that reports success. A guard that passes on empty input is
+          # exactly the vacuous-pass class this lane exists to keep out of
+          # the tree, so it must not live in the lane’s own guards. Both
+          # cases have an empty-input proof recorded on the PR.
+          if [ -z "${PLATFORM_PORT:-}" ]; then
+            echo "::error::PLATFORM_PORT is empty — 'Pick platform port' did not run, and the inlining check below would collapse to a search for the bare '127.0.0.1:' prefix. Refusing to assert vacuously."
+            exit 1
+          fi
+          if [ -z "${NEXT_PUBLIC_ADMIN_TOKEN:-}" ]; then
+            echo "::error::NEXT_PUBLIC_ADMIN_TOKEN is empty — 'Set deterministic admin token' did not run, and grepping for the empty string matches EVERY file, so the check below would pass having asserted nothing."
+            exit 1
+          fi
+          if ! grep -rqF "127.0.0.1:${PLATFORM_PORT}" .next/static/chunks; then
+            echo "::error::NEXT_PUBLIC_PLATFORM_URL (127.0.0.1:${PLATFORM_PORT}) was not inlined into the client bundle — the canvas would call the wrong platform. Check step ordering: the build must run after 'Pick platform port'."
+            exit 1
+          fi
+          # -q so the token value is never echoed into the log.
+          if ! grep -rqF "${NEXT_PUBLIC_ADMIN_TOKEN}" .next/static/chunks; then
+            echo "::error::NEXT_PUBLIC_ADMIN_TOKEN was not inlined into the client bundle — every workspace API call would 401. Check step ordering: the build must run after 'Set deterministic admin token'."
+            exit 1
+          fi
+          # The regression this lane switched build modes to kill: React Flow
+          # rendering unstyled because its stylesheet never reached the page.
+          # In a production build the rule lives in a content-hashed CSS file
+          # on disk, so its ABSENCE is a build defect and must be loud here
+          # rather than showing up as a 15s "node never became hittable".
+          RF_CSS=$(grep -rlF 'react-flow__background' .next/static/css | head -1 || true)
+          if [ -z "$RF_CSS" ]; then
+            echo "::error::No built stylesheet contains .react-flow__background — @xyflow/react/dist/style.css did not make it into the production CSS output; every canvas click would be swallowed by the unstyled background."
+            exit 1
+          fi
+          echo "RF_CSS_PATH=/_next/static/css/$(basename "$RF_CSS")" >> "$GITHUB_ENV"
+          echo "React Flow stylesheet: $(basename "$RF_CSS")"
+
+          # Assemble the standalone runtime exactly as canvas/Dockerfile does
+          # (`COPY .next/standalone`, `.next/static`, `public`). `next start`
+          # is NOT usable here — Next 15 prints "next start does not work with
+          # output: standalone" — so we run the same `node server.js` entry
+          # point production runs.
+          cp -r .next/static .next/standalone/.next/static
+          cp -r public .next/standalone/public
+
+      - name: Start canvas (production server, background)
+        working-directory: canvas
+        run: |
+          set -euo pipefail
+          # Single node process (not an `npx` wrapper), so the pid we record
+          # is the pid the cleanup step actually kills.
+          #
+          # HOSTNAME MUST be set explicitly. Next's standalone server.js does
+          # `process.env.HOSTNAME || '0.0.0.0'`, and on this runner HOSTNAME
+          # is the container's own name — the server then bound
+          # `http://robot-2:35783` and every `localhost` probe got HTTP 000
+          # (observed: run 623567). Pin the loopback address the rest of this
+          # lane already uses (Postgres/Redis/platform all bind 127.0.0.1);
+          # `localhost` resolves to it on this runner, which is exactly how
+          # the dev server was being reached before.
+          cd .next/standalone
+          PORT="${CANVAS_PORT}" HOSTNAME=127.0.0.1 node server.js > ../../canvas.log 2>&1 &
+          echo $! > ../../canvas.pid
+          cd ../..
+          # Readiness is the real signal, not a sleep: poll the exact route
+          # the specs navigate to (`/?m=chat`) until it answers 2xx. A
+          # production server has nothing to compile, so this settles in
+          # ~1s; the budget stays 120s only as an upper bound (unchanged
+          # from the dev lane — it is a deadline, not a wait).
           READY=""
           for i in $(seq 1 60); do
             # Tempfile-routed -w + set +e/-e prevents curl-exit-code
@@ -320,17 +456,61 @@ jobs:
             set -e
             CODE=$(cat /tmp/canvas-ready.code 2>/dev/null || echo "000")
             if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 400 ]; then
-              echo "Canvas (chat route compiled) up after ~$((i*2))s (HTTP ${CODE})"
+              echo "Canvas (production server) up after ~$((i*2))s (HTTP ${CODE})"
               READY=1
               break
             fi
             sleep 2
           done
           if [ -z "$READY" ]; then
-            echo "::error::Canvas chat route did not compile in 120s (last HTTP ${CODE})"
+            echo "::error::Canvas production server did not answer /?m=chat in 120s (last HTTP ${CODE})"
             cat canvas.log || true
             exit 1
           fi
+
+          # --- React Flow stylesheet: NAMED by the document, and SERVED ----
+          #
+          # Read this as exactly what it checks, no more. Next does NOT emit
+          # this file as a plain `<link rel="stylesheet">` in the initial
+          # HTML — it emits `<link rel="preload" as="style">` plus an
+          # RSC-payload entry that React turns into a stylesheet during
+          # hydration. (The only plain stylesheet links in the initial
+          # document are the two LAYOUT sheets.) So these assertions prove
+          # AVAILABILITY: the document names the exact hashed asset, the
+          # server serves it, and it carries the rule. They do NOT prove the
+          # rule ends up APPLIED in the browser — a sheet that is named,
+          # fetched, and then never applied still passes here. What catches
+          # that is the suite itself, which cannot click the canvas when the
+          # rule is not in effect.
+          #
+          # Non-empty first: grepping for the empty string matches every
+          # file, so an empty RF_CSS_PATH would make the document check a
+          # no-op that reports success.
+          if [ -z "${RF_CSS_PATH:-}" ]; then
+            echo "::error::RF_CSS_PATH is empty — the build step did not export it. The document check below would search for the empty string, which matches every file. Refusing to assert vacuously."
+            exit 1
+          fi
+          set +e
+          curl -s -o /tmp/canvas-doc.html -w '%{http_code}' "http://localhost:${CANVAS_PORT}/?m=chat" > /tmp/canvas-doc.code
+          curl -s -o /tmp/canvas-rf.css -w '%{http_code}' "http://localhost:${CANVAS_PORT}${RF_CSS_PATH}" > /tmp/canvas-rf.code
+          set -e
+          RF_CODE=$(cat /tmp/canvas-rf.code 2>/dev/null || echo "000")
+          # Anchor on the full href, not the bare basename: that pins the
+          # match to the real preload link rather than any incidental
+          # occurrence of the hash.
+          if ! grep -qF 'href="'"${RF_CSS_PATH}"'"' /tmp/canvas-doc.html; then
+            echo "::error::The served /?m=chat document does not name ${RF_CSS_PATH} — the page would never fetch the React Flow stylesheet and the canvas background would swallow every click."
+            exit 1
+          fi
+          if [ "$RF_CODE" != "200" ]; then
+            echo "::error::${RF_CSS_PATH} is not served (HTTP ${RF_CODE}) — the standalone static assets were not assembled."
+            exit 1
+          fi
+          if ! grep -qF 'react-flow__background' /tmp/canvas-rf.css; then
+            echo "::error::${RF_CSS_PATH} served but does not contain the .react-flow__background rule."
+            exit 1
+          fi
+          echo "React Flow stylesheet named by the document and served OK (${RF_CSS_PATH})"
 
       - name: Run Playwright E2E tests
         working-directory: canvas

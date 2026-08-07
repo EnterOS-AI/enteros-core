@@ -394,18 +394,53 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 	if configFiles == nil {
 		configFiles = map[string][]byte{}
 	}
-	if composed, err := h.composeConciergeRuntimeConfig(runtime); err != nil {
-		// Base config unavailable (template-cache miss / a test without the
-		// template tree). Fall back to the delivered config UNCHANGED and keep the
-		// historical {{CONCIERGE_NAME}} substitution so we never regress the
-		// claude-code path — but log loudly so a real cache miss is visible.
+	// Resolve the concierge's identity name ONCE, here, and use that ONE value for
+	// BOTH the composed config.yaml and the persona's {{CONCIERGE_NAME}}
+	// substitution. Previously the raw `name` went to both while the
+	// empty-name fallback lived only inside composeConciergeRuntimeConfig: an empty
+	// name (reachable on restart paths that do not hydrate payload.Name from the
+	// workspace row — see workspace_dispatchers.go) produced
+	// `name: Org Concierge` in config.yaml and `# You are  — the Org Concierge` in
+	// the persona. The agent card and the system prompt then disagreed about who
+	// the agent is, which is the SAME class of defect (two competing identities in
+	// one prompt) this whole change exists to remove.
+	identityName := resolveConciergeIdentityName(workspaceID, runtime, name)
+	if composed, err := h.composeConciergeRuntimeConfig(runtime, identityName); err != nil {
+		// Base config unavailable (template-cache miss after a fleet restart, an
+		// image without the template tree, a test without fixtures). Fall back to
+		// the delivered config and keep the historical {{CONCIERGE_NAME}}
+		// substitution so we never regress the claude-code path — but log loudly so
+		// a real cache miss is visible.
 		log.Printf("Provisioner: concierge %s could not compose runtime-native config for runtime=%q (%v) — keeping delivered config + {{CONCIERGE_NAME}} substitution", workspaceID, runtime, err)
+		// The DELIVERED config.yaml is frequently the runtime BASE template itself
+		// (that is what the asset channel ships), so falling through UNCHANGED here
+		// re-shipped the vendor `name`/`description` — i.e. the exact incident, on
+		// the exact degraded path this branch documents. Apply the identity
+		// override to the delivered bytes too.
+		//
+		// BOOT SAFETY (same rule as graftConciergeSchedules / stripConciergePersonaGraft):
+		// an unloadable config.yaml BRICKS boot, so on ANY problem — no delivered
+		// config, unparseable, not a mapping, failed round-trip — we ship the
+		// delivered bytes UNCHANGED and log at ERROR. A wrong identity is bad; a
+		// workspace that cannot boot is worse.
+		if delivered, ok := configFiles["config.yaml"]; ok && len(delivered) > 0 {
+			if fixed, oerr := overrideConciergeIdentityBytes(delivered, identityName); oerr != nil {
+				log.Printf("Provisioner: ERROR concierge %s runtime=%q — could not override the vendor identity on the DELIVERED config.yaml (%v); shipping it UNCHANGED to stay boot-safe. If that config came from the runtime base template the concierge will boot with the VENDOR name/description as its Role and may introduce itself as the vendor's agent",
+					workspaceID, runtime, oerr)
+			} else {
+				configFiles["config.yaml"] = fixed
+				log.Printf("Provisioner: concierge %s runtime=%q — compose unavailable; overrode name/description on the DELIVERED config.yaml (name=%q) so no vendor identity ships",
+					workspaceID, runtime, identityName)
+			}
+		} else {
+			log.Printf("Provisioner: concierge %s runtime=%q — compose unavailable and NO config.yaml was delivered; nothing to identity-override", workspaceID, runtime)
+		}
 		if prompt, ok := configFiles["system-prompt.md"]; ok {
-			configFiles["system-prompt.md"] = substituteConciergeName(prompt, name)
+			configFiles["system-prompt.md"] = substituteConciergeName(prompt, identityName)
 		}
 	} else {
 		configFiles["config.yaml"] = composed
-		persona := substituteConciergeName(h.resolveConciergePersonaBytes(configFiles), name)
+		persona := substituteConciergeName(h.resolveConciergePersonaBytes(configFiles), identityName)
 		if len(persona) > 0 {
 			// Always land the persona at prompts/concierge.md (the path the
 			// grafted prompt_files references for non-claude-code runtimes); ALSO
@@ -416,7 +451,7 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 				configFiles["system-prompt.md"] = persona
 			}
 			log.Printf("Provisioner: concierge %s composed runtime-native /configs for runtime=%q (persona grafted per convention, name=%q, %d config file(s))",
-				workspaceID, runtime, name, len(configFiles))
+				workspaceID, runtime, identityName, len(configFiles))
 		} else {
 			// NO persona resolved. composeConciergeRuntimeConfig ALWAYS grafts
 			// prompt_files: [prompts/concierge.md] for a non-claude-code runtime, so
@@ -496,7 +531,12 @@ func conciergeBaseTemplateName(runtime string) string {
 //   - prompt_files -> [prompts/concierge.md]  for every NON-claude-code runtime
 //     (the persona is the sole system-prompt file; claude-code reads
 //     system-prompt.md, delivered separately, so its prompt_files is untouched).
-func (h *WorkspaceHandler) composeConciergeRuntimeConfig(runtime string) ([]byte, error) {
+//   - name/description -> the ORG CONCIERGE's (setConciergeIdentity). These two
+//     fields, and ONLY these two, are what the runtime renders into the system
+//     prompt as the agent's Role. Vendor strings that survive elsewhere in the
+//     document (YAML comments, provider notes, model display names) are not
+//     rendered and are deliberately left alone.
+func (h *WorkspaceHandler) composeConciergeRuntimeConfig(runtime, conciergeName string) ([]byte, error) {
 	base := conciergeBaseTemplateName(runtime)
 	dir, err := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, base)
 	if err != nil {
@@ -519,6 +559,29 @@ func (h *WorkspaceHandler) composeConciergeRuntimeConfig(runtime string) ([]byte
 	if rc := yamlMappingGet(root, "runtime_config"); rc != nil && rc.Kind == yaml.MappingNode {
 		yamlMappingSet(rc, "required_env", yamlEmptySeq())
 	}
+	// Replace the base template's VENDOR identity with the ORG CONCIERGE's.
+	//
+	// The base config's `name`/`description` describe the runtime vendor — for
+	// the default hermes runtime, "Hermes Agent" / "Nous Research hermes-agent —
+	// the self-improving AI agent …". The runtime renders `description` into the
+	// system prompt as the agent's **Role**, so leaving it in place seats a
+	// SECOND, COMPETING IDENTITY beside the grafted Org Concierge persona and the
+	// model chooses between them non-deterministically.
+	//
+	// Observed on prod 2026-08-06: two concierges on the same build, both with a
+	// correct fully-substituted persona at prompts/concierge.md — one introduced
+	// itself as the org concierge, the other as "Hermes Agent, operated by Nous
+	// Research — a self-improving AI agent", quoting this description. Clearing
+	// the persona's conversation history did NOT fix the second one; overriding
+	// these two fields did. Delivering the persona (#2890) is necessary but not
+	// sufficient — the competing identity has to go with it.
+	//
+	// The override mutates `root` IN PLACE, i.e. the same node tree both exits of
+	// this function marshal — the plain `out` below AND the re-marshal inside
+	// graftConciergeSchedules. Applying it to a copy (or to the marshaled bytes)
+	// would silently drop the identity on the grafted path, which is the path every
+	// self-host concierge takes.
+	setConciergeIdentity(root, resolveConciergeIdentityName("(compose)", runtime, conciergeName))
 	// Graft the persona per the runtime's convention. claude-code reads
 	// system-prompt.md (delivered separately); every other runtime reads the
 	// prompt_files list, so the persona becomes its sole prompt file.
@@ -713,6 +776,102 @@ func yamlStringSeq(items ...string) *yaml.Node {
 	return seq
 }
 
+// yamlString returns a plain string scalar node.
+func yamlString(v string) *yaml.Node {
+	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: v}
+}
+
+// conciergeFallbackName is the identity used when the caller could not resolve
+// the org's concierge name. It is deliberately generic-but-correct: an unknown
+// name is NOT a reason to fall back to the base runtime template's vendor name,
+// which is the very identity this override exists to remove.
+const conciergeFallbackName = "Org Concierge"
+
+// resolveConciergeIdentityName resolves the ONE name the concierge is known by.
+//
+// It exists so config.yaml and prompts/concierge.md can never disagree. The
+// empty-name fallback used to live inside composeConciergeRuntimeConfig only,
+// while applyConciergeProvisionConfig passed the RAW name to
+// substituteConciergeName — so an empty name yielded `name: Org Concierge` in the
+// agent card and `# You are  — the Org Concierge` in the persona: two documents,
+// two different answers to "who are you". Callers resolve once and thread the
+// result everywhere.
+//
+// An empty name is reachable in production: restart/reconcile paths that do not
+// hydrate payload.Name from the workspace row (a hazard workspace_dispatchers.go
+// documents) call in with "". Logged, because a nameless concierge is a real
+// upstream defect that should be visible — but never fatal, and NEVER a reason to
+// fall back to the base runtime template's vendor name.
+//
+// scope is only a log label (workspace id, or "(compose)" for a direct compose).
+func resolveConciergeIdentityName(scope, runtime, conciergeName string) string {
+	if n := strings.TrimSpace(conciergeName); n != "" {
+		return n
+	}
+	log.Printf("Provisioner: concierge %s runtime=%q got an EMPTY concierge name — falling back to %q for BOTH config.yaml and the persona substitution, rather than the base template's vendor name",
+		scope, runtime, conciergeFallbackName)
+	return conciergeFallbackName
+}
+
+// setConciergeIdentity writes the ORG CONCIERGE identity onto a config root
+// mapping node, replacing whatever vendor `name`/`description` the base runtime
+// template carried. It is the SSOT for the override so the composed path and the
+// compose-ERROR fallback path can never drift apart.
+//
+// Only these two fields are rewritten. Vendor strings elsewhere in a real runtime
+// template — YAML comments, provider notes, model display names — are NOT touched
+// and NOT rendered as the agent's Role, so they are out of scope by design (see
+// concierge_identity_name_description_test.go, which measures exactly that against
+// the real 477-line hermes template).
+func setConciergeIdentity(root *yaml.Node, name string) {
+	yamlMappingSet(root, "name", yamlString(name))
+	yamlMappingSet(root, "description", yamlString(conciergeRoleDescription))
+}
+
+// overrideConciergeIdentityBytes applies setConciergeIdentity to an ALREADY
+// SERIALIZED config.yaml. It is the compose-ERROR fallback's path: when
+// composeConciergeRuntimeConfig cannot reach the runtime's base template, the
+// config we ship is whatever was DELIVERED — which is frequently that same base
+// template, vendor identity and all.
+//
+// Boot-safety contract (same rule as graftConciergeSchedules /
+// stripConciergePersonaGraft): this returns an error rather than a
+// best-effort document on ANY problem — empty input, unparseable YAML, a
+// non-mapping root, a failed marshal, or output that does not re-parse. The
+// caller must then ship the input UNCHANGED. An unloadable config.yaml bricks
+// workspace boot, so a wrong identity always loses to a broken document.
+func overrideConciergeIdentityBytes(cfg []byte, name string) ([]byte, error) {
+	if len(strings.TrimSpace(string(cfg))) == 0 {
+		return nil, fmt.Errorf("delivered config.yaml is empty")
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(cfg, &doc); err != nil {
+		return nil, fmt.Errorf("parse delivered config.yaml: %w", err)
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("delivered config.yaml is not a YAML mapping")
+	}
+	setConciergeIdentity(doc.Content[0], name)
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return nil, fmt.Errorf("marshal identity-overridden config.yaml: %w", err)
+	}
+	var probe map[string]interface{}
+	if err := yaml.Unmarshal(out, &probe); err != nil {
+		return nil, fmt.Errorf("identity-overridden config.yaml fails to re-parse: %w", err)
+	}
+	return out, nil
+}
+
+// conciergeRoleDescription replaces the base runtime template's vendor blurb.
+// The runtime renders `description` into the system prompt as the agent's
+// **Role**, so this text is prompt material, not documentation — it must
+// describe the org-concierge role and name no runtime vendor.
+const conciergeRoleDescription = "The organization's platform agent — the org concierge. " +
+	"The single org-root agent above every workspace, and the organization's one front door: " +
+	"the default chat target for its members. An orchestrator that routes and delegates work to " +
+	"workspaces rather than performing it directly."
+
 // conciergeNamePlaceholder is the {{CONCIERGE_NAME}} marker the template's
 // prompts/concierge.md carries where the per-instance name goes. The runtime's
 // build_system_prompt does NOT template prompt files, so applyConciergeProvisionConfig
@@ -731,10 +890,12 @@ func substituteConciergeName(prompt []byte, name string) []byte {
 	// on the hot path. strings.Replace is in the standard library and
 	// handles the empty-name case safely (the placeholder is replaced
 	// with "" — leaving the prompt with a blank first line. We
-	// intentionally do NOT guard against empty name here: the caller
-	// (defaultPlatformAgentName) guarantees a non-empty name; if it
-	// somehow becomes empty, an empty first line is the louder failure
-	// mode (visible in the agent's startup log) than a silent skip.
+	// intentionally do NOT guard against empty name here: the concierge
+	// caller resolves the name through resolveConciergeIdentityName, which
+	// guarantees a non-empty value AND is the SAME value written into
+	// config.yaml, so the two documents cannot disagree. If some other
+	// caller passes an empty name, an empty first line is the louder
+	// failure mode (visible in the agent's startup log) than a silent skip.
 	// CR2 RC 11903 QF1004: strings.ReplaceAll (replaces all) replaces
 	// the legacy strings.Replace(s, old, new, -1) "replace all" idiom
 	// with the dedicated stdlib helper.
