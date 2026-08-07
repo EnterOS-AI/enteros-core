@@ -42,11 +42,19 @@
 package db
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// errKilledMidMigration is what the crash seam returns. It lives HERE and not
+// beside the seam: production never produces it, and a sentinel declared in
+// production code that only an integration-tagged test can reach reads as dead
+// code to every linter run without that tag (golangci-lint caught exactly
+// that).
+var errKilledMidMigration = errors.New("migration boot killed after DDL, before the ledger row (test seam)")
 
 // crashAfterDDL wires the production crash seam so the run fails at exactly the
 // point the kubelet killed the rehearsal tenant: after the migration's own SQL

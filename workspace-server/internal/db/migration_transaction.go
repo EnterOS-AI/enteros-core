@@ -71,22 +71,19 @@ package db
 // place — and only then reads the SQL.
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"regexp"
 	"strings"
 )
 
-// errKilledMidMigration is what the crash seam returns. It exists so the
-// integration gate can reproduce the kubelet's kill at the exact instruction
-// boundary the rehearsal died on; production never sets the seam.
-var errKilledMidMigration = errors.New("migration boot killed after DDL, before the ledger row (test seam)")
-
 // migrationCrashAfterDDL is nil in production. It is the ONLY way to observe
 // the atomicity property from a test: the property is about what survives an
 // abrupt death between two writes, and nothing short of dying between them
-// measures it.
+// measures it. The error it returns is the TEST's to define
+// (errKilledMidMigration, in migration_atomicity_test.go) — nothing in
+// production ever produces one, and a sentinel declared here would be dead code
+// under every build tag but the integration one.
 var migrationCrashAfterDDL func(filename string) error
 
 // migrationPlan is how one file will be applied.
@@ -240,7 +237,7 @@ func blankRanges(s string, bounds ...int) string {
 // valid.
 //
 // Handles: -- line comments, /* */ block comments (Postgres nests them),
-// 'single-quoted' strings with the '' escape, "quoted identifiers", and
+// 'single-quoted' strings with the ” escape, "quoted identifiers", and
 // $tag$ dollar-quoted $tag$ bodies — the last because four migrations define
 // functions whose bodies contain semicolons and SQL keywords that would
 // otherwise be read as top-level statements.
