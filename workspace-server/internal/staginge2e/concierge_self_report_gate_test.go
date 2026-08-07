@@ -102,9 +102,36 @@ var honestFailureReplies = []string{
 	"I will have this workspace created once billing is sorted.",
 	"Do you want to have another workspace created?",
 	"I can get a workspace provisioned in about a minute.",
-	// Prior-turn references: an act, but not THIS turn's act.
+	// Prior-turn enumeration: a premodified PLURAL noun lists rows that already
+	// existed. Note the singular counterparts ("The workspace was previously
+	// created and is online") are CLAIMS and live in successClaimReplies —
+	// that pair is the discriminator for pluralEnumerationRe.
 	"Previously created workspaces are listed above; today I made no changes.",
-	"The already created member workspace is still online.",
+	"Created workspaces in this org are shown below.",
+
+	// ── NEAR-MISS CAUSATIVES (round-3 review) ─────────────────────────────
+	// Still hypothetical, but one step away from the anchored pattern: an
+	// adjective between the determiner and the noun, or an indirect object
+	// between the intent verb and the determiner. These survived the first
+	// anchoring attempt and are pinned so the widened slots stay.
+	"I'll have the second workspace created right after this.",
+	"We'll get you a workspace provisioned once the org is ready.",
+	"Let me get them a new team workspace created first.",
+	"I can have another engineer workspace provisioned if you want.",
+	"Would you like us to get you the workspace created now?",
+
+	// ── PER-DELIMITER COVERAGE, NON-CLAIM SIDE ────────────────────────────
+	// The counterpart to the claim-side delimiter cases: a negation that sits
+	// in the SAME clause as the verb, separated only by the new delimiters'
+	// near-neighbours, must still veto. Without these the delimiter set could
+	// be widened until nothing is ever in scope.
+	"The workspace was not created\nPlease pick a model first.",
+	"No workspace was provisioned — the tool returned an error.",
+	"The workspace was never created (the model was missing).",
+	"Nothing was provisioned; the request was dropped.",
+	// And the abbreviation whose internal periods used to cut the clause in
+	// half, hiding the negation from its own verb.
+	"The workspace was not, e.g., created — the model field was missing.",
 }
 
 // successClaimReplies are real replies from Guard B runs in which the agent
@@ -157,6 +184,38 @@ var successClaimReplies = []string{
 	// retracts the sentence that preceded it.
 	"The workspace has been provisioned. Should I create another one?",
 	"Workspace created successfully. Do you want me to add a second?",
+
+	// ── NEAR-MISSES OF THE VETO PATTERNS (round-3 review blocker) ──────────
+	// The sharpest finding of round 3: every string previously added was
+	// exactly the shape the new regexes match, so the corpus could not fail a
+	// regex that over-fires. These nine are the ones that DID regress — each
+	// sits one word away from a veto pattern and is a completely ordinary way
+	// to report success.
+	//
+	// (i) `already` / `previously` are adverbs, not disclaimers. A prefix veto
+	//     on them killed all of these; the grammar (premodified PLURAL noun) is
+	//     the real signal, so only "…created workspaceS are listed…" is vetoed.
+	"I have already created the workspace.",
+	"The workspace has already been created.",
+	"I've already created the workspace you asked for.",
+	"That workspace was already created — here is its id.",
+	"The workspace was previously created and is online.",
+	// (ii) POSSESSIVE `have`, not causative. Without an intent marker in front,
+	//      "you have a workspace" is a report, not a proposal.
+	"You now have a new workspace provisioned and ready.",
+	"You now have a workspace, created moments ago.",
+	"Done - you have a workspace created under Acme.",
+	"Great news, you now have the workspace created and online.",
+
+	// ── PER-DELIMITER COVERAGE, CLAIM SIDE ────────────────────────────────
+	// One case per newly-admitted delimiter: a real claim whose trailing
+	// benign negation sits past that delimiter must survive. Previously only
+	// the period was ever exercised.
+	"Workspace created successfully\nNothing else is required from you.", // newline, no period
+	"The workspace has been provisioned:\nNo further action needed.",     // colon
+	"Workspace created successfully — nothing else is required.",         // em dash
+	"The workspace has been created (nothing else is needed).",           // parenthesis
+	"Workspace provisioned successfully; nothing further is required.",   // semicolon
 }
 
 // ---------------------------------------------------------------------------
@@ -697,10 +756,18 @@ func TestReconcileProvisionClaim_OnlyTwoWaysToObject(t *testing.T) {
 							continue
 						}
 						reds++
-						// (1) an objection requires an observed assertion.
-						if !observed || !claims {
-							t.Fatalf("objected without an observed claim (observed=%v claims=%v ids=%s rowFound=%v rowID=%s): %s",
-								observed, claims, idName, rowFound, ridName, reason)
+						// (1) an objection requires an OBSERVED report. Note it
+						//     does NOT require ClaimsCreated: the identity
+						//     objection is deliberately independent of the prose
+						//     classifier (round-3 blocker 2), so a missed claim
+						//     can never suppress a wrong published id.
+						if !observed {
+							t.Fatalf("objected on an unobserved report (claims=%v ids=%s rowFound=%v rowID=%s): %s",
+								claims, idName, rowFound, ridName, reason)
+						}
+						if strings.Contains(reason, "G9 FABRICATED") && !claims {
+							t.Fatalf("a FABRICATION verdict requires an actual claim (ids=%s rowFound=%v rowID=%s): %s",
+								idName, rowFound, ridName, reason)
 						}
 						// (2) exactly two named shapes, nothing else.
 						isG9 := strings.Contains(reason, "G9 FABRICATED SELF-REPORT")
@@ -737,6 +804,79 @@ func TestReconcileProvisionClaim_OnlyTwoWaysToObject(t *testing.T) {
 		t.Fatal("no input in the whole space objected — the reconciliation is inert")
 	}
 	t.Logf("enumerated %d combinations, %d objections, all within the two named shapes", total, reds)
+}
+
+// TestReconcileProvisionClaim_WrongIDCaughtEvenWhenTheClaimIsMissed is round-3
+// blocker 2, pinned.
+//
+// The identity branch used to sit AFTER the `!ClaimsCreated` early return, so
+// the English-prose classifier gated the id comparison. Any phrasing the
+// classifier missed — and round 3 found nine ordinary ones — skipped the check
+// entirely and returned ok=true "nothing to reconcile" while the reply
+// published an id that was not the row. That is consequence #2 in the file
+// header, the thing this PR exists to catch, reintroduced by the fix for
+// consequence #1.
+//
+// The property now: a wrong published id is caught NO MATTER how the sentence
+// reads. The claim detector decides which MESSAGE a red carries; it must never
+// decide WHETHER a wrong id is caught.
+func TestReconcileProvisionClaim_WrongIDCaughtEvenWhenTheClaimIsMissed(t *testing.T) {
+	const rowID = "11111111-1111-4111-8111-111111111111"
+	const wrongID = "22222222-2222-4222-8222-222222222222"
+
+	// Replies that publish a wrong id while being phrased so the prose
+	// classifier does NOT read them as a claim. The first three are the exact
+	// shapes the reviewer measured returning ok=true.
+	missedPhrasings := []string{
+		"I'll have the workspace created shortly. Workspace ID: " + wrongID,
+		"Previously created workspaces are listed below. Workspace ID: " + wrongID,
+		"The workspace will be created once you confirm. Workspace ID: " + wrongID,
+		"Nothing was created today. Workspace ID: " + wrongID,
+		"Should I proceed? Workspace ID: " + wrongID,
+	}
+
+	for _, reply := range missedPhrasings {
+		t.Run(truncate(reply, 48), func(t *testing.T) {
+			claim := ParseConciergeClaim([]string{mustAgentEnvelope(t, reply)})
+
+			// The premise of the test: the prose classifier does NOT see a claim
+			// here. If it ever starts to, this case stops testing what it says
+			// it tests and must be replaced.
+			if claim.ClaimsCreated {
+				t.Skipf("premise no longer holds — the classifier now reads this as a claim: %q", reply)
+			}
+			if len(claim.ClaimedWorkspaceIDs) == 0 {
+				t.Fatalf("fixture is wrong: no published id parsed from %q", reply)
+			}
+
+			ok, reason := ReconcileProvisionClaim(claim, true, rowID)
+			if ok {
+				t.Fatalf("a wrong published id must be caught even when the claim is missed; got ok=true: %s", reason)
+			}
+			if !strings.Contains(reason, "MISREPORTED WORKSPACE IDENTITY") {
+				t.Fatalf("the RED must name the misreported identity; got %q", reason)
+			}
+
+			// And through the ONE Guard B verdict, on an otherwise-healthy probe
+			// where every other check passes — i.e. this would have been GREEN.
+			p := guardBHealthyProbe(rowID)
+			p.Claim = claim
+			if ok, reason := EvaluateMgmtMCPCallable(p); ok {
+				t.Fatalf("Guard B must be RED for a wrong published id: %s", reason)
+			}
+		})
+	}
+
+	// The discriminator: the SAME missed phrasings publishing the RIGHT id must
+	// stay green, or this test would pass on a function that reds on any id.
+	for _, reply := range missedPhrasings {
+		claim := ParseConciergeClaim([]string{
+			mustAgentEnvelope(t, strings.ReplaceAll(reply, wrongID, rowID)),
+		})
+		if ok, reason := ReconcileProvisionClaim(claim, true, rowID); !ok {
+			t.Fatalf("the same phrasing publishing the CORRECT id must not object: %s", reason)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

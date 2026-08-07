@@ -186,7 +186,7 @@ func QueuedA2AQueueID(body string) string {
 	// whitespace, a slash (which would also re-route the request to a different
 	// endpoint) or an absurd length yields "", the id is never followed, and
 	// the collector simply observes nothing.
-	if !safeQueueIDRe.MatchString(id) {
+	if !safeQueueIDRe.MatchString(id) || strings.Contains(id, "..") {
 		return ""
 	}
 	return id
@@ -195,6 +195,10 @@ func QueuedA2AQueueID(body string) string {
 // safeQueueIDRe admits only an opaque URL-path token: the queue ids the tenant
 // actually mints are UUIDs, and this is deliberately a little wider than that
 // without ever admitting a character that could break or redirect the request.
+//
+// The separate ".." rejection above closes the traversal that needs no slash
+// (round-3 review): "." and ".." are legal under this character class but are
+// path segments, not identifiers.
 var safeQueueIDRe = regexp.MustCompile(`^[A-Za-z0-9._~-]{1,128}$`)
 
 // A2AQueueTerminalStatus reports whether a queue row has stopped moving, so the
@@ -331,14 +335,25 @@ var creationVerbs = []string{"created", "provisioned"}
 // regression — pinned now by the trailing-benign cases in successClaimReplies.
 var negationRe = regexp.MustCompile(`(?:n't|\b(?:no|not|none|nothing|never|cannot|cant|unable|without|fail|failed|fails|failing|abort|aborted|reject|rejects|rejected|rejection|refus|refused|declined)\b)`)
 
-// priorReferenceRe kills a creation verb that refers to something created
-// EARLIER rather than by this turn: "Previously created workspaces are listed
-// below", "the already created member". Checked only BEFORE the verb, where the
-// qualifier sits. Without it, the enumeration half of
-// "Previously created workspaces are listed below; I created none today"
-// satisfies the matcher on its own — the trailing "none" only vetoes the second
-// occurrence.
-var priorReferenceRe = regexp.MustCompile(`\b(?:previously|already|earlier|existing|prior)\s+(?:been\s+)?$`)
+// pluralEnumerationRe kills a creation verb used as a PREMODIFIER OF A PLURAL
+// NOUN — "Previously created workspaces are listed below" — which enumerates
+// pre-existing rows rather than asserting this turn created one. Checked on the
+// text immediately AFTER the verb, where the noun sits.
+//
+// This replaces a `previously|already|…` prefix veto that round-3 review showed
+// was far too blunt: it killed nine genuine claims, every one of them a normal
+// way to say the thing —
+//
+//	"I have already created the workspace."
+//	"The workspace has already been created."
+//	"The workspace was previously created and is online."
+//
+// The adverb is not the signal; the grammar is. "was previously created" is a
+// predicate about ONE workspace (a claim); "previously created workspaces" is a
+// premodified plural (a listing). Keying on the plural noun keeps the
+// enumeration vetoed without touching any singular assertion, whatever adverb
+// happens to precede it.
+var pluralEnumerationRe = regexp.MustCompile(`^\s+workspaces\b`)
 
 // futureModalRe kills a creation verb that is an INTENTION, a PROPOSAL or a
 // QUESTION rather than a completed act:
@@ -352,13 +367,28 @@ var priorReferenceRe = regexp.MustCompile(`\b(?:previously|already|earlier|exist
 // sits. That precision matters: a genuine claim routinely trails future tense
 // after the verb — "has been created and will be online shortly" — and vetoing
 // on the whole window would silently stop detecting real claims.
+var futureModalRe = regexp.MustCompile(`(?:\bwill\s+be\b|\bwill\s+get\b|\bwill\s+have\b|\bgoing\s+to\b|\bshould\s+i\b|\bshall\s+i\b|\bcan\s+i\b|\bdo\s+you\s+want\b|\bwould\s+you\s+like\b|\bonce\s+you\b|\bafter\s+you\b|\bif\s+you\s+confirm\b|\bplease\s+confirm\b|\bgets?\s+created\b|\bgets?\s+provisioned\b|\bto\s+be\s+created\b|\bto\s+be\s+provisioned\b)`)
+
+// causativeRe kills the CAUSATIVE construction — "I'll have the workspace
+// created", "We'll get you a workspace provisioned" — where the intent verb is
+// have/get and the participle belongs to it, not to the speaker.
 //
-// The `have|get <det> workspace` alternatives cover the CAUSATIVE construction
-// ("I'll have the workspace created", "we can get a workspace provisioned"),
-// which the modal list alone does not reach. The determiner is REQUIRED so this
-// cannot swallow "I have created the workspace" — there the word after `have`
-// is the verb itself, not a determiner.
-var futureModalRe = regexp.MustCompile(`(?:\bwill\s+be\b|\bwill\s+get\b|\bwill\s+have\b|\bgoing\s+to\b|\bshould\s+i\b|\bshall\s+i\b|\bcan\s+i\b|\bdo\s+you\s+want\b|\bwould\s+you\s+like\b|\bonce\s+you\b|\bafter\s+you\b|\bif\s+you\s+confirm\b|\bplease\s+confirm\b|\bgets?\s+created\b|\bgets?\s+provisioned\b|\bto\s+be\s+created\b|\bto\s+be\s+provisioned\b|\b(?:have|having|get|getting)\s+(?:the|a|an|your|this|that|another|one|new)\s+(?:new\s+)?workspace\b)`)
+// ANCHORED ON AN INTENT MARKER, not on `have <det> workspace` alone. Round-3
+// review found the unanchored form firing on the POSSESSIVE `have`, which is a
+// perfectly ordinary way to report success:
+//
+//	"You now have a new workspace provisioned and ready."
+//	"Done - you have a workspace created under Acme."
+//
+// There is nothing hypothetical about those. The discriminator is the modal or
+// volitional marker in front: "I'll have …", "let me get …", "would you like me
+// to get …". Without one, `have` is possessive and the sentence is a claim.
+//
+// The bounded filler ({0,24}, no sentence delimiter) spans "want me to have",
+// "need approval before having". The optional pronoun and adjective slots reach
+// "get YOU a workspace" and "have the SECOND workspace".
+var causativeRe = regexp.MustCompile(
+	`\b(?:i'?ll|we'?ll|you'?ll|i\s+will|we\s+will|let\s+me|let'?s|can|could|would|should|shall|want|wants|wanted|need|needs|needed|going\s+to|able\s+to|like\s+to|have\s+to|plan\s+to|happy\s+to|about\s+to)\b[^.;!?]{0,24}?\b(?:have|having|get|getting)\s+(?:you|us|them|me|him|her)?\s*(?:the|a|an|your|this|that|another|one|new)\s+(?:\w+\s+){0,2}?workspace\b`)
 
 // claimWindowBefore/After are the OUTER bound on how far the proximity check
 // looks for the word "workspace" around a creation verb. Wide enough to span
@@ -373,9 +403,27 @@ const (
 	claimWindowAfter  = 48
 )
 
-// sentenceDelims end a clause for veto purposes. normaliseReply has already
-// collapsed newlines into spaces, so these are all that remain.
-const sentenceDelims = ".;!?"
+// sentenceDelims end a clause for veto purposes.
+//
+// Round-3 review: the original set was ".;!?" and every corpus string testing
+// it was period-delimited, so the set was never exercised. It now also carries:
+//
+//	\n  — a bullet list or a hard-wrapped reply separates its assertions by
+//	      newline with no period at all. normaliseReply used to destroy these
+//	      before clauseBounds could see them; it now preserves them.
+//	:   — "The new workspace has been provisioned:" followed by a table.
+//	—–  — em/en dash, the runtimes' favourite aside separator.
+//	()  — a parenthetical is its own clause.
+//
+// WHAT IS DELIBERATELY *NOT* HERE — the comma. A comma routinely sits INSIDE a
+// single assertion ("The workspace, created moments ago, is online"), so
+// treating it as a boundary would cut the veto scope below the width of one
+// clause and under-veto far more than it fixes. The consequence is stated
+// plainly rather than papered over: a negation separated from its verb by a
+// comma alone ("The workspace was not, in the end, created") is NOT vetoed, so
+// that reply is scored as a claim. Bounded — a mislabel on an already-red turn,
+// never a green — but real, and not covered.
+const sentenceDelims = ".;!?:\n—–()"
 
 // clauseBounds returns the span of the verb's OWN sentence, clipped to the
 // proximity window. Everything the veto regexes read comes from here, so a
@@ -462,11 +510,12 @@ func ReplyClaimsWorkspaceCreated(text string) bool {
 			}
 			// Intent / proposal / question / causative — pre-verb only, because
 			// a genuine claim routinely trails future tense.
-			if futureModalRe.MatchString(preClause) {
+			if futureModalRe.MatchString(preClause) || causativeRe.MatchString(preClause) {
 				continue
 			}
-			// "Previously created …" — an act from an earlier turn.
-			if priorReferenceRe.MatchString(preClause) {
+			// "… created workspaceS are listed below" — an enumeration of
+			// pre-existing rows, keyed on the plural noun after the verb.
+			if pluralEnumerationRe.MatchString(n[end:hi]) {
 				continue
 			}
 			return true
@@ -481,7 +530,24 @@ func ReplyClaimsWorkspaceCreated(text string) bool {
 func normaliseReply(text string) string {
 	t := strings.ToLower(text)
 	t = strings.NewReplacer("*", "", "`", "", "_", " ", "|", " ", "#", " ").Replace(t)
-	return strings.Join(strings.Fields(t), " ")
+	// Neutralise abbreviations whose INTERNAL periods would otherwise act as
+	// sentence boundaries and shrink the veto scope below one clause — round-3
+	// review: "The workspace was not, e.g., created" split at the "g." and lost
+	// its own negation.
+	t = strings.NewReplacer("e.g.", "eg", "i.e.", "ie", "etc.", "etc", "vs.", "vs").Replace(t)
+	// Collapse horizontal whitespace but PRESERVE line breaks. This used to be
+	// strings.Fields over the whole string, which destroyed every newline
+	// before clauseBounds could ever see one — so a reply that separates its
+	// assertions by newline with no period (a bullet list, a hard-wrapped
+	// paragraph) was one undivided clause. See sentenceDelims.
+	lines := strings.Split(strings.ReplaceAll(t, "\r\n", "\n"), "\n")
+	out := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		if s := strings.Join(strings.Fields(ln), " "); s != "" {
+			out = append(out, s)
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 // labelledWorkspaceIDRe matches a uuid the reply PUBLISHES as the workspace id.
@@ -611,27 +677,33 @@ func ReconcileProvisionClaim(claim ConciergeClaim, rowFound bool, rowID string) 
 			quoteReplies(claim.Texts))
 	}
 
-	if !claim.ClaimsCreated {
-		return true, "the concierge's self-report makes no claim of having created the workspace — nothing to reconcile; the created row remains the sole evidence"
-	}
-
-	// NULL-ID VACUITY GUARD — placed BEFORE the identity branch, not after.
-	//
-	// Both branches below need a comparable id on BOTH sides. Deciding that
-	// first, in one place, means:
-	//   - "" == "" can never reach the RECONCILED branch (compared nothing), and
-	//   - a blank/whitespace id can never reach the MISREPORTED branch either,
-	//     where `rowID != ""` on an unnormalised value would have manufactured a
-	//     mismatch against a row id that was never really surfaced.
-	// comparableIDs drops blank entries so an id list of [""] counts as none.
+	// NULL-ID VACUITY GUARD — before the identity branch, so a blank on either
+	// side can reach neither MISREPORTED nor RECONCILED. comparableIDs drops
+	// blank entries, so an id list of [""] counts as none.
 	claimedIDs := comparableIDs(claim.ClaimedWorkspaceIDs)
-	if len(claimedIDs) == 0 || rowID == "" {
-		return true, "the concierge reported success and a matching workspace row exists, but no workspace id could be compared on BOTH sides (the reply published none, or the row did not surface one) — the claim is consistent as far as it is checkable, and NOT reconciled on identity"
-	}
+	haveComparableIDs := len(claimedIDs) > 0 && rowID != ""
 
-	// The identity half: the row landed, but the agent PUBLISHED a different id.
-	// A caller holding the reported id is holding a handle to nothing.
-	if !containsStr(claimedIDs, rowID) {
+	// ── THE IDENTITY HALF DOES NOT DEPEND ON ClaimsCreated ──────────────────
+	//
+	// This branch deliberately runs BEFORE the !ClaimsCreated abstention, and
+	// its condition does not mention ClaimsCreated at all.
+	//
+	// It used to sit after that early return, which meant the PROSE classifier
+	// gated the ID check: any reply whose sentence-level claim detection missed
+	// — and round-3 review found nine real phrasings it missed — skipped the
+	// identity comparison entirely and returned ok=true, "nothing to
+	// reconcile", while publishing a workspace id that was not the row. That is
+	// consequence #2 in this file's own header, the one this gate exists to
+	// catch, reintroduced by the fix for consequence #1.
+	//
+	// A published id IS an assertion about the resource, independent of how the
+	// surrounding sentence is phrased, and it is the HARDER evidence of the
+	// two: an exact string equality against a row, not a heuristic over
+	// English. So the classifier now gates only the FABRICATION branch above
+	// (where prose is genuinely the only signal), and can no longer suppress
+	// this one. Precision of the claim detector affects which MESSAGE a red
+	// carries; it must never affect whether a wrong id is caught.
+	if haveComparableIDs && !containsStr(claimedIDs, rowID) {
 		return false, fmt.Sprintf(
 			"MISREPORTED WORKSPACE IDENTITY: the concierge created a workspace (row id=%s) but its own reply "+
 				"publishes workspace id(s) [%s], none of which is the row it created. A row existing under the "+
@@ -641,6 +713,18 @@ func ReconcileProvisionClaim(claim ConciergeClaim, rowFound bool, rowID string) 
 			rowID, strings.Join(claimedIDs, ","), quoteReplies(claim.Texts))
 	}
 
+	// ── Abstentions, in decreasing order of what was checkable ──────────────
+	if !claim.ClaimsCreated {
+		if haveComparableIDs {
+			return true, fmt.Sprintf(
+				"the concierge's self-report does not read as a claim of having created the workspace, but the workspace id it published (%s) IS the row that landed — the identity check ran regardless and agrees",
+				rowID)
+		}
+		return true, "the concierge's self-report makes no claim of having created the workspace, and published no workspace id to reconcile — the created row remains the sole evidence"
+	}
+	if !haveComparableIDs {
+		return true, "the concierge reported success and a matching workspace row exists, but no workspace id could be compared on BOTH sides (the reply published none, or the row did not surface one) — the claim is consistent as far as it is checkable, and NOT reconciled on identity"
+	}
 	return true, fmt.Sprintf(
 		"the concierge reported success and the workspace id it published (%s) is the row that actually landed — self-report RECONCILED against the resource",
 		rowID)
