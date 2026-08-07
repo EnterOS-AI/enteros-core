@@ -175,7 +175,7 @@ func extractGraftedScheduleEntries(t *testing.T, schedulesBlock string) []map[st
 		"name: Org Concierge\nruntime: hermes\n"+schedulesBlock)
 	h := &WorkspaceHandler{configsDir: dir}
 
-	composed, err := h.composeConciergeRuntimeConfig("hermes")
+	composed, err := h.composeConciergeRuntimeConfig("hermes", "Acme Concierge")
 	if err != nil {
 		t.Fatalf("composeConciergeRuntimeConfig error: %v", err)
 	}

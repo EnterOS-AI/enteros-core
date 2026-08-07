@@ -571,6 +571,9 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 		case <-timer.C:
 		}
 		delay *= 2
+		if delay > cpProvisionRetryMaxDelay {
+			delay = cpProvisionRetryMaxDelay
+		}
 	}
 	if lastErr != nil {
 		// Greppable, mirroring the LEAK-SUSPECT line cpStopWithRetryErr emits on
