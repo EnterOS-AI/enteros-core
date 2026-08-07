@@ -394,7 +394,7 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 	if configFiles == nil {
 		configFiles = map[string][]byte{}
 	}
-	if composed, err := h.composeConciergeRuntimeConfig(runtime); err != nil {
+	if composed, err := h.composeConciergeRuntimeConfig(runtime, name); err != nil {
 		// Base config unavailable (template-cache miss / a test without the
 		// template tree). Fall back to the delivered config UNCHANGED and keep the
 		// historical {{CONCIERGE_NAME}} substitution so we never regress the
@@ -496,7 +496,7 @@ func conciergeBaseTemplateName(runtime string) string {
 //   - prompt_files -> [prompts/concierge.md]  for every NON-claude-code runtime
 //     (the persona is the sole system-prompt file; claude-code reads
 //     system-prompt.md, delivered separately, so its prompt_files is untouched).
-func (h *WorkspaceHandler) composeConciergeRuntimeConfig(runtime string) ([]byte, error) {
+func (h *WorkspaceHandler) composeConciergeRuntimeConfig(runtime, conciergeName string) ([]byte, error) {
 	base := conciergeBaseTemplateName(runtime)
 	dir, err := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, base)
 	if err != nil {
@@ -519,6 +519,31 @@ func (h *WorkspaceHandler) composeConciergeRuntimeConfig(runtime string) ([]byte
 	if rc := yamlMappingGet(root, "runtime_config"); rc != nil && rc.Kind == yaml.MappingNode {
 		yamlMappingSet(rc, "required_env", yamlEmptySeq())
 	}
+	// Replace the base template's VENDOR identity with the ORG CONCIERGE's.
+	//
+	// The base config's `name`/`description` describe the runtime vendor — for
+	// the default hermes runtime, "Hermes Agent" / "Nous Research hermes-agent —
+	// the self-improving AI agent …". The runtime renders `description` into the
+	// system prompt as the agent's **Role**, so leaving it in place seats a
+	// SECOND, COMPETING IDENTITY beside the grafted Org Concierge persona and the
+	// model chooses between them non-deterministically.
+	//
+	// Observed on prod 2026-08-06: two concierges on the same build, both with a
+	// correct fully-substituted persona at prompts/concierge.md — one introduced
+	// itself as the org concierge, the other as "Hermes Agent, operated by Nous
+	// Research — a self-improving AI agent", quoting this description. Clearing
+	// the persona's conversation history did NOT fix the second one; overriding
+	// these two fields did. Delivering the persona (#2890) is necessary but not
+	// sufficient — the competing identity has to go with it.
+	name := strings.TrimSpace(conciergeName)
+	if name == "" {
+		// Unknown name is not a reason to reinstate the vendor's.
+		log.Printf("Provisioner: concierge config compose for runtime=%q got an EMPTY concierge name — falling back to %q rather than the base template's vendor name",
+			runtime, conciergeFallbackName)
+		name = conciergeFallbackName
+	}
+	yamlMappingSet(root, "name", yamlString(name))
+	yamlMappingSet(root, "description", yamlString(conciergeRoleDescription))
 	// Graft the persona per the runtime's convention. claude-code reads
 	// system-prompt.md (delivered separately); every other runtime reads the
 	// prompt_files list, so the persona becomes its sole prompt file.
@@ -712,6 +737,26 @@ func yamlStringSeq(items ...string) *yaml.Node {
 	}
 	return seq
 }
+
+// yamlString returns a plain string scalar node.
+func yamlString(v string) *yaml.Node {
+	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: v}
+}
+
+// conciergeFallbackName is the identity used when the caller could not resolve
+// the org's concierge name. It is deliberately generic-but-correct: an unknown
+// name is NOT a reason to fall back to the base runtime template's vendor name,
+// which is the very identity this override exists to remove.
+const conciergeFallbackName = "Org Concierge"
+
+// conciergeRoleDescription replaces the base runtime template's vendor blurb.
+// The runtime renders `description` into the system prompt as the agent's
+// **Role**, so this text is prompt material, not documentation — it must
+// describe the org-concierge role and name no runtime vendor.
+const conciergeRoleDescription = "The organization's platform agent — the org concierge. " +
+	"The single org-root agent above every workspace, and the organization's one front door: " +
+	"the default chat target for its members. An orchestrator that routes and delegates work to " +
+	"workspaces rather than performing it directly."
 
 // conciergeNamePlaceholder is the {{CONCIERGE_NAME}} marker the template's
 // prompts/concierge.md carries where the per-instance name goes. The runtime's

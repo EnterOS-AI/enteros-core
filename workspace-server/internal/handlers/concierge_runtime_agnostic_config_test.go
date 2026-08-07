@@ -127,7 +127,7 @@ func TestComposeConciergeRuntimeConfig_RuntimeAgnostic(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.runtime, func(t *testing.T) {
-			composed, err := h.composeConciergeRuntimeConfig(tc.runtime)
+			composed, err := h.composeConciergeRuntimeConfig(tc.runtime, "Acme Concierge")
 			if err != nil {
 				t.Fatalf("composeConciergeRuntimeConfig(%q) error: %v", tc.runtime, err)
 			}
@@ -169,7 +169,7 @@ func TestComposeConciergeRuntimeConfig_MissingBaseFallsBackToError(t *testing.T)
 	// No fixtures → the base config is unavailable → compose returns an error so
 	// the caller falls back to the delivered config unchanged (never panics).
 	h := &WorkspaceHandler{configsDir: t.TempDir()}
-	if _, err := h.composeConciergeRuntimeConfig("openclaw"); err == nil {
+	if _, err := h.composeConciergeRuntimeConfig("openclaw", "Acme Concierge"); err == nil {
 		t.Fatal("expected error when the runtime base config is missing, got nil")
 	}
 }
@@ -302,7 +302,7 @@ func TestApplyConciergeProvisionConfig_NeverDeclaresAnUndeliveredPersonaFile(t *
 			}
 			h := &WorkspaceHandler{configsDir: dir}
 
-			composed, err := h.composeConciergeRuntimeConfig(runtime)
+			composed, err := h.composeConciergeRuntimeConfig(runtime, "Acme Concierge")
 			if err != nil {
 				t.Fatalf("composeConciergeRuntimeConfig(%q): %v", runtime, err)
 			}
