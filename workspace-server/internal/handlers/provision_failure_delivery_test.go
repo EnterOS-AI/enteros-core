@@ -72,41 +72,95 @@ func (s *slowBroadcaster) observed() (called bool, ctxErr error, hadBudget bool)
 	return s.called, s.ctxErrAtCall, s.ctxHadBudget
 }
 
-// TestMarkProvisionFailed_SurvivesAContextThatDiesMidCall is the residual half
-// of the ceiling gap, and it is the ORIGINAL defect in a narrower window.
+// TestMarkProvisionFailed_BothLegsSurviveACallerThatDiesMidCall is the residual
+// half of the ceiling gap: the ORIGINAL defect in a narrower window.
 //
 // Deciding ONCE, up front, whether the caller's context is usable is a
 // check-then-USE race. The context is live at the check, is therefore passed
-// straight through, and then dies while the broadcast leg is in flight. By the
-// time the UPDATE runs it is exactly as dead as the one the entry check was
-// written to catch, and database/sql drops the statement just the same — the
-// reason computed correctly and lost anyway.
+// straight through, and then dies while the call is still in flight. By the time
+// the work runs it is exactly as dead as the one the entry check was written to
+// catch, and database/sql drops the statement just the same — the reason computed
+// correctly and lost anyway.
 //
 // The caller here is ALIVE on entry. That is the whole point: a context already
 // expired at entry does not exercise this at all, which is why the first version
 // of these tests could not see it.
-func TestMarkProvisionFailed_SurvivesAContextThatDiesMidCall(t *testing.T) {
+//
+// IT MUST DISCRIMINATE BOTH LEGS, and doing so takes deliberate construction.
+// Once the durable write was reordered ahead of the broadcast, a version of this
+// test that only blocked inside the broadcast stopped discriminating leg 1
+// entirely: the write now runs first, so nothing has had time to elapse and it
+// completes even on a caller context. The test kept its name and quietly stopped
+// pinning the race it is named for. So each leg is made to outlive the caller on
+// its own:
+//
+//	leg 1 (the UPDATE)    — WillDelayFor outlasts the caller's deadline, and
+//	                        sqlmock's ExecContext honours ctx DURING that delay
+//	leg 2 (the broadcast) — blocks until the caller's context is actually Done
+//
+// Sabotaging EITHER leg to use the caller's context turns this red — verified by
+// doing exactly that, one leg at a time.
+//
+// Leg 1 is asserted through the LOG, not through ExpectationsWereMet, and the
+// difference is not cosmetic. sqlmock matches and FULFILS an expectation inside
+// c.exec, before it races the delay against ctx.Done — so a cancelled exec still
+// leaves every expectation met and still runs the argument matchers. Asserting
+// on expectations alone therefore proves the statement reached the driver, NOT
+// that it succeeded, and a sabotaged leg 1 sails straight through it. The
+// absence of the "db update FAILED" line is the outcome signal.
+//
+// It still does not replace TestMarkProvisionFailed_DeliversThroughAnExpiredContext
+// or TestCeilingReasonReachesTheColumn: those cover a caller already dead ON
+// ENTRY, which is a different input, and no amount of mid-call coverage implies
+// it. Do not delete them on the strength of this one.
+func TestMarkProvisionFailed_BothLegsSurviveACallerThatDiesMidCall(t *testing.T) {
+	// The caller's remaining budget. Every other duration here is a multiple of
+	// it, so the test's outcome never depends on machine speed in the dangerous
+	// direction — a slower machine only makes the caller MORE certainly dead.
+	const callerBudget = 60 * time.Millisecond
+	// 5x the caller budget: under sabotage the caller is long dead before the
+	// write's delay elapses; with the fix, leg 1's own reserve covers it easily.
+	const writeDelay = 5 * callerBudget
+
 	mock := setupTestDB(t)
 	var got string
 	mock.ExpectExec(`UPDATE workspaces SET status =`).
 		WithArgs(sqlmock.AnyArg(), captureLastSampleError{got: &got}, sqlmock.AnyArg()).
+		WillDelayFor(writeDelay).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), callerBudget)
 	defer cancel()
 	if ctx.Err() != nil {
 		t.Fatal("precondition: the caller context must be ALIVE at entry")
 	}
 
+	readLog := captureProvLog(t)
 	bc := &slowBroadcaster{waitFor: ctx, maxBlock: 2 * time.Second}
 	h := NewWorkspaceHandler(bc, nil, "http://localhost:8080", t.TempDir())
 	h.markProvisionFailed(ctx, "ws-midcall-1", provisionFailedBudgetExhausted, nil)
 
+	// Leg 1 — the durable write outlived the caller. The LOG is the outcome
+	// signal; see the note above on why ExpectationsWereMet cannot be.
+	if logged := readLog(); strings.Contains(logged, "db update FAILED") {
+		t.Errorf("the WRITE was lost to a caller that died mid-call; log was:\n%s", logged)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("the write was lost to a context that died MID-CALL: %v", err)
+		t.Errorf("the write statement never reached the driver: %v", err)
 	}
 	if got != provisionFailedBudgetExhausted {
 		t.Errorf("last_sample_error = %q, want %q", got, provisionFailedBudgetExhausted)
+	}
+	// Leg 2 — so did the notification.
+	called, ctxErr, hadBudget := bc.observed()
+	if !called {
+		t.Error("the BROADCAST leg never ran")
+	}
+	if ctxErr != nil {
+		t.Errorf("the BROADCAST leg ran on a context already dead (%v) — it could not have reached the canvas", ctxErr)
+	}
+	if !hadBudget {
+		t.Error("the BROADCAST leg had no budget left")
 	}
 }
 
