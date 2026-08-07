@@ -95,7 +95,15 @@ func writeConciergeIdentityFixtures(t *testing.T, configsDir string) {
 			"  required_env: [ANTHROPIC_API_KEY]\n",
 		"platform-agent/config.yaml": "name: Org Concierge\n" +
 			"runtime: claude-code\n" + conciergeIdentitySchedulesBlock,
-		"platform-agent/prompts/concierge.md": "# You are {{CONCIERGE_NAME}} — the Org Concierge\n",
+		// The persona's ONLY occurrence of the agent's name must be the
+		// {{CONCIERGE_NAME}} placeholder. An earlier draft of this fixture read
+		// "# You are {{CONCIERGE_NAME}} — the Org Concierge", which made
+		// `persona contains conciergeFallbackName` TRUE even when the placeholder
+		// was substituted with the empty string — the agreement assertion below
+		// then passed on the exact defect it exists to catch. Measured: mutation
+		// (f) (persona substituted with the raw name instead of the resolved one)
+		// went GREEN until this literal was removed.
+		"platform-agent/prompts/concierge.md": "# You are {{CONCIERGE_NAME}}, the organization's front door.\n",
 	}
 	for rel, content := range fixtures {
 		p := filepath.Join(configsDir, filepath.FromSlash(rel))
@@ -674,6 +682,12 @@ func TestApplyConciergeProvisionConfig_EmptyNameAgreesBetweenConfigAndPersona(t 
 	// THE INVARIANT: the persona names the SAME agent the config card does.
 	if !strings.Contains(persona, gotName) {
 		t.Errorf("persona and config.yaml disagree about the agent's identity — config says %q, persona is:\n%s", gotName, persona)
+	}
+	// Exact form, so a substitution with the EMPTY string (the pre-fix behaviour:
+	// config.yaml got the resolved fallback, the persona got the raw empty name)
+	// cannot slip past on a substring match.
+	if want := "# You are " + conciergeFallbackName + ", the organization's front door.\n"; persona != want {
+		t.Errorf("persona = %q, want %q", persona, want)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
