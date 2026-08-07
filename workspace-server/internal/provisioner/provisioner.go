@@ -87,12 +87,38 @@ const (
 	// DefaultPort is the port the A2A server listens on inside the container.
 	DefaultPort = "8000"
 
-	// ProvisionTimeout bounds the SaaS/CP provision context (cpProv.Start —
-	// the provider provision API call, which returns quickly; the long cold-boot is
-	// owned by the CP bootstrap-watcher + the registry provision-timeout
-	// sweep, not this ctx) and the short DB-lookup nudge at
-	// buildProvisionerConfig. It is deliberately NO LONGER the cap on the
-	// LOCAL docker-build path: a cold `docker build` can legitimately run
+	// ProvisionTimeout BOUNDS NOTHING. As of the CP-mode migration below it has
+	// no remaining call site in this module (the package is internal/, so there
+	// are none outside it either). It is kept as the named record of a value
+	// that must not come back, and because a fresh 3-minute constant is exactly
+	// what someone would otherwise reinvent.
+	//
+	// DO NOT reintroduce it as a provision-context bound. Both times a fixed
+	// 3-minute deadline was applied to "provisioning", it cost a workspace.
+	//
+	// (1) THE CP PROVISION CONTEXT. The claim that this constant could safely
+	// bound it — "cpProv.Start … the provider provision API call, which
+	// returns quickly" — was false, and is the origin of a production defect.
+	// cpProv.Start does NOT return quickly: the control plane resolves the
+	// workspace's image from runtime_image_pins at PROVISION time, so a
+	// workspace created shortly after a runtime-image promote is the one host
+	// that must obtain a freshly promoted multi-GB image (workspace-template-
+	// hermes is 6.89GB) before the call can answer at all. Everything
+	// downstream was sized for that — core#5019 raised provisionHTTPClient to
+	// 20 min, the control plane raised its own pull cap to 30 min with a 2-min
+	// stall window — and this 3-minute ceiling beat all of them, cancelling the
+	// request so the CP's `docker pull` died with it. The signature is
+	// `pull failed: context canceled` in CP stdout, and the workspace is marked
+	// terminally failed. CP-mode callers now derive their deadline from
+	// provisioner.CPProvisionCeiling (see handlers.cpProvisionTimeout), which
+	// is the provision client's own budget and therefore cannot invert.
+	//
+	// The long cold-boot after the box exists is still owned by the CP
+	// bootstrap-watcher + the registry provision-timeout sweep, not by any
+	// context here.
+	//
+	// (2) THE LOCAL DOCKER-BUILD PATH, which it likewise no longer caps:
+	// a cold `docker build` can legitimately run
 	// past 3 min, so the Docker-mode + bundle-import call sites now derive
 	// their deadline from the per-runtime provision timeout (floored at 12m,
 	// see handlers.dockerProvisionTimeout / provisioner.DefaultProvisionCeiling)
