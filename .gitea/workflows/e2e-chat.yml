@@ -468,20 +468,26 @@ jobs:
             exit 1
           fi
 
-          # --- React Flow stylesheet: NAMED by the document, and SERVED ----
+          # --- React Flow stylesheet: RENDER-BLOCKING, and SERVED ----------
           #
-          # Read this as exactly what it checks, no more. Next does NOT emit
-          # this file as a plain `<link rel="stylesheet">` in the initial
-          # HTML — it emits `<link rel="preload" as="style">` plus an
-          # RSC-payload entry that React turns into a stylesheet during
-          # hydration. (The only plain stylesheet links in the initial
-          # document are the two LAYOUT sheets.) So these assertions prove
-          # AVAILABILITY: the document names the exact hashed asset, the
-          # server serves it, and it carries the rule. They do NOT prove the
-          # rule ends up APPLIED in the browser — a sheet that is named,
-          # fetched, and then never applied still passes here. What catches
-          # that is the suite itself, which cannot click the canvas when the
-          # rule is not in effect.
+          # This used to assert only that the document NAMED the asset. That
+          # was satisfied by a `<link rel="preload" as="style">`, and a
+          # preload is not a stylesheet: Next puts PAGE css behind a preload
+          # plus an RSC-payload entry that REACT inserts during hydration, so
+          # the rule was reliably absent for the first few hundred ms — and
+          # for ~5s under CPU contention, measured at 20x throttling on this
+          # exact build. That window is what produced "workspace node never
+          # became hittable" (runs 628513, 630140) and
+          # "<rect> from <svg data-testid=rf__background> subtree intercepts
+          # pointer events" (run 629224): a guard that passes while the page
+          # can still render unstyled is not a guard.
+          #
+          # So assert the property that actually removes the window: the
+          # initial document must carry a PLAIN `<link rel="stylesheet">`
+          # for the sheet that holds the rule. That only happens when the
+          # import lives in a LAYOUT stylesheet (canvas/src/app/globals.css),
+          # and it makes the browser block rendering on it — there is then no
+          # state in which the canvas exists and the rule does not.
           #
           # Non-empty first: grepping for the empty string matches every
           # file, so an empty RF_CSS_PATH would make the document check a
@@ -495,11 +501,17 @@ jobs:
           curl -s -o /tmp/canvas-rf.css -w '%{http_code}' "http://localhost:${CANVAS_PORT}${RF_CSS_PATH}" > /tmp/canvas-rf.code
           set -e
           RF_CODE=$(cat /tmp/canvas-rf.code 2>/dev/null || echo "000")
-          # Anchor on the full href, not the bare basename: that pins the
-          # match to the real preload link rather than any incidental
-          # occurrence of the hash.
-          if ! grep -qF 'href="'"${RF_CSS_PATH}"'"' /tmp/canvas-doc.html; then
-            echo "::error::The served /?m=chat document does not name ${RF_CSS_PATH} — the page would never fetch the React Flow stylesheet and the canvas background would swallow every click."
+          # Split the document into one <link ...> tag per line and require a
+          # SINGLE tag that is both rel="stylesheet" and points at this exact
+          # href. Attribute-order independent, and — unlike a bare
+          # `grep -F href="..."` — a preload of the same href cannot satisfy
+          # it. Anchoring on the full href (not the basename) keeps an
+          # incidental occurrence of the hash from matching.
+          grep -oE '<link[^>]*>' /tmp/canvas-doc.html > /tmp/canvas-links.txt || true
+          if ! grep -F 'rel="stylesheet"' /tmp/canvas-links.txt | grep -qF 'href="'"${RF_CSS_PATH}"'"'; then
+            echo "::error::The served /?m=chat document has no render-blocking <link rel=\"stylesheet\" href=\"${RF_CSS_PATH}\">. Found these link tags:"
+            cat /tmp/canvas-links.txt
+            echo "::error::@xyflow/react/dist/style.css must be imported from a LAYOUT stylesheet (canvas/src/app/globals.css), not from a client component such as Canvas.tsx. Imported from a component it lands in the PAGE css chunk, which Next ships as a preload that React only turns into a stylesheet during hydration — leaving a window in which the canvas renders unstyled, the background svg swallows every click, and node hit-testing is meaningless."
             exit 1
           fi
           if [ "$RF_CODE" != "200" ]; then

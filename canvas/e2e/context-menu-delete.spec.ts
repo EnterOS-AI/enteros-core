@@ -1,4 +1,5 @@
 import { test, expect, type APIRequestContext } from "@playwright/test";
+import { enterMapView, rightClickWorkspaceNode } from "./helpers/canvas";
 
 /**
  * Playwright E2E for context-menu → delete confirm flow.
@@ -22,6 +23,16 @@ async function seedWorkspace(request: APIRequestContext, name: string) {
     headers: { "Content-Type": "application/json" },
   });
   const workspace = (await create.json()) as { id: string; name: string };
+  // Fail HERE, not 10s later at `workspace-node-undefined`. The node is now
+  // targeted by `data-testid` derived from this name, so an error body would
+  // otherwise surface as an unrelated node-hittability timeout that points at
+  // the canvas instead of at the failed POST that actually broke the test.
+  if (!workspace?.id || !workspace?.name) {
+    throw new Error(
+      `POST ${API}/workspaces did not return {id,name} (status ${create.status()}): ` +
+        `${JSON.stringify(workspace).slice(0, 300)}`,
+    );
+  }
 
   await request.post(`${API}/registry/register`, {
     data: {
@@ -44,18 +55,20 @@ test.describe("Context Menu → Delete Confirm", () => {
     // It does NOT assume an empty canvas, and it never calls test.skip().
 
     // 1. Create a workspace to delete (leaf node — no children, no cascade)
-    const { id: wsId } = await seedWorkspace(request, "E2E Delete Test");
+    const { id: wsId, name: wsName } = await seedWorkspace(request, "E2E Delete Test");
 
-    // 2. Open the canvas and wait for the workspace node
-    await page.goto("/", { waitUntil: "networkidle" });
-    await page.waitForTimeout(2000); // allow WS to appear
-
-    // Find the workspace node on the canvas
-    const node = page.locator(`.react-flow__node`).filter({ hasText: "E2E Delete Test" }).first();
-    await expect(node).toBeVisible({ timeout: 10000 });
+    // 2. Open the canvas and wait for the workspace node.
+    //    `<Canvas/>` is mount-gated on topView === "map", so the map view has
+    //    to be entered explicitly — and the node has to be settled and
+    //    unoccluded before it can be hit-tested. Both come from the shared
+    //    helper; this spec used to open a raw `.react-flow__node` locator
+    //    behind a 2s sleep, which is the same anti-pattern #5079 removed from
+    //    boot-regression.spec.ts.
+    await page.goto("/");
+    await enterMapView(page);
 
     // 3. Right-click to open context menu
-    await node.click({ button: "right" });
+    await rightClickWorkspaceNode(page, wsName);
     const menu = page.locator('[role="menu"]').first();
     await expect(menu).toBeVisible({ timeout: 3000 });
     await expect(menu).toHaveAttribute("aria-label", /E2E Delete Test/i);
@@ -92,11 +105,10 @@ test.describe("Context Menu → Delete Confirm", () => {
     // on leftovers from earlier suites.
     const { name: wsName } = await seedWorkspace(request, "E2E Cancel Test");
 
-    await page.goto("/", { waitUntil: "networkidle" });
-    await page.waitForTimeout(2000);
+    await page.goto("/");
+    await enterMapView(page);
 
-    const node = page.locator(`.react-flow__node`).filter({ hasText: wsName }).first();
-    await node.click({ button: "right" });
+    await rightClickWorkspaceNode(page, wsName);
 
     const menu = page.locator('[role="menu"]').first();
     await expect(menu).toBeVisible();
