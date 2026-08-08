@@ -660,6 +660,43 @@ jobs:
       - if: ${{ needs.changes.outputs.canvas == 'true' }}
         run: npm ci --include=optional --prefer-offline
       - if: ${{ needs.changes.outputs.canvas == 'true' }}
+        name: ESLint (canvas package, incl. the e2e waitForFunction guard)
+        # Runs BEFORE `npm run build` — it is ~7s against a ~minutes build, so
+        # a lint failure surfaces first instead of behind a compile.
+        #
+        # This step is the ONLY thing that executes ESLint over canvas/e2e.
+        # `npm run build` does not: `next build` lints only ESLINT_DEFAULT_DIRS
+        # (app, pages, components, lib, src) and canvas declares no
+        # `eslint.dirs` override, so the e2e tree — the only tree the
+        # waitForFunction guard added by #5107 is scoped to — was outside every
+        # automated check in the repository. The rule matched correctly and
+        # gated nothing.
+        #
+        # It is deliberately a STEP of an existing required job rather than a
+        # new workflow/job:
+        #   • `CI / all-required` is already an ENFORCED context in
+        #     .gitea/required-contexts.txt, and it is a plain `needs:`
+        #     aggregator — canvas-build failing means all-required never runs
+        #     and the context goes red. No branch-protection change, no new
+        #     required-contexts.txt entry, and nothing for the phantom-gate
+        #     lint to flag.
+        #   • adding a JOB would have to be mirrored into the all-required
+        #     `needs:` list AND ci-required-drift.py's F1 check; adding a
+        #     WORKFLOW would emit a context that BP's ['*'] treats as
+        #     required-if-posted but that nothing makes required-if-absent.
+        #
+        # Skip semantics: like every other step here it is gated on
+        # `needs.changes.outputs.canvas`. That is NOT an `on:.paths` filter —
+        # the job still reaches SUCCESS, so `CI / all-required` is always
+        # posted and never `skipped`. The canvas lane is an INVERTED deny-list
+        # (detect-changes.py: `canvas = deny_list("workspace-server/")`), i.e.
+        # true unless every changed path is docs/, *.md or workspace-server/.
+        # A PR that edits canvas/e2e therefore always sets it true. The only
+        # PRs that skip this lint are ones that cannot contain a
+        # canvas/e2e change, so the skip leaves no hole for THIS rule.
+        working-directory: .
+        run: bash .gitea/scripts/canvas-eslint-gate.sh
+      - if: ${{ needs.changes.outputs.canvas == 'true' }}
         run: npm run build
       - if: ${{ needs.changes.outputs.canvas == 'true' }}
         name: Run tests with coverage

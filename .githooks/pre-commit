@@ -184,6 +184,48 @@ if [ -n "$ALL_STAGED" ]; then
 fi
 
 # ──────────────────────────────────────────────────────────
+# 7. Canvas e2e: ESLint on staged e2e specs/helpers
+# ──────────────────────────────────────────────────────────
+#
+# Sections 1 and 2 above are scoped to `canvas/src/` — so was every other
+# canvas check in this hook, which is one of the three reasons the
+# waitForFunction guard in canvas/eslint.config.mjs (#5107) could not fire
+# anywhere. This section covers `canvas/e2e/`.
+#
+# This hook is ADVISORY, not the gate. The real gate is the ESLint step in
+# ci.yml's `Canvas (Next.js)` job (.gitea/scripts/canvas-eslint-gate.sh),
+# which feeds the ENFORCED `CI / all-required` context. A hook can be skipped
+# with --no-verify, is not installed until someone runs
+# `git config core.hooksPath .githooks`, and never runs for a commit pushed
+# from another machine — so nothing here may be relied on for enforcement.
+# It exists only to fail in 2 seconds at the keyboard instead of 6 minutes in
+# CI.
+#
+# Cost is zero when no e2e file is staged (the common case): the file list is
+# empty and eslint is never invoked. Only STAGED files are linted, so it does
+# not surface the package's pre-existing 183 warnings.
+
+STAGED_E2E=$(git diff --cached --name-only --diff-filter=ACM | grep '^canvas/e2e/.*\.ts$' || true)
+
+if [ -n "$STAGED_E2E" ]; then
+  if [ -x canvas/node_modules/.bin/eslint ]; then
+    # Paths must be relative to canvas/ for the config's `files: ["e2e/**"]`
+    # scoping to apply.
+    E2E_REL=$(echo "$STAGED_E2E" | sed 's|^canvas/||')
+    # shellcheck disable=SC2086
+    if ! (cd canvas && ./node_modules/.bin/eslint $E2E_REL >/tmp/precommit-e2e-eslint.log 2>&1); then
+      echo "❌ ESLINT FAILED on staged canvas/e2e files:"
+      sed 's/^/     /' /tmp/precommit-e2e-eslint.log | head -40
+      ERRORS=$((ERRORS + 1))
+    fi
+  else
+    # Same policy as the go-build check above: surface the gap, don't block.
+    # CI installs eslint via `npm ci`, so the gate still runs there.
+    echo "⚠️  canvas/node_modules absent — skipping e2e eslint pre-commit check"
+  fi
+fi
+
+# ──────────────────────────────────────────────────────────
 # Result
 # ──────────────────────────────────────────────────────────
 
