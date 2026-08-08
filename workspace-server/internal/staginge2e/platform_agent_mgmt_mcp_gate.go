@@ -96,6 +96,17 @@ type MgmtMCPProbe struct {
 	// explicit require-live flag, "this arm did not actually run" is a hard
 	// failure, not an optional arm.
 	RequireCallable bool
+
+	// Claim is what the concierge ITSELF said about the provision turn, parsed
+	// from its real reply (see concierge_self_report_gate.go). Guard B's primary
+	// evidence is and stays the row; this exists so the agent's REPORT can be
+	// reconciled against that row instead of discarded. The zero value
+	// (Observed=false) abstains, so every pre-existing probe is unaffected.
+	Claim ConciergeClaim
+	// ProvisionedWorkspaceID is the id of the row the callable turn actually
+	// produced ("" when absent/not surfaced). It is the ground truth the claim's
+	// published id is reconciled against.
+	ProvisionedWorkspaceID string
 }
 
 // GuardBMode resolves the two Guard B posture booleans from their raw env
@@ -202,6 +213,28 @@ func EvaluateMgmtMCPCallable(p MgmtMCPProbe) (ok bool, reason string) {
 	//     backstop at all.
 	if !p.AssertCallable && !p.MCPServerPresentReported && len(p.LoadedTools) == 0 {
 		return false, "platform agent reached status=online but the tenant surfaced NEITHER mcp_server_present NOR a non-empty loaded_mcp_tools inventory, and this run did not arm the real A2A callable turn — the verdict would be based on ZERO positive evidence that the management MCP exists (a vacuous pass). Re-run with E2E_ASSERT_MGMT_MCP_CALLABLE=1 (or GUARD_B_REQUIRE_CALLABLE=1) so the callable turn supplies the evidence"
+	}
+
+	// 4c. SELF-REPORT RECONCILIATION (failure mode G9 — see
+	//     concierge_self_report_gate.go). Runs BEFORE check 5 on purpose: check 5
+	//     reds on ANY turn that produced no workspace and says only "not
+	//     genuinely CALLABLE", which reads identically whether the agent
+	//     honestly answered "I don't have that tool" (G5) or asserted "Done, the
+	//     workspace has been created" while creating nothing (G9). Those need
+	//     different fixes, so the fabrication must be NAMED, not folded into the
+	//     generic red.
+	//
+	//     It also catches the shape check 5 scores GREEN: the row landed under
+	//     the requested NAME, and the agent published a DIFFERENT id — so every
+	//     consumer of the reported id addresses a resource that does not exist.
+	//
+	//     This can only ADD failures. It never rescues a missing row: an absent
+	//     or silent self-report abstains and check 5 still decides, which is the
+	//     invariant — a self-report must never be the evidence.
+	if p.AssertCallable {
+		if ok, reason := ReconcileProvisionClaim(p.Claim, p.WorkerProvisioned, p.ProvisionedWorkspaceID); !ok {
+			return false, reason
+		}
 	}
 
 	// 5. The CALLABLE proof (the whole point of Guard B): a real A2A tool-use turn
