@@ -1,24 +1,22 @@
 """Guards for DIGEST_SOURCE=registry in advance-staging-tenant-pin.sh.
 
-WHY. The PRODUCTION promote lane must reach the prod control planes on
-loopback, which only the `local-deploy` runner pods can do. Their label set is
-exactly ['local-deploy'] and they have NO docker socket. `runs-on:` is an AND
-over labels, so `[docker-host, local-deploy]` matched zero of the 29 registered
-runners and the lane could never be scheduled — its one and only run (624317)
-sat at started_at=1970-01-01T00:00:00Z until it was cancelled.
+WHY. The PRODUCTION promote lane could not be scheduled at all. `runs-on:` is an
+AND over labels, and `[docker-host, local-deploy]` matched zero of the 29
+registered runners: 22 carry `docker-host` and none of those carries
+`local-deploy`, while the five `local-deploy` pods carry exactly
+['local-deploy']. Its one and only run (624317) sat at
+started_at=1970-01-01T00:00:00Z until it was cancelled.
 
-Relabelling cannot fix that: dropping `local-deploy` lands the job on a robot-1
-runner with no loopback route to the prod CP, and dropping `docker-host` lands
-it on a pod with no docker socket. Removing the docker DEPENDENCY is the fix, so
-these tests exist to keep it removed.
+Relabelling alone could not fix it while the pin script needed a docker socket,
+so the docker DEPENDENCY was removed instead. These tests exist to keep it
+removed — if `docker` creeps back onto this path the lane silently becomes
+unschedulable again on any runner without a socket.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -70,12 +68,16 @@ def _run(env_extra: dict, tmp_path: Path, path_value: str) -> subprocess.Complet
     )
 
 
-def test_registry_digest_source_needs_no_docker_at_all(tmp_path: Path):
-    """DIGEST_SOURCE=registry must resolve with NO docker binary on PATH.
+def test_registry_digest_source_never_invokes_docker(tmp_path: Path):
+    """DIGEST_SOURCE=registry must complete without ever executing docker.
 
-    A docker stub that simply is never called would pass even if the code still
-    called docker behind a fallback. Removing docker from PATH entirely is the
-    only honest proof that this path is docker-free.
+    The property under test is "this path does not invoke docker", so it is
+    tested with a TRIPWIRE rather than by emptying PATH. A docker stub that
+    records every invocation and then fails is a real negative control: if the
+    code shells out to docker at all — including behind a fallback — the marker
+    file exists and this test fails. Stripping PATH down to a hand-listed set of
+    coreutils instead makes the test brittle against the script's helper usage
+    (xargs needs an external `echo`, and so on) without proving anything extra.
     """
     digest = "sha256:" + "c" * 64
     repo_root = tmp_path / "root"
@@ -91,24 +93,17 @@ def test_registry_digest_source_needs_no_docker_at_all(tmp_path: Path):
     binbox = tmp_path / "bin"
     binbox.mkdir()
     _fake_curl_cp_only(binbox, digest, "deadbeef")
-    (binbox / "python3").write_text(
-        f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8"
-    )
-    (binbox / "python3").chmod(0o755)
-    # `bash` itself must be present — the script is run as `bash <script>`, and
-    # this PATH replaces the ambient one entirely. `docker` deliberately is NOT.
-    for tool in ("bash", "sh", "sed", "grep", "tr", "xargs", "head", "cat", "env",
-                 "mktemp", "wc", "rm", "printf", "dirname", "cut", "uname", "date"):
-        src = shutil.which(tool)
-        if src:
-            try:
-                (binbox / tool).symlink_to(src)
-            except OSError:
-                shutil.copy2(src, binbox / tool)
 
-    assert shutil.which("docker", path=str(binbox)) is None, (
-        "the test PATH must not expose docker, or this proves nothing"
+    tripwire = tmp_path / "docker-was-invoked"
+    docker = binbox / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        f'echo "docker $*" >> "{tripwire}"\n'
+        'echo "FAIL: docker must not be invoked on the registry digest path" >&2\n'
+        "exit 97\n",
+        encoding="utf-8",
     )
+    docker.chmod(0o755)
 
     r = _run(
         {
@@ -119,11 +114,44 @@ def test_registry_digest_source_needs_no_docker_at_all(tmp_path: Path):
             "GITHUB_SHA": "deadbeef1234567890abcdef1234567890abcdef",
         },
         tmp_path,
-        str(binbox),
+        f"{binbox}{os.pathsep}{os.environ['PATH']}",
+    )
+    assert not tripwire.exists(), (
+        "docker WAS invoked on the registry digest path: "
+        + tripwire.read_text(encoding="utf-8")
     )
     assert r.returncode == 0, f"rc={r.returncode}\nSTDOUT={r.stdout}\nSTDERR={r.stderr}"
     out = (tmp_path / "github-output").read_text(encoding="utf-8")
     assert f"new_digest={digest}" in out, out
+
+
+def test_the_docker_tripwire_actually_fires(tmp_path: Path):
+    """Negative control for the control: the tripwire must catch a docker call.
+
+    Without this, `test_registry_digest_source_never_invokes_docker` could pass
+    for the wrong reason — a tripwire that never fires proves nothing. Here the
+    DEFAULT (docker) path is taken, so docker MUST be invoked and the marker MUST
+    appear.
+    """
+    binbox = tmp_path / "bin"
+    binbox.mkdir()
+    _fake_curl_cp_only(binbox, "sha256:" + "b" * 64, "cafebabe")
+
+    tripwire = tmp_path / "docker-was-invoked"
+    docker = binbox / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        f'echo "docker $*" >> "{tripwire}"\n'
+        "exit 97\n",
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+
+    _run({}, tmp_path, f"{binbox}{os.pathsep}{os.environ['PATH']}")
+    assert tripwire.exists(), (
+        "the docker tripwire never fired on the DEFAULT path, so it cannot be "
+        "trusted to prove the registry path is docker-free"
+    )
 
 
 def test_registry_absent_tag_fails_loud_and_never_promotes(tmp_path: Path):
