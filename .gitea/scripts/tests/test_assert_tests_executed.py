@@ -50,8 +50,13 @@ def pkg_events(pkg: str, *, passes=0, fails=0, skips=0,
     """
     out = [_ev(Action="start", Package=pkg)]
     if no_test_files:
-        out.append(_ev(Action="output", Package=pkg, Output="?   \t%s\t[no test files]\n" % pkg))
-        out.append(_ev(Action="skip", Package=pkg, Elapsed=0))
+        # UNDER -coverprofile go emits no "[no test files]" marker at all --
+        # just a coverage line and a package-level `pass`. The gate therefore
+        # must not depend on the marker, and these fixtures must not hand it
+        # one. This exact shape is what reddened run 632196 / job 932832.
+        out.append(_ev(Action="output", Package=pkg,
+                       Output="\t%s\t\tcoverage: 0.0%% of statements\n" % pkg))
+        out.append(_ev(Action="pass", Package=pkg, Elapsed=0.4))
         return out
     n = 0
     for action, count in (("pass", passes), ("fail", fails), ("skip", skips)):
@@ -77,13 +82,26 @@ def healthy_stream(n_pkgs: int = 45) -> tuple[list[str], list[str]]:
     return pkgs, lines
 
 
+def manifest_line(pkg: str, ntest: int = 3, ignored: list[str] | None = None) -> str:
+    r"""One row of the `go list -f '{{.ImportPath}} {{len .TestGoFiles}}...'` manifest.
+
+    ntest is what the gate uses to tell "this dir owns no test files" from
+    "this dir's tests stopped compiling in" -- a distinction go's console
+    output does not reliably carry.
+    """
+    return "%s %d 0 %s" % (pkg, ntest, ",".join(ignored or []))
+
+
 def write_case(tmp_path: Path, pkgs: list[str], lines: list[str],
-               allowlist: str | None = None) -> list[str]:
+               allowlist: str | None = None,
+               manifest: list[str] | None = None) -> list[str]:
     log = tmp_path / "test.json"
     log.write_text("\n".join(lines) + "\n", encoding="utf-8")
     plist = tmp_path / "pkgs.txt"
-    plist.write_text("\n".join(pkgs) + "\n", encoding="utf-8")
-    argv = ["--json-log", str(log), "--expected-packages", str(plist)]
+    if manifest is None:
+        manifest = [manifest_line(p) for p in pkgs]
+    plist.write_text("\n".join(manifest) + "\n", encoding="utf-8")
+    argv = ["--json-log", str(log), "--package-manifest", str(plist)]
     if allowlist is not None:
         al = tmp_path / "allow.txt"
         al.write_text(allowlist, encoding="utf-8")
@@ -195,14 +213,54 @@ def test_tests_expected_but_no_verdict_and_no_no_test_files_marker(tmp_path):
 
 
 def test_no_test_files_package_is_not_a_failure(tmp_path):
-    """cmd/ packages with only a main.go are not a defect."""
+    """cmd/ packages with only a main.go are not a defect.
+
+    THE REGRESSION TEST for run 632196 / job 932832. The first cut of this
+    gate decided "has no test files" by looking for go's "[no test files]"
+    marker in the output stream. Under `-coverprofile` go does not print it
+    -- it prints a coverage line and a package-level `pass` -- so all three
+    test-free cmd/ packages were classified as "tests did not compile in"
+    and the gate reddened a healthy run. `go list` metadata replaced the
+    marker; pkg_events(no_test_files=True) now emits the coverage shape, so
+    this test fails again if anything goes back to reading the prose.
+    """
     pkgs, lines = healthy_stream()
     victim = "%s/cmd/justamain" % MOD
     pkgs.append(victim)
     lines += pkg_events(victim, no_test_files=True)
-    res = run_gate(write_case(tmp_path, pkgs, lines))
+    manifest = [manifest_line(p) for p in pkgs[:-1]] + [manifest_line(victim, ntest=0)]
+    res = run_gate(write_case(tmp_path, pkgs, lines, manifest=manifest))
     assert res.returncode == 0, res.stdout
     assert "no-test-files 1" in res.stdout
+
+
+def test_package_whose_test_files_are_all_tagged_out_fails(tmp_path):
+    """Owns _test.go files; a build constraint excluded every one.
+
+    Nothing ran, `go test` exits 0, and the package reads as covered. This
+    is the shape the original inline check was written for, and it is
+    invisible to any count of what DID run.
+    """
+    pkgs, lines = healthy_stream()
+    victim = "%s/internal/taggedout" % MOD
+    pkgs.append(victim)
+    lines += pkg_events(victim, no_test_files=True)
+    manifest = [manifest_line(p) for p in pkgs[:-1]] + [
+        manifest_line(victim, ntest=0, ignored=["only_integration_test.go", "helpers_test.go"])
+    ]
+    res = run_gate(write_case(tmp_path, pkgs, lines, manifest=manifest))
+    assert res.returncode == 1, res.stdout
+    assert "build constraint excluded EVERY one of them" in res.stdout
+
+
+def test_package_in_the_stream_but_not_the_manifest_fails(tmp_path):
+    """The two inputs disagree about what the module contains."""
+    pkgs, lines = healthy_stream()
+    ghost = "%s/internal/ghost" % MOD
+    lines += pkg_events(ghost, no_test_files=True)
+    res = run_gate(write_case(tmp_path, pkgs, lines))
+    assert res.returncode == 1, res.stdout
+    assert "NOT in the `go list` manifest" in res.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -212,9 +270,10 @@ def test_no_test_files_package_is_not_a_failure(tmp_path):
 def test_missing_log_fails(tmp_path):
     """It greps a log that isn't produced -> it must not report success."""
     plist = tmp_path / "pkgs.txt"
-    plist.write_text("\n".join("%s/p%d" % (MOD, i) for i in range(45)), encoding="utf-8")
+    plist.write_text("\n".join(manifest_line("%s/p%d" % (MOD, i)) for i in range(45)),
+                     encoding="utf-8")
     res = run_gate(["--json-log", str(tmp_path / "nope.json"),
-                    "--expected-packages", str(plist)])
+                    "--package-manifest", str(plist)])
     assert res.returncode == 1
     assert "does not exist" in res.stdout
     assert "inspected ZERO packages" in res.stdout
@@ -225,8 +284,8 @@ def test_empty_log_fails(tmp_path):
     log = tmp_path / "test.json"
     log.write_text("", encoding="utf-8")
     plist = tmp_path / "pkgs.txt"
-    plist.write_text("\n".join(pkgs), encoding="utf-8")
-    res = run_gate(["--json-log", str(log), "--expected-packages", str(plist)])
+    plist.write_text("\n".join(manifest_line(p) for p in pkgs), encoding="utf-8")
+    res = run_gate(["--json-log", str(log), "--package-manifest", str(plist)])
     assert res.returncode == 1
     assert "EMPTY" in res.stdout
 
@@ -239,10 +298,44 @@ def test_two_empty_sets_do_not_compare_equal_into_a_pass(tmp_path):
     log.write_text(_ev(Action="output", Package="x", Output="hi\n") + "\n", encoding="utf-8")
     plist = tmp_path / "pkgs.txt"
     plist.write_text("", encoding="utf-8")
-    res = run_gate(["--json-log", str(log), "--expected-packages", str(plist)])
+    res = run_gate(["--json-log", str(log), "--package-manifest", str(plist)])
     assert res.returncode == 1, res.stdout
     assert "below the floor" in res.stdout
     assert "ZERO packages executed a single test" in res.stdout
+
+
+def test_manifest_where_no_package_owns_a_test_file_fails(tmp_path):
+    """A wrong -f template yields 61 rows of zeroes.
+
+    Every package then classifies as NO_TEST_FILES, every "must not" rule is
+    satisfied, and the gate would wave through a run that asserted nothing.
+    """
+    pkgs, lines = healthy_stream()
+    manifest = [manifest_line(p, ntest=0) for p in pkgs]
+    res = run_gate(write_case(tmp_path, pkgs, lines, manifest=manifest))
+    assert res.returncode == 1, res.stdout
+    assert "NO package in the module owns a compiled-in test file" in res.stdout
+
+
+def test_manifest_with_too_few_fields_fails(tmp_path):
+    """A wrong -f template that emits only the import path.
+
+    Every package would then have no counts at all. Defaulting a missing
+    count to zero would silently reclassify the whole module as "owns no
+    tests" -- which is the vacuous pass, arrived at through a typo.
+    """
+    pkgs, lines = healthy_stream()
+    res = run_gate(write_case(tmp_path, pkgs, lines, manifest=list(pkgs)))
+    assert res.returncode == 1, res.stdout
+    assert "unparseable manifest line" in res.stdout
+
+
+def test_manifest_with_non_numeric_counts_fails(tmp_path):
+    pkgs, lines = healthy_stream()
+    manifest = ["%s this is not a count" % p for p in pkgs]
+    res = run_gate(write_case(tmp_path, pkgs, lines, manifest=manifest))
+    assert res.returncode == 1, res.stdout
+    assert "non-numeric test-file count" in res.stdout
 
 
 def test_a_handful_of_packages_trips_the_floor(tmp_path):
@@ -368,8 +461,14 @@ def test_ci_invokes_the_gate_over_the_whole_module():
     body = CI.read_text(encoding="utf-8")
     assert "assert-tests-executed.py" in body, "the gate is not wired into ci.yml at all"
     assert "go test -json" in body, "the gate needs a -json stream to parse"
-    assert "--expected-packages" in body, (
-        "without `go list ./...` fed in, a package that vanishes from the run is invisible")
+    assert "--package-manifest" in body, (
+        "without the `go list` manifest fed in, a package that vanishes from the run is "
+        "invisible, and a test-free cmd/ dir cannot be told from one whose tests stopped "
+        "compiling in")
+    assert "go list -f" in body, "ci.yml must actually PRODUCE the manifest it passes"
+    assert ".IgnoredGoFiles" in body, (
+        "without IgnoredGoFiles the manifest cannot see a package whose every _test.go is "
+        "excluded by a build constraint")
     assert "--allowlist" in body
 
 

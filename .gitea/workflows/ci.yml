@@ -447,17 +447,30 @@ jobs:
         # depending on a shell default at all is better than depending on it
         # correctly.
         #
-        # `go list ./...` is fed in as the expected-package set. Without it
-        # the gate could only check packages it happened to see, and a
-        # package that silently dropped out of the run would be an absence
-        # rather than a failure. The script additionally refuses to run on a
-        # package set below a floor, because two empty sets compare equal and
-        # that is how this gate would come to report success while inspecting
-        # nothing.
+        # A `go list` MANIFEST is fed in, not just a package list. Without it
+        # the gate could only check packages it happened to see, and a package
+        # that silently dropped out of the run would be an absence rather than
+        # a failure. The per-package COUNTS matter too: they are what tells
+        # "this dir has no _test.go" (a cmd/ main.go — fine) from "this dir's
+        # tests stopped compiling in" (the defect). Reading that off go's
+        # console output does NOT work — the "[no test files]" marker is
+        # absent under -coverprofile, which is exactly how the first cut of
+        # this gate reddened its own first CI run (run 632196 / job 932832).
+        # IgnoredGoFiles catches the third case: every _test.go excluded by a
+        # build constraint.
+        #
+        # The script additionally refuses to run on a package set below a
+        # floor, because two empty sets compare equal and that is how this
+        # gate would come to report success while inspecting nothing.
         run: |
           set -uo pipefail
           LOG=/tmp/test-all.json
-          go list ./... > /tmp/go-packages.txt
+          # Space-separated, not tab: no workflow in this repo contains a
+          # literal tab, and a tab that only exists inside a YAML block scalar
+          # is exactly the kind of byte an editor or a reformat silently eats.
+          # Import paths and counts contain no spaces and IgnoredGoFiles are
+          # comma-joined, so whitespace splitting is unambiguous here.
+          go list -f '{{.ImportPath}} {{len .TestGoFiles}} {{len .XTestGoFiles}} {{join .IgnoredGoFiles ","}}' ./... > /tmp/go-packages.txt
           go test -json -timeout 10m -coverprofile=coverage.out ./... > "$LOG" 2>/tmp/test-all.err
           test_exit=$?
           if [ -s /tmp/test-all.err ]; then
@@ -471,7 +484,7 @@ jobs:
           gate_exit=0
           python3 "$GITHUB_WORKSPACE/.gitea/scripts/assert-tests-executed.py" \
             --json-log "$LOG" \
-            --expected-packages /tmp/go-packages.txt \
+            --package-manifest /tmp/go-packages.txt \
             --allowlist "$GITHUB_WORKSPACE/.gitea/tests-may-skip-wholesale.txt" \
             --min-packages 50 \
             --trim-prefix workspace-server/ \

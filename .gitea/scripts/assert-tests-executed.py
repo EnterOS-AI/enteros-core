@@ -37,13 +37,21 @@ its top-level tests passed or failed.
 Three other package states are distinguished, because collapsing them is how
 a gate ends up reporting success while checking nothing:
 
-  NO_TEST_FILES   `go test` printed "[no test files]". The package has no
-                  _test.go at all. Not a defect; counted and reported.
-  ALL_SKIP        Tests exist and ran, and every one of them skipped. FAILS,
-                  unless the package is named in the allowlist with a reason.
-  NO_TEST_EVENTS  Tests were expected but the JSON stream carries no test
-                  event for the package and Go did not say "[no test files]".
-                  This is the original vacuous-pass shape. FAILS.
+  NO_TEST_FILES     `go list` reports no _test.go at all (a cmd/ dir with one
+                    main.go). Not a defect; counted and reported.
+  ALL_SKIP          Tests exist and ran, and every one of them skipped. FAILS,
+                    unless the package is allowlisted with a reason.
+  TESTS_TAGGED_OUT  The package HAS _test.go files and a build constraint
+                    excluded every one of them, so nothing ran. FAILS, same
+                    allowlist escape.
+  NO_TEST_EVENTS    Tests compile in, yet the stream carries no verdict for
+                    the package. The original vacuous-pass shape. FAILS.
+
+Those four are told apart using `go list` metadata, NOT go's console prose.
+The first cut of this script looked for the "[no test files]" marker in the
+output stream and was wrong: under `-coverprofile` go prints
+`pkg  coverage: 0.0% of statements` and no marker, so three test-free cmd/
+packages were misread as defects and the gate reddened its own first CI run.
 
 WHY THIS GATE CANNOT ITSELF PASS VACUOUSLY
 ------------------------------------------
@@ -52,12 +60,13 @@ set that came out empty, reports success while inspecting nothing. Every
 mechanism this script depends on is therefore asserted before it is used:
 
   * the JSON log must exist and be non-empty;
-  * the expected-package list (``go list ./...``) must be non-empty;
+  * the `go list` manifest must be non-empty, and at least one package in it
+    must own a compiled-in test file;
   * BOTH must contain at least ``--min-packages`` entries. Comparing two
     empty sets succeeds — the floor is what makes the comparison mean
     something;
-  * every expected package must appear in the JSON stream, so a package that
-    silently vanished from the run is a failure rather than an absence;
+  * every package in the manifest must appear in the JSON stream, so a
+    package that silently vanished from the run is a failure, not an absence;
   * at least one package must be EXECUTED.
 
 The last one is the load-bearing line. Without it, a run in which every
@@ -79,26 +88,47 @@ import os
 import sys
 from collections import Counter, defaultdict
 
-# A package-level output line Go emits for a directory with no _test.go files.
-NO_TEST_FILES_MARKER = "[no test files]"
-
 EXECUTED = "EXECUTED"
 NO_TEST_FILES = "NO_TEST_FILES"
 ALL_SKIP = "ALL_SKIP"
 NO_TEST_EVENTS = "NO_TEST_EVENTS"
+TESTS_TAGGED_OUT = "TESTS_TAGGED_OUT"
 
 VERDICT_ACTIONS = ("pass", "fail", "skip")
 
 
+class PackageFacts:
+    """What `go list` says a package HAS, independent of what the run did.
+
+    Whether a package owns test files is not something to infer from go's
+    console prose. The first cut of this script looked for the "[no test
+    files]" marker in the output stream, and it was WRONG: under
+    `-coverprofile` go emits `pkg  coverage: 0.0% of statements` and no
+    marker at all, so all three test-free cmd/ packages were misread as
+    "tests did not compile in" and the gate failed its own first CI run
+    (run 632196 / job 932832). The marker is a rendering detail that
+    changes with flags; `go list` metadata is not.
+
+    ntest        test files that DO compile in under the active build tags
+    nignored     _test.go files excluded BY a build constraint
+    """
+
+    __slots__ = ("ntest", "nignored")
+
+    def __init__(self, ntest: int, nignored: int) -> None:
+        self.ntest = ntest
+        self.nignored = nignored
+
+
 class PackageResult:
-    __slots__ = ("name", "top", "sub", "pkg_action", "no_test_files", "output")
+    __slots__ = ("name", "top", "sub", "pkg_action", "facts", "output")
 
     def __init__(self, name: str) -> None:
         self.name = name
         self.top: Counter = Counter()
         self.sub: Counter = Counter()
         self.pkg_action: str | None = None
-        self.no_test_files = False
+        self.facts: PackageFacts | None = None
         self.output: list[str] = []
 
     @property
@@ -116,9 +146,14 @@ class PackageResult:
             return EXECUTED
         if self.total_test_events > 0:
             return ALL_SKIP
-        if self.no_test_files:
-            return NO_TEST_FILES
-        return NO_TEST_EVENTS
+        # Nothing ran. Whether that is fine depends on what the package OWNS,
+        # which only `go list` can say.
+        f = self.facts
+        if f is None or f.ntest > 0:
+            return NO_TEST_EVENTS
+        if f.nignored > 0:
+            return TESTS_TAGGED_OUT
+        return NO_TEST_FILES
 
 
 def parse_json_log(path: str) -> tuple[dict[str, PackageResult], list[str]]:
@@ -148,10 +183,7 @@ def parse_json_log(path: str) -> tuple[dict[str, PackageResult], list[str]]:
             action = event.get("Action")
             test = event.get("Test")
             if action == "output":
-                text = event.get("Output") or ""
-                if test is None and NO_TEST_FILES_MARKER in text:
-                    result.no_test_files = True
-                result.output.append(text)
+                result.output.append(event.get("Output") or "")
                 continue
             if action not in VERDICT_ACTIONS:
                 continue
@@ -164,14 +196,44 @@ def parse_json_log(path: str) -> tuple[dict[str, PackageResult], list[str]]:
     return packages, malformed
 
 
-def read_list_file(path: str) -> list[str]:
-    out = []
+def read_manifest(path: str) -> tuple[dict[str, PackageFacts], list[str]]:
+    """Parse the `go list` manifest. Returns ({import path: facts}, errors).
+
+    Produced by:
+
+        go list -f '{{.ImportPath}} {{len .TestGoFiles}} {{len .XTestGoFiles}} {{join .IgnoredGoFiles ","}}' ./...
+
+    Whitespace-separated on purpose: import paths and counts contain no
+    spaces, IgnoredGoFiles are comma-joined, and no workflow in this repo
+    carries a literal tab -- one that existed only inside a YAML block
+    scalar would be an easy byte for a reformat to eat.
+
+    IgnoredGoFiles is how a package whose test files are ALL excluded by a
+    build constraint stays distinguishable from a package that simply has
+    none -- the first is the tests-stopped-compiling-in defect, the second
+    is a cmd/ dir holding one main.go.
+    """
+    facts: dict[str, PackageFacts] = {}
+    errors: list[str] = []
     with open(path, "r", encoding="utf-8") as fh:
-        for raw in fh:
-            line = raw.strip()
-            if line and not line.startswith("#"):
-                out.append(line)
-    return out
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                errors.append("%s:%d: unparseable manifest line %r" % (path, lineno, line[:120]))
+                continue
+            parts += [""] * (4 - len(parts))
+            try:
+                ntest = int(parts[1]) + int(parts[2])
+            except ValueError:
+                errors.append("%s:%d: non-numeric test-file count in %r" % (path, lineno, line[:120]))
+                continue
+            nignored = len([f for f in parts[3].split(",") if f.strip().endswith("_test.go")])
+            del parts[4:]
+            facts[parts[0].strip()] = PackageFacts(ntest, nignored)
+    return facts, errors
 
 
 def read_allowlist(path: str | None) -> tuple[dict[str, str], list[str]]:
@@ -231,9 +293,12 @@ def render(packages: dict[str, PackageResult], trim: str, show_failures: bool) -
             NO_TEST_FILES: "----",
             ALL_SKIP: "SKIP",
             NO_TEST_EVENTS: "????",
+            TESTS_TAGGED_OUT: "TAGD",
         }[state]
         if state == NO_TEST_FILES:
-            detail = "[no test files]"
+            detail = "no test files (go list)"
+        elif state == TESTS_TAGGED_OUT:
+            detail = "%d _test.go file(s) excluded by build constraints" % r.facts.nignored
         else:
             detail = "pass=%d fail=%d skip=%d" % (
                 r.top["pass"],
@@ -262,9 +327,10 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--json-log", required=True, help="file holding a `go test -json` stream")
     ap.add_argument(
-        "--expected-packages",
+        "--package-manifest",
         required=True,
-        help="file holding the output of `go list ./...` -- every line must appear in the stream",
+        help="manifest from `go list -f '{{.ImportPath}} {{len .TestGoFiles}} "
+             "{{len .XTestGoFiles}} {{join .IgnoredGoFiles \",\"}}' ./...`",
     )
     ap.add_argument(
         "--allowlist",
@@ -300,24 +366,37 @@ def main(argv: list[str]) -> int:
             "The gate inspected ZERO packages; that is a gate failure, not a pass." % args.json_log
         )
         return 1
-    if not os.path.exists(args.expected_packages):
+    if not os.path.exists(args.package_manifest):
         print(
-            "::error::assert-tests-executed: the expected-package list %r does not exist "
-            "(it should be `go list ./...`)." % args.expected_packages
+            "::error::assert-tests-executed: the package manifest %r does not exist "
+            "(it should be the `go list` TSV)." % args.package_manifest
         )
         return 1
 
-    expected = read_list_file(args.expected_packages)
+    facts, manifest_errors = read_manifest(args.package_manifest)
+    errors.extend(manifest_errors)
+    expected = sorted(facts)
     packages, malformed = parse_json_log(args.json_log)
+    # A package go list never heard of cannot be classified, so say so rather
+    # than defaulting it to something harmless.
+    for name, result in packages.items():
+        result.facts = facts.get(name)
 
     if args.render:
         render(packages, args.trim_prefix, not args.no_failure_output)
 
     if len(expected) < args.min_packages:
         errors.append(
-            "expected-package list %s holds %d package(s), below the floor of %d. "
+            "package manifest %s holds %d package(s), below the floor of %d. "
             "`go list ./...` matched (almost) nothing, so any set comparison below would "
-            "have succeeded vacuously." % (args.expected_packages, len(expected), args.min_packages)
+            "have succeeded vacuously." % (args.package_manifest, len(expected), args.min_packages)
+        )
+    with_tests = sum(1 for f in facts.values() if f.ntest > 0)
+    if facts and with_tests == 0:
+        errors.append(
+            "the manifest says NO package in the module owns a compiled-in test file. "
+            "Either the -f template is wrong or the build tags excluded everything; "
+            "either way the per-package assertion below would have nothing to assert on."
         )
     if len(packages) < args.min_packages:
         errors.append(
@@ -347,10 +426,39 @@ def main(argv: list[str]) -> int:
         by_state[result.state].append(name)
 
     for name in sorted(by_state[NO_TEST_EVENTS]):
+        f = packages[name].facts
+        if f is None:
+            errors.append(
+                "%s appears in the test stream but NOT in the `go list` manifest, so nothing "
+                "can say whether it should have run. The two inputs disagree about what the "
+                "module contains; do not read this run as a pass."
+                % short(name, args.trim_prefix)
+            )
+            continue
         errors.append(
-            "%s produced NO test verdict at all, and go did not report '[no test files]'. "
-            "Its tests did not compile into the binary -- check the build tags, the file names, "
-            "and that the package path still matches." % short(name, args.trim_prefix)
+            "%s owns %d compiled-in test file(s) but produced NO test verdict at all. Its tests "
+            "did not run -- check that they still compile in (build tags, file names) and that "
+            "the package path still matches." % (short(name, args.trim_prefix), f.ntest)
+        )
+
+    for name in sorted(by_state[TESTS_TAGGED_OUT]):
+        f = packages[name].facts
+        if name in allowlist:
+            notes.append(
+                "%s has all %d of its _test.go files excluded by build constraints - allowlisted: %s"
+                % (short(name, args.trim_prefix), f.nignored, allowlist[name])
+            )
+            continue
+        errors.append(
+            "%s has %d _test.go file(s), and a build constraint excluded EVERY one of them, so "
+            "the package ran nothing. This is the tests-stopped-compiling-in shape: `go test` "
+            "exits 0 and the package looks covered. If the tag gating is deliberate, add the "
+            "package to %s with a reason naming the lane that sets the tag."
+            % (
+                short(name, args.trim_prefix),
+                f.nignored,
+                args.allowlist or "(no --allowlist configured)",
+            )
         )
 
     unjustified_all_skip = []
@@ -383,7 +491,7 @@ def main(argv: list[str]) -> int:
                 "renamed or deleted. Remove the line. (reason on file: %s)"
                 % (short(name, args.trim_prefix), reason)
             )
-        elif packages[name].state != ALL_SKIP:
+        elif packages[name].state not in (ALL_SKIP, TESTS_TAGGED_OUT):
             errors.append(
                 "allowlist entry %s is STALE: the package is %s (pass=%d fail=%d skip=%d), not "
                 "all-skip. It no longer needs an exemption -- delete the line so the allowlist "
@@ -413,7 +521,7 @@ def main(argv: list[str]) -> int:
 
     print(
         "assert-tests-executed: inspected %d package(s) | executed %d (%d top-level tests) | "
-        "no-test-files %d | all-skip %d (%d allowlisted) | no-test-events %d"
+        "no-test-files %d | all-skip %d (%d allowlisted) | no-test-events %d | tagged-out %d"
         % (
             len(packages),
             executed_pkgs,
@@ -422,6 +530,7 @@ def main(argv: list[str]) -> int:
             len(by_state[ALL_SKIP]),
             len(by_state[ALL_SKIP]) - len(unjustified_all_skip),
             len(by_state[NO_TEST_EVENTS]),
+            len(by_state[TESTS_TAGGED_OUT]),
         )
     )
     for note in notes:
