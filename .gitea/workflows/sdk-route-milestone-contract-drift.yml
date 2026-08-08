@@ -130,7 +130,7 @@ jobs:
 
       - name: Milestone derive-gate (HappyPathMilestones vs E2E runner) — #88
         env:
-          MOLECULE_RUN_CONTRACT_DRIFT_GATES: ""
+          MOLECULE_RUN_CONTRACT_DRIFT_GATES: "1"
         run: |
           set -uo pipefail
           LOG=$(mktemp)
