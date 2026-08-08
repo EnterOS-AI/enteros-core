@@ -29,14 +29,27 @@ name: promote-prod-tenant-pin
 #    script's resolve_digest() did `docker pull`) AND a route to the prod CP.
 #    FIX: the docker DEPENDENCY is removed — scripts/deploy/advance-staging-tenant-pin.sh
 #    now takes DIGEST_SOURCE=registry and resolves the digest over the registry
-#    HTTP API via .gitea/scripts/registry-manifest-state.py. The job is now
-#    `runs-on: local-deploy` (single label), matching redeploy-tenants-on-main.yml.
+#    HTTP API via .gitea/scripts/registry-manifest-state.py.
 #
-#    AVAILABILITY CAVEAT, stated plainly: only ONE of the five local-deploy pods
-#    is currently online. If it is down this job QUEUES — `timeout-minutes`
-#    bounds execution, not queue time — and a queued dispatch looks exactly like
-#    the epoch-zero symptom above. Check runner health before concluding the lane
-#    is broken again.
+#    WHY `docker-host` AND NOT `local-deploy`. The obvious single label was
+#    `local-deploy`, matching redeploy-tenants-on-main.yml. That was tried and it
+#    FAILS — measured, not guessed. Run 634105 on this branch was scheduled onto
+#    local-deploy-deploy-runner-5685894b6b-mdtvd (so the label fix itself worked:
+#    started_at was real, not epoch zero) and died at the digest step with
+#        python3: command not found
+#    The local-deploy pod image is minimal. That is fatal for this lane well
+#    beyond one step: registry-manifest-state.py, prod_pin_plan.py and the eight
+#    python3 calls inside advance-staging-tenant-pin.sh are all unavailable there.
+#    `local-deploy` exists to hold a runner-configured mTLS Docker endpoint, which
+#    this lane does not use at all.
+#
+#    `docker-host` is correct because defect 2 below removes the only reason the
+#    lane ever needed local-deploy: the control planes answer over public HTTPS,
+#    not loopback. docker-host runners are full ubuntu-22.04 images that run
+#    python3 throughout CI today, and 22 of them are online versus ONE local-deploy
+#    pod — so this also removes a single-runner queue-forever hazard, which is
+#    worth stating because `timeout-minutes` bounds execution, not queue time.
+#    This job uses no docker; being ON docker-host is simply where the tooling is.
 #
 # 2. THE CP IS NOT ON LOOPBACK. The old default was
 #    PROD_CP_BASE_URL=http://127.0.0.1:8092. The `local-deploy` runners are k8s
@@ -135,7 +148,7 @@ jobs:
   # bp-exempt: dispatch-only production promote lane, emits no PR/push context
   promote:
     name: Promote the production molecule-tenant pin
-    runs-on: local-deploy
+    runs-on: docker-host
     timeout-minutes: 30
     env:
       PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}

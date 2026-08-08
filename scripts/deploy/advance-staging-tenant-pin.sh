@@ -15,8 +15,10 @@
 # Digest resolution:
 #   DIGEST_SOURCE=docker    (default) docker pull + docker image inspect.
 #   DIGEST_SOURCE=registry  resolve over the registry HTTP API; needs REG_USER /
-#                           REG_TOKEN and NO docker daemon. Use this on runners
-#                           without a docker socket (e.g. the local-deploy pods).
+#                           REG_TOKEN and NO docker daemon. Use this wherever a
+#                           docker socket is absent or undesirable. It still needs
+#                           python3, as does the rest of this script — a runner
+#                           image without python3 cannot run this script at all.
 #
 # Required auth:
 #   CP_ADMIN_API_TOKEN, or INFISICAL_CLIENT_ID / INFISICAL_CLIENT_SECRET /
@@ -99,13 +101,16 @@ DIGEST_SOURCE="${DIGEST_SOURCE:-docker}"
 # Resolve <name>:<tag> to its sha256 digest over the registry HTTP API, with no
 # docker daemon and no docker socket.
 #
-# WHY THIS EXISTS. The PRODUCTION promote lane runs on the `local-deploy` runner
-# pods, whose label set is exactly ['local-deploy'] and which have NO docker
-# socket. `runs-on:` is an AND over labels, so the old `[docker-host,
-# local-deploy]` matched zero of the 29 registered runners and the lane could
-# never be scheduled — its one run, 624317, sat at started_at=1970-01-01 until it
-# was cancelled. Relabelling alone cannot fix that while the script needs docker,
-# so removing the docker DEPENDENCY is what actually fixes it.
+# WHY THIS EXISTS. The PRODUCTION promote lane could not be scheduled at all:
+# `runs-on:` is an AND over labels, and its old `[docker-host, local-deploy]`
+# matched zero of the 29 registered runners (22 carry docker-host, none of those
+# carries local-deploy; the five local-deploy pods carry exactly ['local-deploy']).
+# Its one run, 624317, sat at started_at=1970-01-01 until it was cancelled.
+#
+# Relabelling alone could not fix it while the script needed a docker socket, so
+# the docker DEPENDENCY is removed here instead. The lane now runs on docker-host
+# and reaches the control planes over public HTTPS; it needs no docker socket, and
+# this path lets a runner WITHOUT one resolve a digest correctly.
 #
 # It delegates to .gitea/scripts/registry-manifest-state.py, which is already
 # the SSOT for the registry ref grammar and the manifest read: it rejects
