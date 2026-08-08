@@ -46,6 +46,14 @@ export async function settleCanvas(page: Page): Promise<void> {
       }
       return (store.__rfSteady ?? 0) >= 3; // ~3 stable polls => fitView done
     },
+    // The `null` is REQUIRED, not stylistic. Playwright's signature is
+    // waitForFunction(pageFunction, arg, options): with only two arguments the
+    // options object is taken as the page function's ARG, so `timeout` and
+    // `polling` are silently discarded and the wait becomes unbounded —
+    // measured at 29937ms under a 30s test timeout and 44947ms under a 45s one
+    // (it tracks whatever the test budget is), instead of throwing at 10s.
+    // Passing `arg` explicitly is what binds the options.
+    null,
     { timeout: 10_000, polling: 100 },
   );
   await page.evaluate(() =>
