@@ -438,8 +438,24 @@ jobs:
           # lane already uses (Postgres/Redis/platform all bind 127.0.0.1);
           # `localhost` resolves to it on this runner, which is exactly how
           # the dev server was being reached before.
+          #
+          # --require the core#5106 server probe. On the one captured
+          # recurrence (run 632484) this log contained four lines — the banner
+          # and "Ready in 85ms" — for the whole run, so it could establish that
+          # the server had not crashed and NOTHING else. It could not say
+          # whether the request for the stylesheet that died ever reached this
+          # process, nor whether this process was able to run at the time. The
+          # probe answers both (see canvas/e2e/support/server-probe.cjs) and is
+          # silent on the happy path. Absolute path: the server runs with
+          # cwd=.next/standalone, and a relative --require resolves against cwd.
+          PROBE="${PWD}/e2e/support/server-probe.cjs"
+          if [ ! -f "$PROBE" ]; then
+            echo "::error::server probe not found at ${PROBE} — refusing to start the canvas server without the instrument this lane's failures are diagnosed from."
+            exit 1
+          fi
           cd .next/standalone
-          PORT="${CANVAS_PORT}" HOSTNAME=127.0.0.1 node server.js > ../../canvas.log 2>&1 &
+          PORT="${CANVAS_PORT}" HOSTNAME=127.0.0.1 NODE_OPTIONS="--require ${PROBE}" \
+            node server.js > ../../canvas.log 2>&1 &
           echo $! > ../../canvas.pid
           cd ../..
           # Readiness is the real signal, not a sleep: poll the exact route
@@ -467,6 +483,18 @@ jobs:
             cat canvas.log || true
             exit 1
           fi
+
+          # The probe is only useful if it actually loaded, and a --require that
+          # silently no-ops (wrong path, NODE_OPTIONS stripped, a syntax error
+          # in the file) leaves a log that looks exactly like a healthy quiet
+          # run. That is the same shape as the failure being investigated, so
+          # assert the instrument is live rather than assuming it.
+          if ! grep -q '\[probe .*\] attached' canvas.log; then
+            echo "::error::the core#5106 server probe did not attach — canvas.log has no '[probe] attached' line, so a silent canvas.log would prove nothing. NODE_OPTIONS/--require did not take effect."
+            cat canvas.log || true
+            exit 1
+          fi
+          echo "Server probe attached (event-loop + static-asset instrumentation live)."
 
           # --- React Flow stylesheet: RENDER-BLOCKING, and SERVED ----------
           #
@@ -546,6 +574,7 @@ jobs:
           npx playwright test e2e/chat-desktop.spec.ts e2e/chat-mobile.spec.ts e2e/chat-separation.spec.ts \
             e2e/schedule-tab.spec.ts \
             e2e/boot-regression.spec.ts \
+            e2e/css-diagnostic.spec.ts \
             --reporter=list 2>&1 | tee /tmp/pw-chat.out
           # The guard used to be `grep -qE '[0-9]+ (passed|failed|skipped)'` — which
           # ACCEPTED `skipped` as proof of execution, while its own comment claimed
@@ -575,12 +604,23 @@ jobs:
         if: failure()
         run: cat canvas/canvas.log || true
 
-      - name: Upload Playwright report
+      # `--reporter=list` writes NO playwright-report/ directory — only the HTML
+      # reporter does — so this step has been finding nothing and warning
+      # "No files were found with the provided path" on every failure. It cost
+      # us the failure screenshot and error-context.md on run 632484, the one
+      # captured recurrence of core#5106, leaving the job log as the sole
+      # evidence. `test-results/` is where `screenshot: "only-on-failure"`
+      # actually puts them; keep the report path too so adding an HTML reporter
+      # later still uploads.
+      - name: Upload Playwright failure artifacts
         if: failure()
         uses: actions/upload-artifact@c6a366c94c3e0affe28c06c8df20a878f24da3cf # v3.2.2
         with:
           name: playwright-report-chat
-          path: canvas/playwright-report/
+          path: |
+            canvas/test-results/
+            canvas/playwright-report/
+            canvas/canvas.log
 
       - name: Stop canvas
         if: always()
