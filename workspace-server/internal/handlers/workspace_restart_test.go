@@ -351,8 +351,15 @@ func TestPauseHandler_SuccessNoChildren(t *testing.T) {
 		WithArgs("ws-pause-ok").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}))
 
+	// NOTE (2026-08-07): this expectation used to read WithArgs("ws-pause-ok") —
+	// one argument against a two-argument statement. sqlmock rejected every
+	// mark-paused UPDATE on an arg-count mismatch, so this "success" test in fact
+	// exercised a Pause whose row write FAILED… and still asserted 200, because
+	// the handler swallowed the error and answered 200 unconditionally. The test
+	// was a miniature of the production defect it should have caught. Corrected to
+	// the real argument list so it now asserts a pause that genuinely writes.
 	mock.ExpectExec("UPDATE workspaces SET status =").
-		WithArgs("ws-pause-ok").
+		WithArgs(models.StatusPaused, "ws-pause-ok").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	mock.ExpectExec("INSERT INTO structure_events").
