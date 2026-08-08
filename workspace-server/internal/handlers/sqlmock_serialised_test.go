@@ -135,7 +135,7 @@ func (c *serialisingConn) Prepare(query string) (driver.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &serialisingStmt{inner: stmt, mu: c.mu}, nil
+	return &serialisingStmt{inner: stmt, conn: c, query: query}, nil
 }
 
 func (c *serialisingConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
@@ -145,17 +145,13 @@ func (c *serialisingConn) PrepareContext(ctx context.Context, query string) (dri
 	if err != nil {
 		return nil, err
 	}
-	return &serialisingStmt{inner: stmt, mu: c.mu}, nil
+	return &serialisingStmt{inner: stmt, conn: c, query: query}, nil
 }
 
+// Begin routes through BeginTx rather than the inner Conn.Begin, which is
+// deprecated (SA1019). driver.Conn still requires the method to exist.
 func (c *serialisingConn) Begin() (driver.Tx, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	tx, err := c.inner.Begin()
-	if err != nil {
-		return nil, err
-	}
-	return &serialisingTx{inner: tx, mu: c.mu}, nil
+	return c.BeginTx(context.Background(), driver.TxOptions{})
 }
 
 func (c *serialisingConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
@@ -176,32 +172,55 @@ func (c *serialisingConn) Close() error {
 
 // ─── statement ───────────────────────────────────────────────────────────────
 
+// serialisingStmt keeps the inner statement only for Close and NumInput.
+// Exec and Query are routed back through the connection's context methods —
+// which is exactly what go-sqlmock's own statement does (it forwards to
+// conn.ExecContext with the prepared query) — so the locking lives in one place
+// and no deprecated Stmt method is ever called (SA1019).
 type serialisingStmt struct {
 	inner driver.Stmt
-	mu    *sync.Mutex
+	conn  *serialisingConn
+	query string
 }
 
-var _ driver.Stmt = (*serialisingStmt)(nil)
+var (
+	_ driver.Stmt             = (*serialisingStmt)(nil)
+	_ driver.StmtExecContext  = (*serialisingStmt)(nil)
+	_ driver.StmtQueryContext = (*serialisingStmt)(nil)
+)
 
 // NumInput takes no lock: go-sqlmock's statement returns a constant.
 func (s *serialisingStmt) NumInput() int { return s.inner.NumInput() }
 
 func (s *serialisingStmt) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.conn.mu.Lock()
+	defer s.conn.mu.Unlock()
 	return s.inner.Close()
 }
 
+func (s *serialisingStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	return s.conn.ExecContext(ctx, s.query, args)
+}
+
+func (s *serialisingStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	return s.conn.QueryContext(ctx, s.query, args)
+}
+
+// Exec and Query satisfy driver.Stmt, which still requires them.
 func (s *serialisingStmt) Exec(args []driver.Value) (driver.Result, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.inner.Exec(args)
+	return s.ExecContext(context.Background(), namedValues(args))
 }
 
 func (s *serialisingStmt) Query(args []driver.Value) (driver.Rows, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.inner.Query(args)
+	return s.QueryContext(context.Background(), namedValues(args))
+}
+
+func namedValues(args []driver.Value) []driver.NamedValue {
+	out := make([]driver.NamedValue, len(args))
+	for i, v := range args {
+		out[i] = driver.NamedValue{Ordinal: i + 1, Value: v}
+	}
+	return out
 }
 
 // ─── transaction ─────────────────────────────────────────────────────────────
