@@ -80,7 +80,12 @@ func setupTestDB(t *testing.T) sqlmock.Sqlmock {
 	// Drain globalGoAsync stragglers from prior tests BEFORE swapping the
 	// global db.DB (see setupTestDBForQueueTests — same -race class).
 	waitGlobalAsyncForTest()
-	mockDB, mock, err := sqlmock.New()
+	// The mock is reached through a serialising driver shim: go-sqlmock hands
+	// every pooled connection the same *sqlmock, so database/sql's per-connection
+	// lock does not protect it, and any handler that dispatches goroutines while
+	// its own request goroutine keeps issuing statements corrupts the expectation
+	// list under -race. See sqlmock_serialised_test.go.
+	mockDB, rawMockDB, mock, err := newSerialisedSqlmock()
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
 	}
@@ -116,6 +121,9 @@ func setupTestDB(t *testing.T) sqlmock.Sqlmock {
 		drainTestAsync()
 		db.DB = prevDB
 		mockDB.Close()
+		// rawMockDB owns the mock's entry in go-sqlmock's DSN pool; closing it
+		// last keeps that entry alive for as long as mockDB might still use it.
+		rawMockDB.Close()
 	})
 
 	// The wsauth.platform_inbound_secret cache (#189) is package-level
