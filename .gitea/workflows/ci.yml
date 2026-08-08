@@ -674,16 +674,41 @@ jobs:
         #
         # It is deliberately a STEP of an existing required job rather than a
         # new workflow/job:
-        #   • `CI / all-required` is already an ENFORCED context in
-        #     .gitea/required-contexts.txt, and it is a plain `needs:`
-        #     aggregator — canvas-build failing means all-required never runs
-        #     and the context goes red. No branch-protection change, no new
-        #     required-contexts.txt entry, and nothing for the phantom-gate
-        #     lint to flag.
+        #   • canvas-build already feeds `CI / all-required`, which is the
+        #     first ENFORCED entry in .gitea/required-contexts.txt. No
+        #     branch-protection change, no new required-contexts.txt entry,
+        #     and nothing for the phantom-gate lint to flag.
         #   • adding a JOB would have to be mirrored into the all-required
         #     `needs:` list AND ci-required-drift.py's F1 check; adding a
         #     WORKFLOW would emit a context that BP's ['*'] treats as
         #     required-if-posted but that nothing makes required-if-absent.
+        #
+        # ── HOW A FAILURE HERE ACTUALLY BLOCKS THE MERGE ──────────────────
+        # Measured on PR #5110 (the scratch branch that reintroduced the
+        # defect), NOT inferred. When this step fails:
+        #     CI / Canvas (Next.js)   = failure
+        #     CI / Canvas Deploy Status = skipped
+        #     CI / all-required       = SKIPPED   ← not `failure`
+        #
+        # Note the sentinel lands `skipped`, not red. Gitea SKIPS the
+        # dependents of a failed `needs:` rather than failing them, so the
+        # "failed dependency propagation" the all-required block below
+        # describes does not turn the sentinel red. Two INDEPENDENT
+        # mechanisms block the merge anyway, and it is worth knowing which:
+        #
+        #   1. `CI / Canvas (Next.js) = failure` is a POSTED red context, and
+        #      branch protection on main is status_check_contexts=['*'] —
+        #      every posted context must be success. This is the one that
+        #      blocks via BP. (BP's ['*'] would NOT block on all-required
+        #      being `skipped`; a skipped context is not a posted red.)
+        #   2. gitea-merge-queue.py treats `<workflow> / all-required` as a
+        #      CRITICAL fail-closed context: only `success` clears it, and
+        #      `skipped`/`missing` are explicitly FATAL (RCA core#1676, where
+        #      a skipped sentinel was swept up as a non-required red and
+        #      force-merged past). So the queue blocks on the skip.
+        #
+        # Do not "simplify" this by relying on the sentinel going red. It
+        # does not.
         #
         # Skip semantics: like every other step here it is gated on
         # `needs.changes.outputs.canvas`. That is NOT an `on:.paths` filter —
