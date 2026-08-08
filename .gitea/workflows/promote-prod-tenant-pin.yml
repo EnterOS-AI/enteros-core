@@ -14,6 +14,63 @@ name: promote-prod-tenant-pin
 # LOCAL_TENANT_IMAGE pointed at `staging-7d78136`, a tag that returns 404 on BOTH
 # registry hosts.
 #
+# ---------------------------------------------------------------------------
+# WHY THIS FILE WAS REWRITTEN (2026-08-08, issue #5123)
+#
+# The lane had never completed a single run. Its one and only run, 624317, has
+# `started_at: 1970-01-01T00:00:00Z` — epoch zero, i.e. no runner ever picked it
+# up — and was eventually cancelled. Three concrete defects, all fixed here:
+#
+# 1. UNSCHEDULABLE. `runs-on: [docker-host, local-deploy]` is an AND over labels.
+#    Of the 29 registered runners, 22 carry `docker-host` and none of those
+#    carries `local-deploy`; the 5 `local-deploy-deploy-runner-*` pods carry
+#    exactly ['local-deploy'] and nothing else. The intersection is EMPTY.
+#    Relabelling alone cannot fix it, because the job needed docker (the pin
+#    script's resolve_digest() did `docker pull`) AND a route to the prod CP.
+#    FIX: the docker DEPENDENCY is removed — scripts/deploy/advance-staging-tenant-pin.sh
+#    now takes DIGEST_SOURCE=registry and resolves the digest over the registry
+#    HTTP API via .gitea/scripts/registry-manifest-state.py. The job is now
+#    `runs-on: local-deploy` (single label), matching redeploy-tenants-on-main.yml.
+#
+#    AVAILABILITY CAVEAT, stated plainly: only ONE of the five local-deploy pods
+#    is currently online. If it is down this job QUEUES — `timeout-minutes`
+#    bounds execution, not queue time — and a queued dispatch looks exactly like
+#    the epoch-zero symptom above. Check runner health before concluding the lane
+#    is broken again.
+#
+# 2. THE CP IS NOT ON LOOPBACK. The old default was
+#    PROD_CP_BASE_URL=http://127.0.0.1:8092. The `local-deploy` runners are k8s
+#    pods that reach the production Docker daemon over a runner-configured mTLS
+#    tcp:// endpoint (see scripts/deploy/require-local-deploy-daemon.sh); they are
+#    NOT on the prod box and have no loopback route to it. Verified 2026-08-08 by
+#    reading the same pin over both paths:
+#        https://api.moleculesai.app          == 127.0.0.1:8092  (molecule-cp-prod)
+#        https://staging-api.moleculesai.app  == 127.0.0.1:8096  (molecule-cp-staging)
+#    Both control planes answer over public HTTPS, so that is what is used here.
+#
+# 3. SINGLE-CP, THEREFORE HALF-BLIND. The production fleet is split across TWO
+#    control-plane databases; tenants are assigned by their `cp-env` label. On
+#    2026-08-08 the two disagreed:
+#        cp_prod     molecule-tenant  sha256:747d3df6…  git f3c9eaf244…
+#        cp_staging  molecule-tenant  sha256:f1972d8c…  git 1802ebe22…
+#    A promote against one endpoint returns 200 while the reconciler reports the
+#    out-of-scope tenants converged AGAINST THEIR OWN PIN — the miss is silent and
+#    looks exactly like success. Every endpoint in PROD_CP_BASE_URLS is now read,
+#    and .gitea/scripts/prod_pin_plan.py fails closed if the
+#    (molecule-tenant, global) row is absent from ANY of them.
+#
+# CREDENTIAL. The plan READS the live pin (`GET /cp/admin/runtime-image`), so it
+# needs a read-capable credential. `CP_PROMOTE_PROD_API_TOKEN` — the documented
+# least-privilege promote capability — is accepted ONLY for
+# `POST /cp/admin/promote` and `POST /cp/admin/runtime-image/promote`; verified
+# 2026-08-08 that it returns 401 on the GET, and 401 on EVERY route of the
+# second control plane (its capability is enabled only where the canonical
+# environment is `production`). So it cannot drive this lane. The token is read
+# from the Infisical SSOT at run time — prod env, /shared/controlplane-admin —
+# using the existing INFISICAL_CI_* machine identity, exactly the way
+# staging-tenant-cd.yml does. NOTE the env slug is `prod`, not `production`.
+# Deliberately NOT minted as a second long-lived Gitea Actions secret.
+#
 # THIS DOES NOT ARM AUTO-DEPLOY. Read this before changing the gating:
 #   * There is NO push trigger. Dispatch only. Merging cannot promote prod.
 #   * The APPLY path additionally requires BOTH:
@@ -22,12 +79,32 @@ name: promote-prod-tenant-pin
 #       - PROD_TENANT_PIN_PROMOTE_ARMED == 'true' (a second, explicit arming
 #         switch that is intentionally NOT provisioned).
 #     Both must be true. Under the current freeze posture the apply path cannot
-#     run, which is the intended state.
+#     run, which is the intended state and is UNCHANGED by this rewrite.
 #   * The DEFAULT path is PLAN-ONLY and needs neither. It resolves the target
-#     digest, reads the live pin back from the CP, and prints the exact diff and
-#     the exact command — an auditable, reviewable plan, with no mutation.
+#     digest, reads the live pin back from EVERY control plane, and prints the
+#     exact diff — an auditable, reviewable plan, with no mutation.
 # "Via CI" here means a gated, reviewed, auditable step. It does not mean deploy
 # on merge, and this file must not be edited into meaning that.
+#
+# A pin promote changes what FRESH provisions get; it does not roll running
+# workspaces (Guard E converges those separately), and native plugin versions are
+# compiled INTO the tenant binary, so a pin promote alone ships no plugin change.
+#
+# REGISTRY HOST — a live mismatch an operator must decide about, NOT fixed here.
+# As of 2026-08-08 the production boot SSOT reads
+#     LOCAL_TENANT_IMAGE = registry.enteros.ai/molecule-ai/molecule-tenant:staging-f3c9eaf
+# i.e. the `registry.enteros.ai` host, while TENANT_IMAGE below defaults to the
+# canonical `registry.moleculesai.app`. Both hosts serve byte-identical digests
+# (verified for staging-f3c9eaf and staging-1802ebe), so the two refs are
+# equivalent TODAY. Two consequences worth knowing before arming the apply path:
+#   * .gitea/scripts/registry-manifest-state.py pins CANONICAL_REGISTRY to
+#     registry.moleculesai.app and REJECTS an enteros.ai ref outright. Setting the
+#     MOLECULE_TENANT_IMAGE var to the enteros.ai host makes the digest step fail
+#     closed — deliberately, but surprisingly.
+#   * The apply path records TENANT_IMAGE verbatim into LOCAL_TENANT_IMAGE, so
+#     running it with the default would REWRITE the prod boot default from the
+#     enteros.ai host to the moleculesai.app host. That is a real change to the
+#     boot SSOT and should be an explicit operator decision, not a side effect.
 #
 # NO workflow_dispatch inputs (lint-workflow-yaml forbids them). The target is
 # DERIVED: the molecule-tenant image built from the current main HEAD, i.e.
@@ -58,13 +135,17 @@ jobs:
   # bp-exempt: dispatch-only production promote lane, emits no PR/push context
   promote:
     name: Promote the production molecule-tenant pin
-    runs-on: [docker-host, local-deploy]
+    runs-on: local-deploy
     timeout-minutes: 30
     env:
       PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}
       PROMOTE_ARMED: ${{ vars.PROD_TENANT_PIN_PROMOTE_ARMED || '' }}
       TENANT_IMAGE: ${{ vars.MOLECULE_TENANT_IMAGE || 'registry.moleculesai.app/molecule-ai/molecule-tenant' }}
-      CP_BASE_URL: ${{ vars.PROD_CP_BASE_URL || 'http://127.0.0.1:8092' }}
+      # Comma-separated <label>=<base_url> list, one entry per control-plane
+      # database that serves production tenants. BOTH are required for a complete
+      # picture; see defect 3 in the header.
+      PROD_CP_BASE_URLS: ${{ vars.PROD_CP_BASE_URLS || 'cp_prod=https://api.moleculesai.app,cp_staging=https://staging-api.moleculesai.app' }}
+      INFISICAL_BASE: https://key.moleculesai.app
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -79,6 +160,126 @@ jobs:
           echo "sha7=${sha:0:7}"   >> "$GITHUB_OUTPUT"
           echo "tag=staging-${sha:0:7}" >> "$GITHUB_OUTPUT"
           echo "::notice::target = ${TENANT_IMAGE}:staging-${sha:0:7} (main ${sha})"
+
+      - name: Resolve the target digest over the registry API (no docker)
+        id: digest
+        env:
+          REG_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
+          REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REG_TOKEN:-}" ]; then
+            echo "::error::MOLECULE_REGISTRY_TOKEN is not provisioned — cannot resolve the target digest."
+            exit 1
+          fi
+          echo "::add-mask::$REG_TOKEN"
+          ref="${TENANT_IMAGE}:${TAG}"
+          set +e
+          digest="$(python3 .gitea/scripts/registry-manifest-state.py "$ref")"
+          rc=$?
+          set -e
+          if [ "$rc" = "10" ]; then
+            echo "::error::the registry serves NO manifest for ${ref}. Promoting a pin to a tag the registry does not serve is exactly how prod was left on staging-7d78136 (404 on both registry hosts). Refusing."
+            exit 1
+          fi
+          if [ "$rc" != "0" ] || [ -z "$digest" ]; then
+            echo "::error::could not resolve ${ref} over the registry API (rc=$rc)"
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "::notice::target digest = ${digest}"
+
+      - name: Read the production CP admin token from the Infisical SSOT
+        id: cptoken
+        env:
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          for v in INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET INFISICAL_PROJECT_ID; do
+            eval "val=\${$v:-}"
+            if [ -z "$val" ]; then
+              echo "::error::$v is not provisioned — this lane reads the prod CP admin token from Infisical rather than holding a second long-lived copy as a Gitea secret. Failing closed."
+              exit 1
+            fi
+          done
+          tok="$(curl -fsS -A curl/8.4.0 -X POST "$INFISICAL_BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; sys.stdout.write(json.load(sys.stdin).get("accessToken") or "")')"
+          if [ -z "$tok" ]; then
+            echo "::error::Infisical auth returned an empty accessToken — failing closed."
+            exit 1
+          fi
+          echo "::add-mask::$tok"
+          # env slug is `prod`, NOT `production`. A promote once wrote to a
+          # nonexistent environment because of exactly that confusion.
+          cp_token="$(curl -fsS -A curl/8.4.0 \
+            "$INFISICAL_BASE/api/v3/secrets/raw/CP_ADMIN_API_TOKEN?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=%2Fshared%2Fcontrolplane-admin" \
+            -H "Authorization: Bearer $tok" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.stdout.write(((d.get("secret") or {}).get("secretValue")) or "")')"
+          if [ -z "$cp_token" ]; then
+            echo "::error::Infisical returned an EMPTY CP_ADMIN_API_TOKEN at prod /shared/controlplane-admin — failing closed rather than reporting a plan this lane never produced."
+            exit 1
+          fi
+          echo "::add-mask::$cp_token"
+          echo "CP_ADMIN_API_TOKEN=$cp_token" >> "$GITHUB_ENV"
+          echo "prod CP admin token loaded from the Infisical SSOT (len=${#cp_token})"
+
+      - name: Plan — current pin vs target on EVERY control plane (no mutation)
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+          TARGET_DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # FAIL-CLOSED. The plan IS the default path's entire product. Without a
+          # readable pin none of it happens, so a warn-and-exit-0 would make a
+          # dispatch that read nothing indistinguishable from one that confirmed
+          # prod was already on trunk — the vacuous-green shape sdk-pin-bump
+          # carried (run 620174, 2026-08-05).
+          #
+          # Failing here is safe and cannot wedge anything: this lane is
+          # dispatch-only and posts no commit status on any PR, and going red on
+          # the PLAN step can never promote — the apply step is separately gated.
+          if [ -z "${CP_ADMIN_API_TOKEN:-}" ]; then
+            echo "::error::CP_ADMIN_API_TOKEN is empty after the Infisical read — refusing to plan."
+            exit 1
+          fi
+          args=()
+          IFS=',' read -ra entries <<< "$PROD_CP_BASE_URLS"
+          for entry in "${entries[@]}"; do
+            label="${entry%%=*}"
+            base="${entry#*=}"
+            if [ -z "$label" ] || [ -z "$base" ] || [ "$label" = "$base" ]; then
+              echo "::error::PROD_CP_BASE_URLS entry '${entry}' is not <label>=<base_url>"
+              exit 1
+            fi
+            resp="${RUNNER_TEMP:-/tmp}/pins-${label}.json"
+            # lint-curl-status-capture shape: body to a file, status to a var, no
+            # or-else fallback inside the subshell.
+            code=$(curl -sS -A curl/8.4.0 -o "$resp" -w '%{http_code}' \
+              -H "Authorization: Bearer ${CP_ADMIN_API_TOKEN}" \
+              "${base%/}/cp/admin/runtime-image")
+            if [ "$code" != "200" ]; then
+              echo "::error::[${label}] could not read the live pin at ${base} (HTTP $code)"
+              exit 1
+            fi
+            # An empty 200 body is a KNOWN silent-failure shape on this path.
+            if [ ! -s "$resp" ]; then
+              echo "::error::[${label}] CP returned HTTP 200 with an EMPTY body — that is the known silent-failure shape, not an empty pin set. Refusing to plan against it."
+              exit 1
+            fi
+            args+=("${label}=${resp}")
+          done
+          if [ "${#args[@]}" -lt 2 ]; then
+            echo "::warning::planning against ${#args[@]} control plane(s). Production tenants are split across TWO CP databases; a single-endpoint plan is true for at most half the fleet."
+          fi
+          python3 .gitea/scripts/prod_pin_plan.py \
+            --target "${TENANT_IMAGE}:${TAG}" \
+            --target-digest "${TARGET_DIGEST}" \
+            "${args[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Decide plan vs apply
         id: mode
@@ -101,54 +302,16 @@ jobs:
             echo "apply=1" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Plan — current pin vs target (no mutation)
-        env:
-          CP_ADMIN_API_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
-          TAG: ${{ steps.target.outputs.tag }}
-        run: |
-          set -euo pipefail
-          # FAIL-CLOSED. The plan IS the default path's entire product: resolve
-          # the target digest, read the live pin back from the CP, print the diff.
-          # Without the token none of that happens, so the previous warn-and-exit-0
-          # made a dispatch that read nothing indistinguishable from a dispatch
-          # that confirmed prod was already on trunk. That is the same
-          # vacuous-green shape sdk-pin-bump carried (run 620174, 2026-08-05).
-          #
-          # Failing here is safe and cannot wedge anything: this lane is
-          # dispatch-only and posts no commit status on any PR, and going red on
-          # the PLAN step can never promote — the apply step is separately gated
-          # on PROD_AUTO_DEPLOY_DISABLED being unset AND
-          # PROD_TENANT_PIN_PROMOTE_ARMED == 'true', neither of which this change
-          # touches.
-          if [ -z "${CP_ADMIN_API_TOKEN:-}" ]; then
-            echo "::error::CP_ADMIN_API_TOKEN is not provisioned — this lane cannot read the live production pin, so it is FAILING rather than reporting a green plan it never produced."
-            echo "::error::Wire it the way staging-tenant-cd.yml does: read the PROD control-plane admin token from the Infisical SSOT (prod env, secretPath /shared/controlplane-admin) using INFISICAL_CI_CLIENT_ID / INFISICAL_CI_CLIENT_SECRET / INFISICAL_CI_PROJECT_ID, rather than minting a second copy as a long-lived Gitea Actions secret. Provisioning a prod CP admin credential to CI is an operator decision and is deliberately NOT done by the change that made this guard loud."
-            exit 1
-          fi
-          # lint-curl-status-capture shape: body to a file, status to a var, no
-          # or-else fallback inside the subshell.
-          resp="${RUNNER_TEMP:-/tmp}/pins.json"
-          code=$(curl -sS -A curl/8.4.0 -o "$resp" -w '%{http_code}' \
-            -H "Authorization: Bearer ${CP_ADMIN_API_TOKEN}" \
-            "${CP_BASE_URL}/cp/admin/runtime-image")
-          if [ "$code" != "200" ]; then
-            echo "::error::could not read the live pin (HTTP $code)"; exit 1
-          fi
-          # An empty 200 body is a KNOWN silent-failure shape on this path.
-          if [ ! -s "$resp" ]; then
-            echo "::error::CP returned HTTP 200 with an EMPTY body — that is the known silent-failure shape, not an empty pin set. Refusing to plan against it."
-            exit 1
-          fi
-          python3 .gitea/scripts/prod_pin_plan.py "$resp" "${TENANT_IMAGE}:${TAG}" | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Apply — promote BOTH SSOTs and read back
+      - name: Apply — promote BOTH SSOTs on EVERY control plane and read back
         if: ${{ steps.mode.outputs.apply == '1' }}
         env:
-          CP_ADMIN_API_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
           INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
           INFISICAL_ENV: prod
+          DIGEST_SOURCE: registry
+          REG_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
+          REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
           TENANT_PIN_GIT_SHA: ${{ steps.target.outputs.sha }}
           TAG: ${{ steps.target.outputs.tag }}
         run: |
@@ -157,5 +320,17 @@ jobs:
           # the runtime_image_pins row AND the LOCAL_TENANT_IMAGE boot secret,
           # and verifies each landed. Re-implementing it here is how the two
           # halves drift apart again.
-          ./scripts/deploy/advance-staging-tenant-pin.sh \
-            --tag "${TAG}" --git-sha "${TENANT_PIN_GIT_SHA}"
+          #
+          # Once per control plane. The LOCAL_TENANT_IMAGE write is idempotent
+          # (the script no-ops when the value already matches), so repeating it
+          # is safe; skipping a CP is not.
+          IFS=',' read -ra entries <<< "$PROD_CP_BASE_URLS"
+          for entry in "${entries[@]}"; do
+            label="${entry%%=*}"
+            base="${entry#*=}"
+            echo "::group::promote on ${label} (${base})"
+            CP_BASE_URL="${base%/}" \
+              ./scripts/deploy/advance-staging-tenant-pin.sh \
+                --tag "${TAG}" --git-sha "${TENANT_PIN_GIT_SHA}"
+            echo "::endgroup::"
+          done
