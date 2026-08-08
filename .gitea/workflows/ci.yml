@@ -660,17 +660,25 @@ jobs:
       - if: ${{ needs.changes.outputs.canvas == 'true' }}
         run: npm ci --include=optional --prefer-offline
       - if: ${{ needs.changes.outputs.canvas == 'true' }}
-        name: ESLint (canvas package, incl. the e2e waitForFunction guard)
-        # Runs BEFORE `npm run build` — it is ~7s against a ~minutes build, so
-        # a lint failure surfaces first instead of behind a compile.
+        name: Static gate (ESLint over canvas + tsc over e2e)
+        # Runs BEFORE `npm run build` — it is ~14s against a ~minutes build, so
+        # a lint or type failure surfaces first instead of behind a compile.
         #
-        # This step is the ONLY thing that executes ESLint over canvas/e2e.
-        # `npm run build` does not: `next build` lints only ESLINT_DEFAULT_DIRS
-        # (app, pages, components, lib, src) and canvas declares no
-        # `eslint.dirs` override, so the e2e tree — the only tree the
-        # waitForFunction guard added by #5107 is scoped to — was outside every
-        # automated check in the repository. The rule matched correctly and
-        # gated nothing.
+        # This step is the ONLY thing that runs EITHER check over canvas/e2e.
+        #   • ESLint: `next build` lints only ESLINT_DEFAULT_DIRS (app, pages,
+        #     components, lib, src) and canvas declares no `eslint.dirs`
+        #     override, so the e2e tree — the only tree the waitForFunction
+        #     guard added by #5107 is scoped to — was outside every automated
+        #     check in the repository. The rule matched correctly and gated
+        #     nothing.
+        #   • tsc: canvas/tsconfig.json EXCLUDES e2e, there is no `typecheck`
+        #     script, no workflow ran tsc, and `playwright test` transpiles via
+        #     esbuild without type-checking. So the e2e tree was never
+        #     type-checked either — which mattered because the guard is an
+        #     ARITY rule and the transposed-argument shape needs types to
+        #     catch. canvas/tsconfig.e2e.json plus this step is what makes the
+        #     rule's "TypeScript covers that slot" claim true; before, it was
+        #     an unbacked assertion in a comment.
         #
         # It is deliberately a STEP of an existing required job rather than a
         # new workflow/job:
@@ -720,7 +728,7 @@ jobs:
         # PRs that skip this lint are ones that cannot contain a
         # canvas/e2e change, so the skip leaves no hole for THIS rule.
         working-directory: .
-        run: bash .gitea/scripts/canvas-eslint-gate.sh
+        run: bash .gitea/scripts/canvas-static-gate.sh
       - if: ${{ needs.changes.outputs.canvas == 'true' }}
         run: npm run build
       - if: ${{ needs.changes.outputs.canvas == 'true' }}
