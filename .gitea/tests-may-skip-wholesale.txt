@@ -1,0 +1,17 @@
+# Packages whose tests may legitimately skip WHOLESALE under `CI / Platform
+# (Go)`'s `go test ./...`, checked by .gitea/scripts/assert-tests-executed.py.
+#
+# Being on this list is not an exemption from testing. It is a claim that the
+# package's tests execute for real SOMEWHERE ELSE, and the reason must say
+# where. If a reader cannot follow the reason to a lane that actually runs the
+# package, the entry is wrong.
+#
+# Format:   <go import path>  # why it skips here, and where it DOES execute
+#
+# Both directions are enforced:
+#   * a package that skips wholesale and is NOT listed here fails the gate;
+#   * an entry that is no longer all-skip (or names a package that no longer
+#     exists) also fails the gate, so the list cannot rot into a rubber stamp.
+#     If you get that failure, DELETE the line — do not "fix" it.
+
+git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/e2emilestones  # shadow contract-drift derive-gate (RFC #4428 Phase 1, issue #88). TestHappyPathMilestonesMatchRunner skips unless MOLECULE_RUN_CONTRACT_DRIFT_GATES is set, deliberately, so drift never blocks a PR through ci.yml's `go test ./...`. It EXECUTES in .gitea/workflows/sdk-route-milestone-contract-drift.yml, which sets that env var and is a required context ("sdk-route-milestone-contract-drift / SDK route + milestone derive-gates").
