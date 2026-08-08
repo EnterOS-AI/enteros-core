@@ -95,8 +95,10 @@ def test_registry_digest_source_needs_no_docker_at_all(tmp_path: Path):
         f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8"
     )
     (binbox / "python3").chmod(0o755)
-    for tool in ("sh", "sed", "grep", "tr", "xargs", "head", "cat", "env",
-                 "mktemp", "wc", "rm", "printf", "dirname", "cut"):
+    # `bash` itself must be present — the script is run as `bash <script>`, and
+    # this PATH replaces the ambient one entirely. `docker` deliberately is NOT.
+    for tool in ("bash", "sh", "sed", "grep", "tr", "xargs", "head", "cat", "env",
+                 "mktemp", "wc", "rm", "printf", "dirname", "cut", "uname", "date"):
         src = shutil.which(tool)
         if src:
             try:
