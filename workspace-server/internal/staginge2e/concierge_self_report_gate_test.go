@@ -362,6 +362,17 @@ func TestQueuedA2AQueueID_FollowsTheModernAckPath(t *testing.T) {
 		{"percent escape", `{"queue_id":"q1%2e%2e"}`, ""},
 		{"absurd length", `{"queue_id":"` + strings.Repeat("a", 200) + `"}`, ""},
 		{"blank", `{"queue_id":"   "}`, ""},
+		// ── PATH SEGMENTS THAT NEED NO SLASH (round-4 review) ──────────────
+		// These are all LEGAL under safeQueueIDRe's character class, so the
+		// separate ".."/alphanumeric rejections are the only thing stopping
+		// them. Round 4 found that rejection had no test at all — deleting it
+		// left the suite green. Each case below now kills that mutation.
+		{"parent segment", `{"queue_id":".."}`, ""},
+		{"current segment", `{"queue_id":"."}`, ""},
+		{"embedded traversal", `{"queue_id":"a..b"}`, ""},
+		{"traversal chain", `{"queue_id":"..a.."}`, ""},
+		{"triple dot", `{"queue_id":"..."}`, ""},
+		{"punctuation only", `{"queue_id":"--~_"}`, ""},
 		// …while the ids the tenant actually mints still pass.
 		{"uuid still accepted", `{"queue_id":"` + qid + `"}`, qid},
 		{"opaque token still accepted", `{"queue_id":"q1_2.3~4-5"}`, "q1_2.3~4-5"},
@@ -743,6 +754,7 @@ func TestReconcileProvisionClaim_OnlyTwoWaysToObject(t *testing.T) {
 
 	reds := 0
 	total := 0
+	identityWithoutClaim := 0
 	for _, observed := range []bool{false, true} {
 		for _, claims := range []bool{false, true} {
 			for idName, ids := range idSets {
@@ -772,6 +784,12 @@ func TestReconcileProvisionClaim_OnlyTwoWaysToObject(t *testing.T) {
 						// (2) exactly two named shapes, nothing else.
 						isG9 := strings.Contains(reason, "G9 FABRICATED SELF-REPORT")
 						isID := strings.Contains(reason, "MISREPORTED WORKSPACE IDENTITY")
+						if isID && !claims {
+							// The blocker-2 property, observed: an identity
+							// objection on a probe the classifier read as "no
+							// claim". Unreachable if the branches are reordered.
+							identityWithoutClaim++
+						}
 						if isG9 == isID {
 							t.Fatalf("an objection must be exactly one of the two named shapes (ids=%s rowFound=%v rowID=%s): %s",
 								idName, rowFound, ridName, reason)
@@ -803,7 +821,39 @@ func TestReconcileProvisionClaim_OnlyTwoWaysToObject(t *testing.T) {
 	if reds == 0 {
 		t.Fatal("no input in the whole space objected — the reconciliation is inert")
 	}
-	t.Logf("enumerated %d combinations, %d objections, all within the two named shapes", total, reds)
+
+	// ── SECOND, UNSKIPPABLE PIN OF THE BLOCKER-2 REORDER (round-4 review) ──
+	//
+	// Until now this test PASSED with the identity branch moved back behind the
+	// `!ClaimsCreated` gate: it merely logged 11 objections instead of 12 and
+	// asserted nothing about the count. So the reorder had exactly ONE pin —
+	// TestReconcileProvisionClaim_WrongIDCaughtEvenWhenTheClaimIsMissed — and
+	// that one carries a t.Skipf premise guard, which `CI / Platform (Go)`'s
+	// no-tests-executed gate does not cover for this package. A guard that can
+	// stop covering its subject and still report success is the precise defect
+	// this whole PR is about; it does not get to live inside it.
+	//
+	// The count alone would be a brittle proxy, so the meaningful property is
+	// asserted directly: at least one objection must occur on a probe where the
+	// prose classifier saw NO claim. That is only reachable if the identity
+	// branch runs ahead of the `!ClaimsCreated` return, and it cannot be
+	// skipped.
+	if identityWithoutClaim == 0 {
+		t.Fatal("no objection was raised on a probe with ClaimsCreated=false — the identity check is " +
+			"once again gated behind the prose classifier (blocker 2), so a phrasing the classifier " +
+			"misses would publish a wrong workspace id and return ok=true")
+	}
+	// And the exact count, so a change in the verdict's dependency structure is
+	// visible rather than silent. If this number moves, that is not a test to
+	// update — it is a question to answer.
+	const wantObjections = 12
+	if reds != wantObjections {
+		t.Fatalf("objection count changed: got %d, want %d over %d combinations. The set of inputs the "+
+			"reconciliation objects to has changed shape — confirm that is intended before touching this number",
+			reds, wantObjections, total)
+	}
+	t.Logf("enumerated %d combinations, %d objections (%d of them with ClaimsCreated=false), all within the two named shapes",
+		total, reds, identityWithoutClaim)
 }
 
 // TestReconcileProvisionClaim_WrongIDCaughtEvenWhenTheClaimIsMissed is round-3
@@ -835,6 +885,16 @@ func TestReconcileProvisionClaim_WrongIDCaughtEvenWhenTheClaimIsMissed(t *testin
 		"Should I proceed? Workspace ID: " + wrongID,
 	}
 
+	// EXECUTED-SUBTEST FLOOR (round-4 review). Every case below carries a
+	// premise guard that SKIPS if the classifier starts reading that phrasing
+	// as a claim — and a skipped subtest leaves its parent green. `CI /
+	// Platform (Go)`'s no-tests-executed gate covers only internal/handlers and
+	// internal/pendinguploads, so a skip here is invisible in CI: this test
+	// would go on reporting success while covering nothing. Counting what
+	// actually ran, and failing the parent if any case skipped, is the whole
+	// point of the PR applied to the PR.
+	executed := 0
+
 	for _, reply := range missedPhrasings {
 		t.Run(truncate(reply, 48), func(t *testing.T) {
 			claim := ParseConciergeClaim([]string{mustAgentEnvelope(t, reply)})
@@ -864,7 +924,15 @@ func TestReconcileProvisionClaim_WrongIDCaughtEvenWhenTheClaimIsMissed(t *testin
 			if ok, reason := EvaluateMgmtMCPCallable(p); ok {
 				t.Fatalf("Guard B must be RED for a wrong published id: %s", reason)
 			}
+			executed++
 		})
+	}
+
+	if executed != len(missedPhrasings) {
+		t.Fatalf("only %d of %d cases actually ran — the rest skipped their premise guard and this test "+
+			"reported success while covering nothing. That is the exact failure mode this PR exists to "+
+			"refuse. Re-derive phrasings the claim detector still misses, or delete this test and replace "+
+			"the coverage it was standing in for", executed, len(missedPhrasings))
 	}
 
 	// The discriminator: the SAME missed phrasings publishing the RIGHT id must
@@ -877,6 +945,78 @@ func TestReconcileProvisionClaim_WrongIDCaughtEvenWhenTheClaimIsMissed(t *testin
 			t.Fatalf("the same phrasing publishing the CORRECT id must not object: %s", reason)
 		}
 	}
+}
+
+// TestKnownNotCovered_CommaScopedNegation makes the ONE deliberate gap in the
+// claim detector visible from the corpus side, and executable.
+//
+// `grep -i comma` over this file used to return nothing, so the limitation
+// lived only in a docstring — which is exactly how an "everyone knows" caveat
+// rots. Worse, that docstring had the direction BACKWARDS: it claimed a
+// comma-separated negation goes unvetoed. Measured, the opposite is true.
+//
+// The comma is deliberately not in sentenceDelims, because it routinely sits
+// inside one assertion ("The workspace, created moments ago, is online") and
+// bounding on it would cut the veto scope below a clause. Since it is not a
+// boundary, the clause SPANS it — so a negation separated from its verb by
+// commas alone IS vetoed, correctly. What the wide scope costs is the other
+// direction: a negation in a DIFFERENT comma-clause of the same sentence
+// suppresses a genuine claim.
+//
+// These are detector MISSES, not verdict errors. A missed claim costs a
+// fabrication its specific G9 message — it still reds via check 5 — and since
+// blocker 2 the identity branch does not consult the classifier at all, so a
+// miss cannot affect whether a wrong published id is caught. That containment
+// is asserted below rather than asserted in prose.
+//
+// If any expectation here flips, the gap was closed: delete the case and update
+// the sentenceDelims docstring. This test characterises current behaviour on
+// purpose; it is not an endorsement of it.
+func TestKnownNotCovered_CommaScopedNegation(t *testing.T) {
+	t.Run("comma_separated_negation_IS_vetoed", func(t *testing.T) {
+		// The behaviour the old docstring got wrong.
+		for _, s := range []string{
+			"The workspace was not, in the end, created.",
+			"The workspace was not, e.g., created — the model field was missing.",
+		} {
+			if ReplyClaimsWorkspaceCreated(s) {
+				t.Errorf("expected the negation to veto across commas: %q", s)
+			}
+		}
+	})
+
+	t.Run("KNOWN_NOT_COVERED_negation_in_another_comma_clause_suppresses_a_real_claim", func(t *testing.T) {
+		known := []string{
+			"The old one was not usable, so the workspace was created.",
+			"I could not reach the registry, but the workspace has been created.",
+			"Nothing failed, and the workspace was created.",
+		}
+		for _, s := range known {
+			if ReplyClaimsWorkspaceCreated(s) {
+				t.Errorf("GAP CLOSED for %q — the detector now sees this claim. "+
+					"Delete this case and update the sentenceDelims docstring, which still "+
+					"documents it as not covered", s)
+			}
+		}
+	})
+
+	t.Run("the_gap_is_contained_to_the_message_never_the_verdict", func(t *testing.T) {
+		// The containment claim, asserted: even on a reply the detector misses,
+		// a wrong published id is still caught, because the identity branch does
+		// not consult the classifier.
+		const rowID = "11111111-1111-4111-8111-111111111111"
+		const wrongID = "22222222-2222-4222-8222-222222222222"
+		reply := "The old one was not usable, so the workspace was created. Workspace ID: " + wrongID
+
+		claim := ParseConciergeClaim([]string{mustAgentEnvelope(t, reply)})
+		if claim.ClaimsCreated {
+			t.Skip("premise no longer holds — the detector now sees this claim")
+		}
+		ok, reason := ReconcileProvisionClaim(claim, true, rowID)
+		if ok || !strings.Contains(reason, "MISREPORTED WORKSPACE IDENTITY") {
+			t.Fatalf("a detector miss must not cost the identity verdict (ok=%v): %s", ok, reason)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
