@@ -660,6 +660,76 @@ jobs:
       - if: ${{ needs.changes.outputs.canvas == 'true' }}
         run: npm ci --include=optional --prefer-offline
       - if: ${{ needs.changes.outputs.canvas == 'true' }}
+        name: Static gate (ESLint over canvas + tsc over e2e)
+        # Runs BEFORE `npm run build` — it is ~14s against a ~minutes build, so
+        # a lint or type failure surfaces first instead of behind a compile.
+        #
+        # This step is the ONLY thing that runs EITHER check over canvas/e2e.
+        #   • ESLint: `next build` lints only ESLINT_DEFAULT_DIRS (app, pages,
+        #     components, lib, src) and canvas declares no `eslint.dirs`
+        #     override, so the e2e tree — the only tree the waitForFunction
+        #     guard added by #5107 is scoped to — was outside every automated
+        #     check in the repository. The rule matched correctly and gated
+        #     nothing.
+        #   • tsc: canvas/tsconfig.json EXCLUDES e2e, there is no `typecheck`
+        #     script, no workflow ran tsc, and `playwright test` transpiles via
+        #     esbuild without type-checking. So the e2e tree was never
+        #     type-checked either — which mattered because the guard is an
+        #     ARITY rule and the transposed-argument shape needs types to
+        #     catch. canvas/tsconfig.e2e.json plus this step is what makes the
+        #     rule's "TypeScript covers that slot" claim true; before, it was
+        #     an unbacked assertion in a comment.
+        #
+        # It is deliberately a STEP of an existing required job rather than a
+        # new workflow/job:
+        #   • canvas-build already feeds `CI / all-required`, which is the
+        #     first ENFORCED entry in .gitea/required-contexts.txt. No
+        #     branch-protection change, no new required-contexts.txt entry,
+        #     and nothing for the phantom-gate lint to flag.
+        #   • adding a JOB would have to be mirrored into the all-required
+        #     `needs:` list AND ci-required-drift.py's F1 check; adding a
+        #     WORKFLOW would emit a context that BP's ['*'] treats as
+        #     required-if-posted but that nothing makes required-if-absent.
+        #
+        # ── HOW A FAILURE HERE ACTUALLY BLOCKS THE MERGE ──────────────────
+        # Measured on PR #5110 (the scratch branch that reintroduced the
+        # defect), NOT inferred. When this step fails:
+        #     CI / Canvas (Next.js)   = failure
+        #     CI / Canvas Deploy Status = skipped
+        #     CI / all-required       = SKIPPED   ← not `failure`
+        #
+        # Note the sentinel lands `skipped`, not red. Gitea SKIPS the
+        # dependents of a failed `needs:` rather than failing them, so the
+        # "failed dependency propagation" the all-required block below
+        # describes does not turn the sentinel red. Two INDEPENDENT
+        # mechanisms block the merge anyway, and it is worth knowing which:
+        #
+        #   1. `CI / Canvas (Next.js) = failure` is a POSTED red context, and
+        #      branch protection on main is status_check_contexts=['*'] —
+        #      every posted context must be success. This is the one that
+        #      blocks via BP. (BP's ['*'] would NOT block on all-required
+        #      being `skipped`; a skipped context is not a posted red.)
+        #   2. gitea-merge-queue.py treats `<workflow> / all-required` as a
+        #      CRITICAL fail-closed context: only `success` clears it, and
+        #      `skipped`/`missing` are explicitly FATAL (RCA core#1676, where
+        #      a skipped sentinel was swept up as a non-required red and
+        #      force-merged past). So the queue blocks on the skip.
+        #
+        # Do not "simplify" this by relying on the sentinel going red. It
+        # does not.
+        #
+        # Skip semantics: like every other step here it is gated on
+        # `needs.changes.outputs.canvas`. That is NOT an `on:.paths` filter —
+        # the job still reaches SUCCESS, so `CI / all-required` is always
+        # posted and never `skipped`. The canvas lane is an INVERTED deny-list
+        # (detect-changes.py: `canvas = deny_list("workspace-server/")`), i.e.
+        # true unless every changed path is docs/, *.md or workspace-server/.
+        # A PR that edits canvas/e2e therefore always sets it true. The only
+        # PRs that skip this lint are ones that cannot contain a
+        # canvas/e2e change, so the skip leaves no hole for THIS rule.
+        working-directory: .
+        run: bash .gitea/scripts/canvas-static-gate.sh
+      - if: ${{ needs.changes.outputs.canvas == 'true' }}
         run: npm run build
       - if: ${{ needs.changes.outputs.canvas == 'true' }}
         name: Run tests with coverage
