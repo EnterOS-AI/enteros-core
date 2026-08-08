@@ -1890,8 +1890,8 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 	})
 }
 
-// resumeSideEffectBudget is the HARD ceiling on Resume's detached side-effect
-// phase — TOTAL for the whole cascade, not per workspace.
+// resumeSideEffectBudget is the HARD ceiling on the DATABASE work in Resume's
+// detached side-effect phase — TOTAL for the whole cascade, not per workspace.
 //
 // Why a ceiling is mandatory: the request context used to be the only thing
 // bounding this work. Detaching from it (see Resume) removes that bound, and a
@@ -1899,25 +1899,42 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 // from this budget is threaded into every ExecContext/QueryContext below, so
 // the deadline is enforced by database/sql itself, not by a convention.
 //
-// Why this is NOT pauseSideEffectBudget's 60s: that number is sized against
-// provisioner.cpAPITimeout, because Pause's detached phase CONTAINS a
-// synchronous CP HTTP round-trip (StopWorkspaceAuto → DELETE /cp/workspaces/:id
-// → provider terminate). Resume's detached phase contains no such call. The
-// provision is dispatched through provisionWorkspaceAuto, which spawns its own
-// goroutine on context.WithTimeout(context.Background(),
-// provisioner.ProvisionTimeout) — already detached, already bounded, and NOT on
-// this budget. What remains here is database round-trips only: per workspace one
-// claim UPDATE, one event INSERT and two small SELECTs. The in-repo precedent
-// for exactly that shape is provisionWorkspaceAuto's no-backend arm, which
-// allots 10s to "the broadcast + single UPDATE inside markProvisionFailed". 30s
-// is that figure with cascade headroom.
+// What it bounds, precisely: the statements. Per workspace that is one claim
+// UPDATE, one event INSERT and two small SELECTs. 30s is scaled from
+// provisionWorkspaceAuto's no-backend arm, the in-repo precedent for exactly
+// that shape, which allots 10s to "the broadcast + single UPDATE inside
+// markProvisionFailed".
 //
-// TOTAL, not per-workspace, for the same reason pauseSideEffectBudget is: a
-// per-workspace timeout lets an N-descendant cascade run for N × budget, which
-// is not a bound. When the budget is spent mid-cascade the remaining workspaces
-// fast-fail on the expired context and land in the failure list — a truthful
-// partial result rather than an unbounded handler. A var, not a const, so tests
-// can shrink it.
+// What it does NOT bound — say it plainly rather than let the name imply
+// otherwise — is the handler's wall clock. Two things sit outside opCtx:
+//
+//   - provisionWorkspaceAuto takes acquireRestartProvisionGate(ws.id) and
+//     gate.Lock()s it SYNCHRONOUSLY, before its goroutine spawn
+//     (workspace_dispatchers.go). If another provision for the same ws-<id> is
+//     in flight, this handler goroutine blocks on that mutex for as long as the
+//     holder runs — up to provisioner.cpProvisionTimeout (20m). That is
+//     pre-existing, deliberate (it is the core#2771 serialization), shared
+//     verbatim with Create, and strands nothing; but it is not covered here and
+//     no ceiling in this file can cover it.
+//   - the provision itself, which runs on the dispatcher's own
+//     context.WithTimeout(context.Background(), provisioner.ProvisionTimeout).
+//     Already detached, already bounded, correctly not on this budget: a
+//     provision legitimately outlives a DB budget.
+//
+// TOTAL, not per-workspace: a per-workspace timeout lets an N-descendant cascade
+// run for N × budget, which is not a bound. When the budget is spent mid-cascade
+// the remaining workspaces fast-fail on the expired context and land in the
+// failure list — a truthful partial result rather than an unbounded handler.
+// A var, not a const, so tests can shrink it.
+//
+// Sibling note: PR #5102 introduces pauseSideEffectBudget for the equivalent
+// phase in Pause. That PR is still OPEN, so the symbol does not exist in this
+// tree and nothing here may depend on it. Sizing differs anyway and the reason
+// is worth recording for whoever merges second: Pause's detached phase CONTAINS
+// a synchronous CP HTTP round-trip (StopWorkspaceAuto → DELETE
+// /cp/workspaces/:id → provider terminate), so its budget is scaled against
+// provisioner.cpAPITimeout (120s). Resume's phase contains no CP call at all,
+// which is why it is scaled against a DB figure instead.
 var resumeSideEffectBudget = 30 * time.Second
 
 // errResumeClaimMissed reports that the guarded provisioning claim matched no
@@ -2008,8 +2025,9 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 	//
 	// Pre-fix this loop ran on `ctx` — the request context — so an aborted client
 	// connection cancelled the status write and the event while the handler still
-	// answered 200 {"status":"provisioning"}. That is the defect PR #5102 closed
-	// for Pause, in the same file; Resume was the remaining copy. Restart hit the
+	// answered 200 {"status":"provisioning"}. That is the defect PR #5102 (open
+	// at time of writing) addresses for Pause, in the same file; Resume is the
+	// other copy and does not depend on that PR. Restart hit the
 	// hazard first and documented it (see the goAsync + context.Background()
 	// dispatch above: "detaches the dispatch from the request lifecycle so an
 	// aborted client connection doesn't cancel the in-flight Stop/provision
@@ -2147,14 +2165,31 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 	// A failure reported through a write that the failure itself has broken is
 	// not a report.
 	//
-	// Note what "provisioning" keeps meaning on the success arm. Unlike Pause's
-	// {"status":"paused"} — a claim about a COMPLETED state, which is why #5102
-	// had to keep Pause synchronous — "provisioning" is an honest "queued": the
-	// claim is durable before this line runs, and the outcome of the provision
-	// itself arrives asynchronously as a WORKSPACE_PROVISION_FAILED event plus
+	// Note what "provisioning" keeps meaning on the success arm, and why the
+	// async dispatch above does not make it a lie. It asserts a state that is
+	// DURABLY TRUE AT RESPONSE TIME: the claim committed before this line runs.
+	// Pause's {"status":"paused"} could not make that trade — it asserts a
+	// COMPLETED TERMINAL state, which is why PR #5102 keeps Pause synchronous.
+	// "provisioning" is an honest "queued", and the provision's own outcome
+	// arrives asynchronously as a WORKSPACE_PROVISION_FAILED event plus
 	// status='failed' via markProvisionFailed, exactly as it does for Restart and
-	// Create. So the async dispatch above is compatible with this body; the
-	// unconditional 200 was not.
+	// Create.
+	//
+	// The residual races are bounded too, which is the property that actually
+	// makes this safe. Post-fix there are exactly two:
+	//
+	//   - claim lands, dispatch never happens (process dies between them). The
+	//     row sits at 'provisioning', and StartProvisioningTimeoutSweep
+	//     (registry/provisiontimeout.go, wired in cmd/server/main.go) flips
+	//     'provisioning' rows older than DefaultProvisioningTimeout — 12m, 30m
+	//     for hermes — to 'failed'. Recoverable: 'failed' is in the heartbeat's
+	//     `recoverable` set and Restart accepts it.
+	//   - claim fails, nothing is dispatched. The row stays 'paused', which is
+	//     the truth, and Resume can be retried.
+	//
+	// So the invariant this handler now holds is: EVERY residual race lands in a
+	// status something can recover from. Pre-fix the SUCCESS path landed in
+	// 'paused'-with-a-running-box, the one status nothing can.
 	if len(failures) == 0 {
 		log.Printf("Resuming workspace %s (%s) + %d children", wsName, id, len(toResume)-1)
 		c.JSON(http.StatusOK, gin.H{"status": "provisioning", "resumed_count": resumedCount})

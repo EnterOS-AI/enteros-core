@@ -673,7 +673,12 @@ func TestResumeHandler_DescendantsWithCascadeReturns200(t *testing.T) {
 	// pinned separately in workspace_resume_context_test.go.
 	waitForHandlerAsyncBeforeDBCleanup(t, handler)
 	for _, wsID := range []string{"ws-resume-parent-cascade", "ws-child-1", "ws-child-2"} {
-		mock.ExpectExec("UPDATE workspaces SET status =").
+		// Full SQL, predicate included — see resumeClaimSQL in
+		// workspace_resume_context_test.go for why the abbreviated
+		// "UPDATE workspaces SET status =" matcher cannot assert the claim.
+		// Pinning it here also stops markProvisionFailed's same-prefix UPDATE
+		// from colliding with this expectation at all.
+		mock.ExpectExec(resumeClaimSQL).
 			WithArgs(models.StatusProvisioning, wsID).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectExec("INSERT INTO structure_events").

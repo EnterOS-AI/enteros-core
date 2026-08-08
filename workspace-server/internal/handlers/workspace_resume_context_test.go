@@ -1,8 +1,9 @@
 package handlers
 
 // workspace_resume_context_test.go — pins the Resume handler's three honesty
-// contracts. It is the Resume counterpart of workspace_pause_context_test.go
-// (PR #5102); the defect is the same class, the blast radius is not.
+// contracts. It is the Resume counterpart of the Pause work in PR #5102, which
+// is still OPEN: nothing here depends on any symbol that PR introduces. Same
+// defect class, different blast radius.
 //
 //  1. DETACH. The status write and the event must NOT run on the request-scoped
 //     context. Pre-fix Resume took `ctx := c.Request.Context()` and used it for
@@ -26,13 +27,14 @@ package handlers
 //     ended in an UNCONDITIONAL c.JSON(200, {"status":"provisioning"}).
 //
 // Note what does NOT change: the async dispatch itself, and the word
-// "provisioning" in the success body. Unlike Pause's {"status":"paused"} — a
-// claim about a COMPLETED state, which is why #5102 had to keep Pause
-// synchronous — "provisioning" is an honest "queued". The provision's own
-// outcome arrives later as a WORKSPACE_PROVISION_FAILED event plus
-// status='failed' from markProvisionFailed, exactly as it does for Restart and
-// Create. A failure landing after the 200 is therefore the documented contract,
-// not a second defect.
+// "provisioning" in the success body. It asserts a state DURABLY TRUE AT
+// RESPONSE TIME — the claim committed before c.JSON. Pause's
+// {"status":"paused"} asserts a COMPLETED TERMINAL state and cannot make that
+// trade, which is why #5102 keeps Pause synchronous. A markProvisionFailed
+// landing after the 200 is therefore the documented contract, not a second
+// defect; and the residual races are bounded, since
+// StartProvisioningTimeoutSweep reclaims a stuck 'provisioning' row to 'failed'
+// (see the report arm of Resume).
 
 import (
 	"context"
@@ -53,6 +55,20 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 )
+
+// resumeClaimSQL matches the guarded paused→provisioning claim EXACTLY,
+// predicate included.
+//
+// It is spelled out rather than abbreviated to "UPDATE workspaces SET status ="
+// because that shorter matcher is satisfied by the UNGUARDED statement too:
+// sqlmock returns whatever rowsAffected the fixture declares regardless of what
+// the WHERE clause says, so with the loose matcher you can delete
+// `AND status = 'paused'` from the handler and every test in this file still
+// passes. The claim LOGIC would be pinned and the predicate that gives
+// rowsAffected its meaning would not — and that predicate is the half of this
+// fix that makes "the row says provisioning" a precondition of "a box gets
+// started". Pinning the SQL is the only way a fixture can assert it.
+const resumeClaimSQL = `UPDATE workspaces SET status = \$1, mcp_unloaded_since = NULL, updated_at = now\(\) WHERE id = \$2 AND status = 'paused'`
 
 // ─────────────────────────────────────────────────────────────────────────────
 // probes
@@ -215,7 +231,7 @@ func TestResumeHandler_ClientCancelMidFlight_ClaimStillLands(t *testing.T) {
 	killer := &resumeArgProbe{expect: "ws-resume-cancel", onHit: cancel}
 	expectResumeReads(mock, "ws-resume-cancel", "Agent A", killer, nil)
 
-	mock.ExpectExec("UPDATE workspaces SET status =").
+	mock.ExpectExec(resumeClaimSQL).
 		WithArgs(models.StatusProvisioning, "ws-resume-cancel").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	expectResumeProvisionLeg(mock, "ws-resume-cancel")
@@ -258,7 +274,7 @@ func TestResumeHandler_ClaimMissed_IsNot200_AndProvisionsNothing(t *testing.T) {
 	expectResumeReads(mock, "ws-resume-lost", "Agent A", "ws-resume-lost", nil)
 
 	// rowsAffected = 0: the predicate `AND status = 'paused'` matched nothing.
-	mock.ExpectExec("UPDATE workspaces SET status =").
+	mock.ExpectExec(resumeClaimSQL).
 		WithArgs(models.StatusProvisioning, "ws-resume-lost").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
@@ -306,7 +322,7 @@ func TestResumeHandler_RefusedClaimWrite_IsNot200_AndProvisionsNothing(t *testin
 
 	expectResumeReads(mock, "ws-resume-dbdead", "Agent A", "ws-resume-dbdead", nil)
 
-	mock.ExpectExec("UPDATE workspaces SET status =").
+	mock.ExpectExec(resumeClaimSQL).
 		WithArgs(models.StatusProvisioning, "ws-resume-dbdead").
 		WillReturnError(sql.ErrConnDone)
 
@@ -356,7 +372,7 @@ func TestResumeHandler_GenuineSuccess_Still200(t *testing.T) {
 	expectResumeReads(mock, "ws-resume-ok", "Agent A", "ws-resume-ok", nil)
 
 	// THE ONE VARIED INPUT: 1 row claimed.
-	mock.ExpectExec("UPDATE workspaces SET status =").
+	mock.ExpectExec(resumeClaimSQL).
 		WithArgs(models.StatusProvisioning, "ws-resume-ok").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	provisionProbe := expectResumeProvisionLeg(mock, "ws-resume-ok")
@@ -397,17 +413,17 @@ func TestResumeHandler_PartialCascade_Is207(t *testing.T) {
 		{"ws-child-2", "Child 2"},
 	})
 
-	mock.ExpectExec("UPDATE workspaces SET status =").
+	mock.ExpectExec(resumeClaimSQL).
 		WithArgs(models.StatusProvisioning, "ws-casc").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	expectResumeProvisionLeg(mock, "ws-casc")
 
 	// child-1 lost the claim — removed, or resumed by a concurrent caller.
-	mock.ExpectExec("UPDATE workspaces SET status =").
+	mock.ExpectExec(resumeClaimSQL).
 		WithArgs(models.StatusProvisioning, "ws-child-1").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	mock.ExpectExec("UPDATE workspaces SET status =").
+	mock.ExpectExec(resumeClaimSQL).
 		WithArgs(models.StatusProvisioning, "ws-child-2").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	expectResumeProvisionLeg(mock, "ws-child-2")
@@ -440,10 +456,12 @@ func TestResumeHandler_PartialCascade_Is207(t *testing.T) {
 
 // TestResumeSideEffectBudget_IsTheNamedCeiling pins the ceiling itself. The
 // number is load-bearing: it is what replaces the request context as the bound
-// on the detached phase, and it is deliberately NOT pauseSideEffectBudget's 60s
-// (Pause's phase contains a synchronous CP HTTP stop; Resume's contains DB
-// round-trips only — the provision runs on provisioner.ProvisionTimeout, off
-// this budget entirely).
+// on the DATABASE work in the detached phase.
+//
+// It bounds the statements, not the handler's wall clock — provisionWorkspaceAuto's
+// synchronous gate.Lock() and the provision goroutine's own
+// provisioner.ProvisionTimeout both sit outside opCtx. See the comment on
+// resumeSideEffectBudget for why that is correct and pre-existing.
 func TestResumeSideEffectBudget_IsTheNamedCeiling(t *testing.T) {
 	if resumeSideEffectBudget != 30*time.Second {
 		t.Errorf("resumeSideEffectBudget = %v, want 30s — the documented ceiling changed without its rationale", resumeSideEffectBudget)
@@ -470,7 +488,7 @@ func TestResumeHandler_DetachedWorkIsBounded(t *testing.T) {
 	shrinkResumeBudget(t, time.Millisecond)
 
 	expectResumeReads(mock, "ws-resume-wedged", "Agent A", "ws-resume-wedged", nil)
-	mock.ExpectExec("UPDATE workspaces SET status =").
+	mock.ExpectExec(resumeClaimSQL).
 		WithArgs(models.StatusProvisioning, "ws-resume-wedged").
 		WillDelayFor(5 * time.Second).
 		WillReturnResult(sqlmock.NewResult(0, 1))
