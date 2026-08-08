@@ -161,11 +161,21 @@ async function collectHittabilityDiagnostic(page: Page, testId: string): Promise
       // @xyflow/react's stylesheet. If it is not, the stylesheet is missing
       // and EVERY canvas interaction is unreliable — say so explicitly.
       const bgPE = bg ? getComputedStyle(bg).pointerEvents : "(no .react-flow__background)";
-      // If the rule is NOT APPLIED, say whether the stylesheet is missing from
-      // the document entirely (a dev-server chunk that never arrived) or is
-      // present but somehow not in effect. Measured: the rule is part of the
-      // INITIAL document CSS — it is there before <Canvas/> ever mounts — so
-      // "present: false" points at chunk delivery, not at import placement.
+      // CSSOM state semantics on Chromium, measured (not assumed) — these are
+      // what make the numbers below diagnostic rather than suggestive:
+      //
+      //   still in flight (headers delayed, body trickled, body STALLED)
+      //     -> ABSENT from document.styleSheets, and link.sheet === null
+      //   terminally failed at the network/security layer (connection reset,
+      //     request aborted, blocked by CSP)
+      //     -> PRESENT in document.styleSheets, cssRules THROWS SecurityError
+      //   HTTP-level failure (404, 500, empty 200, truncated body)
+      //     -> PRESENT, cssRules readable, 0 rules
+      //
+      // So `total` counts only sheets that have SETTLED, and `readable < total`
+      // is proof of a DEAD sheet — never of a slow one. A sheet that is merely
+      // still loading lowers `total`; it can never lower `readable`. Do not
+      // read a low `readable` as "it hasn't arrived yet".
       let ruleSheets = 0;
       let rulePresent = false;
       for (const sheet of Array.from(document.styleSheets)) {
@@ -173,7 +183,7 @@ async function collectHittabilityDiagnostic(page: Page, testId: string): Promise
         try {
           rules = sheet.cssRules;
         } catch {
-          continue; // cross-origin sheet, not ours
+          continue; // terminally failed (or genuinely cross-origin)
         }
         if (!rules) continue;
         ruleSheets++;
@@ -181,21 +191,59 @@ async function collectHittabilityDiagnostic(page: Page, testId: string): Promise
           if (r.cssText.includes(".react-flow__background")) rulePresent = true;
         }
       }
-      // Enumerate every <link> with rel/href and whether its CSSOM sheet
-      // exists. A bare "stylesheets = 2" cannot distinguish "the sheet is
-      // still a preload React has not converted yet" from "the sheet was
-      // inserted and the fetch failed" — and those have different fixes.
-      // `link.sheet === null` on a rel="stylesheet" means inserted-but-not-
-      // (yet-)loaded; a rel="preload" entry with no matching stylesheet link
-      // means React has not run its hoistable-resource insertion for it.
+      // Per-link inventory. The aggregate counts above cannot distinguish the
+      // three settled/unsettled states from each other, and reading them wrong
+      // sends the fix at the wrong layer — so record, for every stylesheet-ish
+      // link, the five facts that DO separate them: href, rel/as,
+      // `link.sheet === null`, whether `cssRules` throws (and with what), and
+      // the rule count. `sheet=null` => still loading; `throws` => dead at the
+      // network/security layer; `rules=0` => served but empty/truncated.
       const linkInventory = Array.from(document.querySelectorAll("link"))
-        .filter((l) => (l.getAttribute("rel") ?? "").includes("style") || l.hasAttribute("as"))
+        .filter(
+          (l) =>
+            (l.getAttribute("rel") ?? "").includes("stylesheet") ||
+            (l.getAttribute("as") ?? "") === "style",
+        )
         .map((l) => {
-          const rel = l.getAttribute("rel") ?? "";
-          const href = l.getAttribute("href") ?? "";
-          return `${rel}${l.getAttribute("as") ? `(as=${l.getAttribute("as")})` : ""} ${href} sheet=${
-            (l as HTMLLinkElement).sheet ? "loaded" : "null"
-          }`;
+          const rel = l.getAttribute("rel") ?? "(no rel)";
+          const as = l.getAttribute("as");
+          const href = l.getAttribute("href") ?? "(no href)";
+          const sheet = (l as HTMLLinkElement).sheet;
+          let state: string;
+          if (!sheet) {
+            // Only meaningful for rel=stylesheet; a preload never gets a sheet.
+            state = rel.includes("stylesheet")
+              ? "sheet=null (IN FLIGHT — not yet settled)"
+              : "sheet=null (preload; never becomes a sheet on its own)";
+          } else {
+            try {
+              const n = sheet.cssRules.length;
+              state =
+                n === 0
+                  ? "sheet=present cssRules=readable rules=0 (SERVED BUT EMPTY/TRUNCATED)"
+                  : `sheet=present cssRules=readable rules=${n}`;
+            } catch (e) {
+              const err = e as Error;
+              // A throw means EITHER the sheet died at the network/security
+              // layer OR it is genuinely cross-origin (which is not a defect).
+              // Every canvas stylesheet is served same-origin from
+              // /_next/static, so resolve the href and say which this is
+              // instead of asserting the alarming one.
+              let sameOrigin = true;
+              try {
+                sameOrigin = new URL(l.getAttribute("href") ?? "", location.href).origin === location.origin;
+              } catch {
+                sameOrigin = false;
+              }
+              state =
+                `sheet=present cssRules=THREW ${err?.name ?? "Error"}: ` +
+                `${(err?.message ?? String(e)).slice(0, 90)} ` +
+                (sameOrigin
+                  ? "(same-origin => DEAD: reset/aborted/CSP-blocked, NOT slow)"
+                  : "(CROSS-ORIGIN => unreadable by design, not necessarily a failure)");
+            }
+          }
+          return `${rel}${as ? `(as=${as})` : ""} ${href}\n      ${state}`;
         });
       return [
         `node box = {x:${r.x.toFixed(1)} y:${r.y.toFixed(1)} w:${r.width.toFixed(1)} h:${r.height.toFixed(1)}}`,
@@ -205,17 +253,19 @@ async function collectHittabilityDiagnostic(page: Page, testId: string): Promise
             ? ""
             : "  <-- @xyflow/react/dist/style.css is NOT applied to this page; " +
               "the React Flow background is swallowing pointer events"),
-        `stylesheets = ${document.styleSheets.length} (${ruleSheets} readable), ` +
+        `stylesheets = ${document.styleSheets.length} settled (${ruleSheets} readable), ` +
           `.react-flow__background rule present = ${rulePresent}` +
-          (bgPE === "none"
-            ? ""
+          (ruleSheets < document.styleSheets.length
+            ? "  <-- readable < settled: at least one settled stylesheet is " +
+              "unreadable. For a SAME-ORIGIN sheet that means DEAD " +
+              "(reset/aborted/CSP-blocked) — it is NOT a slow sheet, because a " +
+              "still-loading sheet is absent from styleSheets entirely and so " +
+              "lowers `settled`, never `readable`. Read the per-link inventory " +
+              "below for which sheet and which state, then fix delivery of that " +
+              "asset; nothing in the spec can wait this out."
             : rulePresent
               ? "  <-- rule IS in the document but not in effect"
-              : "  <-- the rule is not in this document's CSSOM. If the sheet " +
-                "carrying it appears below only as rel=preload, it is a PAGE " +
-                "chunk that React inserts during hydration — import it from " +
-                "canvas/src/app/globals.css so it ships as a render-blocking " +
-                "layout stylesheet instead"),
+              : ""),
         `stylesheet links:\n    ${linkInventory.join("\n    ")}`,
         `viewport transform = ${
           (document.querySelector(".react-flow__viewport") as HTMLElement | null)?.style.transform || "(none)"

@@ -23,6 +23,16 @@ async function seedWorkspace(request: APIRequestContext, name: string) {
     headers: { "Content-Type": "application/json" },
   });
   const workspace = (await create.json()) as { id: string; name: string };
+  // Fail HERE, not 10s later at `workspace-node-undefined`. The node is now
+  // targeted by `data-testid` derived from this name, so an error body would
+  // otherwise surface as an unrelated node-hittability timeout that points at
+  // the canvas instead of at the failed POST that actually broke the test.
+  if (!workspace?.id || !workspace?.name) {
+    throw new Error(
+      `POST ${API}/workspaces did not return {id,name} (status ${create.status()}): ` +
+        `${JSON.stringify(workspace).slice(0, 300)}`,
+    );
+  }
 
   await request.post(`${API}/registry/register`, {
     data: {
