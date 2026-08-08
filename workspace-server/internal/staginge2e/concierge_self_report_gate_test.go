@@ -1000,6 +1000,21 @@ func TestKnownNotCovered_CommaScopedNegation(t *testing.T) {
 		}
 	})
 
+	// EXECUTED-SUBTEST FLOOR, same as
+	// TestReconcileProvisionClaim_WrongIDCaughtEvenWhenTheClaimIsMissed sixty
+	// lines above. The containment subtest below carries a t.Skip premise
+	// guard, and a skipped subtest leaves its parent GREEN — so if the
+	// classifier ever starts reading this phrasing as a claim, the one
+	// assertion that the gap is contained to the message would quietly stop
+	// running and this test would go on reporting success while covering
+	// nothing. That is the exact pattern the floor above exists to refuse, and
+	// it does not get to survive in the same file.
+	//
+	// Nothing else covers it: `CI / Platform (Go)`'s no-tests-executed gate
+	// counts TOP-LEVEL verdicts per package, and this parent reports `pass`
+	// whether or not its subtest skipped, so a package-level gate cannot see
+	// this. A subtest premise guard has to be counted where it is written.
+	containmentRan := false
 	t.Run("the_gap_is_contained_to_the_message_never_the_verdict", func(t *testing.T) {
 		// The containment claim, asserted: even on a reply the detector misses,
 		// a wrong published id is still caught, because the identity branch does
@@ -1016,7 +1031,17 @@ func TestKnownNotCovered_CommaScopedNegation(t *testing.T) {
 		if ok || !strings.Contains(reason, "MISREPORTED WORKSPACE IDENTITY") {
 			t.Fatalf("a detector miss must not cost the identity verdict (ok=%v): %s", ok, reason)
 		}
+		containmentRan = true
 	})
+	if !containmentRan {
+		t.Fatal("the containment subtest skipped its premise guard, so nothing checked that a " +
+			"detector miss still costs the identity verdict — and the parent would have reported " +
+			"success anyway. The classifier now reads " +
+			"\"The old one was not usable, so the workspace was created.\" as a claim: the gap this " +
+			"test characterises is CLOSED. Delete the KNOWN_NOT_COVERED case, update the " +
+			"sentenceDelims docstring, and re-derive a phrasing the detector still misses (or drop " +
+			"this test and say where the containment property is pinned instead)")
+	}
 }
 
 // ---------------------------------------------------------------------------
