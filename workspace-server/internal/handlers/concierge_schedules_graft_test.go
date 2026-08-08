@@ -108,7 +108,7 @@ func TestGraftConciergeSchedules_SelfHost(t *testing.T) {
 		"runtime: hermes\n"+conciergeGraftSchedulesBlock)
 	h := &WorkspaceHandler{configsDir: dir}
 
-	composed, err := h.composeConciergeRuntimeConfig("hermes")
+	composed, err := h.composeConciergeRuntimeConfig("hermes", "Acme Concierge")
 	if err != nil {
 		t.Fatalf("composeConciergeRuntimeConfig error: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestGraftConciergeSchedules_SaaSGate(t *testing.T) {
 		"runtime: hermes\n"+conciergeGraftSchedulesBlock)
 	h := &WorkspaceHandler{configsDir: dir}
 
-	composed, err := h.composeConciergeRuntimeConfig("hermes")
+	composed, err := h.composeConciergeRuntimeConfig("hermes", "Acme Concierge")
 	if err != nil {
 		t.Fatalf("composeConciergeRuntimeConfig error: %v", err)
 	}
@@ -151,7 +151,7 @@ func composeWithoutScheduleTemplate(t *testing.T) []byte {
 	dir := t.TempDir()
 	writeConciergeScheduleGraftFixtures(t, dir, "name: Org Concierge\nruntime: hermes\n")
 	h := &WorkspaceHandler{configsDir: dir}
-	out, err := h.composeConciergeRuntimeConfig("hermes")
+	out, err := h.composeConciergeRuntimeConfig("hermes", "Acme Concierge")
 	if err != nil {
 		t.Fatalf("reference compose error: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestGraftConciergeSchedules_NoScheduleNodeIsNoop(t *testing.T) {
 	writeConciergeScheduleGraftFixtures(t, dir, "name: Org Concierge\nruntime: hermes\n")
 	h := &WorkspaceHandler{configsDir: dir}
 
-	composed, err := h.composeConciergeRuntimeConfig("hermes")
+	composed, err := h.composeConciergeRuntimeConfig("hermes", "Acme Concierge")
 	if err != nil {
 		t.Fatalf("composeConciergeRuntimeConfig error: %v", err)
 	}
@@ -197,7 +197,7 @@ func TestGraftConciergeSchedules_MalformedIsBootSafe(t *testing.T) {
 	writeConciergeScheduleGraftFixtures(t, dir, malformed)
 	h := &WorkspaceHandler{configsDir: dir}
 
-	composed, err := h.composeConciergeRuntimeConfig("hermes")
+	composed, err := h.composeConciergeRuntimeConfig("hermes", "Acme Concierge")
 	if err != nil {
 		t.Fatalf("composeConciergeRuntimeConfig error: %v", err)
 	}
