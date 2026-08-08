@@ -1,0 +1,35 @@
+{
+  // Type-checks canvas/e2e, which the main tsconfig.json does NOT.
+  //
+  // tsconfig.json carries `"exclude": ["node_modules", "e2e",
+  // "playwright.config.ts"]`, so the e2e tree was outside every type check in
+  // the repository: `next build` type-checks the Next project (which excludes
+  // e2e), there is no `typecheck` script, no workflow runs `tsc --noEmit`, and
+  // `playwright test` transpiles through esbuild without type-checking. A
+  // deliberate `const x: number = "nope"` in canvas/e2e/helpers/canvas.ts is
+  // invisible to all of them.
+  //
+  // That mattered beyond ordinary type safety: the waitForFunction guard in
+  // eslint.config.mjs is an ARITY rule, so it cannot see a 3-argument call
+  // whose THIRD argument is not really options (the arg and options
+  // transposed). The rule's comment used to claim TypeScript covered that
+  // slot. It did not, because nothing type-checked the files. This config is
+  // what makes that claim true; .gitea/scripts/canvas-static-gate.sh runs it
+  // and asserts it actually reached every e2e file.
+  //
+  // Scoped to e2e/** ONLY. Adding playwright.config.ts surfaces one
+  // pre-existing error (TS2769: `passWithNoTests` is not a valid Playwright
+  // config key, so it is silently ignored today) which is a real but separate
+  // bug — fixing or suppressing it here would be unrelated scope creep.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // The base config sets `incremental: true`, which writes a .tsbuildinfo
+    // next to the project. A gate must not depend on cached state from a
+    // previous run, and CI should not need to clean it.
+    "incremental": false,
+    "types": ["node"]
+  },
+  "include": ["e2e/**/*.ts", "e2e/**/*.tsx"],
+  "exclude": ["node_modules"]
+}
