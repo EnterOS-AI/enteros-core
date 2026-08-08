@@ -1621,8 +1621,14 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 // expired context and land in the failure list — a truthful partial result
 // rather than an unbounded handler.
 //
-// Sized above the CP stop path's own retry envelope and well under any sane
-// reverse-proxy read timeout; a var, not a const, so tests can shrink it.
+// Sizing: the relevant neighbour is provisioner.cpAPITimeout = 120s, the
+// http.Client timeout on the CP's small JSON calls — "status, stop, console",
+// i.e. literally the Stop this budget has to contain. 60s sits below it
+// deliberately: a single wedged Stop should surface as a reported failure on
+// this budget rather than run the CP client all the way to its own ceiling and
+// take the rest of the cascade with it. (An earlier draft of this comment cited
+// the stop RETRY envelope; that is cpStopWithRetry on the restart/delete paths
+// and is not on the Pause path at all.) A var, not a const, so tests can shrink it.
 var pauseSideEffectBudget = 60 * time.Second
 
 // errPauseClaimMissed reports that the guarded mark-paused UPDATE matched no
@@ -1737,12 +1743,24 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 	//
 	// What CHANGED, beyond the context: a failed stop no longer writes
 	// status='paused' anyway. The old code did, under the comment "orphan sweeper
-	// will reconcile" — which no sweeper does. registry/orphan_sweeper.go and
-	// registry/cp_orphan_sweeper.go both select ONLY `status = 'removed'`, so a
-	// 'paused' row over a still-running container has no backstop in this codebase
-	// and would sit there forever, invisible. The truthful row is the one we leave
-	// untouched (it still says online, which it is), and the caller's retry — now
-	// that the caller is TOLD — is the recovery path. This is the same
+	// will reconcile" — which no sweeper does. Precisely:
+	//
+	//   - registry/cp_orphan_sweeper.go (the SaaS/CP reaper) selects ONLY
+	//     `status = 'removed'`.
+	//   - registry/orphan_sweeper.go's container-reaping passes likewise key on
+	//     `status = 'removed'`. Its one pass with a wider predicate
+	//     (`status NOT IN ('removed','provisioning')`, which does include
+	//     'paused') is the STALE-TOKEN REVOCATION pass — it revokes auth tokens,
+	//     it never stops compute, so it could not reconcile this even in
+	//     principle.
+	//   - and that whole file is moot on the plane that matters: StartOrphanSweeper
+	//     is wired under `if prov != nil` (cmd/server/main.go), so in CP/SaaS prod
+	//     it does not run at all.
+	//
+	// So a 'paused' row over a still-running container has no backstop, and would
+	// sit there forever, invisible. The truthful row is the one we leave untouched
+	// (it still says online, which it is), and the caller's retry — now that the
+	// caller is TOLD — is the recovery path. This is the same
 	// loud-fail-instead-of-silent-leak choice the delete path makes
 	// (workspace_crud.go), minus the false row, because delete's 'removed' write is
 	// what its sweeper keys on and 'paused' is not.
@@ -1773,6 +1791,19 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 		res, err := db.DB.ExecContext(opCtx,
 			`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2 AND status NOT IN ('removed', 'paused')`,
 			models.StatusPaused, ws.id)
+		// stage "mark_paused" = the container IS stopped and the row still says
+		// online. That state does NOT sit still, and a reader who assumes it does
+		// will predict the wrong behaviour: the row is now a stopped box claiming
+		// to be online, which is exactly what the liveness/health sweeps hunt.
+		// StartHealthSweep and StartLivenessMonitor (neither gated on prov, so
+		// both run in CP/SaaS) and StartCPInstanceReconciler all call
+		// onWorkspaceOffline, which ends in `go wh.RestartByID(workspaceID)` —
+		// and RestartByID's dormant-state guard skips 'paused'/'hibernated' but
+		// NOT 'online', so it proceeds. The platform therefore AUTO-REPROVISIONS
+		// the workspace within a sweep interval. The user asked for a pause and
+		// gets a running workspace back; that is a self-healing outcome rather
+		// than a stranded row, but it is emphatically not "paused", which is why
+		// this is a reported failure and not a silent continue.
 		if err != nil {
 			note("mark_paused", err)
 			continue
@@ -1819,9 +1850,18 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 	}
 	log.Printf("Pause: %s (%s) — %d/%d paused, %d failed", wsName, id, pausedCount, len(toPause), len(failures))
 	if pausedCount == 0 {
+		// Same discipline as the 207 below: say what is known, not a guess about
+		// the workload. This branch covers BOTH a failed stop (workload still
+		// running) and a post-stop failure (workload stopped, row never reached
+		// 'paused'), so any fixed claim about whether it is running is false on one
+		// of them — and wrong in the more expensive direction on the second, since
+		// an operator told the box is up will not go looking for a stopped one.
+		// failures[].stage distinguishes them.
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"status":       "pause_failed",
-			"error":        "nothing was paused — the workspace(s) are still running; re-check status before retrying",
+			"status": "pause_failed",
+			"error": fmt.Sprintf("no workspace reached the paused state (%d step(s) failed) — see failures[]: stage \"stop\" = the workload was never stopped; "+
+				"stage \"mark_paused\"/\"claim\" = it WAS stopped but its row does not say paused. Re-check status before retrying",
+				len(failures)),
 			"paused_count": 0,
 			"failed_count": len(failures),
 			"failures":     failures,
@@ -1830,10 +1870,20 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 	}
 	// Partial: the cascade fans out over descendants, so "2 of 3 paused" is a real
 	// outcome and must be representable. Collapsing it into 200 or 500 discards the
-	// only information the caller can act on — which of them are still running.
+	// only information the caller can act on.
+	//
+	// The message states ONLY what is known at this point — a count, and a pointer
+	// to failures[]. It deliberately does not say "cascade", "were not paused" or
+	// "still running", because none of those hold on every path that reaches here:
+	// a single-workspace pause whose stop and claim both succeeded and whose
+	// telemetry INSERT then failed is a 207 in which there is no cascade, the
+	// workspace WAS paused, and it is NOT running. Prose that contradicts the
+	// payload beside it is the same defect as an unconditional 200 — a human reads
+	// the sentence, not failures[].
 	c.JSON(http.StatusMultiStatus, gin.H{
-		"status":       "partially_paused",
-		"error":        "some workspaces in the cascade were not paused — they are still running",
+		"status": "partially_paused",
+		"error": fmt.Sprintf("%d of %d workspace(s) paused; %d step(s) failed — see failures[] for which workspace and which stage",
+			pausedCount, len(toPause), len(failures)),
 		"paused_count": pausedCount,
 		"failed_count": len(failures),
 		"failures":     failures,

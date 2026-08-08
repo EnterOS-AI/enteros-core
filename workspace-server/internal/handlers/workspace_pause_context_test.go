@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -474,6 +475,15 @@ func TestPauseHandler_MarkPausedWriteFails_MustNotReturn200(t *testing.T) {
 		t.Errorf(`want stage "mark_paused" (the stop succeeded — conflating it with `+
 			`"stop" would misdirect whoever debugs it), got %v`, entry["stage"])
 	}
+	// Same prose trap as the 207: the 500 fires for stop failures (workload still
+	// running) AND for post-stop failures like this one (workload stopped). A
+	// fixed string asserting "still running" is false on this path, and it is the
+	// path where being wrong is most expensive — an operator told the box is up
+	// will not go looking for a stopped one.
+	if msg, _ := body["error"].(string); strings.Contains(msg, "still running") {
+		t.Errorf("500 message asserts the workspace is still running, but the stop "+
+			"SUCCEEDED and only the row write failed: %q", msg)
+	}
 }
 
 // TestPauseHandler_ClaimMatchedNoRow_MustNotReturn200 is the atomic-claim half.
@@ -537,6 +547,63 @@ func TestPauseHandler_ClaimIsStatusGuarded(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
+// TestPauseHandler_TelemetryOnlyFailure_MessageMustNotLie closes a lie the FIX
+// introduced. A single workspace whose stop and claim both succeed but whose
+// paused-event INSERT fails is a genuine 207 — the pause happened, the canvas
+// may be stale — but the first cut of the partial-result message read:
+//
+//	"some workspaces in the cascade were not paused — they are still running"
+//
+// which is false on all three counts: it was not a cascade, they WERE paused,
+// and they are NOT still running. The machine-readable fields were right and
+// only the fixed string was wrong, which is the worst version of the bug this
+// PR exists to fix — a correct payload with prose that contradicts it, because
+// the prose is what a human reads first.
+//
+// The message must therefore describe what is actually known at that point: N
+// of M paused, the rest is in failures[]. It must not assert anything about
+// cascades or about workloads still running.
+func TestPauseHandler_TelemetryOnlyFailure_MessageMustNotLie(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	const wsID = "ws-pause-telemetry"
+	cp := &pauseCPStop{errByID: map[string]error{}}
+	handler := newPauseHandler(t, cp)
+
+	expectPauseLookup(mock, wsID, "Telemetry", nil)
+	mock.ExpectExec("UPDATE workspaces SET status =").
+		WithArgs(models.StatusPaused, wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Only the event INSERT dies.
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnError(fmt.Errorf("deadlock detected"))
+
+	w := pauseCall(handler, wsID, "", nil)
+
+	if w.Code != http.StatusMultiStatus {
+		t.Fatalf("want 207 when only telemetry failed, got %d: %s", w.Code, w.Body.String())
+	}
+	body := pauseBody(t, w)
+	if got, ok := body["paused_count"].(float64); !ok || got != 1 {
+		t.Errorf("the workspace WAS paused; want paused_count 1, got %v", body["paused_count"])
+	}
+	fails, ok := body["failures"].([]any)
+	if !ok || len(fails) != 1 {
+		t.Fatalf("want 1 failure entry, got %v", body["failures"])
+	}
+	if entry, _ := fails[0].(map[string]any); entry["stage"] != "broadcast" {
+		t.Errorf(`want stage "broadcast", got %v`, entry["stage"])
+	}
+	msg, _ := body["error"].(string)
+	for _, lie := range []string{"cascade", "still running", "were not paused"} {
+		if strings.Contains(msg, lie) {
+			t.Errorf("partial-result message asserts %q, which is false here "+
+				"(one workspace, it WAS paused, it is NOT running): %q", lie, msg)
+		}
 	}
 }
 
