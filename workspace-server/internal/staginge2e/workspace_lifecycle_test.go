@@ -290,24 +290,41 @@ func waitForWorkspaceStatus(t *testing.T, host, token, orgID, wsID, want string,
 
 // waitForWorkspaceOnlineRoutable polls until status=online AND url is non-empty.
 // A routable url is the real "the agent is reachable" signal the SDK uses — an
-// online row without a url is not yet serveable.
+// online row without a url is not yet serveable. It ends the moment the control
+// plane publishes a terminal verdict instead of polling out the whole budget
+// (readiness_terminal_signal.go).
+//
+// This loop is where the defect was FIRST visible: because it logs every status
+// transition it recorded, nine times in retention, the exact shape the Guard B
+// loop hid — `provisioning` at t+0, `failed` at ~t+93s, then thirteen and a half
+// more minutes of polling a row that had already been written off. Now the same
+// observation ends the wait and the row's own last_sample_error is quoted.
 func waitForWorkspaceOnlineRoutable(t *testing.T, host, token, orgID, wsID string, timeout time.Duration, why string) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	var lastStatus, lastURL string
-	for time.Now().Before(deadline) {
-		_, st, url := workspaceStatusAndURL(t, host, token, orgID, wsID)
-		if st != lastStatus || (url != "") != (lastURL != "") {
-			t.Logf("    [%s] status=%q routable=%v", why, st, url != "")
-			lastStatus, lastURL = st, url
+	watch := DeployWorkspaceOnlineRoutableWatch(why, timeout)
+	for {
+		hs, body := doTenantJSON(t, "GET", "https://"+host+"/workspaces/"+wsID, token, orgID, "")
+		st := topLevelString(body, "status")
+		url := topLevelString(body, "url")
+		step := watch.Observe(time.Now(), Obs{
+			ReadOK:     hs == http.StatusOK,
+			Status:     st,
+			Detail:     topLevelString(body, "last_sample_error"),
+			Extra:      url != "",
+			ExtraLabel: fmt.Sprintf("routable=%v", url != ""),
+		})
+		if step.Transitioned && step.Message != "" {
+			t.Logf("    %s", step.Message)
 		}
-		if st == "online" && url != "" {
+		switch step.Decision {
+		case WaitReady:
+			return
+		case WaitFailTerminal, WaitFailBudget, WaitFailMisconfigured:
+			t.Fatalf("%s: workspace %s — %s", why, wsID, step.Message)
 			return
 		}
 		time.Sleep(10 * time.Second)
 	}
-	t.Fatalf("%s: workspace %s never reached online+routable within %s (last status=%q, url-set=%v)",
-		why, wsID, timeout, lastStatus, lastURL != "")
 }
 
 // assertURLCleared asserts the canvas GET reports an empty url within timeout.
@@ -550,26 +567,59 @@ func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string) (orgID string) {
 	if id == "" {
 		t.Fatalf("AdminCreate org: no id in response: %s", resp)
 	}
-	deadline := time.Now().Add(7 * time.Minute)
+	// TERMINAL-SIGNAL WAIT (see readiness_terminal_signal.go). The admin list
+	// already carries org_instances.last_error alongside instance_status, so a
+	// provision the control plane has already declared dead is answered in
+	// seconds with ITS reason instead of 7 minutes of polling and a stopwatch.
+	// A terminal status must persist past the CP's own self-heal window before
+	// it is believed, so this can never out-run a retry the CP is running.
+	watch := DeployOrgInstanceRunningWatch(slug)
 	var lastListStatus int
 	lastInstance := "<never observed>"
-	for time.Now().Before(deadline) {
+	for {
 		st, list := doJSON(t, "GET", cfg.cpBase+"/cp/admin/orgs", cfg.adminToken, "")
 		lastListStatus = st
+		obs := Obs{}
 		if st == http.StatusOK {
-			if seen := orgInstanceStatus(list, slug); seen != "" {
-				lastInstance = seen
-			} else if strings.Contains(list, `"slug":"`+slug+`"`) {
-				lastInstance = "<row present, instance_status omitted>"
-			} else {
+			seen, lastErr, present := orgInstanceRow(list, slug)
+			switch {
+			case !present:
 				lastInstance = "<org row absent from admin list>"
+				obs = Obs{ReadOK: true, Status: "<org row absent from admin list>"}
+			case seen == "":
+				lastInstance = "<row present, instance_status omitted>"
+				obs = Obs{ReadOK: true, Status: "<instance_status omitted>"}
+			default:
+				lastInstance = seen
+				obs = Obs{ReadOK: true, Status: seen, Detail: lastErr}
 			}
 		}
-		if st == http.StatusOK && strings.Contains(list, `"slug":"`+slug+`"`) &&
-			orgInstanceStatus(list, slug) == "running" {
-			return id
+		step := watch.Observe(time.Now(), obs)
+		if step.Transitioned && step.Message != "" {
+			t.Logf("    %s", step.Message)
 		}
-		time.Sleep(15 * time.Second)
+		switch step.Decision {
+		case WaitReady:
+			return id
+		case WaitFailTerminal, WaitFailMisconfigured:
+			// The control plane published a verdict (or this wait is unsound).
+			// Either way, waiting out the rest of the budget adds nothing.
+			t.Fatalf("%s\n"+
+				"  CP tenant diagnostics: %s\n"+
+				"  CP boot-events:        %s",
+				step.Message,
+				bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/diagnostics"),
+				bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/boot-events?limit=20"))
+			return ""
+		case WaitFailBudget:
+			// Nothing was ever published — fall through to the (unchanged)
+			// self-diagnosing timeout below, which is the right report for a
+			// genuinely STUCK provision.
+		default:
+			time.Sleep(15 * time.Second)
+			continue
+		}
+		break
 	}
 	// SELF-DIAGNOSING TIMEOUT (Guard B operability).
 	//
@@ -589,11 +639,12 @@ func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string) (orgID string) {
 	// exactly this question and put them IN the failure. Both are best-effort —
 	// a diagnostics fetch that itself fails must never replace the real verdict,
 	// only annotate it.
-	t.Fatalf("org %s did not reach instance_status=running within 7m "+
+	t.Fatalf("org %s did not reach instance_status=running within %s AND the control plane never "+
+		"published a terminal verdict about it (it is STUCK, not FAILED) "+
 		"(last admin-list HTTP %d, last instance_status=%q).\n"+
 		"  CP tenant diagnostics: %s\n"+
 		"  CP boot-events:        %s",
-		slug, lastListStatus, lastInstance,
+		slug, orgProvisionBudget, lastListStatus, lastInstance,
 		bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/diagnostics"),
 		bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/boot-events?limit=20"))
 	return ""
