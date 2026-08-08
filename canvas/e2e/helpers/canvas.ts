@@ -232,7 +232,8 @@ export async function collectHittabilityDiagnostic(page: Page, testId: string): 
       // served this exact file 49s earlier lost one request. These entries are
       // the only IN-PAGE source that separates the shapes, and each shape
       // points at a different layer. Measured, not assumed — see
-      // e2e/css-diagnostic.spec.ts, which produces all three on purpose:
+      // e2e/css-diagnostic.spec.ts, which produces every one of them on
+      // purpose:
       //
       //   no entry at all            -> the request has not SETTLED. Entries are
       //                                 buffered on completion, so absence is
@@ -244,6 +245,28 @@ export async function collectHittabilityDiagnostic(page: Page, testId: string): 
       //   status=0, responseStart=0, -> the connection died BEFORE a single
       //     transferSize=0              response byte: refused/reset at setup,
       //                                 or the client could not get a socket.
+      //
+      // TWO LIMITS OF THIS CHANNEL, both measured, both the reason the other
+      // two channels exist rather than being redundant with this one:
+      //
+      //   1. It CANNOT tell "the request never reached the server" from "the
+      //      server got it and reset before answering". A refused connection
+      //      and a reset-before-headers both settle to
+      //      status=0/firstByte=NEVER/transferSize=0 — byte-identical. Only
+      //      net::ERR_CONNECTION_REFUSED vs net::ERR_CONNECTION_RESET (the
+      //      CDP channel, see helpers/net-evidence.ts) and the server probe's
+      //      silence vs its "CONNECTION DIED" line separate them. That is
+      //      exactly the fork core#5106 is stuck on, so read all three.
+      //   2. It cannot tell a mid-body RST from a graceful FIN that stopped
+      //      short of Content-Length: both are status=200 with bytes on the
+      //      wire and a readable, 0-rule sheet. The net error does —
+      //      ERR_CONNECTION_RESET vs ERR_CONTENT_LENGTH_MISMATCH.
+      //
+      // Buffer capacity is not a hazard here: the resource buffer holds 250
+      // entries and drops NEW ones once full (verified — a 400-request flood
+      // after the stylesheets left both stylesheet entries intact and the
+      // final entries missing). So a late flood can never turn "this sheet
+      // died" into "this sheet never settled".
       const timings = new Map<string, string>();
       for (const raw of performance.getEntriesByType("resource")) {
         // `responseStatus` is Chromium-supported but was added to the DOM lib

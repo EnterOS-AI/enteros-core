@@ -52,6 +52,13 @@ const log = (msg) => {
 // ---------------------------------------------------------------------------
 const TICK_MS = 250;
 let lastTick = Date.now();
+
+// Counters for the heartbeat below. `served` is a POSITIVE record of how much
+// this process handled; `inflight` is how many static requests it has accepted
+// and not yet finished answering.
+let servedStatic = 0;
+let inflightStatic = 0;
+
 const ticker = setInterval(() => {
   const now = Date.now();
   const lateBy = now - lastTick - TICK_MS;
@@ -60,6 +67,26 @@ const ticker = setInterval(() => {
 }, TICK_MS);
 // Do not hold the process open on our account; the server does that.
 if (typeof ticker.unref === "function") ticker.unref();
+
+// ---------------------------------------------------------------------------
+// Heartbeat. Without it, "this process never saw the request" would be an
+// INFERENCE from the absence of a line — and absence is exactly the reading
+// that got core#5106 stuck, because a fast, complete response is silent and so
+// is a request that never arrived. The heartbeat makes the claim positive: at
+// any moment in the log you can read how many static requests this process had
+// served and how many it was still holding.
+//
+// `inflight > 0` is the single most direct evidence for the "server accepted it
+// and could not answer" fork; `inflight == 0` with a flat `served` while the
+// browser is waiting is the "it never got here" fork. Unconditional on purpose
+// — a heartbeat that only prints when something changed would restore the same
+// ambiguity it exists to remove. ~12 lines per minute, and the server only runs
+// for the length of the test phase.
+// ---------------------------------------------------------------------------
+const heartbeat = setInterval(() => {
+  log(`heartbeat served=${servedStatic} inflight=${inflightStatic}`);
+}, 5000);
+if (typeof heartbeat.unref === "function") heartbeat.unref();
 
 // ---------------------------------------------------------------------------
 // Per-request record for static assets. `res.on("close")` fires for BOTH a
@@ -82,7 +109,10 @@ http.createServer = function patchedCreateServer(...args) {
     server.on("request", (req, res) => {
       if (!STATIC.test(req.url || "")) return;
       const started = Date.now();
+      inflightStatic++;
       res.on("close", () => {
+        inflightStatic--;
+        servedStatic++;
         const ms = Date.now() - started;
         // Quiet on the happy path: a fast, fully-written response is the
         // expected case and there are ~100 of them per run.

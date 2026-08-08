@@ -30,23 +30,35 @@ import { collectHittabilityDiagnostic } from "./helpers/canvas";
  * canvas build: a small http server on an ephemeral port is enough, because the
  * thing under test is the reader, not the app.
  *
- * The four shapes and what each one is evidence OF (all measured here, none
- * assumed — the mapping is the entire reason the diagnostic is worth reading):
+ * The delivery lattice, and what each row is evidence OF (all measured here,
+ * none assumed — the mapping is the entire reason the diagnostic is worth
+ * reading):
  *
- *   dead before headers  CSSOM: present, cssRules THROWS SecurityError
- *                        timing: status=0, firstByte=NEVER, transfer=0
- *                        => the client never received a response header
- *   truncated mid-body   CSSOM: present, readable, rules=0
- *                        timing: status=200, firstByte set, transfer>0
- *                        => the server DID answer; the transfer was cut
- *   still in flight      CSSOM: link.sheet === null, absent from styleSheets
- *                        timing: no entry (entries buffer on settle)
- *   served cleanly       CSSOM: readable with rules; timing: status=200
+ *   shape                CSSOM                  timing                 net error
+ *   ------------------   --------------------   --------------------   -------------------------
+ *   dead before headers  THROWS SecurityError   status=0 firstByte=    ERR_CONNECTION_RESET
+ *                                               NEVER transfer=0       (or _REFUSED — see below)
+ *   truncated mid-body   readable, rules=0      status=200, firstByte  ERR_CONNECTION_RESET
+ *                                               set, transfer>0
+ *   short graceful FIN   readable, rules=0      status=200, firstByte  ERR_CONTENT_LENGTH_MISMATCH
+ *                                               set, transfer>0
+ *   still in flight      link.sheet === null    no entry (entries      (none yet)
+ *                        absent from styleSheets buffer on settle)
+ *   served cleanly       readable, with rules   status=200             (none)
  *
- * Note the first two: a SecurityError is NOT "the body was cut short". A cut
- * body is readable-with-0-rules. SecurityError means no usable response
- * arrived at all, which is a materially different accusation to level at a
- * server.
+ * Read across, not down — no single column separates every row:
+ *
+ *   - A SecurityError is NOT "the body was cut short". A cut body is
+ *     readable-with-0-rules. SecurityError means no usable response arrived at
+ *     all, a materially different accusation to level at a server.
+ *   - Rows 2 and 3 are identical in CSSOM AND in timing. Only the net error
+ *     separates a reset transfer from a server that closed cleanly having sent
+ *     less than it promised.
+ *   - Row 1 is identical for a connection that was REFUSED (never reached a
+ *     server) and one RESET before headers (reached one that dropped it).
+ *     Only the net error, plus whether canvas/e2e/support/server-probe.cjs saw
+ *     the request at all, separates those — and that is precisely the fork
+ *     core#5106 is stuck on.
  */
 
 const RF_RULE = ".react-flow__background{pointer-events:none;z-index:-1}";
@@ -66,7 +78,9 @@ type Fixture = { url: string; close: () => Promise<void> };
  *   /aux.css       — served cleanly
  *   /layout.css    — served cleanly, or reset before any response byte reaches
  *                    the client (the DEAD sheet: cssRules throws)
- *   /truncated.css — 200 + partial body flushed, then reset (readable, 0 rules)
+ *   /truncated.css — 200 + partial body flushed, then RESET (readable, 0 rules)
+ *   /short-fin.css — 200 + partial body flushed, then closed GRACEFULLY —
+ *                    same CSSOM and timing as /truncated.css, different net error
  *   /page.css      — headers sent, body never completed (IN FLIGHT forever)
  */
 function startFixtureServer(delivery: Delivery): Promise<Fixture> {
@@ -80,6 +94,7 @@ function startFixtureServer(delivery: Delivery): Promise<Fixture> {
           `<link rel="stylesheet" href="/aux.css">` +
           `<link rel="stylesheet" href="/layout.css">` +
           `<link rel="stylesheet" href="/truncated.css">` +
+          `<link rel="stylesheet" href="/short-fin.css">` +
           `<link rel="stylesheet" href="/page.css">` +
           `<link rel="preload" as="style" href="/page.css">` +
           `</head><body style="margin:0">` +
@@ -118,6 +133,17 @@ function startFixtureServer(delivery: Delivery): Promise<Fixture> {
       res.writeHead(200, { "content-type": "text/css", "content-length": Buffer.byteLength(body) + 500 });
       res.write(body.slice(0, 8));
       setTimeout(() => res.socket?.resetAndDestroy(), 40);
+      return;
+    }
+    if (path === "/short-fin.css") {
+      // Identical to /truncated.css except the socket is closed GRACEFULLY
+      // (FIN, not RST). Chromium produces the same status=200 + bytes-on-wire
+      // + readable-0-rule sheet, and a different net error. Kept next to it so
+      // the pair is impossible to read as one shape.
+      const body = ".shortfin{color:olive}";
+      res.writeHead(200, { "content-type": "text/css", "content-length": Buffer.byteLength(body) + 500 });
+      res.write(body.slice(0, 8));
+      setTimeout(() => res.socket?.end(), 40);
       return;
     }
     if (path === "/page.css") {
@@ -171,7 +197,8 @@ async function diagnose(page: Page, delivery: Delivery): Promise<string> {
         };
         return (
           settled("/layout.css", killed ? "threw" : "readable") &&
-          settled("/truncated.css", "readable")
+          settled("/truncated.css", "readable") &&
+          settled("/short-fin.css", "readable")
         );
       },
       delivery.killLayout,
@@ -213,7 +240,7 @@ test.describe("canvas hittability diagnostic", () => {
     expect(diag).toContain(".react-flow__background rule = PRESENT");
   });
 
-  test("the four delivery shapes are told apart by Resource Timing and net::ERR_*", async ({ page }) => {
+  test("the delivery shapes are told apart by Resource Timing and net::ERR_*", async ({ page }) => {
     const diag = await diagnose(page, { ruleIn: "layout", killLayout: true });
 
     // Served cleanly: settled, readable, with a status and a first byte.
@@ -230,9 +257,17 @@ test.describe("canvas hittability diagnostic", () => {
     // settles, so the absence of an entry is the proof, not a gap in the
     // instrument.
     expect(diag).toMatch(/\/page\.css\n\s+sheet=null \(IN FLIGHT[\s\S]*?\n\s+timing: \(no Resource Timing entry/);
-    // And the exact Chromium error, which no in-page API exposes at all.
+    // A graceful close that stopped short of Content-Length is INDISTINGUISHABLE
+    // from the cut transfer above in both the CSSOM and the timing — same
+    // status, same first byte, same readable-0-rule sheet.
+    expect(diag).toMatch(/\/short-fin\.css\n\s+sheet=present cssRules=readable rules=0 \(SERVED BUT EMPTY\/TRUNCATED\)\n\s+timing: status=200 start=\+\d+ms firstByte=\+\d+ms/);
+    // And the exact Chromium error, which no in-page API exposes at all — the
+    // ONLY thing that separates the two rows above, and the reason this channel
+    // is load-bearing rather than a second opinion.
     expect(diag).toContain("network failures (");
-    expect(diag).toMatch(/\/layout\.css -> net::ERR_/);
+    expect(diag).toMatch(/\/layout\.css -> net::ERR_CONNECTION_RESET/);
+    expect(diag).toMatch(/\/truncated\.css -> net::ERR_CONNECTION_RESET/);
+    expect(diag).toMatch(/\/short-fin\.css -> net::ERR_CONTENT_LENGTH_MISMATCH/);
   });
 
   test("a page with no recorder says so, instead of reporting an empty all-clear", async ({ browser }) => {

@@ -18,6 +18,21 @@ import { test as base, type Page } from "@playwright/test";
  * diagnostic in helpers/canvas.ts) but never its cause, and a `<link>` error
  * event carries nothing at all.
  *
+ * This is not belt-and-braces on top of Resource Timing — it decides two
+ * distinctions Resource Timing provably cannot make, both measured in
+ * e2e/css-diagnostic.spec.ts:
+ *
+ *   - a connection REFUSED (the request never reached the server) and a
+ *     connection RESET BEFORE HEADERS (it reached a server that then dropped
+ *     it) settle to byte-identical CSSOM and timing evidence —
+ *     `THREW SecurityError` / `status=0 firstByte=NEVER transfer=0B`. Only
+ *     ERR_CONNECTION_REFUSED vs ERR_CONNECTION_RESET tells them apart, and
+ *     that IS the fork core#5106 is stuck on.
+ *   - a mid-body RST and a graceful FIN that stopped short of Content-Length
+ *     both give `status=200` with bytes on the wire and a readable, 0-rule
+ *     sheet. ERR_CONNECTION_RESET vs ERR_CONTENT_LENGTH_MISMATCH tells them
+ *     apart.
+ *
  * The listener must be attached BEFORE the navigation that loads the
  * stylesheets, so it cannot be attached from inside a helper that only runs
  * after `page.goto`. Hence a fixture: specs opt in by importing `test` from
