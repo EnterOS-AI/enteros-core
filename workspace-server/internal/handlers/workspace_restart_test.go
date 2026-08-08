@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
@@ -631,15 +632,64 @@ func TestResumeHandler_DescendantsWithCascadeReturns200(t *testing.T) {
 			AddRow("ws-child-1", "Child 1", 1, "claude-code", "").
 			AddRow("ws-child-2", "Child 2", 1, "claude-code", ""))
 
+	// NOTE (2026-08-07): this block used to queue THREE statements per workspace
+	// and left the async provision goroutine unfenced. Both were wrong, and both
+	// showed up as a rejected statement attributed to markProvisionFailed:
+	//
+	//  1. Under-specified. Resume issues FOUR statements per workspace, not
+	//     three: the claim UPDATE, the WORKSPACE_PROVISIONING INSERT,
+	//     withStoredCompute's
+	//     `SELECT COALESCE(compute, …)` and storedWorkspaceTemplate's
+	//     `SELECT COALESCE(template, '')`. A bare "SELECT COALESCE" matcher
+	//     matches BOTH of the last two, so the template lookup was always
+	//     refused ("was not expected") while the test still reported success.
+	//     The two are now matched apart by their column.
+	//
+	//  2. Racy. provisionWorkspaceAuto dispatches through goAsync, so the
+	//     provisioner goroutine's own statements — markProvisionFailed's
+	//     three-argument `UPDATE workspaces SET status = $3, last_sample_error =
+	//     $2 …` chief among them — interleaved with this loop. sqlmock is
+	//     ordered, so whichever expectation was next got matched against it:
+	//     against a two-argument `UPDATE workspaces SET status =` that reads
+	//     "expected 2, but got 3 arguments"; against a Query it reads "was not
+	//     expected". Same defect, two messages, appearing in roughly two runs in
+	//     three. waitAsyncForTest() before ExpectationsWereMet drains the
+	//     goroutines first, so the assertion is now deterministic.
+	//
+	// The event INSERT is pinned to (WORKSPACE_PROVISIONING, <id>) rather than
+	// left argument-free, and that is not cosmetic. sqlmock treats a nil arg list
+	// as "matches any arguments", so the provisioner goroutine's
+	// WORKSPACE_PROVISION_FAILED insert — same statement, three args — could
+	// CONSUME one of these slots; the handler's own event would then be the one
+	// refused, and ExpectationsWereMet would still pass, having asserted over a
+	// rejected write. (The claim UPDATE was already immune: markProvisionFailed's
+	// UPDATE carries three arguments against this two-argument expectation, and
+	// sqlmock's ordered exec returns the "expected 2, but got 3" mismatch WITHOUT
+	// marking the expectation triggered, so the real statement still matches it
+	// afterwards. That asymmetry is exactly why the arg list must be explicit.)
+	//
+	// The handler's own writes were landing throughout — this was a fixture
+	// error, not the production defect. The production defect in this handler is
+	// pinned separately in workspace_resume_context_test.go.
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
 	for _, wsID := range []string{"ws-resume-parent-cascade", "ws-child-1", "ws-child-2"} {
-		mock.ExpectExec("UPDATE workspaces SET status =").
+		// Full SQL, predicate included — see resumeClaimSQL in
+		// workspace_resume_context_test.go for why the abbreviated
+		// "UPDATE workspaces SET status =" matcher cannot assert the claim.
+		// Pinning it here also stops markProvisionFailed's same-prefix UPDATE
+		// from colliding with this expectation at all.
+		mock.ExpectExec(resumeClaimSQL).
 			WithArgs(models.StatusProvisioning, wsID).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectExec("INSERT INTO structure_events").
+			WithArgs(string(events.EventWorkspaceProvisioning), wsID, sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
-		mock.ExpectQuery("SELECT COALESCE").
+		mock.ExpectQuery(`SELECT COALESCE\(compute`).
 			WithArgs(wsID).
-			WillReturnRows(sqlmock.NewRows([]string{"COALESCE"}).AddRow("{}"))
+			WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow("{}"))
+		mock.ExpectQuery(`SELECT COALESCE\(template`).
+			WithArgs(wsID).
+			WillReturnRows(sqlmock.NewRows([]string{"template"}).AddRow(""))
 	}
 
 	w := httptest.NewRecorder()
@@ -648,6 +698,7 @@ func TestResumeHandler_DescendantsWithCascadeReturns200(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-resume-parent-cascade/resume?cascade=true", nil)
 
 	handler.Resume(c)
+	handler.waitAsyncForTest()
 
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
