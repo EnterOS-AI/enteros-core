@@ -172,7 +172,29 @@ jobs:
     needs: [advance-pin, await-image]
     runs-on: docker-host
     timeout-minutes: 30
+    # RAN-SENTINEL. This job's `result` is read as a verdict by rollback-pin, so
+    # it must also publish evidence that its body actually EXECUTED. See
+    # scripts/deploy/ran-sentinel.sh for the full rationale (Gitea PickTask
+    # commits the claim before delivering the payload; an undelivered task is
+    # reaped as `failure` with an empty log, indistinguishable from a real one).
+    outputs:
+      ran_begin: ${{ steps.ran_begin.outputs.token }}
+      ran_end: ${{ steps.ran_end.outputs.token }}
     steps:
+      # FIRST step, before checkout and with no `if:` — the only way to emit it
+      # is for the job body to have been dispatched and started.
+      - name: ran-sentinel BEGIN (proves this job's body actually started)
+        id: ran_begin
+        env:
+          RAN_SENTINEL_JOB: redeploy-fleet
+        run: |
+          set -euo pipefail
+          if [ -z "${GITHUB_RUN_ID-}" ]; then
+            echo "::error::ran-sentinel: GITHUB_RUN_ID is empty or unset — refusing to emit a token that is not bound to this run, because an unbound token makes every downstream comparison unfalsifiable."
+            exit 1
+          fi
+          printf 'token=ran-sentinel/v1 %s begin run=%s\n' "$RAN_SENTINEL_JOB" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "ran-sentinel BEGIN emitted for $RAN_SENTINEL_JOB (run $GITHUB_RUN_ID)"
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Roll the staging tenant fleet onto the gate-proven image
         env:
@@ -201,6 +223,24 @@ jobs:
         run: |
           TENANT_FLAGS="${STAGING_TENANT_FLAGS-}" \
             bash scripts/deploy/redeploy-staging-fleet.sh --tag "${{ needs.await-image.outputs.tag }}"
+      # LAST step, under `if: always()`. `always()` is REQUIRED, not incidental:
+      # a job that ran and genuinely FAILED must still emit END, or its own
+      # failure would look like a phantom and suppress the rollback it is owed.
+      # Its absence therefore means only one thing — the job was killed part-way
+      # through and never reached its final step.
+      - name: ran-sentinel END (proves this job's body ran to completion)
+        id: ran_end
+        if: always()
+        env:
+          RAN_SENTINEL_JOB: redeploy-fleet
+        run: |
+          set -euo pipefail
+          if [ -z "${GITHUB_RUN_ID-}" ]; then
+            echo "::error::ran-sentinel: GITHUB_RUN_ID is empty or unset — refusing to emit a token that is not bound to this run, because an unbound token makes every downstream comparison unfalsifiable."
+            exit 1
+          fi
+          printf 'token=ran-sentinel/v1 %s end run=%s\n' "$RAN_SENTINEL_JOB" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "ran-sentinel END emitted for $RAN_SENTINEL_JOB (run $GITHUB_RUN_ID)"
 
   # bp-exempt: post-merge staging CD hard gate; enforced by e2e needs + rollback, not PR branch protection.
   runtime-image-readiness:
@@ -212,7 +252,23 @@ jobs:
     # attachment before any pull.
     runs-on: local-deploy
     timeout-minutes: 30
+    # RAN-SENTINEL — see redeploy-fleet above and scripts/deploy/ran-sentinel.sh.
+    outputs:
+      ran_begin: ${{ steps.ran_begin.outputs.token }}
+      ran_end: ${{ steps.ran_end.outputs.token }}
     steps:
+      - name: ran-sentinel BEGIN (proves this job's body actually started)
+        id: ran_begin
+        env:
+          RAN_SENTINEL_JOB: runtime-image-readiness
+        run: |
+          set -euo pipefail
+          if [ -z "${GITHUB_RUN_ID-}" ]; then
+            echo "::error::ran-sentinel: GITHUB_RUN_ID is empty or unset — refusing to emit a token that is not bound to this run, because an unbound token makes every downstream comparison unfalsifiable."
+            exit 1
+          fi
+          printf 'token=ran-sentinel/v1 %s begin run=%s\n' "$RAN_SENTINEL_JOB" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "ran-sentinel BEGIN emitted for $RAN_SENTINEL_JOB (run $GITHUB_RUN_ID)"
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Verify the exact local-deploy Docker daemon
         run: bash scripts/deploy/require-local-deploy-daemon.sh
@@ -225,12 +281,32 @@ jobs:
           INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
         run: bash scripts/deploy/prepare-staging-runtime-images.sh
+      - name: ran-sentinel END (proves this job's body ran to completion)
+        id: ran_end
+        if: always()
+        env:
+          RAN_SENTINEL_JOB: runtime-image-readiness
+        run: |
+          set -euo pipefail
+          if [ -z "${GITHUB_RUN_ID-}" ]; then
+            echo "::error::ran-sentinel: GITHUB_RUN_ID is empty or unset — refusing to emit a token that is not bound to this run, because an unbound token makes every downstream comparison unfalsifiable."
+            exit 1
+          fi
+          printf 'token=ran-sentinel/v1 %s end run=%s\n' "$RAN_SENTINEL_JOB" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "ran-sentinel END emitted for $RAN_SENTINEL_JOB (run $GITHUB_RUN_ID)"
 
   e2e-smoke:
     name: e2e-smoke (staging real provision + A2A HARD GATE)
     needs: [redeploy-fleet, runtime-image-readiness]
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # RAN-SENTINEL. THE case this mechanism was built for: two staging pin
+    # rollbacks were triggered solely by this job's phantom red
+    # (`redeploy=success readiness=success e2e=failure`), CP audit 40708 landing
+    # 23 seconds after the reaper stamped task 989633 failed.
+    outputs:
+      ran_begin: ${{ steps.ran_begin.outputs.token }}
+      ran_end: ${{ steps.ran_end.outputs.token }}
     env:
       CP_BASE_URL: https://staging-api.moleculesai.app
       E2E_PROVIDER: molecules-server
@@ -259,6 +335,18 @@ jobs:
       # the gate can never silently degrade to presence-only.
       GUARD_B_REQUIRE_CALLABLE: '1'
     steps:
+      - name: ran-sentinel BEGIN (proves this job's body actually started)
+        id: ran_begin
+        env:
+          RAN_SENTINEL_JOB: e2e-smoke
+        run: |
+          set -euo pipefail
+          if [ -z "${GITHUB_RUN_ID-}" ]; then
+            echo "::error::ran-sentinel: GITHUB_RUN_ID is empty or unset — refusing to emit a token that is not bound to this run, because an unbound token makes every downstream comparison unfalsifiable."
+            exit 1
+          fi
+          printf 'token=ran-sentinel/v1 %s begin run=%s\n' "$RAN_SENTINEL_JOB" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "ran-sentinel BEGIN emitted for $RAN_SENTINEL_JOB (run $GITHUB_RUN_ID)"
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Force-fail hook (prove a red gate rolls back the fleet)
         run: |
@@ -390,6 +478,20 @@ jobs:
           # job's in-flight org is never purged.
           TEARDOWN_TAGS: "life mcp"
         run: bash tests/e2e/lib/go_e2e_run_teardown.sh
+      - name: ran-sentinel END (proves this job's body ran to completion)
+        id: ran_end
+        if: always()
+        env:
+          RAN_SENTINEL_JOB: e2e-smoke
+        run: |
+          set -euo pipefail
+          if [ -z "${GITHUB_RUN_ID-}" ]; then
+            echo "::error::ran-sentinel: GITHUB_RUN_ID is empty or unset — refusing to emit a token that is not bound to this run, because an unbound token makes every downstream comparison unfalsifiable."
+            exit 1
+          fi
+          printf 'token=ran-sentinel/v1 %s end run=%s\n' "$RAN_SENTINEL_JOB" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "ran-sentinel END emitted for $RAN_SENTINEL_JOB (run $GITHUB_RUN_ID)"
+
   rollback-pin:
     name: rollback-pin (revert pin if the fleet roll failed)
     needs: [advance-pin, redeploy-fleet, runtime-image-readiness, e2e-smoke]
@@ -400,7 +502,26 @@ jobs:
     if: always()
     runs-on: docker-host
     timeout-minutes: 20
+    # RAN-SENTINEL. rollback-pin is EQUALLY exposed: task 885373 was itself a
+    # phantom, so a genuinely-failed candidate stayed pinned because its
+    # rollback was never delivered. Nothing downstream `needs:` this job, so the
+    # terminal `rollback-audit` job below consumes these outputs.
+    outputs:
+      ran_begin: ${{ steps.ran_begin.outputs.token }}
+      ran_end: ${{ steps.ran_end.outputs.token }}
     steps:
+      - name: ran-sentinel BEGIN (proves this job's body actually started)
+        id: ran_begin
+        env:
+          RAN_SENTINEL_JOB: rollback-pin
+        run: |
+          set -euo pipefail
+          if [ -z "${GITHUB_RUN_ID-}" ]; then
+            echo "::error::ran-sentinel: GITHUB_RUN_ID is empty or unset — refusing to emit a token that is not bound to this run, because an unbound token makes every downstream comparison unfalsifiable."
+            exit 1
+          fi
+          printf 'token=ran-sentinel/v1 %s begin run=%s\n' "$RAN_SENTINEL_JOB" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "ran-sentinel BEGIN emitted for $RAN_SENTINEL_JOB (run $GITHUB_RUN_ID)"
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Revert the staging pin and fleet on failed candidate path
         env:
@@ -408,6 +529,14 @@ jobs:
           REDEPLOY_RESULT: ${{ needs.redeploy-fleet.result }}
           READINESS_RESULT: ${{ needs.runtime-image-readiness.result }}
           E2E_RESULT: ${{ needs.e2e-smoke.result }}
+          # RAN-SENTINEL evidence for each result read above. A result whose
+          # sentinel is absent is NOT a verdict — the job never executed.
+          REDEPLOY_BEGIN: ${{ needs.redeploy-fleet.outputs.ran_begin }}
+          REDEPLOY_END: ${{ needs.redeploy-fleet.outputs.ran_end }}
+          READINESS_BEGIN: ${{ needs.runtime-image-readiness.outputs.ran_begin }}
+          READINESS_END: ${{ needs.runtime-image-readiness.outputs.ran_end }}
+          E2E_BEGIN: ${{ needs.e2e-smoke.outputs.ran_begin }}
+          E2E_END: ${{ needs.e2e-smoke.outputs.ran_end }}
           OLD_IMAGE: ${{ needs.advance-pin.outputs.old_image }}
           OLD_GIT_SHA: ${{ needs.advance-pin.outputs.old_git_sha }}
           INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
@@ -421,24 +550,61 @@ jobs:
           STAGING_TENANT_FLAGS: ${{ vars.STAGING_TENANT_FLAGS }}
         run: |
           set -euo pipefail
+          . scripts/deploy/ran-sentinel.sh
           # Defined for BOTH redeploy invocations below. The shell supplies the
           # default so an undefined repo var can never hard-abort the rollback —
           # the one path you least want to fail is the one that undoes a bad deploy.
           TENANT_FLAGS="${STAGING_TENANT_FLAGS-}"
           export TENANT_FLAGS
+          if [ -z "${ADVANCE_RESULT-}" ]; then
+            echo "::error::advance-pin result is empty — refusing to decide anything about the staging pin from a missing input."
+            exit 1
+          fi
           if [ "$ADVANCE_RESULT" != "success" ]; then
             echo "::notice::pin never advanced (advance-pin=$ADVANCE_RESULT) — nothing to revert."
             exit 0
           fi
-          if [ "$REDEPLOY_RESULT" = "success" ] && [ "$READINESS_RESULT" = "success" ] && [ "$E2E_RESULT" = "success" ]; then
-            echo "::notice::candidate fleet roll + runtime readiness + e2e green — no rollback needed."
-            exit 0
-          fi
+
+          # RAN-SENTINEL GATE. Classify every job whose `result` is about to be
+          # read, using the evidence that it actually executed. This runs BEFORE
+          # the green early-exit on purpose: a `success` that never reached its
+          # own last step must be surfaced, not silently accepted.
+          RAN_SENTINEL_REPORT="$(mktemp)"
+          export RAN_SENTINEL_REPORT
+          DECISION="$(ran_sentinel_decide \
+            redeploy-fleet          "${REDEPLOY_RESULT-}"  "${REDEPLOY_BEGIN-}"  "${REDEPLOY_END-}" \
+            runtime-image-readiness "${READINESS_RESULT-}" "${READINESS_BEGIN-}" "${READINESS_END-}" \
+            e2e-smoke               "${E2E_RESULT-}"       "${E2E_BEGIN-}"       "${E2E_END-}")"
+          echo "ran-sentinel verdicts (decision=$DECISION):"
+          cat "$RAN_SENTINEL_REPORT"
+          rm -f "$RAN_SENTINEL_REPORT"
+
+          case "$DECISION" in
+            INFRA_FAULT)
+              # A job whose result we were about to act on never executed. Gitea
+              # PickTask commits the claim before delivering the payload; an
+              # undelivered task is reaped as `failure` with an EMPTY log
+              # 10-15 minutes later. Rolling the fleet on that is acting on a
+              # verdict nobody produced. Fail loud; touch nothing.
+              echo "::error::ran-sentinel MISSING on a job whose result feeds this decision — that job never executed, so its result is not a verdict. REFUSING to roll the staging fleet. Note the staging pin IS advanced and the fleet may be unrolled: this needs an operator, not a rerun."
+              exit 1
+              ;;
+            NO_ROLLBACK)
+              echo "::notice::candidate fleet roll + runtime readiness + e2e green, each with a complete ran-sentinel — no rollback needed."
+              exit 0
+              ;;
+            ROLLBACK) ;;
+            *)
+              echo "::error::unrecognised ran-sentinel decision '$DECISION' — failing closed without touching the staging fleet."
+              exit 1
+              ;;
+          esac
+
           if [ -z "$OLD_IMAGE" ]; then
             echo "::warning::advance-pin succeeded but exposed no old_image — cannot auto-revert; operator attention needed."
             exit 0
           fi
-          echo "::warning::candidate path failed after pin advance (redeploy=$REDEPLOY_RESULT readiness=$READINESS_RESULT e2e=$E2E_RESULT) — reverting staging pin and fleet to $OLD_IMAGE"
+          echo "::warning::candidate path failed after pin advance (redeploy=$REDEPLOY_RESULT readiness=$READINESS_RESULT e2e=$E2E_RESULT), each verdict backed by a ran-sentinel — reverting staging pin and fleet to $OLD_IMAGE"
           if [ -n "$OLD_GIT_SHA" ]; then
             bash scripts/deploy/advance-staging-tenant-pin.sh --image "$OLD_IMAGE" --git-sha "$OLD_GIT_SHA"
             EXPECTED_BUILD_SHA="$OLD_GIT_SHA" bash scripts/deploy/redeploy-staging-fleet.sh --image "$OLD_IMAGE"
@@ -446,3 +612,86 @@ jobs:
             bash scripts/deploy/advance-staging-tenant-pin.sh --image "$OLD_IMAGE"
             bash scripts/deploy/redeploy-staging-fleet.sh --image "$OLD_IMAGE"
           fi
+      - name: ran-sentinel END (proves this job's body ran to completion)
+        id: ran_end
+        if: always()
+        env:
+          RAN_SENTINEL_JOB: rollback-pin
+        run: |
+          set -euo pipefail
+          if [ -z "${GITHUB_RUN_ID-}" ]; then
+            echo "::error::ran-sentinel: GITHUB_RUN_ID is empty or unset — refusing to emit a token that is not bound to this run, because an unbound token makes every downstream comparison unfalsifiable."
+            exit 1
+          fi
+          printf 'token=ran-sentinel/v1 %s end run=%s\n' "$RAN_SENTINEL_JOB" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "ran-sentinel END emitted for $RAN_SENTINEL_JOB (run $GITHUB_RUN_ID)"
+
+  # bp-exempt: terminal audit of a post-merge staging CD job; informational
+  # surfacing of a phantom rollback-pin, not a pre-merge branch-protection gate.
+  rollback-audit:
+    name: rollback-audit (prove rollback-pin itself actually executed)
+    needs: [advance-pin, redeploy-fleet, runtime-image-readiness, e2e-smoke, rollback-pin]
+    # ALWAYS-RUN. rollback-pin is the job that undoes a bad deploy, and it is on
+    # the same persistent fleet runners that produce phantoms — task 885373 was
+    # a phantom rollback-pin. A rollback that never ran must not be mistaken for
+    # one that succeeded, because the staging pin is then left on a candidate
+    # that genuinely FAILED.
+    #
+    # This job can itself phantom. That is not turtles-all-the-way-down: today a
+    # SINGLE undelivered task hides the fact that no rollback happened, whereas
+    # after this job two must be lost in the same run — and a phantom here still
+    # leaves the run RED with no rollback recorded, which is the loud state we
+    # want anyway.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Require a ran-sentinel from rollback-pin
+        env:
+          ADVANCE_RESULT: ${{ needs.advance-pin.result }}
+          REDEPLOY_RESULT: ${{ needs.redeploy-fleet.result }}
+          READINESS_RESULT: ${{ needs.runtime-image-readiness.result }}
+          E2E_RESULT: ${{ needs.e2e-smoke.result }}
+          REDEPLOY_BEGIN: ${{ needs.redeploy-fleet.outputs.ran_begin }}
+          REDEPLOY_END: ${{ needs.redeploy-fleet.outputs.ran_end }}
+          READINESS_BEGIN: ${{ needs.runtime-image-readiness.outputs.ran_begin }}
+          READINESS_END: ${{ needs.runtime-image-readiness.outputs.ran_end }}
+          E2E_BEGIN: ${{ needs.e2e-smoke.outputs.ran_begin }}
+          E2E_END: ${{ needs.e2e-smoke.outputs.ran_end }}
+          ROLLBACK_RESULT: ${{ needs.rollback-pin.result }}
+          ROLLBACK_BEGIN: ${{ needs.rollback-pin.outputs.ran_begin }}
+          ROLLBACK_END: ${{ needs.rollback-pin.outputs.ran_end }}
+        run: |
+          set -euo pipefail
+          . scripts/deploy/ran-sentinel.sh
+
+          VERDICT="$(ran_sentinel_classify rollback-pin "${ROLLBACK_RESULT-}" "${ROLLBACK_BEGIN-}" "${ROLLBACK_END-}")"
+          echo "rollback-pin result=${ROLLBACK_RESULT-} ran-sentinel verdict=$VERDICT"
+          case "$VERDICT" in
+            ran-ok | ran-failed | ran-failed-partial)
+              # It executed. Whatever it reported is a real report, and is
+              # already visible on the run — nothing for this job to add.
+              echo "::notice::rollback-pin executed (verdict=$VERDICT); its result is a genuine verdict."
+              exit 0
+              ;;
+          esac
+
+          # rollback-pin either never ran, or reported green without reaching its
+          # own last step. Establish whether a revert was actually owed, so the
+          # error says which of the two harms happened.
+          RAN_SENTINEL_REPORT="$(mktemp)"
+          export RAN_SENTINEL_REPORT
+          DECISION="$(ran_sentinel_decide \
+            redeploy-fleet          "${REDEPLOY_RESULT-}"  "${REDEPLOY_BEGIN-}"  "${REDEPLOY_END-}" \
+            runtime-image-readiness "${READINESS_RESULT-}" "${READINESS_BEGIN-}" "${READINESS_END-}" \
+            e2e-smoke               "${E2E_RESULT-}"       "${E2E_BEGIN-}"       "${E2E_END-}")" || DECISION="UNKNOWN"
+          cat "$RAN_SENTINEL_REPORT" || true
+          rm -f "$RAN_SENTINEL_REPORT"
+
+          if [ "${ADVANCE_RESULT-}" = "success" ] && [ "$DECISION" = "ROLLBACK" ]; then
+            echo "::error::rollback-pin NEVER EXECUTED (ran-sentinel verdict=$VERDICT) on a run whose candidate path VERIFIABLY FAILED. The staging tenant pin is LEFT ON A FAILED CANDIDATE and the fleet was never reverted. Revert by hand; do not rerun this workflow, which would advance the pin again."
+          else
+            echo "::error::rollback-pin NEVER EXECUTED (ran-sentinel verdict=$VERDICT). No revert was owed on this run, but the job's result is not a verdict — treat it as an infra fault, not as a green."
+          fi
+          exit 1
