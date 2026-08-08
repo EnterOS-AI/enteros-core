@@ -7,7 +7,6 @@ import "testing"
 // inline fallbacks returned. This is the CP-safety guarantee: the managed
 // SaaS and existing tenants must see byte-identical resolution.
 func TestBase_PreservesLegacyBehavior(t *testing.T) {
-	t.Skip("MUTATION PROOF (temporary): forcing this package to skip wholesale to demonstrate that the no-tests-executed gate goes RED. Reverted in the next commit.")
 	tests := []struct {
 		name       string
 		explicit   []string
@@ -52,7 +51,6 @@ func TestBase_PreservesLegacyBehavior(t *testing.T) {
 // an OSS operator redirect the CP endpoint without code edits, while still
 // ranking below the per-tenant MOLECULE_CP_URL and explicit overrides.
 func TestBase_OSSOverride(t *testing.T) {
-	t.Skip("MUTATION PROOF (temporary): forcing this package to skip wholesale to demonstrate that the no-tests-executed gate goes RED. Reverted in the next commit.")
 	t.Run("MOLECULE_CP_DEFAULT_URL used when MOLECULE_CP_URL unset", func(t *testing.T) {
 		t.Setenv("MOLECULE_CP_URL", "")
 		t.Setenv("MOLECULE_CP_DEFAULT_URL", "https://my-platform.internal")
