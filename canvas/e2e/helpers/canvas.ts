@@ -1,4 +1,5 @@
 import { expect, type Page } from "@playwright/test";
+import { networkFailuresFor } from "./net-evidence";
 
 /** Enter the Org-map view so the Canvas (React Flow graph) mounts. */
 export async function enterMapView(page: Page): Promise<void> {
@@ -150,10 +151,31 @@ export async function waitForNodeHittable(page: Page, testId: string): Promise<v
 }
 
 /** Measure WHY a node is not hittable: its box, what is actually at its centre,
- *  and whether React Flow's stylesheet is in effect. Split out so the caller can
- *  guard it — see waitForNodeHittable. */
-async function collectHittabilityDiagnostic(page: Page, testId: string): Promise<string> {
-  return page.evaluate((id: string) => {
+ *  and whether React Flow's stylesheet is in effect.
+ *
+ *  THIS MESSAGE IS EVIDENCE, NOT PROSE. On the recorded core#5106 failures the
+ *  Playwright report artifact was not retained, so this string was the only
+ *  surviving evidence — and it has now sent investigators the wrong way twice:
+ *
+ *    1. It appended an instruction to import the rule from
+ *       `canvas/src/app/globals.css` — a BUILD fix — while the real failure was
+ *       a dead socket. (Removed by #5105.)
+ *    2. It described the failure as `dev-server chunk delivery` after this lane
+ *       had stopped using `next dev` and moved to a production `node server.js`.
+ *       (Removed by #5105; recorded here because the phrase outlived the code in
+ *       archived job logs and kept asset-delivery theories alive afterwards.)
+ *
+ *  A third of the same kind is corrected below: "fix delivery of that asset" is
+ *  refuted by this lane's own preflight, which proves the file is served. Every
+ *  claim this function makes about a LAYER must be one the evidence in the same
+ *  message supports; anything else belongs in the issue, not in the failure.
+ *
+ *  Split out so the caller can guard it — see waitForNodeHittable. Exported so
+ *  e2e/css-diagnostic.spec.ts can drive it against deliberately-broken
+ *  stylesheet deliveries and assert what it says; a diagnostic that is only ever
+ *  exercised by the failure it describes is a diagnostic nobody has tested. */
+export async function collectHittabilityDiagnostic(page: Page, testId: string): Promise<string> {
+  const inPage = await page.evaluate((id: string) => {
       const el = document.querySelector(`[data-testid="${id}"]`) as HTMLElement | null;
       const bg = document.querySelector(".react-flow__background") as HTMLElement | null;
       const describe = (n: Element | null) =>
@@ -184,20 +206,100 @@ async function collectHittabilityDiagnostic(page: Page, testId: string): Promise
       // is proof of a DEAD sheet — never of a slow one. A sheet that is merely
       // still loading lowers `total`; it can never lower `readable`. Do not
       // read a low `readable` as "it hasn't arrived yet".
+      //
+      // The rule search over those sheets is a THREE-state question, not a
+      // boolean, and reporting it as a boolean was a forced false negative
+      // (core#5106, run 632484): the enumerator skips a sheet whose `cssRules`
+      // throws, so when the rule lives in the sheet that DIED — which is
+      // exactly the failure being diagnosed — the search reports
+      // "rule present = false", indistinguishable from a build that never
+      // shipped the rule at all. The two demand opposite fixes (fix delivery
+      // vs. fix the build), so the message must never conflate them.
+      //
+      //   found                          -> the rule IS in a readable sheet
+      //   not found, every sheet readable-> genuinely ABSENT (a build defect)
+      //   not found, some sheet unreadable-> UNKNOWN; it may be in the dead one
       let ruleSheets = 0;
+      let unreadableSheets = 0;
       let rulePresent = false;
       for (const sheet of Array.from(document.styleSheets)) {
         let rules: CSSRuleList | null = null;
         try {
           rules = sheet.cssRules;
         } catch {
-          continue; // terminally failed (or genuinely cross-origin)
+          unreadableSheets++; // terminally failed (or genuinely cross-origin)
+          continue;
         }
         if (!rules) continue;
         ruleSheets++;
         for (const r of Array.from(rules)) {
           if (r.cssText.includes(".react-flow__background")) rulePresent = true;
         }
+      }
+      const ruleVerdict = rulePresent
+        ? "PRESENT (found in a readable sheet)"
+        : unreadableSheets > 0
+          ? `UNKNOWN — not in the ${ruleSheets} readable sheet(s), and ${unreadableSheets} ` +
+            "settled sheet(s) could not be enumerated, so the rule may well be in one of " +
+            "them. This is NOT evidence the rule is missing from the build."
+          : `ABSENT — all ${ruleSheets} settled sheet(s) were readable and none contains ` +
+            "it, so the rule really is not in the document (a BUILD defect, not a " +
+            "delivery one).";
+      // Resource Timing per asset. The CSSOM says a sheet DIED; it cannot say
+      // how, and "how" is what core#5106 is stuck on — a healthy server that
+      // served this exact file 49s earlier lost one request. These entries are
+      // the only IN-PAGE source that separates the shapes, and each shape
+      // points at a different layer. Measured, not assumed — see
+      // e2e/css-diagnostic.spec.ts, which produces every one of them on
+      // purpose:
+      //
+      //   no entry at all            -> the request has not SETTLED. Entries are
+      //                                 buffered on completion, so absence is
+      //                                 itself the "still in flight" proof.
+      //   status>0 but the body is   -> the server accepted, answered, and began
+      //     short of Content-Length     streaming; the connection then broke
+      //                                 MID-BODY. An endpoint aborted a live
+      //                                 response.
+      //   status=0, responseStart=0, -> the connection died BEFORE a single
+      //     transferSize=0              response byte: refused/reset at setup,
+      //                                 or the client could not get a socket.
+      //
+      // TWO LIMITS OF THIS CHANNEL, both measured, both the reason the other
+      // two channels exist rather than being redundant with this one:
+      //
+      //   1. It CANNOT tell "the request never reached the server" from "the
+      //      server got it and reset before answering". A refused connection
+      //      and a reset-before-headers both settle to
+      //      status=0/firstByte=NEVER/transferSize=0 — byte-identical. Only
+      //      net::ERR_CONNECTION_REFUSED vs net::ERR_CONNECTION_RESET (the
+      //      CDP channel, see helpers/net-evidence.ts) and the server probe's
+      //      silence vs its "CONNECTION DIED" line separate them. That is
+      //      exactly the fork core#5106 is stuck on, so read all three.
+      //   2. It cannot tell a mid-body RST from a graceful FIN that stopped
+      //      short of Content-Length: both are status=200 with bytes on the
+      //      wire and a readable, 0-rule sheet. The net error does —
+      //      ERR_CONNECTION_RESET vs ERR_CONTENT_LENGTH_MISMATCH.
+      //
+      // Buffer capacity is not a hazard here: the resource buffer holds 250
+      // entries and drops NEW ones once full (verified — a 400-request flood
+      // after the stylesheets left both stylesheet entries intact and the
+      // final entries missing). So a late flood can never turn "this sheet
+      // died" into "this sheet never settled".
+      const timings = new Map<string, string>();
+      for (const raw of performance.getEntriesByType("resource")) {
+        // `responseStatus` is Chromium-supported but was added to the DOM lib
+        // later than the rest of PerformanceResourceTiming, so widen locally
+        // rather than pin a lib version for one field.
+        const e = raw as PerformanceResourceTiming & { responseStatus?: number };
+        timings.set(
+          e.name,
+          `status=${e.responseStatus ?? "(unavailable)"} ` +
+            `start=+${e.startTime.toFixed(0)}ms firstByte=${
+              e.responseStart ? `+${e.responseStart.toFixed(0)}ms` : "NEVER"
+            } lastByte=+${e.responseEnd.toFixed(0)}ms ` +
+            `transfer=${e.transferSize}B encodedBody=${e.encodedBodySize}B ` +
+            `proto=${e.nextHopProtocol || "(none)"}`,
+        );
       }
       // Per-link inventory. The aggregate counts above cannot distinguish the
       // three settled/unsettled states from each other, and reading them wrong
@@ -251,27 +353,71 @@ async function collectHittabilityDiagnostic(page: Page, testId: string): Promise
                   : "(CROSS-ORIGIN => unreadable by design, not necessarily a failure)");
             }
           }
-          return `${rel}${as ? `(as=${as})` : ""} ${href}\n      ${state}`;
+          let absolute = href;
+          try {
+            absolute = new URL(href, location.href).href;
+          } catch {
+            /* keep the raw attribute */
+          }
+          const timing =
+            timings.get(absolute) ??
+            "(no Resource Timing entry — the request has NOT settled)";
+          return `${rel}${as ? `(as=${as})` : ""} ${href}\n      ${state}\n      timing: ${timing}`;
         });
+      // `elementFromPoint` returns null for a point OUTSIDE the viewport, which
+      // is a different finding from "something is covering the node" and was
+      // mis-annotated as occlusion on run 632484 (centre computed to
+      // (-26, -648)). Say which it is; the two have different causes.
+      const cx = r.x + r.width / 2;
+      const cy = r.y + r.height / 2;
+      const centreInViewport =
+        cx >= 0 && cy >= 0 && cx <= window.innerWidth && cy <= window.innerHeight;
+      const occludedByBackground = !!hit && !!bg && (hit === bg || bg.contains(hit));
       return [
         `node box = {x:${r.x.toFixed(1)} y:${r.y.toFixed(1)} w:${r.width.toFixed(1)} h:${r.height.toFixed(1)}}`,
-        `hit target at node centre = ${describe(hit)}`,
+        `node centre = (${cx.toFixed(1)}, ${cy.toFixed(1)}) in a ${window.innerWidth}x${window.innerHeight} viewport` +
+          (centreInViewport ? "" : "  <-- OUTSIDE the viewport"),
+        `hit target at node centre = ${describe(hit)}` +
+          (hit
+            ? hit === el || el.contains(hit)
+              ? "  <-- the node itself: it was hittable at the instant this was measured, " +
+                "so the blocker was transient (the box was still moving, or the occluder " +
+                "has since gone)"
+              : occludedByBackground
+                ? "  <-- the React Flow background is on top of the node and is swallowing the click"
+                : "  <-- something else is covering the node"
+            : centreInViewport
+              ? "  <-- nothing at all is at that point inside the viewport"
+              : "  <-- null because the centre is OUTSIDE the viewport, NOT because " +
+                "anything intercepted the click. The node was panned/zoomed off-screen; " +
+                "look at the viewport transform and the node box, not at occlusion."),
         `react-flow background pointer-events = ${bgPE}` +
           (bgPE === "none"
             ? ""
-            : "  <-- @xyflow/react/dist/style.css is NOT applied to this page; " +
-              "the React Flow background is swallowing pointer events"),
-        `stylesheets = ${document.styleSheets.length} settled (${ruleSheets} readable), ` +
-          `.react-flow__background rule present = ${rulePresent}` +
-          (ruleSheets < document.styleSheets.length
+            : "  <-- @xyflow/react/dist/style.css is NOT applied to this page, so the " +
+              "React Flow background is pointer-eventful and the canvas geometry is " +
+              "unstyled" +
+              (occludedByBackground ? " — and it is what the hit test resolved to" : "")),
+        `stylesheets = ${document.styleSheets.length} settled (${ruleSheets} readable, ` +
+          `${unreadableSheets} unreadable), .react-flow__background rule = ${ruleVerdict}` +
+          (unreadableSheets > 0
             ? "  <-- readable < settled: at least one settled stylesheet is " +
               "unreadable. For a SAME-ORIGIN sheet that means DEAD " +
               "(reset/aborted/CSP-blocked) — it is NOT a slow sheet, because a " +
               "still-loading sheet is absent from styleSheets entirely and so " +
-              "lowers `settled`, never `readable`. Read the per-link inventory " +
-              "below for which sheet and which state, then fix delivery of that " +
-              "asset; nothing in the spec can wait this out."
-            : rulePresent
+              "lowers `settled`, never `readable`. Nothing in the spec can wait " +
+              "this out.\n  DO NOT read this as 'the asset is not being served' " +
+              "(core#5106): this lane's own preflight curls that exact file, " +
+              "requires HTTP 200 AND greps the rule out of the body, and it " +
+              "passed ~0.03s after server readiness in every recorded instance " +
+              "— then ~33 further page loads over the same origin succeeded " +
+              "before this one failed. It is a PER-REQUEST failure on a server " +
+              "that owns its port and serves the file. Read the per-link " +
+              "inventory below (which sheet, which state), its `timing:` line " +
+              "(did a response header ever arrive?), the network failures at the " +
+              "end (which net::ERR_*), and canvas.log for the server probe's " +
+              "heartbeat and any CONNECTION DIED line."
+            : rulePresent && bgPE !== "none"
               ? "  <-- rule IS in the document but not in effect"
               : ""),
         `stylesheet links:\n    ${linkInventory.join("\n    ")}`,
@@ -280,6 +426,22 @@ async function collectHittabilityDiagnostic(page: Page, testId: string): Promise
         }`,
       ].join("\n  ");
   }, testId);
+
+  // The exact net::ERR_* is not observable from inside the page — see
+  // helpers/net-evidence.ts. Append it here, and distinguish "nothing failed"
+  // from "nobody was recording": an empty list printed for an unattached page
+  // would be a vacuous all-clear in the one message these failures are read
+  // from.
+  const net = networkFailuresFor(page);
+  const netSection = !net.attached
+    ? "network failures = (NOT RECORDED — this spec does not import `test` from " +
+      "e2e/helpers/net-evidence, so no net::ERR_* was captured. Absence here is not " +
+      "evidence that no request failed.)"
+    : net.failures.length === 0
+      ? "network failures = none (recorder was attached for the whole test)"
+      : `network failures (${net.failures.length}, recorder attached):\n    ` +
+        net.failures.join("\n    ");
+  return `${inPage}\n  ${netSection}`;
 }
 
 /**
