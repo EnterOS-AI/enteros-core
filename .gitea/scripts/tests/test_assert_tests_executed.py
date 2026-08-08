@@ -515,3 +515,254 @@ def test_the_regression_lint_can_actually_see_the_defect():
     assert not [ln for ln in _executable_lines(commented) if "(PASS|FAIL|SKIP)" in ln]
     assert len(_executable_lines(CI.read_text(encoding="utf-8"))) > 500, (
         "the CI body parsed down to almost nothing -- the lint above passed vacuously")
+
+
+# ---------------------------------------------------------------------------
+# the race+verbose shell guard, EXECUTED
+# ---------------------------------------------------------------------------
+#
+# Everything above tests the Python gate. The other half of the fix is four
+# lines of bash in ci.yml, and those were originally verified with a SINGLE
+# negative control: feed it an all-SKIP log, watch it go red. That control
+# proves the mechanism FIRES. It cannot find the input on which the mechanism
+# is never REACHED -- and there was one:
+#
+#     h_ran=$(grep -cE '...' /tmp/test-handlers.log || true)   # log missing -> ""
+#     if [ "$h_ran" -eq 0 ]; then                              # [: : integer expected -> rc 2
+#
+# `set -e` is EXEMPT inside an `if` condition, so rc 2 quietly takes the else
+# branch and the guard is skipped entirely: exit 0, in the step whose whole
+# job is failing closed. The previous `grep -q` form failed closed on a
+# missing file BY ACCIDENT (grep's own non-zero exit), so the rewrite
+# regressed it. `${h_ran:-0}` restores it on purpose.
+#
+# These run the REAL step body out of ci.yml, so the falsification set now
+# includes the not-reached path and lives in CI instead of a transcript.
+
+import os
+import shutil
+import subprocess as _sp
+
+import yaml
+
+
+def _race_step_body() -> str:
+    doc = yaml.safe_load(CI.read_text(encoding="utf-8"))
+    steps = doc["jobs"]["platform-build"]["steps"]
+    bodies = [s["run"] for s in steps if "Race + verbose" in (s.get("name") or "")]
+    assert len(bodies) == 1, (
+        "expected exactly one 'Race + verbose' step in ci.yml, found %d -- the "
+        "extraction below would otherwise test nothing" % len(bodies))
+    return bodies[0]
+
+
+_BASH_CACHE: list = []
+
+
+def _bash() -> str:
+    """A bash that is PROVEN to run, not merely present on PATH.
+
+    `shutil.which("bash")` on Windows finds WSL's stub, which answers the
+    which() question and then fails to exec. Every test below asserts a
+    NON-ZERO exit; a bash that cannot start returns non-zero too, so an
+    unverified interpreter turns those into false passes -- the precise shape
+    this PR exists to refuse, reproduced inside its own test suite. Probe it
+    instead of trusting it, and fail hard if none works.
+    """
+    if _BASH_CACHE:
+        return _BASH_CACHE[0]
+    candidates = [
+        shutil.which("bash"),
+        os.path.join("C:" + os.sep, "Program Files", "Git", "bin", "bash.exe"),
+        os.path.join("C:" + os.sep, "Program Files", "Git", "usr", "bin", "bash.exe"),
+        "/bin/bash",
+        "/usr/bin/bash",
+    ]
+    for cand in candidates:
+        if not cand:
+            continue
+        try:
+            probe = _sp.run([cand, "-c", "echo __bash_ok__"], capture_output=True,
+                            text=True, encoding="utf-8", errors="replace", timeout=30)
+        except OSError:
+            continue
+        if probe.returncode == 0 and "__bash_ok__" in probe.stdout:
+            _BASH_CACHE.append(cand)
+            return cand
+    raise AssertionError(
+        "no working bash found, so the shell guard below cannot be exercised. This "
+        "is a hard failure rather than a skip on purpose: a silently skipped test is "
+        "exactly what this PR exists to refuse.")
+
+
+def _run_race_guard(tmp_path, handlers: str | None, pu: str | None,
+                    h_exit: int = 0, pu_exit: int = 0):
+    """Execute the real guard with go test stubbed and the logs substituted."""
+    bash = _bash()
+    body = _race_step_body()
+    hlog, pulog = tmp_path / "h.log", tmp_path / "pu.log"
+    if handlers is not None:
+        hlog.write_text(handlers, encoding="utf-8")
+    if pu is not None:
+        pulog.write_text(pu, encoding="utf-8")
+
+    lines = [ln for ln in body.splitlines() if not ln.strip().startswith("go test ")]
+    script = "\n".join(lines)
+    assert "grep -cE" in script, "the guard vanished from the extracted body"
+    script = (script
+              .replace("handlers_exit=${PIPESTATUS[0]}", "handlers_exit=%d" % h_exit)
+              .replace("pu_exit=${PIPESTATUS[0]}", "pu_exit=%d" % pu_exit)
+              .replace("/tmp/test-handlers.log", str(hlog).replace("\\", "/"))
+              .replace("/tmp/test-pu.log", str(pulog).replace("\\", "/")))
+    sh = tmp_path / "guard.sh"
+    sh.write_text(script, encoding="utf-8")
+    return _sp.run([bash, str(sh)], capture_output=True, text=True,
+                   encoding="utf-8", errors="replace")
+
+
+PASSLOG = "--- PASS: TestA (0.01s)\n--- PASS: TestB (0.01s)\nok\n"
+SKIPLOG = "--- SKIP: TestA (0.00s)\n--- SKIP: TestB (0.00s)\nok\n"
+
+
+def test_race_guard_stays_green_on_a_healthy_log(tmp_path):
+    r = _run_race_guard(tmp_path, PASSLOG, PASSLOG)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "no-tests-executed" not in r.stdout
+
+
+def test_race_guard_reds_when_every_handlers_test_skipped(tmp_path):
+    """Hole 1. The removed grep accepted this log as proof of execution."""
+    r = _run_race_guard(tmp_path, SKIPLOG, PASSLOG)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "internal/handlers(no-tests-executed)" in r.stdout
+    assert "A skip is not an execution" in r.stdout
+
+
+def test_race_guard_reds_when_every_pendinguploads_test_skipped(tmp_path):
+    r = _run_race_guard(tmp_path, PASSLOG, SKIPLOG)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "internal/pendinguploads(no-tests-executed)" in r.stdout
+
+
+def test_race_guard_fails_closed_when_the_log_does_not_EXIST(tmp_path):
+    """Finding B: the not-reached path, not the not-fired path.
+
+    A guard that greps a log nothing produced must go RED. With a bare
+    `[ "$h_ran" -eq 0 ]` this exits 0 -- the test comparison errors out and
+    `set -e` does not apply inside an `if` condition, so the check is skipped
+    rather than failed.
+    """
+    r = _run_race_guard(tmp_path, None, PASSLOG)
+    assert r.returncode != 0, (
+        "the race guard PASSED with no handlers log at all:\n" + r.stdout + r.stderr)
+
+
+def test_race_guard_fails_closed_when_both_logs_are_missing(tmp_path):
+    r = _run_race_guard(tmp_path, None, None)
+    assert r.returncode != 0, r.stdout + r.stderr
+
+
+def test_race_guard_uses_the_defaulted_comparison(tmp_path):
+    """Pin the fix itself, since the behaviour above can be masked.
+
+    An unrelated `tail` under `set -e` currently exits the step before the
+    comparison is reached on a missing log, which is what let the fail-open
+    ship in the first place: the assembled step looked fine. Reorder or drop
+    that tail and the behavioural test above stops discriminating, so the
+    form is pinned directly too.
+    """
+    body = _race_step_body()
+    live = [ln for ln in body.splitlines()
+            if ln.strip().startswith("if [") and "_ran" in ln]
+    assert live, "the two _ran comparisons vanished from the race step"
+    for ln in live:
+        assert ":-0}" in ln, (
+            "race guard compares an unguarded variable, so an empty value makes the "
+            "test error out (rc 2) and `set -e` skips the check inside the `if` "
+            "condition -- fail-OPEN in the step that exists to fail closed: " + ln.strip())
+
+
+def test_race_guard_bare_comparison_really_does_fail_open(tmp_path):
+    """The positive control for the test above.
+
+    Without this, `test_race_guard_fails_closed_when_the_log_does_not_EXIST`
+    might be passing for some unrelated reason and would keep passing if the
+    fix were reverted. Rebuild the OLD form and confirm it exits 0.
+    """
+    bash = _bash()
+    sh = tmp_path / "bare.sh"
+    sh.write_text(
+        'set -e\n'
+        'n=$(grep -cE "^--- (PASS|FAIL): " %s || true)\n'
+        'if [ "$n" -eq 0 ]; then echo FIRED; exit 1; fi\n'
+        'echo "NOT FIRED"; exit 0\n' % str(tmp_path / "absent.log").replace("\\", "/"),
+        encoding="utf-8")
+    r = _sp.run([bash, str(sh)], capture_output=True, text=True,
+                encoding="utf-8", errors="replace")
+    assert r.returncode == 0 and "NOT FIRED" in r.stdout, (
+        "the bare form no longer fails open, so the guarded form is not "
+        "demonstrably fixing anything: " + r.stdout + r.stderr)
+
+
+# ---------------------------------------------------------------------------
+# an exemption is only as good as the lane it points at
+# ---------------------------------------------------------------------------
+
+DRIFT_LANE = REPO / ".gitea" / "workflows" / "sdk-route-milestone-contract-drift.yml"
+
+
+def test_the_lane_that_justifies_the_allowlist_asserts_execution():
+    """The allowlist's escape hatch must not re-create the hole.
+
+    `internal/e2emilestones` is exempt from the module-wide gate ONLY because
+    sdk-route-milestone-contract-drift.yml runs it for real. That lane was a
+    bare `go test ... -run ... -v` whose only verdict was go's exit code, and
+    every way the test can stop running exits 0 (env var dropped -> t.Skip;
+    -run regex stale -> "no tests to run"). Dropping the env var would then
+    have left the package executing NOWHERE with both gates green.
+
+    So the exemption is coupled to the assertion, here, mechanically: if the
+    lane loses its execution check, this fails and the exemption has to go
+    with it.
+    """
+    allow = ALLOWLIST_IN_REPO.read_text(encoding="utf-8")
+    entries = [ln for ln in allow.splitlines()
+               if ln.strip() and not ln.strip().startswith("#")]
+    named = [ln for ln in entries if "sdk-route-milestone-contract-drift" in ln]
+    if not named:
+        return  # nothing leans on that lane any more
+
+    lane = DRIFT_LANE.read_text(encoding="utf-8")
+    live = _executable_lines(lane)
+    body = "\n".join(live)
+
+    assert "--- PASS:" in body, (
+        "the drift lane no longer counts '--- PASS:' lines, so it cannot tell a run "
+        "from a skip -- and the allowlist entry for internal/e2emilestones is "
+        "justified BY that lane. Either restore the assertion or drop the exemption.")
+    assert "--- SKIP:" in body, (
+        "the drift lane no longer fails on a skip. A skip there is the exact event "
+        "the allowlist entry assumes cannot happen silently.")
+    assert body.count("MOLECULE_RUN_CONTRACT_DRIFT_GATES") >= 2, (
+        "a derive-gate step lost its env var; the tests it names would skip.")
+    for needle in ("./internal/e2emilestones/", "./internal/router/"):
+        assert needle in body, "the drift lane stopped running %s" % needle
+
+
+def test_drift_lane_execution_checks_are_not_merely_mentioned_in_prose():
+    """`_executable_lines` strips comments, so prove it kept real code.
+
+    Without this, the assertions above would pass just as happily on a lane
+    that had been reduced to a comment block.
+    """
+    live = _executable_lines(DRIFT_LANE.read_text(encoding="utf-8"))
+    body = "\n".join(live)
+    assert body.count("npass=$(grep -c") == 2, (
+        "expected both derive-gate steps to compute a PASS count as LIVE shell, "
+        "found %d" % body.count("npass=$(grep -c"))
+    assert body.count("exit 1") >= 4, (
+        "the derive-gate steps stopped having failure arms")
+    assert ":-0}" in body, (
+        "the drift lane compares an unguarded count -- an empty value makes `[` "
+        "error out (rc 2), and `set -e` does not apply inside an `if` condition, "
+        "so the check would be silently skipped. Same fail-open as the race guard.")
