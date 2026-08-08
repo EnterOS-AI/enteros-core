@@ -241,7 +241,13 @@ func EvaluateMgmtMCPCallable(p MgmtMCPProbe) (ok bool, reason string) {
 	//    must have RUN provision_workspace and produced the workspace. Presence
 	//    without callability is exactly the flaw that let regressions through.
 	if p.AssertCallable && !p.WorkerProvisioned {
-		return false, "platform agent is online with its management MCP present, but a REAL A2A provision_workspace turn did NOT create the requested workspace — the verb is present but not genuinely CALLABLE (a presence-only gate would have false-passed here)"
+		// The red is unconditional — describeCallableFailure only NAMES it (see
+		// callable_failure_class.go). Six materially different failures used to
+		// publish this one sentence, so every investigation started by
+		// re-deriving the class from raw logs that the gate had already parsed.
+		return false, describeCallableFailure(
+			"platform agent is online with its management MCP present, but a REAL A2A provision_workspace turn did NOT create the requested workspace — the verb is present but not genuinely CALLABLE (a presence-only gate would have false-passed here).",
+			p.Claim.Texts)
 	}
 
 	if !p.AssertCallable {
