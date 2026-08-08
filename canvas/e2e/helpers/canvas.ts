@@ -181,6 +181,22 @@ async function collectHittabilityDiagnostic(page: Page, testId: string): Promise
           if (r.cssText.includes(".react-flow__background")) rulePresent = true;
         }
       }
+      // Enumerate every <link> with rel/href and whether its CSSOM sheet
+      // exists. A bare "stylesheets = 2" cannot distinguish "the sheet is
+      // still a preload React has not converted yet" from "the sheet was
+      // inserted and the fetch failed" — and those have different fixes.
+      // `link.sheet === null` on a rel="stylesheet" means inserted-but-not-
+      // (yet-)loaded; a rel="preload" entry with no matching stylesheet link
+      // means React has not run its hoistable-resource insertion for it.
+      const linkInventory = Array.from(document.querySelectorAll("link"))
+        .filter((l) => (l.getAttribute("rel") ?? "").includes("style") || l.hasAttribute("as"))
+        .map((l) => {
+          const rel = l.getAttribute("rel") ?? "";
+          const href = l.getAttribute("href") ?? "";
+          return `${rel}${l.getAttribute("as") ? `(as=${l.getAttribute("as")})` : ""} ${href} sheet=${
+            (l as HTMLLinkElement).sheet ? "loaded" : "null"
+          }`;
+        });
       return [
         `node box = {x:${r.x.toFixed(1)} y:${r.y.toFixed(1)} w:${r.width.toFixed(1)} h:${r.height.toFixed(1)}}`,
         `hit target at node centre = ${describe(hit)}`,
@@ -195,7 +211,12 @@ async function collectHittabilityDiagnostic(page: Page, testId: string): Promise
             ? ""
             : rulePresent
               ? "  <-- rule IS in the document but not in effect"
-              : "  <-- the stylesheet never reached this document (dev-server chunk delivery)"),
+              : "  <-- the rule is not in this document's CSSOM. If the sheet " +
+                "carrying it appears below only as rel=preload, it is a PAGE " +
+                "chunk that React inserts during hydration — import it from " +
+                "canvas/src/app/globals.css so it ships as a render-blocking " +
+                "layout stylesheet instead"),
+        `stylesheet links:\n    ${linkInventory.join("\n    ")}`,
         `viewport transform = ${
           (document.querySelector(".react-flow__viewport") as HTMLElement | null)?.style.transform || "(none)"
         }`,
@@ -216,6 +237,20 @@ export async function clickWorkspaceNode(page: Page, workspaceName: string): Pro
   await settleCanvas(page);
   await waitForNodeHittable(page, testId);
   await page.getByTestId(testId).click();
+}
+
+/**
+ * Open a workspace node's context menu. Same preconditions a left click needs
+ * — the node settled and unoccluded — because a right click is hit-tested
+ * identically; a context-menu click fired into the canvas entrance lands on
+ * the React Flow background just as a left click does.
+ */
+export async function rightClickWorkspaceNode(page: Page, workspaceName: string): Promise<void> {
+  const testId = `workspace-node-${workspaceName}`;
+  await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
+  await settleCanvas(page);
+  await waitForNodeHittable(page, testId);
+  await page.getByTestId(testId).click({ button: "right" });
 }
 
 /**

@@ -2,6 +2,14 @@ import { test, expect } from "@playwright/test";
 import type { Page, Request } from "@playwright/test";
 import { startEchoRuntime, type EchoRuntime } from "./fixtures/echo-runtime";
 import { seedWorkspace, startHeartbeat, cleanupWorkspace } from "./fixtures/chat-seed";
+// One copy of the canvas helpers, used by every spec. This file used to carry
+// its OWN enterMapView + raw `getByTestId(node).click()` — the exact
+// anti-pattern #5079 removed from boot-regression.spec.ts — so it kept failing
+// as `<rect> from <svg data-testid="rf__background"> subtree intercepts
+// pointer events` (run 629224) while the specs that had been converted failed
+// with the helper's precise diagnostic instead. A private duplicate of a
+// hardened helper is a hole in the hardening.
+import { enterMapView, clickWorkspaceNode } from "./helpers/canvas";
 
 /**
  * Scheduler ScheduleTab regression e2e — exercises the Canvas schedule surface
@@ -20,11 +28,8 @@ import { seedWorkspace, startHeartbeat, cleanupWorkspace } from "./fixtures/chat
 
 /** Enter the Org-map view so the React-Flow graph mounts, then open the workspace. */
 async function openWorkspace(page: Page, workspaceName: string): Promise<void> {
-  const nav = page.getByTestId("nav-map");
-  await expect(nav, "rail button nav-map missing").toBeVisible({ timeout: 10_000 });
-  await nav.click();
-  await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
-  await page.getByTestId(`workspace-node-${workspaceName}`).click();
+  await enterMapView(page);
+  await clickWorkspaceNode(page, workspaceName);
 }
 
 test.describe("ScheduleTab", () => {
