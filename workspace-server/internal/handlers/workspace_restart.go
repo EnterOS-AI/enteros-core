@@ -1603,6 +1603,41 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	h.fireRestartContextIfBooted(ctx, workspaceID, restartData)
 }
 
+// pauseSideEffectBudget is the HARD ceiling on Pause's detached side-effect
+// phase — TOTAL for the whole cascade, not per workspace.
+//
+// Why a ceiling is mandatory: the request context used to be the only thing
+// bounding this work. Detaching from it (see Pause) removes that bound, and a
+// detached operation with no deadline is a different bug — a wedged CP Stop
+// would pin the handler goroutine and its DB connections forever. The context
+// built from this budget is threaded into StopWorkspaceAuto (which carries it
+// into the CP HTTP round-trip) and into every ExecContext below, so the deadline
+// is enforced by the transports themselves, not by a convention.
+//
+// TOTAL, not per-workspace, for the same reason CascadeDelete's
+// captureCarryoverBudget is total (workspace_crud.go): a per-workspace timeout
+// lets an N-descendant cascade run for N × budget, which is not a bound. When
+// the budget is spent mid-cascade the remaining workspaces fast-fail on the
+// expired context and land in the failure list — a truthful partial result
+// rather than an unbounded handler.
+//
+// Sizing: the relevant neighbour is provisioner.cpAPITimeout = 120s, the
+// http.Client timeout on the CP's small JSON calls — "status, stop, console",
+// i.e. literally the Stop this budget has to contain. 60s sits below it
+// deliberately: a single wedged Stop should surface as a reported failure on
+// this budget rather than run the CP client all the way to its own ceiling and
+// take the rest of the cascade with it. (An earlier draft of this comment cited
+// the stop RETRY envelope; that is cpStopWithRetry on the restart/delete paths
+// and is not on the Pause path at all.) A var, not a const, so tests can shrink it.
+var pauseSideEffectBudget = 60 * time.Second
+
+// errPauseClaimMissed reports that the guarded mark-paused UPDATE matched no
+// row: the workspace left the pausable set between the eligibility SELECT and
+// the claim (removed, or already paused by a concurrent caller). The container
+// was stopped, but this Pause is not the operation that parked the row, so it
+// must not report the row as its own work.
+var errPauseClaimMissed = errors.New("mark-paused claim matched no row — the workspace left the pausable set (removed, or paused by a concurrent caller) after the eligibility check")
+
 // Pause handles POST /workspaces/:id/pause
 // Stops the container and sets status to 'paused'. The workspace remains on the canvas
 // but won't receive heartbeats, won't be auto-restarted, and won't consume resources.
@@ -1659,31 +1694,200 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 		return
 	}
 
-	// Stop containers and mark all as paused. StopWorkspaceAuto routes
-	// to whichever backend is wired (CP for SaaS, Docker for self-hosted)
-	// — pre-2026-05-05 this site inlined `if h.provisioner != nil { Stop }`,
-	// which silently leaked EC2s on every SaaS Pause (same drift class as
-	// the team-collapse leak #2813 and the workspace-delete leak #2814,
-	// both closed by PR #2824). StopWorkspaceAuto returns nil on no-backend
-	// (no-op), so the Pause-specific bookkeeping (mark paused, clear keys,
-	// broadcast) still fires regardless of whether anything was actually
-	// stopped — matches the pre-fix behavior on misconfigured deployments.
+	// ── Detach the side effects from the request lifecycle ────────────────────
+	//
+	// Everything above this line is a READ: it may safely die with the request,
+	// because a dead read produces an honest 404/500 and changes nothing.
+	// Everything below MUTATES, and must not be cancellable by the client.
+	//
+	// Pre-fix this whole loop ran on `ctx` — the request context — so an aborted
+	// client connection cancelled the stop, the status write, the key clear and
+	// the event, while the handler still answered 200 {"status":"paused"}.
+	// Observed live on a tenant (core#5019-adjacent, prod exposure is the ~20s
+	// CP-recreate window the deploy pipeline opens ~5×/day):
+	//
+	//	Pause: stop 35cf77b2-… failed: cp provisioner: stop: … context canceled
+	//	Pause: failed to set paused status for 35cf77b2-…: context canceled
+	//	RecordAndBroadcast: insert event error: context canceled
+	//	[GIN] 200 | 4.21s | POST "/workspaces/35cf77b2-…/pause"
+	//
+	// …and eleven seconds later that workspace read status="online" routable=true.
+	// Restart hit this hazard first and documented it (see the goAsync +
+	// context.Background() dispatch above: "detaches the dispatch from the request
+	// lifecycle so an aborted client connection doesn't cancel the in-flight
+	// Stop/provision pair").
+	//
+	// Pause takes the OTHER documented shape — context.WithoutCancel, SYNCHRONOUS,
+	// no goAsync — matching the a2a ingest writes (a2a_proxy_helpers.go: "a client
+	// disconnect … must not lose the row; SYNCHRONOUS (no goAsync): the row must be
+	// durable before the 200"). The distinction is what the response CLAIMS:
+	// Restart answers {"status":"provisioning"}, an honest "queued", so
+	// backgrounding it stays truthful. Pause answers {"status":"paused"}, a claim
+	// about a COMPLETED state — moving the work behind goAsync would leave the body
+	// reading "done" while meaning "queued", re-introducing the same lie through
+	// the other door. Synchronous + WithoutCancel gives the only combination where
+	// a 200 means what it says: the client may vanish, the work still completes,
+	// and the status line below is computed from what actually happened.
+	//
+	// pauseSideEffectBudget is the ceiling this detach must not exceed.
+	opCtx, cancelOp := context.WithTimeout(context.WithoutCancel(ctx), pauseSideEffectBudget)
+	defer cancelOp()
+
+	// StopWorkspaceAuto routes to whichever backend is wired (CP for SaaS, Docker
+	// for self-hosted) — pre-2026-05-05 this site inlined `if h.provisioner != nil
+	// { Stop }`, which silently leaked EC2s on every SaaS Pause (same drift class
+	// as the team-collapse leak #2813 and the workspace-delete leak #2814, both
+	// closed by PR #2824). StopWorkspaceAuto returns nil on no-backend (no-op), so
+	// the Pause bookkeeping still fires on a misconfigured deployment exactly as
+	// before — a no-op is not a failure.
+	//
+	// What CHANGED, beyond the context: a failed stop no longer writes
+	// status='paused' anyway. The old code did, under the comment "orphan sweeper
+	// will reconcile" — which no sweeper does. Precisely:
+	//
+	//   - registry/cp_orphan_sweeper.go (the SaaS/CP reaper) selects ONLY
+	//     `status = 'removed'`.
+	//   - registry/orphan_sweeper.go's container-reaping passes likewise key on
+	//     `status = 'removed'`. Its one pass with a wider predicate
+	//     (`status NOT IN ('removed','provisioning')`, which does include
+	//     'paused') is the STALE-TOKEN REVOCATION pass — it revokes auth tokens,
+	//     it never stops compute, so it could not reconcile this even in
+	//     principle.
+	//   - and that whole file is moot on the plane that matters: StartOrphanSweeper
+	//     is wired under `if prov != nil` (cmd/server/main.go), so in CP/SaaS prod
+	//     it does not run at all.
+	//
+	// So a 'paused' row over a still-running container has no backstop, and would
+	// sit there forever, invisible. The truthful row is the one we leave untouched
+	// (it still says online, which it is), and the caller's retry — now that the
+	// caller is TOLD — is the recovery path. This is the same
+	// loud-fail-instead-of-silent-leak choice the delete path makes
+	// (workspace_crud.go), minus the false row, because delete's 'removed' write is
+	// what its sweeper keys on and 'paused' is not.
+	var failures []gin.H
+	pausedCount := 0
 	for _, ws := range toPause {
-		if err := h.StopWorkspaceAuto(ctx, ws.id); err != nil {
-			log.Printf("Pause: stop %s failed: %v — orphan sweeper will reconcile", ws.id, err)
+		note := func(stage string, err error) {
+			log.Printf("Pause: %s failed for %s (%s): %v", stage, ws.name, ws.id, err)
+			failures = append(failures, gin.H{
+				"workspace_id": ws.id,
+				"name":         ws.name,
+				"stage":        stage,
+				"error":        err.Error(),
+			})
 		}
-		if _, err := db.DB.ExecContext(ctx,
-			`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2`, models.StatusPaused, ws.id); err != nil {
-			log.Printf("Pause: failed to set paused status for %s: %v", ws.id, err)
+
+		if err := h.StopWorkspaceAuto(opCtx, ws.id); err != nil {
+			note("stop", err)
+			continue // compute is still running — do not claim it is paused
 		}
-		db.ClearWorkspaceKeys(ctx, ws.id)
-		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspacePaused), ws.id, map[string]interface{}{
+
+		// Guarded claim. Pre-fix this was `WHERE id = $2` with rowsAffected never
+		// read, so a row that left the pausable set between the eligibility SELECT
+		// and this write was silently reported as paused. The predicate + the
+		// rowsAffected check turn that no-op into a reported failure — the same
+		// property Hibernate's atomic claim buys, without inventing a 'pausing'
+		// status (see the PR body for why that is deliberately out of scope).
+		res, err := db.DB.ExecContext(opCtx,
+			`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2 AND status NOT IN ('removed', 'paused')`,
+			models.StatusPaused, ws.id)
+		// stage "mark_paused" = the container IS stopped and the row still says
+		// online. That state does NOT sit still, and a reader who assumes it does
+		// will predict the wrong behaviour: the row is now a stopped box claiming
+		// to be online, which is exactly what the liveness/health sweeps hunt.
+		// StartHealthSweep and StartLivenessMonitor (neither gated on prov, so
+		// both run in CP/SaaS) and StartCPInstanceReconciler all call
+		// onWorkspaceOffline, which ends in `go wh.RestartByID(workspaceID)` —
+		// and RestartByID's dormant-state guard skips 'paused'/'hibernated' but
+		// NOT 'online', so it proceeds. The platform therefore AUTO-REPROVISIONS
+		// the workspace within a sweep interval. The user asked for a pause and
+		// gets a running workspace back; that is a self-healing outcome rather
+		// than a stranded row, but it is emphatically not "paused", which is why
+		// this is a reported failure and not a silent continue.
+		if err != nil {
+			note("mark_paused", err)
+			continue
+		}
+		claimed, err := res.RowsAffected()
+		if err != nil {
+			note("mark_paused", err)
+			continue
+		}
+		if claimed == 0 {
+			note("claim", errPauseClaimMissed)
+			continue
+		}
+
+		// From here the workspace IS paused: stopped, and the row says so. A
+		// failure below is real and reportable, but it does not un-pause anything,
+		// so it counts toward pausedCount AND toward failures — the caller gets a
+		// 207 telling them the canvas may be stale, not a 500 implying nothing
+		// happened.
+		pausedCount++
+		db.ClearWorkspaceKeys(opCtx, ws.id)
+		if err := h.broadcaster.RecordAndBroadcast(opCtx, string(events.EventWorkspacePaused), ws.id, map[string]interface{}{
 			"name": ws.name,
-		})
+		}); err != nil {
+			note("broadcast", err)
+		}
 	}
 
-	log.Printf("Paused workspace %s (%s) + %d children", wsName, id, len(toPause)-1)
-	c.JSON(http.StatusOK, gin.H{"status": "paused", "paused_count": len(toPause)})
+	// ── Report what actually happened ─────────────────────────────────────────
+	//
+	// Pre-fix this was an UNCONDITIONAL c.JSON(200, {"status":"paused"}) with every
+	// failure above reduced to a log line — the same lie 6d64c183f closed for
+	// hibernate (#4293), in a different handler.
+	//
+	// The status is computed in memory and delivered on the HTTP response. That is
+	// deliberate: the response needs no DB, no Redis and no broadcast, so it is
+	// still reachable when the very subsystem that caused the failure is dead. A
+	// failure reported through a write that the failure itself has broken is not a
+	// report.
+	if len(failures) == 0 {
+		log.Printf("Paused workspace %s (%s) + %d children", wsName, id, len(toPause)-1)
+		c.JSON(http.StatusOK, gin.H{"status": "paused", "paused_count": pausedCount})
+		return
+	}
+	log.Printf("Pause: %s (%s) — %d/%d paused, %d failed", wsName, id, pausedCount, len(toPause), len(failures))
+	if pausedCount == 0 {
+		// Same discipline as the 207 below: say what is known, not a guess about
+		// the workload. This branch covers BOTH a failed stop (workload still
+		// running) and a post-stop failure (workload stopped, row never reached
+		// 'paused'), so any fixed claim about whether it is running is false on one
+		// of them — and wrong in the more expensive direction on the second, since
+		// an operator told the box is up will not go looking for a stopped one.
+		// failures[].stage distinguishes them.
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status": "pause_failed",
+			"error": fmt.Sprintf("no workspace reached the paused state (%d step(s) failed) — see failures[]: stage \"stop\" = the workload was never stopped; "+
+				"stage \"mark_paused\"/\"claim\" = it WAS stopped but its row does not say paused. Re-check status before retrying",
+				len(failures)),
+			"paused_count": 0,
+			"failed_count": len(failures),
+			"failures":     failures,
+		})
+		return
+	}
+	// Partial: the cascade fans out over descendants, so "2 of 3 paused" is a real
+	// outcome and must be representable. Collapsing it into 200 or 500 discards the
+	// only information the caller can act on.
+	//
+	// The message states ONLY what is known at this point — a count, and a pointer
+	// to failures[]. It deliberately does not say "cascade", "were not paused" or
+	// "still running", because none of those hold on every path that reaches here:
+	// a single-workspace pause whose stop and claim both succeeded and whose
+	// telemetry INSERT then failed is a 207 in which there is no cascade, the
+	// workspace WAS paused, and it is NOT running. Prose that contradicts the
+	// payload beside it is the same defect as an unconditional 200 — a human reads
+	// the sentence, not failures[].
+	c.JSON(http.StatusMultiStatus, gin.H{
+		"status": "partially_paused",
+		"error": fmt.Sprintf("%d of %d workspace(s) paused; %d step(s) failed — see failures[] for which workspace and which stage",
+			pausedCount, len(toPause), len(failures)),
+		"paused_count": pausedCount,
+		"failed_count": len(failures),
+		"failures":     failures,
+	})
 }
 
 // Resume handles POST /workspaces/:id/resume

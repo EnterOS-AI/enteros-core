@@ -915,6 +915,14 @@ func TestRunRestartCycle_UsesProvisionWorkspaceAutoSyncLocked(t *testing.T) {
 // stays in the Pause handler — only the "stop the running workload"
 // step delegates to the dispatcher. This pin asserts the dispatcher
 // is called from the Pause loop with `ws.id`.
+//
+// The needle carries `opCtx`, not `ctx`, and the second half of this test
+// forbids `ctx`. Pause's side effects were moved off the request-scoped
+// context (see the detach note in Pause): passing the raw request `ctx` here
+// is the exact regression that let an aborted client connection cancel the
+// stop while the handler still answered 200 {"status":"paused"}. Pinning the
+// argument keeps the two invariants — right dispatcher, right context —
+// from drifting apart.
 func TestPauseHandler_UsesStopWorkspaceAuto(t *testing.T) {
 	wd, err := os.Getwd()
 	if err != nil {
@@ -925,9 +933,14 @@ func TestPauseHandler_UsesStopWorkspaceAuto(t *testing.T) {
 		t.Fatalf("read workspace_restart.go: %v", err)
 	}
 	stripped := stripGoComments(src)
-	if !bytes.Contains(stripped, []byte("h.StopWorkspaceAuto(ctx, ws.id)")) {
-		t.Errorf("workspace_restart.go must call StopWorkspaceAuto from the Pause loop with `ws.id` — current code does not. " +
+	if !bytes.Contains(stripped, []byte("h.StopWorkspaceAuto(opCtx, ws.id)")) {
+		t.Errorf("workspace_restart.go must call StopWorkspaceAuto from the Pause loop with `ws.id` on the DETACHED opCtx — current code does not. " +
 			"Phase 3 of #2799 migrated this site; do not regress to the inline `if h.provisioner != nil { Stop }` dispatch.")
+	}
+	if bytes.Contains(stripped, []byte("h.StopWorkspaceAuto(ctx, ws.id)")) {
+		t.Errorf("Pause's stop is back on the request-scoped `ctx`. An aborted client connection then cancels the stop " +
+			"mid-flight — the defect where Pause reported 200 {\"status\":\"paused\"} having stopped nothing. Use the " +
+			"detached, budget-bounded opCtx.")
 	}
 }
 
