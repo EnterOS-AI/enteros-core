@@ -7,7 +7,7 @@ package staginge2e
 // created no row, with ONE sentence: "the verb is present but not genuinely
 // CALLABLE". Measured over the whole Gitea Actions retention window
 // (2026-07-09 → 2026-08-08, 258 genuine Guard B verdicts, 50 red), that single
-// sentence was the entire published verdict for SIX materially different
+// sentence was the entire published verdict for FIVE materially different
 // failures:
 //
 //	G4  the model emitted a tool id that does not exist
@@ -18,10 +18,12 @@ package staginge2e
 //	    ("Billing or credits exhausted: HTTP 402")
 //	G7  the LLM rejected the model
 //	    ("Error code: 422 - {'error': 'model has no ...")
-//	G8  the runtime/gateway itself errored
 //	G10 the agent never answered at all
 //
-// Those need six different fixes and four different owners — G6/G7 are not even
+// (core#5088 also recorded a G8 runtime/gateway error in an older window; it
+// has no occurrence in this one, so no G8 class is declared — see below.)
+//
+// Those need five different fixes and three different owners — G6/G7 are not even
 // defects in the deploy candidate, they are account state — yet the gate
 // published them identically. This is precisely the defect core#5090 removed
 // from the ONLINE wait ("waits on the control plane terminal verdict, not the
@@ -42,6 +44,15 @@ package staginge2e
 // discipline refusalMarkers in concierge_self_report_gate.go follows.
 
 import "strings"
+
+// callableRedBaseReason is the VERBATIM pre-change check-5 sentence, kept as a
+// single source so the fallback path can be asserted byte-identical to what the
+// gate published before this file existed (TestDescribeCallableFailure_
+// FallsBackByteIdenticalToThePreChangeSentence). It carries no trailing period:
+// describeCallableFailure supplies the separator only when it actually appends
+// a class, so an unrecognised reply reproduces the original string exactly
+// rather than "the original plus a period".
+const callableRedBaseReason = "platform agent is online with its management MCP present, but a REAL A2A provision_workspace turn did NOT create the requested workspace — the verb is present but not genuinely CALLABLE (a presence-only gate would have false-passed here)"
 
 // CallableFailureClass is one named reason a callable turn produced no row.
 type CallableFailureClass struct {
@@ -75,14 +86,29 @@ var callableFailureClasses = []CallableFailureClass{
 			"This is ENVIRONMENT STATE, not a regression in the deploy candidate — the candidate is " +
 			"unproven rather than proven bad, and the red is honest but must not be read as a code defect",
 		// runs 596312, 600954, 607082
-		markers: []string{"billing or credits exhausted", "http 402", "error code: 402"},
+		markers: []string{"billing or credits exhausted"},
 	},
 	{
 		Code: "G7-LLM-MODEL-REJECTED",
 		Summary: "the LLM provider rejected the configured model, so no turn could run. " +
 			"Like G6 this is provider/config state rather than a defect in the deploy candidate",
-		// runs 466512, 468318
-		markers: []string{"error code: 422", "model has no"},
+		//
+		// NO UNANCHORED "model has no" MARKER. It was here and is deliberately
+		// gone. It sits ABOVE G5 in this list, and the phrase is not anchored to
+		// the provider's error envelope, so a perfectly ordinary refusal — "The
+		// model has no access to that, so I don't have provision_workspace" —
+		// would have been routed to the provider owner instead of the persona
+		// owner. The verdict would still be RED and still correct; only the
+		// OWNER would be wrong, which is precisely the cost this file exists to
+		// remove. It also bought nothing: across every reply in the corpus
+		// "model has no" appears 16 times and NEVER without "error code: 422"
+		// beside it, so the anchored marker already catches 100% of observed
+		// traffic. A reply that says "model has no" without the error code now
+		// ABSTAINS to the generic sentence — strictly better than a confident
+		// wrong owner.
+		// runs 468318 (and 466512, whose reply is genuine though its run reddened
+		// earlier, at check 1)
+		markers: []string{"error code: 422"},
 	},
 	// NOTE — no G8 (runtime/gateway error) class. core#5088 recorded one such
 	// red in an older retention window, but a scan of every reply text in the
@@ -97,13 +123,35 @@ var callableFailureClasses = []CallableFailureClass{
 		Summary: "the agent was online with all platform verbs loaded and still ASSERTED it does not " +
 			"have provision_workspace. The tool was present and dispatchable; the agent declined to " +
 			"believe so. Owner: concierge persona/prompt, not the MCP surface",
-		// runs 556986, 557305, 609311, 614408
+		// runs 556986, 557305, 557370, 609311, 614408
+		//
+		// Every marker below is NECESSARY: there is a real logged reply that it
+		// alone matches, so deleting any one of them leaves that reply
+		// unclassified and turns the suite RED.
+		// TestClassifyCallableTurnFailure_EveryMarkerIsNecessary enforces it.
+		//
+		//	i don't have        609311 "I don't have the ability to create workspaces."
+		//	i do not have       557370 "Final answer: I do not have a `provision_workspac"
+		//	don't have a        557370 "I still don't have a `provision_workspace` tool"
+		//	                           (note: "I STILL don't have" — "i don't have" misses it)
+		//	no peers registered 556986 "No luck — I have no peers registered in this or"
+		//	not something i     556986 "This request is not something I'm choosing not to"
+		//	i can't             557370 "I can't do this. No tool exists in my environment"
+		//	tool is not         614408 "I see that the `provision_workspace` tool is not "
+		//
+		// Seven further variants were deleted, in two groups. Four match NO
+		// corpus reply at all ("do not have the", "i am unable to", "i cannot",
+		// and G6's "error code: 402"). Three matched only replies that another
+		// marker already catches ("don't have the", "do not have a",
+		// "don't have the capability", "i'm unable to", "unable to create") —
+		// redundant, so their deletion changed no behaviour and nothing
+		// detected it. Two more ("necessary permission", "is not available")
+		// existed only because an earlier fixture INVENTED the end of a
+		// truncated reply. All of them are the G8 mistake at finer grain: a
+		// branch no traffic exercises and no test would miss.
 		markers: []string{
-			"i don't have", "i do not have", "don't have a", "don't have the",
-			"do not have a", "do not have the", "no peers registered",
-			"necessary permission", "not something i", "i'm unable to", "i am unable to",
-			"unable to create", "don't have the capability", "is not available",
-			"tool is not", "i can't", "i cannot",
+			"i don't have", "i do not have", "don't have a", "no peers registered",
+			"not something i", "i can't", "tool is not",
 		},
 	},
 }
@@ -157,7 +205,9 @@ func describeCallableFailure(base string, texts []string) string {
 	if code == "" {
 		return base
 	}
-	out := base + " FAILURE CLASS " + code + ": " + summary + "."
+	// The separator lives HERE, not in base, so the fallback above returns base
+	// byte-identical to the pre-change sentence.
+	out := base + ". FAILURE CLASS " + code + ": " + summary + "."
 	if evidence != "" {
 		out += " The agent's own words: " + quoteReplies([]string{evidence})
 	}

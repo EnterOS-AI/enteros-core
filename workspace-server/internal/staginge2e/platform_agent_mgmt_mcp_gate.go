@@ -245,9 +245,7 @@ func EvaluateMgmtMCPCallable(p MgmtMCPProbe) (ok bool, reason string) {
 		// callable_failure_class.go). Six materially different failures used to
 		// publish this one sentence, so every investigation started by
 		// re-deriving the class from raw logs that the gate had already parsed.
-		return false, describeCallableFailure(
-			"platform agent is online with its management MCP present, but a REAL A2A provision_workspace turn did NOT create the requested workspace — the verb is present but not genuinely CALLABLE (a presence-only gate would have false-passed here).",
-			p.Claim.Texts)
+		return false, describeCallableFailure(callableRedBaseReason, p.Claim.Texts)
 	}
 
 	if !p.AssertCallable {
