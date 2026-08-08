@@ -348,14 +348,34 @@ jobs:
 
       - name: Install Playwright browsers
         working-directory: canvas
-        run: |
-          PREBAKED_PLAYWRIGHT=/ms-playwright
-          if [ -d "${PREBAKED_PLAYWRIGHT}" ] && find "${PREBAKED_PLAYWRIGHT}" -maxdepth 3 -type f -name 'chrome' | grep -q .; then
-            echo "Using prebaked Playwright Chromium from ${PREBAKED_PLAYWRIGHT}"
-            echo "PLAYWRIGHT_BROWSERS_PATH=${PREBAKED_PLAYWRIGHT}" >> "$GITHUB_ENV"
-            exit 0
-          fi
-          npx playwright install --with-deps chromium
+        # This step USED to open with a "use the prebaked browsers" fast path:
+        #
+        #   PREBAKED_PLAYWRIGHT=/ms-playwright
+        #   if [ -d "$PREBAKED_PLAYWRIGHT" ] && find ... -name 'chrome' | grep -q .; then
+        #       ... export PLAYWRIGHT_BROWSERS_PATH; exit 0
+        #   fi
+        #
+        # It could never match. /ms-playwright does not exist in this lane's
+        # runner image (runner-base:full-latest-cloudflared-goproxy-pipe) and
+        # PLAYWRIGHT_BROWSERS_PATH is unset, so `[ -d ... ]` was false on every
+        # run and the guard fell through 100% of the time. Verified on job
+        # 934478 (run 633420, main, GREEN, 2026-08-08): the string "Using
+        # prebaked Playwright Chromium" appears in that log exactly once — as
+        # the ECHOED SCRIPT SOURCE inside the `::group::Run` block — and never
+        # as output. What actually ran was the fallback below, downloading
+        # 170.4 MiB of Chromium + ffmpeg + chrome-headless-shell into
+        # /home/runner/.cache/ms-playwright in 24.9s (17:08:32.80→17:08:57.71),
+        # on every e2e job, every time.
+        #
+        # So the guard was pure decoration that read as an optimisation — the
+        # same "protection that cannot fire" class as the other defects fixed
+        # in this PR. Deleted rather than repaired: making it real means baking
+        # the browsers into runner-base at /ms-playwright, and runner-base is
+        # not built in this repository (no Dockerfile for it here) — that is a
+        # fleet-image change, out of scope for a test-harness PR. The ~25s /
+        # ~230MB per-job cost is UNCHANGED by this commit; it is simply now
+        # honest about being paid. Prebaking remains worth doing separately.
+        run: npx playwright install --with-deps chromium
 
       - name: Build canvas (production bundle)
         working-directory: canvas
