@@ -375,13 +375,43 @@ jobs:
           # files]" if a package's tests stop compiling into the binary (build
           # tag, rename, wrong path) — a green that executed nothing. Require at
           # least one per-test verdict line from -v in each log.
-          if ! grep -qE '^--- (PASS|FAIL|SKIP): ' /tmp/test-handlers.log; then
+          #
+          # SKIP IS NOT EXECUTION. This grep used to read
+          # `^--- (PASS|FAIL|SKIP): `, so a package in which every test called
+          # t.Skip satisfied the check — which is precisely the state the check
+          # exists to detect. A guard that passes on its own failure mode is
+          # worse than no guard, because it reads as coverage. Only a real
+          # verdict counts now, and the count is printed so a reader can see
+          # the gate looked at something.
+          #
+          # This step covers 2 packages. The other 59 are covered by
+          # .gitea/scripts/assert-tests-executed.py in the coverage step below,
+          # which is where an all-skip package (as opposed to a
+          # nothing-compiled-in package) is classified and either failed or
+          # allowlisted by name.
+          # `${h_ran:-0}`, not `$h_ran`. If the log is MISSING, `grep -c ... ||
+          # true` yields the EMPTY STRING, and `[ "" -eq 0 ]` is not false — it
+          # is an "integer expression expected" error, exit 2. Inside an `if`
+          # condition that is exempt from `set -e`, so the whole check would be
+          # SKIPPED and the gate would pass. The old `grep -q` form failed
+          # closed on a missing file by accident; this form has to do it on
+          # purpose. Same defensive default as `${nskip:-0}` in
+          # handlers-postgres-integration.yml and `${npass:-0}` in
+          # concierge-creates-workspace-hermetic.yml.
+          #
+          # Unreachable today — both logs are tee'd a few lines above in this
+          # same step — but this is the step whose entire purpose is failing
+          # closed, so it does not get to depend on that.
+          h_ran=$(grep -cE '^--- (PASS|FAIL): ' /tmp/test-handlers.log || true)
+          pu_ran=$(grep -cE '^--- (PASS|FAIL): ' /tmp/test-pu.log || true)
+          echo "race+verbose gate: top-level verdicts (SKIP excluded) — handlers=${h_ran:-0} pendinguploads=${pu_ran:-0}"
+          if [ "${h_ran:-0}" -eq 0 ]; then
             failed="$failed internal/handlers(no-tests-executed)"
-            echo "::error::race+verbose gate executed ZERO tests in ./internal/handlers/... — vacuous pass (check the package path and that its _test.go files still compile in)."
+            echo "::error::race+verbose gate executed ZERO tests in ./internal/handlers/... — vacuous pass. Zero '--- PASS:'/'--- FAIL:' lines: either nothing compiled in (check the package path and the build tags on its _test.go files) or every test skipped. A skip is not an execution."
           fi
-          if ! grep -qE '^--- (PASS|FAIL|SKIP): ' /tmp/test-pu.log; then
+          if [ "${pu_ran:-0}" -eq 0 ]; then
             failed="$failed internal/pendinguploads(no-tests-executed)"
-            echo "::error::race+verbose gate executed ZERO tests in ./internal/pendinguploads/... — vacuous pass (check the package path and that its _test.go files still compile in)."
+            echo "::error::race+verbose gate executed ZERO tests in ./internal/pendinguploads/... — vacuous pass. Zero '--- PASS:'/'--- FAIL:' lines: either nothing compiled in (check the package path and the build tags on its _test.go files) or every test skipped. A skip is not an execution."
           fi
           if [ "$handlers_exit" -ne 0 ]; then
             failed="$failed internal/handlers(exit=$handlers_exit)"
@@ -397,12 +427,87 @@ jobs:
           fi
           echo "race+verbose gate: internal/handlers + internal/pendinguploads passed under -race ✓"
       - if: ${{ needs.changes.outputs.platform == 'true' }}
-        name: Run tests with coverage (blocking gate)
+        name: Run tests with coverage + no-tests-executed gate (blocking gate)
         # Removed -race from the blocking gate per #1184: cold runners
         # take 13-25 min to compile with race instrumentation, exceeding
         # the 10m step timeout and causing false failures. Race detection
         # now runs as a non-blocking advisory step below.
-        run: go test -timeout 10m -coverprofile=coverage.out ./...
+        #
+        # WAS: `go test -timeout 10m -coverprofile=coverage.out ./...`, whose
+        # only verdict was go's exit code. `go test` exits 0 on a package
+        # whose tests stopped compiling in ("[no test files]", a flipped build
+        # tag, a moved path) and on a package where every test calls t.Skip.
+        # This is the ONE lane that runs all 61 packages, and it asserted
+        # nothing about whether any of them executed.
+        #
+        # The repo's only no-tests-executed check lived in the race+verbose
+        # step above and had two holes: it accepted `--- SKIP:` as proof of
+        # execution (the vacuous pass it exists to detect satisfied it), and
+        # it covered 2 of 61 packages. Hole 1 is fixed in place above; hole 2
+        # is fixed here, because widening a log-grep to 61 packages is not
+        # something a grep should be asked to do.
+        #
+        # `-json` instead of `-v` + grep: the stream carries a typed
+        # per-test verdict, so "did this package execute a test" stops being
+        # a regex question. A CACHED package still replays its full event
+        # stream (verified on go1.26.4 against this module), so the runner's
+        # persistent bind-mounted GOCACHE does not turn a cache hit into a
+        # phantom no-tests-executed. `-coverprofile` is unchanged and still
+        # writes coverage.out for the threshold steps below.
+        #
+        # NO PIPE: `go test ... > log`, so `$?` is go's own status. The
+        # race step above needs ${PIPESTATUS[0]} because it tees; not
+        # depending on a shell default at all is better than depending on it
+        # correctly.
+        #
+        # A `go list` MANIFEST is fed in, not just a package list. Without it
+        # the gate could only check packages it happened to see, and a package
+        # that silently dropped out of the run would be an absence rather than
+        # a failure. The per-package COUNTS matter too: they are what tells
+        # "this dir has no _test.go" (a cmd/ main.go — fine) from "this dir's
+        # tests stopped compiling in" (the defect). Reading that off go's
+        # console output does NOT work — the "[no test files]" marker is
+        # absent under -coverprofile, which is exactly how the first cut of
+        # this gate reddened its own first CI run (run 632196 / job 932832).
+        # IgnoredGoFiles catches the third case: every _test.go excluded by a
+        # build constraint.
+        #
+        # The script additionally refuses to run on a package set below a
+        # floor, because two empty sets compare equal and that is how this
+        # gate would come to report success while inspecting nothing.
+        run: |
+          set -uo pipefail
+          LOG=/tmp/test-all.json
+          # Space-separated, not tab: no workflow in this repo contains a
+          # literal tab, and a tab that only exists inside a YAML block scalar
+          # is exactly the kind of byte an editor or a reformat silently eats.
+          # Import paths and counts contain no spaces and IgnoredGoFiles are
+          # comma-joined, so whitespace splitting is unambiguous here.
+          go list -f '{{.ImportPath}} {{len .TestGoFiles}} {{len .XTestGoFiles}} {{join .IgnoredGoFiles ","}}' ./... > /tmp/go-packages.txt
+          go test -json -timeout 10m -coverprofile=coverage.out ./... > "$LOG" 2>/tmp/test-all.err
+          test_exit=$?
+          if [ -s /tmp/test-all.err ]; then
+            echo "::group::go test stderr (build/toolchain errors appear here, not in the JSON)"
+            cat /tmp/test-all.err
+            echo "::endgroup::"
+          fi
+          # Render + assert BEFORE acting on test_exit: -json replaces go's own
+          # `ok  pkg  1.2s` lines, so this is where the per-package result gets
+          # into the log, and it must be there for a red too.
+          gate_exit=0
+          python3 "$GITHUB_WORKSPACE/.gitea/scripts/assert-tests-executed.py" \
+            --json-log "$LOG" \
+            --package-manifest /tmp/go-packages.txt \
+            --allowlist "$GITHUB_WORKSPACE/.gitea/tests-may-skip-wholesale.txt" \
+            --min-packages 50 \
+            --trim-prefix workspace-server/ \
+            --render || gate_exit=$?
+          if [ "$test_exit" -ne 0 ]; then
+            echo "::error::go test -coverprofile ./... exited $test_exit — see the FAILED package output groups above."
+          fi
+          if [ "$test_exit" -ne 0 ] || [ "$gate_exit" -ne 0 ]; then
+            exit 1
+          fi
 
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Run e2e_busy_inject positive-control tests (blocking gate)
@@ -511,10 +616,29 @@ jobs:
         # resolver/schema regression on the live composition, which is exactly
         # the signal worth gating on.
         #
-        # Non-vacuity: a `-run` filter that matches zero tests exits 0 with "no
-        # tests to run" — a vacuous green. We require the top-level result line
-        # (PASS or SKIP) to appear; its absence means the test was renamed or
-        # the filter is wrong, and fails this step.
+        # Non-vacuity, AND WHAT IT DOES NOT COVER — read both halves.
+        #
+        # A `-run` filter that matches zero tests exits 0 with "no tests to
+        # run" — a vacuous green. We require the top-level result line (PASS or
+        # SKIP) to appear; its absence means the test was renamed or the filter
+        # is wrong, and fails this step.
+        #
+        # SKIP is accepted ON PURPOSE here, unlike the module-wide
+        # no-tests-executed gate above. This step is deliberately non-blocking
+        # on network: a clone failure or the held-broken
+        # molecule-dev-department@v1.0.0 !external ref makes the test t.Skip
+        # rather than fail (see the note above), and gating on a live clone
+        # would import GitHub's availability into every PR.
+        #
+        # The honest consequence: THIS CHECK PROVES SELECTION, NOT EXECUTION.
+        # MOLECULE_LIVE_ORG_TEMPLATE=1 immediately below is the only thing
+        # arming the test — delete that env and the test skips its own guard,
+        # the grep still matches `--- SKIP:`, and the step reports success
+        # having executed nothing. That is a real (smaller) instance of the
+        # same class the race+verbose and coverage gates above were fixed for;
+        # it is deferred, not unnoticed, because closing it means deciding
+        # whether a live clone may block a PR. The output below therefore says
+        # which of the two actually happened instead of claiming "executed".
         env:
           MOLECULE_LIVE_ORG_TEMPLATE: "1"
         run: |
@@ -522,10 +646,14 @@ jobs:
           go test -count=1 -timeout 5m -v ./internal/handlers/ \
             -run '^TestResolveYAMLIncludes_RealMoleculeDev$' 2>&1 | tee /tmp/test-live-org.log
           if ! grep -q -E '^(--- PASS|--- SKIP): TestResolveYAMLIncludes_RealMoleculeDev' /tmp/test-live-org.log; then
-            echo "::error::live org-template smoke did not execute TestResolveYAMLIncludes_RealMoleculeDev — vacuous pass (check the -run filter and that the test still exists)."
+            echo "::error::live org-template smoke did not SELECT TestResolveYAMLIncludes_RealMoleculeDev — no top-level PASS or SKIP line, so the -run filter matched nothing or the test was renamed/deleted. (This check proves selection only; a skipped run is accepted here by design.)"
             exit 1
           fi
-          echo "live org-template clone+resolve smoke executed ✓"
+          if grep -q -E '^--- PASS: TestResolveYAMLIncludes_RealMoleculeDev' /tmp/test-live-org.log; then
+            echo "live org-template clone+resolve smoke: EXECUTED and passed"
+          else
+            echo "::warning::live org-template clone+resolve smoke SKIPPED — selected but not executed, so the live composition was NOT checked on this run. Accepted by design (network/env-gated); check MOLECULE_LIVE_ORG_TEMPLATE above if you expected it to run."
+          fi
 
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Race detection (advisory, non-blocking)
