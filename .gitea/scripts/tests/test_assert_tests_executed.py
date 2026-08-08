@@ -584,7 +584,14 @@ def _bash() -> str:
         try:
             probe = _sp.run([cand, "-c", "echo __bash_ok__"], capture_output=True,
                             text=True, encoding="utf-8", errors="replace", timeout=30)
-        except OSError:
+        except (OSError, _sp.SubprocessError):
+            # OSError alone is not enough. A cold WSL start makes the same
+            # stub hang rather than fail fast, so the probe raises
+            # TimeoutExpired -- a SubprocessError, NOT an OSError -- which
+            # propagated out and aborted the whole group instead of falling
+            # through to the next candidate. Loud rather than silent, so it
+            # could not resurrect the false pass, but an intermittent abort
+            # is an unfixed bug by this repo's rule, not a flake.
             continue
         if probe.returncode == 0 and "__bash_ok__" in probe.stdout:
             _BASH_CACHE.append(cand)
@@ -724,13 +731,29 @@ def test_the_lane_that_justifies_the_allowlist_asserts_execution():
     So the exemption is coupled to the assertion, here, mechanically: if the
     lane loses its execution check, this fails and the exemption has to go
     with it.
+
+    KEYED ON THE PACKAGE PATH, NOT THE LANE NAME. This was keyed on the
+    string "sdk-route-milestone-contract-drift" appearing in the allowlist
+    reason, and bailed when it did not. The reason is free-form prose, so
+    rewording it to name a different lane -- while keeping the exemption
+    exactly as permissive -- silently switched this whole check off. A guard
+    that stops applying when someone edits a comment is the same shape as
+    everything else this PR closes. The exemption is a claim about
+    internal/e2emilestones, so the package path is what selects the check.
     """
     allow = ALLOWLIST_IN_REPO.read_text(encoding="utf-8")
     entries = [ln for ln in allow.splitlines()
                if ln.strip() and not ln.strip().startswith("#")]
-    named = [ln for ln in entries if "sdk-route-milestone-contract-drift" in ln]
-    if not named:
-        return  # nothing leans on that lane any more
+    assert entries, (
+        "the allowlist parsed to zero entries -- if that file was renamed or its "
+        "format changed, this check would return without asserting anything rather "
+        "than telling you it had stopped working")
+    exempted = [ln.split("#", 1)[0].strip() for ln in entries]
+    if not any(p.endswith("/internal/e2emilestones") for p in exempted):
+        # The package is no longer exempt at all, so there is nothing for the
+        # drift lane to be standing in for. This is the one honest early
+        # return: it is keyed on the exemption itself, not on prose about it.
+        return
 
     lane = DRIFT_LANE.read_text(encoding="utf-8")
     live = _executable_lines(lane)
