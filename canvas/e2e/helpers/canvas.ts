@@ -151,11 +151,29 @@ export async function waitForNodeHittable(page: Page, testId: string): Promise<v
 }
 
 /** Measure WHY a node is not hittable: its box, what is actually at its centre,
- *  and whether React Flow's stylesheet is in effect. Split out so the caller can
- *  guard it — see waitForNodeHittable. Exported so e2e/css-diagnostic.spec.ts can
- *  drive it against deliberately-broken stylesheet deliveries and assert what it
- *  says; a diagnostic that is only ever exercised by the failure it describes is
- *  a diagnostic nobody has tested. */
+ *  and whether React Flow's stylesheet is in effect.
+ *
+ *  THIS MESSAGE IS EVIDENCE, NOT PROSE. On the recorded core#5106 failures the
+ *  Playwright report artifact was not retained, so this string was the only
+ *  surviving evidence — and it has now sent investigators the wrong way twice:
+ *
+ *    1. It appended an instruction to import the rule from
+ *       `canvas/src/app/globals.css` — a BUILD fix — while the real failure was
+ *       a dead socket. (Removed by #5105.)
+ *    2. It described the failure as `dev-server chunk delivery` after this lane
+ *       had stopped using `next dev` and moved to a production `node server.js`.
+ *       (Removed by #5105; recorded here because the phrase outlived the code in
+ *       archived job logs and kept asset-delivery theories alive afterwards.)
+ *
+ *  A third of the same kind is corrected below: "fix delivery of that asset" is
+ *  refuted by this lane's own preflight, which proves the file is served. Every
+ *  claim this function makes about a LAYER must be one the evidence in the same
+ *  message supports; anything else belongs in the issue, not in the failure.
+ *
+ *  Split out so the caller can guard it — see waitForNodeHittable. Exported so
+ *  e2e/css-diagnostic.spec.ts can drive it against deliberately-broken
+ *  stylesheet deliveries and assert what it says; a diagnostic that is only ever
+ *  exercised by the failure it describes is a diagnostic nobody has tested. */
 export async function collectHittabilityDiagnostic(page: Page, testId: string): Promise<string> {
   const inPage = await page.evaluate((id: string) => {
       const el = document.querySelector(`[data-testid="${id}"]`) as HTMLElement | null;
@@ -387,9 +405,18 @@ export async function collectHittabilityDiagnostic(page: Page, testId: string): 
               "unreadable. For a SAME-ORIGIN sheet that means DEAD " +
               "(reset/aborted/CSP-blocked) — it is NOT a slow sheet, because a " +
               "still-loading sheet is absent from styleSheets entirely and so " +
-              "lowers `settled`, never `readable`. Read the per-link inventory " +
-              "below for which sheet and which state, then fix delivery of that " +
-              "asset; nothing in the spec can wait this out."
+              "lowers `settled`, never `readable`. Nothing in the spec can wait " +
+              "this out.\n  DO NOT read this as 'the asset is not being served' " +
+              "(core#5106): this lane's own preflight curls that exact file, " +
+              "requires HTTP 200 AND greps the rule out of the body, and it " +
+              "passed ~0.03s after server readiness in every recorded instance " +
+              "— then ~33 further page loads over the same origin succeeded " +
+              "before this one failed. It is a PER-REQUEST failure on a server " +
+              "that owns its port and serves the file. Read the per-link " +
+              "inventory below (which sheet, which state), its `timing:` line " +
+              "(did a response header ever arrive?), the network failures at the " +
+              "end (which net::ERR_*), and canvas.log for the server probe's " +
+              "heartbeat and any CONNECTION DIED line."
             : rulePresent && bgPE !== "none"
               ? "  <-- rule IS in the document but not in effect"
               : ""),

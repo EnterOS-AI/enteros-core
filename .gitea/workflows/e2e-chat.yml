@@ -36,11 +36,19 @@ name: E2E Chat
 # (623210 ✗, 623299 ✓, 623425 ✗, 622625 ✓).
 #
 # `next build` emits immutable, content-hashed CSS files that are NAMED by
-# the initial document — this one as `<link rel="preload" as="style">` plus
-# an RSC-payload stylesheet entry React inserts at hydration. (Checked
-# against a real build: the only plain `<link rel="stylesheet">` tags in the
-# initial HTML are the two LAYOUT sheets.) There is no on-demand chunk
-# compilation left, which removes the COMPILATION mechanism behind the flake.
+# the initial document. There is no on-demand chunk compilation left, which
+# removes the COMPILATION mechanism behind the flake.
+#
+# This paragraph used to add that the React Flow sheet arrives "as `<link
+# rel="preload" as="style">` plus an RSC-payload stylesheet entry React
+# inserts at hydration". That was true when written and is FALSE NOW: #5105
+# moved the import into the layout stylesheet precisely so the sheet is a
+# plain, render-blocking `<link rel="stylesheet">` in the initial document,
+# and the preflight below ASSERTS that shape and fails the job if it ever
+# regresses. Left corrected rather than deleted because a stale claim about
+# how an asset is delivered is not inert — it is what a future investigator
+# reasons from, and core#5106 has now been misdirected twice by exactly that
+# (see the note on the diagnostic in canvas/e2e/helpers/canvas.ts).
 #
 # It does NOT remove every mechanism, and this file will not pretend
 # otherwise. A stylesheet request that is merely SLOW makes React suspend the
