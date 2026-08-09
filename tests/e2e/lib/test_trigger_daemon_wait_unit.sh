@@ -15,9 +15,31 @@ FAILED=0
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-# Injected reader: prints whatever the scenario staged, so no container needed.
+# Injected readers: print whatever the scenario staged, so no container needed.
 fake_health() { cat "$TMP/health.json" 2>/dev/null; }
 export TRIGGER_DAEMON_HEALTH_CMD=fake_health
+
+# The DELIVERY-LANE signal: the daemon's durable attempt log. Staged as a plain
+# file so a scenario can freeze it (wedged lane) or advance it (progressing lane)
+# poll by poll, which is what makes the both-directions mutation possible offline.
+fake_history() { cat "$TMP/history.json" 2>/dev/null; }
+export TRIGGER_DAEMON_PROGRESS_CMD=fake_history
+
+# $1 = number of attempt-log entries, or "none" for an absent/unreadable log.
+stage_history() {
+  if [ "$1" = "none" ]; then rm -f "$TMP/history.json"; return; fi
+  N="$1" OUT="$TMP/history.json" python3 -c '
+import json, os
+n = int(os.environ["N"])
+json.dump([{"name": "probe", "at": "2026-08-09T00:%02d:00+00:00" % (i % 60),
+            "status": "fired", "cause": "completed"} for i in range(n)],
+          open(os.environ["OUT"], "w"))
+'
+}
+
+# A stall window big enough that the tests above (which are about the TICK
+# signal) never trip the delivery detector by accident.
+NOSTALL=100000
 
 stage_health() { # $1 = age seconds, or "none" for no heartbeat at all
   if [ "$1" = "none" ]; then rm -f "$TMP/health.json"; return; fi
@@ -42,50 +64,87 @@ check() { # $1 desc, $2 expected rc, $3 actual rc
   fi
 }
 
+# A readable, FROZEN attempt log for every tick-signal scenario below. Frozen is
+# the harder default on purpose: paired with $NOSTALL it proves the delivery
+# detector runs on every poll (SAMPLES climbs) without ever changing a verdict
+# that belongs to the tick signal.
+stage_history 1
+
 # --- evidence wins immediately, even if the heartbeat looks frozen -----------
 stage_health 5
-trigger_daemon_wait c 600 10 60 probe_hit; check "evidence present -> pass" 0 $?
+trigger_daemon_wait c 600 10 60 "$NOSTALL" probe_hit; check "evidence present -> pass" 0 $?
 
 stage_health 4000
-trigger_daemon_wait c 600 10 60 probe_hit
+trigger_daemon_wait c 600 10 60 "$NOSTALL" probe_hit
 check "evidence present, heartbeat frozen -> STILL pass (evidence beats liveness)" 0 $?
 
 # --- wedged daemon fails fast ------------------------------------------------
 stage_health 400
-trigger_daemon_wait c 600 10 60 probe_never; check "frozen heartbeat, no evidence -> fail fast" 2 $?
+trigger_daemon_wait c 600 10 60 "$NOSTALL" probe_never; check "frozen heartbeat, no evidence -> fail fast" 2 $?
 [ -n "$TRIGGER_DAEMON_LAST_AGE" ] || { echo "FAIL: TRIGGER_DAEMON_LAST_AGE not reported"; FAILED=1; }
 
 stage_health 61
-trigger_daemon_wait c 600 10 60 probe_never; check "age 61s (just over threshold) -> fail fast" 2 $?
+trigger_daemon_wait c 600 10 60 "$NOSTALL" probe_never; check "age 61s (just over threshold) -> fail fast" 2 $?
 
 # --- live daemon that simply has not fired yet -> backstop, NOT a wedge ------
 stage_health 59
-trigger_daemon_wait c 60 10 60 probe_never; check "age 59s (just under threshold) -> backstop" 1 $?
+# Short backstop (2 polls) on purpose: `stage_health` fixes an ABSOLUTE
+# timestamp, so the observed age grows with the test's own real elapsed time.
+# A 1s-under-threshold case that loops seven times ages past the threshold
+# mid-wait and reports a wedge — a self-inflicted flake, not a lib defect.
+trigger_daemon_wait c 10 10 60 "$NOSTALL" probe_never; check "age 59s (just under threshold) -> backstop" 1 $?
 
 stage_health 5
-trigger_daemon_wait c 60 10 60 probe_never; check "fresh heartbeat, no evidence -> backstop" 1 $?
+trigger_daemon_wait c 60 10 60 "$NOSTALL" probe_never; check "fresh heartbeat, no evidence -> backstop" 1 $?
 
 # --- an unreadable/absent heartbeat must NOT be reported as a wedged daemon --
 stage_health none
-trigger_daemon_wait c 60 10 60 probe_never; check "no heartbeat file -> backstop, never 'wedged'" 1 $?
+trigger_daemon_wait c 60 10 60 "$NOSTALL" probe_never; check "no heartbeat file -> backstop, never 'wedged'" 1 $?
 
 printf 'not json' > "$TMP/health.json"
-trigger_daemon_wait c 60 10 60 probe_never; check "corrupt heartbeat -> backstop, never 'wedged'" 1 $?
+trigger_daemon_wait c 60 10 60 "$NOSTALL" probe_never; check "corrupt heartbeat -> backstop, never 'wedged'" 1 $?
 
 python3 -c 'import json,os; json.dump({"armed":1,"errors":{},"last_tick":None}, open(os.environ["OUT"],"w"))' OUT="$TMP/health.json" 2>/dev/null \
   || OUT="$TMP/health.json" python3 -c 'import json,os; json.dump({"armed":1,"errors":{},"last_tick":None}, open(os.environ["OUT"],"w"))'
-trigger_daemon_wait c 60 10 60 probe_never; check "null last_tick (pre-first-tick) -> backstop" 1 $?
+trigger_daemon_wait c 60 10 60 "$NOSTALL" probe_never; check "null last_tick (pre-first-tick) -> backstop" 1 $?
 
 # --- usage errors are refused, never silently treated as success -------------
-trigger_daemon_wait "" 60 10 60 probe_never;  check "missing container -> usage error" 3 $?
-trigger_daemon_wait c 60 0 60 probe_never;    check "zero poll -> usage error" 3 $?
-trigger_daemon_wait c abc 10 60 probe_never;  check "non-numeric backstop -> usage error" 3 $?
-trigger_daemon_wait c 60 10 60 "";            check "missing probe -> usage error" 3 $?
+trigger_daemon_wait "" 60 10 60 "$NOSTALL" probe_never;  check "missing container -> usage error" 3 $?
+trigger_daemon_wait c 60 0 60 "$NOSTALL" probe_never;    check "zero poll -> usage error" 3 $?
+trigger_daemon_wait c abc 10 60 "$NOSTALL" probe_never;  check "non-numeric backstop -> usage error" 3 $?
+trigger_daemon_wait c 60 10 60 "$NOSTALL" "";            check "missing probe -> usage error" 3 $?
+# The stall window has NO "off" value. A 0 that meant "disabled" would produce a
+# run indistinguishable from an armed-and-correct one — the vacuous pass — so it
+# is a usage error like any other missing argument.
+trigger_daemon_wait c 60 10 60 0 probe_never;     check "zero stall (no 'disabled' value) -> usage error" 3 $?
+trigger_daemon_wait c 60 10 60 abc probe_never;   check "non-numeric stall -> usage error" 3 $?
+trigger_daemon_wait c 60 10 60 "" probe_never;    check "missing stall -> usage error" 3 $?
+# Arity is fail-CLOSED: an un-migrated 5-arg call passes the probe name where the
+# stall belongs, which is non-numeric, so it refuses instead of silently running
+# with the detector off and the probe never invoked.
+trigger_daemon_wait c 60 10 60 probe_never;       check "old 5-arg call shape -> usage error, not a silent unarmed run" 3 $?
 
 # --- derived thresholds ------------------------------------------------------
-[ "$(trigger_daemon_stale_secs 10)" = "60" ]  || { echo "FAIL: stale(10) != 60"; FAILED=1; }
-[ "$(trigger_daemon_stale_secs 30)" = "180" ] || { echo "FAIL: stale(30) != 180"; FAILED=1; }
+#
+# THE TICK-WEDGE THRESHOLD DERIVES FROM THE DAEMON'S TICK, NOT OUR POLL.
+# Both defaulted to 10 in CI, so `6 x observation-poll` and `6 x tick` were the
+# same number and the old derivation looked right. They are independent knobs
+# (E2E_SCHEDULER_POLL_SECS vs E2E_TRIGGER_POLL_SECONDS), and the mutation that
+# separates them is the point: at a 120s daemon tick, a threshold derived from
+# the observation poll stays 60s and declares a perfectly healthy daemon wedged.
+[ "$(trigger_daemon_stale_secs 10)" = "60" ]  || { echo "FAIL: stale(10) != 60 at the default 10s tick"; FAILED=1; }
 [ "$(trigger_daemon_stale_secs 1)" = "60" ]   || { echo "FAIL: stale floor not 60"; FAILED=1; }
+[ "$(TRIGGER_DAEMON_TICK_INTERVAL_SECS=30 trigger_daemon_stale_secs 10)" = "180" ] \
+  || { echo "FAIL: stale does not track the DAEMON tick (30s tick should give 180s)"; FAILED=1; }
+if [ "$(TRIGGER_DAEMON_TICK_INTERVAL_SECS=120 trigger_daemon_stale_secs 10)" -gt 120 ]; then
+  echo "PASS [stale=$(TRIGGER_DAEMON_TICK_INTERVAL_SECS=120 trigger_daemon_stale_secs 10)s at a 120s daemon tick] the wedge threshold cannot fire on a healthy slow-ticking daemon"
+else
+  echo "FAIL: at a 120s daemon tick the stale threshold is $(TRIGGER_DAEMON_TICK_INTERVAL_SECS=120 trigger_daemon_stale_secs 10)s — below one tick, so EVERY healthy poll reads as a wedged daemon"; FAILED=1
+fi
+# The observation poll still FLOORS it (we cannot conclude a wedge from fewer
+# reads than that), it just no longer sets it.
+[ "$(TRIGGER_DAEMON_TICK_INTERVAL_SECS=1 trigger_daemon_stale_secs 40)" = "120" ] \
+  || { echo "FAIL: observation poll does not floor the stale threshold"; FAILED=1; }
 
 # The backstop MUST exceed the delivery watchdog — the old 360s-vs-600s
 # inversion is the bug this guards against.
@@ -207,8 +266,11 @@ for k in MOLECULE_TRIGGER_DELIVERY_ABSOLUTE_CAP_SECONDS MOLECULE_MAX_TURN_SECOND
     echo "FAIL: trigger_daemon_delivery_cap_env does not emit $k=$cap_secs (got: $(printf '%s' "$cap_env" | tr '\n' ' '))"; FAILED=1
   fi
 done
-[ "$(printf '%s\n' "$cap_env" | grep -c .)" = "2" ] \
-  || { echo "FAIL: trigger_daemon_delivery_cap_env emitted something other than exactly 2 keys"; FAILED=1; }
+# Three keys exactly: the two cap keys above plus the daemon tick cadence the
+# wedge threshold is derived from. Pinning the COUNT (not just presence) is what
+# catches a fourth key sneaking onto the workspace without a reader here.
+[ "$(printf '%s\n' "$cap_env" | grep -c .)" = "3" ] \
+  || { echo "FAIL: trigger_daemon_delivery_cap_env emitted $(printf '%s\n' "$cap_env" | grep -c .) keys, expected exactly 3 (2 cap keys + MOLECULE_TRIGGER_POLL_SECONDS)"; FAILED=1; }
 
 # ONE number: the injected caps and the derived backstop must move together. A
 # second literal anywhere in that chain is how the 210 survived four months.
@@ -305,6 +367,451 @@ gc=$(schedule_grid_confirm_secs 10); fb=$(TRIGGER_DAEMON_WATCHDOG_SECS=600 trigg
 gc=$(schedule_grid_confirm_secs 600)
 [ "$gc" -lt "$fb" ] || { echo "FAIL: grid-confirm $gc (max poll) not shorter than fire backstop $fb"; FAILED=1; }
 
+# ═══ THE DELIVERY-LANE STALL DETECTOR ════════════════════════════════════════
+#
+# The watchdog this file is really about. `last_tick` proves the TICK LOOP is
+# alive and nothing more: scheduler.py's `tick()` never awaits a delivery, so the
+# heartbeat advances at full cadence while `_delivery_worker` sits in an await
+# that never returns. A heartbeat-only watchdog therefore CANNOT fire on that
+# wedge, and the only thing that ever did was elapsed wall-clock — which is also
+# the only thing that reds a slow-but-healthy delivery. Both failures, one
+# number.
+#
+# The replacement is the daemon's durable ATTEMPT LOG. Every terminal outcome in
+# scheduler.py appends exactly one entry, and nothing else can: not the tick, not
+# the cron, not a held connection. So the verdict is "has the log advanced",
+# never "how long has this taken", and the deadline RESETS on every advancement.
+#
+# BOTH DIRECTIONS ARE DEMONSTRATED BELOW, not argued:
+#   A. a genuinely wedged lane (log frozen, heartbeat healthy)  -> MUST fire
+#   B. a slow-but-progressing lane (attempts landing 600s apart,
+#      run for 1800s — nearly 3x the stall window)              -> MUST NOT fire
+# plus the boundary either side, the judgement order against the tick signal, and
+# the vacuous-pass shape where the detector never armed at all.
+
+STALL=$(trigger_daemon_progress_stall_secs 10)
+CAP=$(trigger_daemon_watchdog_secs)
+BACKSTOP=$(trigger_daemon_backstop_secs)
+# The scenarios below run at the REAL derived bounds. Only the OBSERVATION poll
+# is coarsened, to 300s, so a 1800s scenario is six loop iterations instead of a
+# hundred and eighty — the wait's arithmetic is in seconds, not in iterations, so
+# this changes nothing about which verdict is reached, only how many `cksum`
+# spawns it costs. The boundary cases further down use a fine poll against a
+# small window, which is where iteration granularity actually matters.
+SIMPOLL=300
+echo "PASS [cap=${CAP}s stall=${STALL}s backstop=${BACKSTOP}s, simulated at a ${SIMPOLL}s observation poll] derived bounds under test"
+
+# Advancing probes. These mutate the staged attempt log the way the daemon would
+# — one line per finished attempt — and never report evidence, so the ONLY thing
+# that can end the wait is a watchdog verdict.
+_pollN=0
+probe_never_advancing() {        # an attempt finishes every poll: fastest healthy lane
+  _pollN=$((_pollN + 1)); printf '{"e":%s}\n' "$_pollN" >> "$TMP/history.json"; return 1
+}
+probe_never_advancing_slowly() { # an attempt finishes every 2 polls = 600 simulated s,
+  _pollN=$((_pollN + 1))         # i.e. AT the delivery cancel bound: as slow as a
+  [ "$((_pollN % 2))" = "0" ] && printf '{"e":%s}\n' "$_pollN" >> "$TMP/history.json"
+  return 1                       # delivery can legitimately be, and still healthy.
+}
+
+progress_check() { # $1 desc, $2 min-samples, $3 min-transitions, $4 max-transitions
+  local s="$TRIGGER_DAEMON_PROGRESS_SAMPLES" t="$TRIGGER_DAEMON_PROGRESS_TRANSITIONS"
+  if [ "$s" -ge "$2" ] && [ "$t" -ge "$3" ] && [ "$t" -le "$4" ]; then
+    echo "PASS [samples=$s transitions=$t] $1"
+  else
+    echo "FAIL [samples=$s transitions=$t, wanted samples>=$2 and ${3}<=transitions<=$4] $1"; FAILED=1
+  fi
+}
+
+# ── DIRECTION A: a WEDGED lane must fire ─────────────────────────────────────
+# Heartbeat perfectly healthy (5s old, against a 60s wedge threshold) — so the
+# tick signal says "fine, keep waiting" and would have burned the whole 1800s
+# backstop. The attempt log is frozen. rc=4 at the stall window.
+stage_health 5
+stage_history 3
+trigger_daemon_wait c "$BACKSTOP" "$SIMPOLL" 60 "$STALL" probe_never
+check "WEDGED lane (log frozen, heartbeat healthy) -> stall verdict" 4 $?
+# ARMED, and the count is reported: a run where the detector never engaged
+# returns a different rc, but it would be indistinguishable in a bare pass/fail.
+progress_check "the detector was ARMED and saw NO advancement on the wedged lane" 1 0 0
+if [ "${TRIGGER_DAEMON_PROGRESS_AGE:-0}" -gt "$STALL" ]; then
+  echo "PASS [progress age ${TRIGGER_DAEMON_PROGRESS_AGE}s > ${STALL}s] the verdict is reported with the silence that produced it"
+else
+  echo "FAIL: stall fired but TRIGGER_DAEMON_PROGRESS_AGE='${TRIGGER_DAEMON_PROGRESS_AGE:-}' does not exceed the ${STALL}s window — the number in the operator's message would be wrong"; FAILED=1
+fi
+
+# ── DIRECTION B: a SLOW-BUT-PROGRESSING lane must NOT fire ───────────────────
+# Attempts land 600s apart — at the delivery cancel bound itself, i.e. as slow as
+# a delivery can legitimately be — and the wait runs the full 1800s backstop,
+# nearly THREE stall windows. Elapsed time is enormous; absence of progress never
+# occurs. Anything other than rc=1 here is the false positive this replaces.
+stage_health 5
+stage_history 1
+_pollN=0
+trigger_daemon_wait c "$BACKSTOP" "$SIMPOLL" 60 "$STALL" probe_never_advancing_slowly
+_slow_rc=$?
+check "SLOW-BUT-PROGRESSING lane (attempts 600s apart, run for ${BACKSTOP}s) -> NOT a stall" 1 $_slow_rc
+[ "$_slow_rc" = "4" ] && { echo "FAIL: the watchdog fired on a HEALTHY lane — this is the false positive a fixed wall-clock cap produces"; FAILED=1; }
+progress_check "the detector was ARMED and RESET on each of the lane's advancements" 1 2 999
+
+# The same lane, but the marker finally lands long after the stall window would
+# have expired had it been a stopwatch. A slow delivery still PASSES.
+stage_health 5
+stage_history 1
+_pollN=0
+_late=0
+probe_late() {  # advances the log every 2 polls, then succeeds at poll 5 (1500s)
+  _pollN=$((_pollN + 1))
+  [ "$((_pollN % 2))" = "0" ] && printf '{"e":%s}\n' "$_pollN" >> "$TMP/history.json"
+  _late=$_pollN
+  [ "$_pollN" -ge 5 ]
+}
+trigger_daemon_wait c "$BACKSTOP" "$SIMPOLL" 60 "$STALL" probe_late
+check "slow lane that DELIVERS at ~1500s (>2x the ${STALL}s stall window) -> pass" 0 $?
+[ "$_late" -ge 5 ] || { echo "FAIL: probe_late ended at poll $_late, so the slow-success path was not exercised"; FAILED=1; }
+
+# ── the BOUNDARY either side of the stall window ─────────────────────────────
+# A threshold asserted only far from its edge is a threshold nobody has checked.
+stage_health 5
+stage_history 2
+trigger_daemon_wait c 50 10 60 50 probe_never
+check "frozen for exactly the stall window (backstop == stall) -> NOT yet a stall" 1 $?
+stage_history 2
+trigger_daemon_wait c 60 10 60 50 probe_never
+check "frozen for one poll PAST the stall window -> stall" 4 $?
+
+# ── judgement ORDER: a dead tick is named before a stalled lane ──────────────
+# A frozen tick freezes the attempt log as a CONSEQUENCE. Reporting that as a
+# delivery stall would name the symptom and send the operator at the wrong lane.
+stage_health 400
+stage_history 2
+trigger_daemon_wait c "$BACKSTOP" "$SIMPOLL" 60 "$STALL" probe_never
+check "tick dead AND log frozen -> reported as the TICK wedge, not the delivery stall" 2 $?
+
+# ── evidence still beats every watchdog ──────────────────────────────────────
+stage_health 5
+stage_history 2
+trigger_daemon_wait c "$BACKSTOP" "$SIMPOLL" 60 1 probe_hit
+check "evidence present, stall window of 1s -> STILL pass (evidence beats both signals)" 0 $?
+
+# ── THE VACUOUS PASS, made visible ───────────────────────────────────────────
+# An unreadable attempt log leaves the detector UNARMED. That must not be
+# reported as a stall (an unexecable container is not a wedged lane) — but it
+# also must not look like a clean run, because it carries no evidence about the
+# delivery lane at all. The two are told apart by SAMPLES, which is exactly why
+# the harness prints it on every leg.
+stage_health 5
+stage_history none
+trigger_daemon_wait c "$BACKSTOP" "$SIMPOLL" 60 "$STALL" probe_never
+check "attempt log unreadable -> backstop, NEVER a stall verdict" 1 $?
+if [ "$TRIGGER_DAEMON_PROGRESS_SAMPLES" = "0" ]; then
+  echo "PASS [samples=0] the UNARMED run is distinguishable from an armed one; a caller asserting samples>0 catches it"
+else
+  echo "FAIL: samples=$TRIGGER_DAEMON_PROGRESS_SAMPLES with no readable attempt log — the unarmed run is being counted as armed, which is the vacuous pass"; FAILED=1
+fi
+# ...and the armed-vs-unarmed distinction is REAL, not an artefact of the rc:
+# both of these return 1, and only the counter separates them.
+stage_history 1
+_pollN=0
+trigger_daemon_wait c 30 10 60 "$STALL" probe_never_advancing
+check "readable+advancing log, short backstop -> backstop (same rc as the unarmed run)" 1 $?
+if [ "$TRIGGER_DAEMON_PROGRESS_SAMPLES" -gt 0 ]; then
+  echo "PASS [samples=$TRIGGER_DAEMON_PROGRESS_SAMPLES vs 0 above, identical rc=1] armed and unarmed are separable ONLY by the counter"
+else
+  echo "FAIL: an armed run reported samples=0 — the counter cannot distinguish the vacuous case"; FAILED=1
+fi
+
+# ── "NOT POLLED" AND "BLIND" ARE DIFFERENT STATES ────────────────────────────
+#
+# `samples == 0` conflated two outcomes that mean opposite things, and the live
+# log printed the identical "carries NO evidence" line for both on every green
+# run. TRIGGER_DAEMON_PROGRESS_READS separates them: reads counts ATTEMPTS,
+# samples counts READABLE attempts.
+#
+#   reads == 0              returned on the probe before any read. Benign — the
+#                           evidence arrived before the detector looked.
+#   reads > 0, samples == 0 polled and read nothing. The real blind spot.
+stage_health 5
+stage_history 2
+trigger_daemon_wait c "$BACKSTOP" "$SIMPOLL" 60 "$STALL" probe_hit
+if [ "$TRIGGER_DAEMON_PROGRESS_READS" = "0" ] && [ "$TRIGGER_DAEMON_PROGRESS_SAMPLES" = "0" ]; then
+  echo "PASS [reads=0 samples=0] evidence on the first probe -> NOT POLLED, distinguishable from blind"
+else
+  echo "FAIL: probe_hit gave reads=$TRIGGER_DAEMON_PROGRESS_READS samples=$TRIGGER_DAEMON_PROGRESS_SAMPLES, expected 0/0 — a fast pass is being counted as a poll"; FAILED=1
+fi
+
+stage_history none   # unreadable log: polls happen, reads return nothing
+trigger_daemon_wait c 30 10 60 "$STALL" probe_never
+if [ "$TRIGGER_DAEMON_PROGRESS_READS" -gt 0 ] && [ "$TRIGGER_DAEMON_PROGRESS_SAMPLES" = "0" ]; then
+  echo "PASS [reads=$TRIGGER_DAEMON_PROGRESS_READS samples=0] polled but unreadable -> BLIND, the state that genuinely carries no evidence"
+else
+  echo "FAIL: unreadable log gave reads=$TRIGGER_DAEMON_PROGRESS_READS samples=$TRIGGER_DAEMON_PROGRESS_SAMPLES, expected reads>0 and samples=0"; FAILED=1
+fi
+
+stage_history 2      # readable: reads and samples both climb, and agree
+trigger_daemon_wait c 30 10 60 "$STALL" probe_never
+if [ "$TRIGGER_DAEMON_PROGRESS_SAMPLES" -gt 0 ] && [ "$TRIGGER_DAEMON_PROGRESS_READS" -eq "$TRIGGER_DAEMON_PROGRESS_SAMPLES" ]; then
+  echo "PASS [reads=$TRIGGER_DAEMON_PROGRESS_READS samples=$TRIGGER_DAEMON_PROGRESS_SAMPLES] readable log -> ARMED, every attempt readable"
+else
+  echo "FAIL: readable log gave reads=$TRIGGER_DAEMON_PROGRESS_READS samples=$TRIGGER_DAEMON_PROGRESS_SAMPLES; both should climb together"; FAILED=1
+fi
+
+# The harness must report all THREE states, not two.
+if [ -f "$HARNESS" ]; then
+  _missing=""
+  for pat in "NOT POLLED" "BLIND" "ARMED" "TRIGGER_DAEMON_PROGRESS_READS"; do
+    grep -q "$pat" "$HARNESS" || _missing="$_missing $pat"
+  done
+  if [ -z "$_missing" ]; then
+    echo "PASS [3 states] the harness distinguishes ARMED / NOT POLLED / BLIND"
+  else
+    echo "FAIL: the harness is missing:$_missing — a fast pass and a genuine blind spot would print the same line again"; FAILED=1
+  fi
+fi
+
+# ── EVERY BOUND ON THE PATH IS REACHABLE ─────────────────────────────────────
+#
+# The 210-vs-600 defect was an ordering defect nobody could see: the outer bound
+# expired before the inner one it existed to accommodate could fire, so the retry
+# was unreachable, and it parsed and read as deliberate for four months because
+# the two numbers lived in different files. The inventory is now data and the
+# ordering is asserted, in BOTH directions.
+if out=$(trigger_daemon_timeout_ordering_check 10 2>&1); then
+  echo "PASS [ordering] every bound in the inventory can be reached"
+else
+  echo "FAIL: the default timeout inventory is not reachable end to end: $out"; FAILED=1
+fi
+echo "       inventory: $(trigger_daemon_timeout_ledger 10 | tr '\n' ' ')"
+
+# Mutation 1 — the DIRECT re-creation of the 210 defect: an outer bound that
+# cuts before the inner cancel it is meant to outlast. The check must REFUSE it.
+_bad_stall() { printf '%s' 210; }
+if out=$(trigger_daemon_progress_stall_secs() { _bad_stall; }; trigger_daemon_timeout_ordering_check 10 2>&1); then
+  echo "FAIL: a 210s outer window against a ${CAP}s cancel bound was ACCEPTED — the exact inversion this guard exists to refuse"; FAILED=1
+else
+  echo "PASS [refused] a 210s outer window against the ${CAP}s cancel bound (the original defect, re-created)"
+fi
+
+# Mutation 2 — equality. Two bounds expiring at the same instant race, and the
+# outer wins often enough that the inner is unreachable in practice.
+if out=$(trigger_daemon_progress_stall_secs() { trigger_daemon_watchdog_secs; }; trigger_daemon_timeout_ordering_check 10 2>&1); then
+  echo "FAIL: an outer window EQUAL to the cancel bound was accepted"; FAILED=1
+else
+  echo "PASS [refused] an outer window exactly EQUAL to the cancel bound"
+fi
+
+# Mutation 3 — the subsumption claim is checked, not trusted. Raise the cap past
+# the runtime's 900s idle TTL and `CAUSE_IDLE` becomes reachable again, so the
+# ledger's "subsumed" disposition is no longer true and must fail.
+if out=$(TRIGGER_DAEMON_WATCHDOG_SECS=1000 trigger_daemon_timeout_ordering_check 10 2>&1); then
+  echo "FAIL: a 1000s cap above the ${TRIGGER_DAEMON_RUNTIME_IDLE_TTL_SECS}s idle TTL was accepted while the ledger still calls the TTL subsumed"; FAILED=1
+else
+  echo "PASS [refused] a cap above the idle TTL, which would silently make CAUSE_IDLE reachable again"
+fi
+
+# ── the CAP IS DERIVED, not typed ────────────────────────────────────────────
+# The whole objection to the old 600 was that it was a literal somebody has to
+# find and re-tune. It is now the repo's 10x margin on the system's own fire
+# interval, so it FOLLOWS the configuration instead of being maintained beside
+# it. That the derivation reproduces exactly the 600 previously chosen by
+# measurement is the corroboration, not the definition.
+[ "$(trigger_daemon_fire_interval_secs)" = "60" ] || { echo "FAIL: '* * * * *' does not derive a 60s fire interval"; FAILED=1; }
+[ "$(trigger_daemon_fire_interval_secs '*/5 * * * *')" = "300" ] || { echo "FAIL: '*/5 * * * *' does not derive 300s"; FAILED=1; }
+for bad in '0 3 * * *' '* * * *' 'garbage' '*/0 * * * *' '*/99 * * * *' ''; do
+  if out=$(trigger_daemon_fire_interval_secs "$bad" 2>&1); then
+    echo "FAIL: cron '$bad' was accepted and derived '$out' — a bound from a misparsed cron describes nothing"; FAILED=1
+  else
+    echo "PASS [refused] uninterpretable cron '$bad'"
+  fi
+done
+# The cap tracks the cron. A `*/5` probe must not leave a 600s cap sized for a
+# 60s cadence — that is precisely how a literal rots.
+_c5=$(TRIGGER_DAEMON_PROBE_CRON='*/5 * * * *' trigger_daemon_watchdog_secs)
+if [ "$_c5" = "3000" ]; then
+  echo "PASS [cap=${_c5}s at a */5 cron] the cancel bound follows the configured fire cadence"
+else
+  echo "FAIL: a */5 probe cron gave cap=$_c5, not 3000 — the cap is not derived from the fire interval"; FAILED=1
+fi
+# ...and the STALL window follows it too, so the cap/stall PAIR keeps its
+# relative ordering at the new cadence. If only one of them scaled, the
+# inversion would come back silently.
+#
+# NOTE WHAT THIS DOES AND DOES NOT CLAIM. It proves the DERIVATION rescales, not
+# that `*/5` is a usable configuration — it is not, and the next assertion is the
+# proof. An earlier version of this test was labelled "the ordering survives a
+# change of fire cadence", which over-claimed: the pair rescales, the LEDGER does
+# not survive.
+_s5=$(TRIGGER_DAEMON_PROBE_CRON='*/5 * * * *' trigger_daemon_progress_stall_secs 10)
+if [ "$_s5" -gt "$_c5" ]; then
+  echo "PASS [cap=${_c5}s < stall=${_s5}s] cap and stall rescale TOGETHER at a */5 cadence (the pair keeps its ordering)"
+else
+  echo "FAIL: at a */5 cron the stall window $_s5 does not exceed the cap $_c5 — the inversion returns as soon as the cadence moves"; FAILED=1
+fi
+# The whole-ledger verdict at */5 is a REFUSAL, and that is correct, not a gap:
+# a 3000s cap sits above the runtime's 900s idle TTL, so `runtime_idle_ttl` is no
+# longer subsumed and its disposition would be a lie. Asserting the refusal here
+# stops someone "fixing" the cadence knob without noticing the ledger rejects it.
+if TRIGGER_DAEMON_PROBE_CRON='*/5 * * * *' trigger_daemon_timeout_ordering_check 10 >/dev/null 2>&1; then
+  echo "FAIL: the ledger ACCEPTED a */5 cadence, whose ${_c5}s cap exceeds the ${TRIGGER_DAEMON_RUNTIME_IDLE_TTL_SECS}s idle TTL — the subsumption claim would be false and unchecked"; FAILED=1
+else
+  echo "PASS [refused] the whole ledger REJECTS a */5 cadence (cap ${_c5}s > idle TTL ${TRIGGER_DAEMON_RUNTIME_IDLE_TTL_SECS}s) — the derivation rescales, this cadence does not survive"
+fi
+
+# --- the ordering check is NOT vacuous on an empty or truncated ledger -------
+#
+# The negative control this guard was missing. Every rule in
+# trigger_daemon_timeout_ordering_check is a rule ABOUT ROWS, so zero rows
+# satisfies all of them and the function reported "every bound can be reached"
+# having examined nothing — the exact defect class the rest of this PR closes,
+# inside the guard that closes it. Three shapes, all of which used to pass:
+_ledger_orig=$(declare -f trigger_daemon_timeout_ledger)
+
+# 1. EMPTY.
+trigger_daemon_timeout_ledger() { printf ''; }
+if out=$(trigger_daemon_timeout_ordering_check 10 2>&1); then
+  echo "FAIL: an EMPTY ledger returned success — the guard asserted nothing and said so was fine"; FAILED=1
+else
+  echo "PASS [refused] an EMPTY ledger (0 rows) cannot report a reachable path"
+fi
+
+# 2. TRUNCATED — rows present, but fewer than the path has.
+trigger_daemon_timeout_ledger() { printf 'a|10|d|reachable\nb|60|h|reachable\nc|600|d|reachable\n'; }
+if out=$(trigger_daemon_timeout_ordering_check 10 2>&1); then
+  echo "FAIL: a TRUNCATED ledger (3 of $(trigger_daemon_ledger_rows) rows) returned success — bounds silently fell off the path unchecked"; FAILED=1
+else
+  echo "PASS [refused] a TRUNCATED ledger (3 of $(trigger_daemon_ledger_rows) rows)"
+fi
+
+# 3. RIGHT COUNT, no chain — all-but-one subsumed. The row count is satisfied and
+#    the loop runs, but the strictly-increasing comparison never fires even once.
+trigger_daemon_timeout_ledger() {
+  printf 'x|600|d|reachable\n'
+  for _i in 1 2 3 4 5; do printf 's%s|900|r|subsumed-by:x\n' "$_i"; done
+}
+if out=$(trigger_daemon_timeout_ordering_check 10 2>&1); then
+  echo "FAIL: a ledger with the right row count but only ONE reachable bound returned success — the ordering chain was never compared against anything"; FAILED=1
+else
+  echo "PASS [refused] right row count but no reachable CHAIN (1 reachable, 5 subsumed)"
+fi
+
+# 4. THE COUNT GUARD MUST NOT BE BYPASSABLE BY AN ENV KNOB.
+#    It shipped for one commit as `${TRIGGER_DAEMON_LEDGER_ROWS:-6}` — the only
+#    numeric knob in the lib with no validator — consumed by a bare `[ -ne ]`.
+#    A non-numeric value makes that test ERROR (rc=2), not return false; the `if`
+#    reads the error as false, the count check is SKIPPED, and a truncated ledger
+#    passes at rc=0. `set -e` is exempt inside an `if`, so nothing aborts.
+#
+#    Three vectors, because the first fix (a hard `TRIGGER_DAEMON_LEDGER_ROWS=6`
+#    constant) closed only the first and STILL bypassed on the other two when
+#    actually run. The count now comes from a FUNCTION, which a variable
+#    assignment cannot shadow.
+trigger_daemon_timeout_ledger() { printf 'a|10|d|reachable\nb|60|h|reachable\nc|600|d|reachable\n'; }
+_env_bypass() { # $1 = description, then the command that must still REFUSE
+  local desc="$1"; shift
+  if "$@" >/dev/null 2>&1; then
+    echo "FAIL: $desc — a 3-of-6 truncated ledger PASSED; the count guard was bypassed"; FAILED=1
+  else
+    echo "PASS [refused] $desc"
+  fi
+}
+_check_prefix() { TRIGGER_DAEMON_LEDGER_ROWS=abc trigger_daemon_timeout_ordering_check 10; }
+# shellcheck disable=SC2034
+#   "TRIGGER_DAEMON_LEDGER_ROWS appears unused" is the ASSERTION, not a lint
+#   miss: nothing reads this variable any more, which is precisely why setting it
+#   can no longer weaken the guard. shellcheck agreeing that it is inert is
+#   corroboration; the runtime refusal below is the proof.
+_check_after()  { TRIGGER_DAEMON_LEDGER_ROWS=3;   trigger_daemon_timeout_ordering_check 10; }
+_env_bypass "command-prefix shadow TRIGGER_DAEMON_LEDGER_ROWS=abc" _check_prefix
+_env_bypass "assignment after sourcing TRIGGER_DAEMON_LEDGER_ROWS=3 (would legitimise truncation)" _check_after
+# (nothing to unset: the knob is retired; these assignments were inert)
+
+# 5. ...and a REDEFINED count function returning garbage must FAIL CLOSED, not
+#    skip. This is the residual the function form cannot prevent, so it is
+#    validated at the point of use instead.
+_rows_orig=$(declare -f trigger_daemon_ledger_rows)
+trigger_daemon_ledger_rows() { printf 'abc'; }
+if out=$(trigger_daemon_timeout_ordering_check 10 2>&1); then
+  echo "FAIL: a non-numeric expected row count returned SUCCESS — the count check was skipped rather than failing closed"; FAILED=1
+else
+  case "$out" in
+    *"not a positive integer"*) echo "PASS [refused, fail-closed] a non-numeric expected row count is diagnosed, not skipped" ;;
+    *) echo "FAIL: refused but with the wrong diagnosis ('$out')"; FAILED=1 ;;
+  esac
+fi
+eval "$_rows_orig"
+
+eval "$_ledger_orig"   # restore the real ledger for everything below
+
+# The env knob must be INERT against the real ledger too — set to garbage, the
+# check still passes and still reports 6 rows. (A "fix" that made every run fail
+# would also have refused the truncated case.)
+if out=$(TRIGGER_DAEMON_LEDGER_ROWS=zzz trigger_daemon_timeout_ordering_check 10 2>&1); then
+  case "$out" in
+    *"checked 6 row(s)"*) echo "PASS [$out] the retired env knob is INERT: real ledger still passes and still counts 6" ;;
+    *) echo "FAIL: passed but did not report 6 rows ('$out')"; FAILED=1 ;;
+  esac
+else
+  echo "FAIL: the real ledger was refused merely because a stale env knob was set: $out"; FAILED=1
+fi
+
+# ...and the restored, real ledger must still PASS and must REPORT its count —
+# a guard that only ever refuses is as useless as one that only ever passes.
+if out=$(trigger_daemon_timeout_ordering_check 10 2>&1); then
+  case "$out" in
+    *"checked $(trigger_daemon_ledger_rows) row(s)"*)
+      echo "PASS [$out] the real ledger passes AND reports how many rows it checked" ;;
+    *)
+      echo "FAIL: the real ledger passed but did not report its row count ('$out') — an armed check must be distinguishable from an empty one"; FAILED=1 ;;
+  esac
+else
+  echo "FAIL: the real ledger was REFUSED after restore: $out"; FAILED=1
+fi
+# No literal 600 left in the lib's derivation path: the default must come out of
+# the fire interval, so overriding the interval must move it.
+if [ "$(TRIGGER_DAEMON_CAP_FIRE_MULTIPLE=3 trigger_daemon_watchdog_secs)" = "180" ]; then
+  echo "PASS [3x fire interval = 180s] the cap is a MULTIPLE of a configured interval, not a stored number"
+else
+  echo "FAIL: changing the fire multiple did not change the cap — it is still a literal"; FAILED=1
+fi
+
+# The injected env must carry the daemon tick too, from the SAME call: the
+# tick-wedge threshold is derived from it, and it used to be typed at the
+# provision site while the threshold came from a different knob entirely.
+if trigger_daemon_delivery_cap_env | grep -qx "MOLECULE_TRIGGER_POLL_SECONDS=$(trigger_daemon_tick_interval_secs)"; then
+  echo "PASS [MOLECULE_TRIGGER_POLL_SECONDS=$(trigger_daemon_tick_interval_secs)] the daemon tick is injected from the same place the wedge threshold derives from"
+else
+  echo "FAIL: trigger_daemon_delivery_cap_env does not emit MOLECULE_TRIGGER_POLL_SECONDS — the provisioned tick and the derived threshold can drift apart again"; FAILED=1
+fi
+
+# The harness must ROUTE the stall window and the cron through the lib, for the
+# same reason as every other bound: a literal at the call site parses, runs, and
+# reads as deliberate.
+if [ -f "$HARNESS" ]; then
+  for fn in trigger_daemon_progress_stall_secs trigger_daemon_timeout_ordering_check trigger_daemon_probe_cron; do
+    if grep -q "$fn" "$HARNESS"; then
+      echo "PASS [routed] the harness uses $fn"
+    else
+      echo "FAIL: test_staging_full_saas.sh never calls $fn — the delivery-lane signal or the cron SSOT is not actually wired into the run"; FAILED=1
+    fi
+  done
+  # Every trigger_daemon_wait call site must pass SIX arguments before the probe.
+  # A five-argument leftover would hand the probe name in as the stall window and
+  # be refused at runtime, but only when that leg actually executes — catch it here.
+  _bad_arity=$(grep -n 'trigger_daemon_wait "' "$HARNESS" \
+    | grep -Ev 'trigger_daemon_wait "[^"]*" "[^"]*" "[^"]*" +"[^"]*" "[^"]*" [A-Za-z_]' || true)
+  if [ -z "$_bad_arity" ]; then
+    echo "PASS [arity] every trigger_daemon_wait call site passes container/backstop/poll/stale/stall before the probe"
+  else
+    echo "FAIL: trigger_daemon_wait call site(s) missing the stall argument: $_bad_arity"; FAILED=1
+  fi
+  # The harness must ASSERT the detector engaged rather than assume it.
+  if grep -q "TRIGGER_DAEMON_PROGRESS_SAMPLES" "$HARNESS"; then
+    echo "PASS [anti-vacuous] the harness reports whether the stall detector armed"
+  else
+    echo "FAIL: the harness never reads TRIGGER_DAEMON_PROGRESS_SAMPLES — an unarmed run would be indistinguishable from an armed, correct one"; FAILED=1
+  fi
+fi
+
 # --- REAL wall-clock: raising the backstop must not lengthen the happy path ---
 #
 # Everything above collapses `sleep`, which proves the RETURN CODE but says
@@ -334,7 +841,7 @@ stage_health 5
 # Signal ALREADY present -> returns before the first sleep, so ~0s regardless of
 # how large the backstop is.
 t0=$(date +%s)
-trigger_daemon_wait c "$REAL_BACKSTOP" 5 60 probe_hit; rc=$?
+trigger_daemon_wait c "$REAL_BACKSTOP" 5 60 "$NOSTALL" probe_hit; rc=$?
 t1=$(date +%s)
 check "REAL sleep, signal already present -> pass" 0 $rc
 elapsed_check "signal already present returns immediately, not at the ${REAL_BACKSTOP}s backstop" \
@@ -347,7 +854,7 @@ elapsed_check "signal already present returns immediately, not at the ${REAL_BAC
 _hits=0
 probe_third() { _hits=$((_hits + 1)); [ "$_hits" -ge 3 ]; }
 t0=$(date +%s)
-trigger_daemon_wait c "$REAL_BACKSTOP" 5 60 probe_third; rc=$?
+trigger_daemon_wait c "$REAL_BACKSTOP" 5 60 "$NOSTALL" probe_third; rc=$?
 t1=$(date +%s)
 check "REAL sleep, signal on the 3rd poll -> pass" 0 $rc
 elapsed_check "3rd-poll signal returns at ~10s (2 x 5s poll), not at the ${REAL_BACKSTOP}s backstop" \
@@ -363,7 +870,7 @@ _ms0=$(date +%s%3N 2>/dev/null || echo N)
 case "$_ms0" in
   *[!0-9]*) echo "SKIP [no ms-resolution date on this host] sub-second signal-return timing" ;;
   *)
-    trigger_daemon_wait c "$REAL_BACKSTOP" 5 60 probe_hit; rc=$?
+    trigger_daemon_wait c "$REAL_BACKSTOP" 5 60 "$NOSTALL" probe_hit; rc=$?
     _ms1=$(date +%s%3N)
     check "REAL sleep, ms-resolution: signal already present -> pass" 0 $rc
     _ms=$((_ms1 - _ms0))
