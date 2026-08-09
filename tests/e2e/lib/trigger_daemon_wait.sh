@@ -29,14 +29,49 @@
 # than mirroring it — see `trigger_daemon_watchdog_secs` below for which env
 # vars carry it and why both are needed.
 #
-# Callers get three distinguishable outcomes instead of one timeout:
-#   0 = evidence observed (pass immediately, no residual sleep)
-#   1 = backstop exhausted while the daemon kept ticking (NOT a frozen tick)
-#   2 = daemon stopped ticking (fail fast, name the wedge)
-#   3 = usage error
+# TICK LIVENESS IS NECESSARY BUT NOT SUFFICIENT — and that gap is the whole
+# reason this file needed a second signal. Decoupling delivery from the tick is
+# what makes `last_tick` trustworthy, but it is ALSO what makes a fresh
+# `last_tick` compatible with a delivery that is wedged forever: `tick()` never
+# awaits a delivery, so the heartbeat keeps advancing at full cadence while
+# `_delivery_worker` sits in an `await` that will never return. A watchdog
+# reading only the heartbeat therefore CANNOT fire on that wedge — it waits out
+# the whole backstop and then reports "still ticking", which is true and useless.
+# Elapsed wall-clock was the only thing that ever caught it, and a wall-clock cap
+# is exactly what reds a slow-but-healthy delivery.
 #
-# Offline-testable: health JSON is read through TRIGGER_DAEMON_HEALTH_CMD when
-# set, so the unit test drives it without Docker.
+# THE SECOND SIGNAL: THE DAEMON'S DURABLE ATTEMPT LOG. `schedule-history.json`
+# gains exactly one entry per FINISHED delivery attempt, and every terminal path
+# in scheduler.py writes one — `_commit` for fired / unknown / deferred / error,
+# and `check_watchdog`'s `_record_history` for a cancellation, each with a
+# machine-readable `cause`. Read at v0.2.3 (see
+# `trigger_daemon_scheduler_version_validated`), there is no path that finishes
+# an attempt without appending. That makes the log a TRUE forward-progress
+# signal for the delivery lane specifically:
+#
+#   - the tick loop cannot advance it (tick() only enqueues and writes health),
+#   - the cron cannot advance it (schedule-state.json advances every minute even
+#     while a fire is in-flight — `persisted[turn.name] = turn.scheduled_for`
+#     runs BEFORE the `_inflight` skip — so state is a cron signal, not a
+#     delivery signal, and is deliberately NOT part of the fingerprint),
+#   - a wedged delivery holding a connection open cannot advance it,
+#   - and a slow-but-healthy one DOES advance it, once per attempt.
+#
+# So the wait now fails on ABSENCE OF ADVANCEMENT, not on elapsed time: the
+# stall deadline is reset on every observed change, which means a delivery that
+# keeps finishing attempts can run arbitrarily long without ever tripping it.
+#
+# Callers get five distinguishable outcomes instead of one timeout:
+#   0 = evidence observed (pass immediately, no residual sleep)
+#   1 = backstop exhausted while BOTH signals kept advancing (not a wedge)
+#   2 = tick loop stopped (fail fast, name the wedge)
+#   3 = usage error
+#   4 = delivery lane stalled: ticking normally, but the attempt log has not
+#       advanced for the derived stall window (fail fast, name the lane)
+#
+# Offline-testable: health JSON is read through TRIGGER_DAEMON_HEALTH_CMD and the
+# attempt log through TRIGGER_DAEMON_PROGRESS_CMD when set, so the unit test
+# drives both without Docker.
 
 # Last heartbeat age observed by trigger_daemon_wait, in whole seconds ("" when
 # unreadable). Exported because it is a PUBLIC OUTPUT of this lib: callers put it
@@ -44,8 +79,26 @@
 # had been silent, rather than a bare "timed out".
 export TRIGGER_DAEMON_LAST_AGE="${TRIGGER_DAEMON_LAST_AGE:-}"
 
+# Delivery-lane progress accounting from the last trigger_daemon_wait. PUBLIC
+# OUTPUTS, and the ANTI-VACUOUS-PASS instrumentation: a run in which the stall
+# detector was never armed passes identically to one in which it was armed and
+# correct, so the caller must be able to assert it engaged and print the count.
+#
+#   TRIGGER_DAEMON_PROGRESS_SAMPLES     readable attempt-log reads (0 == the
+#                                       detector NEVER ARMED — treat as no proof)
+#   TRIGGER_DAEMON_PROGRESS_TRANSITIONS observed advancements of the attempt log
+#   TRIGGER_DAEMON_PROGRESS_AGE         seconds since the last advancement ("" if
+#                                       never armed)
+export TRIGGER_DAEMON_PROGRESS_SAMPLES="${TRIGGER_DAEMON_PROGRESS_SAMPLES:-0}"
+export TRIGGER_DAEMON_PROGRESS_TRANSITIONS="${TRIGGER_DAEMON_PROGRESS_TRANSITIONS:-0}"
+export TRIGGER_DAEMON_PROGRESS_AGE="${TRIGGER_DAEMON_PROGRESS_AGE:-}"
+
 # Path of the daemon heartbeat inside the workspace container.
 TRIGGER_DAEMON_HEALTH_PATH="${TRIGGER_DAEMON_HEALTH_PATH:-/configs/schedules/schedule-health.json}"
+
+# Path of the daemon's durable ATTEMPT LOG inside the workspace container — the
+# delivery-lane progress signal. scheduler.py HISTORY_FILENAME.
+TRIGGER_DAEMON_HISTORY_PATH="${TRIGGER_DAEMON_HISTORY_PATH:-/configs/schedules/schedule-history.json}"
 
 # Age of the last heartbeat in whole seconds, or "" when it is absent or
 # unreadable. Absent is deliberately NOT reported as stale: a daemon that has
@@ -78,27 +131,92 @@ except Exception:
 ' 2>/dev/null || printf ''
 }
 
-# trigger_daemon_wait <container> <backstop-secs> <poll-secs> <stale-secs> <probe-fn> [probe-args...]
+# A short, stable fingerprint of the daemon's durable ATTEMPT LOG, or "" when it
+# is absent or unreadable. Changes if and only if the delivery lane finished an
+# attempt (see the header): one entry per terminal outcome, appended by
+# `_commit` or by the watchdog's `_record_history`.
 #
-# Polls <probe-fn> for evidence. Between polls it checks the OWNING container's
-# heartbeat: a sibling daemon's health says nothing about the one that owns the
-# work (in the incident this was written for, two idle siblings ticked normally
-# while the owner was frozen).
+# Unreadable is deliberately NOT reported as "no progress", for the same reason
+# an absent heartbeat is not reported as a wedge: a workspace whose container is
+# briefly unexecable, or one that has simply not completed its first attempt
+# yet, is not a stalled lane. An empty fingerprint leaves the stall detector
+# UNARMED for that poll, and the caller can see that it was unarmed because
+# TRIGGER_DAEMON_PROGRESS_SAMPLES stays 0.
 #
-# Sets TRIGGER_DAEMON_LAST_AGE to the last observed age ("" if unreadable) so the
-# caller can put a real number in its failure message.
+# WHOLE-FILE, NOT PER-SCHEDULE, and that is the correct granularity rather than a
+# convenient one. A digest covering every schedule on the container could in
+# principle mask one wedged schedule behind another that keeps firing — except
+# that the daemon runs a SINGLE `_delivery_worker` awaiting a SINGLE `_active`
+# delivery, so a wedged delivery blocks the queue for every schedule at once. The
+# wedge is lane-wide by construction, so the lane-wide signal is the one that
+# matches it; filtering to one schedule's entries would only make the signal
+# sparser (one attempt per fire instead of N) without making it more specific.
+#
+# `cksum` rather than the raw file: the log grows to HISTORY_MAX=200 entries, so
+# comparing content directly would hold two multi-kilobyte strings in shell
+# variables on every poll for no gain. A collision would have to reproduce both
+# the byte count and the CRC of an append-only log whose entries carry
+# timestamps; the failure mode of a collision is one missed advancement, which
+# the next poll corrects.
+trigger_daemon_progress_digest() {
+  local container="${1:-}" blob
+  [ -n "$container" ] || { printf ''; return 0; }
+
+  if [ -n "${TRIGGER_DAEMON_PROGRESS_CMD:-}" ]; then
+    blob=$($TRIGGER_DAEMON_PROGRESS_CMD "$container" 2>/dev/null) || blob=""
+  else
+    blob=$(docker exec "$container" sh -c "cat $TRIGGER_DAEMON_HISTORY_PATH 2>/dev/null" 2>/dev/null) || blob=""
+  fi
+  [ -n "$blob" ] || { printf ''; return 0; }
+
+  printf '%s' "$blob" | cksum 2>/dev/null | tr -d ' \t\n' || printf ''
+}
+
+# trigger_daemon_wait <container> <backstop-secs> <poll-secs> <stale-secs> <stall-secs> <probe-fn> [probe-args...]
+#
+# Polls <probe-fn> for evidence. Between polls it checks TWO independent signals
+# on the OWNING container — a sibling daemon's state says nothing about the one
+# that owns the work (in the incident this was written for, two idle siblings
+# ticked normally while the owner was frozen):
+#
+#   TICK      last_tick advancement    -> rc=2 when silent for <stale-secs>
+#   DELIVERY  attempt-log advancement  -> rc=4 when silent for <stall-secs>
+#
+# Neither is a stopwatch on the work. Both deadlines are reset by OBSERVED
+# ADVANCEMENT, so a slow-but-progressing delivery is never cancelled by either,
+# however long it takes. <backstop-secs> is the only elapsed-time bound left and
+# it is a never-hit outermost net, not a budget.
+#
+# ORDER OF JUDGEMENT is deliberate and mirrors the daemon's own classifier: a
+# dead TICK is judged before a stalled DELIVERY, because a frozen tick loop
+# freezes the attempt log as a CONSEQUENCE — reporting that as a delivery stall
+# would name the symptom and hide the cause.
+#
+# Sets TRIGGER_DAEMON_LAST_AGE, TRIGGER_DAEMON_PROGRESS_AGE,
+# TRIGGER_DAEMON_PROGRESS_SAMPLES and TRIGGER_DAEMON_PROGRESS_TRANSITIONS so the
+# caller can put real numbers in its message AND assert the detector was armed.
 trigger_daemon_wait() {
-  local container="${1:-}" backstop="${2:-}" poll="${3:-}" stale="${4:-}" probe="${5:-}"
+  local container="${1:-}" backstop="${2:-}" poll="${3:-}" stale="${4:-}" stall="${5:-}" probe="${6:-}"
   TRIGGER_DAEMON_LAST_AGE=""
+  TRIGGER_DAEMON_PROGRESS_AGE=""
+  TRIGGER_DAEMON_PROGRESS_SAMPLES=0
+  TRIGGER_DAEMON_PROGRESS_TRANSITIONS=0
 
   case "$backstop" in ''|*[!0-9]*) return 3 ;; esac
   case "$poll" in ''|*[!0-9]*|0) return 3 ;; esac
   case "$stale" in ''|*[!0-9]*) return 3 ;; esac
+  # NO "off" VALUE. `0` is refused rather than treated as "stall detection
+  # disabled", because a disabled detector produces a run that is
+  # indistinguishable from an armed-and-correct one — the vacuous pass this
+  # lib's own instrumentation exists to make visible. A caller that cannot name
+  # a window has to fail, not silently opt out of the only signal that catches a
+  # wedged delivery under a healthy heartbeat.
+  case "$stall" in ''|*[!0-9]*|0) return 3 ;; esac
   [ -n "$container" ] || return 3
   [ -n "$probe" ] || return 3
-  shift 5
+  shift 6
 
-  local waited=0 age
+  local waited=0 age digest last_digest="" since_progress=0
   while true; do
     if "$probe" "$@"; then
       return 0
@@ -110,19 +228,133 @@ trigger_daemon_wait() {
       return 2
     fi
 
+    digest=$(trigger_daemon_progress_digest "$container")
+    if [ -n "$digest" ]; then
+      TRIGGER_DAEMON_PROGRESS_SAMPLES=$((TRIGGER_DAEMON_PROGRESS_SAMPLES + 1))
+      if [ "$digest" != "$last_digest" ]; then
+        # The FIRST readable digest is a baseline, not an advancement: there is
+        # nothing before it to have advanced from. Counting it would inflate the
+        # transition count that callers assert on, which is the one number that
+        # distinguishes "the lane moved" from "the detector merely ran".
+        #
+        # An `if` rather than `[ ... ] && assign`: on the first digest the test
+        # is false, so the `&&` list would carry exit status 1. Every current
+        # call site spells `trigger_daemon_wait ... || rc=$?`, which suspends the
+        # caller's errexit for the whole body and makes that harmless — but the
+        # harness runs `set -euo pipefail` AND is invoked by Gitea Actions as
+        # `bash --noprofile --norc -e -o pipefail`, so a future call site that
+        # drops the `||` would kill the run inside this loop with no message at
+        # all. Not worth leaving to a convention nobody can see from here.
+        if [ -n "$last_digest" ]; then
+          TRIGGER_DAEMON_PROGRESS_TRANSITIONS=$((TRIGGER_DAEMON_PROGRESS_TRANSITIONS + 1))
+        fi
+        last_digest="$digest"
+        since_progress=0
+      fi
+      TRIGGER_DAEMON_PROGRESS_AGE="$since_progress"
+      if [ "$since_progress" -gt "$stall" ]; then
+        return 4
+      fi
+    fi
+
     [ "$waited" -ge "$backstop" ] && return 1
 
     sleep "$poll"
     waited=$((waited + poll))
+    since_progress=$((since_progress + poll))
   done
 }
 
-# The stale threshold: enough missed polls that a loaded box never trips it,
-# short enough to fail in about a minute instead of the whole backstop.
+# ─── the two intervals every threshold below is derived from ─────────────────
+#
+# Both are CONFIGURED BY THIS HARNESS, which is what makes deriving from them
+# honest rather than a guess about somebody else's default.
+
+# The daemon's own tick cadence, in seconds. scheduler.py `_poll_seconds()` reads
+# MOLECULE_TRIGGER_POLL_SECONDS (default 30, floor 1) and the harness injects it
+# at provision — see `trigger_daemon_delivery_cap_env`, which emits it from here
+# so the value the daemon runs and the value the thresholds are derived from
+# cannot be two different numbers.
+trigger_daemon_tick_interval_secs() {
+  local tick="${TRIGGER_DAEMON_TICK_INTERVAL_SECS:-10}"
+  case "$tick" in ''|*[!0-9]*|0) tick=10 ;; esac
+  printf '%s' "$tick"
+}
+
+# The cron the harness writes on its own probe schedules. Single SSOT so the
+# expression sent to the API and the interval every bound is derived from cannot
+# drift — the whole failure being fixed is a number that stopped matching the
+# thing it was supposed to describe.
+trigger_daemon_probe_cron() {
+  printf '%s' "${TRIGGER_DAEMON_PROBE_CRON:-* * * * *}"
+}
+
+# trigger_daemon_fire_interval_secs [cron]
+#
+# How often the probe schedule fires, in seconds, derived from its cron. This is
+# the system's own statement of how much time one delivery is allotted: the
+# daemon refuses to re-enqueue a schedule that is still in flight
+# (`if turn.name in self._inflight: continue`), so a delivery that outlives one
+# fire interval has already caused the lane to SKIP a fire. That makes the fire
+# interval — not a stopwatch reading — the natural unit for every delivery bound.
+#
+# Only the shapes the harness actually writes are accepted (`*` and `*/N` in the
+# minute field, remaining fields all `*`). Anything else is REFUSED with rc=3 and
+# nothing on stdout, rather than silently defaulting: a bound derived from a
+# misparsed cron is precisely the "number that describes nothing" this file
+# exists to eliminate, and a wrong derivation is worse than a loud refusal.
+#
+# shellcheck disable=SC2120
+#   The argument IS optional and IS passed — by lib/test_trigger_daemon_wait_unit.sh,
+#   which shellcheck lints as a separate file and so cannot see. The usual way to
+#   tell shellcheck an argument is optional is `${1:-default}`, and that is exactly
+#   the form this function must NOT use: `:-` would substitute the default for an
+#   argument supplied as the EMPTY STRING, and refusing that case is an assertion
+#   with a test behind it (a caller that thinks it has a cron and does not must get
+#   rc=3, not a 60s interval invented on its behalf).
+trigger_daemon_fire_interval_secs() {
+  # `${1-...}`, not `${1:-...}`: an OMITTED argument takes the configured probe
+  # cron, but an argument supplied as the empty string is a caller that thinks it
+  # has a cron and does not. Defaulting that would hand back a 60s interval for a
+  # schedule nobody described.
+  local cron minute rest
+  cron="${1-$(trigger_daemon_probe_cron)}"
+  minute="${cron%% *}"
+  rest="${cron#* }"
+  [ "$rest" = "* * * *" ] || return 3
+  case "$minute" in
+    '*') printf '%s' 60; return 0 ;;
+    '*/'*)
+      local n="${minute#*/}"
+      case "$n" in ''|*[!0-9]*|0) return 3 ;; esac
+      [ "$n" -le 59 ] || return 3
+      printf '%s' "$((n * 60))"; return 0 ;;
+  esac
+  return 3
+}
+
+# ─── TICK-WEDGE threshold: absence of tick-sequence advancement ──────────────
+#
+# trigger_daemon_stale_secs [observation-poll-secs]
+#
+# Derived from the DAEMON'S tick interval, not from the harness's observation
+# poll. That distinction is the bug: both defaulted to 10 in CI, so 6 x poll
+# happened to equal 6 x tick and the threshold looked correct — but they are two
+# independent knobs (E2E_SCHEDULER_POLL_SECS vs E2E_TRIGGER_POLL_SECONDS). Raise
+# the DAEMON's poll to 120s, a supported configuration, and a threshold derived
+# from the observation poll stays 60s: every wait then returns rc=2 "the trigger
+# daemon STOPPED TICKING" against a daemon that is ticking exactly as configured.
+# A false positive by construction, waiting on a knob nobody had reason to think
+# was load-bearing.
+#
+# Six missed ticks, so a loaded box never trips it, floored by three observation
+# polls (we cannot conclude anything from fewer reads than that) and by 60s.
 trigger_daemon_stale_secs() {
-  local poll="${1:-10}" stale
+  local poll="${1:-10}" tick stale
   case "$poll" in ''|*[!0-9]*|0) poll=10 ;; esac
-  stale=$((poll * 6))
+  tick=$(trigger_daemon_tick_interval_secs)
+  stale=$((tick * 6))
+  [ "$stale" -ge $((poll * 3)) ] || stale=$((poll * 3))
   [ "$stale" -ge 60 ] || stale=60
   printf '%s' "$stale"
 }
@@ -170,24 +402,53 @@ trigger_daemon_stale_secs() {
 # guess about somebody else's default: the harness owns the workspace env, so it
 # does not have to track the daemon's shipped cap — it sets it.
 #
-# THE DEFAULT, 600s, is chosen against measured delivery latency, not taste.
-# Across seven consecutive green ephemeral-happy-path runs on 2026-08-09 the
-# 10g DELIVER marker was already present within 0.05-0.15s of the fire being
-# observed, and the whole cron-boundary -> fire -> turn -> `notify` -> activity
-# row chain completed within 18.7s to 47.7s of the minute boundary — a bound
-# that already includes up to 10s of daemon poll lag and up to 10s of the
-# harness's own observation poll, so the true delivery is shorter still. 600s is
-# ~12.6x the WORST of those, satisfying this repo's ~10x margin rule, and it is
-# what keeps a shrunken cap from re-creating the v0.2.2 incident by
-# configuration: a cap under the real delivery time cancels every delivery and
-# the schedule never advances.
+# THE DEFAULT IS DERIVED, NOT TYPED. It is the repo's ~10x margin rule applied
+# to the system's own fire interval:
 #
-# It also derives exactly the 1800s backstop the harness already runs, so this
-# change costs no CI wall-clock and no job budget — what changes is that 1800
-# now strictly exceeds the REAL cap instead of a retired env var's nominal value.
+#     cap = TRIGGER_DAEMON_CAP_FIRE_MULTIPLE x trigger_daemon_fire_interval_secs
+#         = 10 x 60s = 600s at the harness's `* * * * *` probe cron
+#
+# WHY THE FIRE INTERVAL IS THE RIGHT BASE UNIT. It is not a proxy for delivery
+# latency; it is the system's own declaration of how much time one delivery is
+# allotted, enforced by the daemon: a schedule still in flight when its next fire
+# comes due is skipped rather than re-enqueued, so outliving one fire interval is
+# already, mechanically, falling behind. A cap expressed as "N fire intervals"
+# therefore says something about the lane, and it re-derives itself if the probe
+# cadence ever changes — where a literal 600 would quietly become 1/5 of a cycle
+# against a `*/5 * * * *` probe and nobody would notice until it cancelled every
+# delivery.
+#
+# WHY THE MULTIPLE IS 10 AND WHY IT IS NOT A RETUNABLE LITERAL. 10 is this
+# repo's standing margin rule, and it is dimensionless: it survives every change
+# to the intervals, which is exactly the property the old 600 lacked. The
+# measurement corroborates the unit rather than setting the number — across seven
+# consecutive green ephemeral-happy-path runs on 2026-08-09 the whole cron
+# boundary -> fire -> turn -> `notify` -> activity row chain completed 18.7s to
+# 47.7s after the minute boundary, i.e. 0.31 to 0.79 of ONE fire interval. Real
+# deliveries do fit inside a single cycle, which is what makes the cycle a
+# meaningful unit; the 10x margin is then the usual headroom on top.
+#
+# The derivation reproduces exactly the 600 that was previously chosen by
+# measurement, so this costs no CI wall-clock and no job budget. What changes is
+# that the number now follows the configuration instead of having to be found
+# and re-tuned by hand when the configuration moves.
+#
+# A cap UNDER the real delivery time cancels every delivery and the schedule
+# never advances — the v0.2.2 incident, reproduced by configuration. That is what
+# the 60s floor below defends.
+TRIGGER_DAEMON_CAP_FIRE_MULTIPLE="${TRIGGER_DAEMON_CAP_FIRE_MULTIPLE:-10}"
+
 trigger_daemon_watchdog_secs() {
-  local watchdog="${TRIGGER_DAEMON_WATCHDOG_SECS:-600}"
-  case "$watchdog" in ''|*[!0-9]*|0) watchdog=600 ;; esac
+  local derived watchdog
+  # A cron this lib cannot parse must not silently produce a bound. The refusal
+  # propagates: fire_interval rc=3 -> empty -> the default branch below is a
+  # non-numeric, which falls through to... nothing safe. So refuse loudly here
+  # too rather than invent a number.
+  derived=$(trigger_daemon_fire_interval_secs) || return 3
+  case "$TRIGGER_DAEMON_CAP_FIRE_MULTIPLE" in ''|*[!0-9]*|0) return 3 ;; esac
+  derived=$((derived * TRIGGER_DAEMON_CAP_FIRE_MULTIPLE))
+  watchdog="${TRIGGER_DAEMON_WATCHDOG_SECS:-$derived}"
+  case "$watchdog" in ''|*[!0-9]*|0) watchdog="$derived" ;; esac
   # FLOOR. `0` and garbage already fell back to the default; a positive-but-
   # absurd value did not, and it had three consequences, all of them a guard
   # that passes while measuring against a declared lie:
@@ -230,11 +491,55 @@ trigger_daemon_watchdog_secs() {
 # turn past the idle cap, since the cap is now below the TTL — reaching that
 # needs 900s of runtime-event silence, which every other budget in this harness
 # (a 90s A2A turn, a 360s idle digest) already calls a hard failure.
+#
+# MOLECULE_TRIGGER_POLL_SECONDS rides along for the same reason: the tick-wedge
+# threshold is derived from the daemon's tick cadence, so the cadence the daemon
+# actually runs and the one the threshold is computed from must be one value
+# emitted once. It used to be typed at the provision site while the threshold was
+# derived from a DIFFERENT knob entirely (the harness's observation poll) — two
+# numbers that agreed only by coincidence at their defaults.
 trigger_daemon_delivery_cap_env() {
-  local cap
-  cap=$(trigger_daemon_watchdog_secs)
+  local cap tick
+  cap=$(trigger_daemon_watchdog_secs) || return 3
+  tick=$(trigger_daemon_tick_interval_secs)
   printf 'MOLECULE_TRIGGER_DELIVERY_ABSOLUTE_CAP_SECONDS=%s\n' "$cap"
   printf 'MOLECULE_MAX_TURN_SECONDS=%s\n' "$cap"
+  printf 'MOLECULE_TRIGGER_POLL_SECONDS=%s\n' "$tick"
+}
+
+# ─── DELIVERY-STALL threshold: absence of attempt-log advancement ────────────
+#
+# trigger_daemon_progress_stall_secs [observation-poll-secs]
+#
+# How long the daemon's attempt log may stay frozen before the delivery lane is
+# declared stalled. This is NOT a budget for the work: it is reset by every
+# observed advancement, so a lane that keeps finishing attempts never approaches
+# it however long the run lasts.
+#
+# It is sized so that the DAEMON always gets first crack at its own wedge, which
+# is the correct nesting for any two timeouts on one path — the inner one must be
+# able to fire, act, and have its effect OBSERVED before the outer one gives up:
+#
+#     stall = cap                     the daemon's own absolute cancel bound
+#           + fire_interval           slack so a cancel landing just after a tick
+#                                     boundary is still inside the window
+#           + tick_interval           up to one tick before check_watchdog runs
+#           + observation_poll        up to one harness poll before we see the
+#                                     history entry the cancellation wrote
+#
+# At defaults: 600 + 60 + 10 + 10 = 680s. Every term is a configured interval, so
+# the ordering cap < stall holds by construction rather than by arithmetic luck —
+# there is no pair of settings under which the harness can declare a stall before
+# the daemon has had the chance to cancel and re-queue. That is the exact
+# inversion the 210-vs-600 pair had, in the opposite direction: there the OUTER
+# bound cut first and the inner one it existed to accommodate was unreachable.
+trigger_daemon_progress_stall_secs() {
+  local poll="${1:-10}" cap fire tick
+  case "$poll" in ''|*[!0-9]*|0) poll=10 ;; esac
+  cap=$(trigger_daemon_watchdog_secs) || return 3
+  fire=$(trigger_daemon_fire_interval_secs) || return 3
+  tick=$(trigger_daemon_tick_interval_secs)
+  printf '%s' "$((cap + fire + tick + poll))"
 }
 
 # The scheduler tag whose source the two env names and the four-branch model
@@ -257,7 +562,9 @@ trigger_daemon_scheduler_version_validated() {
 # observe a recovery. 3x leaves room for the cancel AND at least two full retry
 # cycles inside the wait.
 trigger_daemon_backstop_secs() {
-  printf '%s' $(( $(trigger_daemon_watchdog_secs) * 3 ))
+  local cap
+  cap=$(trigger_daemon_watchdog_secs) || return 3
+  printf '%s' "$((cap * 3))"
 }
 
 # trigger_daemon_backstop_resolve [operator-override-secs]
@@ -283,7 +590,7 @@ trigger_daemon_backstop_secs() {
 # the recovery it is supposed to be able to see is still unobservable.
 trigger_daemon_backstop_resolve() {
   local override="${1:-}" watchdog
-  watchdog=$(trigger_daemon_watchdog_secs)
+  watchdog=$(trigger_daemon_watchdog_secs) || return 3
 
   if [ -z "$override" ]; then
     trigger_daemon_backstop_secs
@@ -293,6 +600,145 @@ trigger_daemon_backstop_resolve() {
   case "$override" in *[!0-9]*) return 3 ;; esac
   [ "$override" -gt "$watchdog" ] || return 3
   printf '%s' "$override"
+}
+
+# ─── the timeout inventory, and the proof that every entry can be REACHED ────
+#
+# The 210-vs-600 defect was not a wrong number. It was an ORDERING defect that no
+# reader could see, because the two bounds lived in different files and nothing
+# ever compared them: the outer bound (a 210s DELIVER backstop, sized as "about
+# three fire cycles plus slack") expired before the inner one (a 600s delivery
+# cancel) could fire, so the retry the backstop existed to accommodate was
+# unreachable — the extra fire cycles it was bought to allow were exactly what
+# its own literal cut off. A timeout that cannot be reached is not a safety net;
+# it is dead code shaped like one, and it reads as deliberate forever.
+#
+# So the inventory is DATA, and the ordering is ASSERTED. Every bound on the
+# trigger delivery path is listed here with its owner and its disposition, and
+# `trigger_daemon_timeout_ordering_check` refuses any arrangement in which a
+# bound cannot be reached. Adding a timeout to this path without adding it here
+# is the one failure this cannot catch, which is why the unit test also greps the
+# pinned daemon source for cap-shaped env names.
+#
+# DISPOSITIONS. Exactly two are legal:
+#   reachable        nothing on the path cuts before it, so it can actually fire.
+#   subsumed-by:NAME a strictly TIGHTER bound at the same layer always fires
+#                    first, so this one is unreachable ON THIS PATH by design.
+#                    Legal only when the named subsumer is strictly SMALLER —
+#                    which makes it the opposite of the 210 defect, where a
+#                    LARGER outer bound was cut off by a SMALLER one it was
+#                    supposed to contain.
+#
+# The one subsumed entry is the runtime's 900s idle TTL. On the delivery path
+# `classify_delivery_liveness` tests `absolute_cap_exceeded` BEFORE `idle_expired`
+# (read at the validated pin), and `idle_seconds <= turn_age_seconds` always
+# holds, so idle > 900 implies turn_age > 900 > cap: `CAUSE_IDLE` can never be
+# the verdict while the injected cap is below the TTL. That is intentional — the
+# absolute cap is the tighter, un-bypassable bound and the harness has no
+# business retuning a runtime-wide idle policy — but it must be DECLARED, not
+# assumed, or a future reader counts CAUSE_IDLE as live protection it does not
+# have. If someone raises the cap above the TTL the subsumption inverts, the
+# check below fails, and the re-read is forced.
+#
+# THE ONE BOUND THIS LEDGER DOES NOT MODEL is the CI job timeout, and it is
+# named here rather than left off the list, because "a bound nobody enumerated"
+# is how the 210 survived. `.gitea/workflows/e2e-ephemeral-happy-path.yml` sets
+# `timeout-minutes: 75` (4500s), which is the true outermost layer: if it were
+# ever below the 1800s backstop, the backstop would be unreachable and every
+# derived number below it would be decoration.
+#
+# It is not a ledger ROW because making it one honestly would mean each lane
+# passing its own `timeout-minutes` in as env, and there is more than one lane
+# running this harness — a row wired from a single workflow would assert the
+# bound for one lane and silently assert NOTHING for the others, which is a
+# guard that looks like it covers the path and does not. The inequality that
+# holds today: at most ONE backstop is reachable per run (every leg `fail`s
+# rather than continuing, so reaching a later backstop means the earlier legs
+# returned on their signal in seconds), so worst case is 1800s of backstop
+# inside 4500s of job. Anyone shortening `timeout-minutes` below ~2x the
+# backstop must revisit this.
+#
+# Read at the validated scheduler pin; the runtime constant is
+# molecule_runtime/turn_lease.py `_DEFAULT_IDLE_CAP_SECONDS`.
+TRIGGER_DAEMON_RUNTIME_IDLE_TTL_SECS="${TRIGGER_DAEMON_RUNTIME_IDLE_TTL_SECS:-900}"
+
+# trigger_daemon_timeout_ledger [observation-poll-secs]
+#
+# One row per bound, in the order they sit on the path, as
+#   name|seconds|owner|disposition
+trigger_daemon_timeout_ledger() {
+  local poll="${1:-10}" tick stale cap stall backstop
+  case "$poll" in ''|*[!0-9]*|0) poll=10 ;; esac
+  tick=$(trigger_daemon_tick_interval_secs)
+  stale=$(trigger_daemon_stale_secs "$poll")
+  cap=$(trigger_daemon_watchdog_secs) || return 3
+  stall=$(trigger_daemon_progress_stall_secs "$poll") || return 3
+  backstop=$(trigger_daemon_backstop_secs) || return 3
+
+  printf 'daemon_tick_interval|%s|daemon|reachable\n' "$tick"
+  printf 'harness_tick_wedge|%s|harness|reachable\n' "$stale"
+  printf 'delivery_absolute_cap|%s|daemon+runtime|reachable\n' "$cap"
+  printf 'runtime_idle_ttl|%s|runtime|subsumed-by:delivery_absolute_cap\n' "$TRIGGER_DAEMON_RUNTIME_IDLE_TTL_SECS"
+  printf 'harness_delivery_stall|%s|harness|reachable\n' "$stall"
+  printf 'harness_backstop|%s|harness|reachable\n' "$backstop"
+}
+
+# trigger_daemon_timeout_ordering_check [observation-poll-secs]
+#
+# rc=0 when every ledger entry can be reached; rc=1 otherwise, with the offending
+# rows on stdout. Deliberately does NOT use `set -e`-dependent control flow: this
+# is called from a harness that runs under errexit from its Gitea Actions
+# invocation (`bash --noprofile --norc -e -o pipefail`), where a non-zero
+# intermediate would kill the caller before it could print the diagnosis. Every
+# failure here accumulates into a report and comes back as one rc.
+trigger_daemon_timeout_ordering_check() {
+  local poll="${1:-10}" ledger rc=0 prev_name="" prev_secs=0 name secs owner disp sub sub_secs
+
+  ledger=$(trigger_daemon_timeout_ledger "$poll") || {
+    printf 'timeout-ledger: could not be computed (a bound refused to derive)\n'
+    return 1
+  }
+
+  while IFS='|' read -r name secs owner disp; do
+    [ -n "$name" ] || continue
+    case "$secs" in ''|*[!0-9]*|0)
+      printf 'timeout-ledger: %s has a non-positive/non-numeric bound %s\n' "$name" "$secs"
+      rc=1; continue ;;
+    esac
+    case "$disp" in
+      reachable)
+        # Reachable bounds must be STRICTLY increasing along the path. Equality
+        # is not good enough: two bounds that expire at the same instant race,
+        # and the outer one wins often enough that the inner is unreachable in
+        # practice while looking fine in the inventory.
+        if [ -n "$prev_name" ] && [ "$secs" -le "$prev_secs" ]; then
+          printf 'timeout-ledger: %s (%ss, %s) is not STRICTLY greater than the bound before it, %s (%ss) — the inner bound can never fire; this is the 210-vs-600 inversion\n' \
+            "$name" "$secs" "$owner" "$prev_name" "$prev_secs"
+          rc=1
+        fi
+        prev_name="$name"; prev_secs="$secs"
+        ;;
+      subsumed-by:*)
+        sub="${disp#subsumed-by:}"
+        sub_secs=$(printf '%s\n' "$ledger" | awk -F'|' -v n="$sub" '$1==n{print $2}')
+        if [ -z "$sub_secs" ]; then
+          printf 'timeout-ledger: %s claims to be subsumed by %s, which is not in the ledger\n' "$name" "$sub"
+          rc=1
+        elif [ "$sub_secs" -ge "$secs" ]; then
+          printf 'timeout-ledger: %s (%ss) claims to be subsumed by %s (%ss), but the subsumer is NOT strictly tighter — %s is now reachable and its disposition is a lie\n' \
+            "$name" "$secs" "$sub" "$sub_secs" "$name"
+          rc=1
+        fi
+        ;;
+      *)
+        printf 'timeout-ledger: %s has disposition %q — only "reachable" or "subsumed-by:NAME" are legal, so a bound nobody classified cannot slip onto the path\n' "$name" "$disp"
+        rc=1
+        ;;
+    esac
+  done <<EOF
+$ledger
+EOF
+  return "$rc"
 }
 
 # ─── the grid-landing wait is deliberately NOT a trigger_daemon_wait ─────────
