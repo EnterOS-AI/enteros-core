@@ -857,6 +857,24 @@ def detect_noop_gate(doc: dict, job_key: str) -> list[str]:
 # --------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------
+def _step_summary(markdown: str) -> None:
+    """Also surface a message in the run-summary UI, not only in the log.
+
+    A failed step's log is collapsed by default; the run summary is what an
+    operator sees first. "Unmistakable" has to mean unmistakable BEFORE
+    anyone expands a log — that is the difference between reading
+    `LINT DID NOT RUN` and spending an hour hunting a workflow defect that
+    does not exist. Best-effort: never let reporting break the verdict."""
+    dest = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not dest:
+        return
+    try:
+        with open(dest, "a", encoding="utf-8") as fh:
+            fh.write(markdown.rstrip() + "\n")
+    except OSError as exc:  # pragma: no cover - reporting must never throw
+        sys.stderr.write(f"::warning::could not write step summary: {exc}\n")
+
+
 def run() -> int:
     """Main lint entrypoint. Returns the process exit code.
 
@@ -937,6 +955,27 @@ def run() -> int:
             f"::error::lint-required-no-paths: DID NOT RUN — "
             f"{GITEA_HOST} unreachable after {e.attempts} attempts. "
             f"NOT a compliance failure.\n"
+        )
+        _step_summary(
+            "## ⚠ lint-required-no-paths — **THE LINT DID NOT RUN**\n\n"
+            "**This is NOT a compliance finding. No workflow is "
+            "non-compliant. Do not go looking for one.**\n\n"
+            f"`GET {protection_path}` against `{GITEA_HOST}` failed "
+            f"transiently on all {e.attempts} attempt(s) (last: "
+            + (f"HTTP {e.last_status}" if e.last_status else "transport error")
+            + "). Runners reach Gitea through Cloudflare, where 502/52x and "
+            "connection resets are self-clearing.\n\n"
+            "**ZERO workflow files were inspected** — the lint never got far "
+            "enough to look at any of them.\n\n"
+            "| exit | meaning | what to do |\n"
+            "|---|---|---|\n"
+            "| 1 | a required workflow really does carry a paths filter | "
+            "fix the workflow |\n"
+            "| 4 | the API answered and its answer blocks verification | "
+            "fix the token / the SSOT |\n"
+            "| **5** | **the API never answered — you are here** | "
+            "**re-run the job; if it persists the Gitea/Cloudflare edge is "
+            "down** |\n"
         )
         return 5
     except ApiError as e:

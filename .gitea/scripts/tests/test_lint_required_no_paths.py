@@ -504,6 +504,47 @@ class TestUnreachableIsNotNonCompliance:
         assert "retrying in" not in log
         assert "UNREACHABLE" not in log and "LINT DID NOT RUN" not in log
 
+    def test_the_did_not_run_banner_also_lands_in_the_run_summary(
+        self, api_env, monkeypatch, capsys, tmp_path
+    ):
+        """A failed step's log is collapsed by default; the run summary is
+        what an operator sees FIRST. 'Unmistakable' has to hold before
+        anyone expands a log."""
+        summary = tmp_path / "summary.md"
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+        rc, _, _ = self._run(monkeypatch, ["502"], capsys)
+        assert rc == 5
+        md = summary.read_text(encoding="utf-8")
+        assert "THE LINT DID NOT RUN" in md
+        assert "NOT a compliance finding" in md
+        assert "ZERO workflow files were inspected" in md
+        assert "the API never answered" in md
+
+    def test_a_broken_step_summary_never_changes_the_verdict(
+        self, api_env, monkeypatch, capsys, tmp_path
+    ):
+        """Reporting must never be able to turn a verdict into something
+        else — including into a traceback exiting 1."""
+        monkeypatch.setenv(
+            "GITHUB_STEP_SUMMARY", str(tmp_path / "no" / "such" / "dir" / "s.md")
+        )
+        rc, log, _ = self._run(monkeypatch, ["502"], capsys)
+        assert rc == 5
+        assert "LINT DID NOT RUN" in log
+        assert "Traceback" not in log
+
+    def test_a_clean_run_writes_no_did_not_run_summary(
+        self, api_env, monkeypatch, capsys, tmp_path
+    ):
+        """Negative control: the banner must not appear when the lint ran."""
+        summary = tmp_path / "summary.md"
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+        rc, _, _ = self._run(monkeypatch, ["502", "ok"], capsys)
+        assert rc == 0
+        assert not summary.exists() or "DID NOT RUN" not in summary.read_text(
+            encoding="utf-8"
+        )
+
     def test_404_still_degrades_gracefully_without_retrying(
         self, api_env, monkeypatch, capsys
     ):
