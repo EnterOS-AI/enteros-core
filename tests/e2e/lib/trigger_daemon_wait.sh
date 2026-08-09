@@ -680,16 +680,28 @@ trigger_daemon_backstop_resolve() {
 # ever below the 1800s backstop, the backstop would be unreachable and every
 # derived number below it would be decoration.
 #
-# It is not a ledger ROW because making it one honestly would mean each lane
-# passing its own `timeout-minutes` in as env, and there is more than one lane
-# running this harness — a row wired from a single workflow would assert the
-# bound for one lane and silently assert NOTHING for the others, which is a
-# guard that looks like it covers the path and does not. The inequality that
-# holds today: at most ONE backstop is reachable per run (every leg `fail`s
-# rather than continuing, so reaching a later backstop means the earlier legs
-# returned on their signal in seconds), so worst case is 1800s of backstop
-# inside 4500s of job. Anyone shortening `timeout-minutes` below ~2x the
-# backstop must revisit this.
+# It is not a ledger ROW, and the reason is the CALLER SET, which is worth
+# stating exactly because an earlier version of this comment got it wrong. This
+# harness has exactly TWO invocations:
+#
+#   tests/e2e/ephemeral_cp_happy_path.sh   `bash "$HERE/test_staging_full_saas.sh"`
+#     — the ONE CI lane, run by .gitea/workflows/e2e-ephemeral-happy-path.yml
+#       at `timeout-minutes: 75`.
+#   tests/e2e/STAGING_SAAS_E2E.md          `bash tests/e2e/test_staging_full_saas.sh`
+#     — the manual runbook, run by a human at a terminal, with NO timeout at all.
+#
+# So a `timeout-minutes`-derived row would assert a real bound under CI and be
+# silently ABSENT under the runbook — a ledger row that is present in one context
+# and missing in the other is worse than no row, because the check would still
+# report a full green while covering one caller. (The earlier wording said "more
+# than one lane", which suggested several CI lanes disagreeing; the real split is
+# CI-vs-human, and it is a stronger reason.)
+#
+# The inequality that holds today: at most ONE backstop is reachable per run
+# (every leg `fail`s rather than continuing, so reaching a later backstop means
+# the earlier legs returned on their signal in seconds), so worst case is 1800s
+# of backstop inside 4500s of job. Anyone shortening `timeout-minutes` below ~2x
+# the backstop must revisit this.
 #
 # Read at the validated scheduler pin; the runtime constant is
 # molecule_runtime/turn_lease.py `_DEFAULT_IDLE_CAP_SECONDS`.
