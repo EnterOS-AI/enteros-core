@@ -400,11 +400,33 @@ func TestMCPSurface_StickinessCannotInventCorroboration(t *testing.T) {
 	disp, n := dispatchSet("mcp__molecule__send_message_to_user")
 
 	empty := mcpSurfaceReport{} // e.g. a pre-sticky document, or a parse miss
-	for name, prior := range map[string]*mcpSurfaceReport{"nil prior": nil, "empty union": &empty} {
+
+	// The discriminating prior: a workspace that has been ADVERTISING the
+	// management namespace for beats on end and has never once dispatched it —
+	// exactly the fleet's normal state. Only CorroboratedNamespaces may be
+	// carried forward. Seeding the union from any other field (ReportedNamespaces
+	// is the tempting one, and it sits right beside it in the struct) would
+	// auto-corroborate every advertised namespace on the second beat and turn the
+	// whole record into a constant TRUE. An all-empty prior cannot catch that;
+	// this one can.
+	advertisedNeverDispatched := mcpSurfaceReport{
+		ReportedNamespaces:     []string{"molecule_platform"},
+		DispatchedNamespaces:   []string{"molecule"},
+		CorroboratedNamespaces: []string{},
+	}
+
+	for name, prior := range map[string]*mcpSurfaceReport{
+		"nil prior":                       nil,
+		"empty union":                     &empty,
+		"advertised but never dispatched": &advertisedNeverDispatched,
+	} {
 		got := classifyMCPSurface(reported, disp, n, prior, time.Now())
 		if got.Verdict != verdictNotYetExercised {
-			t.Errorf("%s: verdict = %q, want %q — a prior record must not be able to mint corroboration",
+			t.Errorf("%s: verdict = %q, want %q — a prior record may only carry CORROBORATION forward, never manufacture it",
 				name, got.Verdict, verdictNotYetExercised)
+		}
+		if got.DispatchCorroboratedCount != 0 {
+			t.Errorf("%s: dispatch_corroborated_count = %d, want 0", name, got.DispatchCorroboratedCount)
 		}
 		if got.FirstCorroboratedAt != nil {
 			t.Errorf("%s: first_corroborated_at set without corroboration", name)
