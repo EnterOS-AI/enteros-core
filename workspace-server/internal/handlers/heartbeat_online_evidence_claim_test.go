@@ -89,7 +89,6 @@ func TestOnlineEvidence_LabelsAreStrengthPrefixedAndDistinct(t *testing.T) {
 		// vocabulary. It is admitted here on the SAME terms as the others: it
 		// must carry its strength in the string and must not read as proof.
 		evidenceDispatchObservedMCPSurface,
-		evidenceSelfReportContradicted,
 	}
 
 	// "dispatch_observed:" = core's own turn record shows the model dispatched
@@ -154,11 +153,11 @@ func TestOnlineEvidence_NamesTheStrongestSelfReport(t *testing.T) {
 		// on its own (the "neither" rows below stay empty whatever the verdict).
 		{"corroborated upgrades the label", true, false, verdictCorroborated, evidenceDispatchObservedMCPSurface},
 		{"corroborated upgrades the back-compat arm too", false, true, verdictCorroborated, evidenceDispatchObservedMCPSurface},
-		{"contradicted downgrades the label", true, false, verdictContradicted, evidenceSelfReportContradicted},
+		{"not-yet-exercised changes nothing", true, false, verdictNotYetExercised, evidenceSelfReportMCPToolsReady},
 		{"unknown:no_dispatch_record changes nothing", true, false, verdictNoDispatchRecord, evidenceSelfReportMCPToolsReady},
 		{"unknown:no_inventory changes nothing", false, true, verdictNoInventory, evidenceSelfReportLoadedMCPTools},
 		{"corroborated cannot mint a label from nothing", false, false, verdictCorroborated, ""},
-		{"contradicted cannot mint a label from nothing", false, false, verdictContradicted, ""},
+		{"not-yet-exercised cannot mint a label from nothing", false, false, verdictNotYetExercised, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

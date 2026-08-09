@@ -9,17 +9,27 @@
 -- summaries) — tool ids emitted by the model's dispatcher, which no enumeration
 -- probe can synthesise.
 --
--- Shape (handlers.mcpSurfaceReport):
+-- Shape (handlers.mcpSurfaceReport). Namespaces are CANONICAL — folded through
+-- the same [^A-Za-z0-9_] -> _ transform hermes applies, mirroring the runtime's
+-- canonical_tool_id — so the hyphenated inventory and the underscored dispatch
+-- ids compare as the same namespace:
 --   {
 --     "reported_count": 54,
 --     "dispatch_corroborated_count": 0,
 --     "advertised_only_count": 54,
---     "reported_namespaces": ["molecule-platform"],
+--     "reported_namespaces": ["molecule_platform"],
 --     "dispatched_namespaces": ["molecule"],
+--     "corroborated_namespaces": ["molecule"],
 --     "dispatch_records": 504,
---     "verdict": "contradicted:dispatch_uses_only_other_namespaces",
+--     "verdict": "unknown:advertised_not_yet_exercised",
 --     "observed_at": "2026-08-09T00:00:00Z"
 --   }
+--
+-- Every verdict is either an observation ("dispatch_observed:") or an admission
+-- of ignorance ("unknown:"). There is deliberately NO fault verdict: dispatch
+-- records are existential, so no quantity of non-observation establishes that a
+-- tool is unreachable. corroborated_namespaces is MONOTONIC (sticky) — an
+-- existence claim a shorter read window must not be able to falsify.
 --
 -- NULL means "core has not evaluated this row yet" (pre-deploy rows, and any
 -- workspace whose runtime never publishes loaded_mcp_tools). NULL is NOT a
