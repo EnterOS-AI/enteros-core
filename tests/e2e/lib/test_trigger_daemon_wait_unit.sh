@@ -613,7 +613,21 @@ else
     # MUTATION: strip the normalisation `case` lines and the suite must RED.
     # Without this the whole block above could pass against an implementation
     # that never normalises anything.
-    _rep_mut=$(printf '%s\n' "$_rep_src" | grep -v '^  case "\$_samples"' | grep -v '^  case "\$_reads"')
+    # Mutate SEMANTICALLY, not structurally. An earlier version deleted the
+    # `case "$_samples"` header lines by anchored grep; once the `case` became
+    # multi-line that would have left orphaned arms, so the mutant would have
+    # died of a SYNTAX ERROR rather than of a changed label — a mutation that
+    # passes for the wrong reason. Removing the garbage ARMS leaves valid shell
+    # and isolates exactly the behaviour under test: with them gone, `abc` no
+    # longer matches anything, `_bad` stays empty, and the label degrades.
+    _rep_mut=$(printf '%s\n' "$_rep_src" | grep -v '\*\[!0-9\]\*)')
+    # ANCHOR CHECK. If the pattern ever stops matching, the mutant is identical
+    # to the original and would "die" only because nothing changed — the probe
+    # testing itself. (The wider mutation is already fail-closed: an unmatched
+    # anchor leaves COUNTERS UNREADABLE and reds below. This just names the cause.)
+    if [ "$_rep_mut" = "$_rep_src" ]; then
+      echo "FAIL: the reporter mutation's anchor matched nothing — the mutant is identical to the original, so the check below proves nothing"; FAILED=1
+    fi
     (
       _REPORTED=""
       log() { _REPORTED="$*"; }
@@ -816,13 +830,29 @@ eval "$_rows_orig"
 _alias_rc=0
 (
   shopt -s expand_aliases
-  # No `shellcheck disable` here on purpose. An earlier revision carried
-  # `disable=SC2262,SC2263` "for the alias"; those codes fire at NO version
-  # available to check — not CI's 0.9.0, not 0.10.0, not 0.11.0. A directive that
-  # suppresses nothing tells the next reader there is a known lint issue at this
-  # line when there is not, which is the same species as every other claim this
-  # file has had to walk back. If a future shellcheck flags it, the gate reds and
-  # someone adds the disable back with a reason that is true at the time.
+  # No `shellcheck disable` here on purpose, and the reason is NARROWER than an
+  # earlier revision of this comment claimed. That revision said SC2262/SC2263
+  # "fire at NO version available to check, not CI's 0.9.0". That is false:
+  # 0.9.0 raises both readily. Verified, not assumed —
+  #
+  #     shopt -s expand_aliases; alias f="printf 3"; f
+  #     -> SC2262 (warning) on the alias, SC2263 (info) on the use
+  #
+  # What is actually true is about THIS FILE: SC2262 fires only when the alias
+  # is defined AND USED as a command word in the same parsing unit, and the name
+  # `trigger_daemon_ledger_rows` never appears as a command word here. Its only
+  # use is inside trigger_daemon_timeout_ordering_check, which lives in the
+  # sourced lib — a different parsing unit shellcheck does not connect to this
+  # definition. Insert a bare `trigger_daemon_ledger_rows` line below and 0.9.0
+  # reports SC2262 immediately; that is the check, and it is the whole reason
+  # the directives were inert.
+  #
+  # So they are omitted because they suppress nothing HERE, not because the
+  # codes are dead. If this block ever gains a direct use of the alias, the gate
+  # will red and the disable should come back — with that use as its reason.
+  # (Recording the correction rather than quietly fixing it: this is the fourth
+  # comment in this file to assert more than the mechanism supports, and it is
+  # the first place a future reader will look before re-adding the directives.)
   alias trigger_daemon_ledger_rows='printf 3'
   trigger_daemon_timeout_ledger() { printf 'a|10|d|reachable\nb|60|h|reachable\nc|600|d|reachable\n'; }
   trigger_daemon_timeout_ordering_check 10 >/dev/null 2>&1

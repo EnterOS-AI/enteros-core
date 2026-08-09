@@ -314,9 +314,23 @@ e2e_scheduler_backstop_secs() {
 # NOT POLLED. Only a value that is present and unusable (`abc`, `-1`, `3x`)
 # trips the fourth state.
 scheduler_progress_report() {
-  local _samples="${TRIGGER_DAEMON_PROGRESS_SAMPLES:-0}" _reads="${TRIGGER_DAEMON_PROGRESS_READS:-0}" _bad=""
-  case "$_samples" in ''|*[!0-9]*) _bad="samples='$_samples'"; _samples=0 ;; esac
-  case "$_reads"   in ''|*[!0-9]*) _bad="${_bad:+$_bad }reads='$_reads'"; _reads=0 ;; esac
+  # ONE normalisation point, and every branch reachable. The first version paired
+  # `${…:-0}` with a `case` whose pattern still listed `''` — but `:-` had already
+  # turned empty into `0`, so that arm could never match. An unreachable branch is
+  # the exact shape this change set has spent its whole life deleting, so it is
+  # not left in as belt-and-braces: the `-` default passes empty THROUGH and the
+  # `case` decides, which keeps the two outcomes explicit and both arms live.
+  #   ''        -> 0, the counters' true starting value  -> NOT POLLED
+  #   non-digit -> corrupt                               -> COUNTERS UNREADABLE
+  local _samples="${TRIGGER_DAEMON_PROGRESS_SAMPLES-}" _reads="${TRIGGER_DAEMON_PROGRESS_READS-}" _bad=""
+  case "$_samples" in
+    '') _samples=0 ;;
+    *[!0-9]*) _bad="samples='$_samples'"; _samples=0 ;;
+  esac
+  case "$_reads" in
+    '') _reads=0 ;;
+    *[!0-9]*) _bad="${_bad:+$_bad }reads='$_reads'"; _reads=0 ;;
+  esac
   if [ -n "$_bad" ]; then
     log "    [$1] delivery-stall detector COUNTERS UNREADABLE ($_bad) — the instrumentation itself is corrupt, so this leg carries no evidence in EITHER direction. Not the benign 'returned before the first read' case: that one is a real observation, this is the absence of one."
   elif [ "$_samples" -gt 0 ]; then
