@@ -289,13 +289,29 @@ e2e_scheduler_backstop_secs() {
 # needed to look. Saying the same thing about that and about a leg that polled
 # for 64s and read nothing trains the reader to skip the line entirely — losing
 # exactly the case it exists to surface.
+#
+# THE COUNTERS ARE NORMALISED BEFORE THEY ARE COMPARED. They are `export`ed, so
+# they are reachable from the environment, and a bare `[ "$x" -gt 0 ]` on a
+# non-numeric value does not return false — it ERRORS, and the `if` reads that
+# as false. Here the only consequence is a wrong LABEL (both tests error, so a
+# fast pass would be announced as BLIND, printing "polled abc time(s)"); it
+# cannot fail a run. It is also not reachable today: trigger_daemon_wait resets
+# both to 0 on entry, before any `return`.
+#
+# Fixed anyway, because it is the identical shape to the count-guard bypass, in
+# code added by the same change, and "not reachable today" is precisely how that
+# one started. Two lines of `case` is cheaper than the next person rediscovering
+# the pattern from a confusing log line.
 scheduler_progress_report() {
-  if [ "${TRIGGER_DAEMON_PROGRESS_SAMPLES:-0}" -gt 0 ]; then
-    log "    [$1] delivery-stall detector ARMED: ${TRIGGER_DAEMON_PROGRESS_SAMPLES}/${TRIGGER_DAEMON_PROGRESS_READS:-0} attempt-log reads readable, ${TRIGGER_DAEMON_PROGRESS_TRANSITIONS} observed advancement(s), ${TRIGGER_DAEMON_PROGRESS_AGE:-0}s since the last one."
-  elif [ "${TRIGGER_DAEMON_PROGRESS_READS:-0}" -eq 0 ]; then
+  local _samples="${TRIGGER_DAEMON_PROGRESS_SAMPLES:-0}" _reads="${TRIGGER_DAEMON_PROGRESS_READS:-0}"
+  case "$_samples" in ''|*[!0-9]*) _samples=0 ;; esac
+  case "$_reads"   in ''|*[!0-9]*) _reads=0 ;; esac
+  if [ "$_samples" -gt 0 ]; then
+    log "    [$1] delivery-stall detector ARMED: ${_samples}/${_reads} attempt-log reads readable, ${TRIGGER_DAEMON_PROGRESS_TRANSITIONS} observed advancement(s), ${TRIGGER_DAEMON_PROGRESS_AGE:-0}s since the last one."
+  elif [ "$_reads" -eq 0 ]; then
     log "    [$1] delivery-stall detector NOT POLLED — the wait returned on its probe before the first read. Not a gap: the evidence arrived faster than the detector needed to look."
   else
-    log "    [$1] delivery-stall detector BLIND: polled ${TRIGGER_DAEMON_PROGRESS_READS} time(s) and read the attempt log 0 times. THIS leg's result carries no evidence about the delivery lane — only tick-liveness was in play. Expected before a workspace's first-ever attempt (no schedule-history.json yet); anything else means the log is unreadable and the wedged-delivery signal is dark."
+    log "    [$1] delivery-stall detector BLIND: polled ${_reads} time(s) and read the attempt log 0 times. THIS leg's result carries no evidence about the delivery lane — only tick-liveness was in play. Expected before a workspace's first-ever attempt (no schedule-history.json yet); anything else means the log is unreadable and the wedged-delivery signal is dark."
   fi
 }
 

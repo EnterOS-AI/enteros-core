@@ -740,7 +740,80 @@ else
 fi
 eval "$_rows_orig"
 
+# 6. ALIAS SHADOW. The one vector the function form does NOT close on its own:
+#    `alias trigger_daemon_ledger_rows='printf 3'` under `shopt -s
+#    expand_aliases` replaces the call at parse time. Low reachability, but
+#    INVISIBLE to anyone grepping for the function definition — which is exactly
+#    the audit a maintainer performs — so the call site is `\`-prefixed to
+#    suppress alias expansion. Run in a subshell because enabling
+#    expand_aliases and defining an alias must not leak into the rest of this
+#    suite.
+_alias_rc=0
+(
+  shopt -s expand_aliases
+  # shellcheck disable=SC2262,SC2263
+  #   The alias IS the attack under test; shellcheck's "declared and used in the
+  #   same scope" warnings are noise here.
+  alias trigger_daemon_ledger_rows='printf 3'
+  trigger_daemon_timeout_ledger() { printf 'a|10|d|reachable\nb|60|h|reachable\nc|600|d|reachable\n'; }
+  trigger_daemon_timeout_ordering_check 10 >/dev/null 2>&1
+) || _alias_rc=$?
+if [ "$_alias_rc" = "0" ]; then
+  echo "FAIL: an ALIAS shadow of trigger_daemon_ledger_rows let a 3-of-6 truncated ledger pass — the call site is not alias-proof"; FAILED=1
+else
+  echo "PASS [refused] alias shadow of the row-count function (backslash-prefixed call site)"
+fi
 eval "$_ledger_orig"   # restore the real ledger for everything below
+
+# ...and the alias must not break the REAL ledger either. This half MUST run
+# after the restore above: the previous blocks leave a truncated ledger
+# installed, and against that any correct implementation refuses — so running it
+# earlier would "prove" alias-proofing from a refusal that had nothing to do with
+# the alias. (It did exactly that on the first run of this test.)
+_alias_ok_rc=0
+(
+  shopt -s expand_aliases
+  # shellcheck disable=SC2262,SC2263
+  alias trigger_daemon_ledger_rows='printf 3'
+  trigger_daemon_timeout_ordering_check 10 >/dev/null 2>&1
+) || _alias_ok_rc=$?
+if [ "$_alias_ok_rc" = "0" ]; then
+  echo "PASS [inert] an alias cannot make the REAL six-row ledger fail either"
+else
+  echo "FAIL: the real ledger was refused merely because an alias existed (rc=$_alias_ok_rc)"; FAILED=1
+fi
+
+# 7. A SUBSUMER WITH A MALFORMED BOUND must name ITS OWN cause. `sub_secs` is
+#    read from a DIFFERENT row than the one being validated, so it reaches a
+#    `-ge` unvalidated — the same shape as the count-guard bypass. It must not
+#    be reported as "not in the ledger" (a different edit to make).
+trigger_daemon_timeout_ledger() {
+  printf 'a|10|d|reachable\nb|60|h|reachable\nc|600|d|reachable\n'
+  printf 'x|abc|r|reachable\ny|900|r|subsumed-by:x\nz|1800|h|reachable\n'
+}
+_sub_out=$(trigger_daemon_timeout_ordering_check 10 2>&1) && _sub_rc=0 || _sub_rc=$?
+if [ "$_sub_rc" = "0" ]; then
+  echo "FAIL: a subsumer with a non-numeric bound was ACCEPTED — the -ge errored into a skip"; FAILED=1
+else
+  case "$_sub_out" in
+    *"whose bound is"*"not a positive integer"*)
+      echo "PASS [refused, own cause] a subsumer with a malformed bound is diagnosed as malformed, not as missing" ;;
+    *"is not in the ledger"*)
+      echo "FAIL: a malformed subsumer bound was reported as 'not in the ledger' — wrong remedy for the next reader"; FAILED=1 ;;
+    *) echo "FAIL: refused but with an unexpected diagnosis ('$_sub_out')"; FAILED=1 ;;
+  esac
+fi
+eval "$_ledger_orig"
+
+# 8. THE RETIRED KNOB MUST NOT BE NAMED AS THE REMEDY. It has zero reads
+#    repo-wide, so a message telling an operator to bump it sends them to edit a
+#    variable nothing consults. The remedy must name the function.
+_trunc_out=$(trigger_daemon_ledger_rows() { printf 8; }; trigger_daemon_timeout_ordering_check 10 2>&1) || true
+case "$_trunc_out" in
+  *"update trigger_daemon_ledger_rows"*) echo "PASS [remedy names the function] the row-count mismatch message points at live code" ;;
+  *"bump TRIGGER_DAEMON_LEDGER_ROWS"*)   echo "FAIL: the mismatch message still names the retired TRIGGER_DAEMON_LEDGER_ROWS knob (zero reads repo-wide)"; FAILED=1 ;;
+  *) echo "FAIL: unexpected mismatch message ('$_trunc_out')"; FAILED=1 ;;
+esac
 
 # The env knob must be INERT against the real ledger too — set to garbage, the
 # check still passes and still reports 6 rows. (A "fix" that made every run fail
