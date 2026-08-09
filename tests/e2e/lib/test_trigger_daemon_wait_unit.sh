@@ -556,16 +556,81 @@ else
   echo "FAIL: readable log gave reads=$TRIGGER_DAEMON_PROGRESS_READS samples=$TRIGGER_DAEMON_PROGRESS_SAMPLES; both should climb together"; FAILED=1
 fi
 
-# The harness must report all THREE states, not two.
-if [ -f "$HARNESS" ]; then
-  _missing=""
-  for pat in "NOT POLLED" "BLIND" "ARMED" "TRIGGER_DAEMON_PROGRESS_READS"; do
-    grep -q "$pat" "$HARNESS" || _missing="$_missing $pat"
-  done
-  if [ -z "$_missing" ]; then
-    echo "PASS [3 states] the harness distinguishes ARMED / NOT POLLED / BLIND"
+# ── the harness's REPORTER is DRIVEN, not grepped ────────────────────────────
+#
+# Grepping the harness for the three state strings proved they were TYPED, not
+# that any input reaches them — and that gap shipped: the counter normalisation
+# added with the three-state split had NO assertion behind it, so deleting its
+# `case` lines left the suite fully green. A guard with no test is the same
+# species as a guard that cannot fire, which is what this whole file is about.
+#
+# So the real function is extracted from the harness and CALLED with each input
+# class. `log` is stubbed to capture the line.
+if [ ! -f "$HARNESS" ]; then
+  echo "FAIL: harness not found at $HARNESS (cannot drive scheduler_progress_report)"; FAILED=1
+else
+  _rep_src=$(sed -n '/^scheduler_progress_report()/,/^}/p' "$HARNESS")
+  if [ -z "$_rep_src" ]; then
+    echo "FAIL: could not extract scheduler_progress_report from the harness — the reporter is untested again"; FAILED=1
   else
-    echo "FAIL: the harness is missing:$_missing — a fast pass and a genuine blind spot would print the same line again"; FAILED=1
+    _REPORTED=""
+    log() { _REPORTED="$*"; }
+    eval "$_rep_src"
+
+    report_check() { # $1 desc, $2 want-substring, $3 samples, $4 reads
+      _REPORTED=""
+      TRIGGER_DAEMON_PROGRESS_SAMPLES="$3" TRIGGER_DAEMON_PROGRESS_READS="$4" \
+        TRIGGER_DAEMON_PROGRESS_TRANSITIONS=1 TRIGGER_DAEMON_PROGRESS_AGE=0 \
+        scheduler_progress_report leg
+      case "$_REPORTED" in
+        *"$2"*) echo "PASS [$2] $1" ;;
+        *) echo "FAIL: $1 — wanted '$2', got: ${_REPORTED:-<nothing>}"; FAILED=1 ;;
+      esac
+    }
+
+    # The three legitimate states.
+    report_check "samples>0 -> ARMED"                     "ARMED"       6 6
+    report_check "reads>0, samples=0 -> BLIND"            "BLIND"       0 6
+    report_check "reads=0 -> NOT POLLED"                  "NOT POLLED"  0 0
+    # Empty is a legitimate zero (`${…:-0}`), NOT garbage: it is the true starting
+    # value of both counters, so it must read as NOT POLLED rather than corrupt.
+    report_check "empty counters -> NOT POLLED (legitimate zero)" "NOT POLLED" "" ""
+    # Present-but-unusable is its OWN state. It must NOT degrade to the most
+    # reassuring label — "the evidence arrived faster than the detector needed to
+    # look" asserted about a run where the instrumentation is corrupt is a lie.
+    report_check "samples=abc -> COUNTERS UNREADABLE"     "COUNTERS UNREADABLE" abc 6
+    report_check "reads=abc -> COUNTERS UNREADABLE"       "COUNTERS UNREADABLE" 0 abc
+    report_check "negative -1 -> COUNTERS UNREADABLE"     "COUNTERS UNREADABLE" -1 6
+    report_check "trailing junk 3x -> COUNTERS UNREADABLE" "COUNTERS UNREADABLE" 3x 6
+    # ...and garbage must not be reported as the benign case.
+    _REPORTED=""
+    TRIGGER_DAEMON_PROGRESS_SAMPLES=abc TRIGGER_DAEMON_PROGRESS_READS=abc scheduler_progress_report leg
+    case "$_REPORTED" in
+      *"NOT POLLED"*) echo "FAIL: unparseable counters were reported as the BENIGN 'NOT POLLED' state"; FAILED=1 ;;
+      *) echo "PASS [not benign] unparseable counters do not read as 'NOT POLLED'" ;;
+    esac
+
+    # MUTATION: strip the normalisation `case` lines and the suite must RED.
+    # Without this the whole block above could pass against an implementation
+    # that never normalises anything.
+    _rep_mut=$(printf '%s\n' "$_rep_src" | grep -v '^  case "\$_samples"' | grep -v '^  case "\$_reads"')
+    (
+      _REPORTED=""
+      log() { _REPORTED="$*"; }
+      eval "$_rep_mut"
+      TRIGGER_DAEMON_PROGRESS_SAMPLES=abc TRIGGER_DAEMON_PROGRESS_READS=abc scheduler_progress_report leg 2>/dev/null
+      case "$_REPORTED" in
+        *"COUNTERS UNREADABLE"*) exit 1 ;;   # mutant survived -> the case lines do nothing
+        *) exit 0 ;;                          # mutant died -> the case lines are load-bearing
+      esac
+    )
+    if [ "$?" = "0" ]; then
+      echo "PASS [mutant died] deleting the normalisation 'case' lines changes the label — they are load-bearing"
+    else
+      echo "FAIL: deleting the normalisation 'case' lines left the label unchanged — the normalisation is untested decoration"; FAILED=1
+    fi
+
+    unset -f scheduler_progress_report report_check log
   fi
 fi
 
@@ -751,9 +816,13 @@ eval "$_rows_orig"
 _alias_rc=0
 (
   shopt -s expand_aliases
-  # shellcheck disable=SC2262,SC2263
-  #   The alias IS the attack under test; shellcheck's "declared and used in the
-  #   same scope" warnings are noise here.
+  # No `shellcheck disable` here on purpose. An earlier revision carried
+  # `disable=SC2262,SC2263` "for the alias"; those codes fire at NO version
+  # available to check — not CI's 0.9.0, not 0.10.0, not 0.11.0. A directive that
+  # suppresses nothing tells the next reader there is a known lint issue at this
+  # line when there is not, which is the same species as every other claim this
+  # file has had to walk back. If a future shellcheck flags it, the gate reds and
+  # someone adds the disable back with a reason that is true at the time.
   alias trigger_daemon_ledger_rows='printf 3'
   trigger_daemon_timeout_ledger() { printf 'a|10|d|reachable\nb|60|h|reachable\nc|600|d|reachable\n'; }
   trigger_daemon_timeout_ordering_check 10 >/dev/null 2>&1
@@ -773,7 +842,6 @@ eval "$_ledger_orig"   # restore the real ledger for everything below
 _alias_ok_rc=0
 (
   shopt -s expand_aliases
-  # shellcheck disable=SC2262,SC2263
   alias trigger_daemon_ledger_rows='printf 3'
   trigger_daemon_timeout_ordering_check 10 >/dev/null 2>&1
 ) || _alias_ok_rc=$?
