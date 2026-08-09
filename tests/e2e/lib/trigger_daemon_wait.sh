@@ -50,12 +50,32 @@
 # signal for the delivery lane specifically:
 #
 #   - the tick loop cannot advance it (tick() only enqueues and writes health),
-#   - the cron cannot advance it (schedule-state.json advances every minute even
-#     while a fire is in-flight — `persisted[turn.name] = turn.scheduled_for`
-#     runs BEFORE the `_inflight` skip — so state is a cron signal, not a
-#     delivery signal, and is deliberately NOT part of the fingerprint),
 #   - a wedged delivery holding a connection open cannot advance it,
 #   - and a slow-but-healthy one DOES advance it, once per attempt.
+#
+# WHY `schedule-state.json` IS DELIBERATELY *NOT* PART OF THE FINGERPRINT, and
+# what it actually does on each path — driven at the pinned source, because the
+# obvious guess is wrong in BOTH directions and the two paths differ:
+#
+#   CRON. `evaluate_tick` yields `scheduled_for=armed` — the value already in
+#     state (trigger_schedule.py: `elif armed <= now: ... scheduled_for=armed`).
+#     `tick()` then writes `persisted[turn.name] = turn.scheduled_for`, i.e. it
+#     writes the SAME value back. So during a wedge the file is BYTE-IDENTICAL
+#     tick after tick, deliberately: freezing the armed time is what makes a
+#     crash mid-delivery re-fire. It advances only when `_commit` recomputes
+#     `next_run` on a real completion — which is precisely the event the attempt
+#     log already records. On this path state is REDUNDANT, not wrong.
+#   POKE. `evaluate_tick` yields `scheduled_for=now`, and `keep_pokes` retains
+#     the poke for any schedule still `_inflight`. So a poked schedule whose
+#     delivery is wedged is re-poked every tick and writes a FRESH `now` every
+#     tick. On this path state advances at full cadence while nothing is being
+#     delivered — a FALSE progress signal, exactly the thing this watchdog must
+#     not key on.
+#
+# Either way it must stay out: on one path it adds nothing the attempt log does
+# not already give, and on the other it would reset the stall deadline forever
+# on a wedged poked delivery. This note exists so nobody re-adopts the file
+# after reading only the cron path and concluding it looks like a fine signal.
 #
 # So the wait now fails on ABSENCE OF ADVANCEMENT, not on elapsed time: the
 # stall deadline is reset on every observed change, which means a delivery that
@@ -616,9 +636,22 @@ trigger_daemon_backstop_resolve() {
 # So the inventory is DATA, and the ordering is ASSERTED. Every bound on the
 # trigger delivery path is listed here with its owner and its disposition, and
 # `trigger_daemon_timeout_ordering_check` refuses any arrangement in which a
-# bound cannot be reached. Adding a timeout to this path without adding it here
-# is the one failure this cannot catch, which is why the unit test also greps the
-# pinned daemon source for cap-shaped env names.
+# bound cannot be reached.
+#
+# THE FAILURE THIS CANNOT CATCH, stated plainly rather than papered over: a NEW
+# timeout added to the daemon or the runtime and never added here. Nothing in
+# this repo can see that directly — the daemon source lives in
+# molecule-ai-plugin-scheduler and the runtime in molecule-ai-workspace-runtime,
+# so there is no file here to grep for a cap-shaped env name, and an offline
+# unit test cannot fetch one.
+#
+# What DOES cover it is the version pin: `trigger_daemon_scheduler_version_
+# validated` is compared against core's live pin in
+# plugin_registry_test.go, and the unit test REDS the moment they diverge. A new
+# daemon timeout can only reach a workspace through a repin, and a repin cannot
+# land without turning this red first, which forces the re-read that adds the
+# row. That is a weaker guarantee than a direct grep and it is the honest one:
+# it catches the version moving, not the content, so the re-read is the control.
 #
 # DISPOSITIONS. Exactly two are legal:
 #   reachable        nothing on the path cuts before it, so it can actually fire.
@@ -647,16 +680,28 @@ trigger_daemon_backstop_resolve() {
 # ever below the 1800s backstop, the backstop would be unreachable and every
 # derived number below it would be decoration.
 #
-# It is not a ledger ROW because making it one honestly would mean each lane
-# passing its own `timeout-minutes` in as env, and there is more than one lane
-# running this harness — a row wired from a single workflow would assert the
-# bound for one lane and silently assert NOTHING for the others, which is a
-# guard that looks like it covers the path and does not. The inequality that
-# holds today: at most ONE backstop is reachable per run (every leg `fail`s
-# rather than continuing, so reaching a later backstop means the earlier legs
-# returned on their signal in seconds), so worst case is 1800s of backstop
-# inside 4500s of job. Anyone shortening `timeout-minutes` below ~2x the
-# backstop must revisit this.
+# It is not a ledger ROW, and the reason is the CALLER SET, which is worth
+# stating exactly because an earlier version of this comment got it wrong. This
+# harness has exactly TWO invocations:
+#
+#   tests/e2e/ephemeral_cp_happy_path.sh   `bash "$HERE/test_staging_full_saas.sh"`
+#     — the ONE CI lane, run by .gitea/workflows/e2e-ephemeral-happy-path.yml
+#       at `timeout-minutes: 75`.
+#   tests/e2e/STAGING_SAAS_E2E.md          `bash tests/e2e/test_staging_full_saas.sh`
+#     — the manual runbook, run by a human at a terminal, with NO timeout at all.
+#
+# So a `timeout-minutes`-derived row would assert a real bound under CI and be
+# silently ABSENT under the runbook — a ledger row that is present in one context
+# and missing in the other is worse than no row, because the check would still
+# report a full green while covering one caller. (The earlier wording said "more
+# than one lane", which suggested several CI lanes disagreeing; the real split is
+# CI-vs-human, and it is a stronger reason.)
+#
+# The inequality that holds today: at most ONE backstop is reachable per run
+# (every leg `fail`s rather than continuing, so reaching a later backstop means
+# the earlier legs returned on their signal in seconds), so worst case is 1800s
+# of backstop inside 4500s of job. Anyone shortening `timeout-minutes` below ~2x
+# the backstop must revisit this.
 #
 # Read at the validated scheduler pin; the runtime constant is
 # molecule_runtime/turn_lease.py `_DEFAULT_IDLE_CAP_SECONDS`.
@@ -683,6 +728,11 @@ trigger_daemon_timeout_ledger() {
   printf 'harness_backstop|%s|harness|reachable\n' "$backstop"
 }
 
+# The number of rows the ledger MUST have. Not a style check — see the counter
+# guard in `trigger_daemon_timeout_ordering_check`. Bump it in the same commit
+# that adds or removes a row, which is the point: the bump is the review.
+TRIGGER_DAEMON_LEDGER_ROWS="${TRIGGER_DAEMON_LEDGER_ROWS:-6}"
+
 # trigger_daemon_timeout_ordering_check [observation-poll-secs]
 #
 # rc=0 when every ledger entry can be reached; rc=1 otherwise, with the offending
@@ -691,13 +741,48 @@ trigger_daemon_timeout_ledger() {
 # invocation (`bash --noprofile --norc -e -o pipefail`), where a non-zero
 # intermediate would kill the caller before it could print the diagnosis. Every
 # failure here accumulates into a report and comes back as one rc.
+#
+# ─── THE COUNTER GUARD, and why this function needed one at all ──────────────
+#
+# Every ordering rule below is a rule ABOUT ROWS. Feed it zero rows and every one
+# of them is vacuously satisfied: the loop body never runs, `rc` stays 0, and the
+# function reports "every bound can be reached" having examined nothing. A
+# truncated ledger is the same defect one step milder — the surviving rows are
+# checked, the missing ones are not, and the pass looks identical.
+#
+# That is precisely the failure class this whole change exists to close, so it
+# would be absurd to leave it in the guard that closes it. This is the same
+# treatment `trigger_daemon_wait` gets from
+# TRIGGER_DAEMON_PROGRESS_SAMPLES: assert the thing actually ran on something,
+# and REPORT the count so a reader can tell an armed check from an empty one.
+#
+# The count is printed on stdout on success too (prefixed `timeout-ledger:
+# checked N row(s)`) — a silent pass is exactly what let the empty case hide.
 trigger_daemon_timeout_ordering_check() {
   local poll="${1:-10}" ledger rc=0 prev_name="" prev_secs=0 name secs owner disp sub sub_secs
+  local rows=0 reachable=0
 
   ledger=$(trigger_daemon_timeout_ledger "$poll") || {
     printf 'timeout-ledger: could not be computed (a bound refused to derive)\n'
     return 1
   }
+
+  # FAIL CLOSED ON EMPTY, before any rule runs. An empty ledger is not "an
+  # arrangement with no violations", it is an arrangement nobody described.
+  rows=$(printf '%s\n' "$ledger" | grep -c '|' 2>/dev/null || printf 0)
+  case "$rows" in ''|*[!0-9]*) rows=0 ;; esac
+  if [ "$rows" -eq 0 ]; then
+    printf 'timeout-ledger: EMPTY — 0 rows to check, so every ordering rule below passes vacuously and this guard asserted NOTHING. Refusing rather than reporting a green that means "nobody described the path".\n'
+    return 1
+  fi
+  # ...and on TRUNCATED. Rows can only appear/disappear by editing the ledger, so
+  # a mismatch is either a deliberate change (bump TRIGGER_DAEMON_LEDGER_ROWS in
+  # the same commit) or a bound that silently fell off the path.
+  if [ "$rows" -ne "$TRIGGER_DAEMON_LEDGER_ROWS" ]; then
+    printf 'timeout-ledger: expected %s row(s), got %s — a bound was added or lost without review. If deliberate, bump TRIGGER_DAEMON_LEDGER_ROWS in the same commit; if not, a timeout on this path is no longer being checked at all.\n' \
+      "$TRIGGER_DAEMON_LEDGER_ROWS" "$rows"
+    rc=1
+  fi
 
   while IFS='|' read -r name secs owner disp; do
     [ -n "$name" ] || continue
@@ -717,6 +802,7 @@ trigger_daemon_timeout_ordering_check() {
           rc=1
         fi
         prev_name="$name"; prev_secs="$secs"
+        reachable=$((reachable + 1))
         ;;
       subsumed-by:*)
         sub="${disp#subsumed-by:}"
@@ -738,6 +824,18 @@ trigger_daemon_timeout_ordering_check() {
   done <<EOF
 $ledger
 EOF
+
+  # A ledger of nothing but `subsumed-by` rows would clear the loop with the
+  # strictly-increasing chain never once evaluated — rows present, ordering still
+  # unasserted. The chain needs at least two reachable bounds to BE a chain.
+  if [ "$reachable" -lt 2 ]; then
+    printf 'timeout-ledger: only %s reachable row(s) — the strictly-increasing ordering was never actually compared against anything. Rows alone are not a checked ordering.\n' "$reachable"
+    rc=1
+  fi
+
+  if [ "$rc" -eq 0 ]; then
+    printf 'timeout-ledger: checked %s row(s), %s reachable, ordering strictly increasing\n' "$rows" "$reachable"
+  fi
   return "$rc"
 }
 

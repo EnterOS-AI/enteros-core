@@ -584,13 +584,81 @@ if [ "$_c5" = "3000" ]; then
 else
   echo "FAIL: a */5 probe cron gave cap=$_c5, not 3000 — the cap is not derived from the fire interval"; FAILED=1
 fi
-# ...and the STALL window follows it too, keeping the ordering intact at the new
-# cadence. If only one of them scaled, the inversion would come back silently.
+# ...and the STALL window follows it too, so the cap/stall PAIR keeps its
+# relative ordering at the new cadence. If only one of them scaled, the
+# inversion would come back silently.
+#
+# NOTE WHAT THIS DOES AND DOES NOT CLAIM. It proves the DERIVATION rescales, not
+# that `*/5` is a usable configuration — it is not, and the next assertion is the
+# proof. An earlier version of this test was labelled "the ordering survives a
+# change of fire cadence", which over-claimed: the pair rescales, the LEDGER does
+# not survive.
 _s5=$(TRIGGER_DAEMON_PROBE_CRON='*/5 * * * *' trigger_daemon_progress_stall_secs 10)
 if [ "$_s5" -gt "$_c5" ]; then
-  echo "PASS [cap=${_c5}s < stall=${_s5}s] the ordering survives a change of fire cadence"
+  echo "PASS [cap=${_c5}s < stall=${_s5}s] cap and stall rescale TOGETHER at a */5 cadence (the pair keeps its ordering)"
 else
   echo "FAIL: at a */5 cron the stall window $_s5 does not exceed the cap $_c5 — the inversion returns as soon as the cadence moves"; FAILED=1
+fi
+# The whole-ledger verdict at */5 is a REFUSAL, and that is correct, not a gap:
+# a 3000s cap sits above the runtime's 900s idle TTL, so `runtime_idle_ttl` is no
+# longer subsumed and its disposition would be a lie. Asserting the refusal here
+# stops someone "fixing" the cadence knob without noticing the ledger rejects it.
+if TRIGGER_DAEMON_PROBE_CRON='*/5 * * * *' trigger_daemon_timeout_ordering_check 10 >/dev/null 2>&1; then
+  echo "FAIL: the ledger ACCEPTED a */5 cadence, whose ${_c5}s cap exceeds the ${TRIGGER_DAEMON_RUNTIME_IDLE_TTL_SECS}s idle TTL — the subsumption claim would be false and unchecked"; FAILED=1
+else
+  echo "PASS [refused] the whole ledger REJECTS a */5 cadence (cap ${_c5}s > idle TTL ${TRIGGER_DAEMON_RUNTIME_IDLE_TTL_SECS}s) — the derivation rescales, this cadence does not survive"
+fi
+
+# --- the ordering check is NOT vacuous on an empty or truncated ledger -------
+#
+# The negative control this guard was missing. Every rule in
+# trigger_daemon_timeout_ordering_check is a rule ABOUT ROWS, so zero rows
+# satisfies all of them and the function reported "every bound can be reached"
+# having examined nothing — the exact defect class the rest of this PR closes,
+# inside the guard that closes it. Three shapes, all of which used to pass:
+_ledger_orig=$(declare -f trigger_daemon_timeout_ledger)
+
+# 1. EMPTY.
+trigger_daemon_timeout_ledger() { printf ''; }
+if out=$(trigger_daemon_timeout_ordering_check 10 2>&1); then
+  echo "FAIL: an EMPTY ledger returned success — the guard asserted nothing and said so was fine"; FAILED=1
+else
+  echo "PASS [refused] an EMPTY ledger (0 rows) cannot report a reachable path"
+fi
+
+# 2. TRUNCATED — rows present, but fewer than the path has.
+trigger_daemon_timeout_ledger() { printf 'a|10|d|reachable\nb|60|h|reachable\nc|600|d|reachable\n'; }
+if out=$(trigger_daemon_timeout_ordering_check 10 2>&1); then
+  echo "FAIL: a TRUNCATED ledger (3 of $TRIGGER_DAEMON_LEDGER_ROWS rows) returned success — bounds silently fell off the path unchecked"; FAILED=1
+else
+  echo "PASS [refused] a TRUNCATED ledger (3 of $TRIGGER_DAEMON_LEDGER_ROWS rows)"
+fi
+
+# 3. RIGHT COUNT, no chain — all-but-one subsumed. The row count is satisfied and
+#    the loop runs, but the strictly-increasing comparison never fires even once.
+trigger_daemon_timeout_ledger() {
+  printf 'x|600|d|reachable\n'
+  for _i in 1 2 3 4 5; do printf 's%s|900|r|subsumed-by:x\n' "$_i"; done
+}
+if out=$(trigger_daemon_timeout_ordering_check 10 2>&1); then
+  echo "FAIL: a ledger with the right row count but only ONE reachable bound returned success — the ordering chain was never compared against anything"; FAILED=1
+else
+  echo "PASS [refused] right row count but no reachable CHAIN (1 reachable, 5 subsumed)"
+fi
+
+eval "$_ledger_orig"   # restore the real ledger for everything below
+
+# ...and the restored, real ledger must still PASS and must REPORT its count —
+# a guard that only ever refuses is as useless as one that only ever passes.
+if out=$(trigger_daemon_timeout_ordering_check 10 2>&1); then
+  case "$out" in
+    *"checked $TRIGGER_DAEMON_LEDGER_ROWS row(s)"*)
+      echo "PASS [$out] the real ledger passes AND reports how many rows it checked" ;;
+    *)
+      echo "FAIL: the real ledger passed but did not report its row count ('$out') — an armed check must be distinguishable from an empty one"; FAILED=1 ;;
+  esac
+else
+  echo "FAIL: the real ledger was REFUSED after restore: $out"; FAILED=1
 fi
 # No literal 600 left in the lib's derivation path: the default must come out of
 # the fire interval, so overriding the interval must move it.
