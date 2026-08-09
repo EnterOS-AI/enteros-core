@@ -395,6 +395,53 @@ class TestTransientRetry:
         assert status == 200
         assert len(attempts) == 2
 
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            pytest.param(__import__("ssl").SSLError("decryption failed"), id="ssl"),
+            pytest.param(OSError(5, "Input/output error"), id="oserror"),
+            pytest.param(
+                __import__("http.client", fromlist=["x"]).ResponseNotReady("Idle"),
+                id="responsenotready",
+            ),
+            pytest.param(ConnectionResetError(10054, "reset"), id="reset"),
+        ],
+    )
+    def test_a_READ_PHASE_failure_is_transient_too(
+        self, api_env, monkeypatch, exc
+    ):
+        """urlopen SUCCEEDS and the failure happens later in resp.read().
+
+        urllib only wraps CONNECT-phase errors in URLError, so an earlier
+        revision of this fix — which enumerated leaf exception types —
+        let a read-phase ssl.SSLError / raw OSError / ResponseNotReady
+        escape as a bare traceback exiting 1, i.e. "a required workflow has
+        a paths filter". Classify by BASE class so the read phase cannot
+        fall through the net.
+        """
+        attempts = []
+
+        class ExplodingRead:
+            status = 200
+
+            def read(self):
+                raise exc
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def _open(req, *a, **kw):
+            attempts.append(1)
+            return _FakeResp(_BP_OK) if len(attempts) > 2 else ExplodingRead()
+
+        monkeypatch.setattr(lint.urllib.request, "urlopen", _open)
+        status, doc = lint.api("GET", "/x")
+        assert status == 200, "a read-phase failure must be RETRIED, not raised"
+        assert len(attempts) == 3
+
     def test_exhaustion_raises_ApiUnreachable_not_a_bare_ApiError(
         self, api_env, monkeypatch
     ):
@@ -544,6 +591,96 @@ class TestUnreachableIsNotNonCompliance:
         assert not summary.exists() or "DID NOT RUN" not in summary.read_text(
             encoding="utf-8"
         )
+
+    @pytest.mark.parametrize(
+        "exc_factory, expect_rc",
+        [
+            # Read-phase NETWORK failures: api() retries, exhausts, exit 5.
+            # "the API never answered" is a TRUE claim here.
+            (lambda: __import__("ssl").SSLError("decryption failed"), 5),
+            (lambda: OSError(5, "Input/output error"), 5),
+            (
+                lambda: __import__(
+                    "http.client", fromlist=["x"]
+                ).ResponseNotReady("Idle"),
+                5,
+            ),
+        ],
+    )
+    def test_read_phase_network_faults_exit_5_never_1(
+        self, api_env, monkeypatch, capsys, exc_factory, expect_rc
+    ):
+        exc = exc_factory()
+
+        class ExplodingRead:
+            status = 200
+
+            def read(self):
+                raise exc
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(
+            lint.urllib.request, "urlopen", lambda *a, **k: ExplodingRead()
+        )
+        rc = lint.main()
+        log = "".join(capsys.readouterr())
+        assert rc == expect_rc, "must NOT be exit 1 (a paths-filter finding)"
+        assert "LINT DID NOT RUN" in log
+        assert "has a paths filter that would degrade" not in log
+
+    def test_an_internal_bug_exits_4_and_never_claims_the_api_was_unreachable(
+        self, api_env, monkeypatch, capsys
+    ):
+        """The catch-all must not fabricate a cause.
+
+        A TypeError in our own YAML walk is NOT "the API was unreachable".
+        Routing every escaping exception to exit 5 would blame Cloudflare
+        for our bug — inventing a cause we did not observe, which is the
+        same fault as inventing a finding we did not make. Exit 4 claims
+        only what is known: verification did not complete.
+        """
+        opener, _ = _scripted_opener(["ok"])
+        monkeypatch.setattr(lint.urllib.request, "urlopen", opener)
+
+        def boom(*a, **kw):
+            raise TypeError("bug in the lint's own job indexing")
+
+        monkeypatch.setattr(lint, "build_job_index", boom)
+        rc = lint.main()
+        log = "".join(capsys.readouterr())
+        assert rc == 4, "an internal bug must not exit 1 and must not exit 5"
+        assert "LINT DID NOT COMPLETE" in log
+        assert "unexpected internal error" in log
+        assert "NOT a compliance finding" in log
+        assert "bug in the lint itself" in log
+        # It must NOT assert the API was unreachable — that never happened.
+        assert "GITEA API UNREACHABLE" not in log
+        assert "has a paths filter that would degrade" not in log
+
+    def test_nothing_at_all_escapes_main_as_a_bare_traceback(
+        self, api_env, monkeypatch, capsys
+    ):
+        """The property in one assertion: for every failure mode we can
+        inject, main() returns a code and never propagates."""
+        for inject in (
+            KeyError("missing"),
+            ValueError("bad"),
+            RuntimeError("boom"),
+            AttributeError("nope"),
+        ):
+            opener, _ = _scripted_opener(["ok"])
+            monkeypatch.setattr(lint.urllib.request, "urlopen", opener)
+            monkeypatch.setattr(
+                lint, "build_job_index", lambda *a, _e=inject, **k: (_ for _ in ()).throw(_e)
+            )
+            rc = lint.main()
+            capsys.readouterr()
+            assert rc == 4, f"{type(inject).__name__} escaped or mis-coded as {rc}"
 
     def test_404_still_degrades_gracefully_without_retrying(
         self, api_env, monkeypatch, capsys

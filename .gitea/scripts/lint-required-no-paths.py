@@ -126,8 +126,16 @@ fault: the result did not reflect what was examined.
 
 Now:
   * `api()` RETRIES transient failures — 5xx (including Cloudflare's 52x
-    family), 429, and transport errors (reset/timeout/TLS EOF) — with
-    jittered exponential backoff, `API_MAX_ATTEMPTS` (default 4) attempts.
+    family), 429, and any incomplete HTTP transaction (classified by BASE
+    class: `OSError` + `http.client.HTTPException`, which covers reset,
+    timeout, TLS error, half-closed keepalive and truncated body in BOTH
+    the connect AND the read phase) — with jittered exponential backoff,
+    `API_MAX_ATTEMPTS` (default 4) attempts.
+  * Nothing escapes as a bare traceback. `main()` catches `Exception` and
+    returns 4 ("verification did not complete"), never 1. It does NOT
+    return 5 for an internal fault: exit 5 asserts "the API never
+    answered", and claiming that about a bug in our own YAML walk would be
+    inventing a cause we did not observe — the same fault, one level up.
   * 4xx IS NOT RETRIED. A 401/403/404/422 is an authorisation or
     addressing FACT; the next identical request returns the identical
     answer. Retrying it burns the budget for no possible change AND —
@@ -158,9 +166,9 @@ import json
 import os
 import random
 import re
-import ssl
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -309,22 +317,37 @@ def _is_transient_status(status: int) -> bool:
     return 500 <= status < 600 or status in _RETRYABLE_STATUSES
 
 
-# Transport-level failures: the request never produced an HTTP status at
-# all (reset, timeout, half-closed keepalive, TLS EOF). By definition we
-# learned nothing, so these are transient too.
-# NOTE: urllib.error.HTTPError subclasses URLError, so HTTPError MUST be
-# caught first or every 403 would be misfiled as a transport failure.
+# Transport-level failures: the request never produced a COMPLETE HTTP
+# response (reset, timeout, half-closed keepalive, TLS error, truncated
+# body). By definition we learned nothing, so these are transient too.
+#
+# These two BASE classes are deliberately broad, and the breadth is the
+# point — an earlier revision of this fix enumerated leaf types
+# (ConnectionResetError, TimeoutError, SSLEOFError, IncompleteRead, ...)
+# and left a hole exactly where it hurts most:
+#
+#   urlopen() SUCCEEDS, and the failure happens later in `resp.read()`.
+#   urllib only wraps CONNECT-phase errors in URLError, so a read-phase
+#   `ssl.SSLError` / raw `OSError` / `http.client.ResponseNotReady` matched
+#   none of the leaf types, escaped as a bare traceback, and exited 1 —
+#   i.e. "a required workflow has a paths filter". The very defect this
+#   file exists to eliminate, surviving inside its own fix.
+#
+# So classify by BASE class instead of by enumeration:
+#   OSError                 — URLError, ssl.SSLError, every Connection*Error,
+#                             TimeoutError (socket.timeout), raw errno OSError
+#   http.client.HTTPException — RemoteDisconnected, IncompleteRead,
+#                             BadStatusLine, ResponseNotReady, LineTooLong
+# Together these are "the HTTP transaction did not complete". Anything that
+# is NOT one of these is a bug in this script, not weather — and is handled
+# separately in main(), which must not claim the API was unreachable.
+#
+# NOTE: urllib.error.HTTPError subclasses URLError subclasses OSError, so
+# HTTPError MUST be caught first or every 403 would be misfiled as a
+# transport failure and retried. It is; see api().
 _TRANSIENT_EXC: tuple[type[BaseException], ...] = (
-    urllib.error.URLError,
-    ConnectionResetError,
-    ConnectionAbortedError,
-    ConnectionRefusedError,
-    TimeoutError,          # socket.timeout is an alias of this since 3.10
-    http.client.RemoteDisconnected,
-    http.client.IncompleteRead,
-    http.client.BadStatusLine,
-    ssl.SSLEOFError,
-    ssl.SSLZeroReturnError,
+    OSError,
+    http.client.HTTPException,
 )
 
 # 4 attempts, jittered exponential backoff 1s/2s/4s (cap 8s) → worst case
@@ -1184,10 +1207,28 @@ def run() -> int:
 
 
 def main() -> int:
-    """Last-resort net: an ApiError escaping `run()` must NEVER become a
-    bare traceback, because an uncaught exception exits 1 and exit 1 is
-    this lint's code for "a required workflow carries a paths filter".
-    That is how a Cloudflare 502 came to report a compliance finding."""
+    """Last-resort net: NOTHING may escape as a bare traceback, because an
+    uncaught exception exits 1 and exit 1 is this lint's code for "a
+    required workflow carries a paths filter". That is how a Cloudflare 502
+    came to report a compliance finding, and an earlier revision of the fix
+    still leaked read-phase network errors through the same hole.
+
+    The catch-all is `Exception`, and it maps to exit 4 — NOT 5. That
+    distinction is deliberate:
+
+      * Exit 5 asserts a specific fact — "the API never answered". For a
+        network failure that is true and provable (api() exhausted its
+        retries). For a TypeError in our own YAML walk it is a FABRICATION:
+        we would be blaming Cloudflare for our own bug. Inventing a cause
+        you did not observe is the same fault as inventing a finding you
+        did not make, so a blanket route to 5 would reintroduce the defect
+        one level up.
+      * Exit 4 claims only what is actually known: verification did not
+        complete. Honest for any unexpected failure.
+
+    Either way the load-bearing property holds — an internal fault NEVER
+    exits 1 and NEVER reads as non-compliance.
+    """
     try:
         return run()
     except ApiUnreachable as e:
@@ -1202,6 +1243,22 @@ def main() -> int:
             f"::error::LINT DID NOT COMPLETE — unusable Gitea API response: "
             f"{e}. This is NOT a compliance finding; no workflow was "
             f"judged. Exit 4.\n"
+        )
+        return 4
+    except Exception as e:  # noqa: BLE001 - deliberate catch-all; see docstring
+        sys.stderr.write(
+            f"::error::LINT DID NOT COMPLETE — unexpected internal error in "
+            f"lint-required-no-paths: {type(e).__name__}: {e}. This is NOT a "
+            f"compliance finding — no workflow was judged, and this is a bug "
+            f"in the lint itself, not a finding about any workflow. "
+            f"Traceback follows for debugging; exit 4.\n"
+        )
+        traceback.print_exc(file=sys.stderr)
+        _step_summary(
+            "## ⚠ lint-required-no-paths — **THE LINT CRASHED**\n\n"
+            "**This is NOT a compliance finding. No workflow was judged.** "
+            f"Internal error: `{type(e).__name__}: {e}`\n\n"
+            "This is a bug in the lint, not in any workflow. Exit 4.\n"
         )
         return 4
 
