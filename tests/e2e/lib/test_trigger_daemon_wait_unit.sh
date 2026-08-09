@@ -521,6 +521,54 @@ else
   echo "FAIL: an armed run reported samples=0 — the counter cannot distinguish the vacuous case"; FAILED=1
 fi
 
+# ── "NOT POLLED" AND "BLIND" ARE DIFFERENT STATES ────────────────────────────
+#
+# `samples == 0` conflated two outcomes that mean opposite things, and the live
+# log printed the identical "carries NO evidence" line for both on every green
+# run. TRIGGER_DAEMON_PROGRESS_READS separates them: reads counts ATTEMPTS,
+# samples counts READABLE attempts.
+#
+#   reads == 0              returned on the probe before any read. Benign — the
+#                           evidence arrived before the detector looked.
+#   reads > 0, samples == 0 polled and read nothing. The real blind spot.
+stage_health 5
+stage_history 2
+trigger_daemon_wait c "$BACKSTOP" "$SIMPOLL" 60 "$STALL" probe_hit
+if [ "$TRIGGER_DAEMON_PROGRESS_READS" = "0" ] && [ "$TRIGGER_DAEMON_PROGRESS_SAMPLES" = "0" ]; then
+  echo "PASS [reads=0 samples=0] evidence on the first probe -> NOT POLLED, distinguishable from blind"
+else
+  echo "FAIL: probe_hit gave reads=$TRIGGER_DAEMON_PROGRESS_READS samples=$TRIGGER_DAEMON_PROGRESS_SAMPLES, expected 0/0 — a fast pass is being counted as a poll"; FAILED=1
+fi
+
+stage_history none   # unreadable log: polls happen, reads return nothing
+trigger_daemon_wait c 30 10 60 "$STALL" probe_never
+if [ "$TRIGGER_DAEMON_PROGRESS_READS" -gt 0 ] && [ "$TRIGGER_DAEMON_PROGRESS_SAMPLES" = "0" ]; then
+  echo "PASS [reads=$TRIGGER_DAEMON_PROGRESS_READS samples=0] polled but unreadable -> BLIND, the state that genuinely carries no evidence"
+else
+  echo "FAIL: unreadable log gave reads=$TRIGGER_DAEMON_PROGRESS_READS samples=$TRIGGER_DAEMON_PROGRESS_SAMPLES, expected reads>0 and samples=0"; FAILED=1
+fi
+
+stage_history 2      # readable: reads and samples both climb, and agree
+trigger_daemon_wait c 30 10 60 "$STALL" probe_never
+if [ "$TRIGGER_DAEMON_PROGRESS_SAMPLES" -gt 0 ] && [ "$TRIGGER_DAEMON_PROGRESS_READS" -eq "$TRIGGER_DAEMON_PROGRESS_SAMPLES" ]; then
+  echo "PASS [reads=$TRIGGER_DAEMON_PROGRESS_READS samples=$TRIGGER_DAEMON_PROGRESS_SAMPLES] readable log -> ARMED, every attempt readable"
+else
+  echo "FAIL: readable log gave reads=$TRIGGER_DAEMON_PROGRESS_READS samples=$TRIGGER_DAEMON_PROGRESS_SAMPLES; both should climb together"; FAILED=1
+fi
+
+# The harness must report all THREE states, not two.
+if [ -f "$HARNESS" ]; then
+  _missing=""
+  for pat in "NOT POLLED" "BLIND" "ARMED" "TRIGGER_DAEMON_PROGRESS_READS"; do
+    grep -q "$pat" "$HARNESS" || _missing="$_missing $pat"
+  done
+  if [ -z "$_missing" ]; then
+    echo "PASS [3 states] the harness distinguishes ARMED / NOT POLLED / BLIND"
+  else
+    echo "FAIL: the harness is missing:$_missing — a fast pass and a genuine blind spot would print the same line again"; FAILED=1
+  fi
+fi
+
 # ── EVERY BOUND ON THE PATH IS REACHABLE ─────────────────────────────────────
 #
 # The 210-vs-600 defect was an ordering defect nobody could see: the outer bound
@@ -629,9 +677,9 @@ fi
 # 2. TRUNCATED — rows present, but fewer than the path has.
 trigger_daemon_timeout_ledger() { printf 'a|10|d|reachable\nb|60|h|reachable\nc|600|d|reachable\n'; }
 if out=$(trigger_daemon_timeout_ordering_check 10 2>&1); then
-  echo "FAIL: a TRUNCATED ledger (3 of $TRIGGER_DAEMON_LEDGER_ROWS rows) returned success — bounds silently fell off the path unchecked"; FAILED=1
+  echo "FAIL: a TRUNCATED ledger (3 of $(trigger_daemon_ledger_rows) rows) returned success — bounds silently fell off the path unchecked"; FAILED=1
 else
-  echo "PASS [refused] a TRUNCATED ledger (3 of $TRIGGER_DAEMON_LEDGER_ROWS rows)"
+  echo "PASS [refused] a TRUNCATED ledger (3 of $(trigger_daemon_ledger_rows) rows)"
 fi
 
 # 3. RIGHT COUNT, no chain — all-but-one subsumed. The row count is satisfied and
@@ -646,13 +694,71 @@ else
   echo "PASS [refused] right row count but no reachable CHAIN (1 reachable, 5 subsumed)"
 fi
 
+# 4. THE COUNT GUARD MUST NOT BE BYPASSABLE BY AN ENV KNOB.
+#    It shipped for one commit as `${TRIGGER_DAEMON_LEDGER_ROWS:-6}` — the only
+#    numeric knob in the lib with no validator — consumed by a bare `[ -ne ]`.
+#    A non-numeric value makes that test ERROR (rc=2), not return false; the `if`
+#    reads the error as false, the count check is SKIPPED, and a truncated ledger
+#    passes at rc=0. `set -e` is exempt inside an `if`, so nothing aborts.
+#
+#    Three vectors, because the first fix (a hard `TRIGGER_DAEMON_LEDGER_ROWS=6`
+#    constant) closed only the first and STILL bypassed on the other two when
+#    actually run. The count now comes from a FUNCTION, which a variable
+#    assignment cannot shadow.
+trigger_daemon_timeout_ledger() { printf 'a|10|d|reachable\nb|60|h|reachable\nc|600|d|reachable\n'; }
+_env_bypass() { # $1 = description, then the command that must still REFUSE
+  local desc="$1"; shift
+  if "$@" >/dev/null 2>&1; then
+    echo "FAIL: $desc — a 3-of-6 truncated ledger PASSED; the count guard was bypassed"; FAILED=1
+  else
+    echo "PASS [refused] $desc"
+  fi
+}
+_check_prefix() { TRIGGER_DAEMON_LEDGER_ROWS=abc trigger_daemon_timeout_ordering_check 10; }
+# shellcheck disable=SC2034
+#   "TRIGGER_DAEMON_LEDGER_ROWS appears unused" is the ASSERTION, not a lint
+#   miss: nothing reads this variable any more, which is precisely why setting it
+#   can no longer weaken the guard. shellcheck agreeing that it is inert is
+#   corroboration; the runtime refusal below is the proof.
+_check_after()  { TRIGGER_DAEMON_LEDGER_ROWS=3;   trigger_daemon_timeout_ordering_check 10; }
+_env_bypass "command-prefix shadow TRIGGER_DAEMON_LEDGER_ROWS=abc" _check_prefix
+_env_bypass "assignment after sourcing TRIGGER_DAEMON_LEDGER_ROWS=3 (would legitimise truncation)" _check_after
+# (nothing to unset: the knob is retired; these assignments were inert)
+
+# 5. ...and a REDEFINED count function returning garbage must FAIL CLOSED, not
+#    skip. This is the residual the function form cannot prevent, so it is
+#    validated at the point of use instead.
+_rows_orig=$(declare -f trigger_daemon_ledger_rows)
+trigger_daemon_ledger_rows() { printf 'abc'; }
+if out=$(trigger_daemon_timeout_ordering_check 10 2>&1); then
+  echo "FAIL: a non-numeric expected row count returned SUCCESS — the count check was skipped rather than failing closed"; FAILED=1
+else
+  case "$out" in
+    *"not a positive integer"*) echo "PASS [refused, fail-closed] a non-numeric expected row count is diagnosed, not skipped" ;;
+    *) echo "FAIL: refused but with the wrong diagnosis ('$out')"; FAILED=1 ;;
+  esac
+fi
+eval "$_rows_orig"
+
 eval "$_ledger_orig"   # restore the real ledger for everything below
+
+# The env knob must be INERT against the real ledger too — set to garbage, the
+# check still passes and still reports 6 rows. (A "fix" that made every run fail
+# would also have refused the truncated case.)
+if out=$(TRIGGER_DAEMON_LEDGER_ROWS=zzz trigger_daemon_timeout_ordering_check 10 2>&1); then
+  case "$out" in
+    *"checked 6 row(s)"*) echo "PASS [$out] the retired env knob is INERT: real ledger still passes and still counts 6" ;;
+    *) echo "FAIL: passed but did not report 6 rows ('$out')"; FAILED=1 ;;
+  esac
+else
+  echo "FAIL: the real ledger was refused merely because a stale env knob was set: $out"; FAILED=1
+fi
 
 # ...and the restored, real ledger must still PASS and must REPORT its count —
 # a guard that only ever refuses is as useless as one that only ever passes.
 if out=$(trigger_daemon_timeout_ordering_check 10 2>&1); then
   case "$out" in
-    *"checked $TRIGGER_DAEMON_LEDGER_ROWS row(s)"*)
+    *"checked $(trigger_daemon_ledger_rows) row(s)"*)
       echo "PASS [$out] the real ledger passes AND reports how many rows it checked" ;;
     *)
       echo "FAIL: the real ledger passed but did not report its row count ('$out') — an armed check must be distinguishable from an empty one"; FAILED=1 ;;

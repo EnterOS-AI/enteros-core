@@ -104,11 +104,29 @@ export TRIGGER_DAEMON_LAST_AGE="${TRIGGER_DAEMON_LAST_AGE:-}"
 # detector was never armed passes identically to one in which it was armed and
 # correct, so the caller must be able to assert it engaged and print the count.
 #
-#   TRIGGER_DAEMON_PROGRESS_SAMPLES     readable attempt-log reads (0 == the
-#                                       detector NEVER ARMED — treat as no proof)
+#   TRIGGER_DAEMON_PROGRESS_READS       ATTEMPTED attempt-log reads (poll
+#                                       iterations that reached the read step)
+#   TRIGGER_DAEMON_PROGRESS_SAMPLES     READABLE attempt-log reads
 #   TRIGGER_DAEMON_PROGRESS_TRANSITIONS observed advancements of the attempt log
 #   TRIGGER_DAEMON_PROGRESS_AGE         seconds since the last advancement ("" if
 #                                       never armed)
+#
+# READS AND SAMPLES ARE BOTH NEEDED because `samples == 0` alone conflates two
+# materially different outcomes, and the first version of this instrumentation
+# printed the same sentence for both — on every green run, twice:
+#
+#   reads == 0                 the wait returned on the probe BEFORE the first
+#                              read. Nothing was polled; there was evidence, and
+#                              it arrived before the detector needed to look.
+#                              Benign, and saying "carries no evidence" here is
+#                              simply false.
+#   reads > 0, samples == 0    polled, and read NOTHING every time. This is the
+#                              real blind spot: the leg's verdict genuinely
+#                              carries no information about the delivery lane.
+#
+# A diagnostic that says the same thing about a healthy fast path and a genuine
+# gap trains its reader to skip it, which costs exactly the case it exists for.
+export TRIGGER_DAEMON_PROGRESS_READS="${TRIGGER_DAEMON_PROGRESS_READS:-0}"
 export TRIGGER_DAEMON_PROGRESS_SAMPLES="${TRIGGER_DAEMON_PROGRESS_SAMPLES:-0}"
 export TRIGGER_DAEMON_PROGRESS_TRANSITIONS="${TRIGGER_DAEMON_PROGRESS_TRANSITIONS:-0}"
 export TRIGGER_DAEMON_PROGRESS_AGE="${TRIGGER_DAEMON_PROGRESS_AGE:-}"
@@ -219,6 +237,7 @@ trigger_daemon_wait() {
   local container="${1:-}" backstop="${2:-}" poll="${3:-}" stale="${4:-}" stall="${5:-}" probe="${6:-}"
   TRIGGER_DAEMON_LAST_AGE=""
   TRIGGER_DAEMON_PROGRESS_AGE=""
+  TRIGGER_DAEMON_PROGRESS_READS=0
   TRIGGER_DAEMON_PROGRESS_SAMPLES=0
   TRIGGER_DAEMON_PROGRESS_TRANSITIONS=0
 
@@ -248,6 +267,10 @@ trigger_daemon_wait() {
       return 2
     fi
 
+    # Counted BEFORE the readability test: this records that a read was
+    # ATTEMPTED, which is what separates "never polled" from "polled and saw
+    # nothing". Only the second is a blind spot.
+    TRIGGER_DAEMON_PROGRESS_READS=$((TRIGGER_DAEMON_PROGRESS_READS + 1))
     digest=$(trigger_daemon_progress_digest "$container")
     if [ -n "$digest" ]; then
       TRIGGER_DAEMON_PROGRESS_SAMPLES=$((TRIGGER_DAEMON_PROGRESS_SAMPLES + 1))
@@ -645,13 +668,26 @@ trigger_daemon_backstop_resolve() {
 # so there is no file here to grep for a cap-shaped env name, and an offline
 # unit test cannot fetch one.
 #
-# What DOES cover it is the version pin: `trigger_daemon_scheduler_version_
-# validated` is compared against core's live pin in
-# plugin_registry_test.go, and the unit test REDS the moment they diverge. A new
-# daemon timeout can only reach a workspace through a repin, and a repin cannot
-# land without turning this red first, which forces the re-read that adds the
-# row. That is a weaker guarantee than a direct grep and it is the honest one:
-# it catches the version moving, not the content, so the re-read is the control.
+# What covers the DAEMON half — and ONLY the daemon half — is the scheduler
+# version pin: `trigger_daemon_scheduler_version_validated` is compared against
+# core's live pin in plugin_registry_test.go, and the unit test REDS the moment
+# they diverge. A new SCHEDULER timeout can only reach a workspace through a
+# repin, and a repin cannot land without turning this red first, which forces the
+# re-read that adds the row.
+#
+# THE RUNTIME HALF IS UNCOVERED. There is no equivalent comparison for
+# molecule-ai-workspace-runtime: nothing here pins or checks its version, so a
+# new timeout added to `turn_lease.py` (or anywhere else in the runtime) reaches
+# a workspace with nothing in this repo going red. `TRIGGER_DAEMON_RUNTIME_IDLE_
+# TTL_SECS` below is a transcribed constant, not a verified one — the ordering
+# check will notice if the value it encodes stops being consistent with the cap,
+# and notices nothing at all if the runtime grows a bound this ledger has never
+# heard of.
+#
+# Both statements are deliberately narrow. Even the daemon half catches the
+# VERSION moving, not the content, so the human re-read on a repin is the actual
+# control; and claiming the runtime were covered too would be this file's third
+# comment promising more than the code does.
 #
 # DISPOSITIONS. Exactly two are legal:
 #   reachable        nothing on the path cuts before it, so it can actually fire.
@@ -731,7 +767,31 @@ trigger_daemon_timeout_ledger() {
 # The number of rows the ledger MUST have. Not a style check — see the counter
 # guard in `trigger_daemon_timeout_ordering_check`. Bump it in the same commit
 # that adds or removes a row, which is the point: the bump is the review.
-TRIGGER_DAEMON_LEDGER_ROWS="${TRIGGER_DAEMON_LEDGER_ROWS:-6}"
+#
+# A FUNCTION, NOT A VARIABLE, and that distinction is the whole fix.
+#
+# It shipped for one commit as `${TRIGGER_DAEMON_LEDGER_ROWS:-6}` — the only
+# numeric knob in this file with no `case` validator — and the guard consumes it
+# through a bare `[ "$rows" -ne "$expected" ]`. With a non-numeric value that
+# test does not evaluate false, it ERRORS (`[: abc: integer expected`, rc=2), the
+# `if` reads the error as false, the count check is SKIPPED, and a 3-of-6
+# truncated ledger passes at rc=0 announcing `checked 3 row(s), 3 reachable,
+# ordering strictly increasing`. `set -e` is exempt inside an `if` condition, so
+# nothing aborts. An anti-vacuity guard with its own bypass.
+#
+# WHY A PLAIN CONSTANT WAS NOT ENOUGH — measured, not assumed. Replacing the
+# default with `TRIGGER_DAEMON_LEDGER_ROWS=6` at source time closes only the
+# INHERITED-ENVIRONMENT vector. A caller can still shadow a global for the
+# duration of one call with a command prefix (`TRIGGER_DAEMON_LEDGER_ROWS=abc
+# trigger_daemon_timeout_ordering_check 10`), or simply assign after sourcing;
+# both reproduce the identical skip. The first attempt at this fix was a hard
+# constant and it still bypassed when actually run.
+#
+# A function cannot be shadowed by either. Overriding it needs a redefinition —
+# the same class of act as replacing the ledger itself, which is an edit, not an
+# input. And because a redefinition could still return garbage, the caller
+# VALIDATES the result and fails closed rather than skipping.
+trigger_daemon_ledger_rows() { printf '%s' 6; }
 
 # trigger_daemon_timeout_ordering_check [observation-poll-secs]
 #
@@ -758,8 +818,20 @@ TRIGGER_DAEMON_LEDGER_ROWS="${TRIGGER_DAEMON_LEDGER_ROWS:-6}"
 #
 # The count is printed on stdout on success too (prefixed `timeout-ledger:
 # checked N row(s)`) — a silent pass is exactly what let the empty case hide.
+#
+# SCOPE: THESE ARE EDIT-TIME INVARIANTS, ENFORCED AT RUNTIME. No runtime input
+# produces an empty, truncated, or all-subsumed ledger —
+# `trigger_daemon_timeout_ledger` emits six literal rows and the only way to
+# reach those shapes is to EDIT it. That is the same class as the call-site arity
+# guard and the bare-literal checks in the unit test: the failure being prevented
+# is a future edit, and the check runs at runtime because runtime is where a
+# wrong edit would otherwise go unnoticed. The unit test therefore exercises them
+# the only way they can be exercised — replace the ledger function, assert the
+# refusal, then restore it via `declare -f` / `eval` and re-assert that the real
+# six-row ledger still passes. A reader looking for the malformed input that
+# triggers these will not find one, and should not go looking.
 trigger_daemon_timeout_ordering_check() {
-  local poll="${1:-10}" ledger rc=0 prev_name="" prev_secs=0 name secs owner disp sub sub_secs
+  local poll="${1:-10}" ledger rc=0 prev_name="" prev_secs=0 name secs owner disp sub sub_secs expected
   local rows=0 reachable=0
 
   ledger=$(trigger_daemon_timeout_ledger "$poll") || {
@@ -778,9 +850,18 @@ trigger_daemon_timeout_ordering_check() {
   # ...and on TRUNCATED. Rows can only appear/disappear by editing the ledger, so
   # a mismatch is either a deliberate change (bump TRIGGER_DAEMON_LEDGER_ROWS in
   # the same commit) or a bound that silently fell off the path.
-  if [ "$rows" -ne "$TRIGGER_DAEMON_LEDGER_ROWS" ]; then
-    printf 'timeout-ledger: expected %s row(s), got %s — a bound was added or lost without review. If deliberate, bump TRIGGER_DAEMON_LEDGER_ROWS in the same commit; if not, a timeout on this path is no longer being checked at all.\n' \
-      "$TRIGGER_DAEMON_LEDGER_ROWS" "$rows"
+  expected=$(trigger_daemon_ledger_rows)
+  # VALIDATE BEFORE COMPARING. `[ "$rows" -ne "$expected" ]` with a non-numeric
+  # expected does not return false, it ERRORS (rc=2) — and an `if` treats that as
+  # false, silently skipping the count check. That is how this guard bypassed
+  # itself for one commit. Fail closed on anything unusable.
+  case "$expected" in ''|*[!0-9]*|0)
+    printf 'timeout-ledger: the expected row count is %q, not a positive integer — the count check cannot run, and a guard that cannot run must not report success.\n' "$expected"
+    return 1 ;;
+  esac
+  if [ "$rows" -ne "$expected" ]; then
+    printf 'timeout-ledger: expected %s row(s), got %s — a bound was added or lost without review. If deliberate, update trigger_daemon_ledger_rows in the same commit; if not, a timeout on this path is no longer being checked at all.\n' \
+      "$expected" "$rows"
     rc=1
   fi
 

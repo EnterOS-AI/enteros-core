@@ -282,11 +282,20 @@ e2e_scheduler_backstop_secs() {
 # $1 = leg name. Prints one line; never fails the run on its own — an unarmed
 # detector is a WEAKER run, not a broken product, and reporting it as a red
 # would make a slow container-exec into a product regression.
+# THREE outcomes, not two. The first version printed one "NEVER ARMED — carries
+# NO evidence" line for both `samples == 0` cases, which fired TWICE on every
+# green run and was FALSE on one of them: a leg that returns on its probe in
+# ~59ms did not fail to find evidence, it found evidence before the detector
+# needed to look. Saying the same thing about that and about a leg that polled
+# for 64s and read nothing trains the reader to skip the line entirely — losing
+# exactly the case it exists to surface.
 scheduler_progress_report() {
   if [ "${TRIGGER_DAEMON_PROGRESS_SAMPLES:-0}" -gt 0 ]; then
-    log "    [$1] delivery-stall detector ARMED: ${TRIGGER_DAEMON_PROGRESS_SAMPLES} attempt-log reads, ${TRIGGER_DAEMON_PROGRESS_TRANSITIONS} observed advancement(s), ${TRIGGER_DAEMON_PROGRESS_AGE:-0}s since the last one."
+    log "    [$1] delivery-stall detector ARMED: ${TRIGGER_DAEMON_PROGRESS_SAMPLES}/${TRIGGER_DAEMON_PROGRESS_READS:-0} attempt-log reads readable, ${TRIGGER_DAEMON_PROGRESS_TRANSITIONS} observed advancement(s), ${TRIGGER_DAEMON_PROGRESS_AGE:-0}s since the last one."
+  elif [ "${TRIGGER_DAEMON_PROGRESS_READS:-0}" -eq 0 ]; then
+    log "    [$1] delivery-stall detector NOT POLLED — the wait returned on its probe before the first read. Not a gap: the evidence arrived faster than the detector needed to look."
   else
-    log "    [$1] delivery-stall detector NEVER ARMED (0 readable attempt-log reads) — this leg's result carries NO evidence about the delivery lane; only the tick-liveness signal was in play."
+    log "    [$1] delivery-stall detector BLIND: polled ${TRIGGER_DAEMON_PROGRESS_READS} time(s) and read the attempt log 0 times. THIS leg's result carries no evidence about the delivery lane — only tick-liveness was in play. Expected before a workspace's first-ever attempt (no schedule-history.json yet); anything else means the log is unreadable and the wedged-delivery signal is dark."
   fi
 }
 
