@@ -587,7 +587,12 @@ class TestUnreachableIsNotNonCompliance:
         rc, log, attempts = self._run(monkeypatch, ["403"], capsys)
         assert rc == 4, "403 is fail-closed auth, not exit 5 unreachable"
         assert len(attempts) == 1, "403 must not be retried"
-        assert "AUTH FAILURE" in log and "repo-admin" in log
+        assert "AUTH FAILURE" in log
+        # The log states the OBSERVED fact and quotes the API, rather than
+        # prescribing a grant that is already in place (see
+        # test_the_403_summary_names_the_api_message_not_a_presumed_cause).
+        assert "Gitea said:" in log and "forbidden" in log
+        assert "was NOT retried" in log
         assert "retrying in" not in log
         assert "UNREACHABLE" not in log and "LINT DID NOT RUN" not in log
 
@@ -762,23 +767,36 @@ class TestUnreachableIsNotNonCompliance:
         rc, log, _ = self._run(monkeypatch, ["403"], capsys)
         assert rc == 4 and "AUTH FAILURE" in log and "Traceback" not in log
 
-    @pytest.mark.parametrize("script", [["502"], ["403"], ["ok"]])
-    def test_every_terminal_branch_reports_somewhere(
-        self, api_env, monkeypatch, capsys, tmp_path, script
+    def test_the_403_summary_names_the_api_message_not_a_presumed_cause(
+        self, api_env, monkeypatch, capsys, tmp_path
     ):
-        """Negative control against a future branch being added without a
-        summary: each non-clean exit must write one, and the clean run
-        must not write a scary one."""
+        """The remediation must not instruct something already done.
+
+        The old text said "grant repo-admin to mc-drift-bot (team
+        `drift-bot`, perm=admin)" — but that team IS perm=admin and the
+        account is already `owner` here, so an operator finds the box
+        ticked and blames the lint. And this was the one terminal branch
+        that discarded Gitea's own message, which is exactly what
+        distinguishes a permission 403 from a PAT-scope 403 from a
+        Cloudflare WAF 403."""
         summary = tmp_path / "summary.md"
         monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
-        rc, _, _ = self._run(monkeypatch, script, capsys)
-        md = summary.read_text(encoding="utf-8") if summary.exists() else ""
-        if rc == 0:
-            assert "DID NOT RUN" not in md and "AUTH FAILURE" not in md
-        else:
-            assert "NOT a compliance finding" in md, (
-                f"exit {rc} wrote no run-summary banner"
-            )
+        opener, _ = _scripted_opener(["403"])
+        monkeypatch.setattr(lint.urllib.request, "urlopen", opener)
+        rc = lint.main()
+        log = "".join(capsys.readouterr())
+        md = summary.read_text(encoding="utf-8")
+        assert rc == 4
+        # Gitea's own body is surfaced, in BOTH the log and the summary.
+        assert "forbidden" in md, "the API's own message must be quoted"
+        assert "forbidden" in log
+        # It points at diagnosis, naming all three kinds.
+        for kind in ("permission", "PAT scope", "Cloudflare WAF"):
+            assert kind in md, f"403 taxonomy missing {kind!r}"
+        # And it does NOT issue the already-satisfied instruction.
+        assert "already `owner`" in md
+        assert "grant repo-admin to mc-drift-bot" not in md
+        assert "grant repo-admin to mc-drift-bot" not in log
 
     def test_404_still_degrades_gracefully_without_retrying(
         self, api_env, monkeypatch, capsys
@@ -846,6 +864,135 @@ class TestGenuineNonComplianceStillReds:
         assert "ARM A" in log
         assert "has a paths filter that would degrade" in log
         assert "LINT DID NOT RUN" not in log
+
+
+# ===========================================================================
+# THE EXIT CONTRACT IS ENUMERATED, NOT SAMPLED.
+#
+# The first version of this control parametrised over three hand-written
+# response scripts covering exits {0,4,5} and claimed to prove that no
+# branch could be added without a run-summary — while exits 1, 2 and 3
+# wrote nothing and it could not notice. It also could not simply be
+# extended: its assertion was `"NOT a compliance finding" in md`, and exit
+# 1 IS a compliance finding.
+#
+# So the class is now derived from `lint.EXIT_MEANING`, the machine-readable
+# exit contract in the script, and the CONTENT assertion varies by the
+# class recorded there. Adding an exit code to the registry without a
+# driver here fails `test_every_exit_code_has_a_driver`; adding a branch
+# that skips the summary fails `test_every_non_clean_exit_writes_a_summary`.
+# ===========================================================================
+class TestExitContractIsFullyCovered:
+    OFFENDER = """
+        name: Offending Lane
+        on:
+          pull_request:
+            paths: ['**.go']
+        jobs:
+          build:
+            name: Offending Lane
+            runs-on: ubuntu-latest
+            steps:
+              - run: go build ./...
+    """
+    CLEAN = """
+        name: Clean Lane
+        on: pull_request
+        jobs:
+          build:
+            name: Clean Lane
+            runs-on: ubuntu-latest
+            steps:
+              - run: go build ./...
+    """
+
+    def _drive(self, code, lint_mod, monkeypatch, tmp_path):
+        """Produce exit `code` for real. Returns the observed exit code."""
+        wf = tmp_path / "workflows"
+        wf.mkdir(exist_ok=True)
+        ssot = tmp_path / "required.txt"
+
+        def _lay(body, ctx):
+            (wf / "lane.yml").write_text(
+                textwrap.dedent(body), encoding="utf-8"
+            )
+            ssot.write_text(ctx + "\n", encoding="utf-8")
+            monkeypatch.setattr(lint_mod, "WORKFLOWS_DIR", str(wf))
+            monkeypatch.setattr(lint_mod, "REQUIRED_CONTEXTS_FILE", str(ssot))
+
+        if code == 0:
+            _lay(self.CLEAN, "Clean Lane / Clean Lane")
+            script = ["ok"]
+        elif code == 1:
+            _lay(self.OFFENDER, "Offending Lane / Offending Lane")
+            script = ["ok"]
+        elif code == 2:
+            _lay(self.CLEAN, "Clean Lane / Clean Lane")
+            monkeypatch.delenv("GITEA_TOKEN", raising=False)
+            script = ["ok"]
+        elif code == 3:
+            _lay(self.CLEAN, "Clean Lane / Clean Lane")
+            monkeypatch.setattr(
+                lint_mod, "REQUIRED_CONTEXTS_FILE", str(tmp_path / "gone.txt")
+            )
+            script = ["ok"]
+        elif code == 4:
+            _lay(self.CLEAN, "Clean Lane / Clean Lane")
+            script = ["403"]
+        elif code == 5:
+            _lay(self.CLEAN, "Clean Lane / Clean Lane")
+            script = ["502"]
+        else:  # pragma: no cover - guarded by the driver-coverage test
+            raise AssertionError(f"no driver for exit code {code}")
+
+        opener, _ = _scripted_opener(script)
+        monkeypatch.setattr(lint_mod.urllib.request, "urlopen", opener)
+        try:
+            return lint_mod.main()
+        except SystemExit as e:  # exits 2 and 3 signal via SystemExit
+            return e.code
+
+    def test_every_exit_code_has_a_driver(self):
+        """If someone adds a code to EXIT_MEANING, this fails until they
+        add a driver above — which is what makes the next test complete."""
+        assert set(lint.EXIT_MEANING) == {0, 1, 2, 3, 4, 5}
+
+    @pytest.mark.parametrize("code", sorted(lint.EXIT_MEANING))
+    def test_every_non_clean_exit_writes_a_summary(
+        self, api_env, monkeypatch, capsys, tmp_path, code
+    ):
+        summary = tmp_path / "summary.md"
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+        got = self._drive(code, lint, monkeypatch, tmp_path)
+        capsys.readouterr()
+        assert got == code, f"driver for exit {code} produced {got}"
+        md = summary.read_text(encoding="utf-8") if summary.exists() else ""
+        klass = lint.EXIT_MEANING[code][0]
+        if klass == "clean":
+            assert "DID NOT" not in md and "FINDING" not in md, (
+                "a clean run must not emit a scary banner"
+            )
+            return
+        assert md.strip(), f"exit {code} ({klass}) wrote NO run-summary"
+        if klass == "finding":
+            assert "IS a compliance finding" in md
+            assert "NOT a compliance finding" not in md
+        else:
+            assert "NOT a compliance finding" in md
+            assert "IS a compliance finding" not in md
+
+    @pytest.mark.parametrize("code", sorted(lint.EXIT_MEANING))
+    def test_no_exit_path_depends_on_the_summary_being_writable(
+        self, api_env, monkeypatch, capsys, tmp_path, code
+    ):
+        """Reporting must never change a verdict, on ANY branch."""
+        monkeypatch.setenv(
+            "GITHUB_STEP_SUMMARY", str(tmp_path / "no" / "dir" / "s.md")
+        )
+        got = self._drive(code, lint, monkeypatch, tmp_path)
+        log = "".join(capsys.readouterr())
+        assert got == code
+        assert "Traceback" not in log
 
 
 # ===========================================================================

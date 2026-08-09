@@ -89,7 +89,13 @@ exit code unaffected) and is promoted to blocking by setting
 `NOOP_GATE_ENFORCE=1` once those four lanes are converted to
 always-run. Arm A is and stays BLOCKING. Tracking: task #105.
 
-Exit codes:
+Exit codes — the MACHINE-READABLE copy is `EXIT_MEANING` below; this prose
+must agree with it, and the test suite enumerates the dict, not this text.
+Every non-clean exit writes a GITHUB_STEP_SUMMARY block whose wording is
+determined by its class there ("finding" says it IS one; "did-not-run" says
+it is NOT). A branch that skips the summary fails
+`test_every_non_clean_exit_writes_a_summary`.
+
   0 — no required workflow has a paths/paths-ignore filter (clean).
       Arm-B findings may be present as ::warning:: (report-only mode).
   1 — at least one required workflow has a paths/paths-ignore filter
@@ -179,13 +185,120 @@ import yaml  # PyYAML 6.0.2 — installed by the workflow before this runs.
 
 
 # --------------------------------------------------------------------------
+# THE EXIT CONTRACT — machine-readable, because prose is not enumerable
+# --------------------------------------------------------------------------
+# This table is the SSOT for what each exit code MEANS, and it exists so the
+# test suite can ENUMERATE the contract instead of hand-listing a subset of
+# it. The first version of the "every branch reports" control parametrised
+# over three hand-written scenarios covering exits {0,4,5} and claimed to
+# prove that no branch could be added without a run-summary — while exits 1,
+# 2 and 3 wrote nothing and the control could not notice. A guard that
+# covers half its class and claims the whole class is the same defect this
+# file exists to eliminate, so the class is now derived from here.
+#
+# `klass` drives the CONTENT contract, because the branches genuinely differ:
+#   "finding"     — the lint looked and found something. Exit 1 IS a
+#                   compliance finding; its banner must say so.
+#   "did-not-run" — the lint could not complete a verdict. Its banner must
+#                   say it is NOT a compliance finding.
+#   "clean"       — nothing to report; must NOT emit a scary banner.
+EXIT_MEANING: dict[int, tuple[str, str]] = {
+    0: ("clean", "clean — every resolvable enforced context was inspected"),
+    1: ("finding", "a required workflow carries a paths/paths-ignore filter"),
+    2: ("did-not-run", "env contract violation (missing GITEA_TOKEN/HOST/REPO/BRANCH)"),
+    3: ("did-not-run", "unusable input (workflows dir, workflow YAML, or SSOT file)"),
+    4: ("did-not-run", "the API answered and its answer blocks verification"),
+    5: ("did-not-run", "the API never answered (transient, retries exhausted)"),
+}
+
+_EXIT_TABLE_MD = "\n".join(
+    ["| exit | meaning |", "|---|---|"]
+    + [f"| {c} | {why} |" for c, (_k, why) in sorted(EXIT_MEANING.items())]
+)
+
+
+def _step_summary(markdown: str) -> None:
+    """Also surface a message in the run-summary UI, not only in the log.
+
+    A failed step's log is collapsed by default; the run summary is what an
+    operator sees first. "Unmistakable" has to mean unmistakable BEFORE
+    anyone expands a log — that is the difference between reading
+    `LINT DID NOT RUN` and spending an hour hunting a workflow defect that
+    does not exist. Best-effort: never let reporting break the verdict."""
+    dest = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not dest:
+        return
+    try:
+        with open(dest, "a", encoding="utf-8") as fh:
+            fh.write(markdown.rstrip() + "\n")
+    except OSError as exc:  # pragma: no cover - reporting must never throw
+        sys.stderr.write(f"::warning::could not write step summary: {exc}\n")
+
+
+def _verdict_summary(code: int, headline: str, detail: str = "") -> str:
+    """Build the class-appropriate run-summary block for `code`."""
+    klass, why = EXIT_MEANING.get(code, ("did-not-run", "unknown"))
+    if klass == "finding":
+        lead = (
+            "**This IS a compliance finding — a required workflow really does "
+            "carry a paths/paths-ignore filter.**"
+        )
+        title = "lint-required-no-paths — **FINDING**"
+    else:
+        lead = (
+            "**This is NOT a compliance finding. No workflow was judged.**"
+        )
+        title = "lint-required-no-paths — **LINT DID NOT COMPLETE**"
+    parts = [f"## ⚠ {title}", "", lead, "", headline]
+    if detail:
+        parts += ["", detail]
+    parts += ["", f"Exit **{code}** — {why}.", "", _EXIT_TABLE_MD]
+    return "\n".join(parts)
+
+
+def _report_finding(
+    offenders: list[tuple[str, "Path", list[str]]], *, arm: str
+) -> None:
+    """Run-summary block for exit 1 — the branch that IS a finding.
+
+    Exits 4 and 5 got a banner first because they were the ones being
+    MISREAD as findings. But the converse branch needs the summary just as
+    much: a real Arm-A hit is what the operator must act on, and it was
+    the only non-clean exit still reporting to a collapsed log alone.
+    """
+    lines = "\n".join(
+        f"- `{ctx}` — `{path.name}`" for ctx, path, _f in offenders
+    )
+    _step_summary(
+        _verdict_summary(
+            1,
+            f"**Arm {arm}** — {len(offenders)} required context(s) affected:",
+            f"{lines}\n\nA required check that cannot run (Arm A) or can "
+            f"green without running (Arm B) is a vacuous gate. Fix the "
+            f"workflow: remove the filter and make the job always run.",
+        )
+    )
+
+
+def _die(code: int, message: str, *, detail: str = "") -> None:
+    """Terminal exit for the hard-input / env branches.
+
+    Writes the `::error::` line AND the run-summary block, then exits — so
+    a branch cannot be added that reports to the log but not to the summary.
+    Raises SystemExit, which main() deliberately does NOT catch (see there).
+    """
+    sys.stderr.write(f"::error::{message}\n")
+    _step_summary(_verdict_summary(code, message, detail))
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------
 # Environment
 # --------------------------------------------------------------------------
 def _env(key: str, *, required: bool = True, default: str | None = None) -> str:
     val = os.environ.get(key, default)
     if required and not val:
-        sys.stderr.write(f"::error::missing required env var: {key}\n")
-        sys.exit(2)
+        _die(2, f"missing required env var: {key}")
     return val or ""
 
 
@@ -234,8 +347,7 @@ def _require_runtime_env() -> None:
     individual functions without setting the full env contract."""
     for key in ("GITEA_TOKEN", "GITEA_HOST", "REPO", "BRANCH"):
         if not os.environ.get(key):
-            sys.stderr.write(f"::error::missing required env var: {key}\n")
-            sys.exit(2)
+            _die(2, f"missing required env var: {key}")
 
 
 # --------------------------------------------------------------------------
@@ -530,8 +642,7 @@ def parse_context(ctx: str) -> tuple[str, str, str] | None:
 def _iter_workflow_files() -> list[Path]:
     d = Path(WORKFLOWS_DIR)
     if not d.is_dir():
-        sys.stderr.write(f"::error::workflows directory not found: {d}\n")
-        sys.exit(3)
+        _die(3, f"workflows directory not found: {d}")
     # `.yml` and `.yaml` — Gitea accepts both (rarely used `.yaml`, but
     # don't silently miss it if a future port uses it).
     return sorted(list(d.glob("*.yml")) + list(d.glob("*.yaml")))
@@ -559,8 +670,7 @@ def detect_paths_filters(workflow_path: Path) -> list[str]:
     try:
         doc = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
     except yaml.YAMLError as e:
-        sys.stderr.write(f"::error::YAML parse error in {workflow_path}: {e}\n")
-        sys.exit(3)
+        _die(3, f"YAML parse error in {workflow_path}: {e}")
     if not isinstance(doc, dict):
         return []
 
@@ -643,12 +753,12 @@ def load_enforced_contexts(path: str) -> list[str]:
     """
     p = Path(path)
     if not p.is_file():
-        sys.stderr.write(
-            f"::error::required-contexts SSOT not found: {path} — cannot "
-            f"enumerate the enforced set, so this lint FAILS CLOSED rather "
-            f"than greening a gate it could not verify.\n"
+        _die(
+            3,
+            f"required-contexts SSOT not found: {path} — cannot enumerate "
+            f"the enforced set, so this lint FAILS CLOSED rather than "
+            f"greening a gate it could not verify.",
         )
-        sys.exit(3)
     out: list[str] = []
     for raw in p.read_text(encoding="utf-8").splitlines():
         if _PENDING_MARKER_RE.match(raw.strip()):
@@ -672,8 +782,7 @@ def build_job_index() -> dict[str, tuple[Path, str, dict]]:
         try:
             doc = yaml.safe_load(f.read_text(encoding="utf-8"))
         except yaml.YAMLError as e:
-            sys.stderr.write(f"::error::YAML parse error in {f}: {e}\n")
-            sys.exit(3)
+            _die(3, f"YAML parse error in {f}: {e}")
         if not isinstance(doc, dict):
             continue
         wf_name = doc.get("name") or f.stem
@@ -897,24 +1006,6 @@ def detect_noop_gate(doc: dict, job_key: str) -> list[str]:
 # --------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------
-def _step_summary(markdown: str) -> None:
-    """Also surface a message in the run-summary UI, not only in the log.
-
-    A failed step's log is collapsed by default; the run summary is what an
-    operator sees first. "Unmistakable" has to mean unmistakable BEFORE
-    anyone expands a log — that is the difference between reading
-    `LINT DID NOT RUN` and spending an hour hunting a workflow defect that
-    does not exist. Best-effort: never let reporting break the verdict."""
-    dest = os.environ.get("GITHUB_STEP_SUMMARY")
-    if not dest:
-        return
-    try:
-        with open(dest, "a", encoding="utf-8") as fh:
-            fh.write(markdown.rstrip() + "\n")
-    except OSError as exc:  # pragma: no cover - reporting must never throw
-        sys.stderr.write(f"::warning::could not write step summary: {exc}\n")
-
-
 def run() -> int:
     """Main lint entrypoint. Returns the process exit code.
 
@@ -1035,14 +1126,35 @@ def run() -> int:
         #     protection. Nothing to enumerate; tolerated degradation,
         #     surfaced loudly (exit 0 with ::warning::).
         if http_status in (401, 403):
+            # REPORT THE OBSERVED FACT, NOT A PRESUMED CAUSE.
+            #
+            # This text used to end "Fix: grant repo-admin to mc-drift-bot
+            # (org team `drift-bot`, perm=admin)". That instruction is
+            # ALREADY SATISFIED — team `drift-bot` is perm=admin,
+            # mc-drift-bot is its sole member, and its effective permission
+            # on this repo is `owner`. An operator following it finds the
+            # box ticked and concludes the LINT is broken. A remediation
+            # that names a cause we did not observe is the same fault as a
+            # verdict that names a finding we did not make.
+            #
+            # So: state the status, quote what Gitea actually said, and
+            # point at DIAGNOSING WHICH KIND of 403 this is. The three kinds
+            # need different actions and the API message distinguishes them:
+            #   - permission 403  : the token's account lacks repo-admin
+            #                       (BP read needs admin:true; push:true is
+            #                       not enough — verified)
+            #   - PAT-scope 403   : the account has admin but the TOKEN was
+            #                       minted without the scope
+            #   - Cloudflare 403  : WAF, not Gitea at all (e.g. the
+            #                       error-1010 UA ban this file already
+            #                       works around) — body is HTML/CF JSON
             sys.stderr.write(
                 f"::error::GET {protection_path} returned HTTP "
-                f"{http_status} — DRIFT_BOT_TOKEN cannot read branch "
-                f"protections (needs repo-admin scope). AUTH FAILURE: "
-                f"cannot enumerate required checks, so this lint FAILS "
-                f"CLOSED rather than greening a gate it could not verify. "
-                f"Fix: grant repo-admin to mc-drift-bot (org team "
-                f"`drift-bot`, perm=admin) — fix the token, not the lint.\n"
+                f"{http_status}. AUTH FAILURE: cannot enumerate the "
+                f"required-check set, so this lint FAILS CLOSED rather than "
+                f"greening a gate it could not verify. This is an "
+                f"authorisation fact, not a transient one — it was NOT "
+                f"retried and re-running will not fix it. Gitea said: {e}\n"
             )
             # This branch needs the run-summary banner MORE than any other,
             # not less. A failed step's log is collapsed by default, and
@@ -1058,23 +1170,33 @@ def run() -> int:
                 "NOT VERIFY**\n\n"
                 "**This is NOT a compliance finding. No workflow was "
                 "judged.**\n\n"
-                f"`GET {protection_path}` returned **HTTP {http_status}**. "
-                "The token cannot read branch protections, so the required-"
-                "check set could not be enumerated and the no-paths-filter "
-                "invariant could not be verified. Failing closed rather "
-                "than greening a gate it could not check.\n\n"
+                f"`GET {protection_path}` returned **HTTP {http_status}**, "
+                "so the required-check set could not be enumerated and the "
+                "no-paths-filter invariant could not be verified. Failing "
+                "closed rather than greening a gate it could not check.\n\n"
                 "**This is an authorisation fact, not a transient one — it "
                 "was NOT retried, and re-running will not fix it.**\n\n"
-                "Fix: grant repo-admin to `mc-drift-bot` (org team "
-                "`drift-bot`, perm=admin). Fix the token, not the lint.\n\n"
-                "| exit | meaning | what to do |\n"
+                "**What the API actually said** (this is the diagnostic — "
+                "do not skip it):\n\n"
+                f"```\n{e}\n```\n\n"
+                "**Diagnose which kind of 403 this is — they need different "
+                "actions:**\n\n"
+                "| kind | how to tell | action |\n"
                 "|---|---|---|\n"
-                "| 1 | a required workflow really does carry a paths filter "
-                "| fix the workflow |\n"
-                "| **4** | **the API answered and its answer blocks "
-                "verification — you are here** | **fix the token / the "
-                "SSOT** |\n"
-                "| 5 | the API never answered | re-run; check the edge |\n"
+                "| permission | Gitea JSON message; the account lacks "
+                "repo-admin (BP read needs `admin:true` — `push:true` is "
+                "not enough) | grant repo-admin to the token's account |\n"
+                "| PAT scope | Gitea JSON message; the account HAS admin "
+                "but the token was minted without the scope | re-mint the "
+                "token with the admin scope |\n"
+                "| Cloudflare WAF | body is HTML or CF JSON (e.g. "
+                "`error code: 1010`), not a Gitea message | edge/UA issue, "
+                "not a permission at all |\n\n"
+                "Note: `mc-drift-bot` is already `owner` on this repo via "
+                "team `drift-bot` (perm=admin), so a bare *grant repo-admin* "
+                "is most likely NOT the fix — check the token's scope and "
+                "the response body above first.\n\n"
+                + _EXIT_TABLE_MD
             )
             return 4
         if http_status == 404:
@@ -1235,9 +1357,11 @@ def run() -> int:
                 "blocking. Tracking: task #105."
             )
         elif not offenders:
+            _report_finding(noop_offenders, arm="B")
             return 1
 
     if offenders:
+        _report_finding(offenders, arm="A")
         return 1
 
     print("")
