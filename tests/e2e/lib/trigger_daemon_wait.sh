@@ -19,6 +19,16 @@
 # which delivers inside the tick, a frozen heartbeat is expected during a fire
 # and this wait would misreport it; that version floor is the contract.
 #
+# "THE WATCHDOG" IS NO LONGER ONE FIXED DELIVERY TIMEOUT. It was, up to v0.2.1,
+# and the 600s this lib compared against was that timeout's env default. v0.2.2
+# retired the env var and v0.2.3 replaced the stopwatch with an activity-aware
+# classifier that has FOUR dispositions and TWO distinct bounds (a 900s idle TTL
+# and a 3600s absolute cap by default), including an "alive -> never cancelled"
+# branch that has no bound at all. The number this lib measures against is
+# therefore the ABSOLUTE cap specifically, and the harness CONFIGURES it rather
+# than mirroring it — see `trigger_daemon_watchdog_secs` below for which env
+# vars carry it and why both are needed.
+#
 # Callers get three distinguishable outcomes instead of one timeout:
 #   0 = evidence observed (pass immediately, no residual sleep)
 #   1 = backstop exhausted while the daemon kept ticking (NOT a frozen tick)
@@ -117,21 +127,135 @@ trigger_daemon_stale_secs() {
   printf '%s' "$stale"
 }
 
-# The daemon's own delivery watchdog, in whole seconds — the ONE number every
-# backstop in this lib is measured against. It exists as a function so no caller
-# re-types the value: a second copy of it is a second thing to forget when the
-# daemon's timeout moves, and the invariant below is only as good as the number
-# it compares to.
+# ─── the delivery cancel bound every backstop is measured against ────────────
+#
+# WHAT THIS NUMBER IS at the PINNED scheduler, and what it is NOT. There is no
+# daemon-side `MOLECULE_TRIGGER_DELIVERY_WATCHDOG_SECONDS` to mirror: v0.2.2
+# retired it, and core pins v0.2.3 (workspace-server/internal/handlers/
+# plugin_registry_test.go). v0.2.3's watchdog is ACTIVITY-AWARE — each tick it
+# reads the runtime's turn-lease snapshot and `classify_delivery_liveness`
+# returns one of four dispositions:
+#
+#   lease alive AND attributable      never cancelled, however long it runs
+#   lease attributable, idle-expired  cancel at the lease idle TTL
+#   lease attributable, past its cap  cancel at the runtime's ABSOLUTE cap
+#   no lease, or a lease NOT
+#     attributable to this delivery   cancel at the ABSOLUTE ceiling
+#
+# The LAST row is the ordinary case for an e2e workspace, not an exotic
+# fallback. The turn lease is workspace-GLOBAL (installed at container boot,
+# re-armed per turn, and `turn_lease.arm_turn_if_fed` leaves the FIRST turn of a
+# fresh container unarmed because nothing has yet proved the activity feed
+# works), while `lease_is_attributable` requires `turn_age_seconds < elapsed`.
+# On a freshly-provisioned workspace whose only activity is the fire it just
+# received, `turn_age` is container uptime PLUS this delivery's own elapsed, so
+# it exceeds `elapsed` at EVERY elapsed — the branch is permanent, not a
+# transient at the start of the delivery.
+#
+# So the worst case over all four branches is the ABSOLUTE cap, and that cap is
+# configured in TWO places which must BOTH be set or the smaller one is ignored:
+#
+#   MOLECULE_TRIGGER_DELIVERY_ABSOLUTE_CAP_SECONDS — the DAEMON's own ceiling
+#     (scheduler._absolute_cap_seconds; default 3600). Used verbatim only when
+#     there is no lease at all.
+#   MOLECULE_MAX_TURN_SECONDS — the RUNTIME's absolute per-turn cap
+#     (turn_lease._resolve_absolute_cap; default 4.0 x the 900s idle TTL, so
+#     3600). REPORTED-CAP-WINS: `_reported_absolute_cap` prefers the cap the
+#     snapshot carries over the daemon's env ceiling, so on the not-attributable
+#     branch — the ordinary one — setting the daemon env ALONE changes nothing.
+#
+# Both are injected onto e2e workspaces FROM THIS FUNCTION (see
+# `trigger_daemon_delivery_cap_env` below and its call site in
+# test_staging_full_saas.sh). That is what makes this a real bound rather than a
+# guess about somebody else's default: the harness owns the workspace env, so it
+# does not have to track the daemon's shipped cap — it sets it.
+#
+# THE DEFAULT, 600s, is chosen against measured delivery latency, not taste.
+# Across seven consecutive green ephemeral-happy-path runs on 2026-08-09 the
+# 10g DELIVER marker was already present within 0.05-0.15s of the fire being
+# observed, and the whole cron-boundary -> fire -> turn -> `notify` -> activity
+# row chain completed within 18.7s to 47.7s of the minute boundary — a bound
+# that already includes up to 10s of daemon poll lag and up to 10s of the
+# harness's own observation poll, so the true delivery is shorter still. 600s is
+# ~12.6x the WORST of those, satisfying this repo's ~10x margin rule, and it is
+# what keeps a shrunken cap from re-creating the v0.2.2 incident by
+# configuration: a cap under the real delivery time cancels every delivery and
+# the schedule never advances.
+#
+# It also derives exactly the 1800s backstop the harness already runs, so this
+# change costs no CI wall-clock and no job budget — what changes is that 1800
+# now strictly exceeds the REAL cap instead of a retired env var's nominal value.
 trigger_daemon_watchdog_secs() {
   local watchdog="${TRIGGER_DAEMON_WATCHDOG_SECS:-600}"
   case "$watchdog" in ''|*[!0-9]*|0) watchdog=600 ;; esac
+  # FLOOR. `0` and garbage already fell back to the default; a positive-but-
+  # absurd value did not, and it had three consequences, all of them a guard
+  # that passes while measuring against a declared lie:
+  #   - the derivation. TRIGGER_DAEMON_WATCHDOG_SECS=1 derived a 3s backstop.
+  #   - the refusal, which is a RELATIVE comparison and so waved through any
+  #     positive override at all — a 30s DELIVER backstop included.
+  #   - and now the injection: this number IS the daemon's and the runtime's
+  #     real cancel bound, so a 1 would tell the daemon to abandon every
+  #     delivery after one second — the v0.2.2 cancel/retry loop, reproduced by
+  #     configuration rather than by a bug.
+  # 60s is the floor because no real delivery completes under it; the measured
+  # ones take 18.7-47.7s. Clamping rather than refusing keeps this a FLOOR:
+  # every reader — derivation, refusal and injection alike — then sees the same
+  # honest number instead of three different ones.
+  [ "$watchdog" -ge 60 ] || watchdog=60
   printf '%s' "$watchdog"
 }
 
-# The backstop is a never-hit safety net, so it must EXCEED the daemon's own
-# delivery watchdog — otherwise the wait expires while a wedged fire is still
-# being re-queued for its retry, which is exactly how the old 360s budget could
-# never observe a recovery.
+# trigger_daemon_delivery_cap_env
+#
+# The workspace env, one KEY=VALUE per line, that pins the daemon's AND the
+# runtime's delivery cancel bounds to `trigger_daemon_watchdog_secs`. Emitted
+# from here rather than typed at the provision call site for the same reason the
+# watchdog is a function: a second copy of the number is a second thing to
+# forget, and the whole point of this pair is that the number the backstop is
+# derived from and the number the daemon actually enforces are THE SAME NUMBER.
+#
+# Both keys are required — see the REPORTED-CAP-WINS note above. Emitting only
+# the daemon key would leave the ordinary (not-attributable) branch bounded at
+# the runtime's 3600s default and the inequality would stay false while looking
+# fixed.
+#
+# MOLECULE_MAX_TURN_SECONDS rather than A2A_COMPLETION_IDLE_TIMEOUT_SECONDS is
+# deliberate. Both move the runtime's absolute cap, but the idle knob moves it
+# only via the 4x multiple, which means dividing the executor's per-event idle
+# cap by four as a side effect — at 600s that would put a real LLM turn on a
+# 150s leash, ~3x the measured worst case. MOLECULE_MAX_TURN_SECONDS moves the
+# absolute cap ALONE and leaves the idle cap at its 900s default (~19x measured).
+# Its one side effect is that `turn_is_alive_despite_idle` can no longer rescue a
+# turn past the idle cap, since the cap is now below the TTL — reaching that
+# needs 900s of runtime-event silence, which every other budget in this harness
+# (a 90s A2A turn, a 360s idle digest) already calls a hard failure.
+trigger_daemon_delivery_cap_env() {
+  local cap
+  cap=$(trigger_daemon_watchdog_secs)
+  printf 'MOLECULE_TRIGGER_DELIVERY_ABSOLUTE_CAP_SECONDS=%s\n' "$cap"
+  printf 'MOLECULE_MAX_TURN_SECONDS=%s\n' "$cap"
+}
+
+# The scheduler tag whose source the two env names and the four-branch model
+# above were READ AT — not guessed from, not inferred from a version string.
+#
+# Everything here is only as true as that reading. If core repins the scheduler
+# and the new version renames a knob, adds a fifth disposition, or stops
+# preferring the runtime's reported cap, the injection silently stops bounding
+# anything and the backstop goes back to exceeding a number nobody enforces —
+# which is precisely the failure mode being fixed, one version later. So the
+# unit test compares this against core's live pin and REDS on a bump, forcing a
+# re-read rather than letting the derivation rot in place.
+trigger_daemon_scheduler_version_validated() {
+  printf '%s' 'v0.2.3'
+}
+
+# The backstop is a never-hit safety net, so it must EXCEED the delivery cancel
+# bound above — otherwise the wait expires while a wedged fire is still being
+# re-queued for its retry, which is exactly how the old 360s budget could never
+# observe a recovery. 3x leaves room for the cancel AND at least two full retry
+# cycles inside the wait.
 trigger_daemon_backstop_secs() {
   printf '%s' $(( $(trigger_daemon_watchdog_secs) * 3 ))
 }

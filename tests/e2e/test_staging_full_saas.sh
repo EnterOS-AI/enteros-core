@@ -108,26 +108,26 @@
 #                                lane red twice on 2026-07-30 with
 #                                curl_rc=28 / http=000.
 #   E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS
-#                                default 600. The daemon-side delivery timeout
-#                                every backstop above is derived from and
-#                                measured against. Set it here if you retune the
-#                                daemon.
-#                                CAVEAT, deliberately left as-is by the change
-#                                that added the enforcement above: 600 mirrors
-#                                MOLECULE_TRIGGER_DELIVERY_WATCHDOG_SECONDS,
-#                                which scheduler v0.2.2 RETIRED. v0.2.3 replaces
-#                                the fixed timeout with an activity-aware
-#                                watchdog probing every ~30s, whose FALLBACK
-#                                ceiling (MOLECULE_TRIGGER_DELIVERY_ABSOLUTE_CAP
-#                                _SECONDS, used only when no turn-lease answer is
-#                                obtainable) defaults to 3600 — larger than the
-#                                1800 this derives. Tracking 3600 literally would
-#                                make the backstop 10800s inside a 75-minute job
-#                                (e2e-ephemeral-happy-path.yml), so the number is
-#                                a POLICY call about the job budget, not a
-#                                mechanical follow-on. Filed separately; the
-#                                inequality enforced above is correct against
-#                                whatever value is configured here.
+#                                default 600, floored at 60. The delivery
+#                                ABSOLUTE CANCEL BOUND. This is not a value
+#                                mirrored from the daemon: scheduler v0.2.2
+#                                retired MOLECULE_TRIGGER_DELIVERY_WATCHDOG
+#                                _SECONDS and there is nothing by that name to
+#                                retune, so the harness CONFIGURES the bound
+#                                instead. Step 10's provision injects this same
+#                                number onto the workspace as BOTH
+#                                MOLECULE_TRIGGER_DELIVERY_ABSOLUTE_CAP_SECONDS
+#                                (the daemon's ceiling) and
+#                                MOLECULE_MAX_TURN_SECONDS (the runtime's
+#                                per-turn cap, which the daemon PREFERS over its
+#                                own ceiling whenever the turn-lease snapshot
+#                                reports one — so setting only the first leaves
+#                                the ordinary branch at its 3600s default). The
+#                                backstops above are then derived as 3x it and
+#                                strictly exceed the bound the daemon actually
+#                                enforces. Raise it if a real delivery ever
+#                                needs longer than 600s; both the injected caps
+#                                and the derived backstops follow.
 #
 # Exit codes:
 #   0  happy path
@@ -225,15 +225,27 @@ ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 # one drifted: 10g's DELIVER backstop was a bare `210` against the 600s watchdog
 # it was supposed to outlast, so a fire still inside the daemon's own budget was
 # reported as a delivery failure.
+#
+# The delivery cancel bound this run CONFIGURES, resolved ONCE through the lib so
+# the default AND the 60s floor apply at every reader. Re-expanding the raw
+# `${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-600}` at each site was a second copy
+# of the number: after the floor landed it would have quoted a declared `1` back
+# at an operator whose effective bound is 60, and injected a different value into
+# the workspace than the one the backstop was derived from.
+e2e_trigger_delivery_cap_secs() {
+  TRIGGER_DAEMON_WATCHDOG_SECS="${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-}" \
+    trigger_daemon_watchdog_secs
+}
+
 #   $1 = operator override ("" to derive)
 e2e_scheduler_backstop_secs() {
-  TRIGGER_DAEMON_WATCHDOG_SECS="${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-600}" \
+  TRIGGER_DAEMON_WATCHDOG_SECS="$(e2e_trigger_delivery_cap_secs)" \
     trigger_daemon_backstop_resolve "${1:-}"
 }
 
 # The refusal message, built once — $1 = knob name, $2 = the rejected value.
 scheduler_backstop_refusal() {
-  printf '%s' "Scheduler: $1='$2' is not a usable backstop. It must be a positive integer STRICTLY GREATER than the trigger daemon's delivery watchdog (${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-600}s; set E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS to mirror a retuned daemon). The backstop is a never-hit safety net, never a budget: at or below the watchdog it expires while a wedged fire is still being re-queued for its retry, so the wait can never observe the recovery and reports 'the daemon is still inside its own budget' as a red — the 360s-vs-600s inversion lib/trigger_daemon_wait.sh exists to prevent. Raise it, or unset it to take the derived 3x default."
+  printf '%s' "Scheduler: $1='$2' is not a usable backstop. It must be a positive integer STRICTLY GREATER than the delivery ABSOLUTE CANCEL BOUND this run configures on the workspace ($(e2e_trigger_delivery_cap_secs)s, injected at provision as MOLECULE_TRIGGER_DELIVERY_ABSOLUTE_CAP_SECONDS + MOLECULE_MAX_TURN_SECONDS). To move it, set E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS (floor 60) — that moves the injected caps AND these backstops together. Do NOT go looking for a daemon-side MOLECULE_TRIGGER_DELIVERY_WATCHDOG_SECONDS to retune: scheduler v0.2.2 retired it and v0.2.3's watchdog is activity-aware, so this bound is one the harness SETS, not one it mirrors. The backstop is a never-hit safety net, never a budget: at or below the cancel bound it expires while a wedged fire is still being re-queued for its retry, so the wait can never observe the recovery and reports 'the daemon is still inside its own budget' as a red — the 360s-vs-600s inversion lib/trigger_daemon_wait.sh exists to prevent. Raise it, or unset it to take the derived 3x default."
 }
 
 # Collision-proof slug construction (core#2782) — runs AFTER log/fail/ok
@@ -1046,14 +1058,35 @@ fi
 #
 # Guarded by lib/test_scheduler_source_ssot_unit.sh, which fails RED if any
 # pinned scheduler plugin source is reintroduced into tests/e2e/**/*.sh.
+#
+# The DELIVERY ABSOLUTE CANCEL BOUND is injected here too, and it is the reason
+# the backstops above can claim to exceed it. Left at its defaults, scheduler
+# v0.2.3 abandons a delivery it cannot attribute at 3600s — and a fresh e2e
+# workspace ALWAYS lands in that not-attributable branch, because the turn lease
+# is workspace-global and predates the fire it is being asked about. No backstop
+# that fits a 75-minute job can exceed 3600, so the harness stops trying to
+# track the daemon's default and CONFIGURES the bound instead: the same number
+# `trigger_daemon_watchdog_secs` derives the backstops from is written onto the
+# workspace as the daemon's ceiling AND the runtime's per-turn cap. Both keys,
+# emitted by one lib function so they cannot drift apart or from the backstop —
+# the daemon prefers the cap the runtime REPORTS over its own env ceiling, so
+# the daemon key alone would move nothing on the branch that matters.
 if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
-  SECRETS_JSON=$(SECRETS_JSON_IN="$SECRETS_JSON" python3 -c "
+  _SCHED_DLV_CAP_ENV=$(TRIGGER_DAEMON_WATCHDOG_SECS="${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-}" \
+    trigger_daemon_delivery_cap_env)
+  SECRETS_JSON=$(SECRETS_JSON_IN="$SECRETS_JSON" DLV_CAP_ENV="$_SCHED_DLV_CAP_ENV" python3 -c "
 import json, os
 s = json.loads(os.environ['SECRETS_JSON_IN'])
 s['MOLECULE_TRIGGER_POLL_SECONDS'] = os.environ.get('E2E_TRIGGER_POLL_SECONDS', '10')
+for line in os.environ['DLV_CAP_ENV'].splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    k, _, v = line.partition('=')
+    s[k] = v
 print(json.dumps(s))
 ")
-  log "    scheduler check ON: MOLECULE_TRIGGER_POLL_SECONDS=${E2E_TRIGGER_POLL_SECONDS:-10} (the molecule-scheduler plugin itself is declared by core at provision from the SDK native-plugins registry — this harness carries no source literal)"
+  log "    scheduler check ON: MOLECULE_TRIGGER_POLL_SECONDS=${E2E_TRIGGER_POLL_SECONDS:-10}, delivery cancel bound $(e2e_trigger_delivery_cap_secs)s injected as $(printf '%s' "$_SCHED_DLV_CAP_ENV" | tr '\n' ' ') (the backstops derive 3x that same number) — the molecule-scheduler plugin itself is declared by core at provision from the SDK native-plugins registry, so this harness carries no source literal"
 fi
 
 # Self-schedule tool sub-step (10f): with E2E_SELF_SCHEDULE_CHECK=on, additively
