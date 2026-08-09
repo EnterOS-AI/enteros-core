@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -581,13 +582,118 @@ func TestMCPDispatchNamespacesFrom(t *testing.T) {
 // and which that endpoint has no field for — may back a dispatch_observed:
 // label. If a future edit re-adds the summary arm, this fails.
 func TestMCPDispatchNamespaces_IgnoresForgeableAgentLogSummaries(t *testing.T) {
-	// The exact string a workspace would post to fake corroboration.
-	forged := []byte(`["\U0001F6E0 mcp__molecule_platform__list_orgs(limit=10)"]`)
+	// Built with json.Marshal so the marker is the REAL U+1F6E0 rune. An earlier
+	// draft hand-wrote "\U0001F6E0" inside a Go RAW string literal: that is a
+	// literal backslash-U, which is not a valid JSON escape, so json.Unmarshal
+	// rejected the element and the test passed without ever reaching the parser
+	// logic it claimed to cover. It survived a mutation that re-added the
+	// marker-stripping arm — a vacuous pass. Marshalling makes the fixture the
+	// string a forger would actually produce.
+	forgedSummary := "\U0001F6E0 mcp__molecule_platform__list_orgs(limit=10)"
+	forged, err := json.Marshal([]string{forgedSummary})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// Guard the fixture itself: the marker must survive into the JSON, or this
+	// test is again asserting nothing.
+	if !strings.Contains(string(forged), "\U0001F6E0") {
+		t.Fatalf("fixture lost the tool-use marker: %s", forged)
+	}
+
 	got, records := mcpDispatchNamespacesFrom([][]byte{forged})
 	if len(got) != 0 || records != 0 {
 		t.Errorf("a tool-use-shaped SUMMARY string produced namespaces %v (records=%d) — "+
-			"only core-written tool_trace entries may corroborate; reading a workspace-postable "+
-			"field would launder a self-report behind a dispatch_observed: label", got, records)
+			"only core-written tool_trace entries may corroborate; accepting a marker-prefixed "+
+			"string would launder a workspace-postable self-report behind a dispatch_observed: label", got, records)
+	}
+}
+
+// TestMCPSurface_ReadTouchesOnlyToolTrace pins the TRUST BOUNDARY at the SQL,
+// which is where it is actually enforced. The corroboration read must issue
+// exactly one query, against tool_trace, and must never reach
+// activity_logs.summary — the column POST /workspaces/:id/activity lets a
+// workspace write. Re-adding the agent_log UNION branch changes the query text
+// and leaves this expectation unmatched.
+func TestMCPSurface_ReadTouchesOnlyToolTrace(t *testing.T) {
+	mock := setupTestDB(t)
+	handler := NewRegistryHandler(newTestBroadcaster())
+
+	mock.ExpectQuery("^\\s*SELECT COALESCE\\(tool_trace::text, ''\\)\\s+FROM activity_logs\\s+WHERE workspace_id = \\$1 AND tool_trace IS NOT NULL\\s+ORDER BY created_at DESC\\s+LIMIT \\$2\\s*$").
+		WithArgs("ws-trust", int64(mcpDispatchLookbackRows)).
+		WillReturnRows(sqlmock.NewRows([]string{"trace"}).
+			AddRow(`[{"tool":"mcp__molecule_platform__list_orgs"}]`))
+	var surface string
+	mock.ExpectExec("UPDATE workspaces SET mcp_surface").
+		WithArgs(capturedArg{seen: &surface}, "ws-trust").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	handler.recordMCPSurfaceCorroboration(c, c, "ws-trust",
+		[]string{conciergePlatformMCPProvisionWorkspaceTool})
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("the corroboration read must be exactly one tool_trace query and nothing else "+
+			"(reading activity_logs.summary would admit workspace-posted rows): %v", err)
+	}
+	if !strings.Contains(surface, string(verdictCorroborated)) {
+		t.Errorf("expected %q in the persisted document, got: %s", verdictCorroborated, surface)
+	}
+	// The verdict must also be published to the request for evaluateStatus.
+	if got := mcpSurfaceVerdictFromContext(c); got != verdictCorroborated {
+		t.Errorf("request-context verdict = %q, want %q", got, verdictCorroborated)
+	}
+}
+
+// TestMCPSurface_ReadFailure_LeavesNoVerdict covers the best-effort contract:
+// a corroboration read that errors must NOT write the column, must NOT set a
+// verdict, and must not panic — a DB blip must read as "unknown", never as
+// "the evidence went away".
+func TestMCPSurface_ReadFailure_LeavesNoVerdict(t *testing.T) {
+	mock := setupTestDB(t)
+	handler := NewRegistryHandler(newTestBroadcaster())
+
+	mock.ExpectQuery("SELECT COALESCE\\(tool_trace::text").
+		WithArgs("ws-readfail", int64(mcpDispatchLookbackRows)).
+		WillReturnError(errors.New("connection reset"))
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	handler.recordMCPSurfaceCorroboration(c, c, "ws-readfail",
+		[]string{conciergePlatformMCPProvisionWorkspaceTool})
+
+	if got := mcpSurfaceVerdictFromContext(c); got != "" {
+		t.Errorf("a failed read produced the verdict %q — it must fail to the neutral value", got)
+	}
+	// No mcp_surface UPDATE was expected; if one fired, ExpectationsWereMet
+	// reports the unexpected call.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("a failed corroboration read must leave the previous record untouched: %v", err)
+	}
+}
+
+// TestMCPSurface_EmptyInventory_SkipsTheRead pins the short-circuit: an empty
+// reported list must persist the unknown:no_inventory_reported verdict WITHOUT
+// issuing the dispatch query (its answer cannot change the outcome). Only the
+// UPDATE is expected, so an unexpected SELECT fails the test.
+func TestMCPSurface_EmptyInventory_SkipsTheRead(t *testing.T) {
+	mock := setupTestDB(t)
+	handler := NewRegistryHandler(newTestBroadcaster())
+
+	var surface string
+	mock.ExpectExec("UPDATE workspaces SET mcp_surface").
+		WithArgs(capturedArg{seen: &surface}, "ws-empty").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	handler.recordMCPSurfaceCorroboration(c, c, "ws-empty", []string{})
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("empty inventory must persist a verdict without reading dispatches: %v", err)
+	}
+	if !strings.Contains(surface, string(verdictNoInventory)) {
+		t.Errorf("expected %q, got: %s", verdictNoInventory, surface)
+	}
+	if got := mcpSurfaceVerdictFromContext(c); got != verdictNoInventory {
+		t.Errorf("request-context verdict = %q, want %q", got, verdictNoInventory)
 	}
 }
 
