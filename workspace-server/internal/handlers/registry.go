@@ -1717,28 +1717,67 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 // There is NO run-time equivalent, so between deploys nothing re-checks it.
 //
 // Consumers that inherit the weaker claim (i.e. that treat `online` as
-// "ready to serve" and are wrong to):
+// "ready to serve" and are wrong to). ADMITTERS — these put real work in
+// front of the concierge on the strength of the flip:
 //
 //   - a2a_proxy.go conciergeWarmingGate — lifts its 503 the instant the row
 //     leaves 'provisioning', admitting real user turns.
+//   - request_nudge_sweeper.go sweepQuery — selects `w.status = 'online'`
+//     and FIRES REAL TURNS at the row unprompted. Unlike the warming gate
+//     (which only stops waiting), this one originates traffic, so an
+//     over-claimed online produces nudges into a concierge that may do
+//     nothing with them.
 //   - canvas ChatTab / MobileChat — enable the composer on online||degraded.
-//   - platform_agent_ensure.go platformAgentHealthy — 'online' is the ONLY
-//     "leave it alone" status, so an over-claimed online SUPPRESSES the
-//     repair/re-provision of a concierge that cannot actually serve.
-//   - a2a_queue.go queued-turn drain, discovery.go peer URL resolution,
-//     plugins_tracking.go fan-out.
 //
-// WHY THIS IS A DISCLOSURE AND NOT A GATE: gating the flip on genuine
-// callability is not achievable from here. The only non-self-reported evidence
-// the platform can observe is an INBOUND management-API call authenticated by
-// this concierge's own org token (created_by "system:concierge:<id>", see
-// resolveConciergeAdminCredential) — i.e. a real provision_workspace
-// invocation. That can only happen AFTER traffic is admitted, and traffic is
-// admitted by leaving 'provisioning' — so gating on it deadlocks. The
-// alternative, having the platform drive a synthetic turn that forces the verb,
-// is the retired fireConciergeWarmup pattern and the required verb is
-// side-effecting (it creates a real workspace). Accepting a runtime-reported
-// `tools/call` result would just relocate the self-report.
+// PASSIVE readers (route/target on it, but do not originate work):
+// a2a_queue.go queued-turn drain, discovery.go peer URL resolution,
+// plugins_tracking.go fan-out.
+//
+// REPAIR SUPPRESSION — real, but NARROW. platform_agent_ensure.go
+// platformAgentHealthy makes 'online' the only "leave it alone" status, so an
+// over-claimed online no-ops the ensure decision. Tracing the callers bounds
+// this tightly, and an honest reading matters here more than most:
+//
+//   - EnsureSelfHostedPlatformAgent (the only AUTOMATIC caller) is ROW-ONLY —
+//     no ProvisionTrigger — and self-host-gated (MOLECULE_ORG_ID unset). What
+//     the no-op costs is the "repaired" path's org-token re-anchor and
+//     re-parent, not a container repair.
+//   - MaybeProvisionPlatformAgentOnBoot, the actual container-level boot
+//     self-heal, reads status ONLY for its log line; it BRANCHES on
+//     prov.IsRunning() plus the identity probe ("IsRunning is the
+//     authoritative liveness check; status is the cheap one").
+//   - The onboarding/Settings repair path (canvas configure.ts runEnsure)
+//     sends force:true, bypassing platformAgentHealthy entirely.
+//
+// So the residual window is: self-host boot re-anchor, plus any force-less
+// caller of POST /admin/org/platform-agent/ensure. NOT "an unservable
+// concierge never gets repaired". A change about not over-stating a signal
+// must not over-state its own blast radius.
+//
+// WHY THIS IS A DISCLOSURE AND NOT A GATE. Two DIFFERENT reasons, and they do
+// not cover the same consumers — conflating them is how a plausible-sounding
+// argument gets applied where it does not hold.
+//
+// (1) For the ADMITTERS, the reason is CIRCULARITY, and it is dispositive.
+// The only non-self-reported evidence the platform can observe is an INBOUND
+// management-API call authenticated by this concierge's own org token
+// (created_by "system:concierge:<id>", see resolveConciergeAdminCredential) —
+// i.e. a real provision_workspace invocation. That can only happen AFTER
+// traffic is admitted, and traffic is admitted by leaving 'provisioning'. You
+// cannot require proof-of-callability before admitting the traffic that
+// produces it. The alternative, having the platform drive a synthetic turn
+// that forces the verb, is the retired fireConciergeWarmup pattern and the
+// required verb is side-effecting (it creates a real workspace). Accepting a
+// runtime-reported `tools/call` result would just relocate the self-report.
+//
+// (2) For the REPAIR decision (platform_agent_ensure) there is NO such
+// circularity — whether to repair could be tightened independently of the
+// flip. What makes a gate wrong THERE, today, is different and simpler:
+// there is nothing honest to tighten it ON. Every label below is a
+// self-report, so keying a repair lever on one would arm a lever on a
+// self-report — precisely the mistake refused by declining to mint a
+// "callable" label. Fix the signal first, then the lever. Tightening that
+// consumer is named explicitly in the follow-up.
 //
 // So the flip stays where it is and STOPS CLAIMING what it has not verified:
 // it now records WHICH self-report authorised it (conciergeOnlineEvidence) in
@@ -1752,6 +1791,18 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 // checked at all. There is intentionally NO value meaning "callable" — nothing
 // at this point can produce one, and minting an unfed label would be a signal
 // armed ahead of its producer.
+//
+// ⚠️ ABSENCE OF `readiness_evidence` IS NOT EVIDENCE OF ABSENCE. This field is
+// emitted ONLY by the two kind=platform promotion arms in evaluateStatus.
+// EventWorkspaceOnline has OTHER producers (the generic non-platform recovery
+// branches, provisioning completion, restart/wake paths) that carry no such
+// field, and pre-existing rows in structure_events predate it entirely. A
+// consumer that sees the field missing may conclude NOTHING — it is "this
+// producer does not label" or "older event", NOT "no evidence was available".
+// Only a PRESENT value is meaningful, and only the value itself (never the
+// mere fact of labelling) says how strong the claim is. Widening the field to
+// every producer is the prerequisite for treating absence as informative;
+// until then, read it as optional-and-additive.
 type conciergeReadinessEvidence string
 
 const (
