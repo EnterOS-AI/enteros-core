@@ -1727,11 +1727,20 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 //     (which only stops waiting), this one originates traffic, so an
 //     over-claimed online produces nudges into a concierge that may do
 //     nothing with them.
+//   - a2a_queue.go sweepA2AQueue — selects w.status IN ('online','degraded')
+//     and drains each match's queued items in detached goroutines. Same
+//     RELEASE shape as the warming gate (turns already withheld are let go
+//     rather than newly created), which is why it belongs here and not in the
+//     passive list where an earlier draft filed it: work reaches the concierge
+//     because of the flip either way.
 //   - canvas ChatTab / MobileChat — enable the composer on online||degraded.
 //
-// PASSIVE readers (route/target on it, but do not originate work):
-// a2a_queue.go queued-turn drain, discovery.go peer URL resolution,
-// plugins_tracking.go fan-out.
+// So admitters come in two flavours — RELEASE (warming gate, queue drain:
+// stop withholding) and ORIGINATE (nudge sweeper: create new turns). Both
+// hand real work to a concierge on the strength of a self-report.
+//
+// PASSIVE readers (resolve/target on it, but neither originate nor release
+// work): discovery.go peer URL resolution, plugins_tracking.go fan-out.
 //
 // REPAIR SUPPRESSION — real, but NARROW. platform_agent_ensure.go
 // platformAgentHealthy makes 'online' the only "leave it alone" status, so an
@@ -1742,10 +1751,15 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 //     no ProvisionTrigger — and self-host-gated (MOLECULE_ORG_ID unset). What
 //     the no-op costs is the "repaired" path's org-token re-anchor and
 //     re-parent, not a container repair.
+//     (Verifiable at the CALL SITE, not just from that doc comment: it passes
+//     only SkipTombstoned, so ProvisionTrigger is nil and the flow cannot
+//     provision — see platform_agent_flow.go.)
 //   - MaybeProvisionPlatformAgentOnBoot, the actual container-level boot
-//     self-heal, reads status ONLY for its log line; it BRANCHES on
-//     prov.IsRunning() plus the identity probe ("IsRunning is the
-//     authoritative liveness check; status is the cheap one").
+//     self-heal, SELECTs status but uses it ONLY for its log line — `status`
+//     appears at its declaration, its Scan, and that log, never as a branch
+//     input. Its decisions key on prov.IsRunning(), conciergeIdentityPresent,
+//     and platformAgentModelConfigured — none status-derived. ("IsRunning is
+//     the authoritative liveness check; status is the cheap one.")
 //   - The onboarding/Settings repair path (canvas configure.ts runEnsure)
 //     sends force:true, bypassing platformAgentHealthy entirely.
 //
@@ -1776,8 +1790,20 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 // there is nothing honest to tighten it ON. Every label below is a
 // self-report, so keying a repair lever on one would arm a lever on a
 // self-report — precisely the mistake refused by declining to mint a
-// "callable" label. Fix the signal first, then the lever. Tightening that
-// consumer is named explicitly in the follow-up.
+// "callable" label. Fix the signal first, then the lever.
+//
+// THE LEVER, named here rather than by reference: platform_agent_ensure.go
+// platformAgentHealthy is the consumer to tighten once a non-self-reported
+// callability signal exists (tracked in core#5137). Naming it inline is
+// deliberate — an earlier draft said "named explicitly in the follow-up",
+// which pointed at an issue that did not name it and a merged PR body that
+// did. A dangling cross-reference is precisely the over-claim this contract
+// exists to prevent, so the claim now stands on its own text.
+//
+// ⚠️ Tightening does NOT mean widening platformAgentHealthy to
+// IN ('online','degraded'). That would leave MORE rows alone and suppress
+// MORE repair — the opposite of the intent. It means keying the
+// leave-it-alone decision on evidence that is not a self-report.
 //
 // So the flip stays where it is and STOPS CLAIMING what it has not verified:
 // it now records WHICH self-report authorised it (conciergeOnlineEvidence) in
