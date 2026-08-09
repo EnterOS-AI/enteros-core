@@ -12,6 +12,14 @@
 #   advance-staging-tenant-pin.sh --image registry.../molecule-tenant@sha256:<digest> --git-sha <sha>
 #   advance-staging-tenant-pin.sh --tag staging-<sha> --dry-run
 #
+# Digest resolution:
+#   DIGEST_SOURCE=docker    (default) docker pull + docker image inspect.
+#   DIGEST_SOURCE=registry  resolve over the registry HTTP API; needs REG_USER /
+#                           REG_TOKEN and NO docker daemon. Use this wherever a
+#                           docker socket is absent or undesirable. It still needs
+#                           python3, as does the rest of this script — a runner
+#                           image without python3 cannot run this script at all.
+#
 # Required auth:
 #   CP_ADMIN_API_TOKEN, or INFISICAL_CLIENT_ID / INFISICAL_CLIENT_SECRET /
 #   INFISICAL_PROJECT_ID so the script can fetch CP_ADMIN_API_TOKEN from
@@ -35,9 +43,17 @@ INFISICAL_PATH="${INFISICAL_PATH:-/shared/controlplane-admin}"   # CP admin toke
 # makes FRESH provisions dynamic (no CP restart), but LOCAL_TENANT_IMAGE is the
 # default a rebooted / freshly-provisioned CP falls back to. Rolling the pin but
 # leaving this stale is EXACTLY how prod broke every fresh org (the pin was fixed
-# on running containers, never written back to the boot SSOT — see
-# molecule-controlplane/scripts/deploy/local-cp-prod-pin-promote.sh). So this
+# on running containers, never written back to the boot SSOT). So this
 # script now writes BOTH, on every path, and verifies the write landed.
+#
+# HISTORICAL NOTE. This used to point at
+# molecule-controlplane/scripts/deploy/local-cp-prod-pin-promote.sh. That script
+# was DELETED from molecule-controlplane main on 2026-07-18 by 1442cd9868
+# ("fix: make provider rollout fail closed end to end"), together with its guard
+# test internal/provisioner/prod_pin_promote_script_test.go. It was replaced by
+# the CP_PROMOTE_PROD_API_TOKEN capability described in
+# molecule-controlplane/docs/operations/production-promote-capability.md. Do not
+# send anyone to the old path; it 404s.
 CP_SSOT_PATH="${CP_SSOT_PATH:-/shared/controlplane}"
 SSOT_SECRET_NAME="${SSOT_SECRET_NAME:-LOCAL_TENANT_IMAGE}"
 TENANT_IMAGE_NAME="${TENANT_IMAGE_NAME:-registry.moleculesai.app/molecule-ai/molecule-tenant}"
@@ -77,10 +93,79 @@ if [ -z "$GIT_SHA" ] && [ -n "$TAG" ]; then
   esac
 fi
 
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${REPO_ROOT:-$(CDPATH='' cd -- "$SCRIPT_DIR/../.." && pwd)}"
+# docker (default, unchanged) | registry (pure HTTP, no docker daemon)
+DIGEST_SOURCE="${DIGEST_SOURCE:-docker}"
+
+# Resolve <name>:<tag> to its sha256 digest over the registry HTTP API, with no
+# docker daemon and no docker socket.
+#
+# WHY THIS EXISTS. The PRODUCTION promote lane could not be scheduled at all:
+# `runs-on:` is an AND over labels, and its old `[docker-host, local-deploy]`
+# matched zero of the 29 registered runners (22 carry docker-host, none of those
+# carries local-deploy; the five local-deploy pods carry exactly ['local-deploy']).
+# Its one run, 624317, sat at started_at=1970-01-01 until it was cancelled.
+#
+# Relabelling alone could not fix it while the script needed a docker socket, so
+# the docker DEPENDENCY is removed here instead. The lane now runs on docker-host
+# and reaches the control planes over public HTTPS; it needs no docker socket, and
+# this path lets a runner WITHOUT one resolve a digest correctly.
+#
+# It delegates to .gitea/scripts/registry-manifest-state.py, which is already
+# the SSOT for the registry ref grammar and the manifest read: it rejects
+# redirects, bounds the response, and asserts the advertised
+# Docker-Content-Digest matches a fresh hash of the manifest bytes. Re-writing
+# that here is how the two copies drift apart.
+#
+# EQUIVALENCE, verified 2026-08-08 against live state rather than asserted:
+#   staging-f3c9eaf -> sha256:747d3df6…  == the live pin on molecule-cp-prod
+#   staging-1802ebe -> sha256:f1972d8c…  == the live pin on molecule-cp-staging
+# i.e. this path reproduces exactly the values production already holds.
+resolve_digest_registry() {
+  local resolver="$REPO_ROOT/.gitea/scripts/registry-manifest-state.py" out rc
+  [ -f "$resolver" ] || {
+    echo "FATAL: DIGEST_SOURCE=registry needs $resolver, which is missing" >&2
+    return 1
+  }
+  for v in REG_USER REG_TOKEN; do
+    [ -n "${!v:-}" ] || {
+      echo "FATAL: $v is required when DIGEST_SOURCE=registry (registry read credentials)" >&2
+      return 1
+    }
+  done
+  set +e
+  out="$(REG_USER="$REG_USER" REG_TOKEN="$REG_TOKEN" python3 "$resolver" "$IMAGE")"
+  rc=$?
+  set -e
+  if [ "$rc" = "10" ]; then
+    # Exit 10 is the resolver's ONLY "tag is absent" signal. It must never be
+    # smoothed into an empty digest: an absent tag is a real, loud failure —
+    # promoting a pin to a tag the registry does not serve is precisely how prod
+    # was left pointing at `staging-7d78136`, a 404 on both registry hosts.
+    echo "FATAL: registry has no manifest for $IMAGE (tag absent) — refusing to resolve a digest" >&2
+    return 1
+  fi
+  if [ "$rc" != "0" ] || [ -z "$out" ]; then
+    echo "FATAL: cannot resolve $IMAGE over the registry API (rc=$rc)" >&2
+    return 1
+  fi
+  printf '%s\n' "$out"
+}
+
 resolve_digest() {
   case "$IMAGE" in
     *@sha256:*) printf '%s\n' "${IMAGE##*@}"; return 0;;
   esac
+  if [ "$DIGEST_SOURCE" = "registry" ]; then
+    log "resolving $IMAGE over the registry HTTP API (no docker)"
+    resolve_digest_registry
+    return $?
+  fi
+  if [ "$DIGEST_SOURCE" != "docker" ]; then
+    echo "FATAL: DIGEST_SOURCE must be 'docker' or 'registry' (got '$DIGEST_SOURCE')" >&2
+    return 1
+  fi
   # Jobs carrying this script may run on a different Gitea runner from the
   # upstream image-availability gate. The registry tag is the shared handoff;
   # a previous runner's Docker cache is not. Pull on this runner before
