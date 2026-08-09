@@ -99,12 +99,49 @@ Exit codes:
   2 — env contract violation (missing GITEA_TOKEN/HOST/REPO/BRANCH).
   3 — workflows directory missing, workflow YAML unparseable, or the
       required-contexts SSOT file is missing.
-  4 — FAIL-CLOSED verification failure: branch_protections 401/403
-      auth failure (token can't read BP), 5xx transient (propagated
-      ApiError), unexpected response shape, or an EMPTY enforced-context
-      set (nothing to lint == the absent-input green; see above). This
-      is a HARD gate on a protected context — it MUST NOT green when it
-      cannot verify.
+  4 — FAIL-CLOSED verification failure: THE API ANSWERED and its answer
+      blocks verification — branch_protections 401/403 auth failure
+      (token can't read BP), any other terminal 4xx, unexpected response
+      shape, or an EMPTY enforced-context set (nothing to lint == the
+      absent-input green; see above). This is a HARD gate on a protected
+      context — it MUST NOT green when it cannot verify.
+  5 — INFRASTRUCTURE UNREACHABLE: the API NEVER ANSWERED. Every attempt
+      failed transiently (5xx / 429 / connection reset / timeout) and
+      the retry budget was exhausted. See "Transient failures" below.
+
+Transient failures — "did not run" is not "failed" (added after a
+Cloudflare 502 red-Xed this required lane)
+------------------------------------------------------------------
+Runners reach git.moleculesai.app THROUGH CLOUDFLARE. A transient 502 at
+that edge used to propagate out of `api()` as an uncaught ApiError:
+
+    ApiError: GET /repos/molecule-ai/molecule-core/branch_protections/main
+              → HTTP 502
+
+An uncaught exception exits 1 — and exit 1 in the table above means "at
+least one required workflow has a paths/paths-ignore filter". The lint
+had opened ZERO workflow files. It reported a compliance finding it had
+not made. That is the inverse of the vacuous pass and the same underlying
+fault: the result did not reflect what was examined.
+
+Now:
+  * `api()` RETRIES transient failures — 5xx (including Cloudflare's 52x
+    family), 429, and transport errors (reset/timeout/TLS EOF) — with
+    jittered exponential backoff, `API_MAX_ATTEMPTS` (default 4) attempts.
+  * 4xx IS NOT RETRIED. A 401/403/404/422 is an authorisation or
+    addressing FACT; the next identical request returns the identical
+    answer. Retrying it burns the budget for no possible change AND —
+    the real harm — buries a permissions defect under retry noise so it
+    reads as weather. (Live instance: the merge-queue actor 403s on this
+    exact endpoint and falls back to a hardcoded REQUIRED_APPROVALS: 2
+    while BP says 1. That 403 must stay loud and immediate.) 429 is the
+    sole 4xx exception: it means "later", not "no".
+  * Retry exhaustion raises `ApiUnreachable` (a distinct subclass) and
+    exits 5 behind an unmistakable `LINT DID NOT RUN` banner stating
+    that zero workflow files were inspected and that there is no finding
+    to hunt. Red, deliberately — a lint that greens when it cannot check
+    is the defect this catalogue is full of — but never red with a
+    compliance-shaped message.
 
 Auth note: the token used for `GET /repos/.../branch_protections/{branch}`
 needs repo-admin access. The workflow-default `GITHUB_TOKEN` is non-admin;
@@ -116,10 +153,14 @@ tolerated graceful skip.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import random
 import re
+import ssl
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -195,7 +236,112 @@ def _require_runtime_env() -> None:
 # `feedback_api_helper_must_raise_not_return_dict`).
 # --------------------------------------------------------------------------
 class ApiError(RuntimeError):
-    """Raised when a Gitea API call cannot be trusted to have succeeded."""
+    """Raised when a Gitea API call cannot be trusted to have succeeded.
+
+    Semantics: the API ANSWERED, and its answer means we cannot proceed
+    (403 = fix the token, 422 = fix the request, non-JSON = fix the host).
+    The answer is a FACT about the request, and repeating the request
+    reproduces it.
+    """
+
+
+class ApiUnreachable(ApiError):
+    """The API could NOT BE REACHED — every attempt failed transiently.
+
+    Deliberately a DIFFERENT type from ApiError, because the two demand
+    different verdicts from a lint:
+
+      ApiError       — we asked and were told no. We learned something.
+      ApiUnreachable — we never got an answer. We learned NOTHING, and
+                       therefore examined nothing, and therefore MUST NOT
+                       report a finding about workflow files we never read.
+
+    Collapsing the two is exactly the defect this class exists to fix: a
+    Cloudflare 502 on the branch-protection GET surfaced as a bare
+    traceback and process exit 1, and exit 1 in this lint's contract means
+    "a required workflow carries a paths filter". The lint claimed a
+    compliance finding it had not made.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempts: int,
+        last_status: int | None = None,
+        last_error: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+        self.last_status = last_status
+        self.last_error = last_error
+
+
+# ---- Transient-vs-terminal classification --------------------------------
+# 4xx AND 5xx ARE TREATED DIFFERENTLY, ON PURPOSE.
+#
+#   5xx → TRANSIENT. Retry with backoff. Runners reach git.moleculesai.app
+#     THROUGH CLOUDFLARE; 502/520/521/522/524 at that edge are an
+#     established, observed, self-clearing condition. They say nothing
+#     about our request. A single-attempt call on this path in a lane
+#     whose status is merge-blocking under BP `["*"]` will red
+#     intermittently forever.
+#
+#   4xx → TERMINAL. Do NOT retry. A 401/403/404/422 is an AUTHORISATION or
+#     ADDRESSING FACT about this token and this path; the next identical
+#     request returns the identical answer. Retrying it (a) burns the
+#     backoff budget for no possible change in outcome, and (b) — the real
+#     harm — buries a permissions defect under "attempt 3/4 …" noise so it
+#     reads like a network flake. This repo has a live instance: the merge
+#     queue actor 403s on THIS EXACT endpoint and silently falls back to a
+#     hardcoded REQUIRED_APPROVALS: 2 while branch protection says 1. A
+#     retry loop over that 403 would make the defect look like weather.
+#     403 must stay loud, immediate, and attributed to the token.
+#
+#   429 is the ONE 4xx exception: it is not a statement about
+#     authorisation, it is the server saying "later" and it carries
+#     Retry-After. Backing off is the protocol-defined response.
+_RETRYABLE_STATUSES = frozenset({429})
+
+
+def _is_transient_status(status: int) -> bool:
+    """5xx (incl. Cloudflare's 52x family) plus 429. Nothing else."""
+    return 500 <= status < 600 or status in _RETRYABLE_STATUSES
+
+
+# Transport-level failures: the request never produced an HTTP status at
+# all (reset, timeout, half-closed keepalive, TLS EOF). By definition we
+# learned nothing, so these are transient too.
+# NOTE: urllib.error.HTTPError subclasses URLError, so HTTPError MUST be
+# caught first or every 403 would be misfiled as a transport failure.
+_TRANSIENT_EXC: tuple[type[BaseException], ...] = (
+    urllib.error.URLError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    ConnectionRefusedError,
+    TimeoutError,          # socket.timeout is an alias of this since 3.10
+    http.client.RemoteDisconnected,
+    http.client.IncompleteRead,
+    http.client.BadStatusLine,
+    ssl.SSLEOFError,
+    ssl.SSLZeroReturnError,
+)
+
+# 4 attempts, jittered exponential backoff 1s/2s/4s (cap 8s) → worst case
+# ~7s of sleeping plus 4×30s of socket timeout = ~127s, inside the
+# workflow's timeout-minutes: 5 alongside checkout/setup-python/Infisical.
+API_MAX_ATTEMPTS = max(1, int(os.environ.get("API_MAX_ATTEMPTS", "4") or 4))
+API_BACKOFF_BASE = float(os.environ.get("API_BACKOFF_BASE", "1.0") or 1.0)
+API_BACKOFF_CAP = float(os.environ.get("API_BACKOFF_CAP", "8.0") or 8.0)
+API_TIMEOUT = float(os.environ.get("API_TIMEOUT", "30") or 30)
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Jittered exponential backoff for `attempt` (1-based)."""
+    raw = min(API_BACKOFF_CAP, API_BACKOFF_BASE * (2 ** (attempt - 1)))
+    # Full-ish jitter (50-100%) so parallel PR runs don't re-collide in
+    # lockstep on a recovering edge.
+    return raw * (0.5 + random.random() / 2.0)
 
 
 def api(
@@ -206,6 +352,15 @@ def api(
     query: dict[str, str] | None = None,
     expect_json: bool = True,
 ) -> tuple[int, Any]:
+    """GET/POST the Gitea API, retrying ONLY transient failures.
+
+    Raises:
+        ApiUnreachable: every attempt failed transiently (5xx/429/transport).
+            The call NEVER completed — the caller has learned nothing and
+            must not report a finding.
+        ApiError: the API answered with a terminal 4xx, or answered 2xx with
+            an unparseable body. One attempt, no retry.
+    """
     url = f"{API}{path}"
     if query:
         url = f"{url}?{urllib.parse.urlencode(query)}"
@@ -218,29 +373,85 @@ def api(
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, method=method, data=data, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read()
-            status = resp.status
-    except urllib.error.HTTPError as e:
-        raw = e.read()
-        status = e.code
 
-    if not (200 <= status < 300):
+    last_status: int | None = None
+    last_detail = ""
+
+    for attempt in range(1, API_MAX_ATTEMPTS + 1):
+        req = urllib.request.Request(
+            url, method=method, data=data, headers=headers
+        )
+        raw = b""
+        status: int | None = None
+        try:
+            with urllib.request.urlopen(req, timeout=API_TIMEOUT) as resp:
+                raw = resp.read()
+                status = resp.status
+        except urllib.error.HTTPError as e:
+            # An HTTP status came back — HTTPError is checked BEFORE the
+            # transport tuple because it subclasses URLError.
+            try:
+                raw = e.read()
+            except Exception:  # pragma: no cover - body already consumed
+                raw = b""
+            status = e.code
+        except _TRANSIENT_EXC as e:
+            last_status = None
+            last_detail = f"{type(e).__name__}: {e}"
+            if attempt < API_MAX_ATTEMPTS:
+                delay = _backoff_delay(attempt)
+                sys.stderr.write(
+                    f"::warning::{method} {path} → transport failure "
+                    f"({last_detail}) on attempt {attempt}/"
+                    f"{API_MAX_ATTEMPTS}; retrying in {delay:.1f}s\n"
+                )
+                time.sleep(delay)
+                continue
+            break
+
+        assert status is not None
+        if 200 <= status < 300:
+            if not raw:
+                return status, None
+            try:
+                return status, json.loads(raw)
+            except json.JSONDecodeError as e:
+                if expect_json:
+                    # 2xx with a broken body is NOT transient: the origin
+                    # answered and its answer is malformed. Terminal.
+                    raise ApiError(
+                        f"{method} {path} → HTTP {status} but body is not "
+                        f"JSON: {e}"
+                    ) from e
+                return status, {"_raw": raw.decode("utf-8", errors="replace")}
+
         snippet = raw[:500].decode("utf-8", errors="replace") if raw else ""
-        raise ApiError(f"{method} {path} → HTTP {status}: {snippet}")
+        if not _is_transient_status(status):
+            # 4xx: TERMINAL. One attempt, immediate raise. See the block
+            # comment above — retrying an authorisation fact hides it.
+            raise ApiError(f"{method} {path} → HTTP {status}: {snippet}")
 
-    if not raw:
-        return status, None
-    try:
-        return status, json.loads(raw)
-    except json.JSONDecodeError as e:
-        if expect_json:
-            raise ApiError(
-                f"{method} {path} → HTTP {status} but body is not JSON: {e}"
-            ) from e
-        return status, {"_raw": raw.decode("utf-8", errors="replace")}
+        last_status = status
+        last_detail = snippet
+        if attempt < API_MAX_ATTEMPTS:
+            delay = _backoff_delay(attempt)
+            sys.stderr.write(
+                f"::warning::{method} {path} → HTTP {status} (transient) on "
+                f"attempt {attempt}/{API_MAX_ATTEMPTS}; retrying in "
+                f"{delay:.1f}s\n"
+            )
+            time.sleep(delay)
+
+    where = (
+        f"HTTP {last_status}" if last_status is not None else "transport failure"
+    )
+    raise ApiUnreachable(
+        f"{method} {path} → UNREACHABLE after {API_MAX_ATTEMPTS} attempt(s); "
+        f"last: {where}: {last_detail}",
+        attempts=API_MAX_ATTEMPTS,
+        last_status=last_status,
+        last_error=last_detail,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -649,13 +860,17 @@ def detect_noop_gate(doc: dict, job_key: str) -> list[str]:
 def run() -> int:
     """Main lint entrypoint. Returns the process exit code.
 
-    Exit semantics (see module docstring for full table):
-      0 — clean (no offending paths-filter on any required workflow),
-          OR protection unreadable (403/404) — surfaced as ::error::
-          but treated as non-fatal so token-scope issues don't red-X
-          every PR.
-      1 — at least one required workflow carries a paths/paths-ignore
-          filter — the regression class this lint exists to prevent.
+    Exit semantics (see module docstring for the full table):
+      0 — clean: the enforced set was enumerated, every resolvable
+          workflow was read, and none carries a paths/paths-ignore filter.
+      1 — A FINDING: at least one required workflow carries a
+          paths/paths-ignore filter (Arm A) — the regression class this
+          lint exists to prevent. Exit 1 means the lint LOOKED and found
+          something; never use it for "could not look".
+      4 — the API answered and its answer blocks verification
+          (401/403/other terminal 4xx, bad shape, empty enforced set).
+      5 — the API never answered (transient, retries exhausted). The lint
+          DID NOT RUN. No workflow was judged.
     """
     _require_runtime_env()
 
@@ -663,6 +878,67 @@ def run() -> int:
     protection: Any = {}
     try:
         _, protection = api("GET", protection_path)
+    except ApiUnreachable as e:
+        # ---- THE CHECK DID NOT RUN. This is NOT a compliance finding. ----
+        # Retry exhaustion on a transient path. Zero workflow files have
+        # been opened; the enforced-context set was never enumerated. The
+        # ONLY honest statement available is "unknown".
+        #
+        # RED-vs-DISTINCT-SIGNAL, decided: RED, on a DEDICATED exit code (5).
+        #   * Red, not green: an unreadable branch-protection API means we
+        #     cannot verify the invariant at all, and this repo's whole
+        #     failure catalogue is gates that pass without checking. A lint
+        #     that greens when it cannot check IS the bug.
+        #   * A dedicated code, not the existing 4: exit 1 means "a required
+        #     workflow carries a paths filter" (fix the workflow); exit 4
+        #     means "the API answered and its answer blocks verification"
+        #     (fix the token / the SSOT). Exit 5 means "we never reached the
+        #     API" (retry the job / check the edge). Three different operator
+        #     actions, so three different codes — and the exit code is the
+        #     only part of a red step that survives into a status summary.
+        #   * The banner below exists because the exit code is NOT enough:
+        #     an hour was lost hunting a workflow defect that did not exist.
+        print("")
+        print(
+            "::error::================ LINT DID NOT RUN ================"
+        )
+        print(
+            f"::error::GITEA API UNREACHABLE — this is NOT a compliance "
+            f"finding. {e}"
+        )
+        print(
+            f"::error::ZERO workflow files were inspected. NOTHING in "
+            f"{WORKFLOWS_DIR} has been reported as non-compliant, because "
+            f"the lint never got far enough to look at any of it."
+        )
+        print(
+            f"::error::What failed: GET {protection_path} against "
+            f"{GITEA_HOST} failed transiently on all {e.attempts} attempt(s) "
+            f"(last: "
+            + (f"HTTP {e.last_status}" if e.last_status else "transport error")
+            + "). Runners reach Gitea through Cloudflare; 502/52x and "
+            "connection resets at that edge are self-clearing."
+        )
+        print(
+            "::error::DO NOT go looking for a paths-filter defect in a "
+            "workflow. There is no finding here. Re-run the job; if it "
+            "keeps happening, the Cloudflare/Gitea edge is genuinely down "
+            "and that is the thing to fix."
+        )
+        print(
+            "::error::Exit 5 = INFRASTRUCTURE UNREACHABLE (exit 1 would "
+            "mean a real Arm-A paths-filter finding; exit 4 would mean the "
+            "API answered but blocked verification). This is 5."
+        )
+        print(
+            "::error::=================================================="
+        )
+        sys.stderr.write(
+            f"::error::lint-required-no-paths: DID NOT RUN — "
+            f"{GITEA_HOST} unreachable after {e.attempts} attempts. "
+            f"NOT a compliance failure.\n"
+        )
+        return 5
     except ApiError as e:
         msg = str(e)
         m = re.search(r"HTTP (\d{3})", msg)
@@ -706,7 +982,20 @@ def run() -> int:
             )
             protection = {}
         else:
-            raise
+            # Any OTHER terminal answer (400/405/409/422, or a 2xx with an
+            # unparseable body). This used to `raise` — a bare traceback
+            # exiting 1, i.e. the process claiming an Arm-A paths-filter
+            # finding it had not made. Same defect class as the 502; same
+            # fix. Exit 4: the API answered, and its answer blocks
+            # verification.
+            sys.stderr.write(
+                f"::error::LINT DID NOT COMPLETE — GET {protection_path} "
+                f"returned a terminal error the lint cannot interpret: {e}. "
+                f"This is NOT a compliance finding: zero workflow files were "
+                f"inspected. Exit 4 (verification impossible), not exit 1 "
+                f"(paths-filter defect).\n"
+            )
+            return 4
 
     if not isinstance(protection, dict):
         sys.stderr.write(
@@ -855,5 +1144,28 @@ def run() -> int:
     return 0
 
 
+def main() -> int:
+    """Last-resort net: an ApiError escaping `run()` must NEVER become a
+    bare traceback, because an uncaught exception exits 1 and exit 1 is
+    this lint's code for "a required workflow carries a paths filter".
+    That is how a Cloudflare 502 came to report a compliance finding."""
+    try:
+        return run()
+    except ApiUnreachable as e:
+        sys.stderr.write(
+            f"::error::LINT DID NOT RUN — Gitea API unreachable after "
+            f"{e.attempts} attempt(s): {e}. This is NOT a compliance "
+            f"finding; no workflow was judged. Exit 5.\n"
+        )
+        return 5
+    except ApiError as e:
+        sys.stderr.write(
+            f"::error::LINT DID NOT COMPLETE — unusable Gitea API response: "
+            f"{e}. This is NOT a compliance finding; no workflow was "
+            f"judged. Exit 4.\n"
+        )
+        return 4
+
+
 if __name__ == "__main__":
-    sys.exit(run())
+    sys.exit(main())

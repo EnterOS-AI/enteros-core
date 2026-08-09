@@ -17,8 +17,10 @@ do not carry it MUST NOT be. If someone converts a lane to always-run, the
 corresponding assertion here is what tells them to promote the lint.
 """
 import importlib.util
+import io
 import sys
 import textwrap
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -287,6 +289,287 @@ class TestEnforcedContextEnumeration:
         with pytest.raises(SystemExit) as e:
             lint.load_enforced_contexts(str(tmp_path / "nope.txt"))
         assert e.value.code == 3
+
+
+# ===========================================================================
+# TRANSIENT-FAILURE HANDLING — "did not run" is not "failed".
+#
+# Regression cover for: a Cloudflare 502 on the branch_protections GET
+# killed this lint before it opened a single workflow file, propagated as
+# an uncaught ApiError, and exited 1 — and exit 1 in this lint's contract
+# means "a required workflow carries a paths filter". The lint reported a
+# compliance finding it had not made.
+#
+# Every guard here is negative-controlled: the retry must recover a
+# transient failure AND must not swallow a genuine finding AND must not
+# retry a terminal 4xx.
+# ===========================================================================
+class _FakeResp:
+    def __init__(self, body: bytes, status: int = 200):
+        self._b, self.status = body, status
+
+    def read(self):
+        return self._b
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+_BP_OK = b'{"branch_name":"main","status_check_contexts":["*"]}'
+_CF_502 = (
+    b'{"type":"https://developers.cloudflare.com/support/troubleshooting/'
+    b'http-status-codes/cloudflare-5xx-errors/error-502/",'
+    b'"title":"Bad gateway","status":502}'
+)
+
+
+def _scripted_opener(script):
+    """Return (opener, attempts_list). `script` items: 'ok' | 'reset' |
+    'timeout' | an int-ish HTTP status string."""
+    attempts: list[str] = []
+
+    def _open(req, *a, **kw):
+        what = script[len(attempts)] if len(attempts) < len(script) else script[-1]
+        attempts.append(what)
+        if what == "ok":
+            return _FakeResp(_BP_OK)
+        if what == "reset":
+            raise ConnectionResetError(10054, "forcibly closed by remote host")
+        if what == "timeout":
+            raise TimeoutError("timed out")
+        code = int(what)
+        body = _CF_502 if code >= 500 else b'{"message":"forbidden"}'
+        raise urllib.error.HTTPError(
+            req.full_url, code, "err", {}, io.BytesIO(body)
+        )
+
+    return _open, attempts
+
+
+@pytest.fixture
+def api_env(monkeypatch):
+    """Full runtime env contract + instant, deterministic backoff.
+
+    The script snapshots GITEA_HOST/REPO/... into module globals at IMPORT
+    time, and the test module imports it once with an empty env — so the
+    env vars alone are not enough; the derived globals must be set too.
+    """
+    monkeypatch.setenv("GITEA_TOKEN", "dummy")
+    monkeypatch.setenv("GITEA_HOST", "git.moleculesai.app")
+    monkeypatch.setenv("REPO", "molecule-ai/molecule-core")
+    monkeypatch.setenv("BRANCH", "main")
+    monkeypatch.setattr(lint, "GITEA_TOKEN", "dummy")
+    monkeypatch.setattr(lint, "GITEA_HOST", "git.moleculesai.app")
+    monkeypatch.setattr(lint, "REPO", "molecule-ai/molecule-core")
+    monkeypatch.setattr(lint, "BRANCH", "main")
+    monkeypatch.setattr(lint, "OWNER", "molecule-ai")
+    monkeypatch.setattr(lint, "NAME", "molecule-core")
+    monkeypatch.setattr(lint, "API", "https://git.moleculesai.app/api/v1")
+    monkeypatch.setattr(lint, "API_MAX_ATTEMPTS", 4)
+    monkeypatch.setattr(lint, "API_BACKOFF_BASE", 0.0)
+    monkeypatch.setattr(lint, "API_BACKOFF_CAP", 0.0)
+    monkeypatch.setattr(lint.time, "sleep", lambda _s: None)
+
+
+class TestTransientRetry:
+    def test_the_helper_retries_a_5xx_and_returns_the_eventual_success(
+        self, api_env, monkeypatch
+    ):
+        opener, attempts = _scripted_opener(["502", "502", "ok"])
+        monkeypatch.setattr(lint.urllib.request, "urlopen", opener)
+        status, doc = lint.api("GET", "/repos/x/y/branch_protections/main")
+        assert status == 200
+        assert doc["status_check_contexts"] == ["*"]
+        assert len(attempts) == 3, "must have retried twice before succeeding"
+
+    @pytest.mark.parametrize("transport", ["reset", "timeout"])
+    def test_the_helper_retries_transport_failures(
+        self, api_env, monkeypatch, transport
+    ):
+        opener, attempts = _scripted_opener([transport, "ok"])
+        monkeypatch.setattr(lint.urllib.request, "urlopen", opener)
+        status, _ = lint.api("GET", "/x")
+        assert status == 200
+        assert len(attempts) == 2
+
+    def test_exhaustion_raises_ApiUnreachable_not_a_bare_ApiError(
+        self, api_env, monkeypatch
+    ):
+        """The TYPE is the contract: callers must be able to tell 'never got
+        an answer' from 'was told no'."""
+        opener, attempts = _scripted_opener(["502"])
+        monkeypatch.setattr(lint.urllib.request, "urlopen", opener)
+        with pytest.raises(lint.ApiUnreachable) as e:
+            lint.api("GET", "/x")
+        assert len(attempts) == 4
+        assert e.value.attempts == 4
+        assert e.value.last_status == 502
+        assert "UNREACHABLE" in str(e.value)
+
+    @pytest.mark.parametrize("code", ["400", "401", "403", "404", "409", "422"])
+    def test_4xx_is_NEVER_retried(self, api_env, monkeypatch, code):
+        """A 4xx is an authorisation/addressing FACT, not weather. Retrying
+        it cannot change the answer and buries a real permissions defect
+        under retry noise — e.g. the merge-queue actor's persistent 403 on
+        this exact endpoint, which must stay loud and immediate."""
+        opener, attempts = _scripted_opener([code])
+        monkeypatch.setattr(lint.urllib.request, "urlopen", opener)
+        with pytest.raises(lint.ApiError) as e:
+            lint.api("GET", "/x")
+        assert len(attempts) == 1, f"HTTP {code} must cost exactly ONE attempt"
+        assert not isinstance(e.value, lint.ApiUnreachable), (
+            "a terminal 4xx must NOT be reported as 'unreachable'"
+        )
+        assert f"HTTP {code}" in str(e.value)
+
+    def test_429_is_the_one_retried_4xx(self, api_env, monkeypatch):
+        """429 is not a statement about authorisation; it means 'later'."""
+        opener, attempts = _scripted_opener(["429", "ok"])
+        monkeypatch.setattr(lint.urllib.request, "urlopen", opener)
+        status, _ = lint.api("GET", "/x")
+        assert status == 200 and len(attempts) == 2
+
+    @pytest.mark.parametrize("code", [500, 502, 503, 504, 520, 521, 522, 524])
+    def test_every_5xx_including_cloudflares_52x_is_transient(self, code):
+        assert lint._is_transient_status(code)
+
+    @pytest.mark.parametrize("code", [400, 401, 403, 404, 409, 422])
+    def test_no_other_4xx_is_transient(self, code):
+        assert not lint._is_transient_status(code)
+
+
+class TestUnreachableIsNotNonCompliance:
+    """The whole point: on retry exhaustion the lint must say the API was
+    unreachable, and must NOT say a workflow is non-compliant."""
+
+    def _run(self, monkeypatch, script, capsys):
+        opener, attempts = _scripted_opener(script)
+        monkeypatch.setattr(lint.urllib.request, "urlopen", opener)
+        rc = lint.main()
+        cap = capsys.readouterr()
+        return rc, cap.out + cap.err, attempts
+
+    def test_exhaustion_exits_5_with_an_unmistakable_did_not_run_banner(
+        self, api_env, monkeypatch, capsys
+    ):
+        rc, log, attempts = self._run(monkeypatch, ["502"], capsys)
+        assert rc == 5, "exhaustion must NOT be exit 1 (a paths-filter finding)"
+        assert rc != 0, "and must NOT be green — a lint that cannot check fails"
+        assert len(attempts) == 4
+        for phrase in (
+            "LINT DID NOT RUN",
+            "GITEA API UNREACHABLE",
+            "NOT a compliance finding",
+            "ZERO workflow files were inspected",
+            "DO NOT go looking for a paths-filter defect",
+            "Exit 5 = INFRASTRUCTURE UNREACHABLE",
+        ):
+            assert phrase in log, f"missing from the log: {phrase!r}"
+
+    def test_exhaustion_makes_no_compliance_claim_and_no_traceback(
+        self, api_env, monkeypatch, capsys
+    ):
+        rc, log, _ = self._run(monkeypatch, ["502"], capsys)
+        assert rc == 5
+        for phrase in (
+            "has a paths filter that would degrade",
+            "ARM A —",
+            "Traceback",
+            "can post SUCCESS WITHOUT RUNNING",
+        ):
+            assert phrase not in log, f"compliance-shaped output leaked: {phrase!r}"
+
+    def test_a_transient_502_that_recovers_passes_cleanly(
+        self, api_env, monkeypatch, capsys
+    ):
+        rc, log, attempts = self._run(monkeypatch, ["502", "502", "ok"], capsys)
+        assert rc == 0
+        assert len(attempts) == 3
+        assert "(transient) on attempt 1/4" in log
+        assert "LINT DID NOT RUN" not in log
+        assert "::notice::Linting" in log, "it must actually have linted"
+
+    def test_persistent_403_stays_a_loud_auth_failure(
+        self, api_env, monkeypatch, capsys
+    ):
+        """The retry must not mask a permissions defect: ONE attempt, exit 4,
+        the AUTH FAILURE message — never 'unreachable'."""
+        rc, log, attempts = self._run(monkeypatch, ["403"], capsys)
+        assert rc == 4, "403 is fail-closed auth, not exit 5 unreachable"
+        assert len(attempts) == 1, "403 must not be retried"
+        assert "AUTH FAILURE" in log and "repo-admin" in log
+        assert "retrying in" not in log
+        assert "UNREACHABLE" not in log and "LINT DID NOT RUN" not in log
+
+    def test_404_still_degrades_gracefully_without_retrying(
+        self, api_env, monkeypatch, capsys
+    ):
+        rc, log, attempts = self._run(monkeypatch, ["404"], capsys)
+        assert rc == 0
+        assert len(attempts) == 1
+        assert "returned HTTP 404" in log and "Falling back to the" in log
+        assert "retrying in" not in log
+
+    def test_an_unhandled_terminal_4xx_exits_4_not_1(
+        self, api_env, monkeypatch, capsys
+    ):
+        """A 422/400 used to `raise` out of run() as a bare traceback →
+        exit 1 → indistinguishable from an Arm-A finding."""
+        rc, log, _ = self._run(monkeypatch, ["422"], capsys)
+        assert rc == 4
+        assert "LINT DID NOT COMPLETE" in log
+        assert "NOT a compliance finding" in log
+        assert "Traceback" not in log
+
+
+class TestGenuineNonComplianceStillReds:
+    """Negative control for the whole fix: the retry must not make the lint
+    softer. A real paths-filter must still exit 1 — including when a
+    transient 502 preceded the successful fetch."""
+
+    OFFENDER = """
+        name: Offending Lane
+        on:
+          pull_request:
+            paths: ['**.go']
+        jobs:
+          build:
+            name: Offending Lane
+            runs-on: ubuntu-latest
+            steps:
+              - run: go build ./...
+    """
+
+    @pytest.fixture
+    def offending_repo(self, tmp_path, monkeypatch):
+        wfdir = tmp_path / "workflows"
+        wfdir.mkdir()
+        (wfdir / "offender.yml").write_text(
+            textwrap.dedent(self.OFFENDER), encoding="utf-8"
+        )
+        ssot = tmp_path / "required.txt"
+        ssot.write_text("Offending Lane / Offending Lane\n", encoding="utf-8")
+        monkeypatch.setattr(lint, "WORKFLOWS_DIR", str(wfdir))
+        monkeypatch.setattr(lint, "REQUIRED_CONTEXTS_FILE", str(ssot))
+
+    @pytest.mark.parametrize(
+        "script", [["ok"], ["502", "502", "ok"], ["reset", "ok"]]
+    )
+    def test_a_real_paths_filter_still_exits_1(
+        self, api_env, offending_repo, monkeypatch, capsys, script
+    ):
+        opener, _ = _scripted_opener(script)
+        monkeypatch.setattr(lint.urllib.request, "urlopen", opener)
+        rc = lint.main()
+        cap = capsys.readouterr()
+        log = cap.out + cap.err
+        assert rc == 1, "a genuine Arm-A finding must still red as exit 1"
+        assert "ARM A" in log
+        assert "has a paths filter that would degrade" in log
+        assert "LINT DID NOT RUN" not in log
 
 
 # ===========================================================================
