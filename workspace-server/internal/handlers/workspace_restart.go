@@ -560,12 +560,15 @@ func (h *WorkspaceHandler) clearWorkspaceRouting(ctx context.Context, workspaceI
 // container is still running and still heartbeating" is an ASSUMPTION about
 // the caller's state, and it is FALSE on a FIRST BOOT. A fresh org's concierge
 // is booted by POST /workspaces/:id/restart against a row that has never had a
-// container at all (platform_agent.go inserts it with last_heartbeat_at NULL,
-// status='provisioning'); the same is true of any workspace whose very first
-// boot is dispatched through a restart path. There is then nothing to protect
-// and nothing "still serving its previous version" — the decline is the
-// TERMINAL outcome of a boot that will never happen, and writing only
-// last_sample_error leaves the row in 'provisioning' with NO published verdict.
+// container at all: platform_agent.go inserts it with status='offline' and
+// last_heartbeat_at NULL, and the row is 'provisioning' by the time this runs
+// only because markProvisioningForRestart (the manual handler, which is the
+// sole caller of RestartWorkspaceAutoOpts) put it there. The same is true of
+// any workspace whose very first boot is dispatched through a restart path.
+// There is then nothing to protect and nothing "still serving its previous
+// version" — the decline is the TERMINAL outcome of a boot that will never
+// happen, and writing only last_sample_error leaves the row in 'provisioning'
+// with NO published verdict.
 //
 // Measured consequence: on 2026-08-05 a staging concierge's hermes image pull
 // stalled (CP `ensure-image` 502 x3, "pull stalled (no progress for 2m0s)").
@@ -588,6 +591,14 @@ func (h *WorkspaceHandler) clearWorkspaceRouting(ctx context.Context, workspaceI
 // must not be touched) — keeps exactly the prior behaviour. The guard is in the
 // WHERE clause, so a concurrent promotion or delete wins the race rather than
 // being clobbered.
+//
+// BOTH conjuncts are load-bearing and neither is redundant. status alone would
+// fail every legitimate manual decline, because that handler has already
+// written 'provisioning'. last_heartbeat_at alone would fail a paused or
+// hibernated row that was created but never booted. And NULL there is a sound
+// proxy for "never had a running agent": nothing in the repo ever writes
+// last_heartbeat_at = NULL — Register and Heartbeat only ever set it to now() —
+// so the column is monotonic from NULL to non-NULL, once, at first contact.
 //
 // This is not a new timeout and not a retry: the signal already existed and
 // arrived on time. It was being swallowed.
@@ -623,6 +634,21 @@ func (h *WorkspaceHandler) markRestartDeclined(ctx context.Context, workspaceID,
 			// not be reported as a boot failure on a guess.
 			log.Printf("markRestartDeclined: stranded-boot check failed for %s: %v", workspaceID, err)
 		} else if rows, rowsErr := res.RowsAffected(); rowsErr != nil {
+			// UNREACHABLE with lib/pq, stated rather than left as a question.
+			// The Exec above returned no error, so the driver has a command tag,
+			// and pq answers RowsAffected from it as driver.RowsAffected — a bare
+			// int64 whose RowsAffected() returns a nil error unconditionally. The
+			// only pq path that errors here is the empty statement, and this
+			// statement is a literal.
+			//
+			// If a future driver did return an error we would not know whether the
+			// row was failed, and an unknown write outcome must never be reported
+			// as a boot failure — so this deliberately falls through to the
+			// historical path. The worst case is then a stale advisory string: a
+			// row we may have just failed also gets the "still serving its previous
+			// version" last_sample_error. status is the SSOT and is already correct
+			// in that case; last_sample_error is the canvas's display reason, so the
+			// residue is cosmetic and self-corrects on the next write.
 			log.Printf("markRestartDeclined: RowsAffected error for %s: %v", workspaceID, rowsErr)
 		} else if rows > 0 {
 			stranded = true
