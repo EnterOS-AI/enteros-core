@@ -1695,6 +1695,109 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// HONEST-CLAIM CONTRACT for the platform concierge's provisioning→online flip.
+//
+// ⚠️ `online` DOES NOT MEAN `mcp__molecule-platform__provision_workspace` IS
+// CALLABLE. Every input the heartbeat has at the moment of the flip is a
+// RUNTIME SELF-REPORT:
+//
+//   - mcp_tools_ready  — the runtime's own MCPReadinessProber reporting that a
+//     `tools/list` SUCCEEDED. A list is not a call.
+//   - loaded_mcp_tools — the runtime's own list of tool identifiers it believes
+//     it loaded. Membership is PRESENCE, not callability.
+//   - (legacy) neither — a pre-#147 runtime is promoted on liveness alone.
+//
+// A concierge can therefore advertise the verb, be `online`, and produce
+// NOTHING on a real turn. That failure mode is real and has been reproduced:
+// 54 tools listed, the required verb among them, mcp_server_present=true, and
+// no work performed. The ONLY place callability is actually proven is the
+// deploy-time staging gate (Guard B, internal/staginge2e), which drives a REAL
+// A2A turn and fails when the verb is present-but-not-genuinely-callable.
+// There is NO run-time equivalent, so between deploys nothing re-checks it.
+//
+// Consumers that inherit the weaker claim (i.e. that treat `online` as
+// "ready to serve" and are wrong to):
+//
+//   - a2a_proxy.go conciergeWarmingGate — lifts its 503 the instant the row
+//     leaves 'provisioning', admitting real user turns.
+//   - canvas ChatTab / MobileChat — enable the composer on online||degraded.
+//   - platform_agent_ensure.go platformAgentHealthy — 'online' is the ONLY
+//     "leave it alone" status, so an over-claimed online SUPPRESSES the
+//     repair/re-provision of a concierge that cannot actually serve.
+//   - a2a_queue.go queued-turn drain, discovery.go peer URL resolution,
+//     plugins_tracking.go fan-out.
+//
+// WHY THIS IS A DISCLOSURE AND NOT A GATE: gating the flip on genuine
+// callability is not achievable from here. The only non-self-reported evidence
+// the platform can observe is an INBOUND management-API call authenticated by
+// this concierge's own org token (created_by "system:concierge:<id>", see
+// resolveConciergeAdminCredential) — i.e. a real provision_workspace
+// invocation. That can only happen AFTER traffic is admitted, and traffic is
+// admitted by leaving 'provisioning' — so gating on it deadlocks. The
+// alternative, having the platform drive a synthetic turn that forces the verb,
+// is the retired fireConciergeWarmup pattern and the required verb is
+// side-effecting (it creates a real workspace). Accepting a runtime-reported
+// `tools/call` result would just relocate the self-report.
+//
+// So the flip stays where it is and STOPS CLAIMING what it has not verified:
+// it now records WHICH self-report authorised it (conciergeOnlineEvidence) in
+// place of the former unqualified `verified_ready: true`.
+// ────────────────────────────────────────────────────────────────────────────
+
+// conciergeReadinessEvidence names the evidence that authorised a platform
+// concierge's promotion to online. Every value is deliberately prefixed with
+// its own strength so no reader can mistake it for proof of callability:
+// "self_report:" = the runtime said so about itself; "none:" = nothing was
+// checked at all. There is intentionally NO value meaning "callable" — nothing
+// at this point can produce one, and minting an unfed label would be a signal
+// armed ahead of its producer.
+type conciergeReadinessEvidence string
+
+const (
+	// evidenceSelfReportMCPToolsReady — the EV2 mcp_tools_ready heartbeat field
+	// was true. The runtime's own prober succeeded at tools/list. Preferred over
+	// the loaded_mcp_tools list because it is turn-independent and does not
+	// depend on the under-emitting per-turn producer (runtime#181) — but it is
+	// still the runtime describing itself, and a successful tools/list says
+	// nothing about whether a tools/call would do any work.
+	evidenceSelfReportMCPToolsReady conciergeReadinessEvidence = "self_report:mcp_tools_ready"
+
+	// evidenceSelfReportLoadedMCPTools — back-compat arm: the runtime did not
+	// publish mcp_tools_ready, but its self-reported loaded_mcp_tools list
+	// contained the required verb. Strictly weaker than the above: it is a
+	// membership test over a list the runtime composed.
+	evidenceSelfReportLoadedMCPTools conciergeReadinessEvidence = "self_report:loaded_mcp_tools"
+
+	// evidenceNoneLegacyRuntime — the pre-#147 fast path. mcp_server_present is
+	// nil, so the runtime cannot speak the readiness contract at all and is
+	// promoted on liveness alone. NO readiness evidence of any kind was
+	// examined; naming it keeps that visible on the wire instead of letting it
+	// masquerade as the same claim as the arms above.
+	evidenceNoneLegacyRuntime conciergeReadinessEvidence = "none:legacy_runtime_no_readiness_contract"
+)
+
+// conciergeOnlineEvidence names the single strongest self-report that
+// authorised a verified-arm promotion. Pure so the honesty contract is
+// unit-testable without a DB: the caller has already decided TO promote; this
+// only labels WHY, and must never collapse the two arms to one value — the
+// distinction is what tells an operator whether the reliable turn-independent
+// prober fired or only the under-emitting list producer did.
+//
+// Returns "" when neither input holds, which the verified arm never reaches
+// (it is guarded by mcpSurfaceSelfReported). An empty label on the wire would
+// therefore itself be a bug signal, not a silent default.
+func conciergeOnlineEvidence(mcpToolsReady, provisionToolLoaded bool) conciergeReadinessEvidence {
+	switch {
+	case mcpToolsReady:
+		return evidenceSelfReportMCPToolsReady
+	case provisionToolLoaded:
+		return evidenceSelfReportLoadedMCPTools
+	default:
+		return ""
+	}
+}
+
 func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.HeartbeatPayload) {
 	ctx := c.Request.Context()
 
@@ -1766,9 +1869,17 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 			return
 		}
 
-		// core#3082 VERIFIED-READY status management. For a kind=platform
-		// concierge, "online" MUST mean provision_workspace is callable. The
-		// closest by-construction signal available in the heartbeat is the tool
+		// core#3082 status management for a kind=platform concierge.
+		//
+		// ⚠️ CLAIM CORRECTION: this block used to assert that "online" MUST mean
+		// provision_workspace is CALLABLE. It does not and never did — see the
+		// HONEST-CLAIM CONTRACT above evaluateStatus. Both inputs below are
+		// runtime SELF-REPORTS; neither is a tools/call. What this block actually
+		// enforces is: the concierge ADVERTISES the required management surface
+		// (and is healthy) before it leaves the warming hold. Callability is
+		// proven only by Guard B at deploy time.
+		//
+		// The closest by-construction signal available in the heartbeat is the tool
 		// present in THIS heartbeat's loaded_mcp_tools — STRICTER than
 		// platformAgentManagementMCPLoaded (which reports not-missing when the
 		// management plugin row isn't declared yet, so it would false-flip to online
@@ -1788,7 +1899,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		// MCPReadinessProber sets mcp_tools_ready=true directly on the FIRST successful
 		// tools/list (turn-independent — no synthetic warmup turn, and independent of the
 		// under-emitting loaded_mcp_tools producer), so the online-flip is driven by that
-		// reliable event (see readyForOnline below). loaded_mcp_tools presence of
+		// reliable event (see mcpSurfaceSelfReported below). loaded_mcp_tools presence of
 		// provision_workspace remains a back-compat fallback for a runtime that emits the
 		// list but not yet the ready flag; the legacy (mcp_server_present==nil) fast-path
 		// still promotes a null-field runtime immediately.
@@ -1811,14 +1922,21 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		// is the positive half.
 		mcpToolsReady := payload.MCPToolsReady != nil && *payload.MCPToolsReady
 
-		// readyForOnline is the verified-ready predicate for the provisioning->
-		// online flip: EITHER the EV2 tools-loaded heartbeat event (preferred —
-		// reliable + turn-independent) OR the legacy presence of the required
-		// provision_workspace tool in loaded_mcp_tools (back-compat for a runtime
-		// that emits the list but not yet the ready flag). The 180s
+		// mcpSurfaceSelfReported is the predicate for the provisioning->online
+		// flip: EITHER the EV2 tools-loaded heartbeat event (preferred —
+		// turn-independent, and the more reliable of the two) OR the legacy presence
+		// of the required provision_workspace tool in loaded_mcp_tools (back-compat
+		// for a runtime that emits the list but not yet the ready flag). The 180s
 		// managementMCPUnloadedGrace below is KEPT as the post-online flap
 		// absorber for the loaded_mcp_tools under-emit window (runtime#181).
-		readyForOnline := mcpToolsReady || provisionToolLoaded
+		//
+		// NAMED FOR WHAT IT IS (was: readyForOnline, described as "verified-ready"):
+		// both disjuncts are the runtime reporting on itself. This predicate proves
+		// the management surface is ADVERTISED, not that the verb does work. Do not
+		// widen it, and do not add a third disjunct that is another self-report —
+		// the fix for the missing callability proof is a platform-OBSERVED signal,
+		// not a cheaper self-report (see the contract above evaluateStatus).
+		mcpSurfaceSelfReported := mcpToolsReady || provisionToolLoaded
 
 		// recoverable lists the statuses a live heartbeat may legitimately promote
 		// to online. removed/paused/hibernated/hibernating are terminal or
@@ -1834,7 +1952,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		// loaded_mcp_tools capture no longer needs a synthetic turn to coax it —
 		// the runtime's turn-independent MCPReadinessProber reports mcp_tools_ready
 		// directly on the heartbeat, so the warming->online flip is driven by that
-		// real readiness event (readyForOnline) instead of a 60s synthetic turn.
+		// real readiness event (mcpSurfaceSelfReported) instead of a 60s synthetic turn.
 
 		// nil mcp_server_present == a legacy runtime that can never report
 		// loaded_mcp_tools; applying the strict verified gate would strand it in
@@ -1874,7 +1992,11 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = $3::workspace_status`, models.StatusOnline, payload.WorkspaceID, currentStatus); err != nil {
 					log.Printf("Heartbeat: legacy platform %s %s->online failed: %v", payload.WorkspaceID, currentStatus, err)
 				}
-				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{"recovered_from": currentStatus})
+				// Label the legacy arm too: it promotes on LIVENESS ALONE (the runtime
+				// cannot speak the readiness contract), which is even weaker than the
+				// self-report arms. Emitting it unlabelled next to a labelled event
+				// would read as "no evidence recorded" rather than "no evidence taken".
+				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{"readiness_evidence": string(evidenceNoneLegacyRuntime), "recovered_from": currentStatus})
 				h.fireReconcileOnline(ctx, payload.WorkspaceID)
 				// FIRST boots only (provisioning→online). Recovery promotions
 				// (offline/failed/degraded→online after an outage) must never
@@ -1884,18 +2006,22 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				if currentStatus == string(models.StatusProvisioning) {
 					h.fireFirstBootGreeting(payload.WorkspaceID, len(payload.LoadedMCPTools))
 				}
-			case readyForOnline && !conciergeUnhealthy:
-				// VERIFIED-ready by construction: the EV2 mcp_tools_ready event (or,
-				// back-compat, provision_workspace present in loaded_mcp_tools) proves
-				// the management MCP is loaded, so promote and clear any warming stamp.
+			case mcpSurfaceSelfReported && !conciergeUnhealthy:
+				// SELF-REPORTED-ready: the EV2 mcp_tools_ready event (or, back-compat,
+				// provision_workspace present in loaded_mcp_tools) says the management
+				// MCP is loaded, so promote and clear any warming stamp. This is an
+				// ADVERTISEMENT of the surface, NOT proof the verb is callable — the
+				// evidence label below records which self-report authorised it so the
+				// event stream never again carries an unqualified "verified" claim.
 				// The AND status=$currentStatus guard keeps the flip conditional so a
 				// racing Delete/pause is not overwritten.
+				evidence := conciergeOnlineEvidence(mcpToolsReady, provisionToolLoaded)
 				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2 AND status = $3::workspace_status`, models.StatusOnline, payload.WorkspaceID, currentStatus); err != nil {
 					log.Printf("Heartbeat: verified platform %s %s->online failed: %v", payload.WorkspaceID, currentStatus, err)
 				} else {
-					log.Printf("Heartbeat: platform %s VERIFIED-ready (mcp_tools_ready=%v provision_workspace_loaded=%v) %s->online (EV2/core#3082)", payload.WorkspaceID, mcpToolsReady, provisionToolLoaded, currentStatus)
+					log.Printf("Heartbeat: platform %s SELF-REPORTED-ready evidence=%s (mcp_tools_ready=%v provision_workspace_loaded=%v) %s->online — surface ADVERTISED, callability NOT verified (EV2/core#3082)", payload.WorkspaceID, evidence, mcpToolsReady, provisionToolLoaded, currentStatus)
 				}
-				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{"verified_ready": true, "recovered_from": currentStatus})
+				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{"readiness_evidence": string(evidence), "recovered_from": currentStatus})
 				h.fireReconcileOnline(ctx, payload.WorkspaceID)
 				// FIRST boots only — see the legacy arm's comment above.
 				if currentStatus == string(models.StatusProvisioning) {
@@ -2043,7 +2169,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		// empty/partial list on this beat. Degrading such a box on loaded_mcp_tools
 		// alone is exactly the #4449 defect: an online codex/hermes concierge whose
 		// loaded_mcp_tools under-emits degraded after the 180s grace and then flapped
-		// (readyForOnline re-promoted it, only to degrade again) — an online<->degraded
+		// (mcpSurfaceSelfReported re-promoted it, only to degrade again) — an online<->degraded
 		// oscillation with intermittent unavailability. We therefore SKIP the
 		// loaded_mcp_tools degrade whenever mcp_tools_ready is affirmed, and clear any
 		// stale unloaded stamp. Genuine management-MCP LOSS is still caught hard by
