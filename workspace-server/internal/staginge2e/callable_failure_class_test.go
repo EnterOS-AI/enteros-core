@@ -28,12 +28,29 @@ type callableFixture struct {
 // pinned two markers that no traffic can fire. Both fixtures and both markers
 // are gone; TestClassifyCallableTurnFailure_EveryMarkerIsNecessary now makes
 // that class of mistake fail the build.
+//
+// HOW THESE ARE VERIFIED. Every row is checked out-of-band against the job
+// logs by a sweep that asserts TWO things: the reply is a verbatim substring
+// of a logged reply, AND it was logged by the RUN the row cites. The first
+// pass only checked the string, which is why a third bad row survived it: the
+// 616276 row carried "…mcp__molecule_platform__list_workspaces", which is real
+// text — logged by 616479. Same string, wrong run. Checking attribution as
+// well as content is what caught it, and all 14 rows now pass both legs.
+//
+// Reconstructing a reply from a log means taking the `"text":"…"` capture and
+// cutting at the first newline; a greedy match runs on into the next log line.
+// The older runs are additionally truncated by the pre-core#5052
+// a2aTurnLogCap, which is why so many rows end mid-word.
 var callableFixtures = []callableFixture{
 	// ── G4: the model emitted a tool id that does not exist ──────────────
 	{"622972", "Model generated invalid tool call: mcp__molecule__get_workspace_info", "G4-TOOL-NAME-MANGLED"},
 	{"616479", "Model generated invalid tool call: mcp__molecule_platform__list_orgs", "G4-TOOL-NAME-MANGLED"},
 	{"609766", "Model generated invalid tool call: list_peers", "G4-TOOL-NAME-MANGLED"},
-	{"616276", "Model generated invalid tool call: mcp__molecule_platform__list_workspaces", "G4-TOOL-NAME-MANGLED"},
+	// 616276's replies are all truncated in its log; this is the verbatim
+	// prefix. An earlier revision carried a 25-char completion
+	// ("…_platform__list_workspaces") that is real text but was logged by
+	// 616479, not by this run — see the sweep note above the table.
+	{"616276", "Model generated invalid tool call: mcp__molecule_", "G4-TOOL-NAME-MANGLED"},
 
 	// ── G6: LLM account out of credit ────────────────────────────────────
 	{"596312", `Billing or credits exhausted: HTTP 402: {"error`, "G6-LLM-BILLING-EXHAUSTED"},

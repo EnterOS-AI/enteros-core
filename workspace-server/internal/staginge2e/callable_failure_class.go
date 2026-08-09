@@ -139,16 +139,22 @@ var callableFailureClasses = []CallableFailureClass{
 		//	i can't             557370 "I can't do this. No tool exists in my environment"
 		//	tool is not         614408 "I see that the `provision_workspace` tool is not "
 		//
-		// Seven further variants were deleted, in two groups. Four match NO
-		// corpus reply at all ("do not have the", "i am unable to", "i cannot",
-		// and G6's "error code: 402"). Three matched only replies that another
-		// marker already catches ("don't have the", "do not have a",
-		// "don't have the capability", "i'm unable to", "unable to create") —
-		// redundant, so their deletion changed no behaviour and nothing
-		// detected it. Two more ("necessary permission", "is not available")
-		// existed only because an earlier fixture INVENTED the end of a
-		// truncated reply. All of them are the G8 mistake at finer grain: a
-		// branch no traffic exercises and no test would miss.
+		// TEN G5 variants were deleted, in three groups that sum to ten:
+		//
+		//	3  match NO corpus reply at all:
+		//	   "do not have the", "i am unable to", "i cannot"
+		//	5  matched only replies another marker already catches, so deleting
+		//	   them changed no behaviour and nothing detected it:
+		//	   "don't have the", "do not have a", "don't have the capability",
+		//	   "i'm unable to", "unable to create"
+		//	2  existed only because an earlier fixture INVENTED the end of a
+		//	   truncated reply: "necessary permission", "is not available"
+		//
+		// Across all classes the count is 13 (23 markers -> 10): these ten,
+		// plus G6's "error code: 402" (ungrounded) and "http 402" (redundant),
+		// plus G7's "model has no" (documented at G7 above). Every one is the
+		// G8 mistake at finer grain: a branch no traffic exercises and no test
+		// would miss.
 		markers: []string{
 			"i don't have", "i do not have", "don't have a", "no peers registered",
 			"not something i", "i can't", "tool is not",
