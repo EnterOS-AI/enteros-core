@@ -5,8 +5,12 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -356,21 +360,37 @@ func TestMCPSurface_DoesNotMoveThePromotionPredicate(t *testing.T) {
 // traffic — exactly the ageing-out case — and must still read corroborated,
 // because "this model has dispatched from namespace X" is an existence claim
 // that a shorter window cannot falsify.
+// ⚠️ The two beats are stamped with EXPLICIT, DISTINCT instants, not time.Now().
+// An earlier version called time.Now() for both: on a coarse monotonic clock the
+// two reads returned the identical value (measured 200/200 iterations), so the
+// re-dating assertion below compared t == t and could not fail — a
+// re-dating implementation passed every time. It was the one assertion
+// protecting this round's own stated mitigation. classifyMCPSurface already
+// takes `now` as a parameter, so there is no reason to depend on the clock at
+// all; t1 is an hour after t0 and the assertion is EQUALITY WITH t0, not merely
+// "unchanged", so a mutant that stamps any other value is caught too.
 func TestMCPSurface_CorroborationIsSticky(t *testing.T) {
 	reported := []string{conciergePlatformMCPProvisionWorkspaceTool}
+	t0 := time.Date(2026, 8, 5, 8, 18, 56, 0, time.UTC)
+	t1 := t0.Add(time.Hour)
 
 	beat1Disp, beat1N := dispatchSet("mcp__molecule_platform__provision_workspace")
-	beat1 := classifyMCPSurface(reported, beat1Disp, beat1N, nil, time.Now())
+	beat1 := classifyMCPSurface(reported, beat1Disp, beat1N, nil, t0)
 	if beat1.Verdict != verdictCorroborated {
 		t.Fatalf("beat 1 verdict = %q, want %q", beat1.Verdict, verdictCorroborated)
 	}
 	if beat1.FirstCorroboratedAt == nil {
 		t.Fatal("beat 1 did not stamp first_corroborated_at — the age of a sticky claim must be visible")
 	}
+	if !beat1.FirstCorroboratedAt.Equal(t0) {
+		t.Fatalf("beat 1 first_corroborated_at = %v, want the instant corroboration was reached (%v)",
+			beat1.FirstCorroboratedAt, t0)
+	}
 
-	// Beat 2: the management dispatch has aged out of the window entirely.
+	// Beat 2, an hour later: the management dispatch has aged out of the window
+	// entirely and only sidecar traffic remains.
 	beat2Disp, beat2N := dispatchSet("mcp__molecule__send_message_to_user")
-	beat2 := classifyMCPSurface(reported, beat2Disp, beat2N, &beat1, time.Now())
+	beat2 := classifyMCPSurface(reported, beat2Disp, beat2N, &beat1, t1)
 
 	if beat2.Verdict != verdictCorroborated {
 		t.Errorf("verdict reverted to %q when the management dispatch aged out of the %d-row window — "+
@@ -384,10 +404,13 @@ func TestMCPSurface_CorroborationIsSticky(t *testing.T) {
 	if len(beat2.DispatchedNamespaces) != 1 || beat2.DispatchedNamespaces[0] != "molecule" {
 		t.Errorf("dispatched_namespaces = %v, want [molecule] — the windowed half must report the window, not the union", beat2.DispatchedNamespaces)
 	}
-	// And the sticky claim must not silently re-date itself.
-	if beat2.FirstCorroboratedAt == nil || !beat2.FirstCorroboratedAt.Equal(*beat1.FirstCorroboratedAt) {
-		t.Errorf("first_corroborated_at moved (%v -> %v) — the age of the claim must be its ORIGINAL age",
-			beat1.FirstCorroboratedAt, beat2.FirstCorroboratedAt)
+	// The sticky claim must carry its ORIGINAL age forward. Compared against t0
+	// (a value beat 2 never sees) rather than against beat1's field, so an
+	// implementation that re-stamps to `now` lands on t1 and fails.
+	if beat2.FirstCorroboratedAt == nil || !beat2.FirstCorroboratedAt.Equal(t0) {
+		t.Errorf("first_corroborated_at = %v after beat 2, want %v — re-dating it every beat "+
+			"erases the age of the claim, which is the only thing that keeps a sticky verdict honest",
+			beat2.FirstCorroboratedAt, t0)
 	}
 }
 
@@ -442,21 +465,89 @@ func TestMCPSurface_StickinessCannotInventCorroboration(t *testing.T) {
 // proves unreachability. A future value spelled "contradicted:"/"degraded:"/
 // "failed:" fails here and should instead be derived from the runtime's
 // loaded_not_model_facing.
+// ⚠️ The list is DERIVED FROM THE DECLARATION, not hand-maintained. A hardcoded
+// slice can only check the values someone remembered to add to it, so the one
+// change this rule exists to stop — a NEW const spelled `contradicted:` — would
+// sail past it. declaredMCPSurfaceVerdicts parses registry.go and returns every
+// const of type mcpSurfaceVerdict, so a new value is covered the moment it is
+// declared.
 func TestMCPSurface_NoVerdictIsNegativeEvidence(t *testing.T) {
-	for _, v := range []mcpSurfaceVerdict{
+	declared := declaredMCPSurfaceVerdicts(t)
+
+	// NON-VACUITY: a parser that silently found nothing would make every
+	// assertion below a no-op — the exact "guard covering NOTHING reports
+	// success" shape. Pin that the extraction really works by requiring the
+	// four values the package defines today to be among the results.
+	for _, known := range []mcpSurfaceVerdict{
 		verdictNoInventory, verdictNoDispatchRecord, verdictNotYetExercised, verdictCorroborated,
 	} {
-		s := string(v)
+		if _, ok := declared[string(known)]; !ok {
+			t.Fatalf("verdict extraction is broken: %q is declared in registry.go but was not found "+
+				"(found %d: %v) — an extraction that finds nothing would pass this test vacuously",
+				known, len(declared), declared)
+		}
+	}
+
+	for s, name := range declared {
 		if !strings.HasPrefix(s, "unknown:") && !strings.HasPrefix(s, "dispatch_observed:") {
-			t.Errorf("verdict %q is neither an observation nor an admission of ignorance — "+
-				"a fault finding cannot be derived from dispatch absence", s)
+			t.Errorf("%s = %q is neither an observation (dispatch_observed:) nor an admission of "+
+				"ignorance (unknown:) — a fault finding cannot be derived from dispatch absence, "+
+				"because no quantity of non-observation proves unreachability", name, s)
 		}
 		for _, forbidden := range []string{"contradict", "degraded", "failed", "broken", "callable"} {
 			if strings.Contains(strings.ToLower(s), forbidden) {
-				t.Errorf("verdict %q contains %q; this classifier cannot establish that", s, forbidden)
+				t.Errorf("%s = %q contains %q; this classifier cannot establish that. "+
+					"A contradiction verdict belongs on the runtime's loaded_not_model_facing, "+
+					"which compares against the OFFERED surface.", name, s, forbidden)
 			}
 		}
 	}
+}
+
+// declaredMCPSurfaceVerdicts returns {value: constName} for every
+// `X mcpSurfaceVerdict = "..."` const declared in registry.go, by parsing the
+// source. Fails the test rather than returning empty on any parse problem, so a
+// broken extraction can never masquerade as "no violations found".
+func declaredMCPSurfaceVerdicts(t *testing.T) map[string]string {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "registry.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse registry.go: %v", err)
+	}
+	out := map[string]string{}
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			ident, ok := vs.Type.(*ast.Ident)
+			if !ok || ident.Name != "mcpSurfaceVerdict" {
+				continue
+			}
+			for i, nameIdent := range vs.Names {
+				if i >= len(vs.Values) {
+					continue
+				}
+				lit, ok := vs.Values[i].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					t.Fatalf("%s is not a plain string literal — the extraction cannot read it, "+
+						"so it would be silently unchecked", nameIdent.Name)
+				}
+				val, uErr := strconv.Unquote(lit.Value)
+				if uErr != nil {
+					t.Fatalf("unquote %s: %v", nameIdent.Name, uErr)
+				}
+				out[val] = nameIdent.Name
+			}
+		}
+	}
+	return out
 }
 
 // ── End-to-end: the real predicate, the real SQL ────────────────────────────
@@ -769,6 +860,70 @@ func TestMCPSurface_ReadTouchesOnlyToolTrace(t *testing.T) {
 	// The verdict must also be published to the request for evaluateStatus.
 	if got := mcpSurfaceVerdictFromContext(c); got != verdictCorroborated {
 		t.Errorf("request-context verdict = %q, want %q", got, verdictCorroborated)
+	}
+}
+
+// TestMCPSurface_PriorReadFailure_CannotStrengthen pins the DIRECTION of
+// priorMCPSurface's failure mode. Its nil-fail was correct but unpinned: nothing
+// stopped a future edit from returning a fabricated corroborated prior on error
+// ("be helpful when the row can't be read"), which would let a DB blip mint
+// corroboration out of nothing — the same manufactured-evidence failure the
+// whole record exists to prevent, arriving through the error path.
+//
+// Both non-happy paths are driven, because they fail differently in the code: a
+// query error, and a row that parses to garbage. In both the dispatch window
+// contains ONLY sidecar traffic, so a correct implementation can only reach
+// unknown:advertised_not_yet_exercised, while any implementation that invents a
+// prior reaches dispatch_observed:*.
+func TestMCPSurface_PriorReadFailure_CannotStrengthen(t *testing.T) {
+	cases := map[string]func(*sqlmock.ExpectedQuery){
+		"prior read errors": func(q *sqlmock.ExpectedQuery) {
+			q.WillReturnError(errors.New("connection reset"))
+		},
+		"prior row is not valid JSON": func(q *sqlmock.ExpectedQuery) {
+			q.WillReturnRows(sqlmock.NewRows([]string{"mcp_surface"}).AddRow("{not json"))
+		},
+		"prior row is JSON of the wrong shape": func(q *sqlmock.ExpectedQuery) {
+			q.WillReturnRows(sqlmock.NewRows([]string{"mcp_surface"}).AddRow(`"a bare string"`))
+		},
+	}
+
+	for name, arrange := range cases {
+		t.Run(name, func(t *testing.T) {
+			mock := setupTestDB(t)
+			handler := NewRegistryHandler(newTestBroadcaster())
+
+			arrange(mock.ExpectQuery("SELECT COALESCE\\(mcp_surface::text").WithArgs("ws-priorfail"))
+			mock.ExpectQuery("SELECT COALESCE\\(tool_trace::text").
+				WithArgs("ws-priorfail", int64(mcpDispatchLookbackRows)).
+				WillReturnRows(sqlmock.NewRows([]string{"trace"}).
+					AddRow(`[{"tool":"mcp__molecule__send_message_to_user"}]`))
+			var surface string
+			mock.ExpectExec("UPDATE workspaces SET mcp_surface").
+				WithArgs(capturedArg{seen: &surface}, "ws-priorfail").
+				WillReturnResult(sqlmock.NewResult(0, 1))
+
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			handler.recordMCPSurfaceCorroboration(c, c, "ws-priorfail",
+				[]string{conciergePlatformMCPProvisionWorkspaceTool})
+
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet sqlmock expectations: %v (surface: %s)", err, surface)
+			}
+			if got := mcpSurfaceVerdictFromContext(c); got != verdictNotYetExercised {
+				t.Errorf("verdict = %q, want %q — an unreadable prior record must FAIL TO THE WEAKER "+
+					"verdict; it must never be able to manufacture corroboration", got, verdictNotYetExercised)
+			}
+			if strings.Contains(surface, string(verdictCorroborated)) {
+				t.Errorf("persisted document claims corroboration after an unreadable prior: %s", surface)
+			}
+			if !strings.Contains(surface, `"dispatch_corroborated_count":0`) {
+				t.Errorf("dispatch_corroborated_count is non-zero after an unreadable prior: %s", surface)
+			}
+			if strings.Contains(surface, "first_corroborated_at") {
+				t.Errorf("first_corroborated_at stamped without corroboration: %s", surface)
+			}
+		})
 	}
 }
 
