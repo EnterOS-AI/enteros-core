@@ -487,6 +487,46 @@ class TestTransientRetry:
     def test_no_other_4xx_is_transient(self, code):
         assert not lint._is_transient_status(code)
 
+    def test_HTTPError_IS_a_subclass_of_the_transient_tuple(self):
+        """Documents the footgun rather than pretending it is not there.
+
+        Since _TRANSIENT_EXC widened to base classes, HTTPError -> URLError
+        -> OSError means this is literally True. Clause ORDER in api() is
+        the only thing keeping 4xx terminal. If this assertion ever starts
+        failing, the tuple narrowed and the ordering comment is stale; if
+        it keeps passing, `test_4xx_is_NEVER_retried` is what stops a
+        reorder from silently retrying 403s."""
+        assert issubclass(urllib.error.HTTPError, lint._TRANSIENT_EXC)
+
+    def test_the_main_net_does_not_swallow_the_exit_protocol(self):
+        """`Exception`, not `BaseException`, is load-bearing.
+
+        The env-contract and YAML-parse failures signal via sys.exit(2) /
+        sys.exit(3), which raise SystemExit — a BaseException. Widening
+        main()'s catch-all would silently collapse exit 2 and exit 3 into
+        4, destroying two documented codes inside the contract this file
+        sharpens."""
+        assert not issubclass(SystemExit, Exception)
+        assert issubclass(SystemExit, BaseException)
+
+    @pytest.mark.parametrize("code", [2, 3])
+    def test_exit_2_and_3_still_propagate_through_main(
+        self, api_env, monkeypatch, capsys, code
+    ):
+        """The executable half of the assertion above."""
+        opener, _ = _scripted_opener(["ok"])
+        monkeypatch.setattr(lint.urllib.request, "urlopen", opener)
+        monkeypatch.setattr(
+            lint, "build_job_index", lambda *a, **k: sys.exit(code)
+        )
+        with pytest.raises(SystemExit) as e:
+            lint.main()
+        capsys.readouterr()
+        assert e.value.code == code, (
+            f"exit {code} was swallowed and remapped — main() must catch "
+            f"Exception, never BaseException"
+        )
+
 
 class TestUnreachableIsNotNonCompliance:
     """The whole point: on retry exhaustion the lint must say the API was
@@ -681,6 +721,64 @@ class TestUnreachableIsNotNonCompliance:
             rc = lint.main()
             capsys.readouterr()
             assert rc == 4, f"{type(inject).__name__} escaped or mis-coded as {rc}"
+
+    def test_the_403_auth_failure_also_lands_in_the_run_summary(
+        self, api_env, monkeypatch, capsys, tmp_path
+    ):
+        """The 403 branch needs the summary MORE than the others.
+
+        A failed step's log is collapsed by default, and this is the one
+        branch pointing at a live permissions defect rather than weather —
+        the merge-queue actor's 403 on this same endpoint. A 403 buried in
+        a folded log is how an authorisation defect gets mistaken for
+        flake."""
+        summary = tmp_path / "summary.md"
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+        rc, _, attempts = self._run(monkeypatch, ["403"], capsys)
+        assert rc == 4
+        assert len(attempts) == 1
+        md = summary.read_text(encoding="utf-8")
+        assert "AUTH FAILURE" in md
+        assert "NOT a compliance finding" in md
+        assert "repo-admin" in md
+        assert "was NOT retried" in md, (
+            "the summary must say re-running will not help — otherwise the "
+            "operator treats an authorisation fact as a transient one"
+        )
+        assert "HTTP 403" in md
+
+    def test_the_403_summary_degrades_cleanly_when_unset_or_unwritable(
+        self, api_env, monkeypatch, capsys, tmp_path
+    ):
+        """Same contract as the other branches: reporting must never be
+        able to change the verdict."""
+        monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+        rc, log, _ = self._run(monkeypatch, ["403"], capsys)
+        assert rc == 4 and "AUTH FAILURE" in log and "Traceback" not in log
+
+        monkeypatch.setenv(
+            "GITHUB_STEP_SUMMARY", str(tmp_path / "no" / "dir" / "s.md")
+        )
+        rc, log, _ = self._run(monkeypatch, ["403"], capsys)
+        assert rc == 4 and "AUTH FAILURE" in log and "Traceback" not in log
+
+    @pytest.mark.parametrize("script", [["502"], ["403"], ["ok"]])
+    def test_every_terminal_branch_reports_somewhere(
+        self, api_env, monkeypatch, capsys, tmp_path, script
+    ):
+        """Negative control against a future branch being added without a
+        summary: each non-clean exit must write one, and the clean run
+        must not write a scary one."""
+        summary = tmp_path / "summary.md"
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+        rc, _, _ = self._run(monkeypatch, script, capsys)
+        md = summary.read_text(encoding="utf-8") if summary.exists() else ""
+        if rc == 0:
+            assert "DID NOT RUN" not in md and "AUTH FAILURE" not in md
+        else:
+            assert "NOT a compliance finding" in md, (
+                f"exit {rc} wrote no run-summary banner"
+            )
 
     def test_404_still_degrades_gracefully_without_retrying(
         self, api_env, monkeypatch, capsys

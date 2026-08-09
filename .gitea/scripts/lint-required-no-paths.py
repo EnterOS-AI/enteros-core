@@ -411,8 +411,25 @@ def api(
                 raw = resp.read()
                 status = resp.status
         except urllib.error.HTTPError as e:
-            # An HTTP status came back — HTTPError is checked BEFORE the
-            # transport tuple because it subclasses URLError.
+            # ██ CLAUSE ORDER IS THE ONLY THING KEEPING 4xx OUT OF THE
+            # ██ RETRY LOOP. DO NOT REORDER THESE TWO `except` CLAUSES.
+            #
+            # Since _TRANSIENT_EXC widened to base classes,
+            # `issubclass(urllib.error.HTTPError, _TRANSIENT_EXC)` is
+            # literally True (HTTPError -> URLError -> OSError). Python
+            # takes the FIRST matching clause, so this one wins and 4xx
+            # stays terminal. Move it below the transport clause and every
+            # 403 is silently retried four times with backoff — turning
+            # the authorisation fact this lint is careful to surface
+            # loudly (see the merge-queue actor's live 403) back into
+            # something that reads like weather. No error, no warning:
+            # just a slower, quieter wrong answer.
+            #
+            # `test_4xx_is_NEVER_retried` asserts exactly one attempt over
+            # six status codes. That test is the guardrail; it is what
+            # stops the reorder, so do not weaken it either.
+            #
+            # An HTTP status came back, so we learned something.
             try:
                 raw = e.read()
             except Exception:  # pragma: no cover - body already consumed
@@ -1027,6 +1044,38 @@ def run() -> int:
                 f"Fix: grant repo-admin to mc-drift-bot (org team "
                 f"`drift-bot`, perm=admin) — fix the token, not the lint.\n"
             )
+            # This branch needs the run-summary banner MORE than any other,
+            # not less. A failed step's log is collapsed by default, and
+            # this is the one branch pointing at a LIVE PERMISSIONS DEFECT
+            # rather than at weather: the merge-queue actor already 403s on
+            # this exact endpoint and falls back to a hardcoded
+            # REQUIRED_APPROVALS: 2 while branch protection says 1. The
+            # collapsed-log argument that justified the exit-5 banner
+            # applies most strongly right here — a 403 buried in a folded
+            # log is how an authorisation defect gets mistaken for flake.
+            _step_summary(
+                "## ⚠ lint-required-no-paths — **AUTH FAILURE, LINT COULD "
+                "NOT VERIFY**\n\n"
+                "**This is NOT a compliance finding. No workflow was "
+                "judged.**\n\n"
+                f"`GET {protection_path}` returned **HTTP {http_status}**. "
+                "The token cannot read branch protections, so the required-"
+                "check set could not be enumerated and the no-paths-filter "
+                "invariant could not be verified. Failing closed rather "
+                "than greening a gate it could not check.\n\n"
+                "**This is an authorisation fact, not a transient one — it "
+                "was NOT retried, and re-running will not fix it.**\n\n"
+                "Fix: grant repo-admin to `mc-drift-bot` (org team "
+                "`drift-bot`, perm=admin). Fix the token, not the lint.\n\n"
+                "| exit | meaning | what to do |\n"
+                "|---|---|---|\n"
+                "| 1 | a required workflow really does carry a paths filter "
+                "| fix the workflow |\n"
+                "| **4** | **the API answered and its answer blocks "
+                "verification — you are here** | **fix the token / the "
+                "SSOT** |\n"
+                "| 5 | the API never answered | re-run; check the edge |\n"
+            )
             return 4
         if http_status == 404:
             # Authenticated absent resource: branch genuinely has no
@@ -1245,6 +1294,18 @@ def main() -> int:
             f"judged. Exit 4.\n"
         )
         return 4
+    # `Exception`, NOT `BaseException` — and that is LOAD-BEARING, not an
+    # oversight. The env-contract and YAML-parse failures signal via
+    # `sys.exit(2)` / `sys.exit(3)`, which raise SystemExit — a
+    # BaseException, deliberately outside this net. Widening to
+    # BaseException would silently collapse exit 2 and exit 3 into 4,
+    # destroying two documented codes inside the very contract this file
+    # exists to sharpen (and would swallow KeyboardInterrupt besides).
+    # If you are here to widen this catch: don't. The next person will
+    # reach for BaseException for exactly the reasons the transient
+    # classifier above reaches for OSError — the difference is that
+    # OSError widens a class of NETWORK faults, while BaseException would
+    # widen over this script's own EXIT PROTOCOL.
     except Exception as e:  # noqa: BLE001 - deliberate catch-all; see docstring
         sys.stderr.write(
             f"::error::LINT DID NOT COMPLETE — unexpected internal error in "
