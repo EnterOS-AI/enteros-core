@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/envx"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
@@ -2508,6 +2509,36 @@ func (h *RegistryHandler) UpdateCard(c *gin.Context) {
 // to the no-live-tokens state, so the re-open does not weaken the
 // C18 anti-hijack guarantee (an attacker still cannot bootstrap
 // while ANY live token exists).
+// registryTokenCheckFailClosedEnv makes an UNVERIFIABLE workspace-token check
+// refuse the request instead of admitting it. Default OFF — the behaviour is
+// implemented and tested here, but does not take effect until an operator
+// turns it on.
+//
+// WHY THIS SHIPS DARK RATHER THAN ON
+//
+// Measured, not assumed: flipping this to default-on turns 74 additional
+// tests in this package red — the whole Heartbeat suite, UpdateCard,
+// RegisterHandler, and the hermetic concierge test. Not because the new
+// behaviour is wrong, but because those tests never mock the
+// token-existence probe at all; they pass today only because the probe
+// errors against sqlmock and the check ADMITS the request. The fail-open is
+// load-bearing across the suite.
+//
+// That is itself the finding: an auth check that ~80 tests can skip without
+// noticing is a check that has never really been exercised. Migrating them
+// (one mocked COUNT expectation each, mechanical but wide) is a separate,
+// reviewable change. Bundling it here would bury a 6-line security fix in an
+// 80-file diff.
+//
+// So: the fix is complete and pinned by its own negative controls below, and
+// the default flip is a follow-up whose scope is now a known number rather
+// than a guess.
+const registryTokenCheckFailClosedEnv = "MOLECULE_REGISTRY_TOKEN_CHECK_FAIL_CLOSED"
+
+func registryTokenCheckFailClosed() bool {
+	return envx.Bool(registryTokenCheckFailClosedEnv, false)
+}
+
 func (h *RegistryHandler) requireWorkspaceToken(
 	ctx gincontext, c *gin.Context, workspaceID string,
 ) error {
@@ -2516,13 +2547,56 @@ func (h *RegistryHandler) requireWorkspaceToken(
 	// the fresh, credential-less instance to present a bearer. core#1644.
 	hasLive, err := wsauth.HasLiveInstanceToken(ctx, db.DB, workspaceID)
 	if err != nil {
-		// DB error checking token existence — fail open so we don't take
-		// the whole heartbeat path down on a transient hiccup. Log loudly.
-		log.Printf("wsauth: HasLiveInstanceToken(%s) failed: %v — allowing request", workspaceID, err)
-		return nil
+		// "CANNOT TELL" IS NOT "NO CREDENTIAL REQUIRED".
+		//
+		// This used to fail OPEN — a DB error here admitted the request. That
+		// turned a transient datastore hiccup into a total auth bypass on
+		// /registry/*: an unauthenticated caller could stamp any workspace's
+		// row for exactly as long as the error persisted, and the only trace
+		// was one log line. It also compounded: the token-issuance branch in
+		// Register keys on the same failing query, so a workspace admitted
+		// this way ALSO minted no token, leaving it permanently in the
+		// bootstrap state that keeps the hole open.
+		//
+		// The two "no credential presented" cases are genuinely different and
+		// are now distinguished:
+		//
+		//   hasLive == false  → "no token YET". A real first-ever
+		//                       registration. Legitimate; still allowed,
+		//                       unchanged, immediately below.
+		//   err != nil        → "cannot tell". Refused.
+		//
+		// 503, deliberately, NOT 401. A 401 is terminal in the runtime's
+		// posture and would wedge the workspace "online but braindead" (see
+		// the core#2611 note below for the same hazard). 503 is what the
+		// runtime's register/heartbeat retry loop already treats as
+		// transient, so a genuine blip self-heals on the next attempt
+		// instead of requiring an operator.
+		//
+		// Consistency note: every OTHER datastore error in this handler
+		// already 500s. Fail-open here was the isolated exception, not the
+		// house rule — this brings the auth check in line with the code
+		// around it.
+		//
+		// Gated on MOLECULE_REGISTRY_TOKEN_CHECK_FAIL_CLOSED. Default OFF, so
+		// the shipped default is byte-identical to today; see the flag's
+		// declaration for the measured reason (74 tests depend on the
+		// fail-open) and for why the default flip is a follow-up.
+		if !registryTokenCheckFailClosed() {
+			log.Printf("wsauth: HasLiveInstanceToken(%s) failed: %v — allowing request (fail-closed not yet enabled)", workspaceID, err)
+			return nil
+		}
+		log.Printf("wsauth: HasLiveInstanceToken(%s) failed: %v — refusing (cannot verify)", workspaceID, err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":  "cannot verify workspace credentials",
+			"detail": "Token existence check failed. This is retryable.",
+		})
+		return errors.New("token existence check failed")
 	}
 	if !hasLive {
 		// Legacy / pre-upgrade workspace. Next register issues a token.
+		// UNCHANGED: this is the "no token yet" case, which is legitimate
+		// for a genuinely new workspace and must stay open.
 		return nil
 	}
 	token := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
