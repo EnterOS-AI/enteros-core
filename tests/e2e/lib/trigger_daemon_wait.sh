@@ -640,6 +640,24 @@ trigger_daemon_backstop_resolve() {
 # have. If someone raises the cap above the TTL the subsumption inverts, the
 # check below fails, and the re-read is forced.
 #
+# THE ONE BOUND THIS LEDGER DOES NOT MODEL is the CI job timeout, and it is
+# named here rather than left off the list, because "a bound nobody enumerated"
+# is how the 210 survived. `.gitea/workflows/e2e-ephemeral-happy-path.yml` sets
+# `timeout-minutes: 75` (4500s), which is the true outermost layer: if it were
+# ever below the 1800s backstop, the backstop would be unreachable and every
+# derived number below it would be decoration.
+#
+# It is not a ledger ROW because making it one honestly would mean each lane
+# passing its own `timeout-minutes` in as env, and there is more than one lane
+# running this harness — a row wired from a single workflow would assert the
+# bound for one lane and silently assert NOTHING for the others, which is a
+# guard that looks like it covers the path and does not. The inequality that
+# holds today: at most ONE backstop is reachable per run (every leg `fail`s
+# rather than continuing, so reaching a later backstop means the earlier legs
+# returned on their signal in seconds), so worst case is 1800s of backstop
+# inside 4500s of job. Anyone shortening `timeout-minutes` below ~2x the
+# backstop must revisit this.
+#
 # Read at the validated scheduler pin; the runtime constant is
 # molecule_runtime/turn_lease.py `_DEFAULT_IDLE_CAP_SECONDS`.
 TRIGGER_DAEMON_RUNTIME_IDLE_TTL_SECS="${TRIGGER_DAEMON_RUNTIME_IDLE_TTL_SECS:-900}"
