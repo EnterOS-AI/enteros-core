@@ -117,14 +117,58 @@ trigger_daemon_stale_secs() {
   printf '%s' "$stale"
 }
 
+# The daemon's own delivery watchdog, in whole seconds — the ONE number every
+# backstop in this lib is measured against. It exists as a function so no caller
+# re-types the value: a second copy of it is a second thing to forget when the
+# daemon's timeout moves, and the invariant below is only as good as the number
+# it compares to.
+trigger_daemon_watchdog_secs() {
+  local watchdog="${TRIGGER_DAEMON_WATCHDOG_SECS:-600}"
+  case "$watchdog" in ''|*[!0-9]*|0) watchdog=600 ;; esac
+  printf '%s' "$watchdog"
+}
+
 # The backstop is a never-hit safety net, so it must EXCEED the daemon's own
 # delivery watchdog — otherwise the wait expires while a wedged fire is still
 # being re-queued for its retry, which is exactly how the old 360s budget could
 # never observe a recovery.
 trigger_daemon_backstop_secs() {
-  local watchdog="${TRIGGER_DAEMON_WATCHDOG_SECS:-600}"
-  case "$watchdog" in ''|*[!0-9]*|0) watchdog=600 ;; esac
-  printf '%s' $((watchdog * 3))
+  printf '%s' $(( $(trigger_daemon_watchdog_secs) * 3 ))
+}
+
+# trigger_daemon_backstop_resolve [operator-override-secs]
+#
+# The ONLY supported way to turn an operator knob into a backstop. An empty
+# override derives the 3x above; a supplied one is honoured ONLY while it still
+# exceeds the watchdog. Anything else is REFUSED (rc=3, nothing on stdout) so the
+# caller fails loudly instead of running a wait that cannot observe a recovery.
+#
+# WHY REFUSING MATTERS MORE THAN DERIVING. Every call site spells its knob
+# `${SOME_OVERRIDE:-$(derive)}`, so the override does not adjust the derivation —
+# it REPLACES it, and any literal at all wins, including one below the watchdog.
+# Deriving correctly in the default branch therefore proves nothing about what
+# actually runs. This is not hypothetical: 10g's DELIVER leg passed a bare `210`
+# against a 600s watchdog from #4568 until this guard, and it parsed, ran and
+# read as deliberate the entire time — the inequality was simply never checked
+# anywhere. A knob able to reintroduce the exact defect this lib exists to
+# prevent has to be rejected by the code, not warned about in a comment.
+#
+# Note the strict `>`: equality is not good enough. A backstop exactly equal to
+# the watchdog expires at the same instant the daemon cancels the wedged
+# delivery, i.e. before the re-queued retry has had any time at all to land, so
+# the recovery it is supposed to be able to see is still unobservable.
+trigger_daemon_backstop_resolve() {
+  local override="${1:-}" watchdog
+  watchdog=$(trigger_daemon_watchdog_secs)
+
+  if [ -z "$override" ]; then
+    trigger_daemon_backstop_secs
+    return 0
+  fi
+
+  case "$override" in *[!0-9]*) return 3 ;; esac
+  [ "$override" -gt "$watchdog" ] || return 3
+  printf '%s' "$override"
 }
 
 # ─── the grid-landing wait is deliberately NOT a trigger_daemon_wait ─────────

@@ -94,6 +94,70 @@ trigger_daemon_wait c 60 10 60 "";            check "missing probe -> usage erro
 wd=600; bs=$(TRIGGER_DAEMON_WATCHDOG_SECS=$wd trigger_daemon_backstop_secs)
 [ "$bs" -gt "$wd" ] || { echo "FAIL: backstop $bs not greater than watchdog $wd"; FAILED=1; }
 
+# The watchdog is the SSOT the inequality is measured against, so it has to be
+# readable on its own and has to survive garbage without silently becoming 0
+# (a 0 watchdog makes EVERY backstop "greater than" it and the guard vacuous).
+[ "$(trigger_daemon_watchdog_secs)" = "600" ] || { echo "FAIL: watchdog default != 600"; FAILED=1; }
+[ "$(TRIGGER_DAEMON_WATCHDOG_SECS=900 trigger_daemon_watchdog_secs)" = "900" ] || { echo "FAIL: watchdog override ignored"; FAILED=1; }
+[ "$(TRIGGER_DAEMON_WATCHDOG_SECS=0 trigger_daemon_watchdog_secs)" = "600" ]   || { echo "FAIL: watchdog 0 not defaulted"; FAILED=1; }
+[ "$(TRIGGER_DAEMON_WATCHDOG_SECS=abc trigger_daemon_watchdog_secs)" = "600" ] || { echo "FAIL: watchdog garbage not defaulted"; FAILED=1; }
+
+# --- the OVERRIDE is held to the same inequality -----------------------------
+# Deriving correctly is not the guard. Every call site spells its knob
+# `${OVERRIDE:-$(derive)}`, so an override REPLACES the derivation and any
+# literal wins outright — which is how 10g's DELIVER leg ran a bare 210 against
+# a 600s watchdog from #4568 onward. These are the both-directions mutation: the
+# 210 case must be REFUSED, and a legitimately larger value must still be taken.
+resolve_check() { # $1 desc, $2 want-stdout ("" = expect refusal), $3 want-rc, $4 override, [$5 watchdog]
+  local out rc
+  out=$(TRIGGER_DAEMON_WATCHDOG_SECS="${5:-600}" trigger_daemon_backstop_resolve "$4") && rc=0 || rc=$?
+  if [ "$rc" = "$3" ] && [ "$out" = "$2" ]; then
+    echo "PASS [rc=$rc out='${out}'] $1"
+  else
+    echo "FAIL [want rc=$3 out='$2', got rc=$rc out='${out}'] $1"; FAILED=1
+  fi
+}
+
+# REFUSED — below / at the watchdog. `210` is the exact literal 10g shipped.
+resolve_check "override 210 vs 600s watchdog (the 10g DELIVER literal) -> REFUSED" "" 3 210
+resolve_check "override 360 vs 600s watchdog (the old fire budget)     -> REFUSED" "" 3 360
+resolve_check "override 599 (one under)                                -> REFUSED" "" 3 599
+resolve_check "override 600 EQUAL to the watchdog                      -> REFUSED" "" 3 600
+resolve_check "override 0                                              -> REFUSED" "" 3 0
+resolve_check "override non-numeric                                    -> REFUSED" "" 3 abc
+resolve_check "override negative                                       -> REFUSED" "" 3 "-300"
+# HONOURED — strictly above the watchdog, and the empty case still derives 3x.
+resolve_check "override 601 (one over)      -> honoured"        "601"  0 601
+resolve_check "override 1800                -> honoured"        "1800" 0 1800
+resolve_check "no override                  -> derives 3x"      "1800" 0 ""
+# The bar tracks the watchdog, it is not a hardcoded 600: the SAME 1000 flips
+# verdict when the watchdog moves. Without this a future watchdog bump would
+# leave the guard silently checking the wrong number.
+resolve_check "override 1000 vs 900s watchdog  -> honoured"     "1000" 0 1000 900
+resolve_check "override 1000 vs 1200s watchdog -> REFUSED"      ""     3 1000 1200
+resolve_check "no override vs 900s watchdog    -> derives 2700" "2700" 0 ""   900
+
+# --- the harness must ROUTE its knobs through the resolver -------------------
+# The contract above is unenforceable if a call site bypasses it, and bypassing
+# it is precisely what happened: a bare literal default reads as deliberate,
+# parses, runs, and is never compared to anything. A backstop knob defaulting to
+# a NUMBER is therefore the defect signature, independent of which number.
+HARNESS="$HERE/../test_staging_full_saas.sh"
+if [ ! -f "$HARNESS" ]; then
+  echo "FAIL: harness not found at $HARNESS (cannot check backstop call sites)"; FAILED=1
+else
+  for knob in E2E_SCHEDULER_TIMEOUT_SECS E2E_SCHEDULE_DELIVER_TIMEOUT_SECS E2E_SCHEDULE_DELIVER_FIRE_TIMEOUT_SECS; do
+    if grep -Eq "\\\$\{$knob:-[0-9]" "$HARNESS"; then
+      echo "FAIL: $knob defaults to a BARE LITERAL in test_staging_full_saas.sh — a scheduler backstop must resolve through trigger_daemon_backstop_resolve so it is checked against the watchdog"; FAILED=1
+    else
+      echo "PASS [no bare literal] $knob"
+    fi
+    if grep -q "$knob" "$HARNESS" && ! grep -q "e2e_scheduler_backstop_secs" "$HARNESS"; then
+      echo "FAIL: $knob is read but the harness never calls e2e_scheduler_backstop_secs"; FAILED=1
+    fi
+  done
+fi
+
 # --- grid-landing confirm bound (core routing, NOT daemon liveness) ----------
 # The grid write is already acked by core's 201 before the first probe, so this
 # bound exists only to absorb docker-exec observation latency. Its CEILING is the
@@ -113,6 +177,55 @@ gc=$(schedule_grid_confirm_secs 10); fb=$(TRIGGER_DAEMON_WATCHDOG_SECS=600 trigg
 [ "$gc" -lt "$fb" ] || { echo "FAIL: grid-confirm $gc not shorter than fire backstop $fb"; FAILED=1; }
 gc=$(schedule_grid_confirm_secs 600)
 [ "$gc" -lt "$fb" ] || { echo "FAIL: grid-confirm $gc (max poll) not shorter than fire backstop $fb"; FAILED=1; }
+
+# --- REAL wall-clock: raising the backstop must not lengthen the happy path ---
+#
+# Everything above collapses `sleep`, which proves the RETURN CODE but says
+# nothing about elapsed time — and elapsed time is the whole objection to a
+# large backstop. Enlarging 210 -> 1800 is only safe because the wait is
+# signal-driven: it returns when the probe fires, so the backstop is dead
+# capacity, never a soak. These two run with the REAL sleep against the DERIVED
+# 1800s backstop and time it.
+unset -f sleep
+
+elapsed_check() { # $1 desc, $2 max-allowed-secs, $3 min-allowed-secs, $4 elapsed
+  if [ "$4" -le "$2" ] && [ "$4" -ge "$3" ]; then
+    echo "PASS [elapsed=${4}s, within ${3}..${2}s] $1"
+  else
+    echo "FAIL [elapsed=${4}s, wanted ${3}..${2}s] $1"; FAILED=1
+  fi
+}
+
+REAL_BACKSTOP=$(TRIGGER_DAEMON_WATCHDOG_SECS=600 trigger_daemon_backstop_secs)   # 1800
+# 10x headroom is the rule the backstop is sized by, so it is also the bar the
+# happy path is held to: anything at or under a TENTH of the backstop provably
+# returned on the signal rather than waiting the timer out.
+HAPPY_CEILING=$((REAL_BACKSTOP / 10))
+
+stage_health 5
+
+# Signal ALREADY present -> returns before the first sleep, so ~0s regardless of
+# how large the backstop is.
+t0=$(date +%s)
+trigger_daemon_wait c "$REAL_BACKSTOP" 5 60 probe_hit; rc=$?
+t1=$(date +%s)
+check "REAL sleep, signal already present -> pass" 0 $rc
+elapsed_check "signal already present returns immediately, not at the ${REAL_BACKSTOP}s backstop" \
+  "$HAPPY_CEILING" 0 $((t1 - t0))
+
+# Signal on the 3rd poll -> two 5s sleeps, so ~10s. The load-bearing assertion
+# is the ceiling: it must be nowhere near the backstop. The floor proves the
+# poll actually happened (a probe that returned instantly would not be
+# exercising the loop at all).
+_hits=0
+probe_third() { _hits=$((_hits + 1)); [ "$_hits" -ge 3 ]; }
+t0=$(date +%s)
+trigger_daemon_wait c "$REAL_BACKSTOP" 5 60 probe_third; rc=$?
+t1=$(date +%s)
+check "REAL sleep, signal on the 3rd poll -> pass" 0 $rc
+elapsed_check "3rd-poll signal returns at ~10s (2 x 5s poll), not at the ${REAL_BACKSTOP}s backstop" \
+  "$HAPPY_CEILING" 10 $((t1 - t0))
+[ "$_hits" = "3" ] || { echo "FAIL: probe called $_hits times, expected exactly 3"; FAILED=1; }
 
 if [ "$FAILED" = "0" ]; then echo "trigger_daemon_wait unit: OK"; else echo "trigger_daemon_wait unit: FAILURES"; fi
 exit $FAILED
