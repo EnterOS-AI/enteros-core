@@ -115,9 +115,26 @@ name: promote-prod-tenant-pin
 #     MOLECULE_TENANT_IMAGE var to the enteros.ai host makes the digest step fail
 #     closed — deliberately, but surprisingly.
 #   * The apply path records TENANT_IMAGE verbatim into LOCAL_TENANT_IMAGE, so
-#     running it with the default would REWRITE the prod boot default from the
-#     enteros.ai host to the moleculesai.app host. That is a real change to the
-#     boot SSOT and should be an explicit operator decision, not a side effect.
+#     running it with the default REWRITES the prod boot default from the
+#     enteros.ai host to the moleculesai.app host.
+#   * Put those two together and the consequence is not optional: because the
+#     resolver refuses the enteros host, there is NO configuration in which this
+#     lane both plans AND applies against enteros.ai. ARMING THEREFORE FORCES THE
+#     HOST REWRITE. It is content-equivalent and pull-equivalent — both hosts
+#     serve byte-identical digests for both tags and the prod box holds auths for
+#     both — but it is a real edit to the boot SSOT and must be a decision, not a
+#     surprise.
+#
+# DIGEST SOURCES ARE NOT INTERCHANGEABLE. `DIGEST_SOURCE=docker` returns
+# `docker image inspect {{.Id}}`, which is the image CONFIG digest;
+# `DIGEST_SOURCE=registry` returns the MANIFEST digest. They are different values
+# in general. They agree here only because every live pin was written as a
+# manifest digest (verified for both tags on both control planes). If some future
+# path ever writes a config digest into runtime_image_pins, this lane's plan would
+# read that row as permanently "PROMOTE REQUIRED" and never converge. Only the
+# manifest digest is pullable as `<name>@sha256:<digest>`, so it is the correct
+# one; the point is that the two sources must not be mixed within one pin's
+# history.
 #
 # NO workflow_dispatch inputs (lint-workflow-yaml forbids them). The target is
 # DERIVED: the molecule-tenant image built from the current main HEAD, i.e.
@@ -154,10 +171,15 @@ jobs:
       PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}
       PROMOTE_ARMED: ${{ vars.PROD_TENANT_PIN_PROMOTE_ARMED || '' }}
       TENANT_IMAGE: ${{ vars.MOLECULE_TENANT_IMAGE || 'registry.moleculesai.app/molecule-ai/molecule-tenant' }}
-      # Comma-separated <label>=<base_url> list, one entry per control-plane
-      # database that serves production tenants. BOTH are required for a complete
-      # picture; see defect 3 in the header.
-      PROD_CP_BASE_URLS: ${{ vars.PROD_CP_BASE_URLS || 'cp_prod=https://api.moleculesai.app,cp_staging=https://staging-api.moleculesai.app' }}
+      # Comma-separated <label>=<base_url>=<infisical_env>, one entry per
+      # control-plane database that serves production tenants. BOTH are required
+      # for a complete picture; see defect 3 in the header.
+      #
+      # The Infisical env is part of the ENDPOINT, not a job-wide constant: it
+      # selects which LOCAL_TENANT_IMAGE boot secret gets written, and each
+      # control plane resolves that secret from its own environment. See
+      # .gitea/scripts/prod_cp_endpoints.py.
+      PROD_CP_BASE_URLS: ${{ vars.PROD_CP_BASE_URLS || 'cp_prod=https://api.moleculesai.app=prod,cp_staging=https://staging-api.moleculesai.app=staging' }}
       INFISICAL_BASE: https://key.moleculesai.app
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -261,14 +283,12 @@ jobs:
             exit 1
           fi
           args=()
-          IFS=',' read -ra entries <<< "$PROD_CP_BASE_URLS"
-          for entry in "${entries[@]}"; do
-            label="${entry%%=*}"
-            base="${entry#*=}"
-            if [ -z "$label" ] || [ -z "$base" ] || [ "$label" = "$base" ]; then
-              echo "::error::PROD_CP_BASE_URLS entry '${entry}' is not <label>=<base_url>"
-              exit 1
-            fi
+          # prod_cp_endpoints.py owns the endpoint grammar and fails closed on a
+          # malformed or unknown-environment entry, so a half-parsed table can
+          # never silently drop a control plane.
+          endpoints="$(python3 .gitea/scripts/prod_cp_endpoints.py "$PROD_CP_BASE_URLS")"
+          while IFS=$'\t' read -r label base inf_env; do
+            [ -n "$label" ] || continue
             resp="${RUNNER_TEMP:-/tmp}/pins-${label}.json"
             # lint-curl-status-capture shape: body to a file, status to a var, no
             # or-else fallback inside the subshell.
@@ -285,13 +305,14 @@ jobs:
               exit 1
             fi
             args+=("${label}=${resp}")
-          done
+          done <<< "$endpoints"
           if [ "${#args[@]}" -lt 2 ]; then
             echo "::warning::planning against ${#args[@]} control plane(s). Production tenants are split across TWO CP databases; a single-endpoint plan is true for at most half the fleet."
           fi
           python3 .gitea/scripts/prod_pin_plan.py \
             --target "${TENANT_IMAGE}:${TAG}" \
             --target-digest "${TARGET_DIGEST}" \
+            --needed-out "${RUNNER_TEMP:-/tmp}/needed.txt" \
             "${args[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Decide plan vs apply
@@ -321,10 +342,15 @@ jobs:
           INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
-          INFISICAL_ENV: prod
           DIGEST_SOURCE: registry
           REG_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
           REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
+          # The SCRIPT reads TENANT_IMAGE_NAME; TENANT_IMAGE is only this job's
+          # variable. Without this hand-off the script falls back to its own
+          # hardcoded repository, so a set `vars.MOLECULE_TENANT_IMAGE` would have
+          # the plan and the digest computed for one repository while the apply
+          # mutated a different one. staging-tenant-cd.yml passes it the same way.
+          TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE }}
           TENANT_PIN_GIT_SHA: ${{ steps.target.outputs.sha }}
           TAG: ${{ steps.target.outputs.tag }}
         run: |
@@ -334,16 +360,36 @@ jobs:
           # and verifies each landed. Re-implementing it here is how the two
           # halves drift apart again.
           #
-          # Once per control plane. The LOCAL_TENANT_IMAGE write is idempotent
-          # (the script no-ops when the value already matches), so repeating it
-          # is safe; skipping a CP is not.
-          IFS=',' read -ra entries <<< "$PROD_CP_BASE_URLS"
-          for entry in "${entries[@]}"; do
-            label="${entry%%=*}"
-            base="${entry#*=}"
-            echo "::group::promote on ${label} (${base})"
-            CP_BASE_URL="${base%/}" \
+          # GATE ON THE PLAN'S OWN VERDICT. Arming is sticky and repo-scoped, and
+          # lint-workflow-yaml forbids dispatch inputs, so there is no per-run
+          # confirmation: without this an armed operator who dispatches wanting
+          # only a plan gets a fleet-global mutation. If the plan found nothing to
+          # promote anywhere, do nothing.
+          needed_file="${RUNNER_TEMP:-/tmp}/needed.txt"
+          if [ ! -f "$needed_file" ]; then
+            echo "::error::the plan step wrote no verdict file — refusing to apply against an unknown plan."
+            exit 1
+          fi
+          if [ ! -s "$needed_file" ]; then
+            echo "::notice::the plan found every control plane already at the target digest — nothing to promote, so the apply is a no-op."
+            echo "KNOWN LIMITATION: this gate keys on the runtime_image_pins digest only. If every DB pin is current but a LOCAL_TENANT_IMAGE boot secret has drifted, this skips the reconciliation that would fix it. Reconcile that case by running scripts/deploy/advance-staging-tenant-pin.sh directly for the affected control plane."
+            exit 0
+          fi
+          echo "::notice::plan says these control planes need the promote: $(tr '\n' ' ' < "$needed_file")"
+          #
+          # Once per control plane, and each one carries its OWN Infisical
+          # environment. INFISICAL_ENV drives BOTH the CP-admin token read AND
+          # the LOCAL_TENANT_IMAGE write, and those boot secrets are per control
+          # plane (molecule-cp-prod resolves `prod`, molecule-cp-staging resolves
+          # `staging`). Setting it once outside this loop promotes the second CP's
+          # DB pin and then rewrites the FIRST one's boot secret — silently, since
+          # write_ssot_pin re-reads the value it already wrote and logs `SSOT ok`.
+          endpoints="$(python3 .gitea/scripts/prod_cp_endpoints.py "$PROD_CP_BASE_URLS")"
+          while IFS=$'\t' read -r label base inf_env; do
+            [ -n "$label" ] || continue
+            echo "::group::promote on ${label} (${base}, infisical env ${inf_env})"
+            CP_BASE_URL="${base}" INFISICAL_ENV="${inf_env}" \
               ./scripts/deploy/advance-staging-tenant-pin.sh \
                 --tag "${TAG}" --git-sha "${TENANT_PIN_GIT_SHA}"
             echo "::endgroup::"
-          done
+          done <<< "$endpoints"

@@ -57,14 +57,15 @@ def find_tenant_pin(doc: object) -> dict | None:
     return None
 
 
-def parse_args(argv: list[str]) -> tuple[str, str | None, list[tuple[str, str]]]:
-    """Return (target_ref, target_digest, [(label, path), ...])."""
+def parse_args(argv: list[str]) -> tuple[str, str | None, str | None, list[tuple[str, str]]]:
+    """Return (target_ref, target_digest, needed_out, [(label, path), ...])."""
     # Legacy positional form: <pins.json> <target_image_ref>
     if len(argv) == 3 and not argv[1].startswith("--") and "=" not in argv[1]:
-        return argv[2], None, [("control-plane", argv[1])]
+        return argv[2], None, None, [("control-plane", argv[1])]
 
     target: str | None = None
     target_digest: str | None = None
+    needed_out: str | None = None
     endpoints: list[tuple[str, str]] = []
     i = 1
     while i < len(argv):
@@ -79,6 +80,11 @@ def parse_args(argv: list[str]) -> tuple[str, str | None, list[tuple[str, str]]]
             if i >= len(argv):
                 raise ValueError("--target-digest requires a value")
             target_digest = argv[i]
+        elif arg == "--needed-out":
+            i += 1
+            if i >= len(argv):
+                raise ValueError("--needed-out requires a value")
+            needed_out = argv[i]
         elif "=" in arg and not arg.startswith("--"):
             label, path = arg.split("=", 1)
             if not label or not path:
@@ -92,12 +98,12 @@ def parse_args(argv: list[str]) -> tuple[str, str | None, list[tuple[str, str]]]
         raise ValueError("--target <image_ref> is required")
     if not endpoints:
         raise ValueError("at least one <label>=<pins.json> endpoint is required")
-    return target, target_digest, endpoints
+    return target, target_digest, needed_out, endpoints
 
 
 def main(argv: list[str]) -> int:
     try:
-        target, target_digest, endpoints = parse_args(argv)
+        target, target_digest, needed_out, endpoints = parse_args(argv)
     except ValueError as exc:
         print(f"::error::{exc}", file=sys.stderr)
         print(
@@ -200,6 +206,16 @@ def main(argv: list[str]) -> int:
         "Native plugin versions are compiled INTO the tenant binary, so a pin",
         "promote alone delivers no native-plugin change.",
     ]
+    # Machine-readable verdict for the apply gate: the labels that still need a
+    # promote, one per line. Written even when EMPTY — the apply step
+    # distinguishes "no file" (the plan never ran, refuse) from "empty file"
+    # (nothing to do, exit cleanly), and conflating those is how a missing plan
+    # would read as an all-clear.
+    if needed_out:
+        with open(needed_out, "w", encoding="utf-8") as fh:
+            for label in needed:
+                fh.write(label + "\n")
+
     sys.stdout.write("\n".join(lines) + "\n")
     return 0
 

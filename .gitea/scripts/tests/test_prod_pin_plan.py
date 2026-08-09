@@ -42,7 +42,7 @@ def _pins(digest: str, git_sha: str) -> dict:
                 "image_digest": digest,
                 "git_sha": git_sha,
                 "promoted_at": "2026-08-07T23:11:01Z",
-                "promoted_by": "api-token-2e19e375",
+                "promoted_by": "api-token-SYNTHETIC",
             },
         ]
     }
@@ -149,3 +149,67 @@ def test_unreadable_document_on_any_endpoint_is_fatal(tmp_path: Path):
 
     assert r.returncode == 1, "an unparseable CP response must fail the plan"
     assert "cp_staging" in (r.stderr + r.stdout)
+
+
+# --------------------------------------------------------------------------
+# --needed-out: the machine-readable verdict the apply step gates on
+# --------------------------------------------------------------------------
+
+def test_needed_out_lists_only_the_endpoints_behind_target(tmp_path: Path):
+    """The apply gate is only as good as this file actually being written.
+
+    Caught live: the workflow passed --needed-out and the plan rendered
+    correctly, but the planner never created the file, so the apply step would
+    have hit its "no verdict file" branch and refused every time. A
+    workflow-text assertion cannot see that — only running the planner can.
+    """
+    target_digest = "sha256:" + "f" * 64
+    behind = _write(tmp_path, "a.json", _pins("sha256:" + "7" * 64, "f3c9eaf24"))
+    already = _write(tmp_path, "b.json", _pins(target_digest, "1802ebe22"))
+    out = tmp_path / "needed.txt"
+
+    r = _run([
+        "--target", TARGET, "--target-digest", target_digest,
+        "--needed-out", str(out),
+        f"cp_prod={behind}", f"cp_staging={already}",
+    ])
+    assert r.returncode == 0, r.stderr
+    assert out.exists(), "--needed-out was accepted but no verdict file was written"
+    assert out.read_text(encoding="utf-8").split() == ["cp_prod"], out.read_text(encoding="utf-8")
+
+
+def test_needed_out_is_written_EMPTY_when_nothing_needs_promoting(tmp_path: Path):
+    """Empty file != absent file.
+
+    The apply step treats an absent file as "the plan never ran" and refuses,
+    and an empty one as "nothing to do". Writing nothing at all would turn a
+    clean no-op into a hard failure.
+    """
+    target_digest = "sha256:" + "f" * 64
+    a = _write(tmp_path, "a.json", _pins(target_digest, "1802ebe22"))
+    b = _write(tmp_path, "b.json", _pins(target_digest, "1802ebe22"))
+    out = tmp_path / "needed.txt"
+
+    r = _run([
+        "--target", TARGET, "--target-digest", target_digest,
+        "--needed-out", str(out),
+        f"cp_prod={a}", f"cp_staging={b}",
+    ])
+    assert r.returncode == 0, r.stderr
+    assert out.exists(), "the verdict file must exist even when nothing needs promoting"
+    assert out.read_text(encoding="utf-8").strip() == ""
+
+
+def test_no_verdict_file_is_written_when_an_endpoint_is_invalid(tmp_path: Path):
+    """A failed plan must not leave a stale all-clear behind."""
+    good = _write(tmp_path, "good.json", _pins("sha256:" + "7" * 64, "f3c9eaf24"))
+    bad = _write(tmp_path, "bad.json", {"pins": []})
+    out = tmp_path / "needed.txt"
+
+    r = _run([
+        "--target", TARGET, "--target-digest", "sha256:" + "f" * 64,
+        "--needed-out", str(out),
+        f"cp_prod={good}", f"cp_staging={bad}",
+    ])
+    assert r.returncode == 1
+    assert not out.exists(), "a failed plan wrote a verdict file — an apply could read it as all-clear"
