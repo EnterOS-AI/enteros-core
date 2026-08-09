@@ -102,6 +102,33 @@ wd=600; bs=$(TRIGGER_DAEMON_WATCHDOG_SECS=$wd trigger_daemon_backstop_secs)
 [ "$(TRIGGER_DAEMON_WATCHDOG_SECS=0 trigger_daemon_watchdog_secs)" = "600" ]   || { echo "FAIL: watchdog 0 not defaulted"; FAILED=1; }
 [ "$(TRIGGER_DAEMON_WATCHDOG_SECS=abc trigger_daemon_watchdog_secs)" = "600" ] || { echo "FAIL: watchdog garbage not defaulted"; FAILED=1; }
 
+# --- the watchdog has a FLOOR ------------------------------------------------
+# 0 and garbage were already defaulted; a positive-but-absurd value was not.
+# TRIGGER_DAEMON_WATCHDOG_SECS=1 derived a 3s backstop, made the RELATIVE
+# refusal wave through any positive override at all, and — now that this number
+# is the bound actually written onto the workspace — would tell the daemon to
+# abandon every delivery after one second. All three consequences are asserted
+# below, not just the clamp: a floor nothing downstream reads is not a floor.
+[ "$(TRIGGER_DAEMON_WATCHDOG_SECS=1 trigger_daemon_watchdog_secs)" = "60" ]  || { echo "FAIL: watchdog 1 not floored to 60"; FAILED=1; }
+[ "$(TRIGGER_DAEMON_WATCHDOG_SECS=59 trigger_daemon_watchdog_secs)" = "60" ] || { echo "FAIL: watchdog 59 not floored to 60"; FAILED=1; }
+[ "$(TRIGGER_DAEMON_WATCHDOG_SECS=60 trigger_daemon_watchdog_secs)" = "60" ] || { echo "FAIL: watchdog 60 (AT the floor) altered"; FAILED=1; }
+[ "$(TRIGGER_DAEMON_WATCHDOG_SECS=61 trigger_daemon_watchdog_secs)" = "61" ] || { echo "FAIL: watchdog 61 (just over the floor) clamped"; FAILED=1; }
+# The consequence that made the hole exploitable: the refusal is a comparison
+# against the watchdog, so a declared `1` used to wave through any positive
+# override at all. A 30s backstop against a declared 1s watchdog must now be
+# REFUSED, because the bound it is really running against is the 60s floor.
+if out=$(TRIGGER_DAEMON_WATCHDOG_SECS=1 trigger_daemon_backstop_resolve 30); then
+  echo "FAIL: override 30 HONOURED ('$out') against a declared 1s watchdog — the floor is not being applied to the refusal"; FAILED=1
+else
+  echo "PASS [refused] override 30 against a declared 1s watchdog (measured against the 60s floor)"
+fi
+# ...and the derived backstop can no longer be 3s.
+[ "$(TRIGGER_DAEMON_WATCHDOG_SECS=1 trigger_daemon_backstop_secs)" = "180" ] || { echo "FAIL: watchdog 1 derives a backstop other than 3x the 60s floor"; FAILED=1; }
+# The floored value is what gets INJECTED too, or the workspace would run a
+# different bound from the one the backstop was derived against.
+[ "$(TRIGGER_DAEMON_WATCHDOG_SECS=1 trigger_daemon_delivery_cap_env | grep -c '=60$')" = "2" ] \
+  || { echo "FAIL: the injected caps do not carry the floored value"; FAILED=1; }
+
 # --- the OVERRIDE is held to the same inequality -----------------------------
 # Deriving correctly is not the guard. Every call site spells its knob
 # `${OVERRIDE:-$(derive)}`, so an override REPLACES the derivation and any
@@ -156,6 +183,106 @@ else
       echo "FAIL: $knob is read but the harness never calls e2e_scheduler_backstop_secs"; FAILED=1
     fi
   done
+fi
+
+# --- the bound is CONFIGURED, so the inequality is about a REAL number -------
+#
+# The backstop exceeding "the watchdog" was true against a number nobody
+# enforced: 600 mirrored MOLECULE_TRIGGER_DELIVERY_WATCHDOG_SECONDS, retired at
+# scheduler v0.2.2, while the pinned v0.2.3 abandons an unattributable delivery
+# at 3600. Rather than grow the backstop to 10800 inside a 75-minute job, the
+# harness now WRITES the bound onto the workspace. These pin that contract.
+cap_env=$(trigger_daemon_delivery_cap_env)
+cap_secs=$(trigger_daemon_watchdog_secs)
+
+# BOTH keys, or the fix is cosmetic. classify_delivery_liveness takes the
+# not-attributable branch on every fresh e2e workspace, and there
+# _reported_absolute_cap PREFERS the cap the runtime's snapshot carries over the
+# daemon's own env ceiling — so shipping only the daemon key leaves that branch
+# at the runtime's 3600s default while every derived number claims otherwise.
+for k in MOLECULE_TRIGGER_DELIVERY_ABSOLUTE_CAP_SECONDS MOLECULE_MAX_TURN_SECONDS; do
+  if printf '%s\n' "$cap_env" | grep -qx "$k=$cap_secs"; then
+    echo "PASS [$k=$cap_secs] injected cap key"
+  else
+    echo "FAIL: trigger_daemon_delivery_cap_env does not emit $k=$cap_secs (got: $(printf '%s' "$cap_env" | tr '\n' ' '))"; FAILED=1
+  fi
+done
+[ "$(printf '%s\n' "$cap_env" | grep -c .)" = "2" ] \
+  || { echo "FAIL: trigger_daemon_delivery_cap_env emitted something other than exactly 2 keys"; FAILED=1; }
+
+# ONE number: the injected caps and the derived backstop must move together. A
+# second literal anywhere in that chain is how the 210 survived four months.
+for wd in 60 120 300 600 900; do
+  got_cap=$(TRIGGER_DAEMON_WATCHDOG_SECS=$wd trigger_daemon_delivery_cap_env | sed -n 's/^MOLECULE_MAX_TURN_SECONDS=//p')
+  got_bs=$(TRIGGER_DAEMON_WATCHDOG_SECS=$wd trigger_daemon_backstop_secs)
+  if [ "$got_cap" = "$wd" ] && [ "$got_bs" = "$((wd * 3))" ] && [ "$got_bs" -gt "$got_cap" ]; then
+    echo "PASS [cap=$got_cap backstop=$got_bs] backstop STRICTLY exceeds the injected cap"
+  else
+    echo "FAIL: watchdog=$wd gave cap=$got_cap backstop=$got_bs — the derived backstop must be 3x the INJECTED cap and strictly greater than it"; FAILED=1
+  fi
+done
+
+# The other direction: a backstop at or below the cap the workspace is actually
+# running must be refused. `1800` is today's derived value and `3600` is the
+# scheduler default this change exists to stop measuring against — against a
+# workspace configured at 3600 both are unusable, and that must be visible.
+resolve_check "override 1800 vs a 3600s configured cap -> REFUSED" "" 3 1800 3600
+resolve_check "override 3600 EQUAL to the configured cap -> REFUSED" "" 3 3600 3600
+resolve_check "override 1800 vs the 600s configured cap -> honoured" "1800" 0 1800 600
+
+# --- the reading this is all derived from is PINNED to a scheduler version ---
+# Every claim above (which env names exist, that the runtime's reported cap
+# wins, that there are four dispositions) was read at one tag. A repin can
+# invalidate all of it silently, so core's live pin is compared against the tag
+# recorded in the lib.
+PIN_FILE="$HERE/../../../workspace-server/internal/handlers/plugin_registry_test.go"
+VALIDATED=$(trigger_daemon_scheduler_version_validated)
+if [ ! -f "$PIN_FILE" ]; then
+  echo "FAIL: cannot find the scheduler pin at $PIN_FILE — the version guard is not actually checking anything"; FAILED=1
+else
+  PINNED=$(sed -n 's|.*molecule-ai-plugin-scheduler#\(v[0-9][0-9.]*\).*|\1|p' "$PIN_FILE" | tail -1)
+  if [ -z "$PINNED" ]; then
+    echo "FAIL: no molecule-ai-plugin-scheduler pin found in $PIN_FILE"; FAILED=1
+  elif [ "$PINNED" = "$VALIDATED" ]; then
+    echo "PASS [scheduler $PINNED] the configured cap was read at the version core pins"
+  else
+    echo "FAIL: core pins molecule-ai-plugin-scheduler $PINNED but lib/trigger_daemon_wait.sh was validated against $VALIDATED — re-read scheduler.py's DEFAULT_DELIVERY_ABSOLUTE_CAP_SECONDS / classify_delivery_liveness and molecule_runtime/turn_lease.py's cap resolution at $PINNED, then update trigger_daemon_scheduler_version_validated"; FAILED=1
+  fi
+fi
+
+# --- the harness must ROUTE the injection through the lib --------------------
+# Same reasoning as the backstop call sites: a literal cap typed at the
+# provision site parses, runs, reads as deliberate and is compared to nothing.
+if [ ! -f "$HARNESS" ]; then
+  echo "FAIL: harness not found at $HARNESS (cannot check the cap injection)"; FAILED=1
+else
+  if grep -q "trigger_daemon_delivery_cap_env" "$HARNESS"; then
+    echo "PASS [routed] the harness injects the delivery cap through the lib"
+  else
+    echo "FAIL: test_staging_full_saas.sh never calls trigger_daemon_delivery_cap_env — the workspace runs the scheduler's 3600s default and every derived backstop is measured against a number nothing enforces"; FAILED=1
+  fi
+  for k in MOLECULE_TRIGGER_DELIVERY_ABSOLUTE_CAP_SECONDS MOLECULE_MAX_TURN_SECONDS; do
+    # The quote/bracket run matters: the provision site builds the env in a
+    # python heredoc, so the literal shape to catch is `s['KEY'] = '3600'`, not
+    # just `KEY=3600`. A pattern that only handled the shell shape read clean
+    # against the python one — checked by mutation, not by eye.
+    # ${k} braced, not $k: bare `$k[` reads as an array expansion (SC1087).
+    if grep -Eq "${k}['\"]*\]?[[:space:]]*[=:][[:space:]]*['\"]?[0-9]" "$HARNESS"; then
+      echo "FAIL: $k is assigned a BARE LITERAL in test_staging_full_saas.sh — it must come from trigger_daemon_delivery_cap_env so it cannot drift from the backstop derived against it"; FAILED=1
+    else
+      echo "PASS [no bare literal] $k"
+    fi
+  done
+  # The refusal message is what an operator reads at the exact moment they are
+  # about to act, so it may not send them after a knob that does not exist. Both
+  # the header and the message used to say to mirror/retune the daemon's
+  # delivery timeout; scheduler v0.2.2 removed it, and the bound is now one this
+  # harness SETS. Wrong remediation is worse than none.
+  if grep -Eqi "retuned daemon|retune the daemon|mirror(ing)? a retuned" "$HARNESS"; then
+    echo "FAIL: test_staging_full_saas.sh still tells the operator to mirror/retune the daemon's delivery watchdog — scheduler v0.2.2 retired that knob; the bound is injected by this harness"; FAILED=1
+  else
+    echo "PASS [no stale remediation] the harness does not point operators at the retired daemon knob"
+  fi
 fi
 
 # --- grid-landing confirm bound (core routing, NOT daemon liveness) ----------
@@ -226,6 +353,27 @@ check "REAL sleep, signal on the 3rd poll -> pass" 0 $rc
 elapsed_check "3rd-poll signal returns at ~10s (2 x 5s poll), not at the ${REAL_BACKSTOP}s backstop" \
   "$HAPPY_CEILING" 10 $((t1 - t0))
 [ "$_hits" = "3" ] || { echo "FAIL: probe called $_hits times, expected exactly 3"; FAILED=1; }
+
+# Whole seconds round a 40ms return and a 900ms one to the same "0s", so the
+# load-bearing claim — the backstop is DEAD CAPACITY, never spent — is measured
+# at millisecond resolution too. The live 10g DELIVER leg returns in ~76ms
+# against this same derived 1800s number (7 consecutive green ephemeral runs,
+# 2026-08-09); the unit case has to show that shape, not just a rounded zero.
+_ms0=$(date +%s%3N 2>/dev/null || echo N)
+case "$_ms0" in
+  *[!0-9]*) echo "SKIP [no ms-resolution date on this host] sub-second signal-return timing" ;;
+  *)
+    trigger_daemon_wait c "$REAL_BACKSTOP" 5 60 probe_hit; rc=$?
+    _ms1=$(date +%s%3N)
+    check "REAL sleep, ms-resolution: signal already present -> pass" 0 $rc
+    _ms=$((_ms1 - _ms0))
+    if [ "$_ms" -le 2000 ]; then
+      echo "PASS [elapsed=${_ms}ms against a ${REAL_BACKSTOP}s backstop] the wait returns ON THE SIGNAL, not on the timer"
+    else
+      echo "FAIL [elapsed=${_ms}ms] a signal already present must return in milliseconds; the backstop is not a budget"; FAILED=1
+    fi
+    ;;
+esac
 
 if [ "$FAILED" = "0" ]; then echo "trigger_daemon_wait unit: OK"; else echo "trigger_daemon_wait unit: FAILURES"; fi
 exit $FAILED
