@@ -59,7 +59,23 @@ type CallableFailureClass struct {
 	// Code is the stable short id used in the verdict and in triage
 	// (core#5088 named these G4/G5/G6/G7/G8/G10).
 	Code string
-	// Summary says what actually went wrong and who owns it.
+	// Owner is WHO FIXES IT, as its own field rather than a phrase buried in
+	// Summary.
+	//
+	// It is separate because routing is the entire product of this file. The
+	// markers decide WHICH class a reply is; Owner decides WHERE the red goes.
+	// Left inside the prose, the mapping from code to owner was unpinned: review
+	// showed that swapping only G6's and G7's Summary strings left the whole
+	// suite GREEN while the gate published "the LLM provider rejected the
+	// configured model" for a billing red. The legs verified the EVIDENCE and
+	// nothing verified the CONCLUSION DRAWN FROM IT — the same shape as check 5
+	// publishing one sentence for six failures, three levels down.
+	//
+	// Owner is published in the verdict (see describeCallableFailure), so it is
+	// not an unread field, and TestCallableFailureClasses_CodeBindsToOwnerAnd
+	// Summary pins the whole table pairwise.
+	Owner string
+	// Summary says what actually went wrong.
 	Summary string
 	// markers are lower-cased verbatim fragments of observed replies.
 	markers []string
@@ -72,16 +88,18 @@ type CallableFailureClass struct {
 // generic enough to swallow G4/G6/G7/G8 replies if they ran first.
 var callableFailureClasses = []CallableFailureClass{
 	{
-		Code: "G4-TOOL-NAME-MANGLED",
+		Code:  "G4-TOOL-NAME-MANGLED",
+		Owner: "runtime/template (the image that registers the MCP tool ids)",
 		Summary: "the model emitted a tool id that does not exist, so the verb was never dispatched. " +
 			"The inventory check (check 4) cannot catch this: it asserts the id the RUNTIME PROBE " +
 			"surfaces (mcp__molecule-platform__…, hyphen) while hermes registers and the model emits " +
-			"mcp__molecule_platform__… (underscore) — see core#5082. Owner: runtime/template, not the deploy candidate",
+			"mcp__molecule_platform__… (underscore) — see core#5082",
 		// runs 609766, 616276, 616479, 622972
 		markers: []string{"invalid tool call"},
 	},
 	{
-		Code: "G6-LLM-BILLING-EXHAUSTED",
+		Code:  "G6-LLM-BILLING-EXHAUSTED",
+		Owner: "LLM account state (operator) — NOT the deploy candidate",
 		Summary: "the LLM account backing the concierge is out of credit, so no turn could run. " +
 			"This is ENVIRONMENT STATE, not a regression in the deploy candidate — the candidate is " +
 			"unproven rather than proven bad, and the red is honest but must not be read as a code defect",
@@ -89,7 +107,8 @@ var callableFailureClasses = []CallableFailureClass{
 		markers: []string{"billing or credits exhausted"},
 	},
 	{
-		Code: "G7-LLM-MODEL-REJECTED",
+		Code:  "G7-LLM-MODEL-REJECTED",
+		Owner: "LLM provider/model configuration (operator) — NOT the deploy candidate",
 		Summary: "the LLM provider rejected the configured model, so no turn could run. " +
 			"Like G6 this is provider/config state rather than a defect in the deploy candidate",
 		//
@@ -119,10 +138,11 @@ var callableFailureClasses = []CallableFailureClass{
 	// the repo refuses phantom gates. Add it WITH a verbatim fixture the first
 	// time a real one is observed.
 	{
-		Code: "G5-AGENT-DENIES-VERB",
+		Code:  "G5-AGENT-DENIES-VERB",
+		Owner: "concierge persona/prompt (the platform MCP surface is fine)",
 		Summary: "the agent was online with all platform verbs loaded and still ASSERTED it does not " +
 			"have provision_workspace. The tool was present and dispatchable; the agent declined to " +
-			"believe so. Owner: concierge persona/prompt, not the MCP surface",
+			"believe so",
 		// runs 556986, 557305, 557370, 609311, 614408
 		//
 		// Every marker below is NECESSARY: there is a real logged reply that it
@@ -173,7 +193,7 @@ var callableFailureClasses = []CallableFailureClass{
 //
 // evidence is the verbatim reply that matched, so the verdict can quote the
 // sentence rather than assert a category the reader cannot check.
-func ClassifyCallableTurnFailure(texts []string) (code, summary, evidence string) {
+func ClassifyCallableTurnFailure(texts []string) (code, owner, summary, evidence string) {
 	// No reply AT ALL is itself a named mode (G10): the turn was accepted and
 	// the agent never spoke. It is distinct from "the agent refused", and
 	// conflating the two hid it entirely in the retention corpus.
@@ -185,6 +205,7 @@ func ClassifyCallableTurnFailure(texts []string) (code, summary, evidence string
 	}
 	if nonEmptyTexts == 0 {
 		return "G10-NO-REPLY-OBSERVED",
+			"UNDETERMINED — no utterance to attribute; start at the runtime, which accepted the turn",
 			"the turn was accepted but the agent never produced a reply — it neither called the verb " +
 				"nor said why. Distinct from a refusal (G5): there is no utterance to disagree with",
 			""
@@ -195,25 +216,25 @@ func ClassifyCallableTurnFailure(texts []string) (code, summary, evidence string
 			lower := strings.ToLower(t)
 			for _, m := range class.markers {
 				if strings.Contains(lower, m) {
-					return class.Code, class.Summary, strings.TrimSpace(t)
+					return class.Code, class.Owner, class.Summary, strings.TrimSpace(t)
 				}
 			}
 		}
 	}
-	return "", "", ""
+	return "", "", "", ""
 }
 
 // describeCallableFailure renders the check-5 reason, appending the named class
 // when one is recognised. Kept separate from EvaluateMgmtMCPCallable so the
 // exact published sentence is unit-testable without building a whole probe.
 func describeCallableFailure(base string, texts []string) string {
-	code, summary, evidence := ClassifyCallableTurnFailure(texts)
+	code, owner, summary, evidence := ClassifyCallableTurnFailure(texts)
 	if code == "" {
 		return base
 	}
 	// The separator lives HERE, not in base, so the fallback above returns base
 	// byte-identical to the pre-change sentence.
-	out := base + ". FAILURE CLASS " + code + ": " + summary + "."
+	out := base + ". FAILURE CLASS " + code + " [owner: " + owner + "]: " + summary + "."
 	if evidence != "" {
 		out += " The agent's own words: " + quoteReplies([]string{evidence})
 	}

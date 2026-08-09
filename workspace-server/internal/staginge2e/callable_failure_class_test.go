@@ -29,18 +29,43 @@ type callableFixture struct {
 // are gone; TestClassifyCallableTurnFailure_EveryMarkerIsNecessary now makes
 // that class of mistake fail the build.
 //
-// HOW THESE ARE VERIFIED. Every row is checked out-of-band against the job
-// logs by a sweep that asserts TWO things: the reply is a verbatim substring
-// of a logged reply, AND it was logged by the RUN the row cites. The first
-// pass only checked the string, which is why a third bad row survived it: the
-// 616276 row carried "…mcp__molecule_platform__list_workspaces", which is real
-// text — logged by 616479. Same string, wrong run. Checking attribution as
-// well as content is what caught it, and all 14 rows now pass both legs.
+// HOW THESE ARE VERIFIED, AND BY WHAT — read this before trusting the rows.
 //
-// Reconstructing a reply from a log means taking the `"text":"…"` capture and
-// cutting at the first newline; a greedy match runs on into the next log line.
-// The older runs are additionally truncated by the pre-core#5052
-// a2aTurnLogCap, which is why so many rows end mid-word.
+// NOTHING IN THIS PACKAGE VERIFIES THE `run` COLUMN. It cannot: the job logs
+// are not in the repo, `go test` has no network, and Gitea's Actions retention
+// is ephemeral — run 634244's log has already expired. A committed corpus check
+// would decay into a false red the day its logs age out, which is a worse
+// failure than the one it would catch. So attribution is verified by PROCESS,
+// not by assertion, and this comment says so rather than implying otherwise.
+// (An earlier revision of this comment read as if enforced. That overclaim is
+// exactly the defect this file exists to remove, so it is called out here
+// rather than quietly fixed.)
+//
+// THE PROCESS. Each row is checked out-of-band against the job logs on two
+// legs: the reply is a verbatim substring of a logged reply, AND it was logged
+// by the RUN the row cites. Reconstructing a reply means taking the
+// `"text":"…"` capture and cutting at the FIRST NEWLINE — the capture is greedy
+// and otherwise runs on into the following log line. Older runs are further
+// truncated by the pre-core#5052 a2aTurnLogCap, which is why many rows end
+// mid-word. Re-deriving it needs only the job logs and that rule.
+//
+// WHY BOTH LEGS. The one-leg version (string only) passed a bad row: 616276
+// carried "…mcp__molecule_platform__list_workspaces", which is real text —
+// logged by 616479. Same string, wrong run. Only the attribution leg caught it.
+//
+// WHAT THE IN-REPO TESTS DO HOLD. They pin everything that does not need the
+// corpus: a marker matched by no fixture (_EveryMarkerIsFixtured), a marker
+// whose deletion changes nothing (_EveryMarkerIsNecessary), a fixture truncated
+// so far it stops carrying its marker, and the Code->Owner->Summary binding
+// (_CodeBindsToOwnerAndSummary). What they cannot see is a fixture whose text
+// is real but whose `run` is wrong — that costs a reader's ability to check the
+// claim, not the gate's correctness.
+//
+// TWO KNOWN WEAKER AXES, recorded so they are not rediscovered as surprises:
+// provenance-WITHIN-run is unasserted (all 14 pass today, and it is non-binding
+// because these logs contain no other `"text":"` producer); and verifiability
+// decays as logs expire — a row whose run has aged out can no longer be
+// re-checked by anyone, only trusted.
 var callableFixtures = []callableFixture{
 	// ── G4: the model emitted a tool id that does not exist ──────────────
 	{"622972", "Model generated invalid tool call: mcp__molecule__get_workspace_info", "G4-TOOL-NAME-MANGLED"},
@@ -76,13 +101,16 @@ var callableFixtures = []callableFixture{
 // produced the identical verdict sentence and this test could not be written.
 func TestClassifyCallableTurnFailure_NamesEveryObservedMode(t *testing.T) {
 	for _, f := range callableFixtures {
-		code, summary, evidence := ClassifyCallableTurnFailure([]string{f.reply})
+		code, owner, summary, evidence := ClassifyCallableTurnFailure([]string{f.reply})
 		if code != f.want {
 			t.Errorf("run %s: reply %q\n  got class %q, want %q", f.run, f.reply, code, f.want)
 			continue
 		}
 		if strings.TrimSpace(summary) == "" {
 			t.Errorf("run %s: class %s has an EMPTY summary — a class that names nothing is no better than the generic red", f.run, code)
+		}
+		if strings.TrimSpace(owner) == "" {
+			t.Errorf("run %s: class %s has an EMPTY owner — a red that names no owner routes nowhere", f.run, code)
 		}
 		if evidence != f.reply {
 			t.Errorf("run %s: evidence %q does not quote the reply verbatim (%q) — an unquotable class is unfalsifiable by the reader", f.run, evidence, f.reply)
@@ -198,6 +226,94 @@ func TestClassifyCallableTurnFailure_EveryMarkerIsNecessary(t *testing.T) {
 	}
 }
 
+// ── Code -> Owner/Summary binding ───────────────────────────────────────────
+//
+// classBinding is the INDEPENDENT statement of what each code means: the phrase
+// its summary must carry, and the owner the red must route to. It is written
+// here, in the test, precisely so it is not the same string as the thing under
+// test — a binding restated from the implementation would agree with any
+// implementation, including a wrong one.
+//
+// distinguisher must be a phrase that is TRUE of this class and FALSE of every
+// other; ownerMark likewise for the owner. The pairwise property below enforces
+// that, which is what makes a swap detectable.
+var classBinding = map[string]struct {
+	distinguisher string
+	ownerMark     string
+}{
+	"G4-TOOL-NAME-MANGLED":     {"tool id that does not exist", "runtime/template"},
+	"G5-AGENT-DENIES-VERB":     {"ASSERTED it does not", "concierge persona"},
+	"G6-LLM-BILLING-EXHAUSTED": {"out of credit", "LLM account state"},
+	"G7-LLM-MODEL-REJECTED":    {"rejected the configured model", "LLM provider/model configuration"},
+}
+
+// TestCallableFailureClasses_CodeBindsToOwnerAndSummary closes the THIRD axis.
+//
+// The first two legs verify the EVIDENCE — that markers are grounded in real
+// traffic and that fixtures are verbatim and correctly attributed. Nothing
+// verified the CONCLUSION DRAWN FROM IT. Review demonstrated the gap by
+// swapping only G6's and G7's Summary strings: codes unchanged, markers still
+// load-bearing, fixtures still verbatim, both legs green — and the gate then
+// published "the LLM provider rejected the configured model" for a BILLING red,
+// naming the wrong owner. That is this PR's own defect (one sentence, wrong
+// attribution) reproduced one level down in the thing meant to fix it.
+//
+// Written as a PROPERTY over the whole table rather than per-class assertions,
+// because the failure mode is PAIRWISE: hand-written per-class checks tend to
+// assert "G6 says something about credit" and stay green when G6 ALSO says
+// everything G7 should say. The second loop below is the one that catches a
+// swap, and it scales to every future class for free.
+func TestCallableFailureClasses_CodeBindsToOwnerAndSummary(t *testing.T) {
+	if len(classBinding) != len(callableFailureClasses) {
+		t.Fatalf("classBinding has %d entries but there are %d classes — a class with no binding is unpinned, "+
+			"and a binding with no class is dead", len(classBinding), len(callableFailureClasses))
+	}
+	for _, c := range callableFailureClasses {
+		want, ok := classBinding[c.Code]
+		if !ok {
+			t.Errorf("class %s has NO binding entry — its summary and owner are asserted by nothing", c.Code)
+			continue
+		}
+		// 1. POSITIVE: this class says its own thing, and routes to its own owner.
+		if !strings.Contains(c.Summary, want.distinguisher) {
+			t.Errorf("class %s summary does not contain its distinguishing phrase %q.\n  summary: %s",
+				c.Code, want.distinguisher, c.Summary)
+		}
+		if !strings.Contains(c.Owner, want.ownerMark) {
+			t.Errorf("class %s owner %q does not name %q — the red would route to the wrong team",
+				c.Code, c.Owner, want.ownerMark)
+		}
+		// 2. PAIRWISE: and says NOBODY ELSE'S. This is the swap detector.
+		for otherCode, other := range classBinding {
+			if otherCode == c.Code {
+				continue
+			}
+			if strings.Contains(c.Summary, other.distinguisher) {
+				t.Errorf("class %s summary ALSO contains %s's distinguishing phrase %q — the two are not "+
+					"distinguishable, so swapping them would go unnoticed.\n  summary: %s",
+					c.Code, otherCode, other.distinguisher, c.Summary)
+			}
+			if strings.Contains(c.Owner, other.ownerMark) {
+				t.Errorf("class %s owner ALSO names %s's owner %q — ownership is ambiguous",
+					c.Code, otherCode, other.ownerMark)
+			}
+		}
+	}
+}
+
+// TestDescribeCallableFailure_PublishesTheOwner keeps Owner from becoming a
+// field that exists and is never read — which would be its own vacuous surface,
+// and the reason it is a struct field rather than a comment.
+func TestDescribeCallableFailure_PublishesTheOwner(t *testing.T) {
+	for _, f := range callableFixtures {
+		got := describeCallableFailure(callableRedBaseReason, []string{f.reply})
+		want := classBinding[f.want].ownerMark
+		if !strings.Contains(got, want) {
+			t.Errorf("run %s: published verdict does not name the owner %q.\n  got: %s", f.run, want, got)
+		}
+	}
+}
+
 // TestClassifyCallableTurnFailure_UnanchoredModelHasNoStaysDeleted pins the
 // review finding that G7's unanchored "model has no" misroutes ownership.
 //
@@ -208,7 +324,7 @@ func TestClassifyCallableTurnFailure_EveryMarkerIsNecessary(t *testing.T) {
 // must fail here.
 func TestClassifyCallableTurnFailure_UnanchoredModelHasNoStaysDeleted(t *testing.T) {
 	reply := "The model has no access to that, so I don't have provision_workspace."
-	code, _, _ := ClassifyCallableTurnFailure([]string{reply})
+	code, _, _, _ := ClassifyCallableTurnFailure([]string{reply})
 	if code != "G5-AGENT-DENIES-VERB" {
 		t.Fatalf("got %q, want G5-AGENT-DENIES-VERB: an unanchored provider-sounding phrase inside an ordinary "+
 			"refusal must not route to the provider owner", code)
@@ -226,12 +342,15 @@ func TestClassifyCallableTurnFailure_UnanchoredModelHasNoStaysDeleted(t *testing
 // TestClassifyCallableTurnFailure_NoReplyIsItsOwnMode: silence is not refusal.
 func TestClassifyCallableTurnFailure_NoReplyIsItsOwnMode(t *testing.T) {
 	for _, texts := range [][]string{nil, {}, {""}, {"   ", "\n"}} {
-		code, summary, _ := ClassifyCallableTurnFailure(texts)
+		code, owner, summary, _ := ClassifyCallableTurnFailure(texts)
 		if code != "G10-NO-REPLY-OBSERVED" {
 			t.Fatalf("texts=%q: got %q, want G10-NO-REPLY-OBSERVED", texts, code)
 		}
 		if strings.TrimSpace(summary) == "" {
 			t.Fatalf("G10 summary is empty")
+		}
+		if strings.TrimSpace(owner) == "" {
+			t.Fatalf("G10 owner is empty")
 		}
 	}
 }
@@ -244,8 +363,8 @@ func TestClassifyCallableTurnFailure_UnrecognisedAbstains(t *testing.T) {
 		"Sure, one moment while I take a look at that for you.",
 		"The org currently contains three workspaces.",
 	} {
-		code, summary, evidence := ClassifyCallableTurnFailure([]string{reply})
-		if code != "" || summary != "" || evidence != "" {
+		code, owner, summary, evidence := ClassifyCallableTurnFailure([]string{reply})
+		if code != "" || owner != "" || summary != "" || evidence != "" {
 			t.Fatalf("reply %q was force-classified as %q — an unrecognised reply must abstain", reply, code)
 		}
 	}
@@ -256,7 +375,7 @@ func TestClassifyCallableTurnFailure_UnrecognisedAbstains(t *testing.T) {
 // concrete mechanism, not G5.
 func TestClassifyCallableTurnFailure_MostSpecificWins(t *testing.T) {
 	reply := "I don't have that tool. Model generated invalid tool call: mcp__molecule__task_add"
-	if code, _, _ := ClassifyCallableTurnFailure([]string{reply}); code != "G4-TOOL-NAME-MANGLED" {
+	if code, _, _, _ := ClassifyCallableTurnFailure([]string{reply}); code != "G4-TOOL-NAME-MANGLED" {
 		t.Fatalf("got %q, want G4-TOOL-NAME-MANGLED (the concrete mechanism must win over the generic denial)", code)
 	}
 }
