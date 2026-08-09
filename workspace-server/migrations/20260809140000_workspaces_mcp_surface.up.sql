@@ -23,8 +23,10 @@
 --
 -- NULL means "core has not evaluated this row yet" (pre-deploy rows, and any
 -- workspace whose runtime never publishes loaded_mcp_tools). NULL is NOT a
--- verdict and must never be read as one — the reader
--- (handlers.mcpSurfaceVerdictFromJSON) maps it to the neutral value.
+-- verdict and must never be read as one — the status path reads the verdict for
+-- the CURRENT beat from the request context
+-- (handlers.mcpSurfaceVerdictFromContext), which fails to a neutral value; this
+-- column is the durable record a caller reads off GET /workspaces/:id.
 --
 -- Additive and idempotent: no default, no backfill, no rewrite of existing rows.
 ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS mcp_surface JSONB;

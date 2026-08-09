@@ -38,25 +38,46 @@ For a `kind=platform` workspace, management-MCP health is fail closed:
 
 `loaded_mcp_tools` is a PRODUCER SELF-REPORT and its count is not a callability
 claim (core#5137). The runtime probe spawns each declared MCP server as its own
-stdio subprocess under a private client and lists that subprocess's tool
-schemas; nothing on that path touches the surface the model dispatches from, and
-the two can be in different namespaces — a concierge has reported 54
-`mcp__molecule-platform__*` ids while every model dispatch on the fleet was
-`mcp__molecule__*`.
+stdio subprocess under a private client and lists that subprocess's tool schemas,
+so **it can only ever prove the server is healthy**. The surface the model is
+finally offered is assembled later, out of that inventory, and the two can
+diverge without the inventory changing at all. On 2026-08-05 a concierge
+reported 54 management tools loaded while its model could call none of them,
+because hermes' tiered disclosure (`tool_search`) had replaced the individual
+MCP tools with three bridge tools and deferred the real schemas — measured
+`tool_search=off → subset CONVERGES`, `tool_search=on → 60/60 DIVERGES`. The
+runtime template fixed that unconditionally on 2026-08-06.
 
-Core therefore publishes a second, consumer-derived field next to it, on
+Two spellings exist for the same tool and they are **not comparable raw**. The
+probe composes ids from the server name as declared
+(`mcp__molecule-platform__…`); hermes sanitises each name component with
+`[^A-Za-z0-9_] → _` before registering, so the model is only ever offered
+`mcp__molecule_platform__…`. Any comparison must fold both sides first — the
+runtime's `canonical_tool_id` is the SSOT for that fold.
+
+The authoritative runtime-side answer now rides the heartbeat:
+
+- `model_facing_tools` — what the model was actually offered, post-assembly;
+- `loaded_not_model_facing` — the runtime's own set-difference, already folded
+  through `canonical_tool_id` because only the runtime sees both spellings. A
+  NON-EMPTY value is the degraded signal, and it needs no spelling knowledge
+  from core. Core does not consume it yet.
+
+Core additionally publishes an INDEPENDENT consumer-side cross-check on
 `GET /workspaces/:id`:
 
-- `mcp_surface` — how many of those reported ids sit in a namespace this
-  workspace's model has actually been observed dispatching from, derived from
-  core's own turn record (`activity_logs.tool_trace` and the tool-use
-  `agent_log` summaries). Read `dispatch_corroborated_count`, not
+- `mcp_surface` — how many reported ids sit in a namespace this workspace's
+  model has actually been observed dispatching from, derived solely from
+  `activity_logs.tool_trace` (written only by core's `extractToolTrace` as it
+  ingests a turn). The tool-use `agent_log` summaries are deliberately NOT read:
+  `POST /workspaces/:id/activity` accepts an arbitrary summary from the
+  authenticated workspace, so reading them would let a workspace manufacture its
+  own corroboration. Read `dispatch_corroborated_count`, not
   `len(loaded_mcp_tools)`, when the question is "what can the model call".
 - `verdict` carries its own strength: `dispatch_observed:*` (core saw a real
   dispatch in that namespace), `contradicted:*` (core has dispatch records and
-  NONE match the advertised inventory — the 54/zero state), or `unknown:*`
-  (nothing to compare yet). `null` means core has not classified the row; it is
-  not a verdict.
+  NONE match the advertised inventory), or `unknown:*` (nothing to compare yet).
+  `null` means core has not classified the row; it is not a verdict.
 
 `mcp_surface` deliberately does not gate anything. It re-labels the
 `workspace.online` event's `readiness_evidence` and reports; it is not a term of

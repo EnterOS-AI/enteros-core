@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1832,40 +1833,58 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 //
 // `loaded_mcp_tools` is produced by the runtime's out-of-band enumeration probe
 // (molecule-ai-workspace-runtime, molecule_runtime/loaded_mcp_tools_probe.py).
-// That probe reads the adapter's native MCP-servers config, spawns EACH declared
-// server as its OWN stdio subprocess under a PRIVATE client (its own clientInfo,
-// "molecule-runtime-loaded-mcp-probe"), drives
+// That probe spawns EACH declared server as its OWN stdio subprocess under a
+// PRIVATE client (its own clientInfo, "molecule-runtime-loaded-mcp-probe"),
+// drives
 //
 //	initialize -> notifications/initialized -> tools/list
 //
-// and normalises every returned tools[].name to `mcp__<config-key>__<tool>`
+// and normalises every returned tools[].name to `mcp__<server>__<tool>`
 // (_normalize_tool_id). The count it publishes therefore answers exactly one
 // question: "can a brand-new client spawn this server and read its schema list?"
+// It CAN ONLY EVER PROVE THE SERVER IS HEALTHY. It says nothing about the tool
+// surface the model was finally offered, because the model's surface is
+// assembled LATER, by the runtime, out of that inventory.
 //
-// NOTHING on that path touches the tool surface the MODEL dispatches from. The
-// probe's client is not the executor's client, and — the load-bearing part — the
-// config the probe reads is not necessarily the config the executor reads. On
-// the hermes runtime the base adapter hook renders/reads
-// `<config_path>/.claude/settings.json` (where the platform-mcp plugin reconcile
-// writes `molecule-platform`), while the model's own surface is the hermes
-// config written by the runtime template's start.sh, which wires ONE server —
-// the A2A sidecar, named `molecule`. So the management MCP registers
-// successfully into a file the model's dispatcher never opens.
+// ⚠️ NOT A WRONG-CONFIG BUG — an earlier draft of this comment claimed the probe
+// and the executor read DIFFERENT files on hermes. That is false and is
+// corrected here rather than deleted, because the wrong story would have sent
+// the next reader to the wrong repo. The hermes adapter OVERRIDES the
+// adapter_base default precisely so both sides read one file:
+// `enumerate_loaded_mcp_tools` -> `_read_hermes_mcp_servers` -> `config.yaml`,
+// and `mcp_settings_path` / `register_mcp_server_hook` resolve the SAME
+// `_hermes_config_path()`, kept "in LOCKSTEP … so a server the renderer writes
+// is byte-for-byte the file the adapter enumerates". Registration lands exactly
+// where the enumeration looks.
 //
-// The two layers then disagree in the ONE way that is invisible to a membership
-// test: the namespace. Captured on this fleet (Loki, container
-// enteros-ws-e2e-life-619276-4822-3a49a308a8c6, 2026-08-05T08:18:56Z):
+// THE TWO REAL CAUSES, both measured on the 2026-08-05 concierge:
 //
-//	loaded_mcp_tools: enumerated 54 MCP tool id(s) from 2 declared server(s)
-//
-// all 54 spelled `mcp__molecule-platform__*` — while every model dispatch
-// recorded across the fleet in the same window is spelled `mcp__molecule__*`,
-// and a search for a `mcp__molecule-platform__*` invocation returns nothing.
+//  1. TIERED DISCLOSURE DEFERRED THE SURFACE. hermes' tool_search replaces the
+//     individual MCP tools with three bridge tools and defers the real schemas.
+//     The runtime's own measurement:
+//     tool_search=off -> model-facing 120 (92 mcp__*), subset=True  CONVERGES
+//     tool_search=on  -> model-facing  28 ( 0 mcp__*), subset=False DIVERGES
+//     The server was healthy and its 54 tools were loaded; the model was
+//     offered none of them. The runtime template fixed this unconditionally on
+//     2026-08-06.
+//  2. A SPELLING SPLIT between the two layers — see mcpToolIDNamespace.
 //
 // The count never disagreed with the gate because the probe AND the gate's
 // membership test (conciergePlatformMCPProvisionWorkspaceTool) are both spelled
-// in the PROBE's naming convention. Two components deriving the same string from
-// the same wrong assumption always agree, and their agreement is worth zero.
+// in the PROBE's naming convention, and neither looks at the assembled surface.
+// Two components deriving the same string from the same source always agree,
+// and their agreement is worth zero.
+//
+// WHERE THE AUTHORITATIVE RUNTIME-SIDE ANSWER NOW LIVES. The runtime has since
+// added the other half itself: `model_facing_tools` (what the model was actually
+// offered, post-assembly) and `loaded_not_model_facing` (its own set-difference,
+// folded through canonical_tool_id because only the runtime sees both
+// spellings). Both ride the heartbeat's identity-gate payload, and a NON-EMPTY
+// `loaded_not_model_facing` is the degraded signal core should gate on — the
+// runtime's comment says so explicitly: "Core gates on this; it needs no
+// spelling knowledge." Consuming that field is the correct next step and is NOT
+// done here (tracked as the follow-up below); this record is the INDEPENDENT
+// consumer-side cross-check of the same question, and does not replace it.
 //
 // THE SIGNAL, and why it is consumer-derived.
 //
@@ -1969,14 +1988,43 @@ type mcpSurfaceReport struct {
 	ObservedAt      time.Time         `json:"observed_at"`
 }
 
-// mcpToolIDNamespace returns the `<server>` segment of a canonical
+// mcpToolIDUnsafe is the transform hermes applies to every MCP name component
+// before registering it with the model (tools/mcp_tool.py
+// sanitize_mcp_name_component). It is reproduced here to MIRROR the runtime's
+// molecule_runtime/loaded_mcp_tools_probe.py canonical_tool_id, which is the
+// SSOT for this fold; the pattern is `[^A-Za-z0-9_]`.
+var mcpToolIDUnsafe = regexp.MustCompile(`[^A-Za-z0-9_]`)
+
+// mcpToolIDNamespace returns the CANONICAL `<server>` segment of an
 // `mcp__<server>__<tool>` dispatcher id, or "" when the string is not one.
+//
+// ⚠️ THE SPELLING SPLIT — why this folds instead of comparing raw.
+// The two sides of this comparison do not spell the server the same way. The
+// runtime's enumeration probe composes ids from the server name AS DECLARED, so
+// it emits `mcp__molecule-platform__provision_workspace` (hyphen). hermes
+// sanitises every name component with `re.sub(r"[^A-Za-z0-9_]", "_", …)` before
+// registering it, so the model is offered
+// `mcp__molecule_platform__provision_workspace` (underscore) — and that is the
+// only spelling the model can emit. Captured on this fleet in one line:
+//
+//	tools.mcp_tool: MCP server 'molecule-platform' (stdio): registered 54
+//	tool(s): mcp__molecule_platform__list_workspaces, …
+//
+// A raw string comparison between the reported inventory and the dispatch
+// record is therefore a CONSTANT FALSE on hermes — it would report a divergence
+// on every beat including a perfectly healthy one, which is exactly as useless
+// as the constant TRUE it replaces. The runtime repo wrote canonical_tool_id to
+// prevent precisely this and says so in its docstring; this function mirrors it.
 //
 // Parsed by explicit index rather than strings.Split so a tool name that itself
 // contains "__" (legal, and present in the wild) cannot shift the namespace: the
 // namespace is everything between the FIRST "mcp__" and the NEXT "__", and the
 // tool is the whole remainder. A trailing-but-empty tool ("mcp__x__") is not a
 // dispatchable id and returns "".
+//
+// The fold is applied to the namespace segment only, AFTER the "mcp__"/"__"
+// structure has been parsed off the raw string — folding first would rewrite the
+// separators themselves and make every id unparseable.
 func mcpToolIDNamespace(toolID string) string {
 	const prefix = "mcp__"
 	const sep = "__"
@@ -1992,25 +2040,38 @@ func mcpToolIDNamespace(toolID string) string {
 	if len(rest) <= idx+len(sep) {
 		return "" // "mcp__server__" with no tool segment
 	}
-	return rest[:idx]
+	return mcpToolIDUnsafe.ReplaceAllString(rest[:idx], "_")
 }
 
-// mcpAgentLogToolSummaryPrefix mirrors messagestore.toolSummaryPrefix (U+1F6E0
-// + space), the marker the executor's _report_tool_use writes ahead of the tool
-// name on an agent_log summary. Spelled as an escape so the source stays ASCII;
-// a divergence from messagestore is caught by
-// TestAgentLogToolSummaryPrefixMatchesMessagestore.
-const mcpAgentLogToolSummaryPrefix = "\U0001F6E0 "
-
-// mcpDispatchNamespacesFrom extracts the set of dispatcher namespaces from the
-// two shapes core persists: a tool_trace JSON array of {"tool": "..."} objects
-// (or of bare strings, which older writers produced) and an agent_log summary
-// of the form "<marker> mcp__server__tool(args...)".
+// mcpDispatchNamespacesFrom extracts the set of canonical dispatcher namespaces
+// from activity_logs.tool_trace documents: a JSON array of {"tool": "..."}
+// objects (or of bare strings, which older writers produced).
+//
+// ⚠️ TRUST BOUNDARY — why ONLY tool_trace, and not the agent_log "tool-use"
+// summaries. Both look like a record of a dispatch, but they are not equally
+// trustworthy:
+//
+//   - tool_trace is DISPATCHER-ONLY. extractToolTrace (a2a_proxy_helpers.go) is
+//     its sole writer; it lifts result.metadata.tool_trace off the A2A response
+//     as core ingests the turn. The workspace-facing ingest endpoint
+//     (ActivityHandler.Report, POST /workspaces/:id/activity) has NO tool_trace
+//     field at all, so a workspace cannot post one.
+//   - The agent_log summaries CAN be posted. That same endpoint accepts
+//     activity_type:"agent_log" with an arbitrary Summary from the
+//     authenticated workspace. A workspace could POST
+//     "<marker> mcp__molecule-platform__list_orgs(…)" having dispatched
+//     nothing and manufacture its own corroboration.
+//
+// That second path is the SAME trust boundary that produced loaded_mcp_tools —
+// the component under scrutiny attesting to itself. Reading it here would make
+// this record a laundered self-report wearing a dispatch_observed: label, which
+// is worse than no label. It is dropped rather than downgraded: a corroboration
+// signal with a forgeable arm has no honest strength to report.
 //
 // Everything unparseable is DROPPED, never guessed. A malformed trace must not
 // invent a namespace — an invented namespace would manufacture corroboration,
 // which is the precise failure this whole record exists to prevent.
-func mcpDispatchNamespacesFrom(toolTraces [][]byte, agentLogSummaries []string) (map[string]struct{}, int) {
+func mcpDispatchNamespacesFrom(toolTraces [][]byte) (map[string]struct{}, int) {
 	out := map[string]struct{}{}
 	records := 0
 
@@ -2042,19 +2103,6 @@ func mcpDispatchNamespacesFrom(toolTraces [][]byte, agentLogSummaries []string) 
 				add(s)
 			}
 		}
-	}
-
-	for _, summary := range agentLogSummaries {
-		s := strings.TrimSpace(summary)
-		if !strings.HasPrefix(s, mcpAgentLogToolSummaryPrefix) {
-			continue
-		}
-		s = strings.TrimSpace(strings.TrimPrefix(s, mcpAgentLogToolSummaryPrefix))
-		// "mcp__server__tool(arg=1)" -> "mcp__server__tool"
-		if i := strings.IndexByte(s, '('); i >= 0 {
-			s = s[:i]
-		}
-		add(s)
 	}
 
 	return out, records
@@ -2141,10 +2189,9 @@ func mcpSurfaceVerdictFromContext(c *gin.Context) mcpSurfaceVerdict {
 	}
 }
 
-// mcpDispatchLookbackRows bounds EACH branch of the corroboration read. The
-// question is categorical ("has this workspace's model dispatched from namespace
-// X recently"), so the newest window is sufficient and the query stays O(1) per
-// heartbeat regardless of how much history a tenant has accumulated.
+// mcpDispatchLookbackRows bounds the corroboration read. The question is
+// categorical ("has this workspace's model dispatched from namespace X
+// recently"), so the newest window is sufficient.
 const mcpDispatchLookbackRows = 200
 
 // recordMCPSurfaceCorroboration reads core's OWN dispatch record for this
@@ -2181,27 +2228,18 @@ func (h *RegistryHandler) recordMCPSurfaceCorroboration(c *gin.Context, ctx cont
 		return
 	}
 
-	// TWO index-served branches rather than one OR'd predicate. An
-	// `(tool_trace IS NOT NULL OR (activity_type='agent_log' AND ...))` disjunct
-	// cannot use idx_activity_ws_type_time and would degrade to a sort over the
-	// workspace's whole activity history — a per-heartbeat cost that grows with
-	// tenant age. Branch 2 is served by idx_activity_ws_type_time
-	// (workspace_id, activity_type, created_at DESC); branch 1 by the partial
-	// idx_activity_logs_ws_tooltrace_time added alongside the mcp_surface column.
-	// Each branch is independently LIMITed, so the read stays O(1).
+	// ONE index-served branch. tool_trace is the only unforgeable source (see
+	// mcpDispatchNamespacesFrom's trust-boundary note), and this predicate is
+	// served by the partial idx_activity_logs_ws_tooltrace_time added alongside
+	// the mcp_surface column. LIMITed, so the read stays O(1) per heartbeat
+	// regardless of how much history a tenant has accumulated.
 	rows, err := db.DB.QueryContext(ctx, `
-		(SELECT COALESCE(tool_trace::text, '') AS trace, '' AS summary
-		   FROM activity_logs
-		  WHERE workspace_id = $1 AND tool_trace IS NOT NULL
-		  ORDER BY created_at DESC
-		  LIMIT $3)
-		UNION ALL
-		(SELECT '' AS trace, COALESCE(summary, '') AS summary
-		   FROM activity_logs
-		  WHERE workspace_id = $1 AND activity_type = 'agent_log' AND summary LIKE $2
-		  ORDER BY created_at DESC
-		  LIMIT $3)
-	`, workspaceID, mcpAgentLogToolSummaryPrefix+"%", mcpDispatchLookbackRows)
+		SELECT COALESCE(tool_trace::text, '')
+		  FROM activity_logs
+		 WHERE workspace_id = $1 AND tool_trace IS NOT NULL
+		 ORDER BY created_at DESC
+		 LIMIT $2
+	`, workspaceID, mcpDispatchLookbackRows)
 	if err != nil {
 		log.Printf("Heartbeat: mcp_surface corroboration read failed for %s: %v — leaving the previous record untouched", workspaceID, err)
 		return
@@ -2209,18 +2247,14 @@ func (h *RegistryHandler) recordMCPSurfaceCorroboration(c *gin.Context, ctx cont
 	defer rows.Close()
 
 	var traces [][]byte
-	var summaries []string
 	for rows.Next() {
-		var trace, summary string
-		if scanErr := rows.Scan(&trace, &summary); scanErr != nil {
+		var trace string
+		if scanErr := rows.Scan(&trace); scanErr != nil {
 			log.Printf("Heartbeat: mcp_surface corroboration scan failed for %s: %v", workspaceID, scanErr)
 			return
 		}
 		if trace != "" {
 			traces = append(traces, []byte(trace))
-		}
-		if summary != "" {
-			summaries = append(summaries, summary)
 		}
 	}
 	if rowsErr := rows.Err(); rowsErr != nil {
@@ -2228,7 +2262,7 @@ func (h *RegistryHandler) recordMCPSurfaceCorroboration(c *gin.Context, ctx cont
 		return
 	}
 
-	dispatched, records := mcpDispatchNamespacesFrom(traces, summaries)
+	dispatched, records := mcpDispatchNamespacesFrom(traces)
 	report := classifyMCPSurface(reported, dispatched, records, time.Now())
 
 	// Publish to the request BEFORE persisting: the label evaluateStatus emits
@@ -2335,9 +2369,11 @@ const (
 // (it is guarded by mcpSurfaceSelfReported). An empty label on the wire would
 // therefore itself be a bug signal, not a silent default.
 //
-// core#5137: `surface` is the LAST-PERSISTED mcp_surface verdict for this row
-// (read alongside status in evaluateStatus — no extra query). It only ever
-// changes the LABEL:
+// core#5137: `surface` is the verdict computed for THIS beat by
+// recordMCPSurfaceCorroboration and read back from the request context in
+// evaluateStatus (mcpSurfaceVerdictFromContext) — request-scoped, not the
+// last-persisted column value, so a concurrent beat cannot label this one, and
+// no extra query is issued. It only ever changes the LABEL:
 //
 //   - corroborated   -> upgrade to the dispatch_observed: value, the only
 //     non-self-reported evidence available here.

@@ -1,13 +1,18 @@
 package handlers
 
 import (
+	"bytes"
+	"database/sql/driver"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/messagestore"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
@@ -103,6 +108,24 @@ var capturedDispatchedToolIDs = []string{
 	"mcp__molecule__recall_memory",
 }
 
+// capturedArg is a permissive sqlmock argument matcher that RECORDS the value
+// it saw. Used for the mcp_surface JSON document: the assertions belong in the
+// test body (where a mismatch can print the whole document) rather than in an
+// opaque "expectation unmet".
+type capturedArg struct{ seen *string }
+
+func (m capturedArg) Match(v driver.Value) bool {
+	switch s := v.(type) {
+	case string:
+		*m.seen = s
+	case []byte:
+		*m.seen = string(s)
+	default:
+		return false
+	}
+	return true
+}
+
 func dispatchSet(ids ...string) (map[string]struct{}, int) {
 	out := map[string]struct{}{}
 	n := 0
@@ -155,8 +178,9 @@ func TestMCPSurface_CapturedFleetShape_ReportsContradicted(t *testing.T) {
 	if got.AdvertisedOnlyCount != 54 {
 		t.Errorf("advertised_only_count = %d, want 54", got.AdvertisedOnlyCount)
 	}
-	if len(got.ReportedNamespaces) != 1 || got.ReportedNamespaces[0] != "molecule-platform" {
-		t.Errorf("reported_namespaces = %v, want [molecule-platform]", got.ReportedNamespaces)
+	if len(got.ReportedNamespaces) != 1 || got.ReportedNamespaces[0] != "molecule_platform" {
+		// Canonical (folded) spelling — see mcpToolIDNamespace.
+		t.Errorf("reported_namespaces = %v, want [molecule_platform]", got.ReportedNamespaces)
 	}
 	if len(got.DispatchedNamespaces) != 1 || got.DispatchedNamespaces[0] != "molecule" {
 		t.Errorf("dispatched_namespaces = %v, want [molecule]", got.DispatchedNamespaces)
@@ -170,8 +194,13 @@ func TestMCPSurface_CapturedFleetShape_ReportsContradicted(t *testing.T) {
 // returned the same verdict for all four input classes would pass any
 // single-direction test; this one pins that the four are distinct.
 func TestMCPSurface_Mutation_BothDirections(t *testing.T) {
-	platformOnly, _ := dispatchSet(capturedDispatchedToolIDs...)            // dispatches only mcp__molecule__*
-	matching, matchingN := dispatchSet("mcp__molecule-platform__list_orgs") // dispatches the reported namespace
+	platformOnly, _ := dispatchSet(capturedDispatchedToolIDs...) // dispatches only mcp__molecule__*
+	// The "fixed" input must be an id the fleet can ACTUALLY emit. hermes
+	// sanitises the server name, so a healthy concierge dispatches the
+	// UNDERSCORE spelling; an earlier draft used the hyphenated form, which no
+	// hermes workspace ever registers — that case would have asserted a state
+	// production cannot reach.
+	matching, matchingN := dispatchSet("mcp__molecule_platform__list_orgs")
 	none := map[string]struct{}{}
 
 	cases := []struct {
@@ -207,9 +236,13 @@ func TestMCPSurface_Mutation_BothDirections(t *testing.T) {
 		},
 		{
 			// PRODUCER DEAD: the enumeration published nothing. Distinct from
-			// "published something wrong".
+			// "published something wrong". The dispatch set is EMPTY here
+			// because that is the only input the caller can produce: the
+			// empty-inventory short-circuit in recordMCPSurfaceCorroboration
+			// returns before the dispatch read runs, so a non-empty set paired
+			// with a nil inventory is unreachable in production.
 			name: "unknown — nothing reported", reported: nil,
-			disp: platformOnly, records: len(capturedDispatchedToolIDs),
+			disp: none, records: 0,
 			want: verdictNoInventory, wantCorr: 0,
 		},
 	}
@@ -241,22 +274,28 @@ func TestMCPSurface_Mutation_BothDirections(t *testing.T) {
 // corroborated count must be the per-id count in the dispatched namespace, not
 // the whole inventory — otherwise one real dispatch would launder an entire
 // mis-namespaced list.
+// The two servers here are the two STDIO servers a real concierge declares —
+// `molecule-platform` and `molecule-self`, both seen in the captured boot. The
+// url-transport `molecule` a2a sidecar is deliberately NOT used: the probe's
+// _read_hermes_mcp_servers keeps only command-based servers, so the sidecar can
+// never appear in a reported inventory and an earlier draft that put it there
+// was asserting an impossible input.
 func TestMCPSurface_PartialCorroboration(t *testing.T) {
 	reported := []string{
-		"mcp__molecule__send_message_to_user",
-		"mcp__molecule__chat_history",
+		"mcp__molecule-self__list_schedules",
+		"mcp__molecule-self__run_schedule",
 		"mcp__molecule-platform__provision_workspace",
 		"mcp__molecule-platform__list_orgs",
 		"mcp__molecule-platform__get_org",
 	}
-	disp, n := dispatchSet("mcp__molecule__send_message_to_user")
+	disp, n := dispatchSet("mcp__molecule_self__list_schedules")
 	got := classifyMCPSurface(reported, disp, n, time.Now())
 
 	if got.Verdict != verdictCorroborated {
 		t.Errorf("verdict = %q, want %q", got.Verdict, verdictCorroborated)
 	}
 	if got.DispatchCorroboratedCount != 2 {
-		t.Errorf("dispatch_corroborated_count = %d, want 2 (only the molecule namespace is backed)", got.DispatchCorroboratedCount)
+		t.Errorf("dispatch_corroborated_count = %d, want 2 (only the molecule-self namespace is backed)", got.DispatchCorroboratedCount)
 	}
 	if got.AdvertisedOnlyCount != 3 {
 		t.Errorf("advertised_only_count = %d, want 3", got.AdvertisedOnlyCount)
@@ -294,7 +333,14 @@ func TestMCPSurface_DoesNotMoveThePromotionPredicate(t *testing.T) {
 }
 
 // TestMCPSurface_ContradictedStillPromotesButSaysSo pins the deliberate
-// asymmetry: a contradicted verdict is REPORTED, never enforced.
+// asymmetry at the LABEL function: a contradicted verdict is REPORTED, never
+// enforced.
+//
+// ⚠️ This is NOT the direction guard. It exercises the pure labeller, and a
+// mutant that wires the blocker into evaluateStatus's REAL predicate survives it
+// untouched (reviewer mutation M3b). The guard that actually covers the
+// predicate is TestMCPSurface_ContradictedVerdict_StillReachesOnline below,
+// which drives the whole Heartbeat handler and asserts the status write.
 func TestMCPSurface_ContradictedStillPromotesButSaysSo(t *testing.T) {
 	got := conciergeOnlineEvidence(true, false, verdictContradicted)
 	if got == "" {
@@ -305,11 +351,169 @@ func TestMCPSurface_ContradictedStillPromotesButSaysSo(t *testing.T) {
 	}
 }
 
+// ── End-to-end: the real predicate, the real SQL ────────────────────────────
+//
+// The two tests below drive handler.Heartbeat through the actual mock DB, so
+// they cover what no pure-function test can:
+//
+//   - recordMCPSurfaceCorroboration and its SQL (previously exercised by NO
+//     test at all — the reviewer had to validate it by hand);
+//   - the mcp_surface document that lands in the column;
+//   - evaluateStatus's REAL promotion predicate, so a blocker wired in there
+//     changes the promoted set and fails.
+//
+// They are mirror images: identical except for the SPELLING of the dispatched
+// tool id, which is the whole defect.
+
+// mcpSurfaceHeartbeatCase runs one Heartbeat with a reported inventory of the
+// required (hyphenated) verb and a single tool_trace row carrying dispatchedID,
+// and returns the persisted mcp_surface JSON. It ALWAYS expects the
+// provisioning->online status write: if a mutant makes the verdict block
+// promotion, that expectation goes unmet and the test fails.
+func mcpSurfaceHeartbeatCase(t *testing.T, wsID, dispatchedID string, wantEvidence conciergeReadinessEvidence) string {
+	t.Helper()
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRegistryHandler(newTestBroadcaster())
+
+	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "provisioning", int64(0)))
+	mock.ExpectExec("UPDATE workspaces SET").
+		WithArgs(wsID, 0.0, "", 0, 60, "", nil).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// The raw inventory write — unchanged by this feature, pinned so a
+	// regression that starts laundering the runtime's claim is caught.
+	mock.ExpectExec("UPDATE workspaces SET\\s+loaded_mcp_tools").
+		WithArgs([]byte(`["`+conciergePlatformMCPProvisionWorkspaceTool+`"]`), wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// The corroboration read. Asserting the SQL shape here is the point: it
+	// must hit activity_logs.tool_trace and NOTHING else (the agent_log
+	// summaries are workspace-forgeable and deliberately not read).
+	mock.ExpectQuery("SELECT COALESCE\\(tool_trace::text, ''\\)\\s+FROM activity_logs\\s+WHERE workspace_id = \\$1 AND tool_trace IS NOT NULL").
+		WithArgs(wsID, int64(mcpDispatchLookbackRows)).
+		WillReturnRows(sqlmock.NewRows([]string{"trace"}).
+			AddRow(`[{"tool":"` + dispatchedID + `"}]`))
+	var surface string
+	mock.ExpectExec("UPDATE workspaces SET mcp_surface").
+		WithArgs(capturedArg{seen: &surface}, wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id =").
+		WithArgs(wsID).
+		WillReturnRows(evalStatusRows("provisioning", "platform", nil, nil))
+	mock.ExpectQuery("SELECT EXISTS").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	// THE DIRECTION GUARD. A blocker wired into evaluateStatus's predicate
+	// leaves this expectation unmet.
+	mock.ExpectExec("UPDATE workspaces SET status = .*mcp_unloaded_since = NULL").
+		WithArgs(models.StatusOnline, wsID, "provisioning").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	var payload string
+	mock.ExpectExec("INSERT INTO structure_events").
+		WithArgs(string(events.EventWorkspaceOnline), wsID, onlineEventPayload{
+			mustContain: []string{`"readiness_evidence":"` + string(wantEvidence) + `"`},
+			seen:        &payload,
+		}).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"workspace_id":"` + wsID + `","error_rate":0.0,"sample_error":"","active_tasks":0,` +
+		`"uptime_seconds":60,"mcp_server_present":true,"mcp_tools_ready":true,` +
+		`"loaded_mcp_tools":["` + conciergePlatformMCPProvisionWorkspaceTool + `"]}`
+	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Heartbeat(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sqlmock expectations: %v\nmcp_surface written: %s\nWORKSPACE_ONLINE payload: %s", err, surface, payload)
+	}
+	return surface
+}
+
+// TestMCPSurface_ContradictedVerdict_StillReachesOnline is the direction guard
+// that covers the PREDICATE, not the label. A genuinely broken concierge
+// (reported molecule-platform, model dispatching only the a2a sidecar) must
+// still be promoted — blocking here is the fleet-wide denial cliff this PR says
+// must never be introduced — while the event records the contradiction.
+func TestMCPSurface_ContradictedVerdict_StillReachesOnline(t *testing.T) {
+	surface := mcpSurfaceHeartbeatCase(t, "ws-surface-contra",
+		"mcp__molecule__send_message_to_user", evidenceSelfReportContradicted)
+
+	for _, want := range []string{
+		`"verdict":"` + string(verdictContradicted) + `"`,
+		`"dispatch_corroborated_count":0`,
+		`"reported_count":1`,
+	} {
+		if !strings.Contains(surface, want) {
+			t.Errorf("persisted mcp_surface missing %s\ngot: %s", want, surface)
+		}
+	}
+}
+
+// TestMCPSurface_HermesUnderscoreSpelling_Corroborates is the proof that
+// verdictCorroborated is REACHABLE on real fleet data.
+//
+// Every `loaded_mcp_tools: enumerated` event on this fleet comes from the hermes
+// template, and hermes registers the sanitised spelling — captured verbatim:
+//
+//	tools.mcp_tool: MCP server 'molecule-platform' (stdio): registered 54
+//	tool(s): mcp__molecule_platform__list_workspaces, …
+//
+// So the ONLY dispatch id a healthy hermes concierge can ever produce for the
+// management server is the UNDERSCORE form, while the inventory reports the
+// HYPHEN form. Before the canonicalisation in mcpToolIDNamespace this test's
+// input produced "contradicted" — making verdictCorroborated unreachable
+// fleet-wide and firing the loud CONTRADICTED log on every healthy concierge.
+func TestMCPSurface_HermesUnderscoreSpelling_Corroborates(t *testing.T) {
+	surface := mcpSurfaceHeartbeatCase(t, "ws-surface-hermes",
+		"mcp__molecule_platform__provision_workspace", evidenceDispatchObservedMCPSurface)
+
+	for _, want := range []string{
+		`"verdict":"` + string(verdictCorroborated) + `"`,
+		`"dispatch_corroborated_count":1`,
+		`"advertised_only_count":0`,
+	} {
+		if !strings.Contains(surface, want) {
+			t.Errorf("persisted mcp_surface missing %s\ngot: %s", want, surface)
+		}
+	}
+}
+
+// TestMCPSurface_SpellingsAreEquivalent pins the fold directly. The runtime repo
+// wrote canonical_tool_id for exactly this and warned in writing that a raw
+// comparison is "a CONSTANT FALSE on hermes"; this is that warning as an
+// executable assertion.
+func TestMCPSurface_SpellingsAreEquivalent(t *testing.T) {
+	hyphen := mcpToolIDNamespace("mcp__molecule-platform__provision_workspace")
+	under := mcpToolIDNamespace("mcp__molecule_platform__provision_workspace")
+	if hyphen != under {
+		t.Fatalf("mcp__molecule-platform__ folds to %q but mcp__molecule_platform__ folds to %q — "+
+			"a raw comparison is a constant FALSE on hermes, which would report a divergence on every "+
+			"healthy beat (molecule_runtime canonical_tool_id exists to prevent exactly this)", hyphen, under)
+	}
+	if hyphen != "molecule_platform" {
+		t.Errorf("canonical namespace = %q, want %q (mirror of canonical_tool_id's [^A-Za-z0-9_] -> _)", hyphen, "molecule_platform")
+	}
+
+	// The fold must not smear DIFFERENT servers onto each other.
+	if mcpToolIDNamespace("mcp__molecule__x") == mcpToolIDNamespace("mcp__molecule-platform__x") {
+		t.Error("the a2a sidecar 'molecule' and the management server folded to the same namespace — the fold is over-broad")
+	}
+}
+
 // ── Parsers ─────────────────────────────────────────────────────────────────
 
 func TestMCPToolIDNamespace(t *testing.T) {
 	cases := map[string]string{
-		"mcp__molecule-platform__provision_workspace": "molecule-platform",
+		"mcp__molecule-platform__provision_workspace": "molecule_platform", // folded
+		"mcp__molecule_platform__provision_workspace": "molecule_platform", // hermes spelling, same fold
 		"mcp__molecule__send_message_to_user":         "molecule",
 		"mcp__reno_work__mark_task_done":              "reno_work",
 		// A tool name containing "__" must not shift the namespace.
@@ -331,31 +535,35 @@ func TestMCPToolIDNamespace(t *testing.T) {
 	}
 }
 
+// Every fixture below is a value a `jsonb` column can actually hold. An earlier
+// draft used `{not json` and a raw `[]`, neither of which Postgres can return
+// from this query (invalid JSON cannot be stored, and extractToolTrace drops
+// empty arrays before the insert) — testing the parser against inputs the
+// source cannot produce proves nothing about the source.
 func TestMCPDispatchNamespacesFrom(t *testing.T) {
 	traces := [][]byte{
 		[]byte(`[{"tool":"mcp__molecule__send_message_to_user"},{"tool":"Bash"}]`),
 		// bare-string element shape (older writers)
 		[]byte(`["mcp__reno_work__list_due_tasks"]`),
-		// malformed must be DROPPED, never guessed into a namespace
-		[]byte(`{not json`),
+		// hermes' sanitised spelling folds onto the declared one
+		[]byte(`[{"tool":"mcp__molecule_platform__list_orgs"}]`),
+		// jsonb-legal but carrying nothing usable: must be DROPPED, never
+		// guessed into a namespace.
+		[]byte(`null`),
+		[]byte(`{"tool":"mcp__ghost__tool"}`), // object, not the array shape
 		[]byte(`[{"tool":123}]`),
-		[]byte(`[]`),
-	}
-	summaries := []string{
-		mcpAgentLogToolSummaryPrefix + "mcp__molecule-platform__list_orgs(limit=10)",
-		mcpAgentLogToolSummaryPrefix + "Read(file.go)",
-		"a plain agent_log line mentioning mcp__ghost__tool that is NOT a tool-use row",
+		[]byte(`["Read"]`),
 	}
 
-	got, records := mcpDispatchNamespacesFrom(traces, summaries)
-	want := []string{"molecule", "reno_work", "molecule-platform"}
+	got, records := mcpDispatchNamespacesFrom(traces)
+	want := []string{"molecule", "reno_work", "molecule_platform"}
 	for _, ns := range want {
 		if _, ok := got[ns]; !ok {
 			t.Errorf("namespace %q missing from %v", ns, got)
 		}
 	}
 	if _, ok := got["ghost"]; ok {
-		t.Errorf("a non-tool-use agent_log line manufactured the namespace %q — corroboration must never be invented from prose", "ghost")
+		t.Error("a non-array tool_trace document manufactured a namespace — corroboration must never be invented from a shape the writer does not produce")
 	}
 	if len(got) != 3 {
 		t.Errorf("got %d namespaces (%v), want exactly 3", len(got), got)
@@ -365,15 +573,21 @@ func TestMCPDispatchNamespacesFrom(t *testing.T) {
 	}
 }
 
-// TestAgentLogToolSummaryPrefixMatchesMessagestore pins the marker against its
-// only other definition. If messagestore's writer/reader convention changes and
-// this copy does not, the corroboration silently reads ZERO agent_log
-// dispatches — a probe that quietly stops probing. Compared by value so a
-// divergence is a compile-time-visible test failure, not a runtime shrug.
-func TestAgentLogToolSummaryPrefixMatchesMessagestore(t *testing.T) {
-	if mcpAgentLogToolSummaryPrefix != messagestore.ToolSummaryPrefix {
-		t.Errorf("marker drift: registry has %q, messagestore has %q — the agent_log half of the corroboration would read nothing",
-			mcpAgentLogToolSummaryPrefix, messagestore.ToolSummaryPrefix)
+// TestMCPDispatchNamespaces_IgnoresForgeableAgentLogSummaries pins the trust
+// boundary as an executable assertion. POST /workspaces/:id/activity accepts
+// activity_type:"agent_log" with an arbitrary summary from the authenticated
+// workspace, so a workspace could post a tool-use-shaped line having dispatched
+// nothing. Only tool_trace — whose sole writer is core's own extractToolTrace,
+// and which that endpoint has no field for — may back a dispatch_observed:
+// label. If a future edit re-adds the summary arm, this fails.
+func TestMCPDispatchNamespaces_IgnoresForgeableAgentLogSummaries(t *testing.T) {
+	// The exact string a workspace would post to fake corroboration.
+	forged := []byte(`["\U0001F6E0 mcp__molecule_platform__list_orgs(limit=10)"]`)
+	got, records := mcpDispatchNamespacesFrom([][]byte{forged})
+	if len(got) != 0 || records != 0 {
+		t.Errorf("a tool-use-shaped SUMMARY string produced namespaces %v (records=%d) — "+
+			"only core-written tool_trace entries may corroborate; reading a workspace-postable "+
+			"field would launder a self-report behind a dispatch_observed: label", got, records)
 	}
 }
 
@@ -415,7 +629,7 @@ func TestMCPSurfaceReport_JSONShapeIsStable(t *testing.T) {
 		`"dispatch_corroborated_count":0`,
 		`"advertised_only_count":54`,
 		`"verdict":"contradicted:dispatch_uses_only_other_namespaces"`,
-		`"reported_namespaces":["molecule-platform"]`,
+		`"reported_namespaces":["molecule_platform"]`,
 		`"dispatched_namespaces":["molecule"]`,
 	} {
 		if !strings.Contains(string(raw), field) {
