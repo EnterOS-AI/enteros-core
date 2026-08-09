@@ -2141,9 +2141,10 @@ func mcpSurfaceVerdictFromContext(c *gin.Context) mcpSurfaceVerdict {
 	}
 }
 
-// mcpDispatchLookbackRows bounds the corroboration read. The question is
-// categorical ("has this workspace's model EVER dispatched from namespace X"),
-// so the newest window is sufficient and the query stays O(1) per heartbeat.
+// mcpDispatchLookbackRows bounds EACH branch of the corroboration read. The
+// question is categorical ("has this workspace's model dispatched from namespace
+// X recently"), so the newest window is sufficient and the query stays O(1) per
+// heartbeat regardless of how much history a tenant has accumulated.
 const mcpDispatchLookbackRows = 200
 
 // recordMCPSurfaceCorroboration reads core's OWN dispatch record for this
@@ -2160,14 +2161,46 @@ const mcpDispatchLookbackRows = 200
 // runtime only publishes loaded_mcp_tools for kind=platform (its own
 // _is_platform_agent gate), so ordinary tenants never reach this at all.
 func (h *RegistryHandler) recordMCPSurfaceCorroboration(c *gin.Context, ctx context.Context, workspaceID string, reported []string) {
+	// Nothing to corroborate against an empty inventory, and the verdict is
+	// already determined (verdictNoInventory) whatever the dispatch record says.
+	// Short-circuit BEFORE the read so a runtime whose producer is dead does not
+	// pay for a query whose answer cannot change the outcome.
+	if len(reported) == 0 {
+		report := classifyMCPSurface(reported, nil, 0, time.Now())
+		if c != nil {
+			c.Set(mcpSurfaceContextKey, report.Verdict)
+		}
+		if encoded, marshalErr := json.Marshal(report); marshalErr == nil {
+			if _, execErr := db.DB.ExecContext(ctx, `
+				UPDATE workspaces SET mcp_surface = $1::jsonb, updated_at = now()
+				 WHERE id = $2 AND status != 'removed'
+			`, encoded, workspaceID); execErr != nil {
+				log.Printf("Heartbeat: failed to persist mcp_surface for %s: %v", workspaceID, execErr)
+			}
+		}
+		return
+	}
+
+	// TWO index-served branches rather than one OR'd predicate. An
+	// `(tool_trace IS NOT NULL OR (activity_type='agent_log' AND ...))` disjunct
+	// cannot use idx_activity_ws_type_time and would degrade to a sort over the
+	// workspace's whole activity history — a per-heartbeat cost that grows with
+	// tenant age. Branch 2 is served by idx_activity_ws_type_time
+	// (workspace_id, activity_type, created_at DESC); branch 1 by the partial
+	// idx_activity_logs_ws_tooltrace_time added alongside the mcp_surface column.
+	// Each branch is independently LIMITed, so the read stays O(1).
 	rows, err := db.DB.QueryContext(ctx, `
-		SELECT COALESCE(tool_trace::text, ''), COALESCE(summary, '')
-		  FROM activity_logs
-		 WHERE workspace_id = $1
-		   AND (tool_trace IS NOT NULL
-		        OR (activity_type = 'agent_log' AND summary LIKE $2))
-		 ORDER BY created_at DESC
-		 LIMIT $3
+		(SELECT COALESCE(tool_trace::text, '') AS trace, '' AS summary
+		   FROM activity_logs
+		  WHERE workspace_id = $1 AND tool_trace IS NOT NULL
+		  ORDER BY created_at DESC
+		  LIMIT $3)
+		UNION ALL
+		(SELECT '' AS trace, COALESCE(summary, '') AS summary
+		   FROM activity_logs
+		  WHERE workspace_id = $1 AND activity_type = 'agent_log' AND summary LIKE $2
+		  ORDER BY created_at DESC
+		  LIMIT $3)
 	`, workspaceID, mcpAgentLogToolSummaryPrefix+"%", mcpDispatchLookbackRows)
 	if err != nil {
 		log.Printf("Heartbeat: mcp_surface corroboration read failed for %s: %v — leaving the previous record untouched", workspaceID, err)
