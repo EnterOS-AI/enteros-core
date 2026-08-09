@@ -16,6 +16,7 @@ lanes that carry the Arm-B shape today MUST be detected, and the lanes that
 do not carry it MUST NOT be. If someone converts a lane to always-run, the
 corresponding assertion here is what tells them to promote the lint.
 """
+import ast
 import importlib.util
 import io
 import sys
@@ -953,9 +954,132 @@ class TestExitContractIsFullyCovered:
             return e.code
 
     def test_every_exit_code_has_a_driver(self):
-        """If someone adds a code to EXIT_MEANING, this fails until they
-        add a driver above — which is what makes the next test complete."""
+        """Direction A — a code declared in the contract with no driver.
+
+        If someone adds a code to EXIT_MEANING, this fails until they add a
+        driver above, which is what keeps the next test complete."""
         assert set(lint.EXIT_MEANING) == {0, 1, 2, 3, 4, 5}
+
+    def test_every_exit_literal_is_declared(self):
+        """Direction B — a branch exiting a code the contract never declared.
+
+        EXIT_MEANING was authoritative for CLASSIFICATION and WORDING (the
+        table derives from it and cannot drift) but NOT for WHICH CODES
+        EXIST. A new branch doing `return 6` compiled, imported, produced
+        exit 6 with `6 in EXIT_MEANING == False`, and the whole suite stayed
+        green — because the `return` sites are bare integer literals and
+        only `_die()` routed through the contract.
+
+        Membership cannot be checked at runtime: a branch that never
+        executes never proves anything. So DERIVE THE DOMAIN FROM THE
+        SOURCE — walk the module's AST and require every exit-shaped integer
+        literal to be a declared key. (cp#2938 landed on the same technique
+        for a structurally identical problem: derive, never enumerate.)
+        """
+        tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+        parents = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+
+        def _fn(node):
+            while node in parents:
+                node = parents[node]
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return node.name
+            return "<module>"
+
+        def _int(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, int):
+                if not isinstance(node.value, bool):
+                    return node.value
+            return None
+
+        found: list[tuple[int, int, str]] = []  # (code, lineno, how)
+        for node in ast.walk(tree):
+            # `return <int>` — every int-literal return in this module is an
+            # exit code (run() and main() are the only producers); asserted
+            # by test_no_int_returns_outside_the_exit_chain below.
+            if isinstance(node, ast.Return):
+                code = _int(node.value)
+                if code is not None:
+                    found.append((code, node.lineno, f"return in {_fn(node)}()"))
+            # `sys.exit(<int>)` and `_die(<int>, ...)`
+            if isinstance(node, ast.Call) and node.args:
+                fn = node.func
+                how = None
+                if isinstance(fn, ast.Attribute) and fn.attr == "exit":
+                    how = "sys.exit"
+                elif isinstance(fn, ast.Name) and fn.id == "_die":
+                    how = "_die"
+                if how:
+                    code = _int(node.args[0])
+                    if code is not None:
+                        found.append((code, node.lineno, how))
+
+        assert found, "AST walk found no exit literals at all — walk is broken"
+        undeclared = [
+            f"line {ln}: {how} -> exit {c} (not in EXIT_MEANING)"
+            for c, ln, how in sorted(found)
+            if c not in lint.EXIT_MEANING
+        ]
+        assert not undeclared, (
+            "exit code(s) produced but never declared in EXIT_MEANING:\n  "
+            + "\n  ".join(undeclared)
+            + "\nDeclare them (class + meaning + action) or use an existing "
+              "code. An undeclared code cannot be described, so it cannot "
+              "tell the operator whether it IS or is NOT a finding."
+        )
+
+    def test_no_int_returns_outside_the_exit_chain(self):
+        """Guards the assumption the AST test rests on.
+
+        The walk treats EVERY int-literal `return` as an exit code. That is
+        only sound while run() and main() are the sole int-returning
+        functions. If a helper starts returning a bare int, this fails and
+        tells you to scope the walk rather than letting it produce
+        false positives."""
+        tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+        offenders = []
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if fn.name in ("run", "main"):
+                continue
+            for node in ast.walk(fn):
+                if (
+                    isinstance(node, ast.Return)
+                    and isinstance(node.value, ast.Constant)
+                    and isinstance(node.value.value, int)
+                    and not isinstance(node.value.value, bool)
+                ):
+                    offenders.append(f"{fn.name}() line {node.lineno}")
+        assert not offenders, (
+            "int-literal return outside run()/main(): " + ", ".join(offenders)
+        )
+
+    def test_verdict_summary_refuses_an_undeclared_code(self):
+        """The runtime half of Direction B.
+
+        This used to be `.get(code, ("did-not-run", "unknown"))` — a silent
+        fallback that would announce a genuine FINDING as a non-run. A
+        branch that cannot say what it means must fail while trying to say
+        it, not guess."""
+        with pytest.raises(KeyError) as e:
+            lint._verdict_summary(6, "headline")
+        assert "not declared in EXIT_MEANING" in str(e.value)
+        # And it still works for every declared code.
+        for code in lint.EXIT_MEANING:
+            assert lint._verdict_summary(code, "h")
+
+    def test_the_exit_table_is_derived_everywhere(self):
+        """The exit-5 banner used to hand-maintain its own 3-row copy."""
+        src = SCRIPT.read_text(encoding="utf-8")
+        # The only literal table header in the module is the derived one.
+        assert src.count('"| exit | meaning | what to do |\\n"') == 0, (
+            "a hand-written exit table has reappeared; use _exit_table_md()"
+        )
+        assert "_exit_table_md(5)" in src and "_exit_table_md(4)" in src
 
     @pytest.mark.parametrize("code", sorted(lint.EXIT_MEANING))
     def test_every_non_clean_exit_writes_a_summary(
