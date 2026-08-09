@@ -611,7 +611,12 @@ class TestUnreachableIsNotNonCompliance:
         assert "THE LINT DID NOT RUN" in md
         assert "NOT a compliance finding" in md
         assert "ZERO workflow files were inspected" in md
-        assert "the API never answered" in md
+        # DERIVED, not enumerated. This used to hardcode "the API never
+        # answered" — an enumerated expectation in a suite whose whole thesis
+        # is "derive, never enumerate". Reading it from the registry means
+        # rewording EXIT_MEANING[5] cannot leave this test asserting text the
+        # banner no longer contains.
+        assert lint.EXIT_MEANING[5][1] in md
 
     def test_a_broken_step_summary_never_changes_the_verdict(
         self, api_env, monkeypatch, capsys, tmp_path
@@ -907,6 +912,14 @@ class TestExitContractIsFullyCovered:
               - run: go build ./...
     """
 
+    def _run(self, monkeypatch, script, capsys):
+        """Same contract as TestUnreachableIsNotNonCompliance._run."""
+        opener, attempts = _scripted_opener(script)
+        monkeypatch.setattr(lint.urllib.request, "urlopen", opener)
+        rc = lint.main()
+        cap = capsys.readouterr()
+        return rc, cap.out + cap.err, attempts
+
     def _drive(self, code, lint_mod, monkeypatch, tmp_path):
         """Produce exit `code` for real. Returns the observed exit code."""
         wf = tmp_path / "workflows"
@@ -943,6 +956,16 @@ class TestExitContractIsFullyCovered:
         elif code == 5:
             _lay(self.CLEAN, "Clean Lane / Clean Lane")
             script = ["502"]
+        elif code == 7:
+            # An undeclared exit code reached at RUNTIME, via the one path
+            # that can detect it: a branch that tries to describe itself.
+            _lay(self.CLEAN, "Clean Lane / Clean Lane")
+            monkeypatch.setattr(
+                lint_mod,
+                "build_job_index",
+                lambda *a, **k: lint_mod._die(6, "an undeclared branch"),
+            )
+            script = ["ok"]
         else:  # pragma: no cover - guarded by the driver-coverage test
             raise AssertionError(f"no driver for exit code {code}")
 
@@ -958,7 +981,7 @@ class TestExitContractIsFullyCovered:
 
         If someone adds a code to EXIT_MEANING, this fails until they add a
         driver above, which is what keeps the next test complete."""
-        assert set(lint.EXIT_MEANING) == {0, 1, 2, 3, 4, 5}
+        assert set(lint.EXIT_MEANING) == {0, 1, 2, 3, 4, 5, 7}
 
     def test_every_exit_literal_is_declared(self):
         """Direction B — a branch exiting a code the contract never declared.
@@ -975,6 +998,23 @@ class TestExitContractIsFullyCovered:
         SOURCE — walk the module's AST and require every exit-shaped integer
         literal to be a declared key. (cp#2938 landed on the same technique
         for a structurally identical problem: derive, never enumerate.)
+
+        SCOPE — THIS WALK IS LITERAL-ONLY, AND THAT IS NOT "DIRECTION B
+        CLOSED IN GENERAL".
+        Caught: `return 6`, `sys.exit(6)`, `_die(6, ...)`, and a literal int
+        return from a helper.
+        NOT caught: `c = 6; return c` · `return 5 + 1` · a helper returning a
+        variable · `sys.exit(f(x))` · `raise SystemExit(6)` · `return -1`
+        (a negative literal is `UnaryOp`, not `ast.Constant`) · a
+        module-level constant · `_die(var, ...)`.
+        That is 3 of 11 probed shapes. It IS sound for this file as written,
+        because all 17 of today's exit sites are literals — and
+        `test_no_int_returns_outside_the_exit_chain` guards the assumption
+        the walk rests on (though it, too, only sees literals). The
+        complementary runtime guard is `ExitContractViolation`, which covers
+        the NON-literal `_die(computed_code, ...)` case the walk cannot see.
+        Neither guard subsumes the other; a bare `return <non-literal>`
+        remains uncovered by both.
         """
         tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
         parents = {}
@@ -1058,6 +1098,36 @@ class TestExitContractIsFullyCovered:
             "int-literal return outside run()/main(): " + ", ".join(offenders)
         )
 
+    def test_the_runtime_guard_covers_what_the_AST_walk_cannot_see(
+        self, api_env, monkeypatch, capsys, tmp_path
+    ):
+        """Fix 1's REAL non-redundant value — stated correctly this time.
+
+        My first claim was that the two fixes "red independently" for the
+        same defect. That was false: only the AST test reds a `return 6`;
+        reverting the raise merely fails the raise's own unit test. Delete
+        the AST test with the raise alive and `return 6` goes undetected.
+
+        What the raise genuinely adds is the case the walk CANNOT see: a
+        COMPUTED exit code. `_die(<expr>, ...)` presents no integer literal
+        to the AST, so only the runtime check can catch it."""
+        summary = tmp_path / "summary.md"
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+        opener, _ = _scripted_opener(["ok"])
+        monkeypatch.setattr(lint.urllib.request, "urlopen", opener)
+
+        computed = 3 + 3  # no literal 6 anywhere for the walk to find
+        monkeypatch.setattr(
+            lint, "build_job_index",
+            lambda *a, **k: lint._die(computed, "computed undeclared code"),
+        )
+        rc = lint.main()
+        log = "".join(capsys.readouterr())
+        assert rc == 7, "a computed undeclared code must be caught at runtime"
+        assert "EXIT CONTRACT VIOLATED" in log
+        md = summary.read_text(encoding="utf-8")
+        assert "proves NOTHING about compliance" in md
+
     def test_verdict_summary_refuses_an_undeclared_code(self):
         """The runtime half of Direction B.
 
@@ -1065,21 +1135,84 @@ class TestExitContractIsFullyCovered:
         fallback that would announce a genuine FINDING as a non-run. A
         branch that cannot say what it means must fail while trying to say
         it, not guess."""
-        with pytest.raises(KeyError) as e:
+        with pytest.raises(lint.ExitContractViolation) as e:
             lint._verdict_summary(6, "headline")
         assert "not declared in EXIT_MEANING" in str(e.value)
         # And it still works for every declared code.
         for code in lint.EXIT_MEANING:
             assert lint._verdict_summary(code, "h")
 
-    def test_the_exit_table_is_derived_everywhere(self):
-        """The exit-5 banner used to hand-maintain its own 3-row copy."""
-        src = SCRIPT.read_text(encoding="utf-8")
-        # The only literal table header in the module is the derived one.
-        assert src.count('"| exit | meaning | what to do |\\n"') == 0, (
-            "a hand-written exit table has reappeared; use _exit_table_md()"
+    @pytest.mark.parametrize("code", [4, 5])
+    def test_the_banners_track_EXIT_MEANING(
+        self, api_env, monkeypatch, capsys, tmp_path, code
+    ):
+        """A real drift assertion, replacing a byte-string regression pin.
+
+        The old version asserted a fixed header literal was absent. That
+        proved almost nothing: the same hand table re-added in SINGLE quotes
+        passed, and REAL drift — changing EXIT_MEANING[5]'s wording while a
+        hand table kept the old text — also passed. So instead: mutate the
+        registry and require the rendered banner to follow it. Only a
+        genuinely derived table can."""
+        sentinel = "SENTINEL-MEANING-a7f3"
+        patched = dict(lint.EXIT_MEANING)
+        klass, _why, action = patched[code]
+        patched[code] = (klass, sentinel, action)
+        monkeypatch.setattr(lint, "EXIT_MEANING", patched)
+
+        summary = tmp_path / "summary.md"
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+        script = ["403"] if code == 4 else ["502"]
+        rc, _log, _ = self._run(monkeypatch, script, capsys)
+        assert rc == code
+        md = summary.read_text(encoding="utf-8")
+        assert sentinel in md, (
+            f"the exit-{code} banner did not follow EXIT_MEANING — its table "
+            f"is hand-written, not derived"
         )
-        assert "_exit_table_md(5)" in src and "_exit_table_md(4)" in src
+
+    def test_no_module_level_exit_table_constant(self):
+        """A constant computed at import cannot be seen to track the
+        registry, which is what let the old pin pass while drifting."""
+        assert not hasattr(lint, "_EXIT_TABLE_MD")
+
+    def test_the_403_substrings_are_the_real_gitea_strings(self):
+        """PINNED. These are EXTERNAL text and must not be paraphrased.
+
+        An earlier revision carried "user does not have admin access to
+        repo" — plausible, reads exactly like Gitea output, and does not
+        exist. Because the column says "the body says" and the banner tells
+        the operator to MATCH against it, a real permission-403 matched
+        neither Gitea row and fell through to the Cloudflare row: the wrong
+        diagnosis for the one 403 this repo actually hits.
+
+        Cross-checked against the in-repo occurrence for the SAME endpoint,
+        so this cannot drift back to paraphrase without failing here."""
+        assert lint._BP_403_PERMISSION == (
+            "user should be an owner or a collaborator with admin write "
+            "of a repository"
+        )
+        assert lint._BP_403_TOKEN_SCOPE == (
+            "token does not have at least one of required scope(s)"
+        )
+        # Corroboration: gitea-merge-queue.py documents the same endpoint's
+        # admin-only 403 in the same words.
+        mq = (SCRIPT.parent / "gitea-merge-queue.py").read_text(encoding="utf-8")
+        assert "user should be an owner or a collaborator with admin write" in mq
+        # And the fabricated paraphrase must not come back anywhere.
+        src = SCRIPT.read_text(encoding="utf-8")
+        assert "does not have admin access to repo" not in src
+
+    def test_the_403_banner_renders_the_real_substrings(
+        self, api_env, monkeypatch, capsys, tmp_path
+    ):
+        summary = tmp_path / "summary.md"
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+        rc, _log, _ = self._run(monkeypatch, ["403"], capsys)
+        assert rc == 4
+        md = summary.read_text(encoding="utf-8")
+        assert lint._BP_403_PERMISSION in md
+        assert lint._BP_403_TOKEN_SCOPE in md
 
     @pytest.mark.parametrize("code", sorted(lint.EXIT_MEANING))
     def test_every_non_clean_exit_writes_a_summary(
@@ -1101,6 +1234,12 @@ class TestExitContractIsFullyCovered:
         if klass == "finding":
             assert "IS a compliance finding" in md
             assert "NOT a compliance finding" not in md
+        elif klass == "unknown":
+            # Must assert NEITHER class — guessing is the inversion this
+            # class exists to prevent.
+            assert "IS a compliance finding" not in md
+            assert "NOT a compliance finding" not in md
+            assert "proves NOTHING about compliance" in md
         else:
             assert "NOT a compliance finding" in md
             assert "IS a compliance finding" not in md
