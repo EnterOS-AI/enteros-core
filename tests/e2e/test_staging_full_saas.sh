@@ -1158,7 +1158,13 @@ print(json.dumps(s))
     trigger_daemon_timeout_ledger "${E2E_SCHEDULER_POLL_SECS:-10}" 2>/dev/null | tr '\n' ' ')
 
   log "    scheduler check ON: injected $(printf '%s' "$_SCHED_DLV_CAP_ENV" | tr '\n' ' ') — probe cron '$(trigger_daemon_probe_cron)' (fire every $(trigger_daemon_fire_interval_secs)s), delivery cancel bound $(e2e_trigger_delivery_cap_secs)s derived as ${TRIGGER_DAEMON_CAP_FIRE_MULTIPLE}x that fire interval. The molecule-scheduler plugin itself is declared by core at provision from the SDK native-plugins registry, so this harness carries no source literal."
-  log "    scheduler timeout inventory (all reachable): $_SCHED_LEDGER"
+  # $_SCHED_ORDERING carries the check's own row count on SUCCESS too
+  # ("timeout-ledger: checked N row(s), M reachable, ..."). Logged rather than
+  # discarded for the same reason the stall detector reports its sample count: a
+  # check that examined ZERO rows passes identically to one that examined six,
+  # and the count is the only thing that tells them apart in a log.
+  log "    scheduler timeout inventory: $_SCHED_ORDERING"
+  log "    scheduler timeout inventory rows: $_SCHED_LEDGER"
 fi
 
 # Self-schedule tool sub-step (10f): with E2E_SELF_SCHEDULE_CHECK=on, additively
