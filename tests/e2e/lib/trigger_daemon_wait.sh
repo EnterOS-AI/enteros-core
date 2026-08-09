@@ -791,6 +791,31 @@ trigger_daemon_timeout_ledger() {
 # the same class of act as replacing the ledger itself, which is an edit, not an
 # input. And because a redefinition could still return garbage, the caller
 # VALIDATES the result and fails closed rather than skipping.
+#
+# WHAT THE FUNCTION FORM DOES AND DOES NOT PROTECT AGAINST, enumerated because
+# "it's a function now" is exactly the kind of claim this file has been wrong
+# about before. All of these were run, not reasoned about:
+#
+#   REFUSED by the function form
+#     command-prefix shadow      `TRIGGER_DAEMON_LEDGER_ROWS=abc <fn> …`
+#     assignment after sourcing  `TRIGGER_DAEMON_LEDGER_ROWS=3; …`
+#     inherited/exported env     `export TRIGGER_DAEMON_LEDGER_ROWS=abc` pre-source
+#   REFUSED by the caller's validator, not by the function form
+#     redefinition returning garbage / empty / zero / negative
+#     (so neither mechanism is redundant: reverting the function to a plain
+#      variable STILL refuses the prefix vector via the validator, and keeping
+#      the function without the validator would skip on a garbage redefinition.
+#      They carry distinct load.)
+#   REFUSED by the `\` at the call site
+#     `alias trigger_daemon_ledger_rows='printf 3'` under
+#     `shopt -s expand_aliases`. This one is worth naming even though it is
+#     low-reachability: an alias is INVISIBLE to someone grepping for the
+#     function definition, which is precisely the audit a maintainer performs.
+#     Backslash-prefixing the call suppresses alias expansion while still
+#     resolving the function, so it costs one character and closes the hole.
+#
+# There is no defence here against someone editing this line, and there should
+# not be — that is the review the number exists to force.
 trigger_daemon_ledger_rows() { printf '%s' 6; }
 
 # trigger_daemon_timeout_ordering_check [observation-poll-secs]
@@ -848,9 +873,14 @@ trigger_daemon_timeout_ordering_check() {
     return 1
   fi
   # ...and on TRUNCATED. Rows can only appear/disappear by editing the ledger, so
-  # a mismatch is either a deliberate change (bump TRIGGER_DAEMON_LEDGER_ROWS in
-  # the same commit) or a bound that silently fell off the path.
-  expected=$(trigger_daemon_ledger_rows)
+  # a mismatch is either a deliberate change (update `trigger_daemon_ledger_rows`
+  # in the same commit) or a bound that silently fell off the path. Naming the
+  # FUNCTION matters: this line used to name the retired
+  # TRIGGER_DAEMON_LEDGER_ROWS knob, which has zero reads repo-wide, so it would
+  # have sent the next reader to edit a variable nothing consults.
+  #
+  # `\`-prefixed to suppress alias expansion — see the vector list above.
+  expected=$(\trigger_daemon_ledger_rows)
   # VALIDATE BEFORE COMPARING. `[ "$rows" -ne "$expected" ]` with a non-numeric
   # expected does not return false, it ERRORS (rc=2) — and an `if` treats that as
   # false, silently skipping the count check. That is how this guard bypassed
@@ -888,8 +918,24 @@ trigger_daemon_timeout_ordering_check() {
       subsumed-by:*)
         sub="${disp#subsumed-by:}"
         sub_secs=$(printf '%s\n' "$ledger" | awk -F'|' -v n="$sub" '$1==n{print $2}')
+        # VALIDATED, not assumed. The per-row `case` above only covers the row
+        # currently being read; `sub_secs` is looked up from a DIFFERENT row that
+        # may not have been visited yet, so at this point it is unvalidated
+        # input to a `-ge` — the same shape that let the count guard skip itself.
+        # Masked today (every row is validated eventually, and a duplicate name
+        # would make awk emit two lines), but "masked today" is exactly how that
+        # defect started, and this is the lib's last unvalidated operand.
         if [ -z "$sub_secs" ]; then
           printf 'timeout-ledger: %s claims to be subsumed by %s, which is not in the ledger\n' "$name" "$sub"
+          rc=1
+        elif ! case "$sub_secs" in ''|*[!0-9]*|0) false ;; *) true ;; esac; then
+          # Each branch reports its OWN cause: "not in the ledger" and "present
+          # but unusable" are different edits to make, so they must not share a
+          # message. An earlier draft set sub_secs="" on the bad-value path and
+          # fell into the -z arm, which would have told the reader the subsumer
+          # was missing when it was right there with a malformed bound.
+          printf 'timeout-ledger: %s claims to be subsumed by %s, whose bound is %q — not a positive integer, so the subsumption cannot be checked. Refusing rather than letting the comparison error into a skip.\n' \
+            "$name" "$sub" "$sub_secs"
           rc=1
         elif [ "$sub_secs" -ge "$secs" ]; then
           printf 'timeout-ledger: %s (%ss) claims to be subsumed by %s (%ss), but the subsumer is NOT strictly tighter — %s is now reachable and its disposition is a lie\n' \
