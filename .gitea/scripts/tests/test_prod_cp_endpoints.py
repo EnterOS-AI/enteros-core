@@ -28,6 +28,7 @@ org broke" mechanism the script header says it exists to stop.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -212,3 +213,149 @@ def test_no_test_fixture_embeds_a_live_admin_token_fingerprint():
         "file(s) %s embed 8 hex characters of the LIVE production CP admin "
         "token; use a synthetic value" % offenders
     )
+
+
+# --------------------------------------------------------------------------
+# Behavioural: the boot-secret write must land in the env it was told to use
+# --------------------------------------------------------------------------
+
+SCRIPT = ROOT / "scripts" / "deploy" / "advance-staging-tenant-pin.sh"
+
+# On the Linux runner this is simply `bash`. TEST_BASH exists so the same test can
+# be executed on a Windows dev box, where the bare name resolves to the WSL stub.
+# It is an override, never a skip: a skipped shell test is a vacuous pass.
+BASH = os.environ.get("TEST_BASH") or "bash"
+
+
+def _ssot_harness(tmp_path: Path, initial: dict[str, str]) -> tuple[Path, Path]:
+    """A fake curl modelling PER-ENVIRONMENT Infisical secrets. Returns (bin, state)."""
+    state = tmp_path / "state"
+    state.mkdir()
+    for env, value in initial.items():
+        (state / f"ssot_{env}").write_text(value, encoding="utf-8")
+    (state / "pin_cp.test").write_text("sha256:" + "a" * 64, encoding="utf-8")
+
+    body = r'''
+import os, sys, json, urllib.parse
+S = os.environ["FAKE_STATE"]
+args = sys.argv[1:]
+method, body, url = "GET", "", ""
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == "-X": method = args[i+1]; i += 2; continue
+    if a == "-d": body = args[i+1]; i += 2; continue
+    if a in ("-H", "--doh-url", "-A", "-o", "-w"): i += 2; continue
+    if a.startswith("http"): url = a
+    i += 1
+u = urllib.parse.urlparse(url)
+env = (urllib.parse.parse_qs(u.query).get("environment") or [""])[0]
+P = lambda f: os.path.join(S, f)
+if "/auth/universal-auth/login" in url:
+    print(json.dumps({"accessToken": "t"})); sys.exit(0)
+if "/api/v3/secrets/raw/CP_ADMIN_API_TOKEN" in url:
+    print(json.dumps({"secret": {"secretValue": "cp"}})); sys.exit(0)
+if "/api/v3/secrets/raw/LOCAL_TENANT_IMAGE" in url:
+    if method in ("PATCH", "POST"):
+        p = json.loads(body); env = p.get("environment") or env
+        open(P("ssot_%s" % env), "w").write(p["secretValue"])
+        open(P("writes.log"), "a").write("WROTE %s\n" % env)
+        print("{}"); sys.exit(0)
+    try: v = open(P("ssot_%s" % env)).read()
+    except OSError: v = ""
+    print(json.dumps({"secret": {"secretValue": v}})); sys.exit(0)
+if url.endswith("/cp/admin/runtime-image"):
+    print(json.dumps({"pins": [{"template_name": "molecule-tenant", "region": "global",
+                                "image_digest": open(P("pin_cp.test")).read(), "git_sha": "old"}]})); sys.exit(0)
+if url.endswith("/cp/admin/runtime-image/promote"):
+    open(P("pin_cp.test"), "w").write(json.loads(body)["image_digest"]); print("{}"); sys.exit(0)
+sys.exit(22)
+'''
+    (tmp_path / "curl.py").write_text(body, encoding="utf-8")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "curl").write_text(
+        f'#!/bin/sh\nexec "{sys.executable}" "{tmp_path / "curl.py"}" "$@"\n', encoding="utf-8"
+    )
+    (bindir / "curl").chmod(0o755)
+    (bindir / "python3").write_text(
+        f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8"
+    )
+    (bindir / "python3").chmod(0o755)
+
+    repo_root = tmp_path / "root"
+    (repo_root / ".gitea" / "scripts").mkdir(parents=True)
+    (repo_root / ".gitea" / "scripts" / "registry-manifest-state.py").write_text(
+        'print("sha256:" + "d"*64)\n', encoding="utf-8"
+    )
+    return bindir, state
+
+
+def test_boot_secret_is_written_to_the_env_it_was_given(tmp_path: Path):
+    """INFISICAL_ENV must steer the LOCAL_TENANT_IMAGE write, per invocation.
+
+    This is the behavioural half of the blocking defect. When the apply loop
+    pinned INFISICAL_ENV=prod outside the loop, the second control plane's
+    iteration promoted the STAGING DB pin and then re-wrote the PROD boot
+    secret — and because write_ssot_pin re-read the value the first iteration
+    had just written, it logged `SSOT ok` and reported success for a write it
+    never made to the staging environment. Only an assertion on WHICH
+    environment received the write can catch that; a log line cannot.
+    """
+    bindir, state = _ssot_harness(
+        tmp_path,
+        {"prod": "registry.test/molecule-tenant:OLD-PROD",
+         "staging": "registry.test/molecule-tenant:OLD-STAGING"},
+    )
+    env = os.environ.copy()
+    env.update({
+        "PATH": f"{bindir}{os.pathsep}{env['PATH']}",
+        "FAKE_STATE": str(state),
+        "REPO_ROOT": str(tmp_path / "root"),
+        "DIGEST_SOURCE": "registry", "REG_USER": "u", "REG_TOKEN": "t",
+        "INFISICAL_CLIENT_ID": "id", "INFISICAL_CLIENT_SECRET": "s",
+        "INFISICAL_PROJECT_ID": "ws",
+        "INFISICAL_ENV": "staging",           # <- the CP being promoted
+        "TENANT_IMAGE_NAME": "registry.test/molecule-tenant",
+        "CP_BASE_URL": "https://cp.test",
+        "GITHUB_OUTPUT": str(tmp_path / "gho"),
+    })
+    r = subprocess.run(
+        [BASH, str(SCRIPT), "--tag", "staging-deadbee", "--git-sha", "deadbeef"],
+        capture_output=True, text=True, env=env, check=False,
+    )
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+
+    assert (state / "ssot_staging").read_text(encoding="utf-8") == \
+        "registry.test/molecule-tenant:staging-deadbee", "the staging boot secret was not updated"
+    assert (state / "ssot_prod").read_text(encoding="utf-8") == \
+        "registry.test/molecule-tenant:OLD-PROD", (
+            "INFISICAL_ENV=staging wrote the PROD boot secret — that is the blocking defect"
+        )
+    assert (state / "writes.log").read_text(encoding="utf-8").split() == ["WROTE", "staging"]
+
+
+def test_plan_and_apply_resolve_the_SAME_repository():
+    """A one-line env addition with nothing pinning it is one refactor from regressing.
+
+    The digest/plan steps interpolate the job-level `TENANT_IMAGE`; the apply
+    hands the script `TENANT_IMAGE_NAME`. If those two ever diverge, the plan and
+    the digest describe one repository while the apply mutates another — silently,
+    because both halves succeed.
+    """
+    doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    job = doc["jobs"]["promote"]
+    assert "TENANT_IMAGE" in job["env"], "TENANT_IMAGE must be a job-level env var"
+
+    apply_env = _apply_step().get("env") or {}
+    assert apply_env.get("TENANT_IMAGE_NAME") == "${{ env.TENANT_IMAGE }}", (
+        "the apply must take the image name from the SAME job-level TENANT_IMAGE "
+        "the plan and digest steps use, got %r" % apply_env.get("TENANT_IMAGE_NAME")
+    )
+    # Both the digest step and the plan step must reference that same variable.
+    for step in doc["jobs"]["promote"]["steps"]:
+        name = str(step.get("name", ""))
+        if name.startswith(("Resolve the target digest", "Plan")):
+            assert "${TENANT_IMAGE}" in step["run"], (
+                "step %r does not derive its ref from the job-level TENANT_IMAGE" % name
+            )
