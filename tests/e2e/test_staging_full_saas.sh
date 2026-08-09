@@ -79,15 +79,22 @@
 #                                evidence for this long. This must cover both
 #                                the idle threshold and the runtime's real A2A/
 #                                LLM completion latency; it is not a cadence.
-#   E2E_SCHEDULER_TIMEOUT_SECS   the scheduler fire BACKSTOP (10d.4), default
-#                                3x the delivery watchdog below. It is a
-#                                never-hit safety net, NOT the thing that
-#                                decides a broken scheduler: the wait passes the
-#                                instant fire evidence appears and fails FAST
-#                                when the daemon's last_tick goes stale. It must
-#                                stay LARGER than the watchdog, or the wait
-#                                expires while a wedged fire is still being
-#                                re-queued for retry.
+#   E2E_SCHEDULER_TIMEOUT_SECS   the scheduler BACKSTOP for 10d.4 fire, 10g fire
+#                                and 10g DELIVER, default 3x the delivery
+#                                watchdog below. It is a never-hit safety net,
+#                                NOT the thing that decides a broken scheduler:
+#                                the wait passes the instant fire evidence
+#                                appears and fails FAST when the daemon's
+#                                last_tick goes stale. It must stay STRICTLY
+#                                LARGER than the watchdog, or the wait expires
+#                                while a wedged fire is still being re-queued for
+#                                retry. That is ENFORCED, not advisory: a value
+#                                at or below the watchdog is REFUSED at the call
+#                                site (trigger_daemon_backstop_resolve rc=3) and
+#                                hard-fails the run. Per-leg overrides
+#                                E2E_SCHEDULE_DELIVER_FIRE_TIMEOUT_SECS and
+#                                E2E_SCHEDULE_DELIVER_TIMEOUT_SECS take
+#                                precedence for 10g and are held to the same bar.
 #   E2E_DELEG_A2A_TIMEOUT_SECS   per-attempt curl budget for the DELEGATION
 #                                A2A POST (section 10), default 90 — matching
 #                                a2a_send_or_poll_queue's budget for the PARENT
@@ -101,10 +108,26 @@
 #                                lane red twice on 2026-07-30 with
 #                                curl_rc=28 / http=000.
 #   E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS
-#                                default 600, mirroring the daemon's own
-#                                MOLECULE_TRIGGER_DELIVERY_WATCHDOG_SECONDS.
-#                                Only used to derive the backstop above; set it
-#                                here if you set it on the workspace.
+#                                default 600. The daemon-side delivery timeout
+#                                every backstop above is derived from and
+#                                measured against. Set it here if you retune the
+#                                daemon.
+#                                CAVEAT, deliberately left as-is by the change
+#                                that added the enforcement above: 600 mirrors
+#                                MOLECULE_TRIGGER_DELIVERY_WATCHDOG_SECONDS,
+#                                which scheduler v0.2.2 RETIRED. v0.2.3 replaces
+#                                the fixed timeout with an activity-aware
+#                                watchdog probing every ~30s, whose FALLBACK
+#                                ceiling (MOLECULE_TRIGGER_DELIVERY_ABSOLUTE_CAP
+#                                _SECONDS, used only when no turn-lease answer is
+#                                obtainable) defaults to 3600 — larger than the
+#                                1800 this derives. Tracking 3600 literally would
+#                                make the backstop 10800s inside a 75-minute job
+#                                (e2e-ephemeral-happy-path.yml), so the number is
+#                                a POLICY call about the job budget, not a
+#                                mechanical follow-on. Filed separately; the
+#                                inequality enforced above is correct against
+#                                whatever value is configured here.
 #
 # Exit codes:
 #   0  happy path
@@ -188,6 +211,30 @@ source "$(dirname "$0")/lib/self_schedule_create_retry.sh"
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
+
+# ─── the ONE place a scheduler backstop is produced ──────────────────────────
+#
+# Every trigger-daemon wait in this harness (10d fire, 10g fire, 10g DELIVER)
+# gets its never-hit backstop from here, so the watchdog number is typed ONCE
+# and every operator override passes the same `> watchdog` refusal in
+# lib/trigger_daemon_wait.sh (rc=3). Call sites pair it with `|| fail` — the
+# `fail` MUST stay in the caller, because a `fail` inside the `$( )` would only
+# `exit` the substitution subshell and hand the parent an empty backstop.
+#
+# Three sites used to spell the derivation out longhand, which is how the third
+# one drifted: 10g's DELIVER backstop was a bare `210` against the 600s watchdog
+# it was supposed to outlast, so a fire still inside the daemon's own budget was
+# reported as a delivery failure.
+#   $1 = operator override ("" to derive)
+e2e_scheduler_backstop_secs() {
+  TRIGGER_DAEMON_WATCHDOG_SECS="${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-600}" \
+    trigger_daemon_backstop_resolve "${1:-}"
+}
+
+# The refusal message, built once — $1 = knob name, $2 = the rejected value.
+scheduler_backstop_refusal() {
+  printf '%s' "Scheduler: $1='$2' is not a usable backstop. It must be a positive integer STRICTLY GREATER than the trigger daemon's delivery watchdog (${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-600}s; set E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS to mirror a retuned daemon). The backstop is a never-hit safety net, never a budget: at or below the watchdog it expires while a wedged fire is still being re-queued for its retry, so the wait can never observe the recovery and reports 'the daemon is still inside its own budget' as a red — the 360s-vs-600s inversion lib/trigger_daemon_wait.sh exists to prevent. Raise it, or unset it to take the derived 3x default."
+}
 
 # Collision-proof slug construction (core#2782) — runs AFTER log/fail/ok
 # are defined so the assert below can call `fail` on mismatch.
@@ -2934,7 +2981,15 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
   # NOTE: there is deliberately no fixed fire budget here any more. The fire
   # wait (10d.4) is signal-driven and derives its never-hit backstop from the
   # daemon's own delivery watchdog; E2E_SCHEDULER_TIMEOUT_SECS still overrides
-  # that backstop for callers who set it.
+  # that backstop for callers who set it, but only UPWARDS — an override at or
+  # below the watchdog is refused outright (see e2e_scheduler_backstop_secs).
+  #
+  # On job cost: 10d fire, 10g fire and 10g DELIVER each carry a derived 1800s
+  # backstop, but at most ONE of them is ever reachable in a run — each leg
+  # `fail`s (exits) rather than continuing, so a run that reaches a later
+  # backstop necessarily passed the earlier ones on their signal, in seconds.
+  # The worst case is therefore one 1800s backstop, which is the exposure the
+  # two fire legs have already carried since the wait became signal-driven.
   _SCHED_POLL_SECS="${E2E_SCHEDULER_POLL_SECS:-10}"
   # Bounded pre/post-create waits that CLOSE the #4448 arm race instead of hiding
   # it behind a longer fire timeout. cap-ready gates the create on the trigger
@@ -3140,7 +3195,8 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
     # different message). The backstop derives from the daemon's own delivery
     # watchdog so it can never again be SHORTER than the thing it waits on.
     _SCHED_STALE_SECS=$(trigger_daemon_stale_secs "$_SCHED_POLL_SECS")
-    _SCHED_BACKSTOP_SECS="${E2E_SCHEDULER_TIMEOUT_SECS:-$(TRIGGER_DAEMON_WATCHDOG_SECS="${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-600}" trigger_daemon_backstop_secs)}"
+    _SCHED_BACKSTOP_SECS=$(e2e_scheduler_backstop_secs "${E2E_SCHEDULER_TIMEOUT_SECS:-}") \
+      || fail "$(scheduler_backstop_refusal E2E_SCHEDULER_TIMEOUT_SECS "${E2E_SCHEDULER_TIMEOUT_SECS:-}")"
 
     log "    Scheduler: waiting for '$_SCHED_NAME' to fire — pass on fire evidence, FAIL FAST if ${_SCHED_TARGET_SC}'s last_tick goes stale (>${_SCHED_STALE_SECS}s), backstop ${_SCHED_BACKSTOP_SECS}s (poll=${_SCHED_POLL_SECS}s)."
     _sched_rc=0
@@ -3242,15 +3298,32 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ] && [ "${E2E_SCHEDULE_DELIVER_CHECK:-on}
     # Backstop, not a budget: it must exceed the daemon's delivery watchdog for
     # the same reason 10d's does (a 360s cap could expire while a wedged fire was
     # still being re-queued for retry, so it could never observe the recovery).
-    _DLV_FIRE_TIMEOUT_SECS="${E2E_SCHEDULE_DELIVER_FIRE_TIMEOUT_SECS:-${E2E_SCHEDULER_TIMEOUT_SECS:-$(TRIGGER_DAEMON_WATCHDOG_SECS="${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-600}" trigger_daemon_backstop_secs)}}"
+    _DLV_FIRE_OVERRIDE="${E2E_SCHEDULE_DELIVER_FIRE_TIMEOUT_SECS:-${E2E_SCHEDULER_TIMEOUT_SECS:-}}"
+    _DLV_FIRE_TIMEOUT_SECS=$(e2e_scheduler_backstop_secs "$_DLV_FIRE_OVERRIDE") \
+      || fail "$(scheduler_backstop_refusal E2E_SCHEDULE_DELIVER_FIRE_TIMEOUT_SECS "$_DLV_FIRE_OVERRIDE")"
     # DELIVER window spans MULTIPLE fires: a `* * * * *` schedule re-fires every
     # minute and each fire is an INDEPENDENT chance for the model to invoke the
-    # tool. Polling across ≥3 fire cycles absorbs the occasional turn where a
+    # tool. Polling across many fire cycles absorbs the occasional turn where a
     # capable-but-nondeterministic model acks in text without calling the tool
     # (the same class the idle-digest A2A seed deliberately avoided). The marker
     # only has to land ONCE — this is the NAMED flake-mitigation mechanism, not a
     # silent retry.
-    _DLV_DELIVER_TIMEOUT_SECS="${E2E_SCHEDULE_DELIVER_TIMEOUT_SECS:-210}"
+    #
+    # This used to be a bare `210`, chosen at #4568 as "~3 fire cycles + slack"
+    # of a `* * * * *` schedule. That reasoning sized a BUDGET — how long we are
+    # willing to give the model — and a budget is the wrong object here: 210s is
+    # SHORTER than the 600s delivery watchdog it has to outlast, so a first fire
+    # whose delivery wedged expired this wait while the daemon was still inside
+    # its own budget, re-queuing the retry that would have satisfied the probe.
+    # The retry it could never see IS the extra fire cycles the literal was
+    # bought to provide. The "≥3 cycles" property is a FLOOR and survives the
+    # change untouched — the derived 3x/1800s backstop is ~30 cycles — and none
+    # of it is spent on the happy path, because trigger_daemon_wait returns the
+    # instant the marker lands and fails FAST (rc=2) the instant the daemon stops
+    # ticking, which is the only state in which more cycles cannot help.
+    _DLV_DELIVER_OVERRIDE="${E2E_SCHEDULE_DELIVER_TIMEOUT_SECS:-${E2E_SCHEDULER_TIMEOUT_SECS:-}}"
+    _DLV_DELIVER_TIMEOUT_SECS=$(e2e_scheduler_backstop_secs "$_DLV_DELIVER_OVERRIDE") \
+      || fail "$(scheduler_backstop_refusal E2E_SCHEDULE_DELIVER_TIMEOUT_SECS "$_DLV_DELIVER_OVERRIDE")"
     _DLV_POLL_SECS="${E2E_SCHEDULER_POLL_SECS:-10}"
     # Imperative single-tool prompt — mirrors the daily-activity-report default's
     # "deliver a report" instruction. The fired turn has no user session, so the
@@ -3383,12 +3456,13 @@ sys.exit(1)
       [ "$_rc" = "0" ] && _DLV_DELIVERED="activity a2a_receive/notify row carries '$_DLV_MARKER'"
       return "$_rc"
     }
-    # This budget stays a real, reasoned window (multiple fire cycles absorb a
-    # nondeterministic model that acks in text without calling the tool) — it is
-    # NOT a blind guess like the fire waits were. But a wedged daemon must still
-    # fail fast rather than burn the whole window: no further fire can occur, so
-    # no further chance at the tool call exists.
-    log "    DELIVER: polling delivery ground-truth (activity a2a_receive/notify row with marker '$_DLV_MARKER') for up to ${_DLV_DELIVER_TIMEOUT_SECS}s across ~$(( _DLV_DELIVER_TIMEOUT_SECS / 60 )) fire cycles (poll=${_DLV_POLL_SECS}s; FAIL FAST if the daemon stops ticking)."
+    # The window is NOT spent on the happy path: the wait returns the instant the
+    # marker lands, and a wedged daemon fails fast rather than burning the
+    # backstop — no further fire can occur, so no further chance at the tool call
+    # exists. Multiple fire cycles are what absorb a nondeterministic model that
+    # acks in text without calling the tool; the backstop only bounds the case
+    # where neither ever happens.
+    log "    DELIVER: polling delivery ground-truth (activity a2a_receive/notify row with marker '$_DLV_MARKER') — passes the instant the marker lands, across up to ~$(( _DLV_DELIVER_TIMEOUT_SECS / 60 )) fire cycles before the ${_DLV_DELIVER_TIMEOUT_SECS}s backstop (poll=${_DLV_POLL_SECS}s; FAIL FAST if the daemon stops ticking)."
     _dlv_deliver_rc=0
     trigger_daemon_wait "$_DLV_GRID_EVIDENCE" "$_DLV_DELIVER_TIMEOUT_SECS" "$_DLV_POLL_SECS"       "$_DLV_STALE_SECS" deliver_probe || _dlv_deliver_rc=$?
     if [ "$_dlv_deliver_rc" = "2" ]; then
