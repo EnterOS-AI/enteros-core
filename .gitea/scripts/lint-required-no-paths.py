@@ -202,19 +202,99 @@ import yaml  # PyYAML 6.0.2 — installed by the workflow before this runs.
 #   "did-not-run" — the lint could not complete a verdict. Its banner must
 #                   say it is NOT a compliance finding.
 #   "clean"       — nothing to report; must NOT emit a scary banner.
-EXIT_MEANING: dict[int, tuple[str, str]] = {
-    0: ("clean", "clean — every resolvable enforced context was inspected"),
-    1: ("finding", "a required workflow carries a paths/paths-ignore filter"),
-    2: ("did-not-run", "env contract violation (missing GITEA_TOKEN/HOST/REPO/BRANCH)"),
-    3: ("did-not-run", "unusable input (workflows dir, workflow YAML, or SSOT file)"),
-    4: ("did-not-run", "the API answered and its answer blocks verification"),
-    5: ("did-not-run", "the API never answered (transient, retries exhausted)"),
+#
+# It is authoritative for WHICH CODES EXIST as well as what they mean. That
+# second half is enforced from OUTSIDE the runtime, by an AST test that walks
+# this module and asserts every `return <int>` / `sys.exit(<int>)` / `_die(<int>)`
+# literal is a key here. Membership cannot be checked at runtime because a
+# branch that never executes never proves anything — so the domain is DERIVED
+# from the source, never enumerated by hand. (Same technique as cp#2938 for a
+# structurally identical problem.) Add a branch returning an undeclared code
+# and `test_every_exit_literal_is_declared` fails, naming the line.
+#
+# Fields: (klass, meaning, what the operator should do).
+EXIT_MEANING: dict[int, tuple[str, str, str]] = {
+    0: (
+        "clean",
+        "clean — every resolvable enforced context was inspected",
+        "nothing to do",
+    ),
+    1: (
+        "finding",
+        "a required workflow carries a paths/paths-ignore filter",
+        "fix the workflow: remove the filter, make the job always run",
+    ),
+    2: (
+        "did-not-run",
+        "env contract violation (missing GITEA_TOKEN/HOST/REPO/BRANCH)",
+        "fix the workflow's env block",
+    ),
+    3: (
+        "did-not-run",
+        "unusable input (workflows dir, workflow YAML, or SSOT file)",
+        "fix the checked-in input the message names",
+    ),
+    4: (
+        "did-not-run",
+        "the API answered and its answer blocks verification",
+        "fix the token / the SSOT — re-running will NOT help",
+    ),
+    5: (
+        "did-not-run",
+        "the API never answered (transient, retries exhausted)",
+        "re-run the job; if it persists the Gitea/Cloudflare edge is down",
+    ),
+    # The class here is "unknown", and that third class exists because of a
+    # real inversion found in review. `_verdict_summary()` raises KeyError on
+    # an undeclared code; KeyError is an Exception; main()'s catch-all mapped
+    # it to exit 4, whose class is "did-not-run". So `_die(6, "workflow
+    # carries a filter")` — a FINDING with an unregistered code — reached the
+    # operator as "NOT a compliance finding". Loud (traceback, THE LINT
+    # CRASHED, red CI), but the CLASS WAS WRONG: the exact inversion this
+    # file exists to prevent, one frame up.
+    #
+    # When the contract is violated we do not KNOW the class, so we must
+    # assert neither. Hence a class that claims nothing.
+    7: (
+        "unknown",
+        "the lint's own exit contract was violated — verdict UNKNOWN",
+        "bug in the lint: this run proves nothing either way; fix the "
+        "undeclared exit code",
+    ),
 }
 
-_EXIT_TABLE_MD = "\n".join(
-    ["| exit | meaning |", "|---|---|"]
-    + [f"| {c} | {why} |" for c, (_k, why) in sorted(EXIT_MEANING.items())]
-)
+# ONE table, built fresh from EXIT_MEANING on every call. There is
+# deliberately NO module-level `_EXIT_TABLE_MD` constant: a constant computed
+# at import time cannot be seen to track EXIT_MEANING, so a drift test cannot
+# tell "derived" from "hand-written but currently identical". Building it here
+# means `test_the_banners_track_EXIT_MEANING` can mutate the registry and
+# assert the banner follows — which catches a re-added hand table in ANY
+# quoting style, and catches real drift, neither of which a byte-string
+# regression pin can do.
+def _exit_table_md(highlight: int | None = None) -> str:
+    """The derived exit table, optionally bolding the row you are on."""
+    rows = ["| exit | meaning | what to do |", "|---|---|---|"]
+    for c, (_k, why, action) in sorted(EXIT_MEANING.items()):
+        if c == highlight:
+            rows.append(f"| **{c}** | **{why} — you are here** | **{action}** |")
+        else:
+            rows.append(f"| {c} | {why} | {action} |")
+    return "\n".join(rows)
+
+
+class ExitContractViolation(Exception):
+    """A branch tried to exit with a code EXIT_MEANING does not declare.
+
+    Its own type, rather than a bare KeyError, so `main()` can handle it
+    BEFORE the generic catch-all. That ordering is the whole point: the
+    catch-all maps to exit 4, whose class is "did-not-run", which would
+    describe an undeclared FINDING as a non-run.
+
+    NOTE THE ASYMMETRY — this is a runtime guard and it only fires on paths
+    that try to DESCRIBE themselves (`_die()` / `_report_finding()`). A bare
+    `return 6` in `run()` never reaches `_verdict_summary()` at all, so for
+    `return` statements the AST test is the ONLY gate.
+    """
 
 
 def _step_summary(markdown: str) -> None:
@@ -236,14 +316,43 @@ def _step_summary(markdown: str) -> None:
 
 
 def _verdict_summary(code: int, headline: str, detail: str = "") -> str:
-    """Build the class-appropriate run-summary block for `code`."""
-    klass, why = EXIT_MEANING.get(code, ("did-not-run", "unknown"))
+    """Build the class-appropriate run-summary block for `code`.
+
+    RAISES on an undeclared code — deliberately, and this is the runtime half
+    of making EXIT_MEANING authoritative for EXISTENCE and not just meaning.
+
+    This used to be `EXIT_MEANING.get(code, ("did-not-run", "unknown"))`. A
+    silent fallback is exactly the wrong behaviour here: a new branch exiting
+    an undeclared code would be described as "did-not-run" — so a genuine
+    FINDING would be announced to the operator as a non-run. That is the
+    precise inversion this whole file exists to prevent, arrived at by
+    default rather than by decision. A branch that cannot say what it means
+    must fail while trying to say it, not guess.
+    """
+    if code not in EXIT_MEANING:
+        raise ExitContractViolation(
+            f"exit code {code} is not declared in EXIT_MEANING. Every exit "
+            f"this script can produce must be registered there with its "
+            f"class ('finding' vs 'did-not-run'), because the class decides "
+            f"how the run-summary characterises the result. Refusing to "
+            f"guess."
+        )
+    klass, why, _action = EXIT_MEANING[code]
     if klass == "finding":
         lead = (
             "**This IS a compliance finding — a required workflow really does "
             "carry a paths/paths-ignore filter.**"
         )
         title = "lint-required-no-paths — **FINDING**"
+    elif klass == "unknown":
+        # Assert NEITHER class. We do not know which this was, and guessing
+        # is what produced the inversion this class exists to prevent.
+        lead = (
+            "**This run proves NOTHING about compliance.** The lint could not "
+            "classify its own outcome, so treat the result as unverified — "
+            "do not conclude that anything is compliant or non-compliant."
+        )
+        title = "lint-required-no-paths — **EXIT CONTRACT VIOLATED**"
     else:
         lead = (
             "**This is NOT a compliance finding. No workflow was judged.**"
@@ -252,7 +361,7 @@ def _verdict_summary(code: int, headline: str, detail: str = "") -> str:
     parts = [f"## ⚠ {title}", "", lead, "", headline]
     if detail:
         parts += ["", detail]
-    parts += ["", f"Exit **{code}** — {why}.", "", _EXIT_TABLE_MD]
+    parts += ["", f"Exit **{code}** — {why}.", "", _exit_table_md(code)]
     return "\n".join(parts)
 
 
@@ -286,6 +395,16 @@ def _die(code: int, message: str, *, detail: str = "") -> None:
     Writes the `::error::` line AND the run-summary block, then exits — so
     a branch cannot be added that reports to the log but not to the summary.
     Raises SystemExit, which main() deliberately does NOT catch (see there).
+
+    THIS FUNCTION IS THE STRUCTURAL GUARANTEE — not the test drivers.
+    `test_every_non_clean_exit_writes_a_summary` covers each exit CODE once,
+    which is NOT the same as covering each exit SITE: there are four
+    `_die(3, ...)` call sites and the exit-3 driver exercises only the
+    missing-SSOT one, so reverting a different site to a bare
+    `stderr.write()` + `sys.exit(3)` would leave the suite green. What makes
+    every site safe is that they all route through here. If you are adding a
+    hard-input exit, call `_die()`; do not hand-roll the pair, because the
+    per-code driver will not notice that you did.
     """
     sys.stderr.write(f"::error::{message}\n")
     _step_summary(_verdict_summary(code, message, detail))
@@ -340,6 +459,33 @@ API = f"https://{GITEA_HOST}/api/v1" if GITEA_HOST else ""
 # unchanged. (curl-based gates like review-check.sh are unaffected for
 # the same reason.)
 _GITEA_UA = "molecule-ci-gate/1.0 (+gitea-api)"
+
+# ---- Gitea's OWN 403 bodies, quoted verbatim -----------------------------
+# These are named constants and not inline literals for one reason: they are
+# EXTERNAL text. A quoted external message must come from a captured response
+# or an existing in-repo occurrence — never from memory of what such a message
+# looks like. An earlier revision of this table carried a paraphrase along
+# the lines of "<user> lacks admin access to <repo>" — plausible, reading
+# exactly like real Gitea output, and NONEXISTENT. Because the surrounding
+# column
+# says "the body says" and the banner tells the operator to MATCH against it,
+# a real permission-403 matched neither Gitea row and fell through to the
+# Cloudflare row — the wrong diagnosis for the one 403 this repo actually
+# hits, and worse than the prose it replaced.
+#
+# Sources (both, deliberately — probe AND in-repo corroboration):
+#   permission  — live probe of GET /repos/{o}/{r}/branch_protections/{b} on
+#                 Gitea 1.26.4 with three separate non-admin tokens, and
+#                 `.gitea/scripts/gitea-merge-queue.py:1163`, which documents
+#                 the same endpoint's admin-only 403 in the same words.
+#   token scope — live probe, same endpoint, scope-restricted token.
+# `test_the_403_substrings_are_the_real_gitea_strings` pins both, including
+# the cross-check against gitea-merge-queue.py, so the next edit cannot drift
+# them back into paraphrase.
+_BP_403_PERMISSION = (
+    "user should be an owner or a collaborator with admin write of a repository"
+)
+_BP_403_TOKEN_SCOPE = "token does not have at least one of required scope(s)"
 
 
 def _require_runtime_env() -> None:
@@ -1098,15 +1244,9 @@ def run() -> int:
             "connection resets are self-clearing.\n\n"
             "**ZERO workflow files were inspected** — the lint never got far "
             "enough to look at any of them.\n\n"
-            "| exit | meaning | what to do |\n"
-            "|---|---|---|\n"
-            "| 1 | a required workflow really does carry a paths filter | "
-            "fix the workflow |\n"
-            "| 4 | the API answered and its answer blocks verification | "
-            "fix the token / the SSOT |\n"
-            "| **5** | **the API never answered — you are here** | "
-            "**re-run the job; if it persists the Gitea/Cloudflare edge is "
-            "down** |\n"
+            # Derived, not hand-maintained. This block used to carry its own
+            # 3-row copy of the exit table — the last one that could drift.
+            + _exit_table_md(5)
         )
         return 5
     except ApiError as e:
@@ -1179,24 +1319,24 @@ def run() -> int:
                 "**What the API actually said** (this is the diagnostic — "
                 "do not skip it):\n\n"
                 f"```\n{e}\n```\n\n"
-                "**Diagnose which kind of 403 this is — they need different "
-                "actions:**\n\n"
-                "| kind | how to tell | action |\n"
+                "**Diagnose which kind of 403 this is — match the body above "
+                "against these. They need different actions:**\n\n"
+                "| kind | the body says | action |\n"
                 "|---|---|---|\n"
-                "| permission | Gitea JSON message; the account lacks "
-                "repo-admin (BP read needs `admin:true` — `push:true` is "
-                "not enough) | grant repo-admin to the token's account |\n"
-                "| PAT scope | Gitea JSON message; the account HAS admin "
-                "but the token was minted without the scope | re-mint the "
-                "token with the admin scope |\n"
-                "| Cloudflare WAF | body is HTML or CF JSON (e.g. "
-                "`error code: 1010`), not a Gitea message | edge/UA issue, "
-                "not a permission at all |\n\n"
+                f"| permission | `\"{_BP_403_PERMISSION}\"` — the ACCOUNT "
+                "lacks repo-admin (BP read needs `admin:true`; `push:true` "
+                "is not enough) | grant repo-admin to the token's account |\n"
+                f"| PAT scope | `\"{_BP_403_TOKEN_SCOPE}\"` — the account "
+                "HAS admin but the TOKEN was minted without it | re-mint "
+                "the token with the admin scope |\n"
+                "| Cloudflare WAF | not Gitea JSON at all — HTML, or "
+                "`error code: 1010`, or a `cloudflare` / `cf-ray` marker "
+                "| edge/UA issue, not a permission; see the `_GITEA_UA` "
+                "note above |\n\n"
                 "Note: `mc-drift-bot` is already `owner` on this repo via "
                 "team `drift-bot` (perm=admin), so a bare *grant repo-admin* "
-                "is most likely NOT the fix — check the token's scope and "
-                "the response body above first.\n\n"
-                + _EXIT_TABLE_MD
+                "is most likely NOT the fix — match the body above first.\n\n"
+                + _exit_table_md(4)
             )
             return 4
         if http_status == 404:
@@ -1430,6 +1570,26 @@ def main() -> int:
     # classifier above reaches for OSError — the difference is that
     # OSError widens a class of NETWORK faults, while BaseException would
     # widen over this script's own EXIT PROTOCOL.
+    except ExitContractViolation as e:
+        # BEFORE the catch-all, deliberately. Routing this to exit 4 would
+        # label it "did-not-run" — and an undeclared code might have been a
+        # FINDING, so that guesses the one thing we must not guess. Exit 7's
+        # class is "unknown": it asserts neither.
+        sys.stderr.write(
+            f"::error::EXIT CONTRACT VIOLATED — {e} This run proves NOTHING "
+            f"about compliance: the lint could not classify its own outcome, "
+            f"so it will not claim the result IS or is NOT a finding. This "
+            f"is a bug in the lint. Exit 7.\n"
+        )
+        _step_summary(
+            _verdict_summary(
+                7,
+                "The lint produced an exit code it does not declare, so it "
+                "cannot say what the run meant.",
+                f"`{e}`",
+            )
+        )
+        return 7
     except Exception as e:  # noqa: BLE001 - deliberate catch-all; see docstring
         sys.stderr.write(
             f"::error::LINT DID NOT COMPLETE — unexpected internal error in "
