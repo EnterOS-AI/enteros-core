@@ -340,6 +340,14 @@ type toolTraceEntry struct {
 // fall in the turn window are never rehydrated as fake tools (CR2).
 const toolSummaryPrefix = "🛠 "
 
+// ToolSummaryPrefix is the exported view of toolSummaryPrefix. It exists so a
+// SECOND reader of this convention can pin itself against the definition rather
+// than re-typing the marker: handlers.recordMCPSurfaceCorroboration (core#5137)
+// counts these rows as evidence that the model dispatched a tool, and a silent
+// divergence would make that corroboration read zero — a probe that quietly
+// stopped probing. Value-identical by construction.
+const ToolSummaryPrefix = toolSummaryPrefix
+
 // toolNameFromSummary strips the leading "🛠 " marker from a tool-use
 // agent_log summary, leaving e.g. "mcp__platform__create_request(…)".
 func toolNameFromSummary(summary string) string {

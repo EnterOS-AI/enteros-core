@@ -32,9 +32,35 @@ task. Runtime capability fields are also reported where applicable.
 For a `kind=platform` workspace, management-MCP health is fail closed:
 
 - `mcp_server_present` reports that the management server is declared;
-- `loaded_mcp_tools` reports tools actually observed by the runtime;
+- `loaded_mcp_tools` reports tools the runtime's enumeration probe observed;
 - after the grace window, absence of the required create-workspace tool can
   degrade the concierge even when the server was declared.
+
+`loaded_mcp_tools` is a PRODUCER SELF-REPORT and its count is not a callability
+claim (core#5137). The runtime probe spawns each declared MCP server as its own
+stdio subprocess under a private client and lists that subprocess's tool
+schemas; nothing on that path touches the surface the model dispatches from, and
+the two can be in different namespaces — a concierge has reported 54
+`mcp__molecule-platform__*` ids while every model dispatch on the fleet was
+`mcp__molecule__*`.
+
+Core therefore publishes a second, consumer-derived field next to it, on
+`GET /workspaces/:id`:
+
+- `mcp_surface` — how many of those reported ids sit in a namespace this
+  workspace's model has actually been observed dispatching from, derived from
+  core's own turn record (`activity_logs.tool_trace` and the tool-use
+  `agent_log` summaries). Read `dispatch_corroborated_count`, not
+  `len(loaded_mcp_tools)`, when the question is "what can the model call".
+- `verdict` carries its own strength: `dispatch_observed:*` (core saw a real
+  dispatch in that namespace), `contradicted:*` (core has dispatch records and
+  NONE match the advertised inventory — the 54/zero state), or `unknown:*`
+  (nothing to compare yet). `null` means core has not classified the row; it is
+  not a verdict.
+
+`mcp_surface` deliberately does not gate anything. It re-labels the
+`workspace.online` event's `readiness_evidence` and reports; it is not a term of
+the promotion predicate in either polarity.
 
 Heartbeat values overwrite the latest snapshot in Postgres. Long-term task and
 request observability belongs in the tracing/activity systems, not a heartbeat

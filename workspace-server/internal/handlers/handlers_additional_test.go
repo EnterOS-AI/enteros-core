@@ -403,13 +403,16 @@ func TestWorkspaceList_WithData(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	rows := sqlmock.NewRows(columns).
 		AddRow("ws-1", "Agent One", "worker", 1, "online", []byte(`{"name":"agent1"}`), "http://localhost:8001",
 			nil, 3, 1, 0.02, "", 7200, "processing", "claude-code", "", 10.0, 20.0, false, nil, int64(0), false, true, []byte(`{}`), "workspace", []byte(`[]`),
+			[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 		).
 		AddRow("ws-2", "Agent Two", "", 2, "degraded", []byte("null"), "",
 			nil, 0, 1, 0.6, "timeout", 100, "", "claude-code", "", 50.0, 60.0, true, nil, int64(0), false, true, []byte(`{}`), "workspace", []byte(`[]`),
+			[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 		)
 
 	mock.ExpectQuery("SELECT w.id, w.name").

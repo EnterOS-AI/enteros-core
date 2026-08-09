@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1495,6 +1496,14 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				log.Printf("Heartbeat: failed to persist loaded_mcp_tools for %s: %v", payload.WorkspaceID, persistErr)
 			}
 		}
+
+		// core#5137: the raw inventory above is a PRODUCER self-report and, as
+		// captured on this fleet, can be 54 ids in a namespace the model never
+		// dispatches from. Publish the consumer-side corroboration NEXT TO it —
+		// same beat, before evaluateStatus reads the verdict — so a caller that
+		// reads the count also reads how much of it the dispatcher backs.
+		// Best-effort: never fails the heartbeat, never rewrites loaded_mcp_tools.
+		h.recordMCPSurfaceCorroboration(c, ctx, payload.WorkspaceID, payload.LoadedMCPTools)
 	}
 
 	// Versioned-heartbeat GENERATION LOOP (PR-C): persist the runtime's reported
@@ -1808,7 +1817,415 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 // So the flip stays where it is and STOPS CLAIMING what it has not verified:
 // it now records WHICH self-report authorised it (conciergeOnlineEvidence) in
 // place of the former unqualified `verified_ready: true`.
+//
+// ── UPDATE (core#5137): the deferred half — a CONSUMER-DERIVED signal ────────
+// The contract above says a "callable" label must wait for "a platform-OBSERVED
+// signal, not a cheaper self-report". That signal exists and core already
+// persists it; it just had no reader. See mcpSurfaceCorroboration below.
 // ────────────────────────────────────────────────────────────────────────────
+
+// ════════════════════════════════════════════════════════════════════════════
+// CONSUMER-DERIVED CALLABILITY CORROBORATION (core#5137)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// THE DEFECT THIS CLOSES — "54 loaded, zero callable".
+//
+// `loaded_mcp_tools` is produced by the runtime's out-of-band enumeration probe
+// (molecule-ai-workspace-runtime, molecule_runtime/loaded_mcp_tools_probe.py).
+// That probe reads the adapter's native MCP-servers config, spawns EACH declared
+// server as its OWN stdio subprocess under a PRIVATE client (its own clientInfo,
+// "molecule-runtime-loaded-mcp-probe"), drives
+//
+//	initialize -> notifications/initialized -> tools/list
+//
+// and normalises every returned tools[].name to `mcp__<config-key>__<tool>`
+// (_normalize_tool_id). The count it publishes therefore answers exactly one
+// question: "can a brand-new client spawn this server and read its schema list?"
+//
+// NOTHING on that path touches the tool surface the MODEL dispatches from. The
+// probe's client is not the executor's client, and — the load-bearing part — the
+// config the probe reads is not necessarily the config the executor reads. On
+// the hermes runtime the base adapter hook renders/reads
+// `<config_path>/.claude/settings.json` (where the platform-mcp plugin reconcile
+// writes `molecule-platform`), while the model's own surface is the hermes
+// config written by the runtime template's start.sh, which wires ONE server —
+// the A2A sidecar, named `molecule`. So the management MCP registers
+// successfully into a file the model's dispatcher never opens.
+//
+// The two layers then disagree in the ONE way that is invisible to a membership
+// test: the namespace. Captured on this fleet (Loki, container
+// enteros-ws-e2e-life-619276-4822-3a49a308a8c6, 2026-08-05T08:18:56Z):
+//
+//	loaded_mcp_tools: enumerated 54 MCP tool id(s) from 2 declared server(s)
+//
+// all 54 spelled `mcp__molecule-platform__*` — while every model dispatch
+// recorded across the fleet in the same window is spelled `mcp__molecule__*`,
+// and a search for a `mcp__molecule-platform__*` invocation returns nothing.
+//
+// The count never disagreed with the gate because the probe AND the gate's
+// membership test (conciergePlatformMCPProvisionWorkspaceTool) are both spelled
+// in the PROBE's naming convention. Two components deriving the same string from
+// the same wrong assumption always agree, and their agreement is worth zero.
+//
+// THE SIGNAL, and why it is consumer-derived.
+//
+// Core already persists, per workspace, the tool ids the MODEL actually
+// dispatched — written by core's own turn-ingest path, not by any readiness
+// producer:
+//
+//   - activity_logs.tool_trace (migration 039) — extractToolTrace() lifts
+//     result.metadata.tool_trace off each A2A response as core ingests the turn.
+//   - activity_logs.summary on activity_type='agent_log' rows, which the
+//     executor's _report_tool_use writes as "<hammer> <tool>(...)" (the same
+//     marker messagestore.toolSummaryPrefix reconstructs turns from).
+//
+// Those strings are emitted by the DISPATCHER — the consumer of the tool surface
+// — and they cannot exist unless a tool was actually dispatched. No enumeration
+// probe, however healthy, can synthesise one. That is the difference in kind
+// from `loaded_mcp_tools`, which is an inventory the producer composed about
+// itself.
+//
+// HONEST LIMITS, stated so no reader over-reads the label. Core observes a
+// DISPATCH RECORD, transported on the runtime's A2A response; it does not
+// independently attest that the tool's side effects landed. Hence the label
+// prefix is `dispatch_observed:`, never `verified:` and never a bare `callable`.
+// It is strictly stronger than every `self_report:` value (it is impossible
+// without a real invocation) and strictly weaker than a platform-executed call.
+//
+// ⚠️ DIRECTION OF EFFECT — checked before writing, per the neighbouring
+// near-miss. This corroboration must NOT be added as a term of the promotion
+// predicate, in EITHER polarity:
+//
+//   - As a new DISJUNCT it would widen mcpSurfaceSelfReported and promote MORE
+//     rows on LESS evidence. Wrong direction.
+//   - As a new BLOCKER ("refuse online while contradicted") it would deny online
+//     to every concierge whose model dispatches only `mcp__molecule__*` — which,
+//     per the capture above, is the ENTIRE fleet. That is a fleet-wide denial
+//     cliff introduced by a signal whose producer has just been shown to be
+//     mis-namespaced. Also wrong direction.
+//
+// So it changes the LABEL and the REPORT, and nothing else. The set of
+// heartbeats that promote is byte-identical before and after this change; a
+// regression test pins that (TestMCPSurface_DoesNotMoveThePromotionPredicate).
+// Tightening the repair lever named in the contract above (platform_agent_ensure
+// platformAgentHealthy) becomes possible once this label has been observed in
+// the field — but that is a separate, evidence-first change.
+
+// mcpSurfaceVerdict is the corroboration outcome for one workspace's reported
+// MCP inventory, checked against the tool ids core has actually seen the model
+// dispatch. Like conciergeReadinessEvidence, every value carries its own
+// strength prefix so the string can never be mistaken for a stronger claim than
+// it is.
+type mcpSurfaceVerdict string
+
+const (
+	// verdictNoInventory — the runtime reported an EMPTY inventory. There is
+	// nothing to corroborate; this is not a failure, and it is not a pass.
+	verdictNoInventory mcpSurfaceVerdict = "unknown:no_inventory_reported"
+
+	// verdictNoDispatchRecord — core has never observed this workspace's model
+	// dispatch ANY mcp__ tool, so there is nothing to check the inventory
+	// against. ABSENCE IS NOT EVIDENCE: a freshly-provisioned concierge that
+	// no one has talked to lands here, and so does a genuinely broken one. A
+	// consumer must treat this as "not yet known", never as "fine".
+	verdictNoDispatchRecord mcpSurfaceVerdict = "unknown:no_dispatch_record"
+
+	// verdictCorroborated — at least one namespace the runtime advertises is a
+	// namespace core has actually seen the model dispatch from. The advertised
+	// surface and the model's surface are the same surface.
+	verdictCorroborated mcpSurfaceVerdict = "dispatch_observed:namespace_corroborated"
+
+	// verdictContradicted — core HAS dispatch records for this workspace and NOT
+	// ONE of them shares a namespace with the reported inventory. This is the
+	// "54 loaded, zero callable" state: the runtime is enumerating a surface the
+	// model demonstrably does not dispatch from. It is a POSITIVE finding, not a
+	// missing one, and it is the state this probe previously had no way to
+	// express.
+	verdictContradicted mcpSurfaceVerdict = "contradicted:dispatch_uses_only_other_namespaces"
+)
+
+// mcpSurfaceReport is what core publishes ALONGSIDE (never in place of) the
+// runtime's raw loaded_mcp_tools. loaded_mcp_tools keeps carrying exactly what
+// the runtime claimed — laundering a producer's claim is how a signal stops
+// being auditable — and this record says how much of that claim the consumer
+// side corroborates.
+type mcpSurfaceReport struct {
+	// ReportedCount is the size of the runtime's inventory: the "54".
+	ReportedCount int `json:"reported_count"`
+	// DispatchCorroboratedCount is how many of those ids sit in a namespace the
+	// model has actually dispatched from. THIS is the number a caller asking
+	// "what can the model call?" should read.
+	DispatchCorroboratedCount int `json:"dispatch_corroborated_count"`
+	// AdvertisedOnlyCount is the remainder: ReportedCount - corroborated.
+	AdvertisedOnlyCount int `json:"advertised_only_count"`
+	// ReportedNamespaces / DispatchedNamespaces are sorted and deduped so the
+	// mismatch is legible at a glance without re-deriving it.
+	ReportedNamespaces   []string `json:"reported_namespaces"`
+	DispatchedNamespaces []string `json:"dispatched_namespaces"`
+	// DispatchRecords is how many dispatch observations backed this verdict. 0
+	// means the verdict is one of the "unknown:" values by construction.
+	DispatchRecords int               `json:"dispatch_records"`
+	Verdict         mcpSurfaceVerdict `json:"verdict"`
+	ObservedAt      time.Time         `json:"observed_at"`
+}
+
+// mcpToolIDNamespace returns the `<server>` segment of a canonical
+// `mcp__<server>__<tool>` dispatcher id, or "" when the string is not one.
+//
+// Parsed by explicit index rather than strings.Split so a tool name that itself
+// contains "__" (legal, and present in the wild) cannot shift the namespace: the
+// namespace is everything between the FIRST "mcp__" and the NEXT "__", and the
+// tool is the whole remainder. A trailing-but-empty tool ("mcp__x__") is not a
+// dispatchable id and returns "".
+func mcpToolIDNamespace(toolID string) string {
+	const prefix = "mcp__"
+	const sep = "__"
+	s := strings.TrimSpace(toolID)
+	if !strings.HasPrefix(s, prefix) {
+		return ""
+	}
+	rest := s[len(prefix):]
+	idx := strings.Index(rest, sep)
+	if idx <= 0 {
+		return "" // no separator, or an empty namespace ("mcp____tool")
+	}
+	if len(rest) <= idx+len(sep) {
+		return "" // "mcp__server__" with no tool segment
+	}
+	return rest[:idx]
+}
+
+// mcpAgentLogToolSummaryPrefix mirrors messagestore.toolSummaryPrefix (U+1F6E0
+// + space), the marker the executor's _report_tool_use writes ahead of the tool
+// name on an agent_log summary. Spelled as an escape so the source stays ASCII;
+// a divergence from messagestore is caught by
+// TestAgentLogToolSummaryPrefixMatchesMessagestore.
+const mcpAgentLogToolSummaryPrefix = "\U0001F6E0 "
+
+// mcpDispatchNamespacesFrom extracts the set of dispatcher namespaces from the
+// two shapes core persists: a tool_trace JSON array of {"tool": "..."} objects
+// (or of bare strings, which older writers produced) and an agent_log summary
+// of the form "<marker> mcp__server__tool(args...)".
+//
+// Everything unparseable is DROPPED, never guessed. A malformed trace must not
+// invent a namespace — an invented namespace would manufacture corroboration,
+// which is the precise failure this whole record exists to prevent.
+func mcpDispatchNamespacesFrom(toolTraces [][]byte, agentLogSummaries []string) (map[string]struct{}, int) {
+	out := map[string]struct{}{}
+	records := 0
+
+	add := func(toolID string) {
+		if ns := mcpToolIDNamespace(toolID); ns != "" {
+			out[ns] = struct{}{}
+			records++
+		}
+	}
+
+	for _, raw := range toolTraces {
+		if len(raw) == 0 {
+			continue
+		}
+		var entries []json.RawMessage
+		if err := json.Unmarshal(raw, &entries); err != nil {
+			continue
+		}
+		for _, e := range entries {
+			var obj struct {
+				Tool string `json:"tool"`
+			}
+			if err := json.Unmarshal(e, &obj); err == nil && obj.Tool != "" {
+				add(obj.Tool)
+				continue
+			}
+			var s string
+			if err := json.Unmarshal(e, &s); err == nil && s != "" {
+				add(s)
+			}
+		}
+	}
+
+	for _, summary := range agentLogSummaries {
+		s := strings.TrimSpace(summary)
+		if !strings.HasPrefix(s, mcpAgentLogToolSummaryPrefix) {
+			continue
+		}
+		s = strings.TrimSpace(strings.TrimPrefix(s, mcpAgentLogToolSummaryPrefix))
+		// "mcp__server__tool(arg=1)" -> "mcp__server__tool"
+		if i := strings.IndexByte(s, '('); i >= 0 {
+			s = s[:i]
+		}
+		add(s)
+	}
+
+	return out, records
+}
+
+// classifyMCPSurface is the whole verdict, as a PURE function of (what the
+// runtime reported, what core observed the model dispatch). Pure so the
+// honesty contract is unit-testable without a DB and so the mutation test can
+// drive it directly in both directions.
+func classifyMCPSurface(reported []string, dispatched map[string]struct{}, dispatchRecords int, now time.Time) mcpSurfaceReport {
+	rep := mcpSurfaceReport{
+		ReportedCount:        len(reported),
+		ReportedNamespaces:   []string{},
+		DispatchedNamespaces: []string{},
+		DispatchRecords:      dispatchRecords,
+		ObservedAt:           now.UTC(),
+	}
+
+	seenReported := map[string]struct{}{}
+	for _, id := range reported {
+		ns := mcpToolIDNamespace(id)
+		if ns == "" {
+			// A reported entry that is not a dispatcher id can never be
+			// callable under ANY namespace, so it counts toward the total but
+			// contributes no namespace and is never corroborated.
+			continue
+		}
+		if _, ok := seenReported[ns]; !ok {
+			seenReported[ns] = struct{}{}
+			rep.ReportedNamespaces = append(rep.ReportedNamespaces, ns)
+		}
+		if _, ok := dispatched[ns]; ok {
+			rep.DispatchCorroboratedCount++
+		}
+	}
+	rep.AdvertisedOnlyCount = rep.ReportedCount - rep.DispatchCorroboratedCount
+	for ns := range dispatched {
+		rep.DispatchedNamespaces = append(rep.DispatchedNamespaces, ns)
+	}
+	sort.Strings(rep.ReportedNamespaces)
+	sort.Strings(rep.DispatchedNamespaces)
+
+	switch {
+	case rep.ReportedCount == 0:
+		rep.Verdict = verdictNoInventory
+	case len(dispatched) == 0:
+		rep.Verdict = verdictNoDispatchRecord
+	case rep.DispatchCorroboratedCount > 0:
+		rep.Verdict = verdictCorroborated
+	default:
+		rep.Verdict = verdictContradicted
+	}
+	return rep
+}
+
+// mcpSurfaceContextKey is where recordMCPSurfaceCorroboration parks this
+// request's verdict for evaluateStatus to read. Request-scoped on purpose: the
+// label must describe the beat being evaluated, not whatever a concurrent beat
+// most recently wrote to the row.
+const mcpSurfaceContextKey = "mcp_surface_verdict"
+
+// mcpSurfaceVerdictFromContext returns the verdict computed earlier in this
+// request, or "" when none was. It FAILS TO THE NEUTRAL VALUE — a missing or
+// unrecognised entry can mint neither corroboration nor contradiction, so a
+// corroboration outage degrades the label to the pre-existing self-report
+// wording rather than inventing a verdict.
+func mcpSurfaceVerdictFromContext(c *gin.Context) mcpSurfaceVerdict {
+	if c == nil {
+		return ""
+	}
+	v, ok := c.Get(mcpSurfaceContextKey)
+	if !ok {
+		return ""
+	}
+	s, ok := v.(mcpSurfaceVerdict)
+	if !ok {
+		return ""
+	}
+	switch s {
+	case verdictNoInventory, verdictNoDispatchRecord, verdictCorroborated, verdictContradicted:
+		return s
+	default:
+		return ""
+	}
+}
+
+// mcpDispatchLookbackRows bounds the corroboration read. The question is
+// categorical ("has this workspace's model EVER dispatched from namespace X"),
+// so the newest window is sufficient and the query stays O(1) per heartbeat.
+const mcpDispatchLookbackRows = 200
+
+// recordMCPSurfaceCorroboration reads core's OWN dispatch record for this
+// workspace, classifies the runtime's reported inventory against it, and
+// persists the result to workspaces.mcp_surface.
+//
+// BEST-EFFORT BY CONTRACT: every failure path logs and returns without touching
+// the column, so a corroboration problem can never break the heartbeat's
+// liveness ack or the status machine. The previous value is left in place rather
+// than being overwritten with a weaker one — a transient DB error must not read
+// as "the evidence went away".
+//
+// Cost: exactly ONE extra SELECT per heartbeat that carries an inventory. The
+// runtime only publishes loaded_mcp_tools for kind=platform (its own
+// _is_platform_agent gate), so ordinary tenants never reach this at all.
+func (h *RegistryHandler) recordMCPSurfaceCorroboration(c *gin.Context, ctx context.Context, workspaceID string, reported []string) {
+	rows, err := db.DB.QueryContext(ctx, `
+		SELECT COALESCE(tool_trace::text, ''), COALESCE(summary, '')
+		  FROM activity_logs
+		 WHERE workspace_id = $1
+		   AND (tool_trace IS NOT NULL
+		        OR (activity_type = 'agent_log' AND summary LIKE $2))
+		 ORDER BY created_at DESC
+		 LIMIT $3
+	`, workspaceID, mcpAgentLogToolSummaryPrefix+"%", mcpDispatchLookbackRows)
+	if err != nil {
+		log.Printf("Heartbeat: mcp_surface corroboration read failed for %s: %v — leaving the previous record untouched", workspaceID, err)
+		return
+	}
+	defer rows.Close()
+
+	var traces [][]byte
+	var summaries []string
+	for rows.Next() {
+		var trace, summary string
+		if scanErr := rows.Scan(&trace, &summary); scanErr != nil {
+			log.Printf("Heartbeat: mcp_surface corroboration scan failed for %s: %v", workspaceID, scanErr)
+			return
+		}
+		if trace != "" {
+			traces = append(traces, []byte(trace))
+		}
+		if summary != "" {
+			summaries = append(summaries, summary)
+		}
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		log.Printf("Heartbeat: mcp_surface corroboration iteration failed for %s: %v", workspaceID, rowsErr)
+		return
+	}
+
+	dispatched, records := mcpDispatchNamespacesFrom(traces, summaries)
+	report := classifyMCPSurface(reported, dispatched, records, time.Now())
+
+	// Publish to the request BEFORE persisting: the label evaluateStatus emits
+	// describes what core observed on THIS beat, and a failure to write the
+	// column must not also silence the event label.
+	if c != nil {
+		c.Set(mcpSurfaceContextKey, report.Verdict)
+	}
+
+	encoded, marshalErr := json.Marshal(report)
+	if marshalErr != nil {
+		log.Printf("Heartbeat: failed to marshal mcp_surface for %s: %v", workspaceID, marshalErr)
+		return
+	}
+	if _, execErr := db.DB.ExecContext(ctx, `
+		UPDATE workspaces SET mcp_surface = $1::jsonb, updated_at = now()
+		 WHERE id = $2 AND status != 'removed'
+	`, encoded, workspaceID); execErr != nil {
+		log.Printf("Heartbeat: failed to persist mcp_surface for %s: %v", workspaceID, execErr)
+		return
+	}
+
+	// Log the CONTRADICTED verdict loudly and exactly once per heartbeat it
+	// holds. This is the line that would have surfaced "54 loaded, zero
+	// callable" on day one instead of a healthy-looking count.
+	if report.Verdict == verdictContradicted {
+		log.Printf("Heartbeat: workspace=%s mcp_surface=CONTRADICTED reported=%d corroborated=0 reported_namespaces=%v dispatched_namespaces=%v dispatch_records=%d — the runtime is enumerating a tool surface the model does NOT dispatch from; the reported inventory is not callable as spelled (core#5137)",
+			workspaceID, report.ReportedCount, report.ReportedNamespaces, report.DispatchedNamespaces, report.DispatchRecords)
+	}
+}
 
 // conciergeReadinessEvidence names the evidence that authorised a platform
 // concierge's promotion to online. Every value is deliberately prefixed with
@@ -1852,6 +2269,26 @@ const (
 	// examined; naming it keeps that visible on the wire instead of letting it
 	// masquerade as the same claim as the arms above.
 	evidenceNoneLegacyRuntime conciergeReadinessEvidence = "none:legacy_runtime_no_readiness_contract"
+
+	// evidenceDispatchObservedMCPSurface — core's OWN turn record shows this
+	// workspace's MODEL has actually dispatched from a namespace the runtime
+	// advertises (mcp_surface verdict = dispatch_observed:namespace_corroborated).
+	// This is the first value here that is NOT a self-report: it cannot exist
+	// unless a tool was really dispatched, and the string it is derived from was
+	// emitted by the dispatcher, not by a readiness producer.
+	//
+	// Still NOT spelled "callable". Core observed a dispatch RECORD, not a
+	// platform-executed call; the prefix says exactly that and nothing more.
+	evidenceDispatchObservedMCPSurface conciergeReadinessEvidence = "dispatch_observed:mcp_namespace_corroborated"
+
+	// evidenceSelfReportContradicted — the promotion was authorised by a
+	// self-report AND core's dispatch record contradicts it: every tool this
+	// model has been observed dispatching sits in a namespace the advertised
+	// inventory does not contain. The row still goes online (see the DIRECTION
+	// OF EFFECT note above — blocking here would be a fleet-wide denial cliff),
+	// but the event now says the authorising evidence is known to be
+	// mis-namespaced instead of presenting it as an unqualified self-report.
+	evidenceSelfReportContradicted conciergeReadinessEvidence = "self_report:contradicted_by_observed_dispatch"
 )
 
 // conciergeOnlineEvidence names the single strongest self-report that
@@ -1864,14 +2301,40 @@ const (
 // Returns "" when neither input holds, which the verified arm never reaches
 // (it is guarded by mcpSurfaceSelfReported). An empty label on the wire would
 // therefore itself be a bug signal, not a silent default.
-func conciergeOnlineEvidence(mcpToolsReady, provisionToolLoaded bool) conciergeReadinessEvidence {
+//
+// core#5137: `surface` is the LAST-PERSISTED mcp_surface verdict for this row
+// (read alongside status in evaluateStatus — no extra query). It only ever
+// changes the LABEL:
+//
+//   - corroborated   -> upgrade to the dispatch_observed: value, the only
+//     non-self-reported evidence available here.
+//   - contradicted   -> downgrade to the contradicted: value, so an event that
+//     used to read as a clean self-report now carries the
+//     known mis-namespacing.
+//   - unknown:* / "" -> unchanged. Absence of a dispatch record is NOT evidence
+//     of absence (a fresh concierge nobody has talked to
+//     lands there), so it must never weaken or strengthen
+//     the label.
+//
+// The promotion DECISION is made by the caller before this is called and is not
+// a function of `surface`; this only names WHY.
+func conciergeOnlineEvidence(mcpToolsReady, provisionToolLoaded bool, surface mcpSurfaceVerdict) conciergeReadinessEvidence {
+	base := conciergeReadinessEvidence("")
 	switch {
 	case mcpToolsReady:
-		return evidenceSelfReportMCPToolsReady
+		base = evidenceSelfReportMCPToolsReady
 	case provisionToolLoaded:
-		return evidenceSelfReportLoadedMCPTools
+		base = evidenceSelfReportLoadedMCPTools
 	default:
 		return ""
+	}
+	switch surface {
+	case verdictCorroborated:
+		return evidenceDispatchObservedMCPSurface
+	case verdictContradicted:
+		return evidenceSelfReportContradicted
+	default:
+		return base
 	}
 }
 
@@ -1887,6 +2350,13 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	if err != nil {
 		return
 	}
+	// core#5137: the consumer-derived verdict computed earlier in THIS request by
+	// recordMCPSurfaceCorroboration. Read from the request context rather than
+	// re-queried: zero extra round-trips, and it is guaranteed to be the verdict
+	// for THIS beat rather than a racing one. Absent (register path, a runtime
+	// that published no inventory, or a corroboration read that failed) yields
+	// the neutral "" — which conciergeOnlineEvidence treats as "changes nothing".
+	mcpSurface := mcpSurfaceVerdictFromContext(c)
 	hasRecentRegisterFailure := lastRegisterFailure.Valid && time.Since(lastRegisterFailure.Time) < 5*time.Minute
 
 	// managementMCPUnloaded tracks whether THIS heartbeat observed the declared
@@ -2092,7 +2562,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				// event stream never again carries an unqualified "verified" claim.
 				// The AND status=$currentStatus guard keeps the flip conditional so a
 				// racing Delete/pause is not overwritten.
-				evidence := conciergeOnlineEvidence(mcpToolsReady, provisionToolLoaded)
+				evidence := conciergeOnlineEvidence(mcpToolsReady, provisionToolLoaded, mcpSurface)
 				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2 AND status = $3::workspace_status`, models.StatusOnline, payload.WorkspaceID, currentStatus); err != nil {
 					log.Printf("Heartbeat: verified platform %s %s->online failed: %v", payload.WorkspaceID, currentStatus, err)
 				} else {
@@ -2717,7 +3187,7 @@ func (h *RegistryHandler) UpdateCard(c *gin.Context) {
 // implemented and tested here, but does not take effect until an operator
 // turns it on.
 //
-// WHY THIS SHIPS DARK RATHER THAN ON
+// # WHY THIS SHIPS DARK RATHER THAN ON
 //
 // Measured, not assumed: flipping this to default-on turns 74 additional
 // tests in this package red — the whole Heartbeat suite, UpdateCard,
