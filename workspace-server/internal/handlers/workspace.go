@@ -1555,7 +1555,7 @@ func scanWorkspaceRow(rows interface {
 	Scan(dest ...interface{}) error
 }) (map[string]interface{}, error) {
 	var id, name, role, status, url, sampleError, currentTask, runtime, workspaceDir, kind string
-	var computeRaw, loadedMCPToolsRaw []byte
+	var computeRaw, loadedMCPToolsRaw, mcpSurfaceRaw []byte
 	var tier, activeTasks, maxConcurrentTasks, uptimeSeconds int
 	var errorRate, x, y float64
 	var collapsed, broadcastEnabled, talkToUserEnabled bool
@@ -1568,7 +1568,7 @@ func scanWorkspaceRow(rows interface {
 		&parentID, &activeTasks, &maxConcurrentTasks, &errorRate, &sampleError, &uptimeSeconds,
 		&currentTask, &runtime, &workspaceDir, &x, &y, &collapsed,
 		&budgetLimit, &monthlySpend, &broadcastEnabled, &talkToUserEnabled, &computeRaw, &kind,
-		&loadedMCPToolsRaw)
+		&loadedMCPToolsRaw, &mcpSurfaceRaw)
 	if err != nil {
 		return nil, err
 	}
@@ -1639,6 +1639,24 @@ func scanWorkspaceRow(rows interface {
 	}
 	ws["loaded_mcp_tools"] = loadedMCPTools
 
+	// core#5137: mcp_surface is the CONSUMER-side corroboration of the count
+	// above — how many of those reported ids sit in a namespace this workspace's
+	// model has actually been observed dispatching from (see
+	// registry.go's recordMCPSurfaceCorroboration). It is emitted NEXT TO
+	// loaded_mcp_tools, never in place of it: the raw list stays exactly as the
+	// runtime reported it so the claim remains auditable.
+	//
+	// null means "core has not evaluated this row yet" — NOT "no evidence
+	// available" and NOT "fine". Unlike loaded_mcp_tools this is deliberately
+	// NOT defaulted to an empty object: an empty object would read as a
+	// zero-count verdict, which is a claim, and a row core has never classified
+	// has made no claim.
+	if len(mcpSurfaceRaw) > 0 && string(mcpSurfaceRaw) != "null" {
+		ws["mcp_surface"] = json.RawMessage(mcpSurfaceRaw)
+	} else {
+		ws["mcp_surface"] = nil
+	}
+
 	return ws, nil
 }
 
@@ -1655,7 +1673,8 @@ const workspaceListQuery = `
 		   w.broadcast_enabled, w.talk_to_user_enabled,
 		   COALESCE(w.compute, '{}'::jsonb),
 		   COALESCE(w.kind, 'workspace'),
-		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb)
+		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb),
+		   COALESCE(w.mcp_surface::text, '')
 	FROM workspaces w
 	LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 	WHERE w.status != 'removed'
@@ -1758,7 +1777,8 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 			   w.broadcast_enabled, w.talk_to_user_enabled,
 			   COALESCE(w.compute, '{}'::jsonb),
 		   COALESCE(w.kind, 'workspace'),
-		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb)
+		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb),
+		   COALESCE(w.mcp_surface::text, '')
 		FROM workspaces w
 		LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 		WHERE w.id = $1
