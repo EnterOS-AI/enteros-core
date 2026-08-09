@@ -143,6 +143,15 @@ except Exception:
 # UNARMED for that poll, and the caller can see that it was unarmed because
 # TRIGGER_DAEMON_PROGRESS_SAMPLES stays 0.
 #
+# WHOLE-FILE, NOT PER-SCHEDULE, and that is the correct granularity rather than a
+# convenient one. A digest covering every schedule on the container could in
+# principle mask one wedged schedule behind another that keeps firing — except
+# that the daemon runs a SINGLE `_delivery_worker` awaiting a SINGLE `_active`
+# delivery, so a wedged delivery blocks the queue for every schedule at once. The
+# wedge is lane-wide by construction, so the lane-wide signal is the one that
+# matches it; filtering to one schedule's entries would only make the signal
+# sparser (one attempt per fire instead of N) without making it more specific.
+#
 # `cksum` rather than the raw file: the log grows to HISTORY_MAX=200 entries, so
 # comparing content directly would hold two multi-kilobyte strings in shell
 # variables on every poll for no gain. A collision would have to reproduce both
@@ -227,8 +236,18 @@ trigger_daemon_wait() {
         # nothing before it to have advanced from. Counting it would inflate the
         # transition count that callers assert on, which is the one number that
         # distinguishes "the lane moved" from "the detector merely ran".
-        [ -n "$last_digest" ] && \
+        #
+        # An `if` rather than `[ ... ] && assign`: on the first digest the test
+        # is false, so the `&&` list would carry exit status 1. Every current
+        # call site spells `trigger_daemon_wait ... || rc=$?`, which suspends the
+        # caller's errexit for the whole body and makes that harmless — but the
+        # harness runs `set -euo pipefail` AND is invoked by Gitea Actions as
+        # `bash --noprofile --norc -e -o pipefail`, so a future call site that
+        # drops the `||` would kill the run inside this loop with no message at
+        # all. Not worth leaving to a convention nobody can see from here.
+        if [ -n "$last_digest" ]; then
           TRIGGER_DAEMON_PROGRESS_TRANSITIONS=$((TRIGGER_DAEMON_PROGRESS_TRANSITIONS + 1))
+        fi
         last_digest="$digest"
         since_progress=0
       fi
@@ -284,6 +303,15 @@ trigger_daemon_probe_cron() {
 # nothing on stdout, rather than silently defaulting: a bound derived from a
 # misparsed cron is precisely the "number that describes nothing" this file
 # exists to eliminate, and a wrong derivation is worse than a loud refusal.
+#
+# shellcheck disable=SC2120
+#   The argument IS optional and IS passed — by lib/test_trigger_daemon_wait_unit.sh,
+#   which shellcheck lints as a separate file and so cannot see. The usual way to
+#   tell shellcheck an argument is optional is `${1:-default}`, and that is exactly
+#   the form this function must NOT use: `:-` would substitute the default for an
+#   argument supplied as the EMPTY STRING, and refusing that case is an assertion
+#   with a test behind it (a caller that thinks it has a cron and does not must get
+#   rc=3, not a 60s interval invented on its behalf).
 trigger_daemon_fire_interval_secs() {
   # `${1-...}`, not `${1:-...}`: an OMITTED argument takes the configured probe
   # cron, but an argument supplied as the empty string is a caller that thinks it
