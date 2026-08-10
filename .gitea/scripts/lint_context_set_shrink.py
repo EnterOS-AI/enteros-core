@@ -228,13 +228,24 @@ def split_event(context: str) -> tuple[str, str]:
     """Split a live context into (event-stripped name, event); `""` when unsuffixed.
 
     The `.strip()` calls below are defensive only, and a mutant that removes them
-    SURVIVES the test suite. That is an equivalent mutant, not a coverage gap:
-    `_EVENT_SUFFIX_RE` already consumes the whitespace between a context and its
-    event suffix, and Gitea does not emit leading or trailing whitespace in a
-    context name — it composes `f"{workflow} / {job}"` from values that were
-    themselves stripped. Recorded here rather than left looking unkilled, because
-    "a mutant survived" and "a mutant cannot be distinguished" are different
-    findings and only the first one is a problem.
+    SURVIVES the test suite. That is an equivalent mutant, not a coverage gap —
+    but the argument only holds if it covers EVERY caller, because the two
+    implementations are genuinely distinct functions: they diverge on `'  A / a'`,
+    `'\tA / a'` and `'A / a\xa0'`. The equivalence is a property of the INPUT
+    DOMAIN, not of the code, so it has to be argued per entry point. There are two:
+
+    1. LIVE STATUS CONTEXTS, via `posted_contexts`. `_EVENT_SUFFIX_RE` already
+       consumes the whitespace between a context and its event suffix, and Gitea
+       composes `f"{workflow} / {job}"` from values that were themselves stripped.
+       Checked against 121 distinct real context strings across five heads: zero
+       padded, zero that differ between the two implementations.
+    2. WAIVER SUBJECTS, via `parse_waivers`. `_WAIVER_LINE_RE` captures the subject
+       as `\\S.*?` with a trailing `\\s*$`, so it is already stripped at both ends
+       before it ever reaches here — `'42\\t A / a \\t'` arrives as `'A / a'`.
+
+    Recorded because "a mutant survived" and "a mutant cannot be distinguished" are
+    different findings, only the first is a problem, and an equivalence argument
+    that silently covers half its callers is a third thing again.
     """
     match = _EVENT_SUFFIX_RE.search(context)
     if match is None:
@@ -425,10 +436,15 @@ def derive_expected(
     base_branch: str,
     changed: list[str],
     tolerate_unreadable: bool = False,
-) -> tuple[set[str], list[str]]:
+) -> tuple[dict[str, str], list[str]]:
     """Contexts a tree SHOULD post for the `pull_request` event.
 
-    Returns `(contexts, skipped)`.
+    Returns `({lane: source workflow filename}, skipped)`.
+
+    The lane->source mapping is not bookkeeping. It is what lets the caller ask the
+    only question that separates "the base legitimately has fewer lanes" from "the
+    base read came back partial": for each lane the head has and the base does not,
+    WHICH FILE produced it, and did this PR touch that file?
 
     `tolerate_unreadable` is the one asymmetry between the two trees this gate
     reads, and it is deliberate. At HEAD an unreadable workflow is fatal: it is the
@@ -439,7 +455,7 @@ def derive_expected(
     the repo until somebody fixed main — punishing every author for one person's
     mistake, which is how a gate gets deleted.
     """
-    expected: set[str] = set()
+    expected: dict[str, str] = {}
     skipped: list[str] = []
     for filename, text in sorted(workflow_texts.items()):
         try:
@@ -453,8 +469,19 @@ def derive_expected(
             continue
         if not fires_on_pull_request(doc, base_branch=base_branch, changed=changed):
             continue
-        expected |= workflow_contexts(doc, filename)
+        for lane in workflow_contexts(doc, filename):
+            expected.setdefault(lane, filename)
     return expected, skipped
+
+
+def workflow_files_in_diff(changed: list[str], workflows_dir: str) -> set[str]:
+    """Bare filenames of workflow files this PR touches, for lane attribution."""
+    prefix = workflows_dir.rstrip("/") + "/"
+    return {
+        path[len(prefix):]
+        for path in changed
+        if path.startswith(prefix) and "/" not in path[len(prefix):]
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -561,14 +588,16 @@ class Verdict:
 
 def decide(
     *,
-    expected: set[str],
+    expected: dict[str, str],
     posted: set[str],
-    base_lanes: set[str],
+    base_lanes: dict[str, str],
     waivers: list[Waiver],
     pr_number: int,
     settled: bool,
     head_has_workflows: bool,
     base_has_workflows: bool,
+    pr_touched_workflow_files: set[str] = frozenset(),
+    base_skipped_files: set[str] = frozenset(),
 ) -> Verdict:
     """Pure decision function. Every branch below is reachable from a test.
 
@@ -620,6 +649,51 @@ def decide(
                 "is fetched."
             ),
         )
+
+    # PARTIAL blindness, which the guard above cannot see. base_lanes = 22 against
+    # expected = 45 passes every total-emptiness check while Check B is most of the
+    # way blind, and nothing about the numbers looks wrong.
+    #
+    # The test is EXACT rather than a ratio, deliberately. A floor like
+    # `len(base_lanes) >= 0.8 * len(expected)` reds a PR that legitimately adds a
+    # lot of workflows, and a gate that reds honest PRs is worse than the gap it
+    # closes. So instead: for every lane the head expects and the base does not
+    # produce, ask WHICH FILE produced it. A PR may legitimately introduce a lane
+    # only by touching that lane's workflow file — adding the file, adding a job,
+    # or widening a trigger — and all three appear in the PR's own diff. A lane
+    # sourced from a file this PR never touched cannot legitimately be new, so the
+    # base read must have come back short.
+    #
+    # Unreachable today: `fetch-depth: 0` keeps origin/main current and a bad
+    # BASE_REF dies in merge-base first. But the workflow's `git fetch … || true` is
+    # the tolerate-silently shape that produced the incident this gate exists for,
+    # and "unreachable today" is the same footing the parked stub started from.
+    unexplained = sorted(
+        lane
+        for lane in set(expected) - set(base_lanes)
+        if expected.get(lane) not in pr_touched_workflow_files
+        and expected.get(lane) not in base_skipped_files
+    )
+    if unexplained:
+        return Verdict(
+            ERROR,
+            expected_count=len(expected),
+            posted_count=len(posted),
+            detail=(
+                f"Check B is PARTIALLY blind: the base branch produced "
+                f"{len(base_lanes)} lane(s) against {len(expected)} expected, and "
+                f"{len(unexplained)} of the difference comes from workflow file(s) "
+                "this PR never touched — so those lanes cannot legitimately be new "
+                "and the base read must have come back short. First few: "
+                + ", ".join(
+                    f"{lane!r} (from {expected.get(lane)})" for lane in unexplained[:3]
+                )
+                + ". The base side is read at the MERGE-BASE, so main moving on "
+                "cannot cause this; it means the fork-point tree could not be read "
+                "in full. Check that the base branch is fetched deeply enough for "
+                "`git merge-base` and `git show <fork>:...` to resolve."
+            ),
+        )
     if not posted:
         return Verdict(
             ERROR,
@@ -643,13 +717,13 @@ def decide(
         )
 
     mine = {w.subject for w in waivers if w.pr_number == pr_number}
-    removed_lanes = base_lanes - expected
-    raw_missing = expected - posted
+    removed_lanes = set(base_lanes) - set(expected)
+    raw_missing = set(expected) - posted
     candidates = raw_missing | removed_lanes
     waived = sorted(mine & candidates)
     missing = sorted(raw_missing - mine)
     removed = sorted(removed_lanes - mine)
-    unexpected = sorted(posted - expected)
+    unexpected = sorted(posted - set(expected))
 
     unused = sorted(mine - candidates)
     if unused:
@@ -785,15 +859,48 @@ def git(*args: str) -> str:
     return result.stdout
 
 
-def changed_files(base_ref: str, head_sha: str) -> list[str]:
-    """Files this PR changes, measured against the MERGE-BASE.
+def merge_base(base_ref: str, head_sha: str) -> str:
+    """The commit where this PR forked from its base branch.
 
-    Against the merge-base, not the base ref tip: main advances while a PR is open,
-    and diffing against a moving tip attributes other people's merges to this PR,
-    which would fire `paths:`-filtered workflows in the derivation that Gitea never
-    scheduled.
+    EVERY base-side read in this gate resolves through here, and that is the whole
+    point. An earlier version diffed `changed` against the merge-base but read the
+    base WORKFLOW TREE from the base branch's TIP, so the two sides differed by the
+    PR's diff PLUS everything main had done since the fork — and Check B attributed
+    all of it to the PR. A workflow retired on main while a PR sat open then reded
+    that PR, unwaivably, for someone else's commit. Measured: main retired a
+    workflow in 15 distinct commits since 2026-05-01, four of them in one week.
+
+    Comparing against the fork point makes Check B's premise true by construction,
+    and states its intent better: "lanes that existed where this PR forked and are
+    gone at its head" is exactly the set attributable to the PR.
     """
-    fork_point = git("merge-base", base_ref, head_sha).strip()
+    return git("merge-base", base_ref, head_sha).strip()
+
+
+def base_tree_at_fork(
+    base_ref: str, head_sha: str, directory: str
+) -> tuple[str, dict[str, str]]:
+    """`(fork point, workflow tree there)` — Check B's base side, in one place.
+
+    This exists as its own function so the choice of ref is reachable from a unit
+    test. It is the single line that made the difference between a gate and a
+    queue-blocker: reading the tree at `base_ref` (the branch TIP) instead of at the
+    fork point attributes everything main did since the fork to the PR, and a
+    workflow retired upstream then reds an innocent PR unwaivably. Buried inside
+    `main()` alongside the network calls, that swap survived mutation testing
+    because nothing could reach it.
+    """
+    fork_point = merge_base(base_ref, head_sha)
+    return fork_point, read_workflow_tree_at(fork_point, directory)
+
+
+def changed_files(fork_point: str, head_sha: str) -> list[str]:
+    """Files this PR changes, measured from the fork point.
+
+    Not from the base branch tip: main advances while a PR is open, and diffing
+    against a moving tip attributes other people's merges to this PR, which would
+    fire `paths:`-filtered workflows in the derivation that Gitea never scheduled.
+    """
     out = git("diff", "--name-only", fork_point, head_sha)
     return [line.strip() for line in out.splitlines() if line.strip()]
 
@@ -967,11 +1074,13 @@ def main(argv: list[str] | None = None) -> int:
 
     api = Gitea(api_url, token, repo)
     try:
-        changed = changed_files(base_ref, head_sha)
+        fork_point, base_texts = base_tree_at_fork(base_ref, head_sha, workflows_dir)
+        changed = changed_files(fork_point, head_sha)
         head_texts = read_workflow_tree(workflows_dir)
         expected, _ = derive_expected(
             head_texts, base_branch=base_branch, changed=changed
         )
+        touched = workflow_files_in_diff(changed, workflows_dir)
         print(
             f"derivation: {len(head_texts)} workflow file(s) at head, "
             f"{len(changed)} changed path(s) vs {base_ref}, "
@@ -980,7 +1089,6 @@ def main(argv: list[str] | None = None) -> int:
         # Check B. Derive the SAME thing from the base branch — same event, same
         # changed-file list — so the two sides are comparable by construction, and
         # the difference is exactly "lanes this PR removed".
-        base_texts = read_workflow_tree_at(base_ref, workflows_dir)
         base_expected, base_skipped = derive_expected(
             base_texts,
             base_branch=base_branch,
@@ -988,9 +1096,10 @@ def main(argv: list[str] | None = None) -> int:
             tolerate_unreadable=True,
         )
         print(
-            f"base lanes: {len(base_texts)} workflow file(s) at {base_ref} -> "
+            f"base lanes: {len(base_texts)} workflow file(s) at fork point "
+            f"{fork_point[:10]} -> "
             f"{len(base_expected)} lane(s) for this same diff, "
-            f"{len(base_expected - expected)} no longer derivable at head"
+            f"{len(set(base_expected) - set(expected))} no longer derivable at head"
             + (f" ({len(base_skipped)} base file(s) unreadable, skipped)"
                if base_skipped else "")
         )
@@ -1020,6 +1129,8 @@ def main(argv: list[str] | None = None) -> int:
         posted=posted,
         base_lanes=base_expected,
         base_has_workflows=bool(base_texts),
+        pr_touched_workflow_files=touched,
+        base_skipped_files=set(base_skipped),
         waivers=waivers,
         pr_number=pr_number,
         settled=settled,

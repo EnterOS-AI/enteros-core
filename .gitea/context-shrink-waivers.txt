@@ -53,11 +53,22 @@
 #
 # WHAT THIS FILE IS NOT FOR
 # -------------------------
-# A workflow retired on MAIN while your PR sat open needs no waiver: the expected
-# set is derived from YOUR tree, so a lane that no longer exists upstream is simply
-# never expected. (Verified against core#4437, where 14 contexts vanished from a
-# doc-only PR because three workflows were deleted upstream — under this gate that
-# PR needs no entry here, and gets none.)
+# A workflow retired on MAIN while your PR sits open needs no waiver, and this is
+# worth spelling out because for one revision of the gate it was FALSE — the base
+# side was read from main's tip, so main's own commits were attributed to whatever
+# PR happened to be open, as an unwaivable hard error.
+#
+# Both checks are now insulated from main's independent movement:
+#   * Check A derives from YOUR tree, and Gitea runs PR workflows from
+#     `refs/pull/N/head` (measured: 33/33 runs), so what your branch carries is what
+#     runs and what is expected — the two cannot disagree because main moved.
+#   * Check B derives its base side at the MERGE-BASE, the commit where your branch
+#     forked. Anything main did after that point is in neither side of the
+#     comparison, so it cannot be blamed on you.
+#
+# (Verified against core#4437, where 14 contexts vanished from a doc-only PR because
+# three workflows were deleted upstream — that PR needs no entry here, and gets
+# none. Re-verified as attack A of the four the reviewer raised on core#5160.)
 #
 # Nor is it for a context that is merely RED. A red status already blocks under
 # branch protection ['*']. This gate only ever asks whether a lane RAN.

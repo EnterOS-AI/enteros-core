@@ -40,30 +40,22 @@ name: lint-context-set-shrink
 # the gate vanish for exactly the changes it exists to notice — its own failure
 # mode, applied to itself.
 #
-# NOT YET IN required-contexts.txt — TRACKED IN core#5158
+# ENFORCED VIA required-contexts.txt (core#5158)
 # --------------------------------------------------------
-# THE LAST HOLE IN THIS DESIGN, stated plainly: delete this workflow file and it
-# does not schedule at head, so Check B never executes, and branch protection
-# ['*'] requires nothing of a context that never posts. The gate cannot detect
-# its own removal. That is the same shape it exists to close, pointed at itself.
+# THE HOLE THIS CLOSES, stated plainly: delete this workflow file and it does not
+# schedule at head, so Check B never executes, and branch protection ['*'] requires
+# nothing of a context that never posts. The gate could not detect its own removal.
+# That is the same shape it exists to close, pointed at itself.
 #
-# It is NOT listed in .gitea/required-contexts.txt because adding it in the PR
-# that introduces it would red that PR with no way out: lint-phantom-gate Guard F
-# resolves every enforced entry against the LIVE Gitea Actions API, which does not
-# know a workflow until it lands on the default branch. During #5157 that API
-# returned 75 workflows while the head tree had 76, so the entry resolved to no
-# producer -> P2 phantom -> exit 1.
+# `lint-context-set-shrink / lint-context-set-shrink` is now listed ABOVE the first
+# `# pending-` marker in .gitea/required-contexts.txt, so
+# gitea-merge-queue.py::enforced_file_contexts_green scores it `missing` when it is
+# absent -> not green -> the queue blocks. A red already blocked under the ['*']
+# wildcard; listing adds the PRESENCE half.
 #
-# The follow-up is core#5158: once this is on main, add
-#
-#     lint-context-set-shrink / lint-context-set-shrink
-#
-# ABOVE the first `# pending-` marker. gitea-merge-queue.py's
-# enforced_file_contexts_green scores an absent enforced context as `missing` ->
-# not green -> the queue blocks, which is exactly the presence half that ['*']
-# cannot provide. A red from here already blocks under the wildcard, so listing
-# adds no new red exposure — it adds the half that makes the gate un-deletable by
-# accident.
+# It could not be listed in #5157, the PR that introduced this workflow:
+# lint-phantom-gate Guard F resolves enforced entries against the LIVE Actions API,
+# which did not know the workflow until it landed on the default branch (75 vs 76).
 #
 # Auth: the auto-injected GITHUB_TOKEN only. Reading combined commit statuses
 # needs nothing more, and an earlier draft of this gate that also called
@@ -89,8 +81,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # bp-exempt: meta-lint; gates through the ['*'] wildcard rather than by
-  # literal membership in branch protection. See the promotion note above.
+  # bp-required: pending #5158
+  #
+  # This context IS enforced: it is listed above the `# pending-` marker in
+  # .gitea/required-contexts.txt, so the merge queue presence-requires it — it must
+  # post AND be green on the PR head. The directive stays `pending` rather than
+  # `yes` for the same reason local-provision-e2e.yml's does: branch protection on
+  # main is status_check_contexts=['*'] and does not name any context literally,
+  # while `bp-required: yes` makes lint-required-context-exists-in-bp demand
+  # literal membership. #5158 tracks that repo-wide gap; it is not specific to this
+  # workflow.
   lint-context-set-shrink:
     name: lint-context-set-shrink
     runs-on: ubuntu-latest

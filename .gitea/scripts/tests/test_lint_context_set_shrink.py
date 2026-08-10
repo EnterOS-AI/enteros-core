@@ -327,13 +327,13 @@ def test_derive_expected_end_to_end():
             "jobs:\n  c:\n    name: C\n"
         ),
     }
-    assert lcss.derive_expected(tree, base_branch="main", changed=["main.go"])[0] == {
-        "Fires / A"
-    }
+    lanes, _ = lcss.derive_expected(tree, base_branch="main", changed=["main.go"])
+    assert lanes == {"Fires / A": "fires.yml"}
     # Same tree, a diff that DOES touch canvas: the filtered lane joins the set.
-    assert lcss.derive_expected(
+    lanes, _ = lcss.derive_expected(
         tree, base_branch="main", changed=["canvas/page.tsx"]
-    )[0] == {"Fires / A", "Filtered / C"}
+    )
+    assert lanes == {"Fires / A": "fires.yml", "Filtered / C": "filtered.yml"}
 
 
 def test_duplicate_env_key_still_derives_the_lane():
@@ -366,7 +366,8 @@ def test_duplicate_env_key_still_derives_the_lane():
         {"local-provision-e2e.yml": text}, base_branch="main", changed=["a.go"]
     )
     assert expected == {
-        "Local Provision Lifecycle E2E / Local Provision Lifecycle E2E (stub)"
+        "Local Provision Lifecycle E2E / Local Provision Lifecycle E2E (stub)":
+            "local-provision-e2e.yml"
     }
 
 
@@ -397,8 +398,60 @@ def test_unparseable_workflow_on_the_base_branch_is_skipped_not_fatal():
     expected, skipped = lcss.derive_expected(
         BROKEN_TREE, base_branch="main", changed=["a.go"], tolerate_unreadable=True
     )
-    assert expected == {"Fine / A"}
+    assert expected == {"Fine / A": "fine.yml"}
     assert skipped == ["broken.yml"]
+
+
+def test_base_tree_is_read_at_the_FORK_POINT_not_the_branch_tip():
+    """The single line that separated a gate from a queue-blocker.
+
+    Reading the base tree at `base_ref` — the branch TIP — while `changed` is
+    measured from the fork point makes the two sides differ by the PR's diff PLUS
+    everything main did since. Check B then attributes main's commits to the PR, so
+    a workflow retired upstream reds an innocent PR, and the `unexplained` return
+    happens before waivers are consulted, so it cannot even be waived. Main retired
+    a workflow in 15 distinct commits since 2026-05-01.
+
+    Asserting on the REF PASSED TO ls-tree, because that is the thing that was
+    wrong. A test that only checked the returned tree would pass against the broken
+    version whenever the tip and the fork point happen to agree — which is most of
+    the time, and never when it matters.
+    """
+    seen = []
+
+    def fake_git(*args):
+        seen.append(args)
+        if args[0] == "merge-base":
+            return "f0rkp01nt\n"
+        if args[0] == "rev-parse":
+            return "f0rkp01nt\n"
+        if args[0] == "ls-tree":
+            return "ci.yml\n"
+        if args[0] == "show":
+            return "name: CI\non:\n  pull_request:\njobs:\n  j:\n    name: J\n"
+        raise AssertionError(f"unexpected git call: {args}")
+
+    original = lcss.git
+    lcss.git = fake_git
+    try:
+        fork, texts = lcss.base_tree_at_fork(
+            "origin/main", "headsha", ".gitea/workflows"
+        )
+    finally:
+        lcss.git = original
+
+    assert fork == "f0rkp01nt"
+    assert texts == {
+        "ci.yml": "name: CI\non:\n  pull_request:\njobs:\n  j:\n    name: J\n"
+    }
+    ls_tree = [a for a in seen if a[0] == "ls-tree"]
+    assert ls_tree, "the tree was never listed"
+    assert ls_tree[0][-1] == "f0rkp01nt:.gitea/workflows", (
+        "base tree must be read at the MERGE-BASE, not at origin/main"
+    )
+    assert not any(
+        "origin/main" in str(a[-1]) for a in seen if a[0] in ("ls-tree", "show")
+    ), "no base-side tree read may reference the branch tip"
 
 
 def test_read_workflow_tree_at_raises_on_an_unresolvable_ref(monkeypatch):
@@ -446,6 +499,79 @@ def test_read_workflow_tree_at_returns_empty_when_only_the_directory_is_absent()
 
 
 # ---------------------------------------------------------------------------
+# Attribution input
+# ---------------------------------------------------------------------------
+# `workflow_files_in_diff` decides what counts as "the PR touched this", which is
+# the input the whole partial-blindness guard rests on. The decide() tests pass that
+# set in as a literal, so they cover the decision and NOT the thing that makes it
+# correct - the guard-covering-nothing shape, one rung up. Two of the mutants below
+# produce exactly the false red this design exists to avoid.
+def test_workflow_files_in_diff_returns_bare_filenames():
+    """Kills two mutants at once, and they are the dangerous pair.
+
+    Returning `set()`, or keeping the full path (which then never matches the bare
+    filename a lane is sourced from), both mean NOTHING is ever explained - so every
+    PR that adds a workflow reds. That is the exact false-red this gate must not
+    produce.
+    """
+    assert lcss.workflow_files_in_diff(
+        [".gitea/workflows/ci.yml", "workspace-server/main.go"], ".gitea/workflows"
+    ) == {"ci.yml"}
+
+
+def test_workflow_files_in_diff_excludes_paths_outside_the_directory():
+    """Kills the over-explaining mutant: without the prefix filter any changed path
+    explains any lane, and the guard silently stops guarding."""
+    assert lcss.workflow_files_in_diff(
+        ["docs/design/rfc.md", "ci.yml", "other/workflows/ci.yml"],
+        ".gitea/workflows",
+    ) == set()
+
+
+def test_workflow_files_in_diff_excludes_nested_subpaths():
+    """Also over-explaining. A workflow lane is sourced from a file directly in the
+    directory; a nested path is a different file that cannot have produced it."""
+    assert lcss.workflow_files_in_diff(
+        [".gitea/workflows/nested/deep.yml", ".gitea/workflows/flat.yml"],
+        ".gitea/workflows",
+    ) == {"flat.yml"}
+
+
+def test_workflow_files_in_diff_tolerates_a_trailing_slash_on_the_directory():
+    assert lcss.workflow_files_in_diff(
+        [".gitea/workflows/ci.yml"], ".gitea/workflows/"
+    ) == {"ci.yml"}
+
+
+def test_derive_expected_lane_source_tie_break_is_first_file_wins():
+    """Two files can claim the same lane if their `name:` and job names collide.
+
+    The mapping must resolve deterministically, and to the FIRST file in sorted
+    order - last-writer-wins survived mutation because nothing pinned it. Which file
+    wins matters: it is the file the partial-blindness guard will ask about.
+    """
+    body = "on:\n  pull_request:\njobs:\n  j:\n    name: J\n"
+    lanes, _ = lcss.derive_expected(
+        {"b-second.yml": "name: Dup\n" + body, "a-first.yml": "name: Dup\n" + body},
+        base_branch="main",
+        changed=["x.go"],
+    )
+    assert lanes == {"Dup / J": "a-first.yml"}
+
+
+def test_decide_does_not_blame_lanes_from_an_unreadable_base_file():
+    """A workflow that will not parse on the BASE side has its lanes skipped, so
+    they are absent from base_lanes through no fault of the PR. Blaming the PR for
+    that re-breaks the invariant derive_expected() is written to protect."""
+    v = _decide(
+        base_lanes={"A / a": "a.yml"},
+        pr_touched_workflow_files=set(),
+        base_skipped_files={"b.yml"},
+    )
+    assert (v.verdict, v.exit_code) == (lcss.OK, 0)
+
+
+# ---------------------------------------------------------------------------
 # Waivers
 # ---------------------------------------------------------------------------
 def test_parse_waivers_accepts_a_documented_entry():
@@ -490,17 +616,23 @@ def test_parse_waivers_ignores_a_comment_only_file():
 # ---------------------------------------------------------------------------
 def _decide(**kw):
     args = dict(
-        expected={"A / a", "B / b"},
+        # `expected` and `base_lanes` are lane -> SOURCE WORKFLOW FILE. The mapping
+        # is what lets the partial-blindness guard ask the only question that
+        # separates a legitimately smaller base from a short read: which file
+        # produced this lane, and did the PR touch it?
+        expected={"A / a": "a.yml", "B / b": "b.yml"},
         posted={"A / a", "B / b"},
         # Check B's base side. Equal to `expected` by default, so the default case
-        # has nothing removed AND is not vacuous. A default of `set()` would run
-        # every test below against a silently disabled Check B.
-        base_lanes={"A / a", "B / b"},
+        # has nothing removed AND is not vacuous. A default of `{}` would run every
+        # test below against a silently disabled Check B.
+        base_lanes={"A / a": "a.yml", "B / b": "b.yml"},
         waivers=[],
         pr_number=1,
         settled=True,
         head_has_workflows=True,
         base_has_workflows=True,
+        pr_touched_workflow_files=set(),
+        base_skipped_files=set(),
     )
     args.update(kw)
     return lcss.decide(**args)
@@ -524,10 +656,62 @@ def test_decide_flags_a_lane_the_pr_removed():
     """Check B. Check A cannot see a removal - delete the workflow, or narrow its
     `on:`, and the expectation disappears along with the lane."""
     gone = "E2E Staging SaaS (full lifecycle) / E2E Staging SaaS"
-    v = _decide(base_lanes={"A / a", "B / b", gone})
+    v = _decide(
+        base_lanes={"A / a": "a.yml", "B / b": "b.yml", gone: "staging-saas.yml"}
+    )
     assert (v.verdict, v.exit_code) == (lcss.MISSING, 1)
     assert v.removed == [gone]
     assert v.missing == [], "a removed lane is not also reported as never-posted"
+
+
+# ---------------------------------------------------------------------------
+# Check B partial blindness
+# ---------------------------------------------------------------------------
+def test_decide_errors_when_the_base_side_is_only_partially_read():
+    """base_lanes = 1 against expected = 2 passes every total-emptiness guard while
+    Check B is half blind, and the numbers do not look wrong on their own.
+
+    `B / b` comes from `b.yml`, which this PR never touched, so it cannot
+    legitimately be a new lane - the base read must have come back short.
+    """
+    v = _decide(
+        base_lanes={"A / a": "a.yml"},
+        pr_touched_workflow_files=set(),
+    )
+    assert (v.verdict, v.exit_code) == (lcss.ERROR, 2)
+    assert "PARTIALLY blind" in v.detail
+    assert "b.yml" in v.detail
+
+
+def test_decide_does_not_red_a_pr_that_legitimately_adds_workflows():
+    """THE half that matters: a smaller base is NORMAL when the PR adds lanes.
+
+    Same shape as the test above - base has one lane, head expects two - and the
+    ONLY difference is that `b.yml` appears in this PR's diff. A ratio-based floor
+    could not tell these two apart, which is why the check is attribution and not
+    arithmetic. This is exactly what #5157 did: base 75 files / 44 lanes, head 76 /
+    45.
+    """
+    v = _decide(
+        base_lanes={"A / a": "a.yml"},
+        pr_touched_workflow_files={"b.yml"},
+    )
+    assert (v.verdict, v.exit_code) == (lcss.OK, 0)
+    assert v.removed == [] and v.missing == []
+
+
+def test_decide_partial_blindness_check_accepts_a_job_added_to_an_existing_file():
+    """A PR may also introduce a lane by adding a JOB to a workflow that already
+    exists on base. The file is in the diff, so attribution still explains it -
+    a check keyed on 'is this a NEW file' rather than 'did the PR touch this file'
+    would red this honest case."""
+    v = _decide(
+        expected={"A / a": "a.yml", "A / a2": "a.yml"},
+        posted={"A / a", "A / a2"},
+        base_lanes={"A / a": "a.yml"},
+        pr_touched_workflow_files={"a.yml"},
+    )
+    assert (v.verdict, v.exit_code) == (lcss.OK, 0)
 
 
 def test_decide_errors_when_check_b_has_no_base_side_to_compare():
