@@ -597,6 +597,7 @@ def decide(
     head_has_workflows: bool,
     base_has_workflows: bool,
     pr_touched_workflow_files: set[str] = frozenset(),
+    base_skipped_files: set[str] = frozenset(),
 ) -> Verdict:
     """Pure decision function. Every branch below is reachable from a test.
 
@@ -671,6 +672,7 @@ def decide(
         lane
         for lane in set(expected) - set(base_lanes)
         if expected.get(lane) not in pr_touched_workflow_files
+        and expected.get(lane) not in base_skipped_files
     )
     if unexplained:
         return Verdict(
@@ -686,7 +688,10 @@ def decide(
                 + ", ".join(
                     f"{lane!r} (from {expected.get(lane)})" for lane in unexplained[:3]
                 )
-                + ". Check BASE_REF and that the base branch is fully fetched."
+                + ". The base side is read at the MERGE-BASE, so main moving on "
+                "cannot cause this; it means the fork-point tree could not be read "
+                "in full. Check that the base branch is fetched deeply enough for "
+                "`git merge-base` and `git show <fork>:...` to resolve."
             ),
         )
     if not posted:
@@ -854,15 +859,48 @@ def git(*args: str) -> str:
     return result.stdout
 
 
-def changed_files(base_ref: str, head_sha: str) -> list[str]:
-    """Files this PR changes, measured against the MERGE-BASE.
+def merge_base(base_ref: str, head_sha: str) -> str:
+    """The commit where this PR forked from its base branch.
 
-    Against the merge-base, not the base ref tip: main advances while a PR is open,
-    and diffing against a moving tip attributes other people's merges to this PR,
-    which would fire `paths:`-filtered workflows in the derivation that Gitea never
-    scheduled.
+    EVERY base-side read in this gate resolves through here, and that is the whole
+    point. An earlier version diffed `changed` against the merge-base but read the
+    base WORKFLOW TREE from the base branch's TIP, so the two sides differed by the
+    PR's diff PLUS everything main had done since the fork — and Check B attributed
+    all of it to the PR. A workflow retired on main while a PR sat open then reded
+    that PR, unwaivably, for someone else's commit. Measured: main retired a
+    workflow in 15 distinct commits since 2026-05-01, four of them in one week.
+
+    Comparing against the fork point makes Check B's premise true by construction,
+    and states its intent better: "lanes that existed where this PR forked and are
+    gone at its head" is exactly the set attributable to the PR.
     """
-    fork_point = git("merge-base", base_ref, head_sha).strip()
+    return git("merge-base", base_ref, head_sha).strip()
+
+
+def base_tree_at_fork(
+    base_ref: str, head_sha: str, directory: str
+) -> tuple[str, dict[str, str]]:
+    """`(fork point, workflow tree there)` — Check B's base side, in one place.
+
+    This exists as its own function so the choice of ref is reachable from a unit
+    test. It is the single line that made the difference between a gate and a
+    queue-blocker: reading the tree at `base_ref` (the branch TIP) instead of at the
+    fork point attributes everything main did since the fork to the PR, and a
+    workflow retired upstream then reds an innocent PR unwaivably. Buried inside
+    `main()` alongside the network calls, that swap survived mutation testing
+    because nothing could reach it.
+    """
+    fork_point = merge_base(base_ref, head_sha)
+    return fork_point, read_workflow_tree_at(fork_point, directory)
+
+
+def changed_files(fork_point: str, head_sha: str) -> list[str]:
+    """Files this PR changes, measured from the fork point.
+
+    Not from the base branch tip: main advances while a PR is open, and diffing
+    against a moving tip attributes other people's merges to this PR, which would
+    fire `paths:`-filtered workflows in the derivation that Gitea never scheduled.
+    """
     out = git("diff", "--name-only", fork_point, head_sha)
     return [line.strip() for line in out.splitlines() if line.strip()]
 
@@ -1036,7 +1074,8 @@ def main(argv: list[str] | None = None) -> int:
 
     api = Gitea(api_url, token, repo)
     try:
-        changed = changed_files(base_ref, head_sha)
+        fork_point, base_texts = base_tree_at_fork(base_ref, head_sha, workflows_dir)
+        changed = changed_files(fork_point, head_sha)
         head_texts = read_workflow_tree(workflows_dir)
         expected, _ = derive_expected(
             head_texts, base_branch=base_branch, changed=changed
@@ -1050,7 +1089,6 @@ def main(argv: list[str] | None = None) -> int:
         # Check B. Derive the SAME thing from the base branch — same event, same
         # changed-file list — so the two sides are comparable by construction, and
         # the difference is exactly "lanes this PR removed".
-        base_texts = read_workflow_tree_at(base_ref, workflows_dir)
         base_expected, base_skipped = derive_expected(
             base_texts,
             base_branch=base_branch,
@@ -1058,7 +1096,8 @@ def main(argv: list[str] | None = None) -> int:
             tolerate_unreadable=True,
         )
         print(
-            f"base lanes: {len(base_texts)} workflow file(s) at {base_ref} -> "
+            f"base lanes: {len(base_texts)} workflow file(s) at fork point "
+            f"{fork_point[:10]} -> "
             f"{len(base_expected)} lane(s) for this same diff, "
             f"{len(set(base_expected) - set(expected))} no longer derivable at head"
             + (f" ({len(base_skipped)} base file(s) unreadable, skipped)"
@@ -1091,6 +1130,7 @@ def main(argv: list[str] | None = None) -> int:
         base_lanes=base_expected,
         base_has_workflows=bool(base_texts),
         pr_touched_workflow_files=touched,
+        base_skipped_files=set(base_skipped),
         waivers=waivers,
         pr_number=pr_number,
         settled=settled,

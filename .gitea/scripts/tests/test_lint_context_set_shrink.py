@@ -402,6 +402,58 @@ def test_unparseable_workflow_on_the_base_branch_is_skipped_not_fatal():
     assert skipped == ["broken.yml"]
 
 
+def test_base_tree_is_read_at_the_FORK_POINT_not_the_branch_tip():
+    """The single line that separated a gate from a queue-blocker.
+
+    Reading the base tree at `base_ref` — the branch TIP — while `changed` is
+    measured from the fork point makes the two sides differ by the PR's diff PLUS
+    everything main did since. Check B then attributes main's commits to the PR, so
+    a workflow retired upstream reds an innocent PR, and the `unexplained` return
+    happens before waivers are consulted, so it cannot even be waived. Main retired
+    a workflow in 15 distinct commits since 2026-05-01.
+
+    Asserting on the REF PASSED TO ls-tree, because that is the thing that was
+    wrong. A test that only checked the returned tree would pass against the broken
+    version whenever the tip and the fork point happen to agree — which is most of
+    the time, and never when it matters.
+    """
+    seen = []
+
+    def fake_git(*args):
+        seen.append(args)
+        if args[0] == "merge-base":
+            return "f0rkp01nt\n"
+        if args[0] == "rev-parse":
+            return "f0rkp01nt\n"
+        if args[0] == "ls-tree":
+            return "ci.yml\n"
+        if args[0] == "show":
+            return "name: CI\non:\n  pull_request:\njobs:\n  j:\n    name: J\n"
+        raise AssertionError(f"unexpected git call: {args}")
+
+    original = lcss.git
+    lcss.git = fake_git
+    try:
+        fork, texts = lcss.base_tree_at_fork(
+            "origin/main", "headsha", ".gitea/workflows"
+        )
+    finally:
+        lcss.git = original
+
+    assert fork == "f0rkp01nt"
+    assert texts == {
+        "ci.yml": "name: CI\non:\n  pull_request:\njobs:\n  j:\n    name: J\n"
+    }
+    ls_tree = [a for a in seen if a[0] == "ls-tree"]
+    assert ls_tree, "the tree was never listed"
+    assert ls_tree[0][-1] == "f0rkp01nt:.gitea/workflows", (
+        "base tree must be read at the MERGE-BASE, not at origin/main"
+    )
+    assert not any(
+        "origin/main" in str(a[-1]) for a in seen if a[0] in ("ls-tree", "show")
+    ), "no base-side tree read may reference the branch tip"
+
+
 def test_read_workflow_tree_at_raises_on_an_unresolvable_ref(monkeypatch):
     """The ref must be RESOLVED before the tree is listed.
 
@@ -444,6 +496,79 @@ def test_read_workflow_tree_at_returns_empty_when_only_the_directory_is_absent()
     finally:
         lcss.git = original
     assert seen == ["rev-parse", "ls-tree"]
+
+
+# ---------------------------------------------------------------------------
+# Attribution input
+# ---------------------------------------------------------------------------
+# `workflow_files_in_diff` decides what counts as "the PR touched this", which is
+# the input the whole partial-blindness guard rests on. The decide() tests pass that
+# set in as a literal, so they cover the decision and NOT the thing that makes it
+# correct - the guard-covering-nothing shape, one rung up. Two of the mutants below
+# produce exactly the false red this design exists to avoid.
+def test_workflow_files_in_diff_returns_bare_filenames():
+    """Kills two mutants at once, and they are the dangerous pair.
+
+    Returning `set()`, or keeping the full path (which then never matches the bare
+    filename a lane is sourced from), both mean NOTHING is ever explained - so every
+    PR that adds a workflow reds. That is the exact false-red this gate must not
+    produce.
+    """
+    assert lcss.workflow_files_in_diff(
+        [".gitea/workflows/ci.yml", "workspace-server/main.go"], ".gitea/workflows"
+    ) == {"ci.yml"}
+
+
+def test_workflow_files_in_diff_excludes_paths_outside_the_directory():
+    """Kills the over-explaining mutant: without the prefix filter any changed path
+    explains any lane, and the guard silently stops guarding."""
+    assert lcss.workflow_files_in_diff(
+        ["docs/design/rfc.md", "ci.yml", "other/workflows/ci.yml"],
+        ".gitea/workflows",
+    ) == set()
+
+
+def test_workflow_files_in_diff_excludes_nested_subpaths():
+    """Also over-explaining. A workflow lane is sourced from a file directly in the
+    directory; a nested path is a different file that cannot have produced it."""
+    assert lcss.workflow_files_in_diff(
+        [".gitea/workflows/nested/deep.yml", ".gitea/workflows/flat.yml"],
+        ".gitea/workflows",
+    ) == {"flat.yml"}
+
+
+def test_workflow_files_in_diff_tolerates_a_trailing_slash_on_the_directory():
+    assert lcss.workflow_files_in_diff(
+        [".gitea/workflows/ci.yml"], ".gitea/workflows/"
+    ) == {"ci.yml"}
+
+
+def test_derive_expected_lane_source_tie_break_is_first_file_wins():
+    """Two files can claim the same lane if their `name:` and job names collide.
+
+    The mapping must resolve deterministically, and to the FIRST file in sorted
+    order - last-writer-wins survived mutation because nothing pinned it. Which file
+    wins matters: it is the file the partial-blindness guard will ask about.
+    """
+    body = "on:\n  pull_request:\njobs:\n  j:\n    name: J\n"
+    lanes, _ = lcss.derive_expected(
+        {"b-second.yml": "name: Dup\n" + body, "a-first.yml": "name: Dup\n" + body},
+        base_branch="main",
+        changed=["x.go"],
+    )
+    assert lanes == {"Dup / J": "a-first.yml"}
+
+
+def test_decide_does_not_blame_lanes_from_an_unreadable_base_file():
+    """A workflow that will not parse on the BASE side has its lanes skipped, so
+    they are absent from base_lanes through no fault of the PR. Blaming the PR for
+    that re-breaks the invariant derive_expected() is written to protect."""
+    v = _decide(
+        base_lanes={"A / a": "a.yml"},
+        pr_touched_workflow_files=set(),
+        base_skipped_files={"b.yml"},
+    )
+    assert (v.verdict, v.exit_code) == (lcss.OK, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +632,7 @@ def _decide(**kw):
         head_has_workflows=True,
         base_has_workflows=True,
         pr_touched_workflow_files=set(),
+        base_skipped_files=set(),
     )
     args.update(kw)
     return lcss.decide(**args)
