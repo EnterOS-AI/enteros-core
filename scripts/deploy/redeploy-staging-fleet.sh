@@ -677,7 +677,10 @@ if [ "$K8S_DISPATCH" = "1" ]; then
 fi
 
 if [ "$FAILED" != 0 ]; then
-  echo "::error::fleet redeploy had at least one failure (see log above; ${K8S_ROLLED_NOTE})" >&2
+  echo "::error::staging fleet redeploy had at least one failure (see log above; ${K8S_ROLLED_NOTE})" >&2
   exit 1
 fi
-log "fleet redeploy complete (image=${IMAGE}, docker tenants=${#TENANTS[@]}, ${K8S_ROLLED_NOTE})"
+# Success phrase kept VERBATIM: .gitea/scripts/tests/test_redeploy_staging_fleet_candidate_guard.py
+# asserts this exact substring as the marker that the health-gated path ran to
+# completion. The substrate detail is appended, not substituted.
+log "staging fleet + shared canvas app redeploy complete (image=${IMAGE}, docker tenants=${#TENANTS[@]}, ${K8S_ROLLED_NOTE})"
