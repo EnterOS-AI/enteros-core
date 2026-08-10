@@ -302,11 +302,38 @@ e2e_scheduler_backstop_secs() {
 # code added by the same change, and "not reachable today" is precisely how that
 # one started. Two lines of `case` is cheaper than the next person rediscovering
 # the pattern from a confusing log line.
+# AN UNPARSEABLE COUNTER READS AS ITS OWN STATE, NOT AS THE REASSURING ONE. The
+# first version normalised garbage to 0, which lands on NOT POLLED — "not a gap,
+# the evidence arrived faster than the detector needed to look". That is the most
+# comforting of the three labels, and it would be asserted about a run where the
+# instrumentation is corrupt and we know nothing at all. Degrading to the benign
+# reading is the same error as a guard reporting success on zero rows.
+#
+# Empty is NOT garbage: `${…:-0}` maps unset/empty to 0, which is the true
+# starting value of both counters, so an empty counter legitimately reads as
+# NOT POLLED. Only a value that is present and unusable (`abc`, `-1`, `3x`)
+# trips the fourth state.
 scheduler_progress_report() {
-  local _samples="${TRIGGER_DAEMON_PROGRESS_SAMPLES:-0}" _reads="${TRIGGER_DAEMON_PROGRESS_READS:-0}"
-  case "$_samples" in ''|*[!0-9]*) _samples=0 ;; esac
-  case "$_reads"   in ''|*[!0-9]*) _reads=0 ;; esac
-  if [ "$_samples" -gt 0 ]; then
+  # ONE normalisation point, and every branch reachable. The first version paired
+  # `${…:-0}` with a `case` whose pattern still listed `''` — but `:-` had already
+  # turned empty into `0`, so that arm could never match. An unreachable branch is
+  # the exact shape this change set has spent its whole life deleting, so it is
+  # not left in as belt-and-braces: the `-` default passes empty THROUGH and the
+  # `case` decides, which keeps the two outcomes explicit and both arms live.
+  #   ''        -> 0, the counters' true starting value  -> NOT POLLED
+  #   non-digit -> corrupt                               -> COUNTERS UNREADABLE
+  local _samples="${TRIGGER_DAEMON_PROGRESS_SAMPLES-}" _reads="${TRIGGER_DAEMON_PROGRESS_READS-}" _bad=""
+  case "$_samples" in
+    '') _samples=0 ;;
+    *[!0-9]*) _bad="samples='$_samples'"; _samples=0 ;;
+  esac
+  case "$_reads" in
+    '') _reads=0 ;;
+    *[!0-9]*) _bad="${_bad:+$_bad }reads='$_reads'"; _reads=0 ;;
+  esac
+  if [ -n "$_bad" ]; then
+    log "    [$1] delivery-stall detector COUNTERS UNREADABLE ($_bad) — the instrumentation itself is corrupt, so this leg carries no evidence in EITHER direction. Not the benign 'returned before the first read' case: that one is a real observation, this is the absence of one."
+  elif [ "$_samples" -gt 0 ]; then
     log "    [$1] delivery-stall detector ARMED: ${_samples}/${_reads} attempt-log reads readable, ${TRIGGER_DAEMON_PROGRESS_TRANSITIONS} observed advancement(s), ${TRIGGER_DAEMON_PROGRESS_AGE:-0}s since the last one."
   elif [ "$_reads" -eq 0 ]; then
     log "    [$1] delivery-stall detector NOT POLLED — the wait returned on its probe before the first read. Not a gap: the evidence arrived faster than the detector needed to look."
