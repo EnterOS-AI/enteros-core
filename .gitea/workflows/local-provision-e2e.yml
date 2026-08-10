@@ -543,7 +543,6 @@ jobs:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
-        env:
           TRANSIENT_LEDGER: /tmp/lpe2e_transient_${{ github.run_id }}_${{ github.run_attempt }}.txt
         run: |
           set -uo pipefail
