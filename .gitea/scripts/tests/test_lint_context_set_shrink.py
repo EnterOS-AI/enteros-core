@@ -327,13 +327,13 @@ def test_derive_expected_end_to_end():
             "jobs:\n  c:\n    name: C\n"
         ),
     }
-    assert lcss.derive_expected(tree, base_branch="main", changed=["main.go"])[0] == {
-        "Fires / A"
-    }
+    lanes, _ = lcss.derive_expected(tree, base_branch="main", changed=["main.go"])
+    assert lanes == {"Fires / A": "fires.yml"}
     # Same tree, a diff that DOES touch canvas: the filtered lane joins the set.
-    assert lcss.derive_expected(
+    lanes, _ = lcss.derive_expected(
         tree, base_branch="main", changed=["canvas/page.tsx"]
-    )[0] == {"Fires / A", "Filtered / C"}
+    )
+    assert lanes == {"Fires / A": "fires.yml", "Filtered / C": "filtered.yml"}
 
 
 def test_duplicate_env_key_still_derives_the_lane():
@@ -366,7 +366,8 @@ def test_duplicate_env_key_still_derives_the_lane():
         {"local-provision-e2e.yml": text}, base_branch="main", changed=["a.go"]
     )
     assert expected == {
-        "Local Provision Lifecycle E2E / Local Provision Lifecycle E2E (stub)"
+        "Local Provision Lifecycle E2E / Local Provision Lifecycle E2E (stub)":
+            "local-provision-e2e.yml"
     }
 
 
@@ -397,7 +398,7 @@ def test_unparseable_workflow_on_the_base_branch_is_skipped_not_fatal():
     expected, skipped = lcss.derive_expected(
         BROKEN_TREE, base_branch="main", changed=["a.go"], tolerate_unreadable=True
     )
-    assert expected == {"Fine / A"}
+    assert expected == {"Fine / A": "fine.yml"}
     assert skipped == ["broken.yml"]
 
 
@@ -490,17 +491,22 @@ def test_parse_waivers_ignores_a_comment_only_file():
 # ---------------------------------------------------------------------------
 def _decide(**kw):
     args = dict(
-        expected={"A / a", "B / b"},
+        # `expected` and `base_lanes` are lane -> SOURCE WORKFLOW FILE. The mapping
+        # is what lets the partial-blindness guard ask the only question that
+        # separates a legitimately smaller base from a short read: which file
+        # produced this lane, and did the PR touch it?
+        expected={"A / a": "a.yml", "B / b": "b.yml"},
         posted={"A / a", "B / b"},
         # Check B's base side. Equal to `expected` by default, so the default case
-        # has nothing removed AND is not vacuous. A default of `set()` would run
-        # every test below against a silently disabled Check B.
-        base_lanes={"A / a", "B / b"},
+        # has nothing removed AND is not vacuous. A default of `{}` would run every
+        # test below against a silently disabled Check B.
+        base_lanes={"A / a": "a.yml", "B / b": "b.yml"},
         waivers=[],
         pr_number=1,
         settled=True,
         head_has_workflows=True,
         base_has_workflows=True,
+        pr_touched_workflow_files=set(),
     )
     args.update(kw)
     return lcss.decide(**args)
@@ -524,10 +530,62 @@ def test_decide_flags_a_lane_the_pr_removed():
     """Check B. Check A cannot see a removal - delete the workflow, or narrow its
     `on:`, and the expectation disappears along with the lane."""
     gone = "E2E Staging SaaS (full lifecycle) / E2E Staging SaaS"
-    v = _decide(base_lanes={"A / a", "B / b", gone})
+    v = _decide(
+        base_lanes={"A / a": "a.yml", "B / b": "b.yml", gone: "staging-saas.yml"}
+    )
     assert (v.verdict, v.exit_code) == (lcss.MISSING, 1)
     assert v.removed == [gone]
     assert v.missing == [], "a removed lane is not also reported as never-posted"
+
+
+# ---------------------------------------------------------------------------
+# Check B partial blindness
+# ---------------------------------------------------------------------------
+def test_decide_errors_when_the_base_side_is_only_partially_read():
+    """base_lanes = 1 against expected = 2 passes every total-emptiness guard while
+    Check B is half blind, and the numbers do not look wrong on their own.
+
+    `B / b` comes from `b.yml`, which this PR never touched, so it cannot
+    legitimately be a new lane - the base read must have come back short.
+    """
+    v = _decide(
+        base_lanes={"A / a": "a.yml"},
+        pr_touched_workflow_files=set(),
+    )
+    assert (v.verdict, v.exit_code) == (lcss.ERROR, 2)
+    assert "PARTIALLY blind" in v.detail
+    assert "b.yml" in v.detail
+
+
+def test_decide_does_not_red_a_pr_that_legitimately_adds_workflows():
+    """THE half that matters: a smaller base is NORMAL when the PR adds lanes.
+
+    Same shape as the test above - base has one lane, head expects two - and the
+    ONLY difference is that `b.yml` appears in this PR's diff. A ratio-based floor
+    could not tell these two apart, which is why the check is attribution and not
+    arithmetic. This is exactly what #5157 did: base 75 files / 44 lanes, head 76 /
+    45.
+    """
+    v = _decide(
+        base_lanes={"A / a": "a.yml"},
+        pr_touched_workflow_files={"b.yml"},
+    )
+    assert (v.verdict, v.exit_code) == (lcss.OK, 0)
+    assert v.removed == [] and v.missing == []
+
+
+def test_decide_partial_blindness_check_accepts_a_job_added_to_an_existing_file():
+    """A PR may also introduce a lane by adding a JOB to a workflow that already
+    exists on base. The file is in the diff, so attribution still explains it -
+    a check keyed on 'is this a NEW file' rather than 'did the PR touch this file'
+    would red this honest case."""
+    v = _decide(
+        expected={"A / a": "a.yml", "A / a2": "a.yml"},
+        posted={"A / a", "A / a2"},
+        base_lanes={"A / a": "a.yml"},
+        pr_touched_workflow_files={"a.yml"},
+    )
+    assert (v.verdict, v.exit_code) == (lcss.OK, 0)
 
 
 def test_decide_errors_when_check_b_has_no_base_side_to_compare():
