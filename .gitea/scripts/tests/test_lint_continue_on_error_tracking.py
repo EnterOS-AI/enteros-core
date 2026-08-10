@@ -260,118 +260,107 @@ class TestValidateTracker(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
-class TestDesignTokenDriftGateWorkflow(unittest.TestCase):
-    """Pin the live workflow file: drift job must have a fresh, open
-    tracker reference. Regression guard for mc#3089 (governance decision:
-    keep fail-soft + renew tracker until the gate promotes to required)."""
+class TestUnmaskedWorkflowsStayUnmasked(unittest.TestCase):
+    """Pin the mc#4602 / mc#4603 close-out.
+
+    These two jobs previously asserted the OPPOSITE — that `drift` and
+    `lifecycle-real` MUST carry `continue-on-error: true` — because the
+    governance decision at the time was to keep the masks and renew their
+    trackers. Both masks were removed instead of renewed a fourth time:
+
+      * `drift` was masking a gate that could not run at all
+        (APP_SSOT_READ_TOKEN was never provisioned, so the script always
+        took its skip branch). It now reads DRIFT_BOT_TOKEN from the
+        Infisical SSOT and compares 15 shared tokens x {light, dark}.
+      * `lifecycle-real` was promoted on 9 days of LOG evidence
+        (279 runs, 278 x "18 passed, 0 failed", 0 skip-path exits, and one
+        run cancelled on a superseded head), which is what mc#2408 asked
+        for.
+
+    So the pin is inverted: a silent RE-MASK of either job is now the
+    regression to catch.
+    """
 
     REPO_ROOT = Path(__file__).resolve().parents[3]
-    WORKFLOW_PATH = (
-        REPO_ROOT / ".gitea" / "workflows" / "design-token-drift-gate.yml"
-    )
+    UNMASKED = {
+        "design-token-drift-gate.yml": "drift",
+        "local-provision-e2e.yml": "lifecycle-real",
+    }
 
-    def test_workflow_has_drift_with_truthy_coe(self):
-        """The live workflow must contain the drift job with
-        continue-on-error: true (governance decision per mc#3089:
-        Phase-1 advisory gate, keep fail-soft until promote to required)."""
-        self.assertTrue(
-            self.WORKFLOW_PATH.exists(),
-            f"workflow not found at {self.WORKFLOW_PATH}",
-        )
-        raw = self.WORKFLOW_PATH.read_text(encoding="utf-8")
+    def _coe_jobs(self, filename):
+        path = self.REPO_ROOT / ".gitea" / "workflows" / filename
+        self.assertTrue(path.exists(), f"workflow not found at {path}")
+        raw = path.read_text(encoding="utf-8")
         doc = lcoet.yaml.load(raw, Loader=lcoet._LineLoader)
-        raw_lines = raw.splitlines()
-        locs = lcoet.find_coe_truthies(doc, raw_lines)
-        coe_jobs = {jkey for jkey, _ in locs}
-        self.assertIn(
-            "drift",
-            coe_jobs,
-            f"drift job must have continue-on-error: true; "
-            f"found coe jobs: {coe_jobs}",
-        )
+        return {jkey for jkey, _ in lcoet.find_coe_truthies(doc, raw.splitlines())}
 
-    def test_workflow_drift_has_tracker_in_window(self):
-        """The drift job's continue-on-error directive must have a
-        `# mc#NNN` or `# internal#NNN` tracker within 2 lines."""
-        raw = self.WORKFLOW_PATH.read_text(encoding="utf-8")
-        doc = lcoet.yaml.load(raw, Loader=lcoet._LineLoader)
-        raw_lines = raw.splitlines()
-        locs = lcoet.find_coe_truthies(doc, raw_lines)
-        for jkey, line in locs:
-            if jkey == "drift":
-                tracker = lcoet.find_tracker_in_window(raw_lines, line)
-                self.assertIsNotNone(
-                    tracker,
-                    f"drift at line {line} has no tracker comment within "
-                    f"±{lcoet.WINDOW} lines. Per mc#3089, the fail-soft "
-                    f"mask must carry a fresh mc#NNNN reference.",
+    def test_unmasked_jobs_have_no_truthy_coe(self):
+        for filename, job in self.UNMASKED.items():
+            with self.subTest(workflow=filename, job=job):
+                coe_jobs = self._coe_jobs(filename)
+                self.assertNotIn(
+                    job,
+                    coe_jobs,
+                    f"{job} was UNMASKED deliberately (mc#4602 / mc#4603 "
+                    f"close-out) and must not regain continue-on-error: true "
+                    f"silently. If the mask is genuinely needed again, that is "
+                    f"a governance decision: re-add it WITH a fresh open "
+                    f"tracker inside the {lcoet.WINDOW}-line window and update "
+                    f"this test. found coe jobs: {coe_jobs}",
                 )
-                slug, num = tracker
-                self.assertEqual(slug, "mc", "tracker slug should be 'mc'")
-                self.assertGreater(
-                    num, 0, f"tracker number must be positive, got {num}"
-                )
-                return
-        self.fail("drift coe directive not found")
 
 
 # --------------------------------------------------------------------------
-# End-to-end fixture pin: the real .gitea/workflows/local-provision-e2e.yml
+# Repo-wide invariant over the LIVE workflow tree
 # --------------------------------------------------------------------------
-class TestLocalProvisionE2eWorkflow(unittest.TestCase):
-    """Pin the live workflow file: lifecycle-real job must have a fresh,
-    open tracker reference. Regression guard for mc#2408 (governance
-    decision: keep fail-soft + renew tracker; promote to gating when
-    docker-host + MiniMax API are stable)."""
+class TestLiveWorkflowTrackerInvariant(unittest.TestCase):
+    """Every `continue-on-error: true` still present in the repo must carry a
+    tracker reference within the scan window.
+
+    This replaces the two per-job pins with the rule they were instances of,
+    so it keeps protecting the masks that remain (and any added later) rather
+    than only the two that happened to exist when it was written.
+    """
 
     REPO_ROOT = Path(__file__).resolve().parents[3]
-    WORKFLOW_PATH = (
-        REPO_ROOT / ".gitea" / "workflows" / "local-provision-e2e.yml"
-    )
+    WORKFLOWS_DIR = REPO_ROOT / ".gitea" / "workflows"
 
-    def test_workflow_has_lifecycle_real_with_truthy_coe(self):
-        """The live workflow must contain the lifecycle-real job with
-        continue-on-error: true (governance decision per mc#2408)."""
-        self.assertTrue(
-            self.WORKFLOW_PATH.exists(),
-            f"workflow not found at {self.WORKFLOW_PATH}",
-        )
-        raw = self.WORKFLOW_PATH.read_text(encoding="utf-8")
-        doc = lcoet.yaml.load(raw, Loader=lcoet._LineLoader)
-        raw_lines = raw.splitlines()
-        locs = lcoet.find_coe_truthies(doc, raw_lines)
-        coe_jobs = {jkey for jkey, _ in locs}
-        self.assertIn(
-            "lifecycle-real",
-            coe_jobs,
-            f"lifecycle-real must have continue-on-error: true; "
-            f"found coe jobs: {coe_jobs}",
-        )
-
-    def test_workflow_lifecycle_real_has_tracker_in_window(self):
-        """The lifecycle-real job's continue-on-error directive must
-        have a `# mc#NNN` or `# internal#NNN` tracker within 2 lines."""
-        raw = self.WORKFLOW_PATH.read_text(encoding="utf-8")
-        doc = lcoet.yaml.load(raw, Loader=lcoet._LineLoader)
-        raw_lines = raw.splitlines()
-        locs = lcoet.find_coe_truthies(doc, raw_lines)
-        for jkey, line in locs:
-            if jkey == "lifecycle-real":
+    def test_every_live_coe_has_a_tracker_in_window(self):
+        checked = 0
+        untracked = []
+        # Enumerate via the LINT'S OWN file-discovery helper rather than a
+        # local glob. A local `*.yml` glob was narrower than the rule it
+        # guards — the lint also reads `*.yaml`, so a mask added in a
+        # `.yaml` workflow would be enforced by the lint and invisible here.
+        # No `.yaml` workflow exists today, so this closes a latent gap
+        # rather than a live one, and it cannot re-open by drift.
+        for path in lcoet._iter_workflow_files(self.WORKFLOWS_DIR):
+            raw = path.read_text(encoding="utf-8")
+            try:
+                doc = lcoet.yaml.load(raw, Loader=lcoet._LineLoader)
+            except lcoet.yaml.YAMLError:
+                continue  # lint-workflow-yaml covers parse errors separately
+            raw_lines = raw.splitlines()
+            for jkey, line in lcoet.find_coe_truthies(doc, raw_lines):
+                checked += 1
                 tracker = lcoet.find_tracker_in_window(raw_lines, line)
-                self.assertIsNotNone(
-                    tracker,
-                    f"lifecycle-real at line {line} has no tracker "
-                    f"comment within ±{lcoet.WINDOW} lines. Per mc#2408, "
-                    f"the fail-soft mask must carry a fresh mc#NNNN "
-                    f"reference.",
-                )
-                slug, num = tracker
-                self.assertEqual(slug, "mc", "tracker slug should be 'mc'")
-                self.assertGreater(
-                    num, 0, f"tracker number must be positive, got {num}"
-                )
-                return
-        self.fail("lifecycle-real coe directive not found")
+                if tracker is None:
+                    untracked.append(f"{path.name}:{line} job={jkey}")
+                else:
+                    slug, num = tracker
+                    self.assertIn(slug, ("mc", "internal"))
+                    self.assertGreater(num, 0)
+        self.assertEqual(untracked, [], f"untracked masks: {untracked}")
+        # A rule that inspected NOTHING reports success identically to one
+        # that inspected everything. If the repo ever reaches zero masks this
+        # assertion is the thing that has to be consciously retired.
+        self.assertGreater(
+            checked,
+            0,
+            "no `continue-on-error: true` found in .gitea/workflows — this "
+            "test would be a vacuous pass; confirm that is real and retire it "
+            "deliberately rather than leaving it green over an empty set.",
+        )
 
 
 if __name__ == "__main__":
