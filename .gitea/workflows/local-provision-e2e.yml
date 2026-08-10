@@ -443,39 +443,51 @@ jobs:
           rm -f "$MANIFEST" 2>/dev/null || true
 
   # ===========================================================================
-  # ADVISORY — real claude-code image, lifecycle-only. Non-blocking. It pulls/
-  # builds the 2.5GB template image, makes a real (cheap) MiniMax LLM call, and is
-  # network-dependent, so a miss must not block. It proves the REAL runtime
+  # Real claude-code image, lifecycle-only. It pulls/builds the 2.5GB template
+  # image and makes a real (cheap) MiniMax LLM call. It proves the REAL runtime
   # survives a restart AND serves a genuine LLM round-trip on the local
   # provisioner (proxy-reach asserts a real MiniMax reply, not just reachability).
+  #
+  # PROMOTED out of the advisory mask (mc#4603 close-out). mc#2408's promotion
+  # criterion was "one further full renewal cycle green on a settled runner
+  # pool". Measured over 2026-08-01 -> 2026-08-09 (9 days, 300 main commits):
+  # 279 runs of this lane, 279 job logs retrieved, of which
+  #   * 278 ended `=== Results: 18 passed, 0 failed ===`
+  #   * 1 (run 634912, PR#5127 head b27707c206) was CANCELLED on a superseded
+  #     head — its log stops mid-Step-5 with no failure output and even its
+  #     `if: always()` steps read `failure`, the act_runner SIGKILL signature.
+  #     It already posted `failure` WITH the mask on, so the mask never
+  #     protected against it.
+  #   * 0 runs took the `MINIMAX_API_KEY` skip path
+  #   * 0 runs took an `infra_skip_advisory` path
+  #   * 0 `--- FAIL` / go-test failures
+  # The evidence is from the LOGS, deliberately: a masked job rolls a failed
+  # step up to a `success` commit status (Gitea Quirk #10), so the status rows
+  # this lane produced could not distinguish "green" from "silently skipped".
+  # That is the exact trap PR#656 / mc#664 fell into.
+  #
+  # Residual coupling is stated rather than masked: this lane needs Infisical,
+  # api.minimax.io and a template build. Those still fail closed, and BP is
+  # ['*'], so a genuine outage reds this context. The shock absorbers that
+  # remain are explicit and capped — infra_skip_advisory() hard-fails on 2+
+  # distinct A2A degradation signatures — and the guard step below refuses to
+  # accept any of them as a pass now that the lane gates.
   # ===========================================================================
-  # bp-exempt: advisory lane (continue-on-error: true) — informational, never a merge gate.
+  # bp-exempt: not in .gitea/required-contexts.txt (the stub lane is the
+  # presence-required one), so this context is not demanded at merge time; it is
+  # no longer continue-on-error, so when it posts it must be green.
   lifecycle-real:
     name: Local Provision Lifecycle E2E (real image + MiniMax LLM, advisory)
     runs-on: docker-host
     # Serialise behind the gating stub job: both jobs share the same docker-host
-    # runner and provision sibling containers. `needs:` forces this advisory job
-    # to start only AFTER lifecycle-stub finishes, avoiding resource contention.
+    # runner and provision sibling containers. `needs:` forces this job to start
+    # only AFTER lifecycle-stub finishes, avoiding resource contention.
     # (Dynamic ports eliminated the fixed-port race; serialisation remains for
-    # docker-host capacity hygiene.) continue-on-error keeps a real-job miss
-    # non-blocking; `needs:` does NOT gate on the stub's success (a failed
-    # required gate still lets this advisory dependent run).
+    # docker-host capacity hygiene.) `needs:` does NOT gate on the stub's
+    # success — `if: always()` keeps this lane running even when the required
+    # stub gate reds, so the two lanes fail independently.
     needs: lifecycle-stub
     if: ${{ always() }}
-    # Tracker for lint-continue-on-error-tracking (Tier 2e / internal#350): this
-    # mask has a forced 14-day renewal cycle. mc#2408 is the decision /
-    # promotion-criteria issue. This is a GENUINELY-advisory real-MiniMax lane:
-    # it stays masked until the docker-host runner pool reliably builds the
-    # template + reaches api.minimax.io AND MOLECULE_STAGING_MINIMAX_API_KEY is
-    # stably available. The current review has not established the required
-    # clean-window evidence, so the mask is re-tracked rather than unmasked. The
-    # 2026-07-25 review recorded 25/25 green runs over ~21h — a promotion
-    # candidate, held only because the CI substrate under this lane is still
-    # mid-migration. Three prior
-    # renewal trackers aged past the 14d cap and were superseded (their numbers
-    # are intentionally NOT repeated within 2 lines of the directive below —
-    # lint-continue-on-error-tracking matches the FIRST tracker in that window).
-    continue-on-error: true  # mc#4603: 2026-07-25 renewal, expires 2026-08-08 — advisory MiniMax e2e; promote to gating (flip false) when the runner pool + staging MiniMax key are stable, else open a successor tracker (per mc#2408).
     timeout-minutes: 30
     env:
       PG_CONTAINER: pg-lpe2e-real-${{ github.run_id }}-${{ github.run_attempt }}
@@ -734,15 +746,75 @@ jobs:
           # the env; we feed it from Infisical (MINIMAX_API_KEY @ staging
           # /shared/controlplane) via the "Fetch staging MiniMax key from Infisical
           # KMS" step above (exported to $GITHUB_ENV). When that fetch is gated off
-          # (untrusted-fork PR) MINIMAX_API_KEY is empty and the script SKIPS loud
-          # (exit 0) — it never reds on a missing key (serving-e2e skip-if-absent
-          # pattern). The advisory job stays green either way.
+          # (untrusted-fork PR) MINIMAX_API_KEY is empty and the script exits 0
+          # having asserted nothing. That was harmless while the job was masked;
+          # now that the lane gates, the guard step below turns any such
+          # zero-assertion exit into a loud, named red.
           LIFECYCLE_LLM: minimax
           # The script appends every workspace id it provisions here, so the teardown can
           # delete OUR containers and only ours. See #4346 — this is the job whose live
           # container a concurrent run's teardown deleted mid-restart.
           E2E_WS_MANIFEST: /tmp/ws_owned_${{ github.run_id }}_${{ github.run_attempt }}.txt
-        run: bash tests/e2e/test_local_provision_lifecycle_e2e.sh
+          E2E_REAL_LOG: /tmp/lpe2e_real_${{ github.run_id }}_${{ github.run_attempt }}.log
+        run: |
+          # Gitea runs a step as `bash --noprofile --norc -e -o pipefail {0}`, but
+          # a script cannot read its own flags off a `set` line, so state them.
+          set -eo pipefail
+          bash tests/e2e/test_local_provision_lifecycle_e2e.sh 2>&1 | tee "$E2E_REAL_LOG"
+
+      # A green exit is NOT evidence this lane exercised anything: the e2e script
+      # has three distinct `exit 0` paths — the normal pass, the
+      # MINIMAX_API_KEY-absent skip, and infra_skip_advisory(). Only the first
+      # prints a `=== Results: <N> passed, 0 failed ===` line. While the job was
+      # `continue-on-error: true` that difference was invisible; now that the
+      # lane gates, a zero-assertion run must not be able to report success
+      # identically to a full one. Assert the COUNT.
+      - name: Assert the real-image lane actually asserted something
+        env:
+          E2E_REAL_LOG: /tmp/lpe2e_real_${{ github.run_id }}_${{ github.run_attempt }}.log
+          # Floor, not equality: adding a 19th assertion to the e2e must not red
+          # this. 18 is what every one of the 279 logs sampled 2026-08-01..09 printed.
+          E2E_MIN_ASSERTIONS: '18'
+        run: |
+          set -uo pipefail
+          if [ ! -s "$E2E_REAL_LOG" ]; then
+            echo "::error::advisory lane produced no log at $E2E_REAL_LOG — cannot confirm it ran."
+            exit 1
+          fi
+          # The tee'd file is the script's raw stdout, but the same text read back
+          # through the Actions job-log API is prefixed with an ISO-8601 stamp
+          # ("2026-08-09T02:10:05.9495407Z === Results: ..."). Strip an optional
+          # leading stamp and any trailing CR so this guard matches BOTH shapes.
+          # Anchoring at start-of-line after that strip is deliberate: it stops a
+          # line of echoed script SOURCE from counting as an emitted result — the
+          # same false-positive class that makes a naive `::error::` grep match
+          # un-executed `echo "::error::..."` lines in a step body.
+          norm() {
+            sed -e 's/\r$//' -e 's/^[0-9][0-9-]*T[0-9:.]*Z[[:space:]]*//' "$E2E_REAL_LOG"
+          }
+          if norm | grep -q '^=== Results: advisory infra-skip'; then
+            reason=$(norm | sed -n 's/^=== Results: advisory infra-skip (\(.*\)) ===$/\1/p' | tail -1)
+            echo "::error::real-image lane took an infra-skip (reason: ${reason:-<unparsed>}) and asserted nothing."
+            echo "          This lane gates now, so a skipped run reds instead of passing silently."
+            echo "          Root-fix the A2A/runner coupling per no-flaky; do not re-mask the job."
+            exit 1
+          fi
+          # NOTE: `n` may be empty if no Results line matched. Test emptiness
+          # FIRST — `[ "" -lt 18 ]` is a bash ERROR, not false, and an
+          # unguarded numeric test on an empty string has silently skipped an
+          # entire check in this repo before.
+          n=$(norm | sed -n 's/^=== Results: \([0-9][0-9]*\) passed, 0 failed ===$/\1/p' | tail -1)
+          if [ -z "${n:-}" ]; then
+            echo "::error::no clean '=== Results: <N> passed, 0 failed ===' line in the real-image lane log."
+            echo "          The script exited without completing its assertions (missing MINIMAX_API_KEY, or an early exit)."
+            tail -n 25 "$E2E_REAL_LOG" || true
+            exit 1
+          fi
+          if [ "$n" -lt "$E2E_MIN_ASSERTIONS" ]; then
+            echo "::error::real-image lane asserted only $n of an expected >=$E2E_MIN_ASSERTIONS checks — refusing a thin pass."
+            exit 1
+          fi
+          echo "real-image lane asserted $n checks, 0 failed (floor $E2E_MIN_ASSERTIONS)."
 
       - name: Dump platform log on failure
         if: failure()
