@@ -85,7 +85,18 @@ func TestOnlineEvidence_LabelsAreStrengthPrefixedAndDistinct(t *testing.T) {
 		evidenceSelfReportMCPToolsReady,
 		evidenceSelfReportLoadedMCPTools,
 		evidenceNoneLegacyRuntime,
+		// core#5137 added the first non-self-reported strength to this
+		// vocabulary. It is admitted here on the SAME terms as the others: it
+		// must carry its strength in the string and must not read as proof.
+		evidenceDispatchObservedMCPSurface,
 	}
+
+	// "dispatch_observed:" = core's own turn record shows the model dispatched
+	// from this namespace. Strictly stronger than a self-report (it cannot exist
+	// without a real invocation) and strictly weaker than a platform-executed
+	// call — which is exactly why it is a THIRD prefix rather than a reuse of
+	// "self_report:" or a bare "callable".
+	allowedPrefixes := []string{"self_report:", "none:", "dispatch_observed:"}
 
 	seen := map[conciergeReadinessEvidence]bool{}
 	for _, e := range all {
@@ -94,8 +105,15 @@ func TestOnlineEvidence_LabelsAreStrengthPrefixedAndDistinct(t *testing.T) {
 			t.Errorf("evidence label is empty — an unlabelled promotion is the over-claim this suite exists to stop")
 			continue
 		}
-		if !strings.HasPrefix(s, "self_report:") && !strings.HasPrefix(s, "none:") {
-			t.Errorf("evidence label %q must declare its strength with a self_report:/none: prefix; an unprefixed label reads as proof", s)
+		prefixed := false
+		for _, p := range allowedPrefixes {
+			if strings.HasPrefix(s, p) {
+				prefixed = true
+				break
+			}
+		}
+		if !prefixed {
+			t.Errorf("evidence label %q must declare its strength with one of %v; an unprefixed label reads as proof", s, allowedPrefixes)
 		}
 		// The flip has NO callability evidence. A label implying otherwise would
 		// re-introduce the over-claim in new words.
@@ -122,19 +140,31 @@ func TestOnlineEvidence_NamesTheStrongestSelfReport(t *testing.T) {
 		name                string
 		mcpToolsReady       bool
 		provisionToolLoaded bool
+		surface             mcpSurfaceVerdict
 		want                conciergeReadinessEvidence
 	}{
-		{"tools_ready only", true, false, evidenceSelfReportMCPToolsReady},
-		{"loaded list only", false, true, evidenceSelfReportLoadedMCPTools},
-		{"both — prober wins", true, true, evidenceSelfReportMCPToolsReady},
-		{"neither — no label", false, false, ""},
+		{"tools_ready only", true, false, "", evidenceSelfReportMCPToolsReady},
+		{"loaded list only", false, true, "", evidenceSelfReportLoadedMCPTools},
+		{"both — prober wins", true, true, "", evidenceSelfReportMCPToolsReady},
+		{"neither — no label", false, false, "", ""},
+
+		// core#5137. The consumer-derived verdict only ever RE-LABELS a
+		// promotion the self-report already authorised; it never authorises one
+		// on its own (the "neither" rows below stay empty whatever the verdict).
+		{"corroborated upgrades the label", true, false, verdictCorroborated, evidenceDispatchObservedMCPSurface},
+		{"corroborated upgrades the back-compat arm too", false, true, verdictCorroborated, evidenceDispatchObservedMCPSurface},
+		{"not-yet-exercised changes nothing", true, false, verdictNotYetExercised, evidenceSelfReportMCPToolsReady},
+		{"unknown:no_dispatch_record changes nothing", true, false, verdictNoDispatchRecord, evidenceSelfReportMCPToolsReady},
+		{"unknown:no_inventory changes nothing", false, true, verdictNoInventory, evidenceSelfReportLoadedMCPTools},
+		{"corroborated cannot mint a label from nothing", false, false, verdictCorroborated, ""},
+		{"not-yet-exercised cannot mint a label from nothing", false, false, verdictNotYetExercised, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := conciergeOnlineEvidence(tc.mcpToolsReady, tc.provisionToolLoaded)
+			got := conciergeOnlineEvidence(tc.mcpToolsReady, tc.provisionToolLoaded, tc.surface)
 			if got != tc.want {
-				t.Errorf("conciergeOnlineEvidence(%v, %v) = %q, want %q",
-					tc.mcpToolsReady, tc.provisionToolLoaded, got, tc.want)
+				t.Errorf("conciergeOnlineEvidence(%v, %v, %q) = %q, want %q",
+					tc.mcpToolsReady, tc.provisionToolLoaded, tc.surface, got, tc.want)
 			}
 		})
 	}
