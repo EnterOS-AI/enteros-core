@@ -1,0 +1,137 @@
+name: lint-context-set-shrink
+
+# Every context this PR SHOULD post, must post.
+#
+# WHY THIS EXISTS
+# ---------------
+# core#5153 added a duplicate `env:` key to local-provision-e2e.yml. Gitea's
+# workflow parser rejects a duplicate mapping key, so it never SCHEDULED the
+# workflow — both of its jobs stopped posting any status, including
+# `Local Provision Lifecycle E2E / Local Provision Lifecycle E2E (stub)`, which
+# .gitea/required-contexts.txt names. Every other workflow ran, so head
+# 23e5960e6 read 43/43 success and was fully mergeable.
+#
+#     The lane did not fail. It ceased to exist.
+#
+# Branch protection on main is status_check_contexts=['*'] — "every POSTED
+# context must be green". A wildcard constrains statuses that EXIST; it cannot
+# require one that never arrives. Five workflow lints all posted `success` on
+# that exact file, because each checks a PROPERTY of the YAML and none checks
+# whether CI actually ran.
+#
+# A duplicate-key rule now ships separately (core#5156). This gate covers the
+# CLASS rather than that one cause: it DERIVES the contexts this PR's head
+# should post — from each workflow's `on:`/`types:`/`branches:`/`paths:`
+# evaluated against the PR's real changed files — and requires every one of them
+# to appear. Parse error, narrowed trigger, narrowed paths, renamed job: all of
+# them land as a derived context that never posted.
+#
+# The rationale for deriving rather than diffing against another commit, and the
+# measured accuracy of the derivation (24/24 real heads exact, zero over- and
+# zero under-prediction), are argued in full at the top of
+# .gitea/scripts/lint_context_set_shrink.py.
+#
+# NO `paths:` FILTER — DELIBERATE, AND LOAD-BEARING
+# -------------------------------------------------
+# This gate must fire on EVERY pull request, not only workflow-touching ones.
+# Most of what it catches is not an edit to .gitea/workflows at all: a `paths:`
+# filter that stops matching because the PR's file set moved, a workflow that
+# stops being scheduled for any other reason. Narrowing the trigger would make
+# the gate vanish for exactly the changes it exists to notice — its own failure
+# mode, applied to itself.
+#
+# NOT YET IN required-contexts.txt — READ BEFORE PROMOTING
+# --------------------------------------------------------
+# This context is NOT listed in .gitea/required-contexts.txt, and adding it in
+# THIS PR would red the PR with no way out: lint-phantom-gate Guard F resolves
+# every enforced entry against the live Gitea Actions API, which does not know a
+# workflow until it lands on the default branch. The entry would resolve to no
+# producer -> P2 phantom -> exit 1.
+#
+# It should be promoted in a FOLLOW-UP, above the first `# pending-` marker, for
+# the same reason this gate exists. A red from here already blocks under the
+# ['*'] wildcard, so listing it adds no new red exposure — what listing adds is
+# PRESENCE enforcement, i.e. cover for the case where THIS workflow is the one
+# that stops scheduling. An unlisted shrink gate is itself deletable by accident,
+# which is precisely the hole it was written to close.
+#
+# Auth: the auto-injected GITHUB_TOKEN only. Reading combined commit statuses
+# needs nothing more, and an earlier draft of this gate that also called
+# /actions/workflows (which 401s on the auto token, so it needed DRIFT_BOT_TOKEN
+# from Infisical) was dropped along with the check that wanted it. Fewer
+# credentials in a job that runs PR-authored code is worth more than the check
+# it bought.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
+permissions:
+  contents: read
+
+concurrency:
+  # Per-PR, cancel-in-progress: a superseded head's verdict is worthless — the
+  # head it measured is no longer the head that would merge.
+  group: lint-context-set-shrink-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # bp-exempt: meta-lint; gates through the ['*'] wildcard rather than by
+  # literal membership in branch protection. See the promotion note above.
+  lint-context-set-shrink:
+    name: lint-context-set-shrink
+    runs-on: ubuntu-latest
+    # Bounded by CSG_MAX_SETTLE_SECONDS (300s) plus checkout and setup. A typical
+    # run settles in ~50s; the ceiling exists so that an unsettled head reports
+    # UNSETTLED and passes rather than being killed mid-poll with no verdict.
+    timeout-minutes: 12
+    # Born `false`, and it must STAY false. Flipping true->false later would wedge
+    # lint-pre-flip-continue-on-error permanently: it accepts only a `(push)`
+    # context as flip evidence for a workflow without a `paths:` filter, this
+    # workflow is pull_request-only and never emits one, and its zero-run branch
+    # fails closed with no remediation available inside the PR.
+    continue-on-error: false
+    steps:
+      - name: Check out PR head with full history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # The derivation needs the PR's real changed-file list, which means
+          # `git merge-base` against the base branch and a diff from it.
+          # Shallow=1 has neither.
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Install PyYAML
+        # Same pin as ci-required-drift.yml and lint-pre-flip-continue-on-error.yml
+        # so the Gitea runner cache hits across all of them.
+        run: python -m pip install --quiet 'PyYAML==6.0.2'
+      - name: Ensure the base ref is reachable locally
+        # merge-base needs the base branch present locally. Cheap insurance
+        # against runner-version differences in what checkout fetches (mirrors
+        # check-migration-collisions.yml).
+        run: |
+          git fetch origin "${{ github.event.pull_request.base.ref }}" || true
+      - name: Run lint-context-set-shrink
+        env:
+          # Auto-injected by Gitea Actions. Read-only is enough: the only API
+          # this gate calls is the combined commit-status endpoint.
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITEA_HOST: git.moleculesai.app
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: origin/${{ github.event.pull_request.base.ref }}
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+        run: python3 .gitea/scripts/lint_context_set_shrink.py
+      - name: Run lint-context-set-shrink unit tests
+        # Also collected wholesale by test-ops-scripts.yml (`pytest
+        # .gitea/scripts/tests`). Running them here too means the gate's own tests
+        # execute on the PR that changes the gate, in the same job, rather than
+        # only in a sibling workflow whose `paths:` filter might not match.
+        run: |
+          python -m pip install --quiet 'pytest==9.0.2'
+          python3 -m pytest .gitea/scripts/tests/test_lint_context_set_shrink.py -v

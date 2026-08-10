@@ -1,0 +1,56 @@
+# Escape hatch for lint-context-set-shrink (.gitea/scripts/lint_context_set_shrink.py).
+#
+# That gate derives the commit-status contexts this PR's head SHOULD post — from
+# each workflow's on:/types:/branches:/paths:, evaluated against the PR's real
+# changed files — and reds when one of them never posts, or when a workflow file
+# present on the base branch is gone at head. Usually that means CI silently
+# stopped scheduling a lane. Sometimes it means somebody deliberately removed one,
+# and that is legitimate. This file is how you say so.
+#
+# FORMAT
+# ------
+#     # why this is allowed to disappear (>= 1 comment line, MANDATORY,
+#     # immediately above the entry, no blank line between)
+#     <pr-number>  <subject>
+#
+# <subject> is either
+#   * a context — the EXACT `<workflow name> / <job name>` string with the
+#     ` (pull_request)` suffix REMOVED, or
+#   * a workflow file name, e.g. `e2e-staging-saas.yml`, for a deletion.
+#
+# Both are compared verbatim. Copy the string out of the gate's own
+# `DERIVED BUT NEVER POSTED :` / `WORKFLOW FILE DELETED    :` output rather than
+# retyping it — several job names in this repo contain an em-dash or an arrow, and
+# a retyped hyphen will not match.
+#
+# THREE PROPERTIES, EACH DELIBERATE
+# ---------------------------------
+# 1. It is a FILE, not an environment variable. An env var set on a runner leaves
+#    no trace in the artefact under review; an entry here lands in the diff, gets
+#    read by a reviewer, and stays in `git blame` afterwards. An escape hatch that
+#    is invisible to review is not an escape hatch, it is a bypass.
+#
+# 2. It is scoped to a PR NUMBER. A waiver applies only to the pull request whose
+#    number it names, so it cannot silently protect a later, unrelated PR that
+#    happens to lose the same lane for a different reason. Once that PR merges the
+#    line is inert; prune it whenever you are next in this file.
+#
+# 3. An entry naming the CURRENT PR that matches nothing is an ERROR, not a shrug.
+#    A waiver that waives nothing is a guard covering nothing — it reads as
+#    protection while protecting against nothing, and this repo has been bitten by
+#    that shape often enough to refuse it here. If the gate says a waiver matched
+#    nothing, the string is wrong or the line is stale.
+#
+# WHAT THIS FILE IS NOT FOR
+# -------------------------
+# A workflow retired on MAIN while your PR sat open needs no waiver: the expected
+# set is derived from YOUR tree, so a lane that no longer exists upstream is simply
+# never expected. (Verified against core#4437, where 14 contexts vanished from a
+# doc-only PR because three workflows were deleted upstream — under this gate that
+# PR needs no entry here, and gets none.)
+#
+# Nor is it for a context that is merely RED. A red status already blocks under
+# branch protection ['*']. This gate only ever asks whether a lane RAN.
+#
+# ── ACTIVE WAIVERS ────────────────────────────────────────────────────────────
+# (none)
