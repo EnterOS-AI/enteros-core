@@ -328,7 +328,13 @@ class TestLiveWorkflowTrackerInvariant(unittest.TestCase):
     def test_every_live_coe_has_a_tracker_in_window(self):
         checked = 0
         untracked = []
-        for path in sorted(self.WORKFLOWS_DIR.glob("*.yml")):
+        # Enumerate via the LINT'S OWN file-discovery helper rather than a
+        # local glob. A local `*.yml` glob was narrower than the rule it
+        # guards — the lint also reads `*.yaml`, so a mask added in a
+        # `.yaml` workflow would be enforced by the lint and invisible here.
+        # No `.yaml` workflow exists today, so this closes a latent gap
+        # rather than a live one, and it cannot re-open by drift.
+        for path in lcoet._iter_workflow_files(self.WORKFLOWS_DIR):
             raw = path.read_text(encoding="utf-8")
             try:
                 doc = lcoet.yaml.load(raw, Loader=lcoet._LineLoader)

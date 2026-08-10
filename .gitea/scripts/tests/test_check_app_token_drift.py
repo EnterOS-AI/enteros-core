@@ -109,6 +109,65 @@ def test_main_errors_when_token_missing_on_trusted_run(capsys):
     assert "empty on a TRUSTED run" in captured.out
 
 
+def _css_without(token: str) -> str:
+    """SAMPLE_CANVAS_CSS with one declaration deleted from the light block only.
+
+    Used to build ASYMMETRIC fixtures. A symmetric fixture (identical CSS on
+    both sides) cannot tell `find_missing(canvas)` and `find_missing(app)`
+    apart — dropping either call still passes — so each side needs a case
+    where only that side is short a token.
+    """
+    out, removed = [], False
+    for line in SAMPLE_CANVAS_CSS.splitlines(keepends=True):
+        if not removed and line.strip().startswith(f"{token}:"):
+            removed = True
+            continue
+        out.append(line)
+    assert removed, f"fixture did not remove {token}"
+    return "".join(out)
+
+
+def _run_main(canvas_css, app_css, tmp_path):
+    canvas = tmp_path / "globals.css"
+    canvas.write_text(canvas_css, encoding="utf-8")
+    env = {"APP_SSOT_READ_TOKEN": "fake", "DRIFT_GATE_REQUIRE_TOKEN": "1"}
+    with patch.dict("os.environ", env, clear=True):
+        with patch.object(drift, "CANVAS_FILE_PATH", str(canvas)):
+            with patch.object(drift, "fetch_app_css", lambda _t: app_css):
+                return drift.main()
+
+
+def test_missing_on_APP_side_only_is_reported_as_missing_not_as_drift(capsys, tmp_path):
+    """Kills a mutant that drops `find_missing(app_tokens, "app")`.
+
+    Asserting only the exit code would NOT kill it: with the app-side presence
+    check removed, the token is present in canvas and absent in app, so
+    `compare_tokens` flags it and main() still returns 1. The two
+    implementations are only distinguishable by WHICH failure is reported, so
+    assert the message — a missing declaration is a broken SSOT surface, not a
+    value that drifted.
+    """
+    rc = _run_main(SAMPLE_CANVAS_CSS, _css_without("--color-accent"), tmp_path)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "would be vacuous" in out, out
+    assert "app:light/--color-accent" in out, out
+    assert "drift detected" not in out, (
+        "app-side absence must be reported as MISSING, not laundered into a "
+        "drift diff — that is the difference the app-side presence check makes"
+    )
+
+
+def test_missing_on_CANVAS_side_only_is_reported_as_missing_not_as_drift(capsys, tmp_path):
+    """Mirror of the above — kills a mutant that drops the canvas-side call."""
+    rc = _run_main(_css_without("--color-good"), SAMPLE_CANVAS_CSS, tmp_path)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "would be vacuous" in out, out
+    assert "canvas:light/--color-good" in out, out
+    assert "drift detected" not in out, out
+
+
 def test_main_errors_when_tokens_absent_on_both_sides(capsys, tmp_path):
     """Presence is asserted separately from equality.
 
