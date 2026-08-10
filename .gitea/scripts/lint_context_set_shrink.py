@@ -25,9 +25,18 @@ watches the observable instead of enumerating causes.
 
     CHECK A  every context DERIVED from the head tree for this PR's event and
              diff must appear in the posted set.
-    CHECK B  every workflow FILE on the base branch must still exist at head,
-             or carry a waiver. (Check A cannot see a deletion: delete the file
-             and the expectation disappears with it.)
+    CHECK B  every lane the BASE branch would have run for this same PR must
+             still be derivable at head, or carry a waiver. (Check A cannot see a
+             removal: delete the workflow — or narrow its `on:` — and the
+             expectation disappears along with the lane, so the absence becomes
+             invisible to a check that only compares expectation against reality.)
+
+             Both sides of Check B are derived for the SAME event and the SAME
+             changed-file list, so it carries none of the event-asymmetry or
+             paths-filter noise that makes a raw base-vs-head status diff
+             unusable. Comparing derived LANES rather than file names also means
+             renaming a workflow file is not a finding — the lanes are unchanged —
+             while deleting one, or narrowing its trigger so it stops running, is.
 
 WHY DERIVE, RATHER THAN DIFF AGAINST ANOTHER COMMIT
 ===================================================
@@ -153,7 +162,7 @@ escape hatch.
 
 EXIT CODES
     0  OK | UNSETTLED
-    1  MISSING — a derived context never posted, or a workflow file was deleted
+    1  MISSING — a derived context never posted, or a base-branch lane is gone
     2  ERROR — vacuous derivation, unreadable workflow, or a failed read
 """
 
@@ -386,18 +395,41 @@ def workflow_contexts(doc: dict, filename: str) -> set[str]:
 
 
 def derive_expected(
-    workflow_texts: dict[str, str], *, base_branch: str, changed: list[str]
-) -> set[str]:
-    """Contexts this PR's head SHOULD post for the `pull_request` event."""
+    workflow_texts: dict[str, str],
+    *,
+    base_branch: str,
+    changed: list[str],
+    tolerate_unreadable: bool = False,
+) -> tuple[set[str], list[str]]:
+    """Contexts a tree SHOULD post for the `pull_request` event.
+
+    Returns `(contexts, skipped)`.
+
+    `tolerate_unreadable` is the one asymmetry between the two trees this gate
+    reads, and it is deliberate. At HEAD an unreadable workflow is fatal: it is the
+    PR's own tree, and a file the gate cannot parse is a file whose lanes it cannot
+    vouch for, so skipping it would silently shrink the expectation into a vacuous
+    pass. On the BASE branch it must NOT be fatal: main's state is not this PR's
+    fault, and one unparseable file upstream would otherwise red every open PR in
+    the repo until somebody fixed main — punishing every author for one person's
+    mistake, which is how a gate gets deleted.
+    """
     expected: set[str] = set()
+    skipped: list[str] = []
     for filename, text in sorted(workflow_texts.items()):
-        doc = load_workflow(text, filename)
+        try:
+            doc = load_workflow(text, filename)
+        except WorkflowUnreadable:
+            if not tolerate_unreadable:
+                raise
+            skipped.append(filename)
+            continue
         if not doc:
             continue
         if not fires_on_pull_request(doc, base_branch=base_branch, changed=changed):
             continue
         expected |= workflow_contexts(doc, filename)
-    return expected
+    return expected, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +516,7 @@ class Verdict:
     expected_count: int = 0
     posted_count: int = 0
     missing: list[str] = field(default_factory=list)
-    deleted: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
     waived: list[str] = field(default_factory=list)
     unexpected: list[str] = field(default_factory=list)
     detail: str = ""
@@ -497,7 +529,7 @@ class Verdict:
         return (
             f"context-shrink: verdict={self.verdict} "
             f"expected={self.expected_count} posted={self.posted_count} "
-            f"missing={len(self.missing)} deleted={len(self.deleted)} "
+            f"missing={len(self.missing)} removed={len(self.removed)} "
             f"waived={len(self.waived)} unexpected={len(self.unexpected)}"
         )
 
@@ -506,7 +538,7 @@ def decide(
     *,
     expected: set[str],
     posted: set[str],
-    deleted_workflows: set[str],
+    removed_lanes: set[str],
     waivers: list[Waiver],
     pr_number: int,
     settled: bool,
@@ -558,10 +590,10 @@ def decide(
 
     mine = {w.subject for w in waivers if w.pr_number == pr_number}
     raw_missing = expected - posted
-    candidates = raw_missing | deleted_workflows
+    candidates = raw_missing | removed_lanes
     waived = sorted(mine & candidates)
     missing = sorted(raw_missing - mine)
-    deleted = sorted(deleted_workflows - mine)
+    removed = sorted(removed_lanes - mine)
     unexpected = sorted(posted - expected)
 
     unused = sorted(mine - candidates)
@@ -571,7 +603,7 @@ def decide(
             expected_count=len(expected),
             posted_count=len(posted),
             missing=missing,
-            deleted=deleted,
+            removed=removed,
             waived=waived,
             unexpected=unexpected,
             detail=(
@@ -583,13 +615,13 @@ def decide(
             ),
         )
 
-    if missing or deleted:
+    if missing or removed:
         return Verdict(
             MISSING,
             expected_count=len(expected),
             posted_count=len(posted),
             missing=missing,
-            deleted=deleted,
+            removed=removed,
             waived=waived,
             unexpected=unexpected,
             detail=(
@@ -711,17 +743,23 @@ def changed_files(base_ref: str, head_sha: str) -> list[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def workflow_files_at(ref: str, directory: str) -> set[str]:
-    """Workflow file names present at `ref` (empty when the directory is absent)."""
+def read_workflow_tree_at(ref: str, directory: str) -> dict[str, str]:
+    """`{filename: text}` for the workflow files as they exist at `ref`.
+
+    Read through git rather than from the working tree: the base branch is not
+    checked out, and `git show` is the only thing that sees it without mutating
+    anything the rest of the job depends on.
+    """
     try:
-        out = git("ls-tree", "--name-only", f"{ref}:{directory}")
+        listing = git("ls-tree", "--name-only", f"{ref}:{directory}")
     except ApiError:
-        return set()
-    return {
-        line.strip()
-        for line in out.splitlines()
-        if line.strip().endswith((".yml", ".yaml"))
-    }
+        return {}
+    texts: dict[str, str] = {}
+    for line in listing.splitlines():
+        name = line.strip()
+        if name.endswith((".yml", ".yaml")):
+            texts[name] = git("show", f"{ref}:{directory}/{name}")
+    return texts
 
 
 def read_workflow_tree(directory: str) -> dict[str, str]:
@@ -811,8 +849,8 @@ def _report(result: Verdict) -> None:
         print(f"  {result.detail}")
     for context in result.missing:
         print(f"  DERIVED BUT NEVER POSTED : {context}")
-    for name in result.deleted:
-        print(f"  WORKFLOW FILE DELETED    : {name}")
+    for name in result.removed:
+        print(f"  LANE REMOVED BY THIS PR  : {name}")
     for subject in result.waived:
         print(f"  waived                   : {subject}")
     for context in result.unexpected:
@@ -863,15 +901,31 @@ def main(argv: list[str] | None = None) -> int:
     try:
         changed = changed_files(base_ref, head_sha)
         head_texts = read_workflow_tree(workflows_dir)
-        base_files = workflow_files_at(base_ref, workflows_dir)
-        deleted_workflows = base_files - set(head_texts)
-        expected = derive_expected(
+        expected, _ = derive_expected(
             head_texts, base_branch=base_branch, changed=changed
         )
         print(
             f"derivation: {len(head_texts)} workflow file(s) at head, "
             f"{len(changed)} changed path(s) vs {base_ref}, "
             f"base branch {base_branch!r} -> {len(expected)} expected context(s)"
+        )
+        # Check B. Derive the SAME thing from the base branch — same event, same
+        # changed-file list — so the two sides are comparable by construction, and
+        # the difference is exactly "lanes this PR removed".
+        base_texts = read_workflow_tree_at(base_ref, workflows_dir)
+        base_expected, base_skipped = derive_expected(
+            base_texts,
+            base_branch=base_branch,
+            changed=changed,
+            tolerate_unreadable=True,
+        )
+        removed_lanes = base_expected - expected
+        print(
+            f"base lanes: {len(base_texts)} workflow file(s) at {base_ref} -> "
+            f"{len(base_expected)} lane(s) for this same diff, "
+            f"{len(removed_lanes)} no longer derivable at head"
+            + (f" ({len(base_skipped)} base file(s) unreadable, skipped)"
+               if base_skipped else "")
         )
         posted, settled, history = settle_head(
             lambda sha: api.combined_statuses(sha),
@@ -897,7 +951,7 @@ def main(argv: list[str] | None = None) -> int:
     result = decide(
         expected=expected,
         posted=posted,
-        deleted_workflows=deleted_workflows,
+        removed_lanes=removed_lanes,
         waivers=waivers,
         pr_number=pr_number,
         settled=settled,

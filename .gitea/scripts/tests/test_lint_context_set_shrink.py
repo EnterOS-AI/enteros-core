@@ -288,13 +288,13 @@ def test_derive_expected_end_to_end():
             "jobs:\n  c:\n    name: C\n"
         ),
     }
-    assert lcss.derive_expected(tree, base_branch="main", changed=["main.go"]) == {
+    assert lcss.derive_expected(tree, base_branch="main", changed=["main.go"])[0] == {
         "Fires / A"
     }
     # Same tree, a diff that DOES touch canvas: the filtered lane joins the set.
     assert lcss.derive_expected(
         tree, base_branch="main", changed=["canvas/page.tsx"]
-    ) == {"Fires / A", "Filtered / C"}
+    )[0] == {"Fires / A", "Filtered / C"}
 
 
 def test_duplicate_env_key_still_derives_the_lane():
@@ -323,7 +323,7 @@ def test_duplicate_env_key_still_derives_the_lane():
         "        env:\n"
         "          TRANSIENT_LEDGER: /tmp/ledger.txt\n"
     )
-    expected = lcss.derive_expected(
+    expected, _ = lcss.derive_expected(
         {"local-provision-e2e.yml": text}, base_branch="main", changed=["a.go"]
     )
     assert expected == {
@@ -331,15 +331,35 @@ def test_duplicate_env_key_still_derives_the_lane():
     }
 
 
-def test_unparseable_workflow_raises_rather_than_deriving_nothing():
-    """A file the gate cannot read is a file whose lanes it cannot vouch for.
-    Silently skipping it would shrink the expectation - a vacuous pass."""
+# One fixture, used by the pair of tests below. It carries a readable workflow
+# ALONGSIDE the broken one so that "tolerate" cannot be satisfied by returning
+# nothing - the readable lane must still come back.
+BROKEN_TREE = {
+    "broken.yml": "name: X\n  bad: [unclosed\n",
+    "fine.yml": "name: Fine\non:\n  pull_request:\njobs:\n  a:\n    name: A\n",
+}
+
+
+def test_unparseable_workflow_at_head_raises_rather_than_deriving_nothing():
+    """A file the HEAD tree cannot parse is a file whose lanes the gate cannot
+    vouch for. Silently skipping it would shrink the expectation - a vacuous pass."""
     with pytest.raises(lcss.WorkflowUnreadable):
-        lcss.derive_expected(
-            {"broken.yml": "name: X\n  bad: [unclosed\n"},
-            base_branch="main",
-            changed=["a.go"],
-        )
+        lcss.derive_expected(BROKEN_TREE, base_branch="main", changed=["a.go"])
+
+
+def test_unparseable_workflow_on_the_base_branch_is_skipped_not_fatal():
+    """Deliberate asymmetry with the test above, on the SAME fixture.
+
+    main's state is not this PR's fault: one unparseable file upstream must not red
+    every open PR in the repo until somebody fixes main. The readable sibling must
+    still be derived and the skip must be REPORTED, so this cannot be satisfied by
+    swallowing the tree whole.
+    """
+    expected, skipped = lcss.derive_expected(
+        BROKEN_TREE, base_branch="main", changed=["a.go"], tolerate_unreadable=True
+    )
+    assert expected == {"Fine / A"}
+    assert skipped == ["broken.yml"]
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +409,7 @@ def _decide(**kw):
     args = dict(
         expected={"A / a", "B / b"},
         posted={"A / a", "B / b"},
-        deleted_workflows=set(),
+        removed_lanes=set(),
         waivers=[],
         pr_number=1,
         settled=True,
@@ -403,7 +423,7 @@ def test_decide_ok_reports_the_counts():
     v = _decide()
     assert (v.verdict, v.exit_code) == (lcss.OK, 0)
     assert v.expected_count == 2 and v.posted_count == 2
-    assert "expected=2 posted=2 missing=0" in v.summary()
+    assert "expected=2 posted=2 missing=0 removed=0" in v.summary()
 
 
 def test_decide_flags_a_derived_context_that_never_posted():
@@ -413,13 +433,13 @@ def test_decide_flags_a_derived_context_that_never_posted():
     assert "missing=1" in v.summary()
 
 
-def test_decide_flags_a_deleted_workflow_file():
-    """Check B. The expectation cannot see a deletion - delete the file and the
-    derived context disappears with it - so deletion is checked separately."""
-    v = _decide(deleted_workflows={"e2e-staging-saas.yml"})
+def test_decide_flags_a_lane_the_pr_removed():
+    """Check B. Check A cannot see a removal - delete the workflow, or narrow its
+    `on:`, and the expectation disappears along with the lane."""
+    v = _decide(removed_lanes={"E2E Staging SaaS (full lifecycle) / E2E Staging SaaS"})
     assert (v.verdict, v.exit_code) == (lcss.MISSING, 1)
-    assert v.deleted == ["e2e-staging-saas.yml"]
-    assert v.missing == []
+    assert v.removed == ["E2E Staging SaaS (full lifecycle) / E2E Staging SaaS"]
+    assert v.missing == [], "a removed lane is not also reported as never-posted"
 
 
 def test_decide_empty_posted_is_an_error_not_a_pass():
