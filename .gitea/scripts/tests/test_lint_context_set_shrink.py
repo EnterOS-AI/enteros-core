@@ -402,56 +402,147 @@ def test_unparseable_workflow_on_the_base_branch_is_skipped_not_fatal():
     assert skipped == ["broken.yml"]
 
 
-def test_base_tree_is_read_at_the_FORK_POINT_not_the_branch_tip():
-    """The single line that separated a gate from a queue-blocker.
+_CI_WORKFLOW = "name: CI\non:\n  pull_request:\njobs:\n  j:\n    name: J\n"
 
-    Reading the base tree at `base_ref` — the branch TIP — while `changed` is
-    measured from the fork point makes the two sides differ by the PR's diff PLUS
-    everything main did since. Check B then attributes main's commits to the PR, so
-    a workflow retired upstream reds an innocent PR, and the `unexplained` return
-    happens before waivers are consulted, so it cannot even be waived. Main retired
-    a workflow in 15 distinct commits since 2026-05-01.
 
-    Asserting on the REF PASSED TO ls-tree, because that is the thing that was
-    wrong. A test that only checked the returned tree would pass against the broken
-    version whenever the tip and the fork point happen to agree — which is most of
-    the time, and never when it matters.
+def test_resolve_pr_base_reads_BOTH_sides_at_the_fork_point_not_the_tip():
+    """The two lines that separate a gate from a queue-blocker.
+
+    Both base-side reads must resolve at the MERGE-BASE:
+
+      * the base TREE — reading it at the branch tip attributes everything main did
+        since the fork to the PR, so a workflow retired upstream reds an innocent
+        PR, and unwaivably: the `unexplained` return precedes the waiver lookup.
+        Main retired a workflow in 15 distinct commits since 2026-05-01. That one
+        shipped, and broke a queue-enforced gate.
+      * the DIFF — the same mistake on the other axis. It inflates the changed-file
+        list with other people's commits, over-firing `paths:`-filtered lanes in
+        the derivation and redding honest PRs through Check A instead of Check B.
+
+    Asserted on the REFS PASSED TO GIT, not on what comes back, and the fake
+    `merge-base` deliberately returns a sentinel UNEQUAL to the ref handed in. An
+    output assertion — or a fixture where tip and fork point agree — passes against
+    both the correct and the broken version, which is most of the time and never
+    when it matters.
     """
     seen = []
 
     def fake_git(*args):
         seen.append(args)
         if args[0] == "merge-base":
+            assert args[1:] == ("origin/main", "headsha")
             return "f0rkp01nt\n"
         if args[0] == "rev-parse":
             return "f0rkp01nt\n"
         if args[0] == "ls-tree":
             return "ci.yml\n"
         if args[0] == "show":
-            return "name: CI\non:\n  pull_request:\njobs:\n  j:\n    name: J\n"
+            return _CI_WORKFLOW
+        if args[0] == "diff":
+            return ".gitea/workflows/ci.yml\n"
         raise AssertionError(f"unexpected git call: {args}")
 
     original = lcss.git
     lcss.git = fake_git
     try:
-        fork, texts = lcss.base_tree_at_fork(
-            "origin/main", "headsha", ".gitea/workflows"
-        )
+        base = lcss.resolve_pr_base("origin/main", "headsha", ".gitea/workflows")
     finally:
         lcss.git = original
 
-    assert fork == "f0rkp01nt"
-    assert texts == {
-        "ci.yml": "name: CI\non:\n  pull_request:\njobs:\n  j:\n    name: J\n"
-    }
+    assert base.fork_point == "f0rkp01nt"
+    assert base.base_texts == {"ci.yml": _CI_WORKFLOW}
+    assert base.changed == [".gitea/workflows/ci.yml"]
+
     ls_tree = [a for a in seen if a[0] == "ls-tree"]
-    assert ls_tree, "the tree was never listed"
+    assert ls_tree, "the base tree was never listed"
     assert ls_tree[0][-1] == "f0rkp01nt:.gitea/workflows", (
-        "base tree must be read at the MERGE-BASE, not at origin/main"
+        "base TREE must be read at the merge-base, not at the branch tip"
     )
+
+    diffs = [a for a in seen if a[0] == "diff"]
+    assert diffs, "the diff was never taken"
+    assert "f0rkp01nt" in diffs[0], (
+        "the DIFF must be measured from the merge-base, not from the branch tip"
+    )
+    assert not any(
+        "origin/main" in str(part) for call in diffs for part in call
+    ), "the diff must not reference the branch tip"
     assert not any(
         "origin/main" in str(a[-1]) for a in seen if a[0] in ("ls-tree", "show")
     ), "no base-side tree read may reference the branch tip"
+
+
+def test_evaluate_head_wires_the_base_skip_list_through_to_the_decision():
+    """`base_skipped` must reach `decide()`; nothing else pins that it does.
+
+    A workflow that will not parse ON THE BASE SIDE has its lanes skipped, so they
+    are absent from `base_lanes` through no fault of the PR. If the skip list does
+    not reach the guard, the PR is blamed for main's bad file — the invariant
+    `derive_expected` is explicitly written to protect.
+
+    Driven end-to-end through the assembly rather than through `decide()`, because
+    `decide()` already honours the list. What was unpinned is the WIRING.
+    """
+    good = "name: Good\non:\n  pull_request:\njobs:\n  j:\n    name: J\n"
+    newer = "name: Newer\non:\n  pull_request:\njobs:\n  j:\n    name: J\n"
+    verdict = lcss.evaluate_head(
+        head_texts={"good.yml": good, "half-broken.yml": newer},
+        base_texts={"good.yml": good, "half-broken.yml": "name: X\n  bad: [oops\n"},
+        changed=["workspace-server/main.go"],  # the PR touches NO workflow file
+        base_branch="main",
+        workflows_dir=".gitea/workflows",
+        posted={"Good / J", "Newer / J"},
+        waivers=[],
+        pr_number=1,
+        settled=True,
+    )
+    assert (verdict.verdict, verdict.exit_code) == (lcss.OK, 0), verdict.detail
+
+
+def test_evaluate_head_derives_attribution_from_the_same_changed_list():
+    """The PR adds a workflow. `pr_touched_workflow_files` must be derived from the
+    same `changed` list the derivation used, or attribution explains the wrong
+    things and an honest PR reds."""
+    body = "name: Brand New\non:\n  pull_request:\njobs:\n  j:\n    name: J\n"
+    old = "name: Old\non:\n  pull_request:\njobs:\n  j:\n    name: J\n"
+    verdict = lcss.evaluate_head(
+        head_texts={"old.yml": old, "brand-new.yml": body},
+        base_texts={"old.yml": old},
+        changed=[".gitea/workflows/brand-new.yml"],
+        base_branch="main",
+        workflows_dir=".gitea/workflows",
+        posted={"Old / J", "Brand New / J"},
+        waivers=[],
+        pr_number=1,
+        settled=True,
+    )
+    assert (verdict.verdict, verdict.exit_code) == (lcss.OK, 0), verdict.detail
+
+
+def test_evaluate_head_feeds_both_derivations_the_same_base_branch():
+    """Check B's two sides are comparable only if derived for the SAME branch.
+
+    A workflow scoped to `branches: [main]` must be derived on BOTH sides for a
+    main-targeted PR. Derive the base side against some other branch and the lane
+    drops out of `base_lanes`, and Check B reports a phantom removal.
+    """
+    scoped = (
+        "name: Scoped\non:\n  pull_request:\n    branches: [main]\n"
+        "jobs:\n  j:\n    name: J\n"
+    )
+    verdict = lcss.evaluate_head(
+        head_texts={"scoped.yml": scoped},
+        base_texts={"scoped.yml": scoped},
+        changed=["x.go"],
+        base_branch="main",
+        workflows_dir=".gitea/workflows",
+        posted={"Scoped / J"},
+        waivers=[],
+        pr_number=1,
+        settled=True,
+    )
+    assert (verdict.verdict, verdict.exit_code) == (lcss.OK, 0), verdict.detail
+    assert verdict.removed == [], "same tree on both sides cannot remove a lane"
 
 
 def test_read_workflow_tree_at_raises_on_an_unresolvable_ref(monkeypatch):
