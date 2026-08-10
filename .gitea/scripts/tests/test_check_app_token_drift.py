@@ -87,11 +87,50 @@ def test_compare_tokens_detects_drift():
     assert "#00ff00" in differences["light"]["--color-good"]
 
 
-def test_main_skips_when_token_missing(capsys):
+def test_main_skips_when_token_missing_on_untrusted_fork(capsys):
+    """No token and not flagged as credentialled == untrusted-fork PR, which
+    structurally cannot hold secrets. Still exit 0, but say why."""
     with patch.dict("os.environ", {}, clear=True):
         assert drift.main() == 0
     captured = capsys.readouterr()
-    assert "APP_SSOT_READ_TOKEN not set" in captured.out
+    assert "APP_SSOT_READ_TOKEN absent" in captured.out
+    assert "untrusted-fork PR" in captured.out
+
+
+def test_main_errors_when_token_missing_on_trusted_run(capsys):
+    """The mc#4602 close-out: on a TRUSTED run a missing token is a real
+    misconfiguration, not a reason to report success. This branch used to
+    return 0 unconditionally, and because APP_SSOT_READ_TOKEN was never
+    provisioned it was the ONLY path this gate ever took — a 100% vacuous
+    pass. A check that cannot run must not be green."""
+    with patch.dict("os.environ", {"DRIFT_GATE_REQUIRE_TOKEN": "1"}, clear=True):
+        assert drift.main() == 1
+    captured = capsys.readouterr()
+    assert "empty on a TRUSTED run" in captured.out
+
+
+def test_main_errors_when_tokens_absent_on_both_sides(capsys, tmp_path):
+    """Presence is asserted separately from equality.
+
+    A token missing from BOTH files compares equal (None == None), so if the
+    @theme regex ever stops matching, every declared token is 'equal' and the
+    gate reports ALIGNED having compared nothing. Guard against that vacuous
+    pass explicitly.
+    """
+    broken = "/* no @theme block at all */\nbody { color: red; }\n"
+    canvas = tmp_path / "globals.css"
+    canvas.write_text(broken, encoding="utf-8")
+    env = {"APP_SSOT_READ_TOKEN": "fake", "DRIFT_GATE_REQUIRE_TOKEN": "1"}
+    with patch.dict("os.environ", env, clear=True):
+        with patch.object(drift, "CANVAS_FILE_PATH", str(canvas)):
+            with patch.object(drift, "fetch_app_css", lambda _t: broken):
+                assert drift.main() == 1
+    captured = capsys.readouterr()
+    assert "would be vacuous" in captured.out
+    # Sanity-check the precondition: equality ALONE calls this input aligned.
+    empty = drift.extract_shared_tokens(broken)
+    ok, _ = drift.compare_tokens(empty, empty)
+    assert ok is True, "precondition: equality alone must call 0 tokens aligned"
 
 
 def test_main_errors_when_canvas_file_missing(capsys):
