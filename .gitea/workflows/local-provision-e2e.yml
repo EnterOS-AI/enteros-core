@@ -543,20 +543,43 @@ jobs:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        env:
+          TRANSIENT_LEDGER: /tmp/lpe2e_transient_${{ github.run_id }}_${{ github.run_attempt }}.txt
         run: |
           set -uo pipefail
           BASE="https://key.moleculesai.app"
-          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+          # Capture curl's exit status SEPARATELY from the body (the
+          # lint-curl-status-capture pattern). Piping straight into python
+          # loses it: a connection failure and a 200-with-empty-value both
+          # arrive as an empty string, and those two are not the same event.
+          #   - transport failure  => Infisical is UNREACHABLE. External
+          #     outage, not our defect. Record a transient and let the guard
+          #     step adjudicate against the budget.
+          #   - 200 with an empty/missing value => MISCONFIGURATION. Ours.
+          #     Fail closed exactly as before.
+          LOGIN_BODY=$(curl -fsS --max-time 30 -X POST "$BASE/api/v1/auth/universal-auth/login" \
             -H 'Content-Type: application/json' \
-            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
-          if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
-          read_secret() {
-            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=$2" \
-              -H "Authorization: Bearer $TOK" \
-              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
-          }
-          MINIMAX_API_KEY=$(read_secret MINIMAX_API_KEY %2Fshared%2Fcontrolplane)
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}") || LOGIN_RC=$?
+          LOGIN_RC=${LOGIN_RC:-0}
+          if [ "$LOGIN_RC" -ne 0 ]; then
+            echo "::warning::Infisical login unreachable (curl rc=$LOGIN_RC) — external dependency, recording a transient."
+            echo "infisical-unreachable login_curl_rc=$LOGIN_RC" >> "$TRANSIENT_LEDGER"
+            exit 0
+          fi
+          TOK=$(printf '%s' "$LOGIN_BODY" | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          if [ -z "$TOK" ]; then
+            echo "::error::Infisical login returned success with an empty accessToken — misconfiguration, failing closed."
+            exit 1
+          fi
+          SECRET_BODY=$(curl -fsS --max-time 30 "$BASE/api/v3/secrets/raw/MINIMAX_API_KEY?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=%2Fshared%2Fcontrolplane" \
+            -H "Authorization: Bearer $TOK") || READ_RC=$?
+          READ_RC=${READ_RC:-0}
+          if [ "$READ_RC" -ne 0 ]; then
+            echo "::warning::Infisical secret read unreachable (curl rc=$READ_RC) — external dependency, recording a transient."
+            echo "infisical-unreachable read_curl_rc=$READ_RC" >> "$TRANSIENT_LEDGER"
+            exit 0
+          fi
+          MINIMAX_API_KEY=$(printf '%s' "$SECRET_BODY" | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")')
           echo "::add-mask::$MINIMAX_API_KEY"
           if [ -z "$MINIMAX_API_KEY" ]; then
             echo "::error::Infisical returned empty MINIMAX_API_KEY at staging /shared/controlplane — failing closed."
@@ -769,15 +792,94 @@ jobs:
       # `continue-on-error: true` that difference was invisible; now that the
       # lane gates, a zero-assertion run must not be able to report success
       # identically to a full one. Assert the COUNT.
+      # PROPORTIONALITY (mc#5155). This workflow has NO `paths:` filter and BP is
+      # ['*'], so every posted context must be green on every PR. Unmasking made
+      # a real defect red the lane -- which is the point -- but it also meant a
+      # MiniMax or Infisical OUTAGE would red every open PR at once, freezing the
+      # whole merge queue. "A check that can fail" and "an external outage blocks
+      # all merges" are different bargains, and only the first was the argument
+      # for unmasking.
+      #
+      # A `paths:` filter was considered and rejected: `paths:` is workflow-level,
+      # so it would also stop the REQUIRED `lifecycle-stub` context (listed in
+      # .gitea/required-contexts.txt) from posting. That is the
+      # `path_filtered_workflow_cant_be_required` class that lint-required-no-paths
+      # exists to prevent -- it only misses it here because BP ['*'] resolves to
+      # zero enumerable contexts in that lint.
+      #
+      # Instead: a BOUNDED, ENUMERATED allowance, adjudicated in one place.
+      #   * Only the signatures in E2E_TRANSIENT_CLASSES may consume it, and each
+      #     one is an EXTERNAL dependency being unreachable -- never our code.
+      #     `a2a-gateway-error` and `a2a-queue-timeout` are deliberately NOT in
+      #     the set: those can indicate a real proxy/daemon regression.
+      #   * The budget is ONE event per run. A second consumes nothing and reds.
+      #   * A consumed budget is a loud ::warning:: naming the class, not silence.
+      # This is bounded in a way an open-ended `continue-on-error` never was: it
+      # cannot absorb an assertion failure, a thin pass, or an unknown skip.
+      #
+      # Budget sizing: the transient trigger fired 0 times in 279 runs over 9 days
+      # (2026-08-01..09), independently re-measured as 0 in 286 runs over 308 main
+      # commits. Budgeting for 1 per run against a measured rate of 0 is therefore
+      # deliberately generous; if it ever actually fires, the warning is visible in
+      # the run and mc#5155 forces the review rather than letting it normalise.
       - name: Assert the real-image lane actually asserted something
         env:
           E2E_REAL_LOG: /tmp/lpe2e_real_${{ github.run_id }}_${{ github.run_attempt }}.log
+          TRANSIENT_LEDGER: /tmp/lpe2e_transient_${{ github.run_id }}_${{ github.run_attempt }}.txt
           # Floor, not equality: adding a 19th assertion to the e2e must not red
           # this. 18 is what every one of the 279 logs sampled 2026-08-01..09 printed.
           E2E_MIN_ASSERTIONS: '18'
+          # Space-separated. EXTERNAL-unreachable signatures only.
+          E2E_TRANSIENT_CLASSES: 'infisical-unreachable a2a-connect-timeout'
+          E2E_TRANSIENT_BUDGET: '1'
         run: |
           set -uo pipefail
+
+          # Count transients recorded by earlier steps (Infisical transport).
+          ledger_n=0
+          if [ -s "$TRANSIENT_LEDGER" ]; then
+            ledger_n=$(grep -c . "$TRANSIENT_LEDGER" || true)
+            ledger_n=${ledger_n:-0}
+          fi
+
+          # `transient_ok <class>` — is this signature allowed to spend budget?
+          transient_ok() {
+            case " $E2E_TRANSIENT_CLASSES " in
+              *" $1 "*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          # `spend <class> <detail>` — consume the budget or red.
+          spend() {
+            _class="$1"; _detail="${2:-}"
+            _total=$((ledger_n + 1))
+            if ! transient_ok "$_class"; then
+              echo "::error::real-image lane stopped on '$_class'${_detail:+ ($_detail)} and asserted nothing."
+              echo "          '$_class' is NOT an allowed transient class ($E2E_TRANSIENT_CLASSES) —"
+              echo "          it can indicate a real regression, so it reds. Root-fix per no-flaky; do not re-mask."
+              exit 1
+            fi
+            if [ "$_total" -gt "$E2E_TRANSIENT_BUDGET" ]; then
+              echo "::error::real-image lane hit $_total transient event(s), over the budget of $E2E_TRANSIENT_BUDGET."
+              echo "          Repeated external failure in one run is not transient — it is an outage to fix (mc#5155)."
+              [ -s "$TRANSIENT_LEDGER" ] && sed 's/^/            ledger: /' "$TRANSIENT_LEDGER"
+              exit 1
+            fi
+            echo "::warning::real-image lane consumed its transient budget: $_class${_detail:+ ($_detail)}."
+            echo "::warning::An EXTERNAL dependency was unreachable, so this run asserted nothing and is NOT"
+            echo "::warning::evidence the lane works. Tracked by mc#5155; budget $_total/$E2E_TRANSIENT_BUDGET."
+            exit 0
+          }
+
           if [ ! -s "$E2E_REAL_LOG" ]; then
+            # No log at all. If an earlier step recorded a transient (e.g. the
+            # Infisical fetch never exported a key), that is the explanation.
+            if [ "$ledger_n" -gt 0 ]; then
+              _first=$(head -1 "$TRANSIENT_LEDGER" | awk '{print $1}')
+              ledger_n=$((ledger_n - 1))   # `spend` re-adds this one
+              spend "$_first" "$(head -1 "$TRANSIENT_LEDGER")"
+            fi
             echo "::error::advisory lane produced no log at $E2E_REAL_LOG — cannot confirm it ran."
             exit 1
           fi
@@ -794,10 +896,10 @@ jobs:
           }
           if norm | grep -q '^=== Results: advisory infra-skip'; then
             reason=$(norm | sed -n 's/^=== Results: advisory infra-skip (\(.*\)) ===$/\1/p' | tail -1)
-            echo "::error::real-image lane took an infra-skip (reason: ${reason:-<unparsed>}) and asserted nothing."
-            echo "          This lane gates now, so a skipped run reds instead of passing silently."
-            echo "          Root-fix the A2A/runner coupling per no-flaky; do not re-mask the job."
-            exit 1
+            # An unparseable reason must NOT be treated as an allowed class:
+            # `spend` fails closed on anything outside E2E_TRANSIENT_CLASSES,
+            # and the empty string is outside it.
+            spend "${reason:-<unparsed>}" "infra-skip"
           fi
           # NOTE: `n` may be empty if no Results line matched. Test emptiness
           # FIRST — `[ "" -lt 18 ]` is a bash ERROR, not false, and an
@@ -805,6 +907,15 @@ jobs:
           # entire check in this repo before.
           n=$(norm | sed -n 's/^=== Results: \([0-9][0-9]*\) passed, 0 failed ===$/\1/p' | tail -1)
           if [ -z "${n:-}" ]; then
+            # No clean Results line. If an earlier step recorded an external
+            # transient, that explains it (an unreachable Infisical means no key,
+            # which makes the e2e take its missing-key exit). Otherwise this is a
+            # genuine early exit and reds.
+            if [ "$ledger_n" -gt 0 ]; then
+              _first=$(head -1 "$TRANSIENT_LEDGER" | awk '{print $1}')
+              ledger_n=$((ledger_n - 1))
+              spend "$_first" "$(head -1 "$TRANSIENT_LEDGER")"
+            fi
             echo "::error::no clean '=== Results: <N> passed, 0 failed ===' line in the real-image lane log."
             echo "          The script exited without completing its assertions (missing MINIMAX_API_KEY, or an early exit)."
             tail -n 25 "$E2E_REAL_LOG" || true
@@ -814,7 +925,15 @@ jobs:
             echo "::error::real-image lane asserted only $n of an expected >=$E2E_MIN_ASSERTIONS checks — refusing a thin pass."
             exit 1
           fi
-          echo "real-image lane asserted $n checks, 0 failed (floor $E2E_MIN_ASSERTIONS)."
+          echo "real-image lane asserted $n checks, 0 failed (floor $E2E_MIN_ASSERTIONS); transient budget used 0/$E2E_TRANSIENT_BUDGET."
+          if [ "$ledger_n" -gt 0 ]; then
+            # Belt-and-braces: a clean Results line alongside a recorded transient
+            # is not an expected combination (an unreachable Infisical means no
+            # key, which makes the e2e exit before asserting). Surface it rather
+            # than let it pass unremarked.
+            echo "::warning::lane passed cleanly BUT $ledger_n transient(s) were recorded earlier this run:"
+            sed 's/^/::warning::  /' "$TRANSIENT_LEDGER"
+          fi
 
       - name: Dump platform log on failure
         if: failure()
