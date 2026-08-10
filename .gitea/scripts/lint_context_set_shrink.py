@@ -34,9 +34,12 @@ watches the observable instead of enumerating causes.
              Both sides of Check B are derived for the SAME event and the SAME
              changed-file list, so it carries none of the event-asymmetry or
              paths-filter noise that makes a raw base-vs-head status diff
-             unusable. Comparing derived LANES rather than file names also means
-             renaming a workflow file is not a finding — the lanes are unchanged —
-             while deleting one, or narrowing its trigger so it stops running, is.
+             unusable. Comparing derived LANES rather than file names means
+             renaming a workflow FILE is not a finding — the lanes are unchanged —
+             while deleting one, narrowing its trigger so it stops running, or
+             changing a workflow's or job's `name:` all are. The last of those is
+             deliberate: the lane's identity IS that string, and the same rename
+             silently invalidates any matching line in required-contexts.txt.
 
 WHY DERIVE, RATHER THAN DIFF AGAINST ANOTHER COMMIT
 ===================================================
@@ -74,15 +77,26 @@ real changed-file list, and compare against what Gitea actually posted.
 Two properties make that accuracy achievable rather than lucky, and both were
 verified rather than hoped for:
 
-* JOB-LEVEL `if:` DOES NOT NEED EVALUATING. Gitea posts a status context for every
-  job of a scheduled workflow, including jobs that skip. Five workflows carry a
-  job-level `if:` (`local-provision-e2e`, `audit-force-merge`, two publish
-  workflows, `staging-tenant-cd`) and the derivation ignores every one of them, yet
-  over-prediction stayed at zero. This is what keeps the derivation out of the
-  business of evaluating `${{ }}` expressions, which is where a faithful emulation
-  of the scheduler would become hopeless.
-* `needs:` SKIPPING DOES NOT SUPPRESS A CONTEXT EITHER. `CI / Platform (Go)` gates
-  behind `needs: detect-changes` and still posts on a one-file manifest-only PR.
+* `needs:` SKIPPING DOES NOT SUPPRESS A CONTEXT. This one is OBSERVED: `CI /
+  Platform (Go)` (job `platform-build`) gates behind `needs: changes` and still
+  posts on a one-file manifest-only PR.
+* JOB-LEVEL `if:` DOES NOT NEED EVALUATING — and this one is asserted from the
+  MECHANISM, not from observation, which is a weaker claim and is written weakly on
+  purpose. Gitea writes the status rows at SCHEDULE time, before any job runs:
+  on 23e5960e6 `CI / all-required` and `CI / Canvas Deploy Status` carry contiguous
+  `pending` rows at +0s, ids 5..11, and neither job had started. A row that exists
+  before evaluation cannot depend on the result of evaluation.
+
+  It is NOT confirmed by seeing a skipped job still post, because there is nothing
+  to see: a scan of 400 runs found ZERO jobs with `conclusion=skipped`. Nor is it
+  currently load-bearing — every in-scope job-level `if:` is either `always()` or
+  belongs to a push-only workflow, so no `pull_request` lane depends on it today.
+  It is stated here so that a future reader knows which of the two properties is
+  measured and which is reasoned, rather than trusting both equally.
+
+Together they keep the derivation out of the business of evaluating `${{ }}`
+expressions, which is where a faithful emulation of the scheduler would become
+hopeless.
 
 The one derivation error observed during development was mine, not the model's: the
 harness read workflow bytes as cp1252, which corrupted an em-dash in
@@ -100,8 +114,9 @@ requiring a push-shaped type; `branches:`/`branches-ignore:` against the PR base
 distinguished; job display names (`name:` or the job key).
 
 Does not model, because it does not have to: `if:` expressions, `needs:` graphs,
-matrices, or runner availability — all measured to have no effect on whether a
-context is POSTED.
+matrices, or runner availability — none of which affect whether a context is
+POSTED. `needs:` is measured; `if:` rests on the schedule-time mechanism above;
+matrices and runner availability are neither, and are simply unused in scope here.
 
 Deliberately outside scope: `pull_request_target` and `pull_request_review`
 workflows. They fire on review and merge actions rather than on a push, so they are
@@ -210,7 +225,17 @@ DEFAULT_PR_TYPES = ("opened", "synchronize", "reopened")
 
 
 def split_event(context: str) -> tuple[str, str]:
-    """Split a live context into (event-stripped name, event); `""` when unsuffixed."""
+    """Split a live context into (event-stripped name, event); `""` when unsuffixed.
+
+    The `.strip()` calls below are defensive only, and a mutant that removes them
+    SURVIVES the test suite. That is an equivalent mutant, not a coverage gap:
+    `_EVENT_SUFFIX_RE` already consumes the whitespace between a context and its
+    event suffix, and Gitea does not emit leading or trailing whitespace in a
+    context name — it composes `f"{workflow} / {job}"` from values that were
+    themselves stripped. Recorded here rather than left looking unkilled, because
+    "a mutant survived" and "a mutant cannot be distinguished" are different
+    findings and only the first one is a problem.
+    """
     match = _EVENT_SUFFIX_RE.search(context)
     if match is None:
         return context.strip(), ""
@@ -538,17 +563,19 @@ def decide(
     *,
     expected: set[str],
     posted: set[str],
-    removed_lanes: set[str],
+    base_lanes: set[str],
     waivers: list[Waiver],
     pr_number: int,
     settled: bool,
     head_has_workflows: bool,
+    base_has_workflows: bool,
 ) -> Verdict:
     """Pure decision function. Every branch below is reachable from a test.
 
     Ordering is load-bearing, not arbitrary:
-      1. a vacuous derivation or an empty posted set is ERROR before anything else,
-         because every later comparison would be trivially satisfied by it;
+      1. a vacuous derivation on EITHER side, or an empty posted set, is ERROR
+         before anything else, because every later comparison would be trivially
+         satisfied by it;
       2. UNSETTLED outranks a missing context, because mid-flight absence is not
          evidence of absence;
       3. a vacuous waiver is ERROR even when the run would otherwise pass, so a
@@ -564,6 +591,33 @@ def decide(
                 "error, not a pass. The usual cause is the `on:` key: YAML 1.1 "
                 "resolves a bare `on` to the boolean True, and a reader that looks "
                 "only for the string derives nothing from anything."
+            ),
+        )
+    # Check B's own non-vacuity guard, and it exists because the omission was
+    # real: without it, a base tree that read as empty made `base_lanes` empty,
+    # `removed` empty, and the run report OK — a guard covering NOTHING, inside
+    # the gate written to catch exactly that. It survived because the base read
+    # fails late and `changed_files` usually errors first, which is precisely how
+    # this shape stays alive. `read_workflow_tree_at` now separates "cannot read
+    # the ref" (an error) from "this ref has no workflow directory", so reaching
+    # here with an empty base side means Check B genuinely compared nothing.
+    #
+    # A repo whose base branch truly has no workflows — bootstrapping the very
+    # first one — trips this. That is the deliberate trade: fail loud rather than
+    # silently compare nothing, on a gate whose entire purpose is catching
+    # comparisons that compare nothing.
+    if head_has_workflows and (not base_has_workflows or not base_lanes):
+        return Verdict(
+            ERROR,
+            expected_count=len(expected),
+            posted_count=len(posted),
+            detail=(
+                "Check B compared NOTHING: the head has workflow files but the base "
+                f"branch yielded {len(base_lanes)} lane(s) from "
+                f"{'no' if not base_has_workflows else 'some'} workflow file(s). "
+                "An empty base side cannot detect a removed lane, and it would "
+                "report OK for every PR. Check BASE_REF and that the base branch "
+                "is fetched."
             ),
         )
     if not posted:
@@ -589,6 +643,7 @@ def decide(
         )
 
     mine = {w.subject for w in waivers if w.pr_number == pr_number}
+    removed_lanes = base_lanes - expected
     raw_missing = expected - posted
     candidates = raw_missing | removed_lanes
     waived = sorted(mine & candidates)
@@ -749,7 +804,15 @@ def read_workflow_tree_at(ref: str, directory: str) -> dict[str, str]:
     Read through git rather than from the working tree: the base branch is not
     checked out, and `git show` is the only thing that sees it without mutating
     anything the rest of the job depends on.
+
+    The ref is resolved FIRST, and a failure there propagates. Without that,
+    `ls-tree` failing for a ref that does not exist and `ls-tree` failing because
+    the directory is absent are the same empty dict, and an unresolvable BASE_REF
+    would silently reduce Check B to comparing nothing while still reporting OK.
+    Resolving separately makes "I could not read the base branch" an error and
+    leaves `{}` meaning only "this ref genuinely has no workflow directory".
     """
+    git("rev-parse", "--verify", f"{ref}^{{commit}}")
     try:
         listing = git("ls-tree", "--name-only", f"{ref}:{directory}")
     except ApiError:
@@ -877,6 +940,11 @@ def main(argv: list[str] | None = None) -> int:
     base_ref = _env("BASE_REF", "origin/main")
     base_branch = _env("BASE_BRANCH", "main")
     waivers_path = _env("WAIVERS_FILE", ".gitea/context-shrink-waivers.txt")
+    # NOTE: WORKFLOWS_DIR is used BOTH as a filesystem path (the checked-out head
+    # tree) and as a git pathspec after a `<ref>:` prefix (the base tree). The two
+    # agree for a plain repo-relative path with forward slashes, which is the only
+    # form this repo uses and the only form documented here. An absolute path, or a
+    # Windows-style separator, would satisfy one reader and not the other.
     workflows_dir = _env("WORKFLOWS_DIR", ".gitea/workflows")
     try:
         pr_number = int(_env("PR_NUMBER", "0"))
@@ -919,11 +987,10 @@ def main(argv: list[str] | None = None) -> int:
             changed=changed,
             tolerate_unreadable=True,
         )
-        removed_lanes = base_expected - expected
         print(
             f"base lanes: {len(base_texts)} workflow file(s) at {base_ref} -> "
             f"{len(base_expected)} lane(s) for this same diff, "
-            f"{len(removed_lanes)} no longer derivable at head"
+            f"{len(base_expected - expected)} no longer derivable at head"
             + (f" ({len(base_skipped)} base file(s) unreadable, skipped)"
                if base_skipped else "")
         )
@@ -951,7 +1018,8 @@ def main(argv: list[str] | None = None) -> int:
     result = decide(
         expected=expected,
         posted=posted,
-        removed_lanes=removed_lanes,
+        base_lanes=base_expected,
+        base_has_workflows=bool(base_texts),
         waivers=waivers,
         pr_number=pr_number,
         settled=settled,

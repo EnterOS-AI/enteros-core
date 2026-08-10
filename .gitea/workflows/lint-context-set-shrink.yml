@@ -40,20 +40,30 @@ name: lint-context-set-shrink
 # the gate vanish for exactly the changes it exists to notice — its own failure
 # mode, applied to itself.
 #
-# NOT YET IN required-contexts.txt — READ BEFORE PROMOTING
+# NOT YET IN required-contexts.txt — TRACKED IN core#5158
 # --------------------------------------------------------
-# This context is NOT listed in .gitea/required-contexts.txt, and adding it in
-# THIS PR would red the PR with no way out: lint-phantom-gate Guard F resolves
-# every enforced entry against the live Gitea Actions API, which does not know a
-# workflow until it lands on the default branch. The entry would resolve to no
+# THE LAST HOLE IN THIS DESIGN, stated plainly: delete this workflow file and it
+# does not schedule at head, so Check B never executes, and branch protection
+# ['*'] requires nothing of a context that never posts. The gate cannot detect
+# its own removal. That is the same shape it exists to close, pointed at itself.
+#
+# It is NOT listed in .gitea/required-contexts.txt because adding it in the PR
+# that introduces it would red that PR with no way out: lint-phantom-gate Guard F
+# resolves every enforced entry against the LIVE Gitea Actions API, which does not
+# know a workflow until it lands on the default branch. During #5157 that API
+# returned 75 workflows while the head tree had 76, so the entry resolved to no
 # producer -> P2 phantom -> exit 1.
 #
-# It should be promoted in a FOLLOW-UP, above the first `# pending-` marker, for
-# the same reason this gate exists. A red from here already blocks under the
-# ['*'] wildcard, so listing it adds no new red exposure — what listing adds is
-# PRESENCE enforcement, i.e. cover for the case where THIS workflow is the one
-# that stops scheduling. An unlisted shrink gate is itself deletable by accident,
-# which is precisely the hole it was written to close.
+# The follow-up is core#5158: once this is on main, add
+#
+#     lint-context-set-shrink / lint-context-set-shrink
+#
+# ABOVE the first `# pending-` marker. gitea-merge-queue.py's
+# enforced_file_contexts_green scores an absent enforced context as `missing` ->
+# not green -> the queue blocks, which is exactly the presence half that ['*']
+# cannot provide. A red from here already blocks under the wildcard, so listing
+# adds no new red exposure — it adds the half that makes the gate un-deletable by
+# accident.
 #
 # Auth: the auto-injected GITHUB_TOKEN only. Reading combined commit statuses
 # needs nothing more, and an earlier draft of this gate that also called
