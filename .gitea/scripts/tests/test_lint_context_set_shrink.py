@@ -142,10 +142,17 @@ def test_posted_contexts_ignores_state_entirely():
         ("canvas/**/page.tsx", "canvas/page.tsx", True),
         ("canvas/**/page.tsx", "canvas/app/dash/page.tsx", True),
         # `?` is a single non-separator character.
-        ("v?/x", "v1/x", True),
-        ("v?/x", "v/1/x", False),
+        ("v?x", "vax", True),
+        ("v?x", "v/x", False),
         # Literal dots are not wildcards.
         ("a.b", "axb", False),
+        # The TRAILING ANCHOR. Without it an exact pattern degrades to a PREFIX
+        # match, which no case above can see (they all fail on the prefix too)
+        # and which silently widens the 289 of 361 real filter patterns in this
+        # repo that do not end in `**`.
+        (".gitea/workflows/ci.yml", ".gitea/workflows/ci.yml", True),
+        (".gitea/workflows/ci.yml", ".gitea/workflows/ci.yml.bak", False),
+        ("docs", "docs/design/rfc.md", False),
     ],
 )
 def test_path_matches(pattern, path, expected):
@@ -207,6 +214,13 @@ def _doc(text):
         # branches: that does not include the base branch.
         ("on:\n  pull_request:\n    branches: [staging]\njobs: {}\n", ["a.go"], False),
         ("on:\n  pull_request:\n    branches: [main, staging]\njobs: {}\n", ["a.go"], True),
+        # branches-ignore is the INVERSE of branches. Zero workflows in this
+        # repo use it, so it gets no observational cover from the field trial at
+        # all -- if the inversion were backwards nothing outside this test would
+        # notice, until the first workflow to use it silently stopped being
+        # expected.
+        ("on:\n  pull_request:\n    branches-ignore: [main]\njobs: {}\n", ["a.go"], False),
+        ("on:\n  pull_request:\n    branches-ignore: [dev]\njobs: {}\n", ["a.go"], True),
         # paths: matching / not matching the PR's real diff.
         (
             "on:\n  pull_request:\n    paths: ['.gitea/workflows/**']\njobs: {}\n",
@@ -256,24 +270,49 @@ def test_workflow_contexts_falls_back_to_the_filename_when_unnamed():
     assert lcss.workflow_contexts(doc, "nameless.yml") == {"nameless.yml / build"}
 
 
-def test_workflow_contexts_includes_conditional_jobs():
-    """Gitea posts a context for a job that SKIPS, so `if:` and `needs:` must not
-    filter the derivation. Measured: `CI / Platform (Go)` gates behind
-    `needs: detect-changes` and still posts on a one-file manifest-only PR."""
+def test_workflow_contexts_includes_a_job_gated_by_needs():
+    """The OBSERVED half of the two derivation properties.
+
+    Shape copied from the real `ci.yml`: job key `platform-build`, `name: Platform
+    (Go)`, `needs: changes`, and NO job-level `if:`. An earlier version of this
+    fixture invented an `if:` here and the module docstring then cited the fixture
+    as field evidence - a fixture written as fact.
+
+    `CI / Platform (Go)` posts on a one-file manifest-only PR despite gating behind
+    `needs:`, which is a thing that was actually seen.
+    """
     doc = _doc(
         "name: CI\n"
         "jobs:\n"
-        "  detect-changes:\n"
+        "  changes:\n"
         "    name: Detect changes\n"
-        "  platform:\n"
+        "  platform-build:\n"
         "    name: Platform (Go)\n"
-        "    needs: detect-changes\n"
-        "    if: needs.detect-changes.outputs.go == 'true'\n"
+        "    needs: changes\n"
     )
     assert lcss.workflow_contexts(doc, "ci.yml") == {
         "CI / Detect changes",
         "CI / Platform (Go)",
     }
+
+
+def test_workflow_contexts_includes_a_job_carrying_a_job_level_if():
+    """The REASONED half, and labelled as such.
+
+    Gitea writes the status rows at SCHEDULE time, before any job runs, so a
+    job-level `if:` cannot suppress a context. That is a mechanism argument, not an
+    observation: a scan of 400 runs found ZERO jobs with `conclusion=skipped`, so
+    there was nothing to observe. It is pinned by this unit test rather than by a
+    claim of field evidence it does not have.
+    """
+    doc = _doc(
+        "name: W\n"
+        "jobs:\n"
+        "  gated:\n"
+        "    name: Gated\n"
+        "    if: github.event_name == 'push'\n"
+    )
+    assert lcss.workflow_contexts(doc, "w.yml") == {"W / Gated"}
 
 
 def test_derive_expected_end_to_end():
@@ -362,6 +401,50 @@ def test_unparseable_workflow_on_the_base_branch_is_skipped_not_fatal():
     assert skipped == ["broken.yml"]
 
 
+def test_read_workflow_tree_at_raises_on_an_unresolvable_ref(monkeypatch):
+    """The ref must be RESOLVED before the tree is listed.
+
+    Without that, `ls-tree` failing because the ref does not exist and `ls-tree`
+    failing because the directory is absent are the same empty dict - so a wrong or
+    unfetched BASE_REF would silently reduce Check B to comparing nothing while the
+    run still reported OK. That is the failure this gate exists to catch, wearing
+    the gate's own clothes.
+    """
+    calls = []
+
+    def fake_git(*args):
+        calls.append(args)
+        if args[0] == "rev-parse":
+            raise lcss.ApiError("unknown revision")
+        raise AssertionError("must not list the tree before resolving the ref")
+
+    monkeypatch.setattr(lcss, "git", fake_git)
+    with pytest.raises(lcss.ApiError):
+        lcss.read_workflow_tree_at("origin/nope", ".gitea/workflows")
+    assert calls and calls[0][0] == "rev-parse"
+
+
+def test_read_workflow_tree_at_returns_empty_when_only_the_directory_is_absent():
+    """The other side of the same coin: a ref that DOES resolve but carries no
+    workflow directory is legitimately empty, not an error. Paired with the test
+    above so 'raise on everything' cannot satisfy both."""
+    seen = []
+
+    def fake_git(*args):
+        seen.append(args[0])
+        if args[0] == "rev-parse":
+            return "abc123\n"
+        raise lcss.ApiError("not a tree object")
+
+    original = lcss.git
+    lcss.git = fake_git
+    try:
+        assert lcss.read_workflow_tree_at("origin/main", ".gitea/workflows") == {}
+    finally:
+        lcss.git = original
+    assert seen == ["rev-parse", "ls-tree"]
+
+
 # ---------------------------------------------------------------------------
 # Waivers
 # ---------------------------------------------------------------------------
@@ -409,11 +492,15 @@ def _decide(**kw):
     args = dict(
         expected={"A / a", "B / b"},
         posted={"A / a", "B / b"},
-        removed_lanes=set(),
+        # Check B's base side. Equal to `expected` by default, so the default case
+        # has nothing removed AND is not vacuous. A default of `set()` would run
+        # every test below against a silently disabled Check B.
+        base_lanes={"A / a", "B / b"},
         waivers=[],
         pr_number=1,
         settled=True,
         head_has_workflows=True,
+        base_has_workflows=True,
     )
     args.update(kw)
     return lcss.decide(**args)
@@ -436,10 +523,32 @@ def test_decide_flags_a_derived_context_that_never_posted():
 def test_decide_flags_a_lane_the_pr_removed():
     """Check B. Check A cannot see a removal - delete the workflow, or narrow its
     `on:`, and the expectation disappears along with the lane."""
-    v = _decide(removed_lanes={"E2E Staging SaaS (full lifecycle) / E2E Staging SaaS"})
+    gone = "E2E Staging SaaS (full lifecycle) / E2E Staging SaaS"
+    v = _decide(base_lanes={"A / a", "B / b", gone})
     assert (v.verdict, v.exit_code) == (lcss.MISSING, 1)
-    assert v.removed == ["E2E Staging SaaS (full lifecycle) / E2E Staging SaaS"]
+    assert v.removed == [gone]
     assert v.missing == [], "a removed lane is not also reported as never-posted"
+
+
+def test_decide_errors_when_check_b_has_no_base_side_to_compare():
+    """Check B's OWN non-vacuity guard.
+
+    An empty base side makes `removed` empty for every PR, so Check B reports OK
+    while comparing nothing - a guard covering nothing, inside the gate written to
+    catch exactly that. It is hard to reach in production because the base read
+    fails earlier, which is precisely how this shape survives review.
+    """
+    v = _decide(base_lanes=set(), base_has_workflows=False)
+    assert (v.verdict, v.exit_code) == (lcss.ERROR, 2)
+    assert "compared NOTHING" in v.detail
+
+
+def test_decide_errors_when_the_base_tree_derives_no_lanes():
+    """The other half: base workflow files were READ but none derived. Distinct
+    from the case above - files present, derivation broken - and equally silent."""
+    v = _decide(base_lanes=set(), base_has_workflows=True)
+    assert (v.verdict, v.exit_code) == (lcss.ERROR, 2)
+    assert "compared NOTHING" in v.detail
 
 
 def test_decide_empty_posted_is_an_error_not_a_pass():
@@ -458,7 +567,15 @@ def test_decide_empty_derivation_from_a_populated_tree_is_an_error():
 
 
 def test_decide_empty_derivation_is_fine_when_there_are_no_workflows():
-    v = _decide(expected=set(), head_has_workflows=False)
+    """A repo with no workflows on EITHER side derives nothing on both, and that is
+    genuinely nothing to report - as distinct from the two ERROR cases above, where
+    one side is populated and the other is not."""
+    v = _decide(
+        expected=set(),
+        head_has_workflows=False,
+        base_lanes=set(),
+        base_has_workflows=False,
+    )
     assert v.verdict == lcss.OK
 
 

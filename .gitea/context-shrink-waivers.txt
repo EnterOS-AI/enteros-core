@@ -41,6 +41,16 @@
 #    that shape often enough to refuse it here. If the gate says a waiver matched
 #    nothing, the string is wrong or the line is stale.
 #
+# WHAT REDS, AND WHAT DOES NOT
+# ----------------------------
+# Check B compares derived LANES, not file names, so:
+#   * renaming a workflow FILE reds nothing — the lanes are identical;
+#   * changing a workflow's or a job's `name:` DOES red, because the lane's
+#     identity IS that string. That is deliberate rather than incidental: the same
+#     rename silently invalidates any matching line in
+#     .gitea/required-contexts.txt, so it is worth one waiver line and a moment's
+#     thought.
+#
 # WHAT THIS FILE IS NOT FOR
 # -------------------------
 # A workflow retired on MAIN while your PR sat open needs no waiver: the expected
