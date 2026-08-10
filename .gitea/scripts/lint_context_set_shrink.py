@@ -153,7 +153,7 @@ THE ESCAPE HATCH
 Declared in `.gitea/context-shrink-waivers.txt`, in the same PR:
 
     # <one or more comment lines giving the reason — mandatory>
-    <pr-number>  <event-stripped context or workflow file name>
+    <pr-number>  <event-stripped context>
 
 Explicit (in-tree, in the diff, under review), auditable (`git blame`), and
 PR-SCOPED so it cannot silently protect a later PR. Not an env var: an env var set on
@@ -454,7 +454,7 @@ def parse_waivers(text: str) -> list[Waiver]:
     """Parse `.gitea/context-shrink-waivers.txt`.
 
         # reason line (at least one, immediately above, mandatory)
-        <pr-number><whitespace><context or workflow file name>
+        <pr-number><whitespace><event-stripped context>
 
     The mandatory reason is not decoration. An undocumented waiver is
     indistinguishable from a typo six months later, and this file exists precisely to
@@ -611,7 +611,7 @@ def decide(
                 + ", ".join(repr(s) for s in unused)
                 + ". A waiver that waives nothing is a guard covering nothing. "
                 "Delete the line, or fix the string — it is compared verbatim "
-                "against the exact event-stripped context or workflow file name."
+                "against the exact event-stripped context name."
             ),
         )
 

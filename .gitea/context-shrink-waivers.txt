@@ -2,26 +2,26 @@
 #
 # That gate derives the commit-status contexts this PR's head SHOULD post — from
 # each workflow's on:/types:/branches:/paths:, evaluated against the PR's real
-# changed files — and reds when one of them never posts, or when a workflow file
-# present on the base branch is gone at head. Usually that means CI silently
-# stopped scheduling a lane. Sometimes it means somebody deliberately removed one,
-# and that is legitimate. This file is how you say so.
+# changed files — and reds when one of them never posts, or when a lane the BASE
+# branch would have run for this same PR is no longer derivable at head. Usually
+# that means CI silently stopped scheduling a lane. Sometimes it means somebody
+# deliberately removed one, and that is legitimate. This file is how you say so.
 #
 # FORMAT
 # ------
 #     # why this is allowed to disappear (>= 1 comment line, MANDATORY,
 #     # immediately above the entry, no blank line between)
-#     <pr-number>  <subject>
+#     <pr-number>  <context>
 #
-# <subject> is either
-#   * a context — the EXACT `<workflow name> / <job name>` string with the
-#     ` (pull_request)` suffix REMOVED, or
-#   * a workflow file name, e.g. `e2e-staging-saas.yml`, for a deletion.
+# <context> is the EXACT `<workflow name> / <job name>` string with the
+# ` (pull_request)` suffix REMOVED — the same form .gitea/required-contexts.txt
+# uses. It is compared verbatim, and it is the subject for BOTH checks: a lane that
+# never posted and a lane this PR removed are both named this way.
 #
-# Both are compared verbatim. Copy the string out of the gate's own
-# `DERIVED BUT NEVER POSTED :` / `WORKFLOW FILE DELETED    :` output rather than
-# retyping it — several job names in this repo contain an em-dash or an arrow, and
-# a retyped hyphen will not match.
+# Copy the string out of the gate's own `DERIVED BUT NEVER POSTED :` or
+# `LANE REMOVED BY THIS PR  :` output rather than retyping it — several job names
+# in this repo contain an em-dash or a left-right arrow, and a retyped hyphen will
+# not match.
 #
 # THREE PROPERTIES, EACH DELIBERATE
 # ---------------------------------
