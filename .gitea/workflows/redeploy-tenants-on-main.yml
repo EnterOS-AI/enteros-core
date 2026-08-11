@@ -204,6 +204,12 @@ jobs:
   # credential, runs the census, prints the counts and FAILS if any of it is
   # missing or empty. It touches no workload: --dry-run is the script's own plan
   # mode.
+  # A production DEPLOY arm, not a merge gate: requiring it would block merges on
+  # the state of production rather than on the state of the change, and its
+  # sibling `redeploy` is out of branch protection for that same reason. What
+  # guards this lane is the freeze plus the script's own roll-nothing refusal,
+  # both of which run INSIDE the job rather than in branch protection.
+  # bp-exempt: production deploy arm; gated by the freeze and the roller's own roll-nothing refusal, not by branch protection.
   redeploy-k8s:
     runs-on: local-deploy
     timeout-minutes: 45
