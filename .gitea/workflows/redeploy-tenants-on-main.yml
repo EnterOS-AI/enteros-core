@@ -174,3 +174,214 @@ jobs:
           set -euo pipefail
           bash scripts/deploy/probe-enteros-buildinfo.sh \
             --cp-env production --domain "$ENTEROS_TENANT_DOMAIN"
+
+  # ── THE K8S ARM ────────────────────────────────────────────────────────────
+  #
+  # WHY THIS JOB EXISTS. The `redeploy` job above enumerates production tenants
+  # with `docker ps --filter label=molecule.cp-env=production`. Measured on the
+  # production control plane (2026-08-10, org_substrates joined to
+  # organizations): the production fleet is 5 orgs and EVERY ONE of them has
+  # substrate='k8s'. None are on docker. So that filter matches nothing, the job
+  # rolls nothing, and a pin promote has been reporting a successful fleet roll
+  # while no tenant moved — work that runs and protects nothing, in deploy form.
+  #
+  # This job is the arm that actually rolls them, via the shared SSOT script.
+  #
+  # IT IS A SEPARATE JOB, NOT A STEP, so a docker arm that legitimately matches
+  # zero containers cannot mask a k8s arm that failed, and vice versa. Each
+  # reports its own counts and its own verdict.
+  #
+  # ── WHY THE FREEZE MAKES THIS PLAN-ONLY INSTEAD OF SKIPPING IT ─────────────
+  #
+  # The docker arm short-circuits entirely while PROD_AUTO_DEPLOY_DISABLED is
+  # set. Doing the same here would mean the wiring below is never exercised until
+  # the day someone lifts the freeze expecting a roll — and finds out THEN that a
+  # secret is absent or the census returns nothing. That is the same "the
+  # plumbing was live but had never carried anything" failure this chain exists
+  # to stop.
+  #
+  # So the freeze selects --dry-run instead. A frozen run still resolves every
+  # credential, runs the census, prints the counts and FAILS if any of it is
+  # missing or empty. It touches no workload: --dry-run is the script's own plan
+  # mode.
+  redeploy-k8s:
+    runs-on: local-deploy
+    timeout-minutes: 45
+    env:
+      PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}
+      # Where the production control plane's database actually runs. Overridable
+      # as repo vars so a cutover does not need a code change, but defaulted to
+      # the measured truth rather than left unset.
+      CP_PROD_NAMESPACE: ${{ vars.CP_PROD_NAMESPACE || 'controlplane-prod' }}
+      CP_PROD_DB_POD: ${{ vars.CP_PROD_DB_POD || 'controlplane-db-postgres-0' }}
+      CP_PROD_DB_USER: ${{ vars.CP_PROD_DB_USER || 'cp' }}
+      CP_PROD_DB_NAME: ${{ vars.CP_PROD_DB_NAME || 'cp_prod' }}
+    steps:
+      - name: Select mode (the freeze plans; it does not skip)
+        id: mode
+        run: |
+          set -euo pipefail
+          case "$(printf '%s' "${PROD_AUTO_DEPLOY_DISABLED:-}" | tr '[:upper:]' '[:lower:]')" in
+            1|true|yes|on|disabled|disable)
+              echo "::notice::PROD_AUTO_DEPLOY_DISABLED is set — the k8s fleet arm runs PLAN-ONLY (--dry-run). No workload is touched."
+              echo "dry=1" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::warning::the production freeze is OFF — this run WILL roll the k8s tenant fleet."
+              echo "dry=0" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Preflight — the roller must EXIST before anything claims to have run it
+        run: |
+          set -euo pipefail
+          # scripts/deploy/redeploy-tenant-fleet-k8s.sh arrives with core#5154, so
+          # this job must not land ahead of it. Checked explicitly rather than
+          # left to `bash <missing>`, and deliberately NEVER softened into "skip
+          # if absent": a step that quietly does nothing when its own tool is
+          # missing is the vacuous pass this job replaces, reintroduced one level
+          # up.
+          if [ ! -f scripts/deploy/redeploy-tenant-fleet-k8s.sh ]; then
+            echo "::error::scripts/deploy/redeploy-tenant-fleet-k8s.sh is missing (core#5154). Refusing to report a fleet roll this job cannot perform."
+            exit 1
+          fi
+          echo "roller present: $(wc -l < scripts/deploy/redeploy-tenant-fleet-k8s.sh) lines"
+
+      - name: Resolve the cluster credential from the Infisical SSOT
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          # ONE CREDENTIAL, NOT TWO, AND THIS IS THE REASON.
+          #
+          # The roller needs kubectl in order to roll. It ALSO needs a substrate
+          # census and the pinned digest, and the obvious wiring for those is a CP
+          # database DSN — a second credential, with a second lifecycle, naming a
+          # host that has to stay correct.
+          #
+          # It did not stay correct. Measured 2026-08-10:
+          #
+          #   /shared/controlplane DATABASE_URL   -> host 'cp-postgres-prod', the
+          #       DOCKER container (postmaster start 2026-07-25)
+          #   /shared/ops-pin-ro CP_PROD_PIN_RO_DSN -> the same docker server
+          #       (172.21.0.4), and GRANT-limited to runtime_image_pins, so it
+          #       answers "permission denied for table org_substrates" — it cannot
+          #       census at all
+          #
+          # while the control plane that actually serves production runs IN the
+          # cluster against controlplane-db-postgres-0 (postmaster start
+          # 2026-08-10 10:44). A roller wired to either DSN would read its target
+          # list and its digest out of a database the live CP no longer writes to,
+          # and today the two happen to AGREE on the tenant digest — so it would
+          # look correct right up until a promote landed in one of them.
+          #
+          # So both go through the SAME kubectl the roll already requires. One
+          # credential to rotate, one cluster to be wrong about, and the census
+          # cannot silently address a different control plane than the roll.
+          KUBECONFIG_BODY="$(python3 .gitea/scripts/infisical-read-secret.py \
+            K8S_FLEET_KUBECONFIG /shared/controlplane prod)"
+          if [ -z "$KUBECONFIG_BODY" ]; then
+            echo "::error::Infisical returned EMPTY for K8S_FLEET_KUBECONFIG (/shared/controlplane, prod)."
+            echo "::error::A declared-but-empty secret produces exactly the vacuous pass this job exists to stop, so this fails rather than rolling zero tenants."
+            echo "::error::NOTE: the pre-existing /shared/controlplane KUBECONFIG key is a PATH ('/etc/molecule/cp-prod.kubeconfig') that resolves only inside the molecule-cp-prod container — it is not kubeconfig CONTENT and a CI runner cannot use it."
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KUBECONFIG_BODY" > "$RUNNER_TEMP/fleet.kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/fleet.kubeconfig" >> "$GITHUB_ENV"
+          echo "kubeconfig materialized ($(wc -c < "$RUNNER_TEMP/fleet.kubeconfig") bytes)"
+
+      - name: Resolve the census and the PINNED digest, and prove both are non-empty
+        id: resolve
+        run: |
+          set -euo pipefail
+          command -v kubectl >/dev/null 2>&1 || { echo "::error::kubectl is not on this runner"; exit 1; }
+          kubectl version -o json >/dev/null 2>&1 || { echo "::error::kubectl cannot reach the cluster with the resolved credential"; exit 1; }
+
+          # The census command handed to the roller. Written as a file because
+          # SUBSTRATE_CENSUS_CMD is eval'd, and a multi-line SQL string through
+          # eval is how quoting bugs become "the fleet is empty".
+          cat > "$RUNNER_TEMP/census.sh" <<'CENSUS'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          exec kubectl exec -i -n "$CP_PROD_NAMESPACE" "$CP_PROD_DB_POD" -- \
+            psql -U "$CP_PROD_DB_USER" -d "$CP_PROD_DB_NAME" -At -F "$(printf '\t')" -v ON_ERROR_STOP=1 \
+            -c "SELECT o.slug, o.id, s.substrate, s.instance_id FROM org_substrates s JOIN organizations o ON o.id = s.org_id ORDER BY o.slug;"
+          CENSUS
+          sed -i 's/^          //' "$RUNNER_TEMP/census.sh"
+          chmod +x "$RUNNER_TEMP/census.sh"
+
+          # THE DIGEST COMES FROM runtime_image_pins, WHICH IS THE SSOT FOR WHAT A
+          # TENANT RUNS. This workflow previously rolled `--tag latest`, a MOVING
+          # tag: two tenants rolled minutes apart can land on different bytes, and
+          # neither need match the pin the control plane believes is deployed. A
+          # digest is the only thing that makes a roll reproducible and makes a
+          # promote mean anything.
+          K8S_TENANT_DIGEST="$(kubectl exec -i -n "$CP_PROD_NAMESPACE" "$CP_PROD_DB_POD" -- \
+            psql -U "$CP_PROD_DB_USER" -d "$CP_PROD_DB_NAME" -At -v ON_ERROR_STOP=1 \
+            -c "SELECT image_digest FROM runtime_image_pins WHERE template_name='molecule-tenant' AND region='global';" \
+            | head -1 | tr -d '[:space:]')"
+          case "$K8S_TENANT_DIGEST" in
+            sha256:[0-9a-f]*) : ;;
+            *)
+              echo "::error::runtime_image_pins has no usable molecule-tenant/global digest (got '${K8S_TENANT_DIGEST}')."
+              echo "::error::Refusing to fall back to a moving tag — that is how a 'successful' roll lands bytes nobody pinned."
+              exit 1 ;;
+          esac
+          echo "::notice::pinned tenant digest = ${K8S_TENANT_DIGEST}"
+          echo "digest=$K8S_TENANT_DIGEST" >> "$GITHUB_OUTPUT"
+
+          # PROVE THE CENSUS RETURNS ROWS BEFORE HANDING IT OVER. The roller has
+          # its own zero-row refusal, but a census broken HERE surfaces there as
+          # "the fleet is empty", which reads like a fact about production rather
+          # than a fact about this wiring.
+          rows="$("$RUNNER_TEMP/census.sh" | grep -c . || true)"
+          k8s_rows="$("$RUNNER_TEMP/census.sh" | awk -F'\t' '$3=="k8s"' | grep -c . || true)"
+          echo "::notice::census: rows=${rows} k8s=${k8s_rows}"
+          if [ "${rows:-0}" -eq 0 ]; then
+            echo "::error::the substrate census returned ZERO rows. A control plane that knows about no tenants on any substrate is a broken query or the wrong database, not an empty fleet."
+            exit 1
+          fi
+          if [ "${k8s_rows:-0}" -eq 0 ]; then
+            echo "::error::the census found ${rows} org(s) and NONE on the k8s substrate, so this job would roll nothing — the exact vacuous pass it replaces."
+            exit 1
+          fi
+          echo "census=$RUNNER_TEMP/census.sh" >> "$GITHUB_OUTPUT"
+
+      - name: Roll the k8s tenant fleet (plan-only while the freeze is on)
+        env:
+          SUBSTRATE_CENSUS_CMD: ${{ steps.resolve.outputs.census }}
+          PINNED_DIGEST: ${{ steps.resolve.outputs.digest }}
+          DRY: ${{ steps.mode.outputs.dry }}
+        run: |
+          set -euo pipefail
+          # --allow-empty is deliberately NOT passed. An empty k8s fleet is only
+          # ever acceptable as an explicit operator assertion, and the step above
+          # has just proven this fleet is not empty.
+          args="--digest $PINNED_DIGEST"
+          if [ "$DRY" = "1" ]; then args="$args --dry-run"; fi
+          # shellcheck disable=SC2086
+          bash scripts/deploy/redeploy-tenant-fleet-k8s.sh $args | tee "$RUNNER_TEMP/roll.log"
+
+          # THE COUNTS ARE THE VERDICT. The script prints a SUMMARY line; surface
+          # it, and refuse a run whose result cannot be read at all.
+          summary="$(grep -E 'SUMMARY ' "$RUNNER_TEMP/roll.log" | tail -1 || true)"
+          if [ -z "$summary" ]; then
+            echo "::error::the roller produced no SUMMARY line, so this run cannot say how many tenants it touched. An unreadable result is a failure, not a pass."
+            exit 1
+          fi
+          {
+            if [ "$DRY" = "1" ]; then
+              echo "## Production k8s tenant fleet — PLAN ONLY (production freeze is on)"
+            else
+              echo "## Production k8s tenant fleet — ROLLED"
+            fi
+            echo ""
+            echo "- Pinned digest: \`${PINNED_DIGEST}\`"
+            echo "- \`${summary}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
