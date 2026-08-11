@@ -156,6 +156,29 @@ case "$url" in
         printf '409'
         exit 0
         ;;
+      delete-202-then-200)
+        # The CURRENT shape of the same transient condition (controlplane#2967):
+        # the CP records a durable purge intent and answers 202 instead of
+        # dropping the request on the floor with a 409. It is still not a
+        # teardown, so the caller must re-issue rather than believe it.
+        dn=$(grep -c '^DELETE ' "${FAKE_CALL_LOG:?}" 2>/dev/null || printf 0)
+        if [ "${dn:-0}" -le 1 ]; then
+          printf '%s' '{"slug":"e2e-receipt-unit","org_id":"11111111-1111-4111-8111-111111111111","purge_id":"22222222-2222-4222-8222-222222222222","deleted":false,"message":"organization has an active lifecycle operation; teardown is queued and will run when it drains"}' > "$out"
+          printf '202'
+        else
+          printf '%s' '{"deleted":true,"slug":"e2e-receipt-unit","org_id":"11111111-1111-4111-8111-111111111111","purge_id":"22222222-2222-4222-8222-222222222222"}' > "$out"
+          printf 'deleted\n' > "${FAKE_STATE_FILE:?}"
+          printf '200'
+        fi
+        exit 0
+        ;;
+      delete-202-persistent)
+        # Queued forever: the CP owns the teardown, but this gate cannot report
+        # success for a tenant that is still there. Fail closed at the deadline.
+        printf '%s' '{"slug":"e2e-receipt-unit","org_id":"11111111-1111-4111-8111-111111111111","purge_id":"22222222-2222-4222-8222-222222222222","deleted":false,"message":"organization has an active lifecycle operation; teardown is queued and will run when it drains"}' > "$out"
+        printf '202'
+        exit 0
+        ;;
       delete-500-persistent)
         # Negative control: a 500 is NOT a self-resolving conflict. It must fail
         # immediately without any retry (guards that only 409 is retried).
@@ -391,9 +414,15 @@ else
 fi
 
 # ── a 409 that never clears retries, then fails closed at the deadline ──
+# BUDGET IS 3s, NOT 1s, AND THAT IS A FLAKE FIX. The deadline is compared with
+# whole-second `date +%s`, so a 1s budget lost the retry whenever the second
+# boundary happened to fall inside the first attempt — observed failing here as
+# `deletes=1; expected >=2` on one run and passing on the next five. A budget
+# that spans several ticks makes "it retried" a property of the code rather than
+# of when the test started.
 persist_out=$(run_case delete-409-persistent local-docker \
   https://staging-api.moleculesai.app e2e-receipt-unit \
-  "$TMPDIR_TEST/persist409-state" "$TMPDIR_TEST/persist409-calls" 1 1 2>&1)
+  "$TMPDIR_TEST/persist409-state" "$TMPDIR_TEST/persist409-calls" 3 1 2>&1)
 persist_rc=$?
 persist_deletes=$(grep -c '^DELETE ' "$TMPDIR_TEST/persist409-calls" 2>/dev/null || true)
 if [ "$persist_rc" = "4" ] && [ "${persist_deletes:-0}" -ge 2 ]; then
@@ -402,6 +431,45 @@ if [ "$persist_rc" = "4" ] && [ "${persist_deletes:-0}" -ge 2 ]; then
 else
   echo "FAIL: persistent 409 fail-closed (rc=$persist_rc deletes=$persist_deletes; expected rc=4 deletes>=2)" >&2
   printf '%s\n' "$persist_out" | sed 's/^/  /' >&2
+  FAIL=$((FAIL + 1))
+fi
+
+# ── 202 "teardown queued" is the SAME transient condition and is re-issued ──
+# controlplane#2967 replaced the dropped 409 with a durable purge intent + 202.
+# This helper only ever accepted 200, so the new answer turned a self-resolving
+# retry into an instant hard fail. It must be re-driven like the 409 was.
+queued_out=$(run_case delete-202-then-200 local-docker \
+  https://staging-api.moleculesai.app e2e-receipt-unit \
+  "$TMPDIR_TEST/queued-state" "$TMPDIR_TEST/queued-calls" 5 0 2>&1)
+queued_rc=$?
+queued_deletes=$(grep -c '^DELETE ' "$TMPDIR_TEST/queued-calls" 2>/dev/null || true)
+if [ "$queued_rc" = "0" ] \
+  && printf '%s' "$queued_out" | grep -q 'teardown queued' \
+  && printf '%s' "$queued_out" | grep -q 'CP purge completed' \
+  && [ "${queued_deletes:-0}" -ge 2 ]; then
+  echo "PASS: queued 202 DELETE is re-issued until the teardown lands (attempts=$queued_deletes)"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: queued 202 retry (rc=$queued_rc deletes=$queued_deletes)" >&2
+  printf '%s\n' "$queued_out" | sed 's/^/  /' >&2
+  FAIL=$((FAIL + 1))
+fi
+
+# ── a 202 that never clears must FAIL CLOSED, not pass on the CP's promise ──
+# The riskiest reading of this change would be "202 means the CP has it, so we
+# are done". It does not: the tenant is still serving. This gate proves absence
+# or it is red.
+queuedp_out=$(run_case delete-202-persistent local-docker \
+  https://staging-api.moleculesai.app e2e-receipt-unit \
+  "$TMPDIR_TEST/persist202-state" "$TMPDIR_TEST/persist202-calls" 3 1 2>&1)
+queuedp_rc=$?
+queuedp_deletes=$(grep -c '^DELETE ' "$TMPDIR_TEST/persist202-calls" 2>/dev/null || true)
+if [ "$queuedp_rc" = "4" ] && [ "${queuedp_deletes:-0}" -ge 2 ]; then
+  echo "PASS: persistent 202 retries then fails closed at the deadline (attempts=$queuedp_deletes)"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: persistent 202 fail-closed (rc=$queuedp_rc deletes=$queuedp_deletes; expected rc=4 deletes>=2)" >&2
+  printf '%s\n' "$queuedp_out" | sed 's/^/  /' >&2
   FAIL=$((FAIL + 1))
 fi
 
