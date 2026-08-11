@@ -1,0 +1,313 @@
+name: pin-provenance-guard
+
+# THE MECHANISM THAT REPLACES "we always bump pins through CI".
+#
+# Two pins decide what runs in production and both could be moved by hand:
+#
+#   SDK pin       workspace-server/go.mod + the paired canonicalRegistrySHA256
+#                 checkpoint. Moving it by hand is four commands, and the repo
+#                 PRINTS those four commands at you — check_sdk_pin_drift.py's
+#                 STUCK remediation and sync_canonical_test.go's failure message
+#                 both spell out the manual equivalent. It has been done for
+#                 real: 45a61bb on 2026-08-05, four minutes after sdk-pin-bump
+#                 run 620174 went green having done nothing.
+#
+#   Tenant pin    the runtime_image_pins row the control plane serves. Moving it
+#                 by hand is one curl, documented in
+#                 molecule-controlplane/docs/operations/provider-aware-tenant-image-rollout.md
+#                 and endorsed in this repo's own promote lane ("Reconcile that
+#                 case by running scripts/deploy/advance-staging-tenant-pin.sh
+#                 directly"). The live prod row read on 2026-08-09 was a hand
+#                 write: notes were a sentence a person typed.
+#
+# WHY A GUARD AND NOT A CONVENTION. `promoted_by` is not evidence — CI and an
+# operator's laptop present the SAME CP admin token, so both render as
+# `api-token-<8 hex>`. Nothing in either repo inspected a pin's provenance
+# before this file existed. A convention with no mechanism is prose.
+#
+# ---------------------------------------------------------------------------
+# THE TWO HALVES ARE NOT EQUALLY STRONG. READ THIS BEFORE TRUSTING THE GATE.
+#
+#   SDK pin     PREVENTED. The edit is a commit, the guard runs on the diff,
+#               and a PR carrying an unattributed pin edit cannot go green. The
+#               bad state never lands.
+#
+#   TENANT pin  DETECTED, not prevented. The blessed writer
+#               (scripts/deploy/advance-staging-tenant-pin.sh) refuses without a
+#               CI-minted stamp, so the documented "just run the script
+#               directly" path is closed. But a raw
+#                   curl -X POST …/cp/admin/runtime-image/promote
+#               STILL SUCCEEDS. The control plane accepts it: the promote
+#               dispatcher has a `GuardPromote` hook designed for exactly this
+#               (molecule-controlplane internal/handlers/admin_pin_handler.go),
+#               and `runtimeImagePinResource` deliberately leaves it unset
+#               ("No GuardPromote: the molecule-tenant pin promotes through the
+#               SAME ungated authenticated-admin path…", pin_runtime_image.go).
+#               Until that hook rejects an unstamped molecule-tenant promote,
+#               this lane catches a hand write AFTER it has already changed what
+#               fresh provisions get — on the next push to main or dispatch,
+#               not at the moment of the write.
+#
+# Do not read the word "blocking" below as "prevented" for the tenant half. It
+# means the audit's verdict blocks; it does not mean the write was stopped.
+# ---------------------------------------------------------------------------
+#
+# WHAT EACH ARM DOES
+#
+#   sdk-pin (every event, BLOCKING)      lint_sdk_pin_provenance.py over
+#       base..head. Fires only when the diff moves an SDK pin LINE, so it cannot
+#       wedge unrelated PRs, and when it fires it demands a Pin-Provenance
+#       trailer citing a real sdk-pin-bump.yml run — resolved through the
+#       Actions API, not believed from the note.
+#
+#   self-test (every event, BLOCKING)    pytest over both guards' disposition
+#       matrices, in the SAME job. Copied deliberately from sdk-pin-drift.yml:
+#       if the classifier regresses into "never blocks", THIS step goes red even
+#       though the arm above is green. Without it a broken guard and a healthy
+#       repo look identical.
+#
+#   tenant-pin audit (push/dispatch, BLOCKING)   reads the live
+#       (molecule-tenant, global) row from EVERY production control plane and
+#       requires a provenance stamp on it.
+#
+# WHY THE LIVE AUDIT DOES NOT RUN ON pull_request. It needs the prod CP admin
+# token. Putting a cross-tenant admin credential in a job whose next step runs
+# code from the PR's own tree is the exact trade this repository already
+# rejected once, in writing, in required-contexts.txt ("a branch push is not a
+# review"). The PR arm is therefore the two offline arms — which are real,
+# deterministic and blocking, not a vacuous self-check. The audit runs where the
+# credential is safe: on push to main and on dispatch.
+#
+# NO paths: filter. A pin's provenance is a property of the DIFF and of ANOTHER
+# system's state; a paths filter would let a pin edit dodge the guard by
+# arriving alongside a file the filter did not list, and lint-required-no-paths
+# forbids paths on a context that is to become required.
+#
+# NO schedule/cron: molecule-core enforces a zero-cron ratchet
+# (lint_schedule_budget.py).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pin-provenance-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # main's branch protection is status_check_contexts=['*'], so every context
+  # this job posts is required. That is intended: a red here means a pin moved
+  # with no pipeline behind it, which is the whole subject of the gate. It is
+  # declared rather than left implicit so lint_required_context_exists_in_bp
+  # records the intent at the emitter, where a scheduled audit can read it.
+  # bp-required: yes
+  guard:
+    name: Pin provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # The SDK arm diffs base..head and reads commit metadata, so it needs
+          # real history, not a shallow tip.
+          fetch-depth: 0
+          # BLOBLESS. `fetch-depth: 0` fetches every ref in a repository with
+          # hundreds of branches, and on the tailnet-remote runners (~190ms) that
+          # is not merely slow: run 637991 sat inside
+          #   [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune …
+          # on molecule-runner-robot-2-10 for over twenty minutes while every
+          # later step stayed `queued`. A gate that posts on every PR must not
+          # be the slowest thing in CI, and a gate that can hang is a gate that
+          # can be cancelled — which under BP ['*'] is a context that never
+          # posts. Blobs are fetched on demand; this guard reads a handful of
+          # small text files.
+          #
+          # SHALLOWING IS THE NEXT THING SOMEONE WILL REACH FOR HERE, and it is
+          # the one that used to break the audit silently: on a truncated
+          # history `git log --diff-filter=A` names the shallow boundary as the
+          # commit that added pin_provenance.py, sliding the grandfathering
+          # window forward to the checkout's tip date and excusing every hand
+          # write in between — with `checked:` still printing a healthy count.
+          # That is now impossible rather than merely discouraged:
+          # mechanism_landed_at() checks `git rev-parse
+          # --is-shallow-repository` FIRST and refuses to derive a boundary at
+          # all, which makes the audit grandfather NOTHING and say so loudly.
+          # So `fetch-depth: 0` is still what you want here, but the audit's
+          # correctness no longer depends on your remembering that.
+          filter: blob:none
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+
+      - name: Prove the stamp can be minted on this runner
+        id: mintcheck
+        run: |
+          set -euo pipefail
+          # The stamp is minted from the ambient Actions environment by
+          # staging-tenant-cd and by the prod promote lane. If GITHUB_RUN_ID
+          # were absent on these runners, EVERY pin write would refuse and the
+          # deploy path would be down — so prove minting works here, in a real
+          # run, rather than assuming the variable exists.
+          #
+          # This also makes the guard's own first run non-vacuous: it executes
+          # the minting path under the same runner the writers use.
+          stamp="$(python3 .gitea/scripts/pin_provenance.py mint)"
+          echo "minted: ${stamp}"
+          python3 .gitea/scripts/pin_provenance.py parse "${stamp}" >/dev/null
+          echo "round-trip: OK"
+          # And prove the refusal is real, here, not just in a unit test.
+          set +e
+          env -u GITHUB_RUN_ID python3 .gitea/scripts/pin_provenance.py mint >/dev/null 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" != "3" ]; then
+            echo "::error::minting WITHOUT GITHUB_RUN_ID exited ${rc}, expected 3. The fail-closed half of the mechanism is not working, which would let a hand promote mint a stamp."
+            exit 1
+          fi
+          echo "fail-closed without GITHUB_RUN_ID: OK (exit 3)"
+
+      - name: Resolve the diff range
+        id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+          HEAD_BRANCH: ${{ github.head_ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          base=""
+          if [ "$EVENT" = "pull_request" ] && [ -n "${BASE_SHA:-}" ]; then
+            base="$BASE_SHA"
+          elif [ -n "${BEFORE:-}" ] && [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+            base="$BEFORE"
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            # Fall back to the previous first-parent commit. Never fall back to
+            # "compare HEAD with itself": an empty range makes the SDK arm find
+            # nothing and report success, which is the vacuous-pass shape this
+            # repository keeps paying for.
+            base="$(git rev-parse "${head}~1" 2>/dev/null || true)"
+          fi
+          if [ -z "$base" ]; then
+            echo "::error::could not resolve a base commit for the diff — refusing to run the SDK arm over an empty range."
+            exit 1
+          fi
+          branch="${HEAD_BRANCH:-$REF_NAME}"
+          echo "base=${base}"     >> "$GITHUB_OUTPUT"
+          echo "head=${head}"     >> "$GITHUB_OUTPUT"
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+          echo "::notice::diff range ${base}..${head} on branch ${branch}"
+
+      - name: Guard — the SDK pin may only move through the pipeline
+        env:
+          PIN_PROVENANCE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITEA_HOST: https://git.moleculesai.app
+          BASE: ${{ steps.range.outputs.base }}
+          HEAD: ${{ steps.range.outputs.head }}
+          BRANCH: ${{ steps.range.outputs.branch }}
+        run: |
+          set -euo pipefail
+          python3 .gitea/scripts/lint_sdk_pin_provenance.py \
+            --base "$BASE" --head "$HEAD" --branch "$BRANCH" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Self-test both guards' disposition matrices
+        run: |
+          set -euo pipefail
+          # Same-job on purpose (see sdk-pin-drift.yml for the precedent). These
+          # suites assert BOTH directions: a hand-edited pin goes red AND a
+          # pipeline-produced one goes green. A one-directional suite has
+          # already shipped a gate that failed the commit fixing the thing it
+          # guarded.
+          python3 -m pip install --quiet pytest
+          python3 -m pytest .gitea/scripts/tests/test_pin_provenance.py \
+                            .gitea/scripts/tests/test_lint_sdk_pin_provenance.py -q
+
+      - name: Read the production CP admin token from the Infisical SSOT
+        id: cptoken
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+          INFISICAL_BASE: https://key.moleculesai.app
+        run: |
+          set -euo pipefail
+          for v in INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET INFISICAL_PROJECT_ID; do
+            eval "val=\${$v:-}"
+            if [ -z "$val" ]; then
+              echo "::error::$v is not provisioned — the live pin audit reads the CP admin token from the Infisical SSOT rather than holding a second long-lived copy. Failing closed rather than reporting an audit that read nothing."
+              exit 1
+            fi
+          done
+          tok="$(curl -fsS -A curl/8.4.0 -X POST "$INFISICAL_BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; sys.stdout.write(json.load(sys.stdin).get("accessToken") or "")')"
+          if [ -z "$tok" ]; then
+            echo "::error::Infisical auth returned an empty accessToken — failing closed."
+            exit 1
+          fi
+          echo "::add-mask::$tok"
+          # env slug is `prod`, NOT `production`.
+          cp_token="$(curl -fsS -A curl/8.4.0 \
+            "$INFISICAL_BASE/api/v3/secrets/raw/CP_ADMIN_API_TOKEN?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=%2Fshared%2Fcontrolplane-admin" \
+            -H "Authorization: Bearer $tok" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.stdout.write(((d.get("secret") or {}).get("secretValue")) or "")')"
+          if [ -z "$cp_token" ]; then
+            echo "::error::Infisical returned an EMPTY CP_ADMIN_API_TOKEN at prod /shared/controlplane-admin — failing closed."
+            exit 1
+          fi
+          echo "::add-mask::$cp_token"
+          echo "CP_ADMIN_API_TOKEN=$cp_token" >> "$GITHUB_ENV"
+          echo "prod CP admin token loaded from the Infisical SSOT (len=${#cp_token})"
+
+      - name: Audit — the live tenant pin on EVERY control plane
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          PIN_PROVENANCE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITEA_HOST: https://git.moleculesai.app
+          PROD_CP_BASE_URLS: ${{ vars.PROD_CP_BASE_URLS || 'cp_prod=https://api.moleculesai.app=prod,cp_staging=https://staging-api.moleculesai.app=staging' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CP_ADMIN_API_TOKEN:-}" ]; then
+            echo "::error::CP_ADMIN_API_TOKEN is empty after the Infisical read — refusing to audit."
+            exit 1
+          fi
+          args=()
+          # Same endpoint grammar as the promote lane, from the same parser, so
+          # the audit can never inspect a different set of control planes than
+          # the promote writes to.
+          endpoints="$(python3 .gitea/scripts/prod_cp_endpoints.py "$PROD_CP_BASE_URLS")"
+          while IFS=$'\t' read -r label base inf_env; do
+            [ -n "$label" ] || continue
+            resp="${RUNNER_TEMP:-/tmp}/audit-${label}.json"
+            # lint-curl-status-capture shape: body to a file, status to a var,
+            # no or-else fallback inside the subshell.
+            code=$(curl -sS -A curl/8.4.0 -o "$resp" -w '%{http_code}' \
+              -H "Authorization: Bearer ${CP_ADMIN_API_TOKEN}" \
+              "${base%/}/cp/admin/runtime-image")
+            if [ "$code" != "200" ]; then
+              echo "::error::[${label}] could not read the live pin at ${base} (HTTP $code) — an unread control plane is not an audited one."
+              exit 1
+            fi
+            if [ ! -s "$resp" ]; then
+              echo "::error::[${label}] CP returned HTTP 200 with an EMPTY body — the known silent-failure shape on this path. Refusing to audit against it."
+              exit 1
+            fi
+            args+=("${label}=${resp}")
+          done <<< "$endpoints"
+          python3 .gitea/scripts/pin_provenance.py audit "${args[@]}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"

@@ -194,6 +194,47 @@ lint-context-set-shrink / lint-context-set-shrink
 # needs no shared-staging credential at all because it stands up its own throwaway
 # control plane. That is the correct home for "pull, not after push".
 
+# pending-#5145 (not yet enforced) ─────────────────────────────────────
+# `pin-provenance-guard / Pin provenance` — the image-pin provenance gate
+# (SDK pin diff arm + tenant-pin live audit). PARKED FOR SEQUENCING ONLY, and
+# the sequencing reason is mechanical, not a doubt about the gate.
+#
+# It is ALREADY merge-blocking when RED: it posts on every pull_request with no
+# paths filter and no skippable arm, and main's branch protection is
+# status_check_contexts=['*'], under which every POSTED context must be
+# success. Parking changes exactly one thing — a MISSING context does not hold
+# the queue.
+#
+# Why that matters here and not in the abstract: gitea-merge-queue.py evaluates
+# the enforced-file set at step 4b, BEFORE step 5 updates a behind-main head.
+# Every PR whose head predates this workflow file therefore never posts the
+# context, returns `wait`, and never reaches the update that would give it the
+# file — a permanent deadlock across every open PR, not a transient one. That is
+# the "merge-train freezes the repo" shape, caused by the promotion rather than
+# by the gate.
+#
+# PROMOTE (move this line above the first pending marker) once every open PR
+# has either merged or taken main — i.e. once `pin-provenance-guard / Pin
+# provenance` is posting on every open PR head. No other condition.
+#
+# The gate has been proven in BOTH directions, and the run ids matter because
+# this block is what a future operator reads when deciding to enforce it:
+#
+#   run 638139  RED   on a hand-edited pin (27s, reached a verdict:
+#                     `FAIL 18ab12d2a431 has NO Pin-Provenance trailer …
+#                     not the bump bot …`)
+#   run 638013  green on a lane-produced bump carrying a real trailer
+#   run 637975  green on a clean diff
+#
+# An earlier version of this block cited run 637991 as the red. THAT WAS WRONG:
+# 637991 posted `failure` with description "Has been cancelled" — it hung for
+# ten minutes inside the checkout fetch on molecule-runner-robot-2-10 with every
+# later step left `queued`, so the guard NEVER REACHED A VERDICT. A cancelled
+# run is not a negative result; citing one as proof is the same defect main
+# fixed in c2ca41d9 ("stop citing a fixture as fact"). 638139 is the run that
+# actually failed on the hand edit.
+pin-provenance-guard / Pin provenance
+
 # pending-#86 (not yet enforced) ────────────────────────────────────────
 # The staging concierge journey is
 # documented but not presence-required by the merge queue.
