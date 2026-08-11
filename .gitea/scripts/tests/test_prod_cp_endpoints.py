@@ -200,11 +200,25 @@ def test_no_test_fixture_embeds_a_live_admin_token_fingerprint():
     exploitable on its own, but a committed fragment of a live production
     credential does not belong in a fixture. The needle is assembled at run time
     so this guard does not itself embed it.
+
+    SCOPE WIDENED 2026-08-09. The scan used to cover `.gitea/` only, and that
+    blind spot was hit for real: work on the pin-provenance lane pasted the same
+    8 characters into a comment in `scripts/deploy/advance-staging-tenant-pin.sh`
+    — a file this test walked straight past — while correctly flagging the
+    identical string inside `.gitea/`. `scripts/` holds the deploy scripts that
+    talk to the CP admin API, so it is exactly where the fragment is most likely
+    to be quoted next. `.sh` is included for the same reason.
     """
     needle = "2e19" + "e" + "375"
-    gitea = ROOT / ".gitea"
+    roots = [ROOT / ".gitea", ROOT / "scripts"]
+    candidates: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for pattern in ("*.py", "*.yml", "*.sh"):
+            candidates.extend(root.rglob(pattern))
     offenders = []
-    for p in sorted(list(gitea.rglob("*.py")) + list(gitea.rglob("*.yml"))):
+    for p in sorted(candidates):
         if p.resolve() == Path(__file__).resolve():
             continue
         if needle in p.read_text(encoding="utf-8", errors="ignore"):
@@ -319,6 +333,11 @@ def test_boot_secret_is_written_to_the_env_it_was_given(tmp_path: Path):
         "TENANT_IMAGE_NAME": "registry.test/molecule-tenant",
         "CP_BASE_URL": "https://cp.test",
         "GITHUB_OUTPUT": str(tmp_path / "gho"),
+        # Explicit, not inherited: the promote refuses without a CI run id, and
+        # a test that passes only inside Actions is a test that fails on a
+        # developer box for a reason it does not assert.
+        "GITHUB_RUN_ID": "900011",
+        "GITHUB_REPOSITORY": "molecule-ai/molecule-core",
     })
     r = subprocess.run(
         [BASH, str(SCRIPT), "--tag", "staging-deadbee", "--git-sha", "deadbeef"],

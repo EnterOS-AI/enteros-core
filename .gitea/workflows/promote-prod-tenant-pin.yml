@@ -137,10 +137,21 @@ name: promote-prod-tenant-pin
 # history.
 #
 # NO workflow_dispatch inputs (lint-workflow-yaml forbids them). The target is
-# DERIVED: the molecule-tenant image built from the current main HEAD, i.e.
-# `<TENANT_IMAGE>:staging-<sha7(main)>`. That is deliberate — it makes "promote
-# prod" mean "promote what trunk says", and removes the footgun of dispatching an
-# arbitrary tag.
+# DERIVED: the molecule-tenant image for the NEWEST FIRST-PARENT TRUNK COMMIT THE
+# REGISTRY ACTUALLY SERVES, i.e. `<TENANT_IMAGE>:staging-<sha7>` for that commit.
+# That is deliberate — it makes "promote prod" mean "promote what trunk says",
+# and removes the footgun of dispatching an arbitrary tag.
+#
+# It used to be main HEAD exactly, and that made the lane unrunnable: see the
+# comment on the target step for run 637861's log lines. Most main commits build
+# no tenant image (the publish lane is path-filtered) and old tags are pruned.
+#
+# PROVENANCE. The apply path's pin write is stamped by
+# .gitea/scripts/pin_provenance.py, which mints from GITHUB_RUN_ID and therefore
+# CANNOT be minted outside a run. `promoted_by` cannot carry that signal — it
+# renders as the CP admin token's identity (`api-token-<8 hex>`) whether the
+# caller is this job or an operator holding the same token. pin-provenance-guard
+# audits the live rows against it.
 #
 # It SHELLS OUT to scripts/deploy/advance-staging-tenant-pin.sh rather than
 # re-implementing the promote. That script already writes BOTH SSOTs (the
@@ -186,22 +197,40 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve the target image from trunk
+      # Resolve the NEWEST TRUNK COMMIT THE REGISTRY ACTUALLY SERVES, not
+      # blindly `main` HEAD.
+      #
+      # This was measured, not anticipated. The first dispatch of this lane from
+      # main after the multi-CP rewrite — run 637861, 2026-08-09 — died here:
+      #
+      #   ::notice::target = registry.moleculesai.app/molecule-ai/molecule-tenant:staging-b7508a4 (main b7508a4abce6169e619081b0e531e5df6f92bf0c)
+      #   ::error::the registry serves NO manifest for registry.moleculesai.app/molecule-ai/molecule-tenant:staging-b7508a4. …Refusing.
+      #
+      # `staging-<sha7(main HEAD)>` only exists if a tenant image was published
+      # for exactly that commit AND has not been pruned. Neither holds in
+      # general: publish-workspace-server-image.yml is path-filtered so most
+      # main commits build no tenant image at all, and the repository keeps a
+      # short tail (20 `staging-*` tags at the time of writing; b7508a4 was
+      # never among them while b5e48f0, three commits older, was). So the lane
+      # was structurally red at almost any moment someone might dispatch it —
+      # a promote path you cannot run is not a promote path.
+      #
+      # Walking back is NOT a weakening of "promote what trunk says": every
+      # candidate is a first-parent commit of origin/main, so the target is
+      # still a trunk commit and still cannot be an arbitrary tag. It is the
+      # newest trunk commit that HAS an image. The 404 refusal is kept for the
+      # case that matters — if NOTHING in the window is served, this fails
+      # closed rather than promoting a pin to a tag nobody can pull, which is
+      # exactly how prod was left on staging-7d78136.
+      - name: Resolve the target — newest trunk commit the registry serves
         id: target
-        run: |
-          set -euo pipefail
-          sha="$(git rev-parse origin/main)"
-          echo "sha=${sha}"        >> "$GITHUB_OUTPUT"
-          echo "sha7=${sha:0:7}"   >> "$GITHUB_OUTPUT"
-          echo "tag=staging-${sha:0:7}" >> "$GITHUB_OUTPUT"
-          echo "::notice::target = ${TENANT_IMAGE}:staging-${sha:0:7} (main ${sha})"
-
-      - name: Resolve the target digest over the registry API (no docker)
-        id: digest
         env:
           REG_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
           REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
-          TAG: ${{ steps.target.outputs.tag }}
+          # How far back down trunk to look. 40 first-parent commits is several
+          # days of merges; beyond that the right answer is "publish an image",
+          # not "promote something ancient".
+          TRUNK_SCAN_DEPTH: ${{ vars.PROD_TENANT_PIN_SCAN_DEPTH || '40' }}
         run: |
           set -euo pipefail
           if [ -z "${REG_TOKEN:-}" ]; then
@@ -209,21 +238,48 @@ jobs:
             exit 1
           fi
           echo "::add-mask::$REG_TOKEN"
-          ref="${TENANT_IMAGE}:${TAG}"
-          set +e
-          digest="$(python3 .gitea/scripts/registry-manifest-state.py "$ref")"
-          rc=$?
-          set -e
-          if [ "$rc" = "10" ]; then
-            echo "::error::the registry serves NO manifest for ${ref}. Promoting a pin to a tag the registry does not serve is exactly how prod was left on staging-7d78136 (404 on both registry hosts). Refusing."
+          head_sha="$(git rev-parse origin/main)"
+          echo "::notice::trunk head = ${head_sha}; scanning up to ${TRUNK_SCAN_DEPTH} first-parent commit(s) for a served tenant image"
+          found_sha=""
+          found_digest=""
+          scanned=0
+          skipped=""
+          for sha in $(git rev-list --first-parent --max-count="${TRUNK_SCAN_DEPTH}" origin/main); do
+            scanned=$((scanned + 1))
+            ref="${TENANT_IMAGE}:staging-${sha:0:7}"
+            set +e
+            digest="$(python3 .gitea/scripts/registry-manifest-state.py "$ref")"
+            rc=$?
+            set -e
+            if [ "$rc" = "0" ] && [ -n "$digest" ]; then
+              found_sha="$sha"
+              found_digest="$digest"
+              break
+            fi
+            if [ "$rc" != "10" ]; then
+              # rc 10 is the ONLY "this tag is simply not published" answer. Any
+              # other failure is a registry/credential problem, and continuing
+              # would walk silently past a broken read and promote an older
+              # image as though trunk had chosen it.
+              echo "::error::registry read for ${ref} failed with rc=${rc} — that is not a 'tag absent' answer. Refusing to keep walking past an unread registry."
+              exit 1
+            fi
+            skipped="${skipped} ${sha:0:7}"
+          done
+          if [ -z "$found_sha" ]; then
+            echo "::error::no tenant image is published for ANY of the last ${scanned} trunk commit(s):${skipped}. Promoting a pin to a tag the registry does not serve is exactly how prod was left on staging-7d78136 (404 on both registry hosts). Refusing. Publish a tenant image for a trunk commit first (publish-workspace-server-image.yml)."
             exit 1
           fi
-          if [ "$rc" != "0" ] || [ -z "$digest" ]; then
-            echo "::error::could not resolve ${ref} over the registry API (rc=$rc)"
-            exit 1
+          if [ "$found_sha" != "$head_sha" ]; then
+            behind="$(git rev-list --count "${found_sha}..${head_sha}")"
+            echo "::warning::trunk HEAD ${head_sha:0:7} has no published tenant image; the target is the newest trunk commit that does — ${found_sha:0:7}, ${behind} commit(s) behind HEAD. Skipped:${skipped}"
           fi
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-          echo "::notice::target digest = ${digest}"
+          echo "sha=${found_sha}"          >> "$GITHUB_OUTPUT"
+          echo "sha7=${found_sha:0:7}"     >> "$GITHUB_OUTPUT"
+          echo "tag=staging-${found_sha:0:7}" >> "$GITHUB_OUTPUT"
+          echo "digest=${found_digest}"    >> "$GITHUB_OUTPUT"
+          echo "::notice::target = ${TENANT_IMAGE}:staging-${found_sha:0:7} (trunk ${found_sha})"
+          echo "::notice::target digest = ${found_digest}"
 
       - name: Read the production CP admin token from the Infisical SSOT
         id: cptoken
@@ -266,7 +322,7 @@ jobs:
       - name: Plan — current pin vs target on EVERY control plane (no mutation)
         env:
           TAG: ${{ steps.target.outputs.tag }}
-          TARGET_DIGEST: ${{ steps.digest.outputs.digest }}
+          TARGET_DIGEST: ${{ steps.target.outputs.digest }}
         run: |
           set -euo pipefail
           # FAIL-CLOSED. The plan IS the default path's entire product. Without a

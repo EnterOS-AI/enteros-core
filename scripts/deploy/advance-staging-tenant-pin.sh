@@ -375,8 +375,75 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
+# PROVENANCE, MINTED NOT ASSERTED. `notes` is the ONLY field on this row that
+# can distinguish a pipeline write from a hand-run one: `promoted_by` renders as
+# the CP admin token's identity (`api-token-<8 hex>`, measured on both control
+# planes 2026-08-09) whether the caller is a runner or a laptop holding the same
+# token. So the note now carries a `[ci-pin-provenance …]` stamp anchored on
+# GITHUB_RUN_ID, and .gitea/scripts/pin_provenance.py refuses to mint one
+# without a run id.
+#
+# THAT REFUSAL IS THE POINT. Outside Actions there is no run id, so there is no
+# stamp, so this script cannot promote — the documented "just run
+# advance-staging-tenant-pin.sh directly" path is closed for the DB pin. There
+# is deliberately no bypass variable: a bypass is a convention with an `if`
+# around it, and this task was assigned precisely because conventions had not
+# held. The boot-SSOT reconcile path above (DB pin already at target) is
+# untouched and still usable by hand — it mutates no pin.
+#
+# WHAT THIS DOES *NOT* CLOSE, said plainly so nobody infers more than is true:
+# this refusal binds THIS SCRIPT, not the control plane. A raw
+#   curl -X POST …/cp/admin/runtime-image/promote -d '{"notes":"whatever"}'
+# still succeeds — the promote dispatcher's `GuardPromote` hook is deliberately
+# unset for `runtimeImagePinResource` (molecule-controlplane
+# internal/handlers/pin_runtime_image.go). Such a write is DETECTED after the
+# fact by pin-provenance-guard's live audit, not prevented. Making it
+# impossible means implementing that hook; that is a control-plane change and a
+# prod CP deploy, not something this script can do.
+#
+# THE MINTER IS RESOLVED FROM $SCRIPT_DIR, NOT $REPO_ROOT. REPO_ROOT is
+# caller-overridable (resolve_digest_registry above honours it, and tests point
+# it at a synthetic tree holding only the resolver). Resolving a provenance
+# dependency through an overridable variable means `REPO_ROOT=/tmp/empty` turns
+# the promote path off — it fails CLOSED, so it is a denial rather than a
+# bypass, but it is still an env var deciding whether provenance happens.
+# BASH_SOURCE cannot be overridden that way, and the minter always ships next to
+# this script. Measured: CI run 638189 failed exactly here, with
+#   python3: can't open file '…/root/.gitea/scripts/pin_provenance.py'
+# on the two suites that set a synthetic REPO_ROOT.
+minter="$SCRIPT_DIR/../../.gitea/scripts/pin_provenance.py"
+if [ ! -f "$minter" ]; then
+  minter="$REPO_ROOT/.gitea/scripts/pin_provenance.py"
+fi
+if [ ! -f "$minter" ]; then
+  echo "FATAL: pin_provenance.py is missing (looked next to this script and under REPO_ROOT). A pin write must carry provenance; refusing." >&2
+  exit 1
+fi
+set +e
+NOTES="$(python3 "$minter" mint --notes "tenant image ${IMAGE}")"
+mint_rc=$?
+set -e
+if [ "$mint_rc" != "0" ] || [ -z "$NOTES" ]; then
+  cat >&2 <<'PROVFAIL'
+FATAL: refusing to promote the molecule-tenant pin without CI provenance.
+
+  This write is the source of truth for what a tenant runs, and it must be
+  attributable to a pipeline run. pin_provenance.py could not mint a stamp,
+  which outside CI means exactly one thing: GITHUB_RUN_ID is unset.
+
+  Promote through the pipeline instead:
+    staging     .gitea/workflows/staging-tenant-cd.yml   (runs on push to main)
+    production  .gitea/workflows/promote-prod-tenant-pin.yml  (dispatch; the
+                apply path additionally requires the freeze off AND
+                PROD_TENANT_PIN_PROMOTE_ARMED=true)
+
+  If you are reconciling a drifted LOCAL_TENANT_IMAGE boot secret while the DB
+  pin is already correct, that path does not come through here and still works.
+PROVFAIL
+  exit 1
+fi
 body="$(python3 -c 'import json,sys; print(json.dumps({"template_name":"molecule-tenant","image_digest":sys.argv[1],"git_sha":sys.argv[2],"notes":sys.argv[3]}))' \
-  "$DIGEST" "$GIT_SHA" "staging tenant image ${IMAGE}")"
+  "$DIGEST" "$GIT_SHA" "$NOTES")"
 cp_json POST /cp/admin/runtime-image/promote "$body" >/dev/null
 
 after="$(cp_json GET /cp/admin/runtime-image)"
