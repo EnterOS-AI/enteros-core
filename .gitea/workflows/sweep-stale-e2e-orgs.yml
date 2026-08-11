@@ -271,6 +271,36 @@ jobs:
         if: steps.identify.outputs.count != '0'
         run: |
           count="${{ steps.identify.outputs.count }}"
+          # AN UNKNOWN COUNT IS NOT A SMALL ONE.
+          #
+          # `[ "$count" -gt N ]` with an EMPTY or non-numeric count is not
+          # false — it is an ERROR, rc 2, "integer expected". And `set -e` is
+          # EXEMPT inside an `if` condition, so the error does not stop the
+          # step: it falls through to the else branch and prints the PASS line.
+          # Measured with the runner's own `bash --noprofile --norc -e -o
+          # pipefail`:
+          #     count=""     -> rc 0, "Within safety cap ( <= 50)"
+          #     count="abc"  -> rc 0, "Within safety cap (abc <= 50)"
+          #     count="999"  -> rc 1, refused          (cap works when numeric)
+          # So the one input the cap exists to distrust — a count the pipeline
+          # could not determine — is the one it waves through, into a step that
+          # DELETES tenants.
+          #
+          # This is defence in depth, not a fix for a demonstrated live bug:
+          # `count` is produced by `wc -l` and today is always numeric, and I
+          # could not construct the empty state either. It is closed on SHAPE
+          # because the blast radius is deletion and the cost is four lines.
+          #
+          # `case` and not `${count:-0}`: a default only covers UNSET. It turns
+          # an empty count into a passing 0 — still a silent wave-through — and
+          # does nothing at all about a non-numeric value, which hits the same
+          # rc 2. Validate, do not default.
+          case "$count" in
+            ''|*[!0-9]*)
+              echo "::error::Safety gate received a non-numeric org count (count=<$count>) from the identify step. Refusing to sweep: an unknown count cannot be compared against the cap, and a comparison that ERRORS reads as a pass. Fix the identify step rather than re-running."
+              exit 1
+              ;;
+          esac
           if [ "$count" -gt "$SAFETY_CAP" ]; then
             echo "::error::Refusing to delete $count orgs in one sweep (cap=$SAFETY_CAP). Investigate manually — this usually means the CP admin API returned no created_at or returned a degraded result. Re-run with workflow_dispatch + max_age_minutes if intentional."
             exit 1
