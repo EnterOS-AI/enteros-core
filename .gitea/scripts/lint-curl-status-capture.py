@@ -68,10 +68,16 @@ def _same_path(a: str, b: str) -> bool:
     `.gitea/workflows\\lint-...yml` and the self-skip missed — the lint then
     flagged its OWN documentation comment. Same verdict on Linux, where the
     separators already matched; this only stops the tool lying on Windows.
+
+    The backslash is folded EXPLICITLY rather than via `os.path.normpath`,
+    which on POSIX treats `\\` as an ordinary filename character and would
+    leave this function platform-dependent — passing on Windows and failing on
+    the runner, which is exactly what the first version did.
     """
-    return os.path.normcase(os.path.normpath(a)) == os.path.normcase(
-        os.path.normpath(b)
-    )
+    def norm(p: str) -> str:
+        return os.path.normcase(os.path.normpath(p.replace("\\", "/")))
+
+    return norm(a) == norm(b)
 
 
 class Finding(NamedTuple):
