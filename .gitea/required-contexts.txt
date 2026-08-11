@@ -113,6 +113,36 @@ E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path
 # enforceable — unlike the staging-concierge journey parked below.
 sdk-route-milestone-contract-drift / SDK route + milestone derive-gates
 
+# PROMOTED (core#5158) — the gate that catches a lane vanishing from CI.
+#
+# lint-context-set-shrink derives the contexts a PR's head SHOULD post and reds
+# when one of them never arrives. It exists because of core#5153: a duplicate
+# `env:` key stopped Gitea scheduling local-provision-e2e.yml at all, both of its
+# jobs stopped posting, and the head read 43/43 `success` and was fully mergeable.
+# The lane did not fail; it ceased to exist.
+#
+# WHY THIS LINE, AND NOT JUST THE ['*'] WILDCARD. Branch protection requires every
+# POSTED context to be green, so a RED from this gate already blocks and listing it
+# adds no new red exposure. What listing adds is the other half: PRESENCE. Delete
+# `.gitea/workflows/lint-context-set-shrink.yml` and the workflow does not schedule
+# at head, so Check B never executes and the wildcard requires nothing of a context
+# that never posts — the gate could be removed by accident, or by a bad merge, and
+# nothing would notice. That is the exact shape it was written to close, pointed at
+# itself, and it is the last hole in the design.
+#
+# gitea-merge-queue.py::enforced_file_contexts_green scores an absent enforced
+# context as `missing` → not green → the queue blocks. Mutation-tested rather than
+# assumed: with the workflow file deleted on a scratch head, the context is absent
+# from the posted set and that function returns not-green naming this entry.
+#
+# This could NOT be added in #5157, the PR that introduced the workflow:
+# lint-phantom-gate Guard F resolves every enforced entry against the LIVE Gitea
+# Actions API, which does not know a workflow until it lands on the default branch.
+# At that point the API returned 75 workflows against a head tree of 76, so the
+# entry resolved to no producer → P2 phantom → exit 1, with no remedy inside the
+# PR. It is added now that the API reports 76 and lists this workflow as `active`.
+lint-context-set-shrink / lint-context-set-shrink
+
 # RE-ENABLED on MOLECULES-SERVER 2026-07-03 — enforcement SEQUENCED ─────────
 # `E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace`
 # is NO LONGER workflow_dispatch-only: its producer (e2e-staging-saas.yml) was
