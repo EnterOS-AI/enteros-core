@@ -53,6 +53,15 @@ def _run(env_extra: dict, tmp_path: Path, path_value: str) -> subprocess.Complet
             "TENANT_IMAGE_NAME": "registry.test/molecule-tenant",
             "GITHUB_OUTPUT": str(tmp_path / "github-output"),
             "SKIP_SSOT_WRITE": "1",
+            # The promote refuses without a CI run id to attribute the pin
+            # write to (pin_provenance.py). Set it EXPLICITLY rather than
+            # inheriting whatever the runner happens to export: a test that
+            # only passes because it is running inside Actions is a test that
+            # fails on a developer box for a reason unrelated to what it
+            # asserts. The absent case has its own test in
+            # test_advance_staging_tenant_pin.py.
+            "GITHUB_RUN_ID": "900010",
+            "GITHUB_REPOSITORY": "molecule-ai/molecule-core",
         }
     )
     env.pop("DIGEST_SOURCE", None)
