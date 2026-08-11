@@ -155,14 +155,22 @@ MASK_WAIVERS = {
         "mask removed by PR #4326 (in flight) — prune this waiver once #4326 lands",
     "Ops Scripts Tests / Ops scripts (unittest)":
         "mask removed by PR #4325 (in flight) — prune this waiver once #4325 lands",
-    # Pre-existing debt, NOT yet proven green — deliberately left masked
-    # rather than un-masked blind (un-masking a red suite wedges every PR).
-    # Follow-ups filed; prove-then-unmask, one lane at a time.
-    "design-token-drift / Canvas ↔ app design-token SSOT drift":
-        "pre-existing mask; not yet proven green — follow-up task filed",
-    "Local Provision Lifecycle E2E / Local Provision Lifecycle E2E (real image + MiniMax LLM, advisory)":
-        "pre-existing mask on the explicitly-advisory real-image lane; "
-        "known-flaky (heartbeat host.docker.internal, task #77) — follow-up task filed",
+    # `design-token-drift / Canvas ↔ app design-token SSOT drift` and
+    # `Local Provision Lifecycle E2E / ... (real image + MiniMax LLM, advisory)`
+    # were both in this register as "pre-existing debt, not yet proven green".
+    # Their masks were REMOVED when mc#4602 / mc#4603 aged out rather than being
+    # renewed a fourth time, so their waivers are pruned here in the same change
+    # (an entry that outlives its mask is reported as prune-me noise, and this
+    # register is meant to shrink).
+    #   - design-token: the mask was covering a gate that could not run at all —
+    #     APP_SSOT_READ_TOKEN was never provisioned, so the script always took
+    #     its skip branch. It now reads DRIFT_BOT_TOKEN from the Infisical SSOT
+    #     and compares 15 shared tokens x {light,dark} for real.
+    #   - lifecycle-real: promoted on 9 days of LOG evidence (279 runs,
+    #     278 x "18 passed, 0 failed", 0 skip-path exits, 1 cancelled-on-
+    #     superseded-head), which is what mc#2408 asked for. The "known-flaky
+    #     heartbeat (task #77)" note above it did not reproduce anywhere in
+    #     that window.
 }
 
 
