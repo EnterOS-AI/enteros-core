@@ -965,6 +965,19 @@ jobs:
         name: Promoted runtime images are ready before staging E2E
         run: bash scripts/deploy/tests/test-prepare-staging-runtime-images.sh
 
+      # A fleet roll that rolls NOTHING must never report success. The docker
+      # roller did exactly that on a k8s-substrate control plane: its label
+      # filter matched zero containers, it logged "nothing to roll" and exited 0,
+      # so the production fleet-roll step went green while every tenant pod stayed
+      # on its provisioning-time image. This drives BOTH rollers against a fake
+      # kubectl and asserts an EXIT CODE for each scenario in which a naive roller
+      # would pass: empty target set, every target scaled to zero, control-plane/
+      # cluster drift, and a rollout that returns success without moving the
+      # digest the pods are actually running.
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
+        name: Fleet roll cannot pass vacuously (both substrates)
+        run: bash scripts/deploy/tests/test-k8s-fleet-roller.sh
+
       # Enter OS rebrand Phase 2 (internal#1089): the ADVISORY enteros.ai edge
       # probe the deploy workflows run after the blocking daemon-side gate.
       # Drives the real script against a fake docker/curl and proves: dual
@@ -1209,7 +1222,9 @@ jobs:
             scripts/deploy/prepare-staging-runtime-images.sh \
             scripts/deploy/tests/test-prepare-staging-runtime-images.sh \
             scripts/deploy/probe-enteros-buildinfo.sh \
-            scripts/deploy/tests/test-probe-enteros-buildinfo.sh
+            scripts/deploy/tests/test-probe-enteros-buildinfo.sh \
+            scripts/deploy/redeploy-tenant-fleet-k8s.sh \
+            scripts/deploy/tests/test-k8s-fleet-roller.sh
 
   # mc#959 root-fix (sre)
 
