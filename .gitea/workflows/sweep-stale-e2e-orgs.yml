@@ -70,9 +70,34 @@ env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 jobs:
-  # bp-exempt: post-merge staging janitor, NOT a merge gate — its context must
-  # not be a required check (a red sweep must not block PRs; it fails loud to ops
-  # via the notify-failure step instead).
+  # WHAT THIS DIRECTIVE IS, AND WHAT IT IS NOT.
+  # It is a Tier 2g lint token (lint_required_context_exists_in_bp.py): it
+  # records that this emitter is not expected to appear in
+  # `.gitea/required-contexts.txt`. It grants NO exemption from branch
+  # protection, and it never could: BP on main is
+  # `status_check_contexts: ['*']` (read from the API 2026-08-11), a WILDCARD
+  # that matches every context present on a commit it evaluates. There is no
+  # per-context opt-out to assert.
+  #
+  # This comment used to say "its context must not be a required check (a red
+  # sweep must not block PRs)". That was false, and the falseness is on record:
+  # on 2026-08-11 this job posted `Sweep stale e2e-* orgs (staging) / Sweep e2e
+  # orgs (push)` = failure (status id=88, 01:55:21Z) on 21ec47e78748 and held
+  # main's combined status red for 70m13s until id=123 succeeded at 03:05:34Z.
+  # A comment asserting an exemption that does not exist is how that outage got
+  # classified as impossible.
+  #
+  # What IS true: this workflow has no `pull_request:` trigger, so it posts no
+  # context on a PR head and is therefore not a PR merge gate TODAY. That is a
+  # property of its TRIGGER, not of this comment — adding `pull_request:` would
+  # silently make it merge-blocking under the same `['*']`. Its red still reds
+  # main. It does not by itself pause the merge queue, whose main-green backstop
+  # reads only `CI / all-required (push)` (gitea-merge-queue.yml
+  # PUSH_REQUIRED_CONTEXTS) — narrowness of that one env var, again not an
+  # exemption. The janitor still fails loud to ops via notify-failure.
+  #
+  # bp-exempt: post-merge staging janitor; push/dispatch only, so it emits no
+  # PR-head context. NOT an exemption from the `['*']` wildcard — see above.
   sweep:
     name: Sweep e2e orgs
     runs-on: ubuntu-latest

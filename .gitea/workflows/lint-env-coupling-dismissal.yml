@@ -39,7 +39,15 @@ jobs:
   # protection required context, so it never freezes the merge queue looking
   # for a phantom emitter; the review half rides the paired sop-checklist item
   # `no-flaky-env-coupling`.
-  # bp-exempt: no-flaky/env-coupling governance lint, not a gate context.
+  # NOT an exemption from branch protection. BP on main is
+  # `status_check_contexts: ['*']` (read from the API 2026-08-11): a wildcard
+  # matches every context on a commit it evaluates, so this job's
+  # (pull_request) status IS merge-blocking whenever it is red. The directive
+  # below is only a Tier 2g lint token recording that the context is not
+  # presence-required in `.gitea/required-contexts.txt`. See
+  # sweep-stale-e2e-orgs.yml for the outage this wording caused.
+  # bp-exempt: no-flaky/env-coupling governance lint; not presence-required
+  # in required-contexts.txt. Its red still blocks merges under `['*']`.
   lint:
     name: lint-env-coupling-dismissal
     runs-on: ubuntu-latest
