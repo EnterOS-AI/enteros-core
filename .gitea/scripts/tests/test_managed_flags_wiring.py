@@ -414,6 +414,30 @@ _KNOWN_FLEET_CALLERS = {
         "mirror its BRAND_PREFIXES / json_git_sha helpers. It never executes the "
         "fleet script and rolls nothing, so TENANT_FLAGS does not apply."
     ),
+    "scripts/deploy/tests/test-k8s-fleet-roller.sh": (
+        "the bash test harness for the non-vacuous fleet-roll guards. It DOES execute "
+        "redeploy-staging-fleet.sh, but only ever with --dry-run, which the script's "
+        "own contract exempts from the TENANT_FLAGS requirement because a dry run "
+        "performs zero mutations and so cannot strip a flag off a live tenant. That "
+        "exemption is self-enforcing rather than a promise: drop the --dry-run and the "
+        "script's fail-closed unset-check exits 1, which fails this harness."
+    ),
+    "scripts/deploy/redeploy-tenant-fleet-k8s.sh": (
+        "MENTION-ONLY, and the CALLEE not the caller: the docker roller dispatches "
+        "the k8s arm, never the reverse. Its header names redeploy-staging-fleet.sh "
+        "to explain which enumeration it exists to cover (that script's docker-label "
+        "filter matches zero containers on a k8s-substrate control plane). It never "
+        "executes the fleet script.\n"
+        "    TENANT_FLAGS genuinely does not apply to it, and that is a property of "
+        "the substrate rather than an exemption: the docker path needs the "
+        "strip-and-reapply dance because swap_tenant rebuilds a container from the "
+        "OLD one's Config.Env, so an unmanaged key is sticky forever. A k8s roll is "
+        "`kubectl set image` — the PodSpec's env is owned by the provisioner's "
+        "Deployment manifest and is not inherited from the outgoing pod, so no key "
+        "can become sticky across a roll and there is nothing to strip. If this "
+        "script ever starts mutating container env, it must honour the same "
+        "TENANT_FLAGS contract and move off this list."
+    ),
 }
 
 
