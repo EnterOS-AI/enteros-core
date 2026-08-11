@@ -769,6 +769,69 @@ def decide(
 
 
 # ---------------------------------------------------------------------------
+# Decision assembly
+# ---------------------------------------------------------------------------
+def evaluate_head(
+    *,
+    head_texts: dict[str, str],
+    base_texts: dict[str, str],
+    changed: list[str],
+    base_branch: str,
+    workflows_dir: str,
+    posted: set[str],
+    waivers: list[Waiver],
+    pr_number: int,
+    settled: bool,
+    report=lambda _: None,
+) -> Verdict:
+    """Derive both sides and reach a verdict. No network, no git.
+
+    This exists for the same reason `resolve_pr_base` does. Every argument
+    `decide()` receives is computed here rather than in `main()`, because wiring
+    buried among the I/O calls is wiring no test can reach — and unpinned wiring is
+    how the tip-vs-fork-point swap survived mutation until it broke a live gate.
+    Three couplings that looked like plumbing are load-bearing:
+
+      * `base_skipped` must reach `decide()`. Without it, a workflow that will not
+        parse ON THE BASE SIDE has its lanes silently missing from `base_lanes`,
+        and the partial-blindness guard blames the PR for main's bad file.
+      * `pr_touched_workflow_files` must be derived from the same `changed` list
+        the derivation used, or attribution explains the wrong things.
+      * BOTH derivations must take the SAME `base_branch` and the SAME `changed`.
+        That is what makes Check B's two sides comparable at all; feed them
+        different inputs and the diff between them stops meaning anything.
+    """
+    expected, _ = derive_expected(
+        head_texts, base_branch=base_branch, changed=changed
+    )
+    base_lanes, base_skipped = derive_expected(
+        base_texts,
+        base_branch=base_branch,
+        changed=changed,
+        tolerate_unreadable=True,
+    )
+    report(
+        f"base lanes: {len(base_texts)} workflow file(s) at the fork point -> "
+        f"{len(base_lanes)} lane(s) for this same diff, "
+        f"{len(set(base_lanes) - set(expected))} no longer derivable at head"
+        + (f" ({len(base_skipped)} base file(s) unreadable, skipped)"
+           if base_skipped else "")
+    )
+    return decide(
+        expected=expected,
+        posted=posted,
+        base_lanes=base_lanes,
+        base_has_workflows=bool(base_texts),
+        pr_touched_workflow_files=workflow_files_in_diff(changed, workflows_dir),
+        base_skipped_files=set(base_skipped),
+        waivers=waivers,
+        pr_number=pr_number,
+        settled=settled,
+        head_has_workflows=bool(head_texts),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Gitea I/O
 # ---------------------------------------------------------------------------
 class ApiError(RuntimeError):
@@ -877,21 +940,41 @@ def merge_base(base_ref: str, head_sha: str) -> str:
     return git("merge-base", base_ref, head_sha).strip()
 
 
-def base_tree_at_fork(
-    base_ref: str, head_sha: str, directory: str
-) -> tuple[str, dict[str, str]]:
-    """`(fork point, workflow tree there)` — Check B's base side, in one place.
+@dataclass
+class PrBase:
+    """Everything this gate reads relative to where the PR forked."""
 
-    This exists as its own function so the choice of ref is reachable from a unit
-    test. It is the single line that made the difference between a gate and a
-    queue-blocker: reading the tree at `base_ref` (the branch TIP) instead of at the
-    fork point attributes everything main did since the fork to the PR, and a
-    workflow retired upstream then reds an innocent PR unwaivably. Buried inside
-    `main()` alongside the network calls, that swap survived mutation testing
-    because nothing could reach it.
+    fork_point: str
+    base_texts: dict[str, str]
+    changed: list[str]
+
+
+def resolve_pr_base(base_ref: str, head_sha: str, directory: str) -> PrBase:
+    """Resolve the fork point ONCE and derive both base-side reads from it.
+
+    Every choice of git ref this gate makes lives here, and that is deliberate:
+    both of the ways to get it wrong are the same bug on different axes, and both
+    hid in `main()` among the network calls where no test could reach them.
+
+      * base TREE from `base_ref` (the branch tip) instead of the fork point —
+        attributes everything main did since the fork to the PR, so a workflow
+        retired upstream reds an innocent PR, unwaivably. That one shipped, and
+        broke a queue-enforced gate.
+      * DIFF from `base_ref` instead of the fork point — the same mistake on the
+        other axis. It inflates the changed-file list with other people's commits,
+        which over-fires `paths:`-filtered lanes in the derivation and reds honest
+        PRs through Check A instead of Check B.
+
+    Both are pinned by asserting on the REFS PASSED TO GIT rather than on the
+    values returned. An output assertion passes whenever the tip and the fork point
+    happen to agree — which is most of the time, and never when it matters.
     """
     fork_point = merge_base(base_ref, head_sha)
-    return fork_point, read_workflow_tree_at(fork_point, directory)
+    return PrBase(
+        fork_point=fork_point,
+        base_texts=read_workflow_tree_at(fork_point, directory),
+        changed=changed_files(fork_point, head_sha),
+    )
 
 
 def changed_files(fork_point: str, head_sha: str) -> list[str]:
@@ -1074,34 +1157,12 @@ def main(argv: list[str] | None = None) -> int:
 
     api = Gitea(api_url, token, repo)
     try:
-        fork_point, base_texts = base_tree_at_fork(base_ref, head_sha, workflows_dir)
-        changed = changed_files(fork_point, head_sha)
+        base = resolve_pr_base(base_ref, head_sha, workflows_dir)
         head_texts = read_workflow_tree(workflows_dir)
-        expected, _ = derive_expected(
-            head_texts, base_branch=base_branch, changed=changed
-        )
-        touched = workflow_files_in_diff(changed, workflows_dir)
         print(
             f"derivation: {len(head_texts)} workflow file(s) at head, "
-            f"{len(changed)} changed path(s) vs {base_ref}, "
-            f"base branch {base_branch!r} -> {len(expected)} expected context(s)"
-        )
-        # Check B. Derive the SAME thing from the base branch — same event, same
-        # changed-file list — so the two sides are comparable by construction, and
-        # the difference is exactly "lanes this PR removed".
-        base_expected, base_skipped = derive_expected(
-            base_texts,
-            base_branch=base_branch,
-            changed=changed,
-            tolerate_unreadable=True,
-        )
-        print(
-            f"base lanes: {len(base_texts)} workflow file(s) at fork point "
-            f"{fork_point[:10]} -> "
-            f"{len(base_expected)} lane(s) for this same diff, "
-            f"{len(set(base_expected) - set(expected))} no longer derivable at head"
-            + (f" ({len(base_skipped)} base file(s) unreadable, skipped)"
-               if base_skipped else "")
+            f"{len(base.changed)} changed path(s) since fork point "
+            f"{base.fork_point[:10]}, base branch {base_branch!r}"
         )
         posted, settled, history = settle_head(
             lambda sha: api.combined_statuses(sha),
@@ -1112,6 +1173,18 @@ def main(argv: list[str] | None = None) -> int:
             max_seconds=_int_env("CSG_MAX_SETTLE_SECONDS", 300),
         )
         print(f"head {head_sha[:10]}: settle poll sizes {history} settled={settled}")
+        result = evaluate_head(
+            head_texts=head_texts,
+            base_texts=base.base_texts,
+            changed=base.changed,
+            base_branch=base_branch,
+            workflows_dir=workflows_dir,
+            posted=posted,
+            waivers=waivers,
+            pr_number=pr_number,
+            settled=settled,
+            report=print,
+        )
     except WorkflowUnreadable as exc:
         print(f"::error::a workflow file at head will not parse: {exc}")
         print(
@@ -1124,18 +1197,6 @@ def main(argv: list[str] | None = None) -> int:
         print("context-shrink: verdict=ERROR expected=0 posted=0 missing=0 (read failed)")
         return _EXIT[ERROR]
 
-    result = decide(
-        expected=expected,
-        posted=posted,
-        base_lanes=base_expected,
-        base_has_workflows=bool(base_texts),
-        pr_touched_workflow_files=touched,
-        base_skipped_files=set(base_skipped),
-        waivers=waivers,
-        pr_number=pr_number,
-        settled=settled,
-        head_has_workflows=bool(head_texts),
-    )
     _report(result)
     return result.exit_code
 
