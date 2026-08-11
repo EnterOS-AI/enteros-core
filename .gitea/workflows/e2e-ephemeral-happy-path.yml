@@ -239,15 +239,15 @@ jobs:
           TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
             -H 'Content-Type: application/json' \
             -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")' || echo "")
           [ -n "$TOK" ] || { echo "::error::Infisical login returned empty accessToken"; exit 1; }
           read_secret() {
             curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
               -H "Authorization: Bearer $TOK" \
               | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
           }
-          MINIMAX_API_KEY=$(read_secret MINIMAX_API_KEY %2Fshared%2Fcontrolplane)
-          AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils)
+          MINIMAX_API_KEY=$(read_secret MINIMAX_API_KEY %2Fshared%2Fcontrolplane || echo "")
+          AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils || echo "")
 
           # FAIL CLOSED on an empty secret VALUE, not just a failed login.
           #
@@ -268,8 +268,8 @@ jobs:
             exit 1
           fi
 
-          echo "::add-mask::$MINIMAX_API_KEY"
-          echo "::add-mask::$AUTO_SYNC_TOKEN"
+          if [ -n "$MINIMAX_API_KEY" ]; then echo "::add-mask::$MINIMAX_API_KEY"; fi
+          if [ -n "$AUTO_SYNC_TOKEN" ]; then echo "::add-mask::$AUTO_SYNC_TOKEN"; fi
           echo "MINIMAX_API_KEY=$MINIMAX_API_KEY" >> "$GITHUB_ENV"
           echo "AUTO_SYNC_TOKEN=$AUTO_SYNC_TOKEN" >> "$GITHUB_ENV"
           echo "creds loaded (minimax len=${#MINIMAX_API_KEY}, sync len=${#AUTO_SYNC_TOKEN})"

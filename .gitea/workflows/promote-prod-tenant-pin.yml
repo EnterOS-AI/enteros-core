@@ -299,23 +299,23 @@ jobs:
           tok="$(curl -fsS -A curl/8.4.0 -X POST "$INFISICAL_BASE/api/v1/auth/universal-auth/login" \
             -H 'Content-Type: application/json' \
             -d "{\"clientId\":\"$INFISICAL_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; sys.stdout.write(json.load(sys.stdin).get("accessToken") or "")')"
+            | python3 -c 'import sys,json; sys.stdout.write(json.load(sys.stdin).get("accessToken") or "")' || echo "")"
           if [ -z "$tok" ]; then
             echo "::error::Infisical auth returned an empty accessToken — failing closed."
             exit 1
           fi
-          echo "::add-mask::$tok"
+          if [ -n "$tok" ]; then echo "::add-mask::$tok"; fi
           # env slug is `prod`, NOT `production`. A promote once wrote to a
           # nonexistent environment because of exactly that confusion.
           cp_token="$(curl -fsS -A curl/8.4.0 \
             "$INFISICAL_BASE/api/v3/secrets/raw/CP_ADMIN_API_TOKEN?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=%2Fshared%2Fcontrolplane-admin" \
             -H "Authorization: Bearer $tok" \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.stdout.write(((d.get("secret") or {}).get("secretValue")) or "")')"
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.stdout.write(((d.get("secret") or {}).get("secretValue")) or "")' || echo "")"
           if [ -z "$cp_token" ]; then
             echo "::error::Infisical returned an EMPTY CP_ADMIN_API_TOKEN at prod /shared/controlplane-admin — failing closed rather than reporting a plan this lane never produced."
             exit 1
           fi
-          echo "::add-mask::$cp_token"
+          if [ -n "$cp_token" ]; then echo "::add-mask::$cp_token"; fi
           echo "CP_ADMIN_API_TOKEN=$cp_token" >> "$GITHUB_ENV"
           echo "prod CP admin token loaded from the Infisical SSOT (len=${#cp_token})"
 
