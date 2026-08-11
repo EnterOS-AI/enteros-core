@@ -59,17 +59,40 @@ env:
 
 jobs:
   # ===========================================================================
-  # REQUIRED merge gate — stub runtime, fast; the only mandatory coverage for
-  # the LOCAL Docker provisioner. ENFORCED TODAY on two layers (do not read the
-  # `pending` directive below as "not enforced"):
-  #   1. This context is listed above the `# pending-` marker in
-  #      .gitea/required-contexts.txt, so the merge queue PRESENCE-requires it:
-  #      it must post AND be green on the PR head (#3181, real since #4363).
-  #   2. branch_protections/main uses status_check_contexts=['*'] — every
-  #      posted context must be success (#4363 '*' semantics).
-  # The directive stays `pending` only because BP does not list this context by
-  # its literal name (it relies on '*'), and `bp-required: yes` makes the lint
-  # demand literal membership. #2409 tracks retiring that gap.
+  # Gating merge check — stub runtime, fast; the only mandatory coverage for
+  # the LOCAL Docker provisioner.
+  #
+  # CORRECTED 2026-08-10. This block previously claimed enforcement on "two
+  # layers" and told the reader "do not read the `pending` directive below as
+  # 'not enforced'". Layer 1 of that claim was FALSE, and the reassuring
+  # wording is what made it durable. What actually holds:
+  #
+  #   1. NOT presence-required. This context sits BELOW the `# pending-#2409`
+  #      marker in .gitea/required-contexts.txt, in the documented-but-NOT-
+  #      enforced half, so the merge queue does not require it to post. It has
+  #      been there since the entry was introduced (08f75b5e6, 2026-06-28) —
+  #      original parking, not drift.
+  #   2. TRUE: branch_protections/main uses status_check_contexts=['*'], so
+  #      every POSTED context must be success (#4363 '*' semantics). This job
+  #      is continue-on-error: false, so a red here does block.
+  #
+  # The gap between 1 and 2 is not academic: ['*'] constrains statuses that
+  # EXIST. On 2026-08-10 a duplicate mapping key in this file made Gitea
+  # refuse to schedule the whole workflow; both contexts stopped posting and
+  # the PR read 43/43 success with all 8 enforced contexts present. Nothing
+  # required this context to exist, so nothing noticed it stop. Rule 11 in
+  # lint-workflow-yaml.py now catches that specific cause.
+  #
+  # Promotion above the marker is deliberately NOT taken here. The stated
+  # precondition is an OPERATOR confirmation that docker-host runners reliably
+  # provision sibling containers (mc#2409, still open), and the measured
+  # record does not discharge it: over 2026-08-01..10, 276 runs of this lane,
+  # 274 green and 2 genuine failures, both the same signature —
+  # `FAIL: proxy reached stub (canned reply)` with the platform logging
+  # `workspace agent restarting — retry after a short backoff
+  # [workspace_settling]`. That is a ~0.7% substrate/timing race at the A2A
+  # proxy-reach step, i.e. exactly the reliability question mc#2409 parks on.
+  # Evidence posted to mc#2409; root-fix the settling race, then promote.
   # bp-required: pending #2409
   # ===========================================================================
   lifecycle-stub:
