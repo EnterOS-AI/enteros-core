@@ -319,7 +319,11 @@ jobs:
             psql -U "$CP_PROD_DB_USER" -d "$CP_PROD_DB_NAME" -At -F "$(printf '\t')" -v ON_ERROR_STOP=1 \
             -c "SELECT o.slug, o.id, s.substrate, s.instance_id FROM org_substrates s JOIN organizations o ON o.id = s.org_id ORDER BY o.slug;"
           CENSUS
-          sed -i 's/^          //' "$RUNNER_TEMP/census.sh"
+          # No dedent step here on purpose: YAML has already stripped this block
+          # scalar's indentation, so the heredoc body and its CENSUS terminator
+          # both arrive at column 0. An earlier revision carried a
+          # `sed -i 's/^          //'` "dedent" that matched nothing — a
+          # transformation the file implied and never performed.
           chmod +x "$RUNNER_TEMP/census.sh"
 
           # THE DIGEST COMES FROM runtime_image_pins, WHICH IS THE SSOT FOR WHAT A
@@ -328,10 +332,18 @@ jobs:
           # neither need match the pin the control plane believes is deployed. A
           # digest is the only thing that makes a roll reproducible and makes a
           # promote mean anything.
-          K8S_TENANT_DIGEST="$(kubectl exec -i -n "$CP_PROD_NAMESPACE" "$CP_PROD_DB_POD" -- \
+          # NO `| head -1` HERE. Under `set -o pipefail`, head closing the pipe as
+          # soon as it has its line SIGPIPEs the producer, and a successful query
+          # becomes a failed pipeline. This platform has already lost time to
+          # exactly that shape (`printf | grep -q` inverting a verdict), and here
+          # it would abort the deploy on a query that worked. Capture the whole
+          # answer, then take the first line with parameter expansion — no pipe,
+          # no signal, and a multi-row answer still cannot slip through because
+          # the sha256 shape check below runs on that first line alone.
+          digest_raw="$(kubectl exec -i -n "$CP_PROD_NAMESPACE" "$CP_PROD_DB_POD" -- \
             psql -U "$CP_PROD_DB_USER" -d "$CP_PROD_DB_NAME" -At -v ON_ERROR_STOP=1 \
-            -c "SELECT image_digest FROM runtime_image_pins WHERE template_name='molecule-tenant' AND region='global';" \
-            | head -1 | tr -d '[:space:]')"
+            -c "SELECT image_digest FROM runtime_image_pins WHERE template_name='molecule-tenant' AND region='global';")"
+          K8S_TENANT_DIGEST="$(printf '%s' "${digest_raw%%$'\n'*}" | tr -d '[:space:]')"
           case "$K8S_TENANT_DIGEST" in
             sha256:[0-9a-f]*) : ;;
             *)
@@ -346,8 +358,14 @@ jobs:
           # its own zero-row refusal, but a census broken HERE surfaces there as
           # "the fleet is empty", which reads like a fact about production rather
           # than a fact about this wiring.
-          rows="$("$RUNNER_TEMP/census.sh" | grep -c . || true)"
-          k8s_rows="$("$RUNNER_TEMP/census.sh" | awk -F'\t' '$3=="k8s"' | grep -c . || true)"
+          # RUN IT ONCE AND COUNT THE FILE. An earlier revision invoked the census
+          # once per count, so a single job made three separate exec-into-Postgres
+          # round trips against the LIVE production control plane to answer two
+          # questions. It also meant the numbers reported and the fleet rolled
+          # could, in principle, come from different reads.
+          "$RUNNER_TEMP/census.sh" > "$RUNNER_TEMP/census.tsv"
+          rows="$(grep -c . "$RUNNER_TEMP/census.tsv" || true)"
+          k8s_rows="$(awk -F'\t' '$3=="k8s"' "$RUNNER_TEMP/census.tsv" | grep -c . || true)"
           echo "::notice::census: rows=${rows} k8s=${k8s_rows}"
           if [ "${rows:-0}" -eq 0 ]; then
             echo "::error::the substrate census returned ZERO rows. A control plane that knows about no tenants on any substrate is a broken query or the wrong database, not an empty fleet."
@@ -371,14 +389,49 @@ jobs:
           # has just proven this fleet is not empty.
           args="--digest $PINNED_DIGEST"
           if [ "$DRY" = "1" ]; then args="$args --dry-run"; fi
+
+          # 2>&1 IS LOAD-BEARING, AND ITS ABSENCE WAS A SHIPPING DEFECT.
+          #
+          # The roller writes its ENTIRE human-readable output to stderr: log() is
+          # `printf ... >&2`, the SUMMARY line goes through log(), and the
+          # before/after table is a `{ ... } >&2` group. A plain `| tee` captures
+          # stdout only, so roll.log was ZERO BYTES, the SUMMARY grep below found
+          # nothing, and this step exited 1 on EVERY run.
+          #
+          # The frozen path would merely have been a confusing red. The un-frozen
+          # path is the dangerous one: the roller would have rolled the production
+          # fleet, exited 0, and then this workflow would have declared the deploy
+          # FAILED — inviting someone to re-run or roll back a roll that had
+          # already succeeded. A false "deploy failed" on a successful fleet roll
+          # is a worse signal than no signal.
+          #
+          # It also self-triggers: this workflow's paths: filter includes its own
+          # file, so merging the change that introduced it is the push that
+          # produces the first red.
+          #
+          # `|| rc=$?` rather than bare pipefail-plus-set-e, so a roller failure
+          # does not abort this step before it can report WHICH failure it was.
+          rc=0
           # shellcheck disable=SC2086
-          bash scripts/deploy/redeploy-tenant-fleet-k8s.sh $args | tee "$RUNNER_TEMP/roll.log"
+          bash scripts/deploy/redeploy-tenant-fleet-k8s.sh $args 2>&1 | tee "$RUNNER_TEMP/roll.log" || rc=$?
+
+          # CAPTURED NOTHING IS ITS OWN FAILURE, named separately from "the roll
+          # failed". Conflating them is how the defect above stayed invisible: an
+          # empty log and a genuine rollout failure both surfaced as "no SUMMARY".
+          if [ ! -s "$RUNNER_TEMP/roll.log" ]; then
+            echo "::error::the roller produced NO captured output at all (roll.log is 0 bytes). This step cannot see what happened to production, which is a reporting fault in THIS workflow — check the stdout/stderr redirection before concluding anything about the fleet."
+            exit 1
+          fi
 
           # THE COUNTS ARE THE VERDICT. The script prints a SUMMARY line; surface
           # it, and refuse a run whose result cannot be read at all.
           summary="$(grep -E 'SUMMARY ' "$RUNNER_TEMP/roll.log" | tail -1 || true)"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::the k8s fleet roll FAILED (exit ${rc}). ${summary:-<no SUMMARY line was emitted>}"
+            exit "$rc"
+          fi
           if [ -z "$summary" ]; then
-            echo "::error::the roller produced no SUMMARY line, so this run cannot say how many tenants it touched. An unreadable result is a failure, not a pass."
+            echo "::error::the roller exited 0 but emitted no SUMMARY line, so this run cannot say how many tenants it touched. An unreadable result is a failure, not a pass."
             exit 1
           fi
           {
