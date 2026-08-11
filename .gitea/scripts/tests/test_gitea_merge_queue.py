@@ -192,6 +192,146 @@ def test_wildcard_still_waits_on_a_real_pending_alongside_self_status():
     assert bad == ["E2E Chat / E2E Chat (pull_request)=pending"]
 
 
+_CANCELLED_TARGET = "/molecule-ai/molecule-core/actions/runs/644628/jobs/949071"
+
+
+def test_wildcard_ignores_a_cancelled_self_status():
+    # core#5156 — the EXACT measured row. Gitea's Actions engine (not any step;
+    # the job had started_at=1970 and run_attempt=0, so nothing of ours ran)
+    # stamped `failure`/"Has been cancelled" on PR #5156 head 626d2049da after
+    # a newer run evicted this one from the repo-global concurrency group while
+    # it was still QUEUED. The queue's own gate-runner status carries no verdict
+    # about the PR, and because the evicting run belongs to a DIFFERENT head SHA
+    # nothing will ever re-post here — so requiring it green latches the PR
+    # forever. With every REAL context green, "*" must return green.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "Secret scan / Scan (pull_request)", "status": "success"},
+        {
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "failure",
+            "description": "Has been cancelled",
+            "target_url": _CANCELLED_TARGET,
+        },
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is True, bad
+    assert bad == []
+
+
+def test_wildcard_still_blocks_on_a_real_failure_alongside_a_cancelled_self():
+    # NEGATIVE CONTROL: the cancellation strip must not become a blanket
+    # "cancelled anywhere is fine" or "reds are fine". A genuinely failing REAL
+    # gate still blocks, and `bad` names ONLY it.
+    latest = mq.latest_statuses_by_context([
+        {
+            "context": "CI / all-required (pull_request)",
+            "status": "failure",
+            "description": "Failing after 3m12s",
+            "target_url": "/molecule-ai/molecule-core/actions/runs/644630/jobs/949080",
+        },
+        {
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "failure",
+            "description": "Has been cancelled",
+            "target_url": _CANCELLED_TARGET,
+        },
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["CI / all-required (pull_request)=failure"]
+
+
+def test_a_cancelled_NON_self_context_still_blocks():
+    # THE load-bearing scope control. The strip is for the queue's own
+    # gate-runner context ONLY. A cancelled PRODUCT gate is still an unproven
+    # gate: nothing ran, so nothing may be blessed. It must keep blocking, and
+    # is healed by re-running the run (stranded_status_janitor), never by
+    # ignoring it here.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {
+            "context": "lint-mask-pr-atomicity / lint-mask-pr-atomicity (pull_request)",
+            "status": "failure",
+            "description": "Has been cancelled",
+            "target_url": "/molecule-ai/molecule-core/actions/runs/644844/jobs/949900",
+        },
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == [
+        "lint-mask-pr-atomicity / lint-mask-pr-atomicity (pull_request)=failure"
+    ]
+
+
+def test_cancellation_strip_requires_an_actions_target_url():
+    # A bot that POSTs a status with the same description is not the Actions
+    # engine. Without an Actions run/job target_url the row is an ordinary red.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "failure",
+            "description": "Has been cancelled",
+            "target_url": "https://example.invalid/some/bot/report",
+        },
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["gitea-merge-queue / queue (pull_request_review)=failure"]
+
+
+def test_cancellation_description_match_is_exact_not_substring():
+    # A genuine queue failure whose description merely QUOTES the phrase must
+    # still block — the same trap main-red-watchdog._is_cancel_cascade avoids.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "failure",
+            "description": "Has been cancelled by the user unexpectedly",
+            "target_url": _CANCELLED_TARGET,
+        },
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["gitea-merge-queue / queue (pull_request_review)=failure"]
+
+
+def test_literal_requirement_on_a_cancelled_self_status_is_still_honored():
+    # The strip is GLOB-only, exactly like the pending strip. A policy that
+    # LITERALLY names the context keeps a strict presence+success check.
+    latest = mq.latest_statuses_by_context([
+        {
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "failure",
+            "description": "Has been cancelled",
+            "target_url": _CANCELLED_TARGET,
+        },
+    ])
+    ok, bad = mq.required_contexts_green(
+        latest, ["gitea-merge-queue / queue (pull_request_review)"]
+    )
+    assert ok is False
+    assert bad == ["gitea-merge-queue / queue (pull_request_review)=failure"]
+
+
+def test_wildcard_with_only_a_cancelled_self_status_is_failclosed_no_match():
+    # Degenerate board: once the uninformative self-status is stripped, "*"
+    # matches nothing -> fail-closed no-match, never a vacuous green.
+    latest = mq.latest_statuses_by_context([
+        {
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "failure",
+            "description": "Has been cancelled",
+            "target_url": _CANCELLED_TARGET,
+        },
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["*=no-match"]
+
+
 def test_wildcard_still_blocks_on_a_failed_self_status():
     # NEGATIVE CONTROL for finding #5: the self-status strip is gated on the
     # `pending` state (fail-closed). Only the queue's OWN in-flight status is a
