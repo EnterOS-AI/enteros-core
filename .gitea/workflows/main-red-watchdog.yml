@@ -35,7 +35,8 @@ name: main-red-watchdog
 # callers and lint fixtures are migrated together.
 on:
   # SCHEDULE RE-ENABLED 2026-05-12 rev3 — interim disable (mc#645) reverted alongside
-  # status-reaper rev3 (widen-window). Job-level timeout-minutes raised 5 → 15 below
+  # status-reaper rev3 (widen-window; status-reaper REMOVED in
+  # chore/delete-uninstalled-status-reaper). Job-level timeout-minutes raised 5 → 15 below
   # to absorb runner-saturation latency without spurious cancels (the original cascade
   # cause). If runner-saturation root persists, the dedicated-runner-label split
   # remains the structural next step (tracked separately).

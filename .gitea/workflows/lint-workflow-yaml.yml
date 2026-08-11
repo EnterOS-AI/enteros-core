@@ -11,6 +11,9 @@ name: Lint workflow YAML (repository compatibility policy)
 #   2. on: workflow_run           — not yet adopted by the status/reaper topology
 #   3. name: containing "/"       — breaks status-context tokenization
 #   4. cross-file name collision  — status-reaper rev1 fail-loud class
+#                                   (status-reaper itself was REMOVED in
+#                                    chore/delete-uninstalled-status-reaper; the
+#                                    rule it motivated still stands)
 #   5. cross-repo uses: org/r/p@r — feedback_gitea_cross_repo_uses_blocked
 #                                   (DEFAULT_ACTIONS_URL=github → 404)
 #   6. (WARN) api.github.com refs — feedback_act_runner_github_server_url

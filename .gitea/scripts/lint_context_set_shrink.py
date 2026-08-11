@@ -142,6 +142,8 @@ wildcard. It also makes the gate immune to every way a state can lie: a CANCELLE
 posts `failure` on a superseded head, a `pending` on a job that already completed is
 mid-settlement, and the status-reaper overwrites stranded pendings. All of those
 change STATE. None changes PRESENCE.
+(status-reaper was REMOVED in chore/delete-uninstalled-status-reaper; it is listed
+here only as one historical example of a state-mutating writer.)
 
 So the gate polls until the posted set is identical across CSG_STABLE_READS
 consecutive reads spaced CSG_POLL_SECONDS apart, with a wall-clock floor of
