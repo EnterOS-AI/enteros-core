@@ -147,8 +147,8 @@ jobs:
               -H "Authorization: Bearer $TOK" \
               | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
           }
-          CP_STAGING_ADMIN_API_TOKEN=$(read_secret_staging CP_ADMIN_API_TOKEN %2Fshared%2Fcontrolplane-admin)
-          echo "::add-mask::$CP_STAGING_ADMIN_API_TOKEN"
+          CP_STAGING_ADMIN_API_TOKEN=$(read_secret_staging CP_ADMIN_API_TOKEN %2Fshared%2Fcontrolplane-admin || echo "")
+          if [ -n "$CP_STAGING_ADMIN_API_TOKEN" ]; then echo "::add-mask::$CP_STAGING_ADMIN_API_TOKEN"; fi
           if [ -z "$CP_STAGING_ADMIN_API_TOKEN" ]; then
             echo "::error::Infisical returned empty CP_ADMIN_API_TOKEN at staging /shared/controlplane-admin — failing closed."
             exit 1

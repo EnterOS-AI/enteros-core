@@ -111,13 +111,21 @@ FAKE_VALUES = {
     "TRANSIENT_LEDGER": "transient.txt",
 }
 
-# A fake `curl`. `dead` reproduces the exact shape that took main down: a
-# transfer that fails before the response exists, so `-o` never opens its file
-# and `-w` never prints.
+# A fake `curl`. A failing transfer reproduces the exact shape that took main
+# down: the transfer dies before the response exists, so `-o` never opens its
+# file and `-w` never prints.
+#
+# CCS_FAIL_AT is the whole point of the second revision of this file. Failing
+# EVERY call only ever exercises the FIRST capture in a step: the first guard
+# `exit 1`s and nothing below it runs. A mutant that stripped the fallback from
+# the SECOND capture in zone-count-drift.yml survived the entire suite and the
+# lint, and `sweep-cf-tunnels.yml:150` — an unguarded capture in the same step
+# whose sibling was fixed — sat in a tree this file called green. So the shim
+# counts its own invocations in a file and fails from index CCS_FAIL_AT onward;
+# sweeping that index walks the failure down the step, capture by capture.
 CURL_SHIM = r'''#!/usr/bin/env python3
 import os, sys
 args = sys.argv[1:]
-mode = os.environ.get("CCS_CURL_MODE", "happy")
 out = None
 wfmt = None
 url = None
@@ -132,7 +140,19 @@ while i < len(args):
         url = a
     i += 1
 
-if mode == "dead":
+# Count this invocation. Ordinary file I/O is enough: the step bodies are
+# sequential shell, so there is no concurrent writer.
+counter = os.environ["CCS_COUNTER"]
+try:
+    with open(counter) as fh:
+        n = int(fh.read().strip() or "0")
+except (OSError, ValueError):
+    n = 0
+with open(counter, "w") as fh:
+    fh.write(str(n + 1))
+
+fail_at = os.environ.get("CCS_FAIL_AT", "")
+if fail_at != "" and n >= int(fail_at):
     sys.stderr.write("curl: (7) Failed to connect to host: Could not connect to server\n")
     sys.exit(7)
 
@@ -209,8 +229,12 @@ def test_the_suite_covers_something() -> None:
 # --------------------------------------------------------------------------
 
 
-def _run(tmp_path: Path, body: str, mode: str) -> subprocess.CompletedProcess:
-    workdir = tmp_path / mode
+def _run(
+    tmp_path: Path, body: str, mode: str, fail_at: int | None = None
+) -> subprocess.CompletedProcess:
+    """Execute a step body. `fail_at` is the 0-based curl invocation from which
+    the transfer dies; None means every transfer succeeds."""
+    workdir = tmp_path / f"{mode}-{'x' if fail_at is None else fail_at}"
     workdir.mkdir(parents=True, exist_ok=True)
     bindir = workdir / "bin"
     bindir.mkdir(exist_ok=True)
@@ -227,9 +251,13 @@ def _run(tmp_path: Path, body: str, mode: str) -> subprocess.CompletedProcess:
     github_env = workdir / "github_env"
     github_env.write_text("", encoding="utf-8")
 
+    counter = workdir / "curl_calls"
+    counter.write_text("0", encoding="utf-8")
+
     env = {
         "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
-        "CCS_CURL_MODE": mode,
+        "CCS_COUNTER": str(counter),
+        "CCS_FAIL_AT": "" if fail_at is None else str(fail_at),
         "GITHUB_ENV": str(github_env),
         "GITHUB_OUTPUT": str(workdir / "github_output"),
         "RUNNER_TEMP": str(workdir),
@@ -265,9 +293,108 @@ def _diagnostics(out: str) -> list[str]:
     ]
 
 
+_CALL_COUNT_CACHE: dict[str, int] = {}
+
+
+def _happy_curl_calls(tmp_path: Path, body: str) -> int:
+    """How many curl invocations the step makes when nothing fails.
+
+    This is the sweep bound. It is MEASURED by running the step, not parsed out
+    of the YAML: a count derived from a regex would inherit exactly the blind
+    spot (`read_secret_staging` vs `read_secret`) that let an unguarded capture
+    sit in a green tree in the first place.
+
+    Cached on the body text. The sweep parametrises over a fixed position range
+    and skips positions past the end, so without a cache the SKIPPED cases each
+    pay for a full step execution just to learn they should skip — hundreds of
+    subprocesses to decide nothing.
+    """
+    if body in _CALL_COUNT_CACHE:
+        return _CALL_COUNT_CACHE[body]
+    result = _run(tmp_path / "count", body, "count", fail_at=None)
+    counter = tmp_path / "count" / "count-x" / "curl_calls"
+    if not counter.exists():
+        _CALL_COUNT_CACHE[body] = 0
+        return 0
+    assert result.returncode == 0, (
+        f"the happy path must complete before its calls can be counted "
+        f"(rc={result.returncode}): {result.stdout!r} {result.stderr[-400:]!r}"
+    )
+    calls = int(counter.read_text(encoding="utf-8").strip() or "0")
+    _CALL_COUNT_CACHE[body] = calls
+    return calls
+
+
+# Sweep bound. Every discovered step is asserted below to make FEWER than this
+# many curl calls, so the bound can never silently truncate the sweep — raising
+# it is a one-line change that the assertion will demand of anyone who needs it.
+# The deepest step in the tree today makes 3 calls; 6 keeps headroom without
+# generating hundreds of skipped cases that make the report harder to read.
+MAX_CURL_CALLS = 6
+
+
 # --------------------------------------------------------------------------
-# The four directions
+# The directions
 # --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("wf,name,body", STEPS, ids=STEP_IDS)
+def test_every_capture_position_is_reachable_by_the_harness(
+    wf: str, name: str, body: str, tmp_path: Path
+) -> None:
+    """The sweep bound must actually cover the step.
+
+    Anti-vacuity for the sweep itself: if a step made more calls than
+    MAX_CURL_CALLS, the positions past the bound would go untested and every
+    parametrised case would still be green.
+    """
+    calls = _happy_curl_calls(tmp_path, body)
+    assert calls > 0, f"{wf} {name}: the happy path made no curl calls at all"
+    assert calls < MAX_CURL_CALLS, (
+        f"{wf} {name}: {calls} curl calls exceeds the sweep bound "
+        f"{MAX_CURL_CALLS}; raise the bound or the later captures go untested"
+    )
+
+
+@pytest.mark.parametrize("fail_at", range(MAX_CURL_CALLS))
+@pytest.mark.parametrize("wf,name,body", STEPS, ids=STEP_IDS)
+def test_a_failure_at_ANY_capture_position_still_diagnoses(
+    wf: str, name: str, body: str, fail_at: int, tmp_path: Path
+) -> None:
+    """Walk the transport failure down the step, one capture at a time.
+
+    WHY THIS EXISTS. The first revision of this file failed EVERY curl call, so
+    the first guard `exit 1`d and no capture below it was ever executed. "32/32
+    green" meant 32 FIRST captures, not 64 sites. Two things hid in that gap:
+
+      * a mutant stripping the fallback from the SECOND capture in
+        `zone-count-drift.yml` survived the whole suite AND the lint;
+      * `sweep-cf-tunnels.yml:150` — `CP_STAGING_ADMIN_API_TOKEN`, captured
+        through a `read_secret_staging` helper — had no fallback and an
+        unwrapped `add-mask`, in the SAME step whose sibling capture was fixed.
+
+    Failing from call index `fail_at` onward makes the earlier captures succeed,
+    so execution reaches the later ones and their guards are exercised too.
+    """
+    calls = _happy_curl_calls(tmp_path, body)
+    if fail_at >= calls:
+        pytest.skip(f"step makes only {calls} curl call(s)")
+    result = _run(tmp_path, body, "dead", fail_at=fail_at)
+    diags = _diagnostics(result.stdout)
+    assert diags, (
+        f"{wf} {name}: transport died at curl call #{fail_at} and the step "
+        f"printed NO ::error::/::warning:: of its own (rc={result.returncode}). "
+        f"A capture below the first one is dying before its guard.\n"
+        f"stdout={result.stdout!r}\nstderr={result.stderr[-800:]!r}"
+    )
+    empty_masks = [
+        ln for ln in result.stdout.splitlines() if ln.strip() == "::add-mask::"
+    ]
+    assert not empty_masks, (
+        f"{wf} {name}: ZERO-LENGTH ::add-mask:: when curl call #{fail_at} died. "
+        "An empty mask pattern is at best ignored and at worst applied to every "
+        'log line; guard it with `if [ -n "$VAR" ]`.'
+    )
 
 
 @pytest.mark.parametrize("wf,name,body", STEPS, ids=STEP_IDS)
@@ -284,7 +411,7 @@ def test_dead_transport_still_prints_the_step_s_own_diagnostic(
     change alters no verdict anywhere. What both shapes owe the operator is a
     line naming the cause; a step that dies with neither is the defect.
     """
-    result = _run(tmp_path, body, "dead")
+    result = _run(tmp_path, body, "dead", fail_at=0)
     diags = _diagnostics(result.stdout)
     assert diags, (
         f"{wf} {name}: step ended with NO ::error::/::warning:: of its own "
@@ -300,39 +427,37 @@ def test_dead_transport_still_prints_the_step_s_own_diagnostic(
 
 
 @pytest.mark.parametrize("wf,name,body", STEPS, ids=STEP_IDS)
-def test_dead_transport_never_emits_a_zero_length_mask(
-    wf: str, name: str, body: str, tmp_path: Path
-) -> None:
-    result = _run(tmp_path, body, "dead")
-    empty_masks = [
-        ln for ln in result.stdout.splitlines()
-        if ln.strip() == "::add-mask::"
-    ]
-    assert not empty_masks, (
-        f"{wf} {name}: emitted a ZERO-LENGTH ::add-mask:: on the failure path. "
-        "An empty mask pattern is at best ignored and at worst applied to every "
-        "log line; guard it with `if [ -n \"$VAR\" ]`."
-    )
-
-
-@pytest.mark.parametrize("wf,name,body", STEPS, ids=STEP_IDS)
 def test_stripping_the_fallback_LOSES_the_diagnostic(
     wf: str, name: str, body: str, tmp_path: Path
 ) -> None:
-    """Negative control: mutate exactly one thing and the guard goes unreachable.
+    """Negative control: mutate exactly one thing and a guard goes unreachable.
 
-    Without this, `test_dead_transport_still_prints...` could be passing for a
-    reason that has nothing to do with the fallback.
+    Swept across capture positions for the same reason the test above is: a
+    control that only ever kills the FIRST capture proves nothing about the
+    second, and a mutant on the second is precisely what survived the first
+    revision of this suite. It is enough that SOME position loses its
+    diagnostic — the mutation removes every fallback in the step, and a step
+    whose diagnostics are unchanged at every position is one where the
+    fallbacks are doing nothing.
     """
     mutated = _mutate(body)
     if mutated == body:
         pytest.skip("no fallback in this step to strip")
-    fixed = _diagnostics(_run(tmp_path, body, "dead").stdout)
-    broken = _diagnostics(_run(tmp_path, mutated, "dead").stdout)
-    assert fixed, f"{wf} {name}: precondition — the fixed body must diagnose"
-    assert len(broken) < len(fixed), (
-        f"{wf} {name}: stripping the fallback changed nothing, so the fallback "
-        f"is not what makes the guard reachable. fixed={fixed} broken={broken}"
+    calls = _happy_curl_calls(tmp_path, body)
+    losses = []
+    for fail_at in range(calls):
+        fixed = _diagnostics(_run(tmp_path / "f", body, "dead", fail_at).stdout)
+        broken = _diagnostics(_run(tmp_path / "b", mutated, "dead", fail_at).stdout)
+        assert fixed, (
+            f"{wf} {name}: precondition — the fixed body must diagnose at "
+            f"position {fail_at}"
+        )
+        if len(broken) < len(fixed):
+            losses.append(fail_at)
+    assert losses, (
+        f"{wf} {name}: stripping every fallback changed nothing at ANY of the "
+        f"{calls} failure positions, so the fallbacks are not what make the "
+        "guards reachable."
     )
 
 
@@ -347,8 +472,8 @@ def test_happy_path_is_byte_identical_with_and_without_the_fallback(
     mutated = _mutate(body)
     if mutated == body:
         pytest.skip("no fallback in this step to strip")
-    a = _run(tmp_path / "a", body, "happy")
-    b = _run(tmp_path / "b", mutated, "happy")
+    a = _run(tmp_path / "a", body, "happy", fail_at=None)
+    b = _run(tmp_path / "b", mutated, "happy", fail_at=None)
     sha_a = hashlib.sha256(a.stdout.encode("utf-8")).hexdigest()
     sha_b = hashlib.sha256(b.stdout.encode("utf-8")).hexdigest()
     assert a.returncode == b.returncode, (

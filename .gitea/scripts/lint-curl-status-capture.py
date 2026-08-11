@@ -108,6 +108,16 @@ BAD_STATUS_CAPTURE = re.compile(
 # `VAR=$(` or `VAR="$(` — the quoted form is not decoration: it is how the two
 # sites in promote-prod-tenant-pin.yml are written, and an enumeration that
 # missed it reported "no remaining sites" while two sat in the tree.
+#
+# KNOWN BOUNDARY, stated so the next reader does not have to rediscover it.
+# This does NOT match `readonly VAR=$(...)`, `declare VAR=$(...)`, backtick
+# substitution, or an assignment directly after `then`/`do` on the same line.
+# A tree-wide grep finds no live instance of any of them, so this is latent
+# rather than a miss — but it is a hole, and "the scanner found nothing" is
+# only worth what its matcher covers. The sibling failure is already on the
+# record: keying the helper-call form on the literal `read_secret` let
+# `read_secret_staging` through, and an unguarded capture sat in a tree this
+# tool called clean.
 CAPTURE_OPEN = re.compile(
     r"(?m)(?:^|[;&|(]|\bexport\b|\blocal\b)\s*"
     r"(?P<var>[A-Za-z_][A-Za-z0-9_]*)=(?P<q>\")?\$\("
@@ -152,10 +162,18 @@ def _logical_shell(content: str) -> str:
 def _strip_full_line_comments(content: str) -> str:
     """Blank out whole-line `#` comments, preserving line count.
 
-    Necessary, not cosmetic: core#5166 documents the defect by QUOTING the
-    pre-fix line in a comment. A scanner that reads comments would flag the
-    explanation of the bug as the bug — and the only way to make it green
-    again would be to delete the explanation.
+    WHICH RULE THIS ACTUALLY PROTECTS. Rule 1 — and only rule 1. Its pattern
+    starts at `$(curl`, with nothing to its left, so a `#`-prefixed line
+    documenting the bad shape matches it exactly as a live line would. Rule 2's
+    `CAPTURE_OPEN` is left-anchored on an assignment at the start of a logical
+    command, so a comment could never have satisfied it. The suite pins both
+    facts separately; an earlier version of this docstring credited the
+    stripper with a rule-2 protection it does not provide, and the test written
+    from that claim passed with the stripper deleted.
+
+    It is still necessary: core#5166 documents the defect by QUOTING the
+    pre-fix line, and this file's own header quotes the rule-1 shape. Without
+    stripping, the only way back to green would be deleting the explanations.
 
     Deliberately full-line only. Stripping from a mid-line `#` would eat
     `secretPath=%2Fshared%2F...#frag` and URL fragments inside real commands.
@@ -328,11 +346,16 @@ Fix template — status capture (rule 1):
   curl ... -w '%{http_code}' >code.txt 2>/dev/null
   set -e
   HTTP_CODE=$(cat code.txt 2>/dev/null || echo "000")
-  # `[ -n x ] || y`, never `[ -z x ] && y`: a trailing `&&` whose test is FALSE
-  # makes the whole line exit non-zero, and under the runner's -e that kills the
-  # step. This template used to end with `[ -z "$HTTP_CODE" ] && HTTP_CODE="000"`
-  # — the exact shape core#5166 refused. The lint was teaching the bug it exists
-  # to prevent.
+  # `[ -n x ] || y`, never `[ -z x ] && y`. The mechanism, measured rather than
+  # assumed: a trailing `&&` whose test is FALSE is NOT killed by errexit —
+  # bash exempts a command that is not the last in a `&&` list, so mid-block it
+  # returns 0 and execution continues. What bites is that the AND-list's own
+  # status is 1, so as the LAST line of a step it becomes the SCRIPT's exit
+  # status and the step fails — identically with `-e -o pipefail`, with `-e`
+  # alone, and with NO flags at all. Script exit status, not errexit.
+  # `[ -n x ] || y` returns 0 in both positions. This template used to end with
+  # `[ -z "$HTTP_CODE" ] && HTTP_CODE="000"` — the exact shape core#5166
+  # refused. The lint was teaching the bug it exists to prevent.
   [ -n "$HTTP_CODE" ] || HTTP_CODE="000"
 
 Fix template — body capture (rule 2):

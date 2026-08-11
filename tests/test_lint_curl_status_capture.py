@@ -206,11 +206,14 @@ def test_the_quoted_capture_form_is_not_a_blind_spot():
     assert len(findings) == 1
 
 
-def test_a_commented_out_example_is_not_a_finding():
+def test_a_commented_out_rule2_example_is_not_a_finding():
     """core#5166 documents the defect by QUOTING the pre-fix line in a comment.
 
-    A scanner that read comments would flag the explanation of the bug as the
-    bug, and the only way back to green would be deleting the explanation.
+    NOTE what this does and does not prove. For rule 2 the protection comes from
+    `CAPTURE_OPEN` being left-anchored on an assignment, NOT from comment
+    stripping — this case stays green with the stripper deleted. The test is
+    kept because the property matters; the test BELOW is the one that pins the
+    stripper.
     """
     lint = _load_module()
     content = """
@@ -222,6 +225,45 @@ def test_a_commented_out_example_is_not_a_finding():
     """
 
     assert lint.scan_content("workflow.yml", content) == []
+
+
+COMMENTED_RULE1 = """
+    # HTTP_CODE=$(curl -sS -w '%{http_code}' https://example.test || echo "000")
+    code=1
+"""
+
+
+def test_a_commented_out_rule1_example_is_not_a_finding():
+    """Rule 1's pattern begins at `$(curl` with nothing to its left, so a
+    `#`-prefixed line matches it exactly as a live line would. This file's own
+    header quotes that shape."""
+    lint = _load_module()
+
+    assert lint.scan_content("workflow.yml", COMMENTED_RULE1) == []
+
+
+def test_comment_stripping_is_LOAD_BEARING_for_rule_1():
+    """Mutation control on the stripper itself.
+
+    The rule-2 comment test above passes with `_strip_full_line_comments`
+    removed, so on its own it pins nothing. Delete the stripper and rule 1 must
+    start flagging prose — if it does not, the stripper is dead code and this
+    suite is asserting a property nothing produces.
+    """
+    lint = _load_module()
+    assert lint.scan_content("workflow.yml", COMMENTED_RULE1) == []
+
+    original = lint._strip_full_line_comments
+    lint._strip_full_line_comments = lambda content: content
+    try:
+        without = lint.scan_content("workflow.yml", COMMENTED_RULE1)
+    finally:
+        lint._strip_full_line_comments = original
+
+    assert [f.rule for f in without] == ["status-capture-pollution"], (
+        "removing the comment stripper changed nothing, so it is not what "
+        f"keeps prose out of rule 1. findings={without}"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -272,6 +314,30 @@ def test_the_fix_template_does_not_teach_the_trailing_and_shape():
     assert not offenders, offenders
     assert any('[ -n "$HTTP_CODE" ] || HTTP_CODE="000"' in ln for ln in code_lines)
     assert not [ln for ln in code_lines if "|| true" in ln]
+
+
+def test_the_fix_template_states_the_RIGHT_mechanism_for_the_trailing_and():
+    """The template is didactic, so a wrong cause teaches a wrong rule.
+
+    Measured with the runner's own invocation:
+      mid-block  `[ -z "$X" ] && X="000"` -> rc=0 under `-e -o pipefail`, `-e`,
+                 and no flags; the next line is reached. errexit exempts a
+                 command that is not the last in a `&&` list.
+      last-line  -> rc=1 under all three, INCLUDING no flags at all. That is
+                 the script's exit status, not errexit.
+    An earlier draft blamed errexit. The remedy was right and the cause wrong.
+    """
+    lint = _load_module()
+    text = lint.FIX_TEMPLATE
+
+    assert "exit status" in text, "the template must name the real mechanism"
+    assert "NO flags at all" in text or "no flags at all" in text, (
+        "the template must say the failure reproduces without errexit — that "
+        "is what rules errexit out as the cause"
+    )
+    assert not re.search(r"under the runner's `?-e`?[^.]*kills the step", text), (
+        "the template still blames errexit for the trailing-&& failure"
+    )
 
 
 def test_the_real_workflow_tree_is_scanned_and_clean():
