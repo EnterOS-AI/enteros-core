@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
-"""stranded-status-janitor — find commit-status contexts stuck at `pending`
-whose underlying Actions run has already finished, and heal them by RE-RUNNING
-the run (never by fabricating a green).
+"""stranded-status-janitor — find commit-status contexts whose LAST row is a
+merge-blocking artifact rather than a verdict about the code, and heal them by
+RE-RUNNING the run (never by fabricating a green).
+
+Two artifact classes, one healing mechanism:
+
+  * PENDING that will never resolve — the underlying Actions run has already
+    finished (the original defect, #4979).
+  * FAILURE that reports nothing — the Actions engine's own
+    `cancelled -> failure` stamp on a run that was cancelled, often before it
+    executed a single step (core#5156). See CANCELLED_DESCRIPTION.
 
 WHY THIS EXISTS
 ---------------
@@ -10,7 +18,25 @@ merge-blocking, so a single context whose LAST commit-status row is `pending`
 blocks a fully-green, fully-approved PR forever. It looks like a slow job, not
 a fault, so it costs a human hours before anyone notices.
 
-Two distinct defects produce it. Both were measured on Gitea 1.26.4 against
+The cancellation class is worse, because it looks like a REAL red. A cancelled
+run's status is written by Gitea itself with `state=failure`, so a PR that is
+otherwise green and `mergeable=true` reads as broken. Whether it clears on its
+own depends entirely on the workflow's concurrency-group key:
+
+  * group keyed on the head SHA / PR number -> the superseding run posts a new
+    row on the SAME SHA and the red is overwritten. Self-healing.
+  * group NOT keyed on the head SHA (e.g. `gitea-merge-queue`'s repo-global
+    `gitea-merge-queue-${{ github.repository }}`) -> the evicting run belongs to
+    a DIFFERENT SHA. Nothing ever posts to this SHA's timeline again and the red
+    latches PERMANENTLY.
+
+Note also that `cancel-in-progress: false` does not prevent this. It protects
+the RUNNING member of a group; at most one run may sit QUEUED per group, so a
+newer arrival cancels the older queued run. Measured (core#5156): run 644627
+running, 644628 queued at 05:59:31Z, 644629 arrives 05:59:53Z — 644628 is
+cancelled at exactly 05:59:53Z with `started_at=1970`, never having run.
+
+The defects below were all measured on Gitea 1.26.4 against
 molecule-core + molecule-controlplane (see molecule-core issue #4979 and the
 evidence issue that landed this script):
 
@@ -31,6 +57,20 @@ evidence issue that landed this script):
       further job transitions, that pending row is never superseded.
       Observable signature: the pending row's `target_url` names run R but a
       job id that is NOT a member of run R ("phantom job id").
+
+  (B) QUEUED-RUN EVICTION (core#5156). A newer run arriving in a concurrency
+      group cancels the run already QUEUED there — `cancel-in-progress: false`
+      only protects the RUNNING one. Gitea then writes `failure` /
+      "Has been cancelled" for a job with `started_at=1970` and
+      `run_attempt=0`, i.e. one that never executed. THIS IS WRITTEN BY THE
+      SERVER, not by any workflow step: on the measured SHA, 148 of 149 status
+      rows carry `creator: null` (the only row with a creator was a bot POST).
+      No `if: always()` guard, no reporting step and no concurrency tweak can
+      suppress it — a workflow-side fix for the WRITE does not exist. Only the
+      READERS can be taught, and only a re-run can replace the row.
+      Observable signature: state `failure`, description exactly
+      "Has been cancelled", and the job named by `target_url` reporting
+      `conclusion: cancelled`.
 
 Healing is safe and simple: re-run the run. The re-run posts a REAL terminal
 status produced by a job that actually reported.
@@ -105,6 +145,28 @@ TARGET_URL_RE = re.compile(r"/actions/runs/(\d+)/jobs/(\d+)")
 #: context as satisfied, so it is terminal for merge purposes.
 TERMINAL_STATES = frozenset({"success", "failure", "error", "warning", "skipped"})
 
+#: Red states that MAY be a cancellation artifact rather than a real verdict.
+RED_STATES = frozenset({"failure", "error"})
+
+#: Gitea's Actions engine writes this description when it maps a cancelled run
+#: to a commit status. Measured on molecule-core PR #5156, head 626d2049da:
+#:
+#:   id=148  pending   05:59:31Z  "Blocked by required conditions"
+#:   id=149  failure   05:59:53Z  "Has been cancelled"
+#:   run 644628 / job 949071: conclusion=cancelled
+#:                            started_at=1970-01-01T00:00:00Z run_attempt=0
+#:
+#: `started_at=1970` + `run_attempt=0` prove the job never started, so no step
+#: wrote this; and every row on that SHA carries `creator: null` except a single
+#: bot POST, the signature of a server-side write. The engine's own stamp cannot
+#: be prevented workflow-side — it can only be detected and healed.
+#:
+#: This string is used ONLY as a cheap pre-filter so ordinary reds cost zero API
+#: calls (real failures read "Failing after Ns"). The VERDICT is always the
+#: authoritative `conclusion` field on the job named by `target_url`, never the
+#: string — so a red that merely quotes the phrase is still treated as real.
+CANCELLED_DESCRIPTION = "Has been cancelled"
+
 
 def parse_run_and_job(target_url):
     """Return (run_id, job_id) parsed out of a status row's target_url.
@@ -149,6 +211,103 @@ def _parse_ts(value):
         return None
 
 
+def looks_like_cancellation_stamp(row):
+    """Cheap pre-filter: does this red row have the ENGINE's cancellation shape?
+
+    Exact description match after strip — a substring test would swallow a
+    genuine failure whose description quotes the phrase (e.g. a test named
+    "Has been cancelled by the user unexpectedly"), the same trap
+    `main-red-watchdog._is_cancel_cascade` avoids. Answering True only buys the
+    row a run lookup; `classify_context` still refuses to act unless the job's
+    own `conclusion` says `cancelled`.
+    """
+    if (row.get("status") or "").lower() not in RED_STATES:
+        return False
+    description = row.get("description")
+    if not isinstance(description, str):
+        return False
+    if description.strip() != CANCELLED_DESCRIPTION:
+        return False
+    run_id, job_id = parse_run_and_job(row.get("target_url"))
+    return run_id is not None and job_id is not None
+
+
+def _classify_cancellation_latch(row, run, jobs, now, min_age_minutes, max_attempts):
+    """Sub-classifier for a red row that has the engine's cancellation shape.
+
+    Under `status_check_contexts=["*"]` this red is merge-blocking even though
+    the job never reported anything about the code. It does NOT always clear
+    itself: when the run's concurrency group is not scoped to the head SHA (e.g.
+    `gitea-merge-queue`'s repo-global group), the run that evicted it belongs to
+    a DIFFERENT SHA, so nothing ever posts to this SHA's timeline again and the
+    red latches permanently.
+
+    Healing is the same as the pending class and just as safe: re-run, so a job
+    that actually executes posts the verdict. Nothing here fabricates a status.
+    """
+    run_id, job_id = parse_run_and_job(row.get("target_url"))
+
+    age_seconds = None
+    updated = _parse_ts(row.get("updated_at"))
+    if updated is not None and now is not None:
+        age_seconds = (now - updated).total_seconds()
+    if age_seconds is not None and age_seconds < min_age_minutes * 60:
+        # A cancellation whose superseding run is still in flight will be
+        # overwritten by that run's own status within seconds. Only an AGED one
+        # is latched.
+        return "too-fresh", "cancelled %.0fs ago (< %dm grace)" % (
+            age_seconds,
+            min_age_minutes,
+        )
+
+    if run is None:
+        return "unknown-run", "run %d could not be read" % run_id
+    if (run.get("status") or "").lower() != "completed":
+        return "run-active", "run %d is %s" % (run_id, run.get("status"))
+    if not jobs:
+        return "no-jobs", "run %d reported no jobs" % run_id
+
+    # AUTHORITATIVE check. The description got us here; the job's `conclusion`
+    # decides. This is "option A" from mc#1564 — resolve the underlying run
+    # status instead of trusting the string — and it is what makes the guard
+    # non-vacuous in the other direction: a genuinely FAILED job is never
+    # selected, no matter what its description says.
+    matched = [j for j in jobs if str(j.get("id")) == str(job_id)]
+    if not matched:
+        # Gitea's cross-run misattribution (see the module docstring, defect A)
+        # can name a job that is not a member of this run. Without the job we
+        # cannot prove cancellation, so we refuse to act.
+        return "phantom-job", "job %s is not a member of run %d" % (job_id, run_id)
+    conclusion = (matched[0].get("conclusion") or "").lower()
+    if conclusion != "cancelled":
+        return "real-failure", (
+            "run %d job %s concluded %r — a genuine red, left alone"
+            % (run_id, job_id, conclusion or "unknown")
+        )
+
+    unfinished = [j for j in jobs if (j.get("status") or "").lower() != "completed"]
+    if unfinished:
+        return "jobs-active", "run %d has %d unfinished job(s)" % (
+            run_id,
+            len(unfinished),
+        )
+
+    attempt = max((int(j.get("run_attempt") or 0) for j in jobs), default=0)
+    if attempt >= max_attempts:
+        return "attempts-exhausted", "run %d already at attempt %d (cap %d)" % (
+            run_id,
+            attempt,
+            max_attempts,
+        )
+
+    return "stranded", (
+        "run %d job %s was CANCELLED (conclusion=cancelled, started_at=%s); its "
+        "`failure` blocks merge under wildcard protection but reports nothing "
+        "about the code"
+        % (run_id, job_id, matched[0].get("started_at") or "unknown")
+    )
+
+
 def classify_context(row, run, jobs, now, min_age_minutes, max_attempts):
     """Decide what to do about one context's newest commit-status row.
 
@@ -156,6 +315,10 @@ def classify_context(row, run, jobs, now, min_age_minutes, max_attempts):
     acted on; everything else is a documented reason to leave the row alone.
     """
     state = (row.get("status") or "").lower()
+    if looks_like_cancellation_stamp(row):
+        return _classify_cancellation_latch(
+            row, run, jobs, now, min_age_minutes, max_attempts
+        )
     if state in TERMINAL_STATES:
         return "terminal", "context already has a verdict (%s)" % state
     if state != "pending":
@@ -445,7 +608,10 @@ def main(argv=None):
             print("::warning::%s (%s): %s" % (sha[:10], label, exc))
 
     if not findings:
-        print("OK no stranded pending contexts across %d commit(s)." % len(ordered))
+        print(
+            "OK no stranded pending / cancellation-latched contexts across %d "
+            "commit(s)." % len(ordered)
+        )
         return 0
 
     print("")
