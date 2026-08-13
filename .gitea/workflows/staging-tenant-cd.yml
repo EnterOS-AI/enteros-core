@@ -930,7 +930,14 @@ jobs:
             exit 1
           fi
           export K8S_TENANT_DIGEST="$OLD_DIGEST"
+          # NO DRIFT AUDIT ON THIS PATH, DELIBERATELY. The forward roll audits the
+          # exclusion list and goes red if any entry is not measurably drifted, so
+          # an unearned exclusion is already loud by the time this job runs. Adding
+          # the same audit here would give it the power to BLOCK a revert — and a
+          # gate that can stop the rollback of a failed candidate is worse than the
+          # thing it guards against. The revert honours the same list and says so.
           export EXCLUDE_SLUGS="${STAGING_FLEET_EXCLUDE_SLUGS-}"
+          [ -z "$EXCLUDE_SLUGS" ] || echo "::warning::the revert honours EXCLUDE_SLUGS='${EXCLUDE_SLUGS}' without re-auditing it; those tenants are NOT rolled back and stay on whatever they are running."
 
           if [ -n "$OLD_GIT_SHA" ]; then
             EXPECTED_BUILD_SHA="$OLD_GIT_SHA" bash scripts/deploy/redeploy-staging-fleet.sh --image "$OLD_IMAGE"
