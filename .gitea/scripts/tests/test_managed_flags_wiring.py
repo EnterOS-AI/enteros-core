@@ -422,6 +422,14 @@ _KNOWN_FLEET_CALLERS = {
         "exemption is self-enforcing rather than a promise: drop the --dry-run and the "
         "script's fail-closed unset-check exits 1, which fails this harness."
     ),
+    "scripts/deploy/resolve-k8s-fleet-census.sh": (
+        "MENTION-ONLY: it resolves a cluster credential and a proven substrate "
+        "census and writes KEY=value lines to a file. Its header names "
+        "redeploy-staging-fleet.sh once, to explain why this logic is a shared "
+        "script (two call sites) rather than inline YAML copied twice. It never "
+        "executes the fleet script and rolls nothing, so TENANT_FLAGS does not "
+        "apply — the call sites it feeds are the ones this lint already asserts on."
+    ),
     "scripts/deploy/redeploy-tenant-fleet-k8s.sh": (
         "MENTION-ONLY, and the CALLEE not the caller: the docker roller dispatches "
         "the k8s arm, never the reverse. Its header names redeploy-staging-fleet.sh "

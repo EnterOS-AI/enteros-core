@@ -117,6 +117,32 @@ def _fake_repo(tmp: Path) -> Path:
             encoding="utf-8",
         )
         target.chmod(0o755)
+
+    # The revert path also has to reach a CLUSTER now: the staging fleet lives on
+    # the k8s substrate, so a revert that only re-ran the docker roller would put
+    # the PIN back and leave every running tenant on the failed candidate. These
+    # are its prerequisites, stubbed as satisfied so that "did the body roll the
+    # fleet?" stays the question this suite is asking.
+    #
+    # They are stubbed SUCCEEDING on purpose. Their FAILURE arms — where the pin
+    # is reverted but the fleet cannot be — are covered in
+    # test_staging_fleet_census_wiring.py, which is also where the ordering
+    # property (pin first, credential second) is proven. Duplicating them here
+    # would make this suite fail for reasons that have nothing to do with
+    # sentinels.
+    for name, body in (
+        ("require-local-deploy-daemon.sh", "exit 0\n"),
+        ("require-deploy-toolchain.sh", 'printf "KUBECTL=/bin/true\\nDEPLOY_PYTHON3=/bin/true\\n"\n'),
+        (
+            "resolve-k8s-fleet-census.sh",
+            'out=""\n'
+            'while [ "$#" -gt 0 ]; do [ "$1" = "--env-out" ] && out="$2"; shift; done\n'
+            'printf "SUBSTRATE_CENSUS_CMD=/bin/true\\n" > "$out"\n',
+        ),
+    ):
+        target = tmp / "scripts" / "deploy" / name
+        target.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
+        target.chmod(0o755)
     return tmp
 
 
@@ -137,6 +163,10 @@ def _run_body(body: str, env_overrides: dict[str, str], *, cwd: Path | None = No
             "GITHUB_OUTPUT": str(gh_output),
             "GITHUB_STEP_SUMMARY": str(tmp / "gh_summary"),
             "GITHUB_RUN_ID": RUN_ID,
+            # The revert writes its resolved census/toolchain env under
+            # $RUNNER_TEMP, which every Gitea step has.
+            "RUNNER_TEMP": str(tmp),
+            "RUNNER_NAME": "test-runner",
         }
         env.update(env_overrides)
         # Written to a FILE, not passed with `-c`. That is how a workflow `run:`
@@ -199,6 +229,16 @@ def _decision_env(
         "E2E_END": sent(e2e_end, "e2e-smoke", "end"),
         "OLD_IMAGE": old_image,
         "OLD_GIT_SHA": old_git_sha,
+        # The digest the k8s tenants must go back to. A tag is not usable there:
+        # the workloads pull from a different registry host than OLD_IMAGE names.
+        "OLD_DIGEST": "sha256:" + "0" * 64,
+        "INFISICAL_CI_CLIENT_ID": "fake",
+        "INFISICAL_CI_CLIENT_SECRET": "fake",
+        "CP_CENSUS_NAMESPACE": "controlplane-staging",
+        "CP_CENSUS_DB_POD": "controlplane-db-postgres-0",
+        "CP_CENSUS_DB_USER": "cps",
+        "CP_CENSUS_DB_NAME": "cp_staging",
+        "STAGING_FLEET_EXCLUDE_SLUGS": "",
         "TENANT_IMAGE": "registry.moleculesai.app/molecule-ai/molecule-tenant",
         "TENANT_IMAGE_NAME": "registry.moleculesai.app/molecule-ai/molecule-tenant",
         "STAGING_TENANT_FLAGS": "",
