@@ -978,6 +978,19 @@ jobs:
         name: Fleet roll cannot pass vacuously (both substrates)
         run: bash scripts/deploy/tests/test-k8s-fleet-roller.sh
 
+      # The k8s deploy arm's first live run died with `python3: command not
+      # found` because the tool it called was never declared anywhere and the
+      # `local-deploy` runner does not carry it. This drives the toolchain
+      # preflight against a fake package manager and asserts BOTH directions —
+      # a present tool still resolves and a missing one produces a NAMED
+      # ::error:: — because a "fix" that simply failed every run would also
+      # have "handled" the missing interpreter. It also pins the shell shape
+      # itself: a bare `V="$(...)"` under `bash -e` dies ABOVE its own guard,
+      # while the rc-captured form reaches the guard and still fails closed.
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
+        name: Deploy toolchain preflight fails by NAME, and its good path still runs
+        run: bash scripts/deploy/tests/test-require-deploy-toolchain.sh
+
       # Enter OS rebrand Phase 2 (internal#1089): the ADVISORY enteros.ai edge
       # probe the deploy workflows run after the blocking daemon-side gate.
       # Drives the real script against a fake docker/curl and proves: dual
@@ -1224,7 +1237,9 @@ jobs:
             scripts/deploy/probe-enteros-buildinfo.sh \
             scripts/deploy/tests/test-probe-enteros-buildinfo.sh \
             scripts/deploy/redeploy-tenant-fleet-k8s.sh \
-            scripts/deploy/tests/test-k8s-fleet-roller.sh
+            scripts/deploy/tests/test-k8s-fleet-roller.sh \
+            scripts/deploy/require-deploy-toolchain.sh \
+            scripts/deploy/tests/test-require-deploy-toolchain.sh
 
   # mc#959 root-fix (sre)
 
