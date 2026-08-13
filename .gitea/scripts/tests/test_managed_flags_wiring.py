@@ -422,6 +422,15 @@ _KNOWN_FLEET_CALLERS = {
         "exemption is self-enforcing rather than a promise: drop the --dry-run and the "
         "script's fail-closed unset-check exits 1, which fails this harness."
     ),
+    "scripts/deploy/tests/test-staging-fleet-k8s-wiring.sh": (
+        "the bash test harness for the staging lane's k8s arm. It DOES execute "
+        "redeploy-staging-fleet.sh, against a fake docker and a fake kubectl, and "
+        "it passes TENANT_FLAGS=\"\" on every non---dry-run invocation — which is "
+        "self-enforcing rather than a promise: drop it and the script's "
+        "fail-closed unset-check exits 1, which fails the harness. Its whole "
+        "purpose is to assert the anti-vacuity refusal, so it must be able to "
+        "drive the script into states a wired call site never reaches."
+    ),
     "scripts/deploy/resolve-k8s-fleet-census.sh": (
         "MENTION-ONLY: it resolves a cluster credential and a proven substrate "
         "census and writes KEY=value lines to a file. Its header names "
