@@ -293,6 +293,70 @@ _SELF_STATUS_RE = re.compile(
 # status view used by wildcard branch protection. Keep both waits short and
 # bounded: failure to observe the write is a hard stop, never permission to
 # bypass the protected endpoint.
+
+# --------------------------------------------------------------------------
+# Gitea's NATIVE cancellation stamp (core#5156)
+# --------------------------------------------------------------------------
+# When an Actions run is cancelled, Gitea's own Actions engine — not any step,
+# script or `if: always()` reporter — writes a commit status with
+# `state=failure` and `description="Has been cancelled"`. Measured on
+# molecule-core PR #5156, head 626d2049da, run 644628 / job 949071:
+#
+#   id=148  pending   05:59:31Z  "Blocked by required conditions"
+#   id=149  failure   05:59:53Z  "Has been cancelled"
+#   job 949071: status=completed conclusion=cancelled
+#               started_at=1970-01-01T00:00:00Z  run_attempt=0
+#
+# `started_at=1970` and `run_attempt=0` prove the job NEVER STARTED, so no
+# workflow-side code could have posted either row; and every one of the 149
+# rows on that SHA except a single status-reaper POST carries `creator: null`,
+# the signature of a server-side write with no API user behind it. There is
+# therefore NO workflow-side way to stop the `failure` being written.
+#
+# Why THIS run was cancelled even though `cancel-in-progress: false`:
+#   644627  head 1165a63f64 (PR #5167)  job created 05:59:06Z -> RUNNING
+#   644628  head 626d2049da (PR #5156)  job created 05:59:31Z -> BLOCKED
+#   644629  head 67e1299253 (PR #5166)  job created 05:59:53Z -> evicts 644628
+# 644628 is cancelled at exactly 05:59:53Z, the second 644629 arrives.
+#
+# NOTE the mechanism, because the obvious reading is wrong: this is NOT
+# `cancel-in-progress` (this workflow sets it to `false`). That setting protects
+# the RUNNING member of a concurrency group; at most one run may sit QUEUED per
+# group, so a newer arrival evicts the older queued run regardless. And the
+# three runs are three DIFFERENT PRs, one approval each inside 48 seconds — not
+# a burst on one PR. Because this workflow's group is repo-global
+# (`gitea-merge-queue-${{ github.repository }}`), approving ANY PR can kill the
+# queued run of ANY OTHER PR. Nothing will ever post to the evicted SHA's
+# timeline again, so the `failure` latches permanently under
+# `status_check_contexts=["*"]`.
+#
+# The operational corollary — and the reason it is a consequence, not folklore:
+# space approvals ACROSS THE REPO until the prior queue run reaches a terminal
+# state. Re-approving a latched PR does clear it (a fresh run re-posts the
+# context), but only if that approval is not itself part of a burst; a clustered
+# approval re-creates the latch it was meant to clear. This code change removes
+# the dependence on that discipline for the queue's own context.
+#
+# A cancelled gate-runner job carries ZERO information about the PR it was
+# evaluating: it never executed a single check. Requiring it green is the exact
+# same self-referential impossibility as requiring the `pending` row green
+# (core#4420), so the strip below covers both. It is NOT a blanket
+# cancelled-is-green rule: it applies ONLY to `SELF_STATUS_CONTEXT`, only under
+# a GLOB pattern, and a genuine queue-job `failure` (any other description)
+# still blocks. See `_is_native_cancellation_artifact`.
+#
+# Description-string coupling is a SOFT contract with Gitea, deliberately the
+# same one `.gitea/scripts/main-red-watchdog.py` already relies on. If a future
+# Gitea release renames the string, cancelled self-statuses simply start
+# blocking again — visible, not silent — and this constant gets re-pinned.
+NATIVE_CANCELLED_DESCRIPTION = "Has been cancelled"
+# Second, independent predicate: the row must point at an Actions run/job, i.e.
+# it was written by the Actions engine rather than POSTed by a bot that happened
+# to choose the same description text.
+_ACTIONS_TARGET_URL_RE = re.compile(
+    r"\A(?:https?://[^/]+)?/[^/\s]+/[^/\s]+/actions/runs/[0-9]+/jobs/[0-9]+\Z"
+)
+
 SELF_STATUS_CONFIRM_ATTEMPTS = 5
 SELF_STATUS_CONFIRM_DELAY_SECONDS = 0.25
 MERGE_STATUS_RETRY_ATTEMPTS = 3
@@ -685,6 +749,52 @@ def status_state(status: dict) -> str:
     return str(status.get("status") or status.get("state") or "").lower()
 
 
+def _is_native_cancellation_artifact(status: dict) -> bool:
+    """True when this row is Gitea's server-side `cancelled -> failure` stamp.
+
+    Requires BOTH predicates to hold, so a real red can never be mistaken for
+    one (see NATIVE_CANCELLED_DESCRIPTION for the measured evidence):
+
+      1. state is `failure` AND the description is EXACTLY the engine's
+         cancellation text. Exact match after strip — a substring test would
+         swallow a genuine failure whose description merely quotes the phrase
+         (e.g. a test named "Has been cancelled by the user unexpectedly"),
+         which is the same trap `main-red-watchdog._is_cancel_cascade` avoids.
+      2. `target_url` is an Actions run/job link, proving the Actions engine
+         wrote it rather than a bot POSTing the same text.
+
+    A run that genuinely FAILED carries "Failing after Ns" and is unaffected.
+    """
+    if status_state(status) != "failure":
+        return False
+    description = status.get("description")
+    if not isinstance(description, str):
+        return False
+    if description.strip() != NATIVE_CANCELLED_DESCRIPTION:
+        return False
+    target_url = status.get("target_url")
+    if not isinstance(target_url, str):
+        return False
+    return bool(_ACTIONS_TARGET_URL_RE.fullmatch(target_url.strip()))
+
+
+def self_status_is_uninformative(status: dict) -> bool:
+    """True when the queue's OWN gate-runner status carries no verdict.
+
+    Two shapes, one meaning — "this queue job never reached a conclusion about
+    the PR", so requiring it green under a wildcard is self-referential:
+
+      * `pending`   — the status of the very run doing this evaluation
+                      (core#4420).
+      * cancelled   — the run was evicted from the repo-global concurrency
+                      group and never executed a single step (core#5156).
+
+    Every other state (`success`, a real `failure`, `error`) IS a verdict and
+    is left to the ordinary evaluation.
+    """
+    return status_state(status) == "pending" or _is_native_cancellation_artifact(status)
+
+
 def status_numeric_id(status: dict) -> int:
     """Return a sortable Gitea commit-status id, or -1 when unavailable."""
     value = status.get("id")
@@ -896,22 +1006,29 @@ def required_contexts_green(
             continue
         matches = [c for c in latest_statuses if matcher.fullmatch(c)]
         if _is_glob(pattern):
-            # Drop the queue's OWN in-flight status from wildcard matches ONLY
-            # while it is `pending` — it stays `pending` throughout this very run,
-            # so requiring it green under a glob like "*" is a self-referential
-            # deadlock (core#4420, see SELF_STATUS_CONTEXT). The strip is gated on
-            # the pending state (fail-closed): a self-status that has actually
-            # FAILED/errored is a real red and MUST still block the merge — it
-            # self-heals on the next clean tick when a fresh run re-posts a
-            # pending (then success) status. A LITERAL requirement is left
-            # untouched: a narrow glob ("CI /*") never matches it anyway, and if a
-            # policy deliberately names it exactly, honor that.
+            # Drop the queue's OWN status from wildcard matches ONLY while it
+            # carries no verdict about the PR — see self_status_is_uninformative:
+            #   * `pending`: it stays pending throughout this very run, so
+            #     requiring it green under a glob like "*" is a self-referential
+            #     deadlock (core#4420, see SELF_STATUS_CONTEXT).
+            #   * Gitea's native cancellation stamp: the run was evicted while
+            #     QUEUED in the repo-global concurrency group and never executed
+            #     a step (core#5156). The pre-#5156 code stripped only `pending`
+            #     and justified it with "it self-heals on the next clean tick" —
+            #     that assumption is FALSE for a repo-global group, because the
+            #     evicting run belongs to a different head SHA and no future run
+            #     ever posts to this one again. The red latched forever.
+            # The strip stays fail-closed for everything else: a self-status that
+            # genuinely FAILED/errored is a real red and MUST still block the
+            # merge. A LITERAL requirement is left untouched: a narrow glob
+            # ("CI /*") never matches it anyway, and if a policy deliberately
+            # names it exactly, honor that.
             matches = [
                 c
                 for c in matches
                 if not (
                     _SELF_STATUS_RE.fullmatch(c)
-                    and status_state(latest_statuses.get(c) or {}) == "pending"
+                    and self_status_is_uninformative(latest_statuses.get(c) or {})
                 )
             ]
         if not matches:
