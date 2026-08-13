@@ -53,11 +53,40 @@ permissions:
   contents: read
   issues: write
 
-# Serialise — two simultaneous drift runs would duel on the issue
-# create/update path. The audit is idempotent, but parallel POSTs
+# Serialise PER REF — two simultaneous drift runs on the SAME ref would duel
+# on the issue create/update path. The audit is idempotent, but parallel POSTs
 # can produce duplicate comments before the title-search dedup wins.
+#
+# The group key MUST include `github.ref`. It was a static literal
+# (`group: ci-required-drift`) until 2026-08-12, which put every PR AND
+# every push to main/staging into ONE queue across the whole repo. With
+# `cancel-in-progress: false` a queued member is not protected: when a run
+# belonging to a DIFFERENT PR arrives, the queued member is evicted and
+# Gitea completes it as `cancelled` — `run_attempt: 0`,
+# `started_at: 1970-01-01`, zero steps, log endpoint 404. That eviction
+# still POSTs `ci-required-drift / drift = failure` ("Has been cancelled")
+# onto the victim PR's head SHA, and nothing ever re-posts on that SHA.
+# The result is a PERMANENT blocking red on a PR whose own code never ran,
+# and it cannot self-heal: `evaluate_merge_readiness` checks required
+# contexts BEFORE the outdated-branch rebase, so a PR with any non-success
+# context returns `wait` and never gets the new head that would clear it.
+# Only a manual force-push cures it. Observed on #5171 (run 646763).
+#
+# `github.ref` is per-PR on `pull_request` (`refs/pull/<n>/head`) and
+# per-branch on `push` (`refs/heads/main` vs `refs/heads/staging`), so
+# members of different PRs can no longer contend, while the anti-duel
+# serialization the original comment describes is preserved WITHIN a ref
+# (the only place two runs actually race on the same `[ci-drift]` issue
+# title, since `title_for()` keys on the protected branch and PR runs
+# audit the same branch set).
+#
+# Rule 7 of `lint-workflow-yaml.py` documents this same runner behaviour
+# ("historical runner behavior cancelled queued runs despite that setting")
+# for production deploy workflows. This is the required-context instance of
+# it. Rule 7 itself does not fire here — this is not a production
+# deploy/redeploy workflow.
 concurrency:
-  group: ci-required-drift
+  group: ci-required-drift-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
