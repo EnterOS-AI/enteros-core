@@ -292,7 +292,45 @@ jobs:
         run: go vet ./...
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+        # v2.13.2, not v2.12.2, and the bump is a CRASH FIX rather than an
+        # upgrade for its own sake.
+        #
+        # v2.12.2 bundles honnef.co/go/tools v0.7.0, which PREDATES Go 1.27 and
+        # cannot lower a construct in the Go 1.27 stdlib to its IR. This job
+        # takes `go-version: stable`, which rolled to Go 1.27.1 — and staticcheck
+        # then panics rather than reporting a finding:
+        #
+        #   buildir: panic during analysis: unexpected expr: *ast.KeyValueExpr
+        #     honnef.co/go/tools@v0.7.0/go/ir/builder.go:888 (expr0)
+        #     ... builder.go:3027 (returnStmt)
+        #   Running error: can't run linter goanalysis_metalinter
+        #   fact_purity: package "poll" (isInitialPkg: false, needAnalyzeSource: true):
+        #     interface conversion: interface {} is nil, not *buildir.IR
+        #
+        # The typedness / nilness / SA5012 / fact_purity panics all CASCADE from
+        # that first buildir failure; the IR is nil for every consumer after it.
+        #
+        # THREE CONDITIONS MUST COINCIDE, which is why it looked like one PR's
+        # fault. Reproduced locally, and the reproduction is the evidence:
+        #   1. GOOS=linux — `internal/poll`'s Linux-only files are what break the
+        #      IR builder. It never reproduces on darwin, warm or cold.
+        #   2. A COLD cache — `needAnalyzeSource: true` says stdlib was analyzed
+        #      from SOURCE rather than read from cached facts. The runner
+        #      bind-mounts a shared GOCACHE, so this only bites after the
+        #      toolchain rolls and invalidates it.
+        #   3. Go 1.27.
+        # Under all three, UNMODIFIED main panics identically — so the crash is
+        # not attributable to whatever PR happens to be in flight. And because
+        # every Go step here is gated on `platform == 'true'`, PRs that do not
+        # touch workspace-server/** pass this job without ever running the
+        # linter: a green history is not evidence the linter is healthy.
+        #
+        # v2.13.2 bundles honnef.co/go/tools v0.8.1, which handles Go 1.27.
+        # VERIFIED under the exact failing conditions (linux + cold cache +
+        # Go 1.27.1): 0 panics, 0 issues — the bump fixes the crash without
+        # surfacing new findings. Pinning `go-version` back to 1.26.x would also
+        # stop the crash, but only defers the incompatibility to the next roll.
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Run golangci-lint
         run: $(go env GOPATH)/bin/golangci-lint run --timeout 3m ./...

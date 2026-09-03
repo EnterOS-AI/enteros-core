@@ -36,7 +36,11 @@ def test_canvas_soak_is_push_main_candidate_publication_only() -> None:
 
     build = workflow["jobs"]["build-and-push"]
     assert build["name"] == "Build & push canvas image"
-    assert build["continue-on-error"] == "true"
+    # The soak ENDED on 2026-09-03 (PR #5202): five consecutive clean post-main
+    # runs satisfied mc#4960's definition of done, so the job now fails closed.
+    # This pin is deliberately kept and inverted rather than deleted — it is what
+    # would catch the mask being quietly reintroduced.
+    assert build["continue-on-error"] == "false"
     assert "candidate_digest" in build["outputs"]
     assert workflow["permissions"] == {"contents": "read"}
 
