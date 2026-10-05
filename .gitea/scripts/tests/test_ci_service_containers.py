@@ -36,11 +36,15 @@ FAKE_DOCKER = """#!/usr/bin/env bash
 printf '%s\\0' "$@" >> "$FAKE_STATE/calls"
 printf '\\n' >> "$FAKE_STATE/calls"
 [ "$1" = run ] && echo 0123456789ab
+if [ "$1" = inspect ]; then
+  [ -n "${FAKE_MOUNTS:-}" ] && echo "$FAKE_MOUNTS "
+  exit "${FAKE_INSPECT_RC:-0}"
+fi
 exit 0
 """
 
 
-def _run(tmp: Path, *args: str) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
+def _run(tmp: Path, *args: str, **env_extra: str) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
     bindir = tmp / "bin"
     bindir.mkdir(exist_ok=True)
     fake = bindir / "docker"
@@ -50,6 +54,9 @@ def _run(tmp: Path, *args: str) -> tuple[subprocess.CompletedProcess[str], list[
     env["PATH"] = str(bindir) + os.pathsep + env["PATH"]
     env["FAKE_STATE"] = tmp.as_posix()
     env["GITHUB_RUN_ID"] = "4242"
+    for k in ("FAKE_MOUNTS", "FAKE_INSPECT_RC"):
+        env.pop(k, None)
+    env.update(env_extra)
     proc = subprocess.run([BASH, str(SCRIPT), *args], env=env, text=True,
                           capture_output=True, check=False)
     calls_file = tmp / "calls"
@@ -78,7 +85,25 @@ def test_starts_with_a_tmpfs_data_dir_and_a_run_label(tmp_path: Path, kind: str,
     assert "--tmpfs" in run and run[run.index("--tmpfs") + 1] == tmpfs
     assert "--label" in run and run[run.index("--label") + 1] == "molecule.ci.run=4242"
     assert run[-5:-1] == ["-e", "X=1", "-p", "127.0.0.1::5432"]
-    assert len(calls) == 2
+    # Then it checks that the container it started has no volume at all.
+    assert calls[2][0] == "inspect" and ".Mounts" in calls[2][2] and calls[2][-1] == "0123456789ab"
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("why,env", [
+    # postgres:18 declares VOLUME /var/lib/postgresql, next to the tmpfs path.
+    ("an uncovered VOLUME", {"FAKE_MOUNTS": "/var/lib/postgresql=" + "e" * 64}),
+    ("the check itself failed", {"FAKE_INSPECT_RC": "1"}),
+])
+def test_refuses_a_container_that_got_a_volume_and_removes_it_with_the_volume(
+        tmp_path: Path, why: str, env: dict[str, str]) -> None:
+    proc, calls = _run(tmp_path, "postgres", "pg-unit-2", "postgres:18", **env)
+    assert proc.returncode == 1, (why, proc.stdout, proc.stderr)
+    assert "::error::" in proc.stderr, why
+    assert "0123456789ab" not in proc.stdout, f"{why}: a refused container must not be handed to the caller"
+    assert calls[-1] == ["rm", "-fv", "0123456789ab"], f"{why}: it must go WITH its volume, got {calls}"
+    if "FAKE_MOUNTS" in env:
+        assert "/var/lib/postgresql=" in proc.stderr, "the error must name the path the tmpfs has to cover"
 
 
 @pytest.mark.parametrize("args", [("mysql", "x", "mysql:8"), ("postgres", "x"), ()])

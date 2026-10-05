@@ -21,6 +21,12 @@
 #
 # The label marks the container as one CI run's (molecule.ci.run=<run id>) so a
 # host janitor can find a killed job's leftovers without guessing by name.
+#
+# The tmpfs covers ONE path: the data dir these tags declare as their VOLUME. A
+# tag whose VOLUME is elsewhere (postgres:18 moved it to /var/lib/postgresql)
+# would quietly get an anonymous volume again, so after the start the container
+# is checked for volume mounts; if it has any it is removed with them (`rm -fv`)
+# and the script fails, naming the path to point the tmpfs at.
 set -euo pipefail
 
 usage() { echo "usage: $0 postgres|redis NAME IMAGE [docker-run-args...]" >&2; exit 2; }
@@ -35,7 +41,19 @@ case "$kind" in
 esac
 
 docker rm -fv "$name" >/dev/null 2>&1 || true
-exec docker run -d --name "$name" \
+id="$(docker run -d --name "$name" \
   --label "molecule.ci.run=${GITHUB_RUN_ID:-local}" \
   --tmpfs "${data_dir}:size=${size}" \
-  "$@" "$image"
+  "$@" "$image")"
+
+# stderr: callers discard stdout, and the runner reads workflow commands from both.
+refuse() {
+  echo "::error::ci-service-container: $1" >&2
+  docker rm -fv "$id" >/dev/null 2>&1 || true
+  exit 1
+}
+vols="$(docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{.Destination}}={{.Name}} {{end}}{{end}}' "$id")" \
+  || refuse "cannot inspect $name to check it has no volume — removed it"
+vols="${vols%"${vols##*[! ]}"}"
+[ -z "$vols" ] || refuse "$name got a volume the tmpfs at $data_dir does not cover (${vols}): $image declares a VOLUME there, so every start would leak one. Removed the container with its volume; point the tmpfs at that path."
+echo "$id"
