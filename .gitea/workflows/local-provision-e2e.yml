@@ -113,6 +113,11 @@ jobs:
       # hostnames (ws-<id>:8000). Force false so the proxy keeps using the
       # host-mapped 127.0.0.1:<ephemeral_port> URL, which IS reachable.
       MOLECULE_IN_DOCKER: false
+      # The platform this job starts provisions ws-<id> containers on the shared
+      # host daemon. Production keeps them unless-stopped; here one that outlives
+      # the run must exit once and stay collectable, not crash-loop on the runner
+      # host (RC09).
+      MOLECULE_WORKSPACE_RESTART_POLICY: "no"
       # core#5031: this job tags a STUB over
       # molecule-local/workspace-template-claude-code:<template-HEAD-sha>-<arch>
       # (+ :latest) — a name derived entirely from the world, so every process on
@@ -418,6 +423,33 @@ jobs:
         run: |
           [ -f workspace-server/platform.pid ] && kill "$(cat workspace-server/platform.pid)" 2>/dev/null || true
 
+      - name: Remove this run's workspace containers + volumes (platform-instance scoped)
+        # Positive identity, like the manifest teardown below, but for every
+        # container THIS run's platform provisioned — including ones no manifest
+        # knows about (a provision that raced a delete, RC09). They carry
+        # molecule.platform.instance=sha256(DATABASE_URL)[:16]; the DSN holds this
+        # run's own ephemeral PG port, so a concurrent run's workspaces never
+        # match. The listing is inside the reviewed script, filtered by that
+        # label only (test_ws_orphan_reap.py); this workflow still lists nothing.
+        # Volumes are derived from the containers (the bind-created ones carry no
+        # labels), so this runs BEFORE the manifest teardown removes them.
+        if: always()
+        run: |
+          if [ -z "${DATABASE_URL:-}" ]; then
+            echo "No DATABASE_URL — the platform never started; nothing to remove."
+            exit 0
+          fi
+          # "Stop platform" only signals it. Wait (bounded) until our own server
+          # has exited, so nothing it is still doing creates a container after
+          # the listing below.
+          PID="$(cat workspace-server/platform.pid 2>/dev/null || true)"
+          for _ in $(seq 1 30); do
+            { [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; } || break
+            sleep 1
+          done
+          bash .gitea/scripts/ws-orphan-reap.sh instance "$DATABASE_URL" \
+            || echo "::warning::instance-scoped workspace teardown did not complete — see above"
+
       - name: Stop service containers
         if: always()
         run: |
@@ -459,6 +491,7 @@ jobs:
             [ -n "$wsid" ] || continue
             echo "removing our workspace container: ws-${wsid}"
             docker rm -f "ws-${wsid}" >/dev/null 2>&1 || true
+            docker volume rm -f "ws-${wsid}-configs" "ws-${wsid}-claude-sessions" "ws-${wsid}-workspace" >/dev/null 2>&1 || true
             removed=$((removed + 1))
           done < "$MANIFEST"
           echo "ws-* teardown removed $removed of $(wc -l < "$MANIFEST" | tr -d ' ') owned container(s)."
@@ -525,6 +558,11 @@ jobs:
       # host-network platform cannot resolve. Leave MOLECULE_IN_DOCKER=false so
       # the proxy uses the host-mapped port directly (same as lifecycle-stub).
       MOLECULE_IN_DOCKER: false
+      # The platform this job starts provisions ws-<id> containers on the shared
+      # host daemon. Production keeps them unless-stopped; here one that outlives
+      # the run must exit once and stay collectable, not crash-loop on the runner
+      # host (RC09).
+      MOLECULE_WORKSPACE_RESTART_POLICY: "no"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -983,6 +1021,33 @@ jobs:
         run: |
           [ -f workspace-server/platform.pid ] && kill "$(cat workspace-server/platform.pid)" 2>/dev/null || true
 
+      - name: Remove this run's workspace containers + volumes (platform-instance scoped)
+        # Positive identity, like the manifest teardown below, but for every
+        # container THIS run's platform provisioned — including ones no manifest
+        # knows about (a provision that raced a delete, RC09). They carry
+        # molecule.platform.instance=sha256(DATABASE_URL)[:16]; the DSN holds this
+        # run's own ephemeral PG port, so a concurrent run's workspaces never
+        # match. The listing is inside the reviewed script, filtered by that
+        # label only (test_ws_orphan_reap.py); this workflow still lists nothing.
+        # Volumes are derived from the containers (the bind-created ones carry no
+        # labels), so this runs BEFORE the manifest teardown removes them.
+        if: always()
+        run: |
+          if [ -z "${DATABASE_URL:-}" ]; then
+            echo "No DATABASE_URL — the platform never started; nothing to remove."
+            exit 0
+          fi
+          # "Stop platform" only signals it. Wait (bounded) until our own server
+          # has exited, so nothing it is still doing creates a container after
+          # the listing below.
+          PID="$(cat workspace-server/platform.pid 2>/dev/null || true)"
+          for _ in $(seq 1 30); do
+            { [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; } || break
+            sleep 1
+          done
+          bash .gitea/scripts/ws-orphan-reap.sh instance "$DATABASE_URL" \
+            || echo "::warning::instance-scoped workspace teardown did not complete — see above"
+
       - name: Stop service containers
         if: always()
         run: |
@@ -1024,6 +1089,7 @@ jobs:
             [ -n "$wsid" ] || continue
             echo "removing our workspace container: ws-${wsid}"
             docker rm -f "ws-${wsid}" >/dev/null 2>&1 || true
+            docker volume rm -f "ws-${wsid}-configs" "ws-${wsid}-claude-sessions" "ws-${wsid}-workspace" >/dev/null 2>&1 || true
             removed=$((removed + 1))
           done < "$MANIFEST"
           echo "ws-* teardown removed $removed of $(wc -l < "$MANIFEST" | tr -d ' ') owned container(s)."

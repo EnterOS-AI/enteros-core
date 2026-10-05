@@ -186,6 +186,11 @@ jobs:
       # we let Docker assign an ephemeral host port.
       PG_CONTAINER: pg-e2e-api-${{ github.run_id }}-${{ github.run_attempt }}
       REDIS_CONTAINER: redis-e2e-api-${{ github.run_id }}-${{ github.run_attempt }}
+      # The platform started below provisions ws-<id> containers on the shared
+      # host daemon. Production keeps them unless-stopped; here one that
+      # outlives the run must exit once and stay collectable, not crash-loop on
+      # the runner host (RC09: ~300k restarts each, for months).
+      MOLECULE_WORKSPACE_RESTART_POLICY: "no"
     steps:
       - name: No-op pass (paths filter excluded this commit)
         if: needs.detect-changes.outputs.api != 'true'
@@ -682,6 +687,32 @@ jobs:
           if [ -f workspace-server/platform.pid ]; then
             kill "$(cat workspace-server/platform.pid)" 2>/dev/null || true
           fi
+      - name: Remove this run's workspace containers + volumes (platform-instance scoped)
+        # The platform provisions ws-<id> containers on the runner's shared host
+        # daemon (bundle import, priority runtimes) and only its own 60s orphan
+        # sweeper ever removed them — which the step above just killed. Workspaces
+        # deleted mid-provision were left crash-looping for months (RC09). Remove
+        # every container labelled with THIS platform's instance id —
+        # sha256(DATABASE_URL)[:16]; the DSN carries this run's own ephemeral PG
+        # port, so a concurrent run's workspaces never match — plus their
+        # ws-<id>-* volumes (derived from the containers: the bind-created ones
+        # carry no labels). Runs after "Stop platform" so nothing new is created.
+        if: always() && needs.detect-changes.outputs.api == 'true'
+        run: |
+          if [ -z "${DATABASE_URL:-}" ]; then
+            echo "No DATABASE_URL — the platform never started; nothing to remove."
+            exit 0
+          fi
+          # "Stop platform" only signals it. Wait (bounded) until our own server
+          # has exited, so nothing it is still doing creates a container after
+          # the listing below.
+          PID="$(cat workspace-server/platform.pid 2>/dev/null || true)"
+          for _ in $(seq 1 30); do
+            { [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; } || break
+            sleep 1
+          done
+          bash .gitea/scripts/ws-orphan-reap.sh instance "$DATABASE_URL" \
+            || echo "::warning::instance-scoped workspace teardown did not complete — see above"
       - name: Stop service containers
         # always() so containers don't leak when test steps fail. The
         # cleanup is best-effort: if the container is already gone
