@@ -83,12 +83,19 @@ concurrency:
   # unconvergeable (a ghost can red a genuine pass) and, at volume, serialized
   # every open PR into a multi-hour backlog on one slot.
   #
-  # cancel-in-progress is now safe (it was not before): a superseded run's
-  # entire topology is one `docker rm -fv` of its dind, so a cancel cannot
-  # leak a half-torn-down namespace. A new push supersedes its own older run
-  # instead of queueing behind it (the RFC's finding-#2 shape).
+  # cancel-in-progress is FALSE, as in harness-replays.yml and
+  # template-delivery-e2e.yml. It was true, on the claim that a cancel cannot
+  # leak because the run's topology is one `docker rm -fv` of its dind. It did
+  # leak: that rm is the `if: always()` "Teardown dind" step, and the deployed
+  # act_runner skips always() steps on a cancelled job. Every superseded run's
+  # dind kept running until the host's harness-reaper `docker rm -f`'d it ~2h
+  # later — no -v — stranding its ~8 GB /var/lib/docker volume (~1 TB on one
+  # runner host; 189 of 190 reaped dinds were cancelled runs). dind.sh now also
+  # reaps a dind whose job container is gone, but nothing here cancels a run in
+  # the first place: a newer push queues behind its own PR's run. Keying stays
+  # per-PR, so the cross-PR queue #4122 removed does not come back.
   group: e2e-ephemeral-happy-path-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
@@ -206,7 +213,8 @@ jobs:
       # Per-job DISPOSABLE dind (tests/harness/dind.sh — the harness-replays
       # pattern, task#78): the WHOLE topology (PG, CP, tenants, workspaces,
       # image builds) lives inside a nested daemon and dies with one atomic
-      # `docker rm -fv`, even on cancel. This is the structural fix for the
+      # `docker rm -fv` (the Teardown step, or on cancel the dind's own owner
+      # watchdog). This is the structural fix for the
       # shared docker-host interference that killed the gate's first CI runs
       # (host-loopback docker-proxy dying mid-run with every container healthy;
       # mc#4081) AND for cross-run tenant leaks (an early `down` implementation
@@ -409,11 +417,13 @@ jobs:
           bash tests/e2e/ephemeral_cp_happy_path.sh
           echo "GATE_ARM=proof" >> "$GITHUB_ENV"
 
-      # Atomic teardown: one rm destroys the entire nested topology (CP, PG,
-      # tenants, workspaces, volumes, networks, built images) — even after a
-      # cancel that skipped every other cleanup. Leaks structurally impossible.
+      # Atomic teardown: one `docker rm -fv` destroys the entire nested topology
+      # (CP, PG, tenants, workspaces, volumes, networks, built images). A
+      # cancelled job never reaches this step (act_runner skips always() steps
+      # on cancel); that dind reaps itself — and its volume — via dind.sh's
+      # owner watchdog once this job's container is gone.
       - name: Teardown dind
-        # always() so a cancelled/failed run still reaps its dind — but gated on
+        # always() so a failed run still reaps its dind — but gated on
         # the same non-fork condition as the start step (an ungated always()
         # step on the fork no-op path was exactly the template-delivery chdir
         # failure, core#4057).
