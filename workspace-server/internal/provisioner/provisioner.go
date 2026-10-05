@@ -768,9 +768,11 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	ctx, done := p.trackStart(ctx, cfg.WorkspaceID)
 	defer done()
 	url, err := p.start(ctx, callerCtx, cfg)
-	if err != nil && !errors.Is(err, ErrWorkspaceRemoved) && errors.Is(context.Cause(ctx), ErrWorkspaceRemoved) {
+	if err != nil && !errors.Is(err, errRemovedAndDiscarded) && errors.Is(context.Cause(ctx), ErrWorkspaceRemoved) {
 		// Cancelled by a delete mid-flight: whatever step failed on the cancelled
 		// ctx may have left a volume (or a created-not-started container) behind.
+		// Only start's own discard counts as done: a Docker call the cancel cut
+		// off returns an error that itself wraps ErrWorkspaceRemoved.
 		p.discardRemovedWorkspace(ctx, cfg.WorkspaceID)
 		return "", fmt.Errorf("%w: %s (start cancelled: %v)", ErrWorkspaceRemoved, cfg.WorkspaceID, err)
 	}
@@ -987,7 +989,7 @@ func (p *Provisioner) start(ctx, callerCtx context.Context, cfg WorkspaceConfig)
 	// removed workspace as a crash-looping orphan. Check, and discard instead.
 	if p.workspaceRemoved(ctx, cfg.WorkspaceID) {
 		p.discardRemovedWorkspace(ctx, cfg.WorkspaceID)
-		return "", fmt.Errorf("%w: %s (before container create)", ErrWorkspaceRemoved, cfg.WorkspaceID)
+		return "", fmt.Errorf("%w: %s (before container create)", errRemovedAndDiscarded, cfg.WorkspaceID)
 	}
 	// Create the /workspace volume LABELLED too when the tier keeps that bind
 	// (ApplyTierConfig drops it for tier 1; a host-path bind is no volume).
@@ -1048,7 +1050,7 @@ func (p *Provisioner) start(ctx, callerCtx context.Context, cfg WorkspaceConfig)
 	// by the container it could not see yet.
 	if p.workspaceRemoved(ctx, cfg.WorkspaceID) {
 		p.discardRemovedWorkspace(ctx, cfg.WorkspaceID)
-		return "", fmt.Errorf("%w: %s (after container start)", ErrWorkspaceRemoved, cfg.WorkspaceID)
+		return "", fmt.Errorf("%w: %s (after container start)", errRemovedAndDiscarded, cfg.WorkspaceID)
 	}
 
 	// Verify the started container uses the expected image

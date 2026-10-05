@@ -32,6 +32,16 @@ const raceWorkspaceID = "11111111-2222-3333-4444-555555555555"
 // the test can hold open (a cold build / slow pull), containers that exist once
 // created, calls that honour a cancelled ctx like the real client does, and an
 // ordered event log.
+//
+// A call on a cancelled ctx fails the way the real client's does: net/http
+// reports the ctx's CAUSE, so after a delete's cancel the error wraps
+// ErrWorkspaceRemoved itself (seen against a real daemon:
+// `error during connect: Post ".../volumes/create": workspace was removed while
+// provisioning`).
+func cancelledCallErr(ctx context.Context, call string) error {
+	return fmt.Errorf("error during connect: %s: %w", call, context.Cause(ctx))
+}
+
 type raceDocker struct {
 	*fakeDockerClient
 
@@ -73,7 +83,7 @@ func (f *raceDocker) ImageInspect(ctx context.Context, img string, _ ...client.I
 			select {
 			case <-f.inspectGate:
 			case <-ctx.Done():
-				return image.InspectResponse{}, ctx.Err()
+				return image.InspectResponse{}, cancelledCallErr(ctx, "image inspect")
 			}
 		} else {
 			<-f.inspectGate
@@ -83,13 +93,16 @@ func (f *raceDocker) ImageInspect(ctx context.Context, img string, _ ...client.I
 }
 
 func (f *raceDocker) VolumeCreate(ctx context.Context, o volume.CreateOptions) (volume.Volume, error) {
+	if ctx.Err() != nil {
+		return volume.Volume{}, cancelledCallErr(ctx, "volume create "+o.Name)
+	}
 	f.log("volume-create:" + o.Name)
 	return f.fakeDockerClient.VolumeCreate(ctx, o)
 }
 
 func (f *raceDocker) ContainerCreate(ctx context.Context, cfg *container.Config, host *container.HostConfig, nw *network.NetworkingConfig, pl *ocispec.Platform, name string) (container.CreateResponse, error) {
-	if err := ctx.Err(); err != nil {
-		return container.CreateResponse{}, err
+	if ctx.Err() != nil {
+		return container.CreateResponse{}, cancelledCallErr(ctx, "container create "+name)
 	}
 	f.log("container-create:" + name)
 	f.mu.Lock()
@@ -111,8 +124,8 @@ func (f *raceDocker) ContainerCreate(ctx context.Context, cfg *container.Config,
 }
 
 func (f *raceDocker) ContainerStart(ctx context.Context, id string, _ container.StartOptions) error {
-	if err := ctx.Err(); err != nil {
-		return err
+	if ctx.Err() != nil {
+		return cancelledCallErr(ctx, "container start "+id)
 	}
 	f.log("container-start:" + id)
 	if f.onStart != nil {
@@ -134,8 +147,8 @@ func (f *raceDocker) ContainerInspect(_ context.Context, name string) (container
 }
 
 func (f *raceDocker) ContainerRemove(ctx context.Context, name string, o container.RemoveOptions) error {
-	if err := ctx.Err(); err != nil {
-		return err // the real client never sends a request on a cancelled ctx
+	if ctx.Err() != nil {
+		return cancelledCallErr(ctx, "container remove "+name) // the request never reaches the daemon
 	}
 	f.log("container-remove:" + name)
 	f.mu.Lock()
@@ -454,6 +467,52 @@ func TestStart_WorkspaceVolumeIsCreatedLabelled(t *testing.T) {
 	}
 }
 
+// cutOffVolumeDocker models a Docker call that a delete cuts off after the
+// daemon already did the work: the config volume gets created, then the client
+// sees the cancel and returns the cause-wrapped error.
+type cutOffVolumeDocker struct {
+	*raceDocker
+	creating chan struct{}
+}
+
+func (f *cutOffVolumeDocker) VolumeCreate(ctx context.Context, o volume.CreateOptions) (volume.Volume, error) {
+	v, err := f.raceDocker.VolumeCreate(ctx, o)
+	if err != nil || o.Name != ConfigVolumeName(raceWorkspaceID) {
+		return v, err
+	}
+	select {
+	case <-f.creating:
+	default:
+		close(f.creating)
+	}
+	<-ctx.Done()
+	return volume.Volume{}, cancelledCallErr(ctx, "volume create "+o.Name)
+}
+
+// The error of a Docker call that a delete cut off wraps ErrWorkspaceRemoved
+// itself (net/http reports the cancelled ctx's cause). Start used to read that
+// as "start already discarded" and skipped the discard, leaving what the daemon
+// had created; against a real daemon, a delete during a legacy-volume migration
+// left both config volumes behind that way.
+func TestStart_DeleteCutsOffADockerCall_StillDiscards(t *testing.T) {
+	f := &cutOffVolumeDocker{raceDocker: newRaceDocker(), creating: make(chan struct{})}
+	p := &Provisioner{cli: f, alpineImage: "alpine"}
+	var removed atomic.Bool
+	p.SetWorkspaceRemovedCheck(func(context.Context, string) bool { return removed.Load() })
+
+	errCh := startAsync(p)
+	<-f.creating
+	removed.Store(true)
+	if !p.CancelInflightStart(raceWorkspaceID, 5*time.Second) {
+		t.Fatal("CancelInflightStart reported the start still running")
+	}
+	err := waitErr(t, errCh)
+	if !errors.Is(err, ErrWorkspaceRemoved) {
+		t.Fatalf("Start returned %v, want ErrWorkspaceRemoved", err)
+	}
+	assertNothingLeft(t, f.raceDocker)
+}
+
 // migrationRaceDocker adds a legacy (KI-013) volume migration slow enough for a
 // delete to land mid-copy: the copy container runs until its ctx is cancelled
 // (the real ContainerWait then reports the ctx error), and a volume that a live
@@ -468,8 +527,8 @@ func (f *migrationRaceDocker) ContainerCreate(ctx context.Context, cfg *containe
 	if name != "" {
 		return f.raceDocker.ContainerCreate(ctx, cfg, host, nw, pl, name)
 	}
-	if err := ctx.Err(); err != nil {
-		return container.CreateResponse{}, err
+	if ctx.Err() != nil {
+		return container.CreateResponse{}, cancelledCallErr(ctx, "container create")
 	}
 	const id = "volume-migration"
 	f.log("container-create:" + id)
@@ -490,7 +549,7 @@ func (f *migrationRaceDocker) ContainerWait(ctx context.Context, _ string, _ con
 		close(f.migrating)
 	}
 	errCh := make(chan error, 1)
-	go func() { <-ctx.Done(); errCh <- ctx.Err() }()
+	go func() { <-ctx.Done(); errCh <- cancelledCallErr(ctx, "container wait") }()
 	return make(chan container.WaitResponse), errCh
 }
 

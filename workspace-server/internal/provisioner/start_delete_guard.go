@@ -3,6 +3,7 @@ package provisioner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"strings"
@@ -38,6 +39,13 @@ import (
 // was deleted while it was in flight. Whatever the Start created has already
 // been torn down; callers must NOT mark the workspace failed — it is removed.
 var ErrWorkspaceRemoved = errors.New("workspace was removed while provisioning")
+
+// errRemovedAndDiscarded is the ErrWorkspaceRemoved that start returns when its
+// own removed-check fired and it has already discarded what it made. Start must
+// not read every ErrWorkspaceRemoved that way: the error of a Docker call that
+// a delete cut off wraps it too (net/http reports the cancelled ctx's cause),
+// and that start still needs its discard.
+var errRemovedAndDiscarded = fmt.Errorf("%w", ErrWorkspaceRemoved)
 
 type inflightStart struct {
 	cancel context.CancelCauseFunc
