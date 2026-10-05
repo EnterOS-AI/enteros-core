@@ -173,7 +173,7 @@ up() {
   if [ -n "$owner" ]; then
     watch=(--mount "type=bind,source=${sock},target=/run/dind-host-docker.sock" -e "DIND_OWNER=${owner}")
   else
-    echo "::warning::[dind] could not identify the job container that owns $DIND — if this job is cancelled, only the ${DIND_MAX_LIFETIME}s lifetime cap will reap it." >&2
+    echo "::warning::[dind] could not identify the job container that owns $DIND — if this job is cancelled, nothing stops it before its ${DIND_MAX_LIFETIME}s lifetime cap, and a host reaper that removes it first with \`docker rm -f\` (no -v) strands its /var/lib/docker volume." >&2
   fi
   if ! host_docker run -d --rm --name "$DIND" --privileged \
       --label "molecule.ci.dind-owner=${owner:-unknown}" \

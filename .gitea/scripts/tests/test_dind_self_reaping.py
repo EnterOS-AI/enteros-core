@@ -133,6 +133,9 @@ def test_up_without_an_identifiable_owner_warns_and_relies_on_the_cap(tmp_path: 
     proc, args = _up(tmp_path, FAKE_OWNER="", DIND_OWNER="b" * 64, DIND_MAX_LIFETIME="7200")
     assert proc.returncode == 0, proc.stderr
     assert "could not identify the job container" in proc.stderr
+    # Not "only the cap will reap it": a host reaper's `rm -f` usually gets there
+    # first, and that strands the volume.
+    assert "(no -v) strands its /var/lib/docker volume" in proc.stderr, proc.stderr
     assert not any(e.startswith("DIND_OWNER=") for e in _flag_values(args, "-e"))
     assert _flag_values(args, "--mount") == []
     assert "molecule.ci.dind-owner=unknown" in _flag_values(args, "--label")
