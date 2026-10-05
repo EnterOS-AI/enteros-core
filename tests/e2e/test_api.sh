@@ -376,10 +376,32 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+# The import PROVISIONS the re-imported workspace in a detached goroutine — on
+# the CI lane a real ws-<id> container on the runner's shared docker daemon (the
+# bundle carries no runtime, so it comes back as the default one). Deleting it
+# while that provision is still building/starting is the delete-vs-provision
+# race that left crash-looping ws-* orphans on the CI hosts for months. The
+# platform now cancels an in-flight provision on delete; this test also stops
+# racing it: wait (bounded) for the provision attempt to SETTLE — url set (the
+# container was started) or a terminal status — before the register below,
+# which overwrites url/status, and the delete at the end.
+SETTLE_SECS="${E2E_BUNDLE_SETTLE_SECS:-120}"
+settle_deadline=$(( $(date +%s) + SETTLE_SECS ))
+while :; do
+  SETTLED=$(curl -s "$BASE/workspaces/$NEW_ID" | python3 -c "import sys,json
+d=json.load(sys.stdin)
+print('yes' if d.get('url') or d.get('status') in ('online','failed','removed') else 'no')" 2>/dev/null || echo no)
+  [ "$SETTLED" = "yes" ] && break
+  if [ "$(date +%s)" -ge "$settle_deadline" ]; then
+    echo "WARN: re-imported workspace $NEW_ID still provisioning after ${SETTLE_SECS}s — continuing; the platform cancels the in-flight provision on delete"
+    break
+  fi
+  sleep 2
+done
+
 # Verify re-imported workspace exists by name — status may be "provisioning",
-# "online", or "failed" depending on runtime availability in the environment
-# (CI has no Docker, so runtime containers never come up). The
-# round-trip assertion is about bundle fidelity, not provisioning success.
+# "online", or "failed" depending on runtime availability in the environment.
+# The round-trip assertion is about bundle fidelity, not provisioning success.
 R=$(curl -s "$BASE/workspaces/$NEW_ID")
 check "Re-imported workspace exists" "\"id\":\"$NEW_ID\"" "$R"
 

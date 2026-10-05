@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -219,6 +220,13 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 	h.mintWorkspaceSecrets(ctx, workspaceID, &cfg)
 
 	url, err := h.provisioner.Start(ctx, cfg)
+	if errors.Is(err, provisioner.ErrWorkspaceRemoved) {
+		// RC09: deleted while this provision was in flight. Start already tore
+		// down what it made; the row is 'removed' and must stay that way —
+		// markProvisionFailed would resurrect it as 'failed'.
+		log.Printf("Provisioner: workspace %s was deleted while provisioning — start abandoned: %v", workspaceID, err)
+		return
+	}
 	if err != nil {
 		// F1086 / #1206: persist a generic message so the canvas and
 		// GET /workspaces/:id expose something actionable without leaking

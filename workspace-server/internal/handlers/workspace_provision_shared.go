@@ -532,8 +532,11 @@ func (h *WorkspaceHandler) markProvisionFailed(ctx context.Context, workspaceID,
 		extra["error"] = msg
 	}
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisionFailed), workspaceID, extra)
+	// `status != 'removed'`: removed is terminal. A provision that fails after a
+	// DELETE marked the row (the delete-vs-provision race, RC09) must not flip
+	// the deleted workspace back to a visible 'failed'.
 	if _, dbErr := db.DB.ExecContext(ctx,
-		`UPDATE workspaces SET status = $3, last_sample_error = $2, updated_at = now() WHERE id = $1`,
+		`UPDATE workspaces SET status = $3, last_sample_error = $2, updated_at = now() WHERE id = $1 AND status != 'removed'`,
 		workspaceID, msg, models.StatusFailed); dbErr != nil {
 		// Non-fatal: the broadcast already fired, the operator sees the
 		// failure event in the canvas. The DB row stays at whatever
