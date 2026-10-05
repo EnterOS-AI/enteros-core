@@ -40,9 +40,10 @@ type raceDocker struct {
 	inspecting  chan struct{} // closed when Start reaches the image step
 	onStart     func()        // runs inside ContainerStart (a delete landing mid-start)
 
-	events      []string
-	createdHost []*container.HostConfig
-	removeOpts  map[string]container.RemoveOptions
+	events        []string
+	createdHost   []*container.HostConfig
+	createdImages []string
+	removeOpts    map[string]container.RemoveOptions
 }
 
 func newRaceDocker() *raceDocker {
@@ -95,7 +96,17 @@ func (f *raceDocker) ContainerCreate(ctx context.Context, cfg *container.Config,
 	defer f.mu.Unlock()
 	f.containerCreateCalls = append(f.containerCreateCalls, name)
 	f.createdHost = append(f.createdHost, host)
+	f.createdImages = append(f.createdImages, cfg.Image)
 	f.containers[name] = container.InspectResponse{ContainerJSONBase: &container.ContainerJSONBase{Name: name, State: &container.State{}}}
+	// Like dockerd: a bind naming a volume that does not exist creates it, with
+	// NO labels.
+	for _, b := range host.Binds {
+		if src, _, ok := strings.Cut(b, ":"); ok && !strings.HasPrefix(src, "/") {
+			if _, exists := f.volumes[src]; !exists {
+				f.volumes[src] = volume.Volume{Name: src}
+			}
+		}
+	}
 	return container.CreateResponse{ID: name}, nil
 }
 
@@ -123,6 +134,9 @@ func (f *raceDocker) ContainerInspect(_ context.Context, name string) (container
 }
 
 func (f *raceDocker) ContainerRemove(ctx context.Context, name string, o container.RemoveOptions) error {
+	if err := ctx.Err(); err != nil {
+		return err // the real client never sends a request on a cancelled ctx
+	}
 	f.log("container-remove:" + name)
 	f.mu.Lock()
 	f.removeOpts[name] = o
@@ -258,6 +272,12 @@ func TestStart_RemovedDuringContainerStart_TearsItDown(t *testing.T) {
 		t.Errorf("the started container was not force-removed WITH its volumes: %+v (removed=%v)", o, ok)
 	}
 	assertNothingLeft(t, f)
+	// The /workspace volume outlives the discard by design (a delete keeps it
+	// too). It must carry the instance label, or nothing could attribute it once
+	// its container is gone (the CI instance teardown lists volumes by it).
+	if v := f.volumes[WorkspaceVolumeName(raceWorkspaceID)]; v.Labels[LabelInstance] != PlatformInstanceID() {
+		t.Errorf("the discarded workspace's /workspace volume has labels %v, want its instance label", v.Labels)
+	}
 }
 
 // The normal path is untouched: not removed → created, started, URL returned;
@@ -394,5 +414,275 @@ func TestCancelInflightStart_CancelsEveryStartForTheWorkspace(t *testing.T) {
 		if !errors.Is(context.Cause(c), ErrWorkspaceRemoved) {
 			t.Errorf("start %d cancelled with cause %v, want ErrWorkspaceRemoved", i, context.Cause(c))
 		}
+	}
+}
+
+// The /workspace volume is created LABELLED before the container whenever the
+// tier keeps that bind, so it stays attributable to its platform instance after
+// the container is gone (a delete keeps it by design; left to the bind, Docker
+// would create it with no labels at all). Tier 1 strips the mount, and a
+// host-path workspace is no volume: neither gets one.
+func TestStart_WorkspaceVolumeIsCreatedLabelled(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*WorkspaceConfig)
+		want bool
+	}{
+		{"tier2", func(c *WorkspaceConfig) { c.Tier = 2 }, true},
+		{"tier3", func(c *WorkspaceConfig) { c.Tier = 3 }, true},
+		{"tier1", func(c *WorkspaceConfig) { c.Tier = 1 }, false},
+		{"host-path", func(c *WorkspaceConfig) {
+			c.WorkspacePath, c.WorkspaceAccess = "/srv/agent-workspace", WorkspaceAccessReadWrite
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRaceDocker()
+			p := &Provisioner{cli: f, alpineImage: "alpine"}
+			cfg := raceConfig()
+			tc.edit(&cfg)
+			if _, err := p.Start(context.Background(), cfg); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			v, ok := f.volumes[WorkspaceVolumeName(raceWorkspaceID)]
+			if ok != tc.want {
+				t.Fatalf("workspace volume exists=%v, want %v (volumes: %v)", ok, tc.want, f.volumes)
+			}
+			if ok && (v.Labels[LabelManaged] != "true" || v.Labels[LabelInstance] != PlatformInstanceID()) {
+				t.Errorf("workspace volume labels = %v, want the managed + instance labels", v.Labels)
+			}
+		})
+	}
+}
+
+// migrationRaceDocker adds a legacy (KI-013) volume migration slow enough for a
+// delete to land mid-copy: the copy container runs until its ctx is cancelled
+// (the real ContainerWait then reports the ctx error), and a volume that a live
+// container mounts cannot be removed, as on a real daemon.
+type migrationRaceDocker struct {
+	*raceDocker
+	migrating chan struct{} // closed once Start is waiting on the copy container
+	binds     map[string][]string
+}
+
+func (f *migrationRaceDocker) ContainerCreate(ctx context.Context, cfg *container.Config, host *container.HostConfig, nw *network.NetworkingConfig, pl *ocispec.Platform, name string) (container.CreateResponse, error) {
+	if name != "" {
+		return f.raceDocker.ContainerCreate(ctx, cfg, host, nw, pl, name)
+	}
+	if err := ctx.Err(); err != nil {
+		return container.CreateResponse{}, err
+	}
+	const id = "volume-migration"
+	f.log("container-create:" + id)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.containers[id] = container.InspectResponse{ContainerJSONBase: &container.ContainerJSONBase{Name: id, State: &container.State{}}}
+	for _, b := range host.Binds {
+		src, _, _ := strings.Cut(b, ":")
+		f.binds[id] = append(f.binds[id], src)
+	}
+	return container.CreateResponse{ID: id}, nil
+}
+
+func (f *migrationRaceDocker) ContainerWait(ctx context.Context, _ string, _ container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+	select {
+	case <-f.migrating:
+	default:
+		close(f.migrating)
+	}
+	errCh := make(chan error, 1)
+	go func() { <-ctx.Done(); errCh <- ctx.Err() }()
+	return make(chan container.WaitResponse), errCh
+}
+
+func (f *migrationRaceDocker) ContainerRemove(ctx context.Context, name string, o container.RemoveOptions) error {
+	err := f.raceDocker.ContainerRemove(ctx, name, o)
+	if err == nil {
+		f.mu.Lock()
+		delete(f.binds, name)
+		f.mu.Unlock()
+	}
+	return err
+}
+
+func (f *migrationRaceDocker) VolumeRemove(ctx context.Context, name string, force bool) error {
+	f.mu.Lock()
+	for c, vols := range f.binds {
+		for _, v := range vols {
+			if v == name {
+				f.mu.Unlock()
+				return fmt.Errorf("remove %s: volume is in use - [%s]", name, c)
+			}
+		}
+	}
+	f.mu.Unlock()
+	return f.raceDocker.VolumeRemove(ctx, name, force)
+}
+
+// A delete landing while Start migrates a legacy config volume must not strand
+// the copy container. Its deferred remove used the Start's ctx, which the delete
+// has just cancelled, so the request never reached the daemon: the copy
+// container outlived the Start and kept both volumes in use, so the discard
+// could not remove them either.
+func TestStart_DeleteDuringLegacyVolumeMigration_RemovesTheCopyContainer(t *testing.T) {
+	f := &migrationRaceDocker{raceDocker: newRaceDocker(), migrating: make(chan struct{}), binds: map[string][]string{}}
+	legacy := legacyConfigVolumeName(raceWorkspaceID)
+	f.volumes[legacy] = volume.Volume{Name: legacy}
+	p := &Provisioner{cli: f, alpineImage: "alpine"}
+	var removed atomic.Bool
+	p.SetWorkspaceRemovedCheck(func(context.Context, string) bool { return removed.Load() })
+
+	errCh := startAsync(p)
+	<-f.migrating
+	removed.Store(true)
+	if !p.CancelInflightStart(raceWorkspaceID, 5*time.Second) {
+		t.Fatal("CancelInflightStart reported the start still running")
+	}
+	if err := waitErr(t, errCh); !errors.Is(err, ErrWorkspaceRemoved) {
+		t.Fatalf("Start returned %v, want ErrWorkspaceRemoved", err)
+	}
+	if live := f.liveContainers(); len(live) != 0 {
+		t.Errorf("containers left behind after the delete: %v (the volume-migration copy container must not outlive the Start)", live)
+	}
+	for _, v := range []string{ConfigVolumeName(raceWorkspaceID), legacy} {
+		if f.hasVolume(v) {
+			t.Errorf("volume %s left behind after the delete", v)
+		}
+	}
+}
+
+func localBuildConfig() WorkspaceConfig {
+	return WorkspaceConfig{WorkspaceID: raceWorkspaceID, Runtime: "hermes", Tier: 2}
+}
+
+// fakeLocalBuild stands in for the local image build (`git clone` + `docker
+// build`): it runs until released or until its ctx is cancelled — as a real
+// build under exec.CommandContext is killed — and records how it ended.
+type fakeLocalBuild struct {
+	entered, release, finished chan struct{}
+	deadline                   time.Time
+	hasDeadline                bool
+	killed                     atomic.Bool
+}
+
+func installFakeLocalBuild(t *testing.T) *fakeLocalBuild {
+	t.Helper()
+	t.Setenv("MOLECULE_IMAGE_REGISTRY", "") // local-build mode
+	b := &fakeLocalBuild{entered: make(chan struct{}), release: make(chan struct{}), finished: make(chan struct{})}
+	orig := ensureLocalImageHook
+	t.Cleanup(func() { ensureLocalImageHook = orig })
+	ensureLocalImageHook = func(ctx context.Context, runtime string) (string, error) {
+		defer close(b.finished)
+		b.deadline, b.hasDeadline = ctx.Deadline()
+		close(b.entered)
+		select {
+		case <-b.release:
+			return "molecule-local/workspace-template-" + runtime + ":0123abcd", nil
+		case <-ctx.Done():
+			b.killed.Store(true)
+			return "", ctx.Err()
+		}
+	}
+	return b
+}
+
+// A delete landing during a cold local image build ABANDONS the build rather
+// than killing it: Start unwinds at once (the delete does not wait out a
+// minutes-long build), nothing is created, and the build itself runs on to
+// completion. A `docker build` killed mid-RUN pins its partial BuildKit
+// snapshot on Docker >= 29.6 (RC06), and before deletes could cancel a Start
+// they never reached the build at all.
+func TestStart_DeleteDuringLocalImageBuild_AbandonsTheBuildWithoutKillingIt(t *testing.T) {
+	b := installFakeLocalBuild(t)
+	f := newRaceDocker()
+	p := &Provisioner{cli: f, alpineImage: "alpine"}
+	var removed atomic.Bool
+	p.SetWorkspaceRemovedCheck(func(context.Context, string) bool { return removed.Load() })
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := p.Start(context.Background(), localBuildConfig())
+		errCh <- err
+	}()
+	<-b.entered
+
+	removed.Store(true)
+	t0 := time.Now()
+	if !p.CancelInflightStart(raceWorkspaceID, 5*time.Second) {
+		t.Fatal("the delete had to wait out the image build: Start did not unwind when cancelled")
+	}
+	if waited := time.Since(t0); waited > 2*time.Second {
+		t.Errorf("CancelInflightStart waited %s on a start that was in its image build", waited)
+	}
+	if err := waitErr(t, errCh); !errors.Is(err, ErrWorkspaceRemoved) {
+		t.Fatalf("Start returned %v, want ErrWorkspaceRemoved", err)
+	}
+	if len(f.containerCreateCalls) != 0 {
+		t.Errorf("ContainerCreate ran for a deleted workspace: %v", f.containerCreateCalls)
+	}
+	assertNothingLeft(t, f)
+
+	select {
+	case <-b.finished:
+		t.Fatal("the delete killed the image build — it must be abandoned, not cancelled")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(b.release)
+	select {
+	case <-b.finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the abandoned build never finished")
+	}
+	if b.killed.Load() {
+		t.Error("the delete cancelled the image build's ctx")
+	}
+}
+
+// Only the delete is cut off from the build. The caller's deadline — the
+// per-runtime provision window, which also sizes the build's ceiling — still
+// reaches it, and the caller's own cancellation still stops it.
+func TestStart_LocalImageBuild_KeepsTheCallersDeadlineAndCancel(t *testing.T) {
+	b := installFakeLocalBuild(t)
+	f := newRaceDocker()
+	p := &Provisioner{cli: f, alpineImage: "alpine"}
+	p.SetWorkspaceRemovedCheck(func(context.Context, string) bool { return false })
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+	want, _ := ctx.Deadline()
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := p.Start(ctx, localBuildConfig())
+		errCh <- err
+	}()
+	<-b.entered
+	if !b.hasDeadline || !b.deadline.Equal(want) {
+		t.Errorf("build deadline = %v (set=%v), want the caller's %v", b.deadline, b.hasDeadline, want)
+	}
+	cancel() // the caller gives up: not a delete
+	err := waitErr(t, errCh)
+	if err == nil || errors.Is(err, ErrWorkspaceRemoved) {
+		t.Fatalf("Start returned %v, want the build's own cancellation error", err)
+	}
+	if !b.killed.Load() {
+		t.Error("the caller's cancellation did not stop the build")
+	}
+}
+
+// Not deleted: Start waits for the build and creates the container from the
+// image it built.
+func TestStart_LocalImageBuild_NotRemovedUsesTheBuiltImage(t *testing.T) {
+	b := installFakeLocalBuild(t)
+	close(b.release)
+	f := newRaceDocker()
+	p := &Provisioner{cli: f, alpineImage: "alpine"}
+	p.SetWorkspaceRemovedCheck(func(context.Context, string) bool { return false })
+	if _, err := p.Start(context.Background(), localBuildConfig()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if want := "molecule-local/workspace-template-hermes:0123abcd"; len(f.createdImages) != 1 || f.createdImages[0] != want {
+		t.Fatalf("created from %v, want [%s]", f.createdImages, want)
+	}
+	if b.killed.Load() {
+		t.Error("a build that was not abandoned was cancelled")
 	}
 }

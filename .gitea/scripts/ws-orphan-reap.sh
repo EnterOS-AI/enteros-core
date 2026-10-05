@@ -26,10 +26,10 @@
 #
 # Volumes: a container's mounted ws-* volumes plus the derived
 # ws-<id>-{configs,workspace,claude-sessions}. Derived because Docker auto-creates
-# a bind's missing named volume WITHOUT labels (the /workspace volume always,
-# the config volume when a delete raced the provision), and a tier-1 container
-# never mounts the claude-sessions volume it was given. `rm -fv` takes the
-# anonymous ones.
+# a bind's missing named volume WITHOUT labels (the /workspace volume, until the
+# platform created it labelled; the config volume when a delete raced the
+# provision), and a tier-1 container never mounts the claude-sessions volume it
+# was given. `rm -fv` takes the anonymous ones.
 #
 # BOTH modes refuse to run against the production box (100.64.0.3), where
 # managed ws-* containers are REAL tenant workspaces: DOCKER_HOST pointing at it,

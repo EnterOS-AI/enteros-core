@@ -26,7 +26,8 @@ import (
 //   - Start registers itself per workspace for its whole run, so a delete can
 //     CANCEL it and WAIT for it to unwind before tearing down
 //     (CancelInflightStart, called by CascadeDelete after the row is marked
-//     'removed').
+//     'removed'). A local image build in progress is abandoned, not killed
+//     (buildLocalImageUnlessRemoved).
 //   - Start re-checks that the workspace was not removed right before
 //     ContainerCreate and right after ContainerStart (SetWorkspaceRemovedCheck),
 //     and tears down whatever it made if it was — the backstop for a delete
@@ -148,6 +149,64 @@ func (p *Provisioner) discardRemovedWorkspace(ctx context.Context, workspaceID s
 		log.Printf("Provisioner: discard of removed workspace %s: %v", workspaceID, err)
 	}
 	log.Printf("Provisioner: workspace %s was removed while provisioning — discarded its container + volumes", workspaceID)
+}
+
+// buildLocalImageUnlessRemoved runs the local image build so that a delete
+// ABANDONS it instead of killing it. ctx is the Start's ctx, which a delete
+// cancels; callerCtx is the ctx Start was called with.
+//
+// Killing `docker build` mid-RUN on the shared host daemon pins the cancelled
+// step's partial BuildKit snapshot on Docker >= 29.6 until dockerd restarts —
+// `builder prune -af` cannot free it (RC06: ~112 GB on one CI host). A delete
+// never used to reach the build, so the build still runs under callerCtx's own
+// bounds: its deadline (the per-runtime provision window, which also sets the
+// build's ceiling) and its cancellation while Start waits. Only the caller's
+// cancel-on-return is cut off, because the caller returns as soon as an
+// abandoned Start does. A delete stops only the WAIT: Start unwinds at once,
+// the build finishes in the background, and the next provision of the runtime
+// reuses the image.
+func (p *Provisioner) buildLocalImageUnlessRemoved(ctx, callerCtx context.Context, workspaceID, runtime string) (string, error) {
+	var buildCtx context.Context
+	var stopBuild context.CancelFunc
+	if dl, ok := callerCtx.Deadline(); ok {
+		buildCtx, stopBuild = context.WithDeadline(context.WithoutCancel(callerCtx), dl)
+	} else {
+		buildCtx, stopBuild = context.WithCancel(context.WithoutCancel(callerCtx))
+	}
+	type built struct {
+		tag string
+		err error
+	}
+	res := make(chan built, 1)
+	go func() {
+		defer stopBuild()
+		tag, err := p.buildLocalImageWithTelemetry(buildCtx, workspaceID, runtime)
+		res <- built{tag, err}
+	}()
+	select {
+	case b := <-res:
+		return b.tag, b.err
+	case <-ctx.Done():
+	}
+	if !errors.Is(context.Cause(ctx), ErrWorkspaceRemoved) {
+		// The caller's own deadline or cancellation: stop the build, as always.
+		stopBuild()
+		b := <-res
+		return b.tag, b.err
+	}
+	log.Printf("Provisioner: workspace %s was deleted during its %s image build — start abandoned; the build runs on in the background (killing it mid-step can pin build cache)", workspaceID, runtime)
+	return "", ctx.Err()
+}
+
+// bindsNamedVolume reports whether binds mounts the named volume volumeName
+// ("<name>:<path>[:<mode>]").
+func bindsNamedVolume(binds []string, volumeName string) bool {
+	for _, b := range binds {
+		if strings.HasPrefix(b, volumeName+":") {
+			return true
+		}
+	}
+	return false
 }
 
 // workspaceRestartPolicy is the Docker restart policy for ws-<id> containers.
