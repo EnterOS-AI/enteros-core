@@ -322,3 +322,107 @@ def test_the_standing_janitor_runs_the_tested_sweep() -> None:
     runs = [s.get("run") or "" for _, _, steps in _steps("sweep-stale-ws-orphans.yml") for s in steps]
     assert any(r.strip() == "bash .gitea/scripts/ws-orphan-reap.sh sweep" for r in runs), runs
     assert not any("StartedAt" in r for r in runs), "the janitor must not age by StartedAt (RC10)"
+
+
+# ---------------------------------------------------------------------------
+# The teardown step's "wait until our platform has exited" loop, run the way the
+# runner runs it. platform.pid holds the `timeout` wrapper, and the job
+# container's PID 1 (`sleep`, no init) never reaps it: once it exits it is a
+# ZOMBIE, which `kill -0` still finds, so a `kill -0` loop always waited its
+# full 30s.
+# ---------------------------------------------------------------------------
+
+def _teardown_steps() -> list[tuple[str, str]]:
+    found = []
+    for wf in ("e2e-api.yml", "local-provision-e2e.yml"):
+        for job_name, _, steps in _steps(wf):
+            for s in steps:
+                if "ws-orphan-reap.sh instance" in (s.get("run") or ""):
+                    found.append((f"{wf}:{job_name}", s["run"]))
+    return found
+
+
+TEARDOWN_STEPS = _teardown_steps()
+TEARDOWN_IDS = [where for where, _ in TEARDOWN_STEPS]
+NO_SUCH_PID = 4194305  # above PID_MAX_LIMIT (2**22): never a live process
+linux_proc = pytest.mark.skipif(not sys.platform.startswith("linux"),
+                                reason="the step reads /proc/<pid>/status, as it does on the Linux runner")
+
+
+def test_the_teardown_steps_are_found() -> None:
+    """Fail-closed: the parametrized tests below would otherwise run zero cases."""
+    assert len(TEARDOWN_STEPS) == 3, TEARDOWN_IDS  # e2e-api + local-provision's two jobs
+
+
+def _run_teardown_step(tmp: Path, script: str, pid: int | None) -> tuple[subprocess.CompletedProcess[str], float, list[str]]:
+    (tmp / "workspace-server").mkdir()
+    if pid is not None:
+        (tmp / "workspace-server" / "platform.pid").write_text(f"{pid}\n", encoding="utf-8")
+    stub = tmp / ".gitea" / "scripts" / "ws-orphan-reap.sh"  # the step's relative path
+    stub.parent.mkdir(parents=True)
+    stub.write_text('printf "%s\\n" "$@" > "$REAPED"\n', encoding="utf-8", newline="\n")
+    step = tmp / "step.sh"
+    step.write_text(script, encoding="utf-8", newline="\n")
+    env = os.environ.copy()
+    env.update(DATABASE_URL=DSN, REAPED=str(tmp / "reaped"))
+    t0 = time.monotonic()
+    # The runner's default `run:` shell.
+    proc = subprocess.run([BASH, "--noprofile", "--norc", "-e", "-o", "pipefail", str(step)], cwd=tmp,
+                          env=env, text=True, capture_output=True, timeout=60, check=False)
+    took = time.monotonic() - t0
+    reaped = (tmp / "reaped").read_text(encoding="utf-8").split() if (tmp / "reaped").exists() else []
+    return proc, took, reaped
+
+
+def _proc_state(pid: int) -> str:
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("State:"):
+                return line.split()[1]
+    except OSError:
+        pass
+    return ""
+
+
+@linux_proc
+@pytest.mark.parametrize("where,script", TEARDOWN_STEPS, ids=TEARDOWN_IDS)
+def test_teardown_does_not_wait_on_an_exited_platform_left_a_zombie(tmp_path: Path, where: str, script: str) -> None:
+    child = subprocess.Popen([sys.executable, "-c", "pass"])  # exits at once; not reaped until child.wait()
+    try:
+        deadline = time.monotonic() + 10
+        while _proc_state(child.pid) != "Z":
+            assert time.monotonic() < deadline, "could not make a zombie to test with"
+            time.sleep(0.05)
+        proc, took, reaped = _run_teardown_step(tmp_path, script, child.pid)
+    finally:
+        child.wait()
+    assert proc.returncode == 0, (where, proc.stderr)
+    assert took < 10, f"{where}: waited {took:.0f}s for a platform that had already exited (a zombie)"
+    assert reaped == ["instance", DSN], (where, reaped)
+
+
+@linux_proc
+@pytest.mark.parametrize("where,script", TEARDOWN_STEPS, ids=TEARDOWN_IDS)
+def test_teardown_waits_while_the_platform_still_runs(tmp_path: Path, where: str, script: str) -> None:
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"])
+    try:
+        proc, took, reaped = _run_teardown_step(tmp_path, script, child.pid)
+    finally:
+        child.wait()
+    assert proc.returncode == 0, (where, proc.stderr)
+    assert took >= 1.5, f"{where}: reaped after {took:.1f}s, while the platform was still running"
+    assert took < 15, f"{where}: kept waiting {took:.0f}s after the platform exited"
+    assert reaped == ["instance", DSN], (where, reaped)
+
+
+@linux_proc
+@pytest.mark.parametrize("where,script", TEARDOWN_STEPS, ids=TEARDOWN_IDS)
+@pytest.mark.parametrize("pid", [NO_SUCH_PID, None], ids=["process-gone", "no-pid-file"])
+def test_teardown_reaps_at_once_when_there_is_no_platform_process(tmp_path: Path, where: str, script: str,
+                                                                  pid: int | None) -> None:
+    # Under the runner's `bash -e`, the failed /proc read for a process that is
+    # gone must not abort the step before it reaps.
+    proc, took, reaped = _run_teardown_step(tmp_path, script, pid)
+    assert proc.returncode == 0, (where, proc.stderr)
+    assert took < 10, (where, took)
+    assert reaped == ["instance", DSN], (where, reaped)
