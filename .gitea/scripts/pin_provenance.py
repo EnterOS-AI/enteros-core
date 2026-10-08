@@ -47,7 +47,19 @@ pin that was not theirs — and it passed. Replay of any historical pin-writer r
 id laundered an arbitrary pin.
 
 ENFORCED NOW (each verified against live runs, not asserted):
-  * the cited run EXISTS (404 → reject);
+  * the cited run EXISTS (404 → reject). A 404 is NOT proof of fabrication,
+    though: Gitea hard-deletes terminal runs once they age past the run
+    retention window (ns/gitea CronJob `gitea-row-retention`, 30 days when this
+    was written). Commit statuses are not deleted. So on a 404 the audit looks
+    for Actions-identity statuses on the stamp's sha that reference the cited
+    run under a pin-writer workflow's name, and reports UNVERIFIABLE (purged)
+    instead of FORGED when it finds them. Both are violations: the statuses
+    only LABEL the finding and never clear it, because a commit status can be
+    written through the API by any write-scoped token. Measured on 2026-10-07:
+    the staging row's stamp cited run 693892, the genuine staging-tenant-cd
+    push run for a2348b19 (2026-09-03). The run had been purged, 25
+    statuses on a2348b19 still referenced it, and the audit called it a
+    "fabricated run id";
   * it belongs to a pin-WRITING workflow (PIN_WRITER_WORKFLOWS), so an
     unrelated green `ci.yml` run is not cover;
   * it is resolved against the verifier's OWN repository, never the stamp's;
@@ -168,6 +180,16 @@ PIN_WRITER_WORKFLOWS = frozenset(
     }
 )
 
+# The top-level `name:` each pin-writing workflow declares. A commit status
+# context reads "<workflow name> / <job name> (<event>)", so this is the only
+# way to connect a status back to a workflow once its run has been purged.
+# test_pin_writer_names_match_the_workflow_files reads the files themselves, so
+# a rename fails that test instead of silently mislabelling findings.
+PIN_WRITER_WORKFLOW_NAMES = {
+    "staging-tenant-cd.yml": "staging-tenant-cd",
+    "promote-prod-tenant-pin.yml": "promote-prod-tenant-pin",
+}
+
 def mechanism_landed_at(repo_root: str = ".") -> _dt.datetime | None:
     """When the stamping mechanism landed, per the checkout under test.
 
@@ -278,6 +300,15 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
 class StampError(ValueError):
     """A notes string carries no usable provenance stamp."""
+
+
+class PurgedRun(StampError):
+    """The cited run no longer exists, but commit statuses show it once did.
+
+    Still a violation. It is a separate class only so the audit reports it as
+    UNVERIFIABLE rather than FORGED; see absent_run_error for why it cannot
+    pass.
+    """
 
 
 # --------------------------------------------------------------------------
@@ -466,6 +497,140 @@ def workflow_file_of(run: dict) -> str:
     return (run.get("path") or "").split("@", 1)[0].strip()
 
 
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_STATUS_PAGE_LIMIT = 50
+_STATUS_MAX_PAGES = 40
+
+
+def fetch_commit_statuses(sha: str, repo: str, gitea_url: str, token: str | None) -> list[dict]:
+    """Every commit status on `sha`. Raises Undetermined unless ALL were read.
+
+    Pages until an EMPTY page instead of stopping on a short one, so a server
+    whose MAX_RESPONSE_ITEMS is below the requested limit is still read to the
+    end rather than silently truncated.
+    """
+    base = normalize_base(gitea_url)
+    out: list[dict] = []
+    for page in range(1, _STATUS_MAX_PAGES + 1):
+        url = (
+            f"{base}/api/v1/repos/{repo}/commits/{sha}/statuses"
+            f"?limit={_STATUS_PAGE_LIMIT}&page={page}"
+        )
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        if token:
+            req.add_header("Authorization", f"token {token}")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                batch = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 — HTTP/network/JSON all mean "unread"
+            raise Undetermined(
+                f"{type(exc).__name__} reading the commit statuses of {sha[:12]}"
+            ) from exc
+        if not isinstance(batch, list):
+            raise Undetermined(f"the commit statuses of {sha[:12]} are not a JSON list")
+        if not batch:
+            return out
+        out.extend(s for s in batch if isinstance(s, dict))
+    raise Undetermined(
+        f"more than {_STATUS_MAX_PAGES} pages of commit statuses on {sha[:12]}; "
+        f"a partial read cannot show that a status is absent"
+    )
+
+
+def _statuses_citing_run(statuses: list[dict], repo: str, run_id: str) -> list[dict]:
+    """Statuses posted under the Actions identity whose link is that run's job.
+
+    Gitea posts a run's statuses with the Actions user (id -2), which the API
+    renders as `"creator": null`. A status posted through the API by an account
+    carries that account, e.g. claude-status-reaper on a2348b19. Those are
+    skipped. The null creator is not proof of origin, because a job's own token
+    also posts as the Actions user. That is why a match is only ever used to
+    LABEL a violation (see absent_run_error).
+    """
+    link = re.compile(
+        r"^(?:https?://[^/]+)?/"
+        + re.escape(repo)
+        + r"/actions/runs/"
+        + re.escape(run_id)
+        + r"/jobs/\d+/?$"
+    )
+    return [
+        s
+        for s in statuses
+        if s.get("creator") is None and link.match((s.get("target_url") or "").strip())
+    ]
+
+
+def _workflow_name_of_status(status: dict) -> str:
+    return (status.get("context") or "").split(" / ", 1)[0].strip()
+
+
+def absent_run_error(
+    fields: dict[str, str], repo: str, gitea_url: str, token: str | None
+) -> StampError:
+    """The finding for a stamp whose cited run the Actions API does not have.
+
+    Returns the exception and never raises it, so verify_run stays the one
+    place a verdict is raised. EVERY outcome is a violation. What changes is
+    whether the message may say "fabricated".
+
+    WHY A PURGED RUN STILL FAILS. Once its run is gone, nothing the Actions API
+    holds can show which workflow minted the stamp or on which sha. Commit
+    statuses can still show that a run with this id existed, but they are not
+    an attestation: any token with write access can POST one with any context
+    and any target_url. Accepting them would let a hand promote cite any run id
+    a status mentions. So a purged run is UNVERIFIABLE, not verified. The cure
+    is a new stamped write, not a softer audit.
+    """
+    run_id = fields["run"]
+    head = f"stamp cites run {run_id} in {repo}, which does NOT exist in the Actions API."
+    sha = (fields.get("sha") or "").lower()
+    if not _FULL_SHA_RE.match(sha):
+        return StampError(
+            f"{head} The stamp carries no full sha= under which to look for a "
+            f"trace of that run, so nothing distinguishes it from a fabricated "
+            f"id. A fabricated run id is a hand-written pin wearing a pipeline's name."
+        )
+    try:
+        statuses = fetch_commit_statuses(sha, repo, gitea_url, token)
+    except Undetermined as exc:
+        return StampError(
+            f"{head} The commit statuses on {sha[:12]}, which would show whether "
+            f"it ever existed, could not be read ({exc}). A run purged by "
+            f"retention cannot be told from a fabricated id without them, so "
+            f"this fails closed."
+        )
+    hits = _statuses_citing_run(statuses, repo, run_id)
+    if not hits:
+        return StampError(
+            f"{head} No commit status on {sha[:12]} posted under the Actions "
+            f"identity references it either. A fabricated run id is a "
+            f"hand-written pin wearing a pipeline's name. (A workflow_dispatch "
+            f"run posts no commit statuses, so a purged dispatch run looks the "
+            f"same. Either way nothing that survives can vouch for this row.)"
+        )
+    names = sorted({_workflow_name_of_status(s) for s in hits})
+    writers = set(PIN_WRITER_WORKFLOW_NAMES.values())
+    if len(names) != 1 or names[0] not in writers:
+        return StampError(
+            f"{head} {len(hits)} commit status(es) on {sha[:12]} reference it as "
+            f"workflow {', '.join(repr(n) for n in names)}, which is not a single "
+            f"pin-writing workflow ({', '.join(sorted(writers))}). Citing an "
+            f"unrelated run does not make a hand promote a CI promote."
+        )
+    return PurgedRun(
+        f"stamp cites run {run_id} in {repo}, which the Actions API no longer "
+        f"has, but {len(hits)} commit status(es) on {sha[:12]} posted under the "
+        f"Actions identity reference it as {names[0]!r} (e.g. "
+        f"{hits[0].get('context')!r}). That is what Gitea's run retention leaves "
+        f"behind: terminal runs are hard-deleted after the retention window "
+        f"(ns/gitea CronJob gitea-row-retention) and commit statuses are not. "
+        f"It is NOT evidence of a fabricated id. It is still a violation, because "
+        f"the run that vouched for this row is gone and a commit status is not an "
+        f"attestation. Re-stamp the row with a pipeline write."
+    )
+
+
 def bind_stamp_to_run(fields: dict[str, str], run: dict) -> None:
     """The stamp's `sha=` must be the run's OWN head sha.
 
@@ -521,11 +686,7 @@ def verify_run(
     repo = resolve_repo(fields, expected)
     run = fetch_run(fields["run"], repo, gitea_url, token)
     if run is None:
-        raise StampError(
-            f"stamp cites run {fields['run']} in {repo}, which does "
-            f"NOT exist. A fabricated run id is a hand-written pin wearing a "
-            f"pipeline's name."
-        )
+        raise absent_run_error(fields, repo, gitea_url, token)
     wf = workflow_file_of(run)
     if wf not in PIN_WRITER_WORKFLOWS:
         raise StampError(
@@ -703,6 +864,15 @@ def audit(
         if online:
             try:
                 detail = verify_run(fields, gitea_url, token)
+            except PurgedRun as exc:
+                # A violation like any other. Only the label differs, so that a
+                # run lost to retention is not reported as a forgery.
+                violations.append(f"[{label}] {exc}")
+                lines.append(
+                    f"* **{label}** — **UNVERIFIABLE STAMP** (cited run purged by "
+                    f"retention) — {exc}"
+                )
+                continue
             except StampError as exc:
                 violations.append(f"[{label}] {exc}")
                 lines.append(f"* **{label}** — **FORGED STAMP** — {exc}")
