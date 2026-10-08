@@ -351,15 +351,27 @@ class TestLiveWorkflowTrackerInvariant(unittest.TestCase):
                     self.assertIn(slug, ("mc", "internal"))
                     self.assertGreater(num, 0)
         self.assertEqual(untracked, [], f"untracked masks: {untracked}")
-        # A rule that inspected NOTHING reports success identically to one
-        # that inspected everything. If the repo ever reaches zero masks this
-        # assertion is the thing that has to be consciously retired.
+        # RETIRED DELIBERATELY, 2026-09-03 (PR #5202), which is what the
+        # assertion that used to sit here asked for: it required `checked > 0`
+        # so the rule could never pass by inspecting nothing, and said that if
+        # the repo ever reached zero masks the assertion itself had to be
+        # consciously retired rather than left green over an empty set.
+        #
+        # The repo has now reached zero. The last two job-level
+        # `continue-on-error: true` directives (lint-mask-pr-atomicity/scan and
+        # publish-canvas-image/build-and-push, trackers mc#4959 / mc#4960) were
+        # removed after review rather than renewed a sixth time. `checked == 0`
+        # is therefore the true state, not a discovery bug.
+        #
+        # The non-vacuity guard is kept, one level out: the enumeration must
+        # still have real workflow files to walk. That is the failure mode this
+        # test can actually suffer now (a moved WORKFLOWS_DIR, a broken
+        # `_iter_workflow_files`), and it does not force the mask count back up.
         self.assertGreater(
-            checked,
+            len(lcoet._iter_workflow_files(self.WORKFLOWS_DIR)),
             0,
-            "no `continue-on-error: true` found in .gitea/workflows — this "
-            "test would be a vacuous pass; confirm that is real and retire it "
-            "deliberately rather than leaving it green over an empty set.",
+            f"no workflow files discovered under {self.WORKFLOWS_DIR} — the "
+            f"enumeration is broken, so this test would be a vacuous pass.",
         )
 
 
