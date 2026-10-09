@@ -45,6 +45,11 @@ const mockStoreState = {
   }>,
   agentMessages: {} as Record<string, Array<{ id: string; content: string; timestamp: string }>>,
   consumeAgentMessages: () => [],
+  // MobileChat is a live consumer too — see useChatSocket for why the store
+  // must not buffer agent pushes without one.
+  agentMessageConsumers: {} as Record<string, number>,
+  retainAgentMessages: vi.fn(),
+  releaseAgentMessages: vi.fn(),
 };
 
 vi.mock("@/store/canvas", () => ({

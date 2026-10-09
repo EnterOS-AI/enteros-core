@@ -1322,10 +1322,24 @@ Trailing user content.
 	}
 
 	// Run the same awk pipeline the production code uses.
+	//
+	// filepath.ToSlash + quoting: `memory` is an OS-native path, and on Windows
+	// that is `C:\Users\...\CLAUDE.md`. Interpolated raw into a `bash -c`
+	// string the backslashes are eaten as escapes, so the redirection target
+	// stopped being a path at all and bash created a file named
+	// `C:<U+F03A>Users...CLAUDE.md.new` — U+F03A being the private-use colon
+	// Windows path translation substitutes — in the CURRENT directory, i.e.
+	// inside internal/handlers/ in the source tree. That debris has been
+	// landing in `git status` for anyone who runs the suite on Windows, and
+	// was committed by accident once during this PR.
+	//
+	// No-op on Linux (ToSlash is identity there and the quotes are harmless),
+	// so CI behaviour is unchanged.
 	marker := "# Plugin: my-plugin /"
+	mem := filepath.ToSlash(memory)
 	script := fmt.Sprintf(
-		`awk 'BEGIN{skip=0; blanks=0} /^%s/{skip=1; blanks=0; next} skip==1 && /^[[:space:]]*$/{blanks++; if(blanks>=2){skip=0; print; next} next} /^# Plugin: /{if(skip==1)skip=0} skip==1{next} {print}' %s > %s.new && mv %s.new %s`,
-		regexpEscapeForAwk(marker), memory, memory, memory, memory,
+		`awk 'BEGIN{skip=0; blanks=0} /^%s/{skip=1; blanks=0; next} skip==1 && /^[[:space:]]*$/{blanks++; if(blanks>=2){skip=0; print; next} next} /^# Plugin: /{if(skip==1)skip=0} skip==1{next} {print}' '%s' > '%s.new' && mv '%s.new' '%s'`,
+		regexpEscapeForAwk(marker), mem, mem, mem, mem,
 	)
 	cmd := exec.Command("bash", "-c", script)
 	if out, err := cmd.CombinedOutput(); err != nil {

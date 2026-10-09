@@ -19,9 +19,29 @@ name: Lint schedule budget
 #   - push:main/staging: post-merge regression detection for direct edits.
 #   - workflow_dispatch: manual re-run.
 #
-# NOT a branch-protection-required context (kept out of
-# .gitea/required-contexts.txt) so a future violation surfaces loudly on the
-# offending PR without wedging the merge queue for unrelated changes.
+# Kept out of .gitea/required-contexts.txt.
+#
+# That does NOT make this lane optional, and the comment here used to say it
+# did ("NOT a branch-protection-required context ... without wedging the merge
+# queue for unrelated changes"). It is false, and it cost real time on core#5117
+# where a red here was read as non-blocking.
+#
+# Two independent mechanisms, and the exclusion only touches one of them:
+#
+#   * ABSENT from required-contexts.txt  -> exempt from the merge queue's
+#     step-4b PRESENCE check. This lane is paths-filtered, so on a PR that
+#     touches no workflow it never posts at all; listing it would make that
+#     silence a merge blocker. THAT is what the exclusion buys.
+#
+#   * main's branch protection is status_check_contexts=['*'], and since #4363
+#     the queue reads that glob with Gitea's real semantics — see
+#     gitea-merge-queue.py::required_contexts_green: "a GLOB pattern is a
+#     SUPERSET check ... it matches every posted context ... and requires all
+#     matches to be `success`". So the instant this lane POSTS, it is required
+#     to be green. Nothing in required-contexts.txt can exempt it from that.
+#
+# Net: a red here DOES wedge the merge queue. The lane is a hard gate whenever
+# it runs, which is the intent — it is just not a gate that has to run.
 
 on:
   pull_request:

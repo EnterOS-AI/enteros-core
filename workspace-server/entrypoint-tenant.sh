@@ -3,7 +3,7 @@
 #
 # Container runs as non-root 'canvas' user (USER directive in Dockerfile.tenant).
 # Both processes start as non-root. SIGTERM propagates to child processes via the
-# shell's trap + wait -n pattern below.
+# shell's trap + the first-death supervise loop at the bottom of this file.
 #
 # Go platform listens on :8080 (deployment health checks hit this port).
 # Canvas Node.js listens on :3000 (internal only).
@@ -230,12 +230,57 @@ cleanup() {
 }
 trap cleanup EXIT SIGTERM SIGINT
 
-# Wait for any to exit — whichever exits first triggers cleanup
-if [ -n "$MEMORY_PLUGIN_PID" ]; then
-  wait -n $CANVAS_PID $PLATFORM_PID $MEMORY_PLUGIN_PID
-else
-  wait -n $CANVAS_PID $PLATFORM_PID
-fi
-EXIT_CODE=$?
+# Wait for any to exit — whichever exits first triggers cleanup.
+#
+# >>> first-death-supervise (extracted verbatim by entrypoint_supervise_test.go
+# — keep these markers; the test drives THIS code, not a copy of it)
+#
+# This was `wait -n $CANVAS_PID $PLATFORM_PID [$MEMORY_PLUGIN_PID]`. `-n` is a
+# BASHISM, and this image's /bin/sh is BusyBox ash (the runtime stage is
+# node:*-alpine). BusyBox's `wait` SILENTLY IGNORES `-n` and blocks until EVERY
+# listed pid has exited — no error, no stderr, no non-zero status. It fails OPEN,
+# which is why nothing ever caught it. Measured inside the shipped tenant image
+# (BusyBox v1.37.0), children exiting at 1s and 12s:
+#
+#     wait -n $A $B   ->  returned rc=0 after 12s      (the LAST child, not the first)
+#
+# The consequence is not cosmetic — it inverts the contract stated at the top of
+# this file ("If either process dies, we kill the other and exit non-zero so the
+# container supervisor restarts the service"). When /platform dies during boot —
+# e.g. `Redis init failed: ping redis: context deadline exceeded` -> log.Fatalf —
+# Canvas and the memory sidecar are still alive, so `wait` did not return,
+# cleanup never ran, and the container did NOT exit. :8080 was never bound, so
+# the tenant sat unhealthy with nothing restarting it until the kubelet
+# startupProbe budget (failureThreshold 60 x periodSeconds 5 = exactly 300s)
+# expired and SIGTERMed the container. The replacement container then bound
+# :8080 and went Ready in SIX SECONDS.
+#
+# Staging 2026-08-11, org cp455-...-0a4f85db: tenant pod Ready 349s after the
+# admin create instead of the usual 75-115s. That overran the 300s provision
+# budget in boot-to-registration-e2e, failed the gate, and leaked the org.
+#
+# So poll for the first death instead of asking `wait` to report it. `kill -0`
+# costs nothing, and a dead child is reaped by the shell before the next tick, so
+# the pid stops answering and `wait` still yields its recorded status. Verified
+# in the same image: with children exiting at 2s (rc=7) and 30s, the loop below
+# reported pid=<first> rc=7 after 2s.
+first_exit_code=0
+while :; do
+  for pid in $CANVAS_PID $PLATFORM_PID $MEMORY_PLUGIN_PID; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      # `|| first_exit_code=$?` keeps this safe under `set -e`: a child that
+      # died non-zero (the whole point of this loop) must not abort the script
+      # before cleanup runs and the code is propagated.
+      first_exit_code=0
+      wait "$pid" || first_exit_code=$?
+      break 2
+    fi
+  done
+  # Bounded so a SIGTERM is honoured promptly: ash runs the trap once the
+  # current command returns, so this caps teardown latency at ~1s.
+  sleep 1
+done
+EXIT_CODE=$first_exit_code
+# <<< first-death-supervise
 cleanup
 exit $EXIT_CODE

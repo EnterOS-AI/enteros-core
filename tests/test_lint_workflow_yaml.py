@@ -811,3 +811,90 @@ def test_ci_shellcheck_steps_are_path_scoped_on_all_events():
         expr = step.get("if", "")
         assert "needs.changes.outputs.scripts == 'true'" in expr
         assert "github.event_name != 'pull_request'" not in expr
+
+
+# ---------------------------------------------------------------------------
+# Rule 11 — duplicate mapping keys (Gitea refuses to schedule; safe_load does not)
+# ---------------------------------------------------------------------------
+DUP_ENV_BAD = textwrap.dedent(
+    """
+    name: dup env probe
+    on:
+      pull_request:
+        branches: [main]
+    jobs:
+      probe:
+        runs-on: ubuntu-latest
+        steps:
+          - name: two env blocks
+            env:
+              FIRST: a
+            env:
+              SECOND: b
+            run: echo hi
+    """
+).lstrip()
+
+DUP_ENV_OK = textwrap.dedent(
+    """
+    name: dup env probe
+    on:
+      pull_request:
+        branches: [main]
+    jobs:
+      probe:
+        runs-on: ubuntu-latest
+        steps:
+          - name: one env block
+            env:
+              FIRST: a
+              SECOND: b
+            run: echo hi
+    """
+).lstrip()
+
+
+def test_rule11_duplicate_key_is_fatal(tmp_path):
+    """The exact shape observed on local-provision-e2e.yml 2026-08-10: a second
+    `env:` on a step that already had one. Gitea would not schedule the file."""
+    _write(tmp_path, "dup.yml", DUP_ENV_BAD)
+    r = _run_lint(tmp_path)
+    assert r.returncode == 1, r.stdout
+    assert "duplicate mapping key 'env'" in r.stdout
+    # The message must point at a line so the fix is findable.
+    assert re.search(r"line=\d+", r.stdout), r.stdout
+
+
+def test_rule11_single_env_block_passes(tmp_path):
+    _write(tmp_path, "ok.yml", DUP_ENV_OK)
+    r = _run_lint(tmp_path)
+    assert r.returncode == 0, r.stdout
+
+
+def test_rule11_precondition_safe_load_accepts_the_duplicate():
+    """Pin WHY this rule needs its own loader.
+
+    If `yaml.safe_load` ever started rejecting duplicates, rule 11 would be
+    redundant. It does not: it accepts the file and keeps only the LAST
+    duplicate, silently discarding the first block's contents. That asymmetry
+    against Gitea's parser is the entire defect class.
+    """
+    doc = yaml.safe_load(DUP_ENV_BAD)
+    env = doc["jobs"]["probe"]["steps"][0]["env"]
+    assert env == {"SECOND": "b"}, env
+    assert "FIRST" not in env
+
+
+def test_rule11_scans_every_live_workflow_and_reports_the_count():
+    """Guard the count, so a future shrink in coverage is visible as a number
+    rather than as a quietly smaller scan."""
+    r = _run_lint(Path(".gitea/workflows"))
+    assert r.returncode == 0, r.stdout
+    m = re.search(r"(\d+) workflow file\(s\) checked", r.stdout)
+    assert m, r.stdout
+    n = int(m.group(1))
+    live = len(list(Path(".gitea/workflows").glob("*.yml"))) + len(
+        list(Path(".gitea/workflows").glob("*.yaml"))
+    )
+    assert n == live, f"lint scanned {n} but {live} workflow files exist"
+    assert n > 0, "a scan of zero files reports success identically to a full one"

@@ -204,7 +204,15 @@ jobs:
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 'stable'
+          # EXACT pin, not 'stable'. 'stable' is a moving target that turned main red
+          # twice with no code change: the roll to Go 1.27.1 (staticcheck panic, fixed
+          # by bumping golangci-lint to v2.13.2 — see the Install step below) and, on
+          # 2026-10-08/09, the roll to Go 1.27.2, under which golangci-lint v2.13.2 fails
+          # on the stdlib itself: "could not import os ... could not load export data"
+          # (main 061dc2f5, run 761868 — reproduced on rerun; 1.27.1 was green at 3a438e87).
+          # Toolchain bumps are now deliberate: raise this pin in a PR whose own Platform
+          # (Go) run proves build, vet, golangci-lint and the race gate on the new version.
+          go-version: '1.27.1'
           # cache:false — the self-hosted runner bind-mounts a persistent
           # GOCACHE/GOMODCACHE (/var/cache/ci-go-{build,mod}); actions/cache is
           # redundant and corrupts it by untarring over the bind mount ("File
@@ -292,7 +300,45 @@ jobs:
         run: go vet ./...
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+        # v2.13.2, not v2.12.2, and the bump is a CRASH FIX rather than an
+        # upgrade for its own sake.
+        #
+        # v2.12.2 bundles honnef.co/go/tools v0.7.0, which PREDATES Go 1.27 and
+        # cannot lower a construct in the Go 1.27 stdlib to its IR. This job
+        # takes `go-version: stable`, which rolled to Go 1.27.1 — and staticcheck
+        # then panics rather than reporting a finding:
+        #
+        #   buildir: panic during analysis: unexpected expr: *ast.KeyValueExpr
+        #     honnef.co/go/tools@v0.7.0/go/ir/builder.go:888 (expr0)
+        #     ... builder.go:3027 (returnStmt)
+        #   Running error: can't run linter goanalysis_metalinter
+        #   fact_purity: package "poll" (isInitialPkg: false, needAnalyzeSource: true):
+        #     interface conversion: interface {} is nil, not *buildir.IR
+        #
+        # The typedness / nilness / SA5012 / fact_purity panics all CASCADE from
+        # that first buildir failure; the IR is nil for every consumer after it.
+        #
+        # THREE CONDITIONS MUST COINCIDE, which is why it looked like one PR's
+        # fault. Reproduced locally, and the reproduction is the evidence:
+        #   1. GOOS=linux — `internal/poll`'s Linux-only files are what break the
+        #      IR builder. It never reproduces on darwin, warm or cold.
+        #   2. A COLD cache — `needAnalyzeSource: true` says stdlib was analyzed
+        #      from SOURCE rather than read from cached facts. The runner
+        #      bind-mounts a shared GOCACHE, so this only bites after the
+        #      toolchain rolls and invalidates it.
+        #   3. Go 1.27.
+        # Under all three, UNMODIFIED main panics identically — so the crash is
+        # not attributable to whatever PR happens to be in flight. And because
+        # every Go step here is gated on `platform == 'true'`, PRs that do not
+        # touch workspace-server/** pass this job without ever running the
+        # linter: a green history is not evidence the linter is healthy.
+        #
+        # v2.13.2 bundles honnef.co/go/tools v0.8.1, which handles Go 1.27.
+        # VERIFIED under the exact failing conditions (linux + cold cache +
+        # Go 1.27.1): 0 panics, 0 issues — the bump fixes the crash without
+        # surfacing new findings. Pinning `go-version` back to 1.26.x would also
+        # stop the crash, but only defers the incompatibility to the next roll.
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Run golangci-lint
         run: $(go env GOPATH)/bin/golangci-lint run --timeout 3m ./...
@@ -375,13 +421,43 @@ jobs:
           # files]" if a package's tests stop compiling into the binary (build
           # tag, rename, wrong path) — a green that executed nothing. Require at
           # least one per-test verdict line from -v in each log.
-          if ! grep -qE '^--- (PASS|FAIL|SKIP): ' /tmp/test-handlers.log; then
+          #
+          # SKIP IS NOT EXECUTION. This grep used to read
+          # `^--- (PASS|FAIL|SKIP): `, so a package in which every test called
+          # t.Skip satisfied the check — which is precisely the state the check
+          # exists to detect. A guard that passes on its own failure mode is
+          # worse than no guard, because it reads as coverage. Only a real
+          # verdict counts now, and the count is printed so a reader can see
+          # the gate looked at something.
+          #
+          # This step covers 2 packages. The other 59 are covered by
+          # .gitea/scripts/assert-tests-executed.py in the coverage step below,
+          # which is where an all-skip package (as opposed to a
+          # nothing-compiled-in package) is classified and either failed or
+          # allowlisted by name.
+          # `${h_ran:-0}`, not `$h_ran`. If the log is MISSING, `grep -c ... ||
+          # true` yields the EMPTY STRING, and `[ "" -eq 0 ]` is not false — it
+          # is an "integer expression expected" error, exit 2. Inside an `if`
+          # condition that is exempt from `set -e`, so the whole check would be
+          # SKIPPED and the gate would pass. The old `grep -q` form failed
+          # closed on a missing file by accident; this form has to do it on
+          # purpose. Same defensive default as `${nskip:-0}` in
+          # handlers-postgres-integration.yml and `${npass:-0}` in
+          # concierge-creates-workspace-hermetic.yml.
+          #
+          # Unreachable today — both logs are tee'd a few lines above in this
+          # same step — but this is the step whose entire purpose is failing
+          # closed, so it does not get to depend on that.
+          h_ran=$(grep -cE '^--- (PASS|FAIL): ' /tmp/test-handlers.log || true)
+          pu_ran=$(grep -cE '^--- (PASS|FAIL): ' /tmp/test-pu.log || true)
+          echo "race+verbose gate: top-level verdicts (SKIP excluded) — handlers=${h_ran:-0} pendinguploads=${pu_ran:-0}"
+          if [ "${h_ran:-0}" -eq 0 ]; then
             failed="$failed internal/handlers(no-tests-executed)"
-            echo "::error::race+verbose gate executed ZERO tests in ./internal/handlers/... — vacuous pass (check the package path and that its _test.go files still compile in)."
+            echo "::error::race+verbose gate executed ZERO tests in ./internal/handlers/... — vacuous pass. Zero '--- PASS:'/'--- FAIL:' lines: either nothing compiled in (check the package path and the build tags on its _test.go files) or every test skipped. A skip is not an execution."
           fi
-          if ! grep -qE '^--- (PASS|FAIL|SKIP): ' /tmp/test-pu.log; then
+          if [ "${pu_ran:-0}" -eq 0 ]; then
             failed="$failed internal/pendinguploads(no-tests-executed)"
-            echo "::error::race+verbose gate executed ZERO tests in ./internal/pendinguploads/... — vacuous pass (check the package path and that its _test.go files still compile in)."
+            echo "::error::race+verbose gate executed ZERO tests in ./internal/pendinguploads/... — vacuous pass. Zero '--- PASS:'/'--- FAIL:' lines: either nothing compiled in (check the package path and the build tags on its _test.go files) or every test skipped. A skip is not an execution."
           fi
           if [ "$handlers_exit" -ne 0 ]; then
             failed="$failed internal/handlers(exit=$handlers_exit)"
@@ -397,12 +473,87 @@ jobs:
           fi
           echo "race+verbose gate: internal/handlers + internal/pendinguploads passed under -race ✓"
       - if: ${{ needs.changes.outputs.platform == 'true' }}
-        name: Run tests with coverage (blocking gate)
+        name: Run tests with coverage + no-tests-executed gate (blocking gate)
         # Removed -race from the blocking gate per #1184: cold runners
         # take 13-25 min to compile with race instrumentation, exceeding
         # the 10m step timeout and causing false failures. Race detection
         # now runs as a non-blocking advisory step below.
-        run: go test -timeout 10m -coverprofile=coverage.out ./...
+        #
+        # WAS: `go test -timeout 10m -coverprofile=coverage.out ./...`, whose
+        # only verdict was go's exit code. `go test` exits 0 on a package
+        # whose tests stopped compiling in ("[no test files]", a flipped build
+        # tag, a moved path) and on a package where every test calls t.Skip.
+        # This is the ONE lane that runs all 61 packages, and it asserted
+        # nothing about whether any of them executed.
+        #
+        # The repo's only no-tests-executed check lived in the race+verbose
+        # step above and had two holes: it accepted `--- SKIP:` as proof of
+        # execution (the vacuous pass it exists to detect satisfied it), and
+        # it covered 2 of 61 packages. Hole 1 is fixed in place above; hole 2
+        # is fixed here, because widening a log-grep to 61 packages is not
+        # something a grep should be asked to do.
+        #
+        # `-json` instead of `-v` + grep: the stream carries a typed
+        # per-test verdict, so "did this package execute a test" stops being
+        # a regex question. A CACHED package still replays its full event
+        # stream (verified on go1.26.4 against this module), so the runner's
+        # persistent bind-mounted GOCACHE does not turn a cache hit into a
+        # phantom no-tests-executed. `-coverprofile` is unchanged and still
+        # writes coverage.out for the threshold steps below.
+        #
+        # NO PIPE: `go test ... > log`, so `$?` is go's own status. The
+        # race step above needs ${PIPESTATUS[0]} because it tees; not
+        # depending on a shell default at all is better than depending on it
+        # correctly.
+        #
+        # A `go list` MANIFEST is fed in, not just a package list. Without it
+        # the gate could only check packages it happened to see, and a package
+        # that silently dropped out of the run would be an absence rather than
+        # a failure. The per-package COUNTS matter too: they are what tells
+        # "this dir has no _test.go" (a cmd/ main.go — fine) from "this dir's
+        # tests stopped compiling in" (the defect). Reading that off go's
+        # console output does NOT work — the "[no test files]" marker is
+        # absent under -coverprofile, which is exactly how the first cut of
+        # this gate reddened its own first CI run (run 632196 / job 932832).
+        # IgnoredGoFiles catches the third case: every _test.go excluded by a
+        # build constraint.
+        #
+        # The script additionally refuses to run on a package set below a
+        # floor, because two empty sets compare equal and that is how this
+        # gate would come to report success while inspecting nothing.
+        run: |
+          set -uo pipefail
+          LOG=/tmp/test-all.json
+          # Space-separated, not tab: no workflow in this repo contains a
+          # literal tab, and a tab that only exists inside a YAML block scalar
+          # is exactly the kind of byte an editor or a reformat silently eats.
+          # Import paths and counts contain no spaces and IgnoredGoFiles are
+          # comma-joined, so whitespace splitting is unambiguous here.
+          go list -f '{{.ImportPath}} {{len .TestGoFiles}} {{len .XTestGoFiles}} {{join .IgnoredGoFiles ","}}' ./... > /tmp/go-packages.txt
+          go test -json -timeout 10m -coverprofile=coverage.out ./... > "$LOG" 2>/tmp/test-all.err
+          test_exit=$?
+          if [ -s /tmp/test-all.err ]; then
+            echo "::group::go test stderr (build/toolchain errors appear here, not in the JSON)"
+            cat /tmp/test-all.err
+            echo "::endgroup::"
+          fi
+          # Render + assert BEFORE acting on test_exit: -json replaces go's own
+          # `ok  pkg  1.2s` lines, so this is where the per-package result gets
+          # into the log, and it must be there for a red too.
+          gate_exit=0
+          python3 "$GITHUB_WORKSPACE/.gitea/scripts/assert-tests-executed.py" \
+            --json-log "$LOG" \
+            --package-manifest /tmp/go-packages.txt \
+            --allowlist "$GITHUB_WORKSPACE/.gitea/tests-may-skip-wholesale.txt" \
+            --min-packages 50 \
+            --trim-prefix workspace-server/ \
+            --render || gate_exit=$?
+          if [ "$test_exit" -ne 0 ]; then
+            echo "::error::go test -coverprofile ./... exited $test_exit — see the FAILED package output groups above."
+          fi
+          if [ "$test_exit" -ne 0 ] || [ "$gate_exit" -ne 0 ]; then
+            exit 1
+          fi
 
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Run e2e_busy_inject positive-control tests (blocking gate)
@@ -511,10 +662,29 @@ jobs:
         # resolver/schema regression on the live composition, which is exactly
         # the signal worth gating on.
         #
-        # Non-vacuity: a `-run` filter that matches zero tests exits 0 with "no
-        # tests to run" — a vacuous green. We require the top-level result line
-        # (PASS or SKIP) to appear; its absence means the test was renamed or
-        # the filter is wrong, and fails this step.
+        # Non-vacuity, AND WHAT IT DOES NOT COVER — read both halves.
+        #
+        # A `-run` filter that matches zero tests exits 0 with "no tests to
+        # run" — a vacuous green. We require the top-level result line (PASS or
+        # SKIP) to appear; its absence means the test was renamed or the filter
+        # is wrong, and fails this step.
+        #
+        # SKIP is accepted ON PURPOSE here, unlike the module-wide
+        # no-tests-executed gate above. This step is deliberately non-blocking
+        # on network: a clone failure or the held-broken
+        # molecule-dev-department@v1.0.0 !external ref makes the test t.Skip
+        # rather than fail (see the note above), and gating on a live clone
+        # would import GitHub's availability into every PR.
+        #
+        # The honest consequence: THIS CHECK PROVES SELECTION, NOT EXECUTION.
+        # MOLECULE_LIVE_ORG_TEMPLATE=1 immediately below is the only thing
+        # arming the test — delete that env and the test skips its own guard,
+        # the grep still matches `--- SKIP:`, and the step reports success
+        # having executed nothing. That is a real (smaller) instance of the
+        # same class the race+verbose and coverage gates above were fixed for;
+        # it is deferred, not unnoticed, because closing it means deciding
+        # whether a live clone may block a PR. The output below therefore says
+        # which of the two actually happened instead of claiming "executed".
         env:
           MOLECULE_LIVE_ORG_TEMPLATE: "1"
         run: |
@@ -522,10 +692,14 @@ jobs:
           go test -count=1 -timeout 5m -v ./internal/handlers/ \
             -run '^TestResolveYAMLIncludes_RealMoleculeDev$' 2>&1 | tee /tmp/test-live-org.log
           if ! grep -q -E '^(--- PASS|--- SKIP): TestResolveYAMLIncludes_RealMoleculeDev' /tmp/test-live-org.log; then
-            echo "::error::live org-template smoke did not execute TestResolveYAMLIncludes_RealMoleculeDev — vacuous pass (check the -run filter and that the test still exists)."
+            echo "::error::live org-template smoke did not SELECT TestResolveYAMLIncludes_RealMoleculeDev — no top-level PASS or SKIP line, so the -run filter matched nothing or the test was renamed/deleted. (This check proves selection only; a skipped run is accepted here by design.)"
             exit 1
           fi
-          echo "live org-template clone+resolve smoke executed ✓"
+          if grep -q -E '^--- PASS: TestResolveYAMLIncludes_RealMoleculeDev' /tmp/test-live-org.log; then
+            echo "live org-template clone+resolve smoke: EXECUTED and passed"
+          else
+            echo "::warning::live org-template clone+resolve smoke SKIPPED — selected but not executed, so the live composition was NOT checked on this run. Accepted by design (network/env-gated); check MOLECULE_LIVE_ORG_TEMPLATE above if you expected it to run."
+          fi
 
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Race detection (advisory, non-blocking)
@@ -660,6 +834,76 @@ jobs:
       - if: ${{ needs.changes.outputs.canvas == 'true' }}
         run: npm ci --include=optional --prefer-offline
       - if: ${{ needs.changes.outputs.canvas == 'true' }}
+        name: Static gate (ESLint over canvas + tsc over e2e)
+        # Runs BEFORE `npm run build` — it is ~14s against a ~minutes build, so
+        # a lint or type failure surfaces first instead of behind a compile.
+        #
+        # This step is the ONLY thing that runs EITHER check over canvas/e2e.
+        #   • ESLint: `next build` lints only ESLINT_DEFAULT_DIRS (app, pages,
+        #     components, lib, src) and canvas declares no `eslint.dirs`
+        #     override, so the e2e tree — the only tree the waitForFunction
+        #     guard added by #5107 is scoped to — was outside every automated
+        #     check in the repository. The rule matched correctly and gated
+        #     nothing.
+        #   • tsc: canvas/tsconfig.json EXCLUDES e2e, there is no `typecheck`
+        #     script, no workflow ran tsc, and `playwright test` transpiles via
+        #     esbuild without type-checking. So the e2e tree was never
+        #     type-checked either — which mattered because the guard is an
+        #     ARITY rule and the transposed-argument shape needs types to
+        #     catch. canvas/tsconfig.e2e.json plus this step is what makes the
+        #     rule's "TypeScript covers that slot" claim true; before, it was
+        #     an unbacked assertion in a comment.
+        #
+        # It is deliberately a STEP of an existing required job rather than a
+        # new workflow/job:
+        #   • canvas-build already feeds `CI / all-required`, which is the
+        #     first ENFORCED entry in .gitea/required-contexts.txt. No
+        #     branch-protection change, no new required-contexts.txt entry,
+        #     and nothing for the phantom-gate lint to flag.
+        #   • adding a JOB would have to be mirrored into the all-required
+        #     `needs:` list AND ci-required-drift.py's F1 check; adding a
+        #     WORKFLOW would emit a context that BP's ['*'] treats as
+        #     required-if-posted but that nothing makes required-if-absent.
+        #
+        # ── HOW A FAILURE HERE ACTUALLY BLOCKS THE MERGE ──────────────────
+        # Measured on PR #5110 (the scratch branch that reintroduced the
+        # defect), NOT inferred. When this step fails:
+        #     CI / Canvas (Next.js)   = failure
+        #     CI / Canvas Deploy Status = skipped
+        #     CI / all-required       = SKIPPED   ← not `failure`
+        #
+        # Note the sentinel lands `skipped`, not red. Gitea SKIPS the
+        # dependents of a failed `needs:` rather than failing them, so the
+        # "failed dependency propagation" the all-required block below
+        # describes does not turn the sentinel red. Two INDEPENDENT
+        # mechanisms block the merge anyway, and it is worth knowing which:
+        #
+        #   1. `CI / Canvas (Next.js) = failure` is a POSTED red context, and
+        #      branch protection on main is status_check_contexts=['*'] —
+        #      every posted context must be success. This is the one that
+        #      blocks via BP. (BP's ['*'] would NOT block on all-required
+        #      being `skipped`; a skipped context is not a posted red.)
+        #   2. gitea-merge-queue.py treats `<workflow> / all-required` as a
+        #      CRITICAL fail-closed context: only `success` clears it, and
+        #      `skipped`/`missing` are explicitly FATAL (RCA core#1676, where
+        #      a skipped sentinel was swept up as a non-required red and
+        #      force-merged past). So the queue blocks on the skip.
+        #
+        # Do not "simplify" this by relying on the sentinel going red. It
+        # does not.
+        #
+        # Skip semantics: like every other step here it is gated on
+        # `needs.changes.outputs.canvas`. That is NOT an `on:.paths` filter —
+        # the job still reaches SUCCESS, so `CI / all-required` is always
+        # posted and never `skipped`. The canvas lane is an INVERTED deny-list
+        # (detect-changes.py: `canvas = deny_list("workspace-server/")`), i.e.
+        # true unless every changed path is docs/, *.md or workspace-server/.
+        # A PR that edits canvas/e2e therefore always sets it true. The only
+        # PRs that skip this lint are ones that cannot contain a
+        # canvas/e2e change, so the skip leaves no hole for THIS rule.
+        working-directory: .
+        run: bash .gitea/scripts/canvas-static-gate.sh
+      - if: ${{ needs.changes.outputs.canvas == 'true' }}
         run: npm run build
       - if: ${{ needs.changes.outputs.canvas == 'true' }}
         name: Run tests with coverage
@@ -766,6 +1010,45 @@ jobs:
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Promoted runtime images are ready before staging E2E
         run: bash scripts/deploy/tests/test-prepare-staging-runtime-images.sh
+
+      # A fleet roll that rolls NOTHING must never report success. The docker
+      # roller did exactly that on a k8s-substrate control plane: its label
+      # filter matched zero containers, it logged "nothing to roll" and exited 0,
+      # so the production fleet-roll step went green while every tenant pod stayed
+      # on its provisioning-time image. This drives BOTH rollers against a fake
+      # kubectl and asserts an EXIT CODE for each scenario in which a naive roller
+      # would pass: empty target set, every target scaled to zero, control-plane/
+      # cluster drift, and a rollout that returns success without moving the
+      # digest the pods are actually running.
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
+        name: Fleet roll cannot pass vacuously (both substrates)
+        run: bash scripts/deploy/tests/test-k8s-fleet-roller.sh
+
+      # The STAGING lane's k8s arm. The gate above wraps its docker-arm cases in
+      # `if docker info`, so on a runner with no daemon the single most important
+      # assertion about this lane — that a roll with no census source and no
+      # docker tenant still REFUSES — silently does not run. This one supplies a
+      # fake docker as well as a fake kubectl, so that case always executes. It
+      # also drives resolve-k8s-fleet-census.sh through every failure it can
+      # have, and proves fleet-drift-audit.sh refuses an exclusion naming a
+      # tenant that is not measurably drifted (the property that keeps
+      # EXCLUDE_SLUGS from being --allow-empty spelled differently).
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
+        name: Staging fleet k8s arm is wired, and cannot pass vacuously
+        run: bash scripts/deploy/tests/test-staging-fleet-k8s-wiring.sh
+
+      # The k8s deploy arm's first live run died with `python3: command not
+      # found` because the tool it called was never declared anywhere and the
+      # `local-deploy` runner does not carry it. This drives the toolchain
+      # preflight against a fake package manager and asserts BOTH directions —
+      # a present tool still resolves and a missing one produces a NAMED
+      # ::error:: — because a "fix" that simply failed every run would also
+      # have "handled" the missing interpreter. It also pins the shell shape
+      # itself: a bare `V="$(...)"` under `bash -e` dies ABOVE its own guard,
+      # while the rc-captured form reaches the guard and still fails closed.
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
+        name: Deploy toolchain preflight fails by NAME, and its good path still runs
+        run: bash scripts/deploy/tests/test-require-deploy-toolchain.sh
 
       # Enter OS rebrand Phase 2 (internal#1089): the ADVISORY enteros.ai edge
       # probe the deploy workflows run after the blocking daemon-side gate.
@@ -1006,11 +1289,16 @@ jobs:
           shellcheck --severity=warning \
             scripts/deploy/redeploy-staging-fleet.sh \
             scripts/deploy/tests/test-managed-flags.sh \
+            scripts/deploy/ran-sentinel.sh \
             scripts/deploy/require-local-deploy-daemon.sh \
             scripts/deploy/prepare-staging-runtime-images.sh \
             scripts/deploy/tests/test-prepare-staging-runtime-images.sh \
             scripts/deploy/probe-enteros-buildinfo.sh \
-            scripts/deploy/tests/test-probe-enteros-buildinfo.sh
+            scripts/deploy/tests/test-probe-enteros-buildinfo.sh \
+            scripts/deploy/redeploy-tenant-fleet-k8s.sh \
+            scripts/deploy/tests/test-k8s-fleet-roller.sh \
+            scripts/deploy/require-deploy-toolchain.sh \
+            scripts/deploy/tests/test-require-deploy-toolchain.sh
 
   # mc#959 root-fix (sre)
 
