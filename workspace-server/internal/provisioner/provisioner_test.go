@@ -305,9 +305,14 @@ func TestBuildContainerEnv_LangfusePassthrough(t *testing.T) {
 		return false
 	}
 
-	t.Run("injects langfuse into the agent with the docker-network host", func(t *testing.T) {
+	// The COMPOSE topology, which is the one where `langfuse-web` is a real
+	// name: the platform is handed the container-network endpoint explicitly
+	// (docker-compose.yml sets MOLECULE_WORKSPACE_LANGFUSE_HOST; dev-start.sh
+	// exports it) and the agent gets it verbatim.
+	t.Run("injects langfuse into the agent with the configured container host", func(t *testing.T) {
 		t.Setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
 		t.Setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+		t.Setenv("MOLECULE_WORKSPACE_LANGFUSE_HOST", "http://langfuse-web:3000")
 		env := buildContainerEnv(WorkspaceConfig{WorkspaceID: "x", Runtime: "claude-code"})
 		if !has(env, "LANGFUSE_PUBLIC_KEY=pk-lf-test") || !has(env, "LANGFUSE_SECRET_KEY=sk-lf-test") {
 			t.Errorf("langfuse keys not injected: %v", env)
@@ -318,9 +323,28 @@ func TestBuildContainerEnv_LangfusePassthrough(t *testing.T) {
 		}
 	})
 
+	// THE REGRESSION THIS BLOCK EXISTS FOR. With keys but no configured
+	// container endpoint the provisioner used to inject the literal
+	// `http://langfuse-web:3000` — a docker-compose service alias that resolves
+	// in exactly one topology. On k8s it resolves nowhere, and every agent
+	// retried an OTLP export against it forever (22,224 error lines in one
+	// tenant in 24h). Nothing may be injected: not the host, and not the keys
+	// either, because a key pair with no host sends the Langfuse SDK to its own
+	// default endpoint, the PUBLIC cloud.langfuse.com.
+	t.Run("injects nothing when no workspace langfuse host is configured", func(t *testing.T) {
+		t.Setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
+		t.Setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+		t.Setenv("MOLECULE_WORKSPACE_LANGFUSE_HOST", "")
+		env := buildContainerEnv(WorkspaceConfig{WorkspaceID: "x", Runtime: "claude-code"})
+		if hasKey(env, "LANGFUSE_") {
+			t.Errorf("no reachable trace endpoint is configured — nothing LANGFUSE_* may be injected, got %v", env)
+		}
+	})
+
 	t.Run("no-op when platform has no langfuse keys", func(t *testing.T) {
 		t.Setenv("LANGFUSE_PUBLIC_KEY", "")
 		t.Setenv("LANGFUSE_SECRET_KEY", "")
+		t.Setenv("MOLECULE_WORKSPACE_LANGFUSE_HOST", "http://langfuse-web:3000")
 		env := buildContainerEnv(WorkspaceConfig{WorkspaceID: "x", Runtime: "claude-code"})
 		if hasKey(env, "LANGFUSE_") {
 			t.Errorf("expected no LANGFUSE_* when keys unset, got %v", env)
@@ -330,6 +354,7 @@ func TestBuildContainerEnv_LangfusePassthrough(t *testing.T) {
 	t.Run("workspace-secret LANGFUSE_HOST override wins", func(t *testing.T) {
 		t.Setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
 		t.Setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+		t.Setenv("MOLECULE_WORKSPACE_LANGFUSE_HOST", "http://langfuse-web:3000")
 		env := buildContainerEnv(WorkspaceConfig{
 			WorkspaceID: "x", Runtime: "claude-code",
 			EnvVars: map[string]string{"LANGFUSE_HOST": "http://custom:3000"},
@@ -345,9 +370,62 @@ func TestBuildContainerEnv_LangfusePassthrough(t *testing.T) {
 		}
 	})
 
+	// A workspace that names its OWN reachable endpoint is traced even with no
+	// platform-side container host configured — the workspace supplied the fact
+	// the platform was missing, so there is nothing to guess.
+	t.Run("workspace LANGFUSE_HOST alone is enough to enable tracing", func(t *testing.T) {
+		t.Setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
+		t.Setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+		t.Setenv("MOLECULE_WORKSPACE_LANGFUSE_HOST", "")
+		env := buildContainerEnv(WorkspaceConfig{
+			WorkspaceID: "x", Runtime: "claude-code",
+			EnvVars: map[string]string{"LANGFUSE_HOST": "https://cloud.langfuse.com"},
+		})
+		if !has(env, "LANGFUSE_HOST=https://cloud.langfuse.com") {
+			t.Errorf("the workspace's own endpoint must survive: %v", env)
+		}
+		if !has(env, "LANGFUSE_PUBLIC_KEY=pk-lf-test") || !has(env, "LANGFUSE_SECRET_KEY=sk-lf-test") {
+			t.Errorf("platform keys should ride along with a workspace-supplied host: %v", env)
+		}
+	})
+
+	// The loopback rewrite, unchanged: a host-published 127.0.0.1 URL is
+	// unreachable from inside the container and is replaced by the configured
+	// container endpoint...
+	t.Run("loopback workspace host is rewritten to the configured container host", func(t *testing.T) {
+		t.Setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
+		t.Setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+		t.Setenv("MOLECULE_WORKSPACE_LANGFUSE_HOST", "http://langfuse-web:3000")
+		env := buildContainerEnv(WorkspaceConfig{
+			WorkspaceID: "x", Runtime: "claude-code",
+			EnvVars: map[string]string{"LANGFUSE_HOST": "http://127.0.0.1:3001"},
+		})
+		if !has(env, "LANGFUSE_HOST=http://langfuse-web:3000") {
+			t.Errorf("a loopback host must be rewritten to the container endpoint: %v", env)
+		}
+	})
+
+	// ...and when there IS no configured container endpoint, a loopback value is
+	// still not a reachable one, so nothing is injected on top of it. The
+	// unusable value the workspace itself carries is left exactly as the
+	// workspace set it — the platform has no better answer to substitute.
+	t.Run("loopback workspace host with no configured container host injects nothing", func(t *testing.T) {
+		t.Setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-platform")
+		t.Setenv("LANGFUSE_SECRET_KEY", "sk-lf-platform")
+		t.Setenv("MOLECULE_WORKSPACE_LANGFUSE_HOST", "")
+		env := buildContainerEnv(WorkspaceConfig{
+			WorkspaceID: "x", Runtime: "claude-code",
+			EnvVars: map[string]string{"LANGFUSE_HOST": "http://127.0.0.1:3001"},
+		})
+		if has(env, "LANGFUSE_PUBLIC_KEY=pk-lf-platform") || has(env, "LANGFUSE_SECRET_KEY=sk-lf-platform") {
+			t.Errorf("platform keys must not be injected without a reachable endpoint: %v", env)
+		}
+	})
+
 	t.Run("workspace-secret langfuse keys win over platform keys", func(t *testing.T) {
 		t.Setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-platform")
 		t.Setenv("LANGFUSE_SECRET_KEY", "sk-lf-platform")
+		t.Setenv("MOLECULE_WORKSPACE_LANGFUSE_HOST", "http://langfuse-web:3000")
 		env := buildContainerEnv(WorkspaceConfig{
 			WorkspaceID: "x", Runtime: "claude-code",
 			EnvVars: map[string]string{

@@ -88,38 +88,39 @@ jobs:
     name: lint-mask-pr-atomicity
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # MASK RETAINED — and here the blocker is STRUCTURAL, not a red job.
-    # Locally this lint is green (lint exit 0 + `pytest
-    # tests/test_lint_mask_pr_atomicity.py` all pass), but the repo's own
-    # pre-flip gate (lint_pre_flip_continue_on_error.py) refuses the flip with
-    # "no runs of 'lint-mask-pr-atomicity / lint-mask-pr-atomicity (push)' found
-    # in the last 5 commits on main — cannot verify flip".
+    # UNMASKED 2026-09-03. Was `continue-on-error: true` under tracker mc#4959.
     #
-    # That is not a fluke: this workflow is PATHS-FILTERED to `.gitea/workflows/
-    # ci.yml` & friends, so it almost never fires on a push to main. The
-    # pre-flip gate only accepts evidence from main-PUSH runs within the last
-    # RECENT_COMMITS_N (=5) commits. A paths-filtered lint structurally cannot
-    # produce that evidence, so its mask can NEVER be removed through the gate
-    # — a catch-22. Un-masking anyway would RED a required context on every PR.
+    # The mask's only stated justification was the pre-flip catch-22 of mc#4344:
+    # this workflow is paths-filtered, so it never fires on a push to main, and
+    # lint_pre_flip_continue_on_error.py accepted main-PUSH run logs as the only
+    # proof that a flip is safe. That gate was fixed on 2026-07-20 by fb426286
+    # ("pre-flip gate paginates statuses + accepts PR evidence for paths-filtered
+    # workflows"), whose body names this workflow and mc#4344 and states it
+    # "unblocks core#4521 (mask-elimination)". The blocker was therefore already
+    # gone when mc#4959 renewed the mask on 2026-07-30; that renewal restated it
+    # without re-checking, and the same text had been carried forward through
+    # mc#774 -> mc#1982 -> mc#2654 -> mc#3436 -> mc#4344 -> mc#4959.
     #
-    # Recorded in MASK_WAIVERS in lint_no_coe_on_required.py; follow-up filed to
-    # let the pre-flip gate accept a paths-filtered workflow's PR-event runs (or
-    # a wider commit window) as proof. Then this flips in one line.
+    # Evidence behind the flip (governance review, 2026-09-03):
+    #   - 45 runs of this workflow in the sampled window (2026-08-10..2026-09-03).
+    #     The job is green in every completed run but one.
+    #   - The exception, run 652757 (PR #5168 @cb5265ff), is not a lint verdict:
+    #     that PR's ci.yml diff changes neither `continue-on-error` nor
+    #     `all-required.needs`, so both predicates are false and the script
+    #     returns 0. The job died in its own setup and its log has since been
+    #     garbage-collected.
+    #   - The mask was not suppressing what it was renewed to suppress. With it
+    #     in place, run 652757 still posted the commit status
+    #     `lint-mask-pr-atomicity / lint-mask-pr-atomicity (pull_request)
+    #     = failure`, exactly as `publish-canvas-image / Build & push canvas
+    #     image (push)` posted `failure` on 2026-07-18 (recorded in mc#4391).
+    #     Job-level continue-on-error does not suppress the posted context on
+    #     this Gitea, so the mask bought a 14-day renewal treadmill and no
+    #     actual masking.
     #
-    # The pre-flip gate cannot bless this flip: this workflow is paths-filtered, so it never
-    # runs on a main PUSH — and main-push run-logs are the ONLY proof that gate accepts. Not a
-    # red suite (the lint is GREEN); a structurally unsatisfiable precondition.
-    #
-    # Two things the tracking lint taught us the hard way, recorded so nobody repeats them:
-    #   1. The tracker must be OPEN. A mask citing a closed one is an excuse with no owner.
-    #   2. Do NOT name a closed tracker anywhere near a continue-on-error, even to explain
-    #      it — the lint scans the ADJACENT lines for any mc#NNNN and resolves every one it
-    #      finds, including the one you only mentioned in passing.
-    # The reference below must stay WITHIN 2 LINES of the directive or Tier 2e reds it.
-    #
-    # The reference must be the FIRST tracker inside that window, so it lives inline on the
-    # directive itself and no superseded number appears on the two lines above.
-    continue-on-error: true  # mc#4959: 2026-07-30 renewal, expires 2026-08-13 — pre-flip catch-22 still blocks removing this mask; successor tracker carries definition-of-done.
+    # No tracker comment belongs here now: with no truthy `continue-on-error`,
+    # Tier 2e has nothing to require.
+    continue-on-error: false
     steps:
       - name: Check out PR head with full history (need base SHA blobs)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
