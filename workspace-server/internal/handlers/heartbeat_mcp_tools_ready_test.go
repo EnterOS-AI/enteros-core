@@ -46,7 +46,7 @@ func TestHeartbeat_EV2_MCPToolsReadyTrue_FlipsProvisioningOnline(t *testing.T) {
 	// Pre-read (prevStatus=provisioning): fireReconcileOnline is nil-safe here.
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-ev2-ready").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "provisioning"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "provisioning", int64(0)))
 
 	// Main heartbeat UPDATE (the inline CASE excludes platform, so the row stays
 	// provisioning until the verified-ready flip below).
@@ -109,7 +109,7 @@ func TestHeartbeat_EV2_MCPToolsReadyAbsent_HoldsProvisioning(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-ev2-absent").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "provisioning"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "provisioning", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-ev2-absent", 0.0, "", 0, 60, "", nil).
@@ -164,7 +164,7 @@ func TestHeartbeat_EV2_MCPToolsReadyFalse_HoldsProvisioning(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-ev2-false").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "provisioning"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "provisioning", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-ev2-false", 0.0, "", 0, 60, "", nil).

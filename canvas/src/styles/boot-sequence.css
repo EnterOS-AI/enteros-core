@@ -67,7 +67,12 @@
 .mol-boot-card {
   width: 100%;
   max-width: 940px;
-  margin: 0 auto;
+  /* `auto` on ALL sides, not `0 auto`: the shell is a flex column, so auto
+     block margins centre the card VERTICALLY too (a `0` here pinned it to the
+     top of a fullscreen mount, leaving a dead black band below). Auto margins
+     — not `justify-content: center` — because they still let an over-tall card
+     scroll without clipping its top inside the overflow container. */
+  margin: auto;
   background: var(--eos-card);
   border: 1px solid var(--eos-border);
   border-radius: 16px;

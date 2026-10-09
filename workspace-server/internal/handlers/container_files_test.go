@@ -156,8 +156,15 @@ func TestBuildContainerFilesTar_SlashOnlyDestRootedNames(t *testing.T) {
 		if strings.Contains(hdr.Name, `\`) {
 			t.Fatalf("tar entry %q contains a backslash — Windows path separator leaked into the tar", hdr.Name)
 		}
-		if !strings.HasPrefix(hdr.Name, "/configs/") {
-			t.Fatalf("tar entry %q not rooted under /configs/", hdr.Name)
+		// Entry names must be RELATIVE to destPath, never prefixed with it:
+		// CopyToContainer extracts the archive WITH destPath as its root, so a
+		// "/configs/..."-prefixed entry lands at /configs/configs/... and the
+		// real file is never written (the caller still gets nil).
+		if strings.HasPrefix(hdr.Name, "/") {
+			t.Fatalf("tar entry %q is absolute — it will double destPath on extraction", hdr.Name)
+		}
+		if strings.HasPrefix(hdr.Name, "configs/") {
+			t.Fatalf("tar entry %q is prefixed with destPath — extraction would double it", hdr.Name)
 		}
 		if hdr.Typeflag == tar.TypeDir && !strings.HasSuffix(hdr.Name, "/") {
 			t.Fatalf("dir entry %q missing trailing slash", hdr.Name)
@@ -172,9 +179,9 @@ func TestBuildContainerFilesTar_SlashOnlyDestRootedNames(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"/configs/config.yaml":         "tier: 3\n",
-		"/configs/skills/foo/SKILL.md": "# Foo\n",
-		"/configs/win/style/file.txt":  "key built with filepath.Join on Windows",
+		"config.yaml":         "tier: 3\n",
+		"skills/foo/SKILL.md": "# Foo\n",
+		"win/style/file.txt":  "key built with filepath.Join on Windows",
 	}
 	for name, body := range want {
 		if got[name] != body {

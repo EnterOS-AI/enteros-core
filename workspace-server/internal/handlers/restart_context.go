@@ -4,6 +4,15 @@
 // keys now available) and delivers it as a synthetic A2A message/send
 // so the agent sees what changed across the restart boundary.
 //
+// First-boot vs restart arbitration (RFC concierge rule 2): restart-context
+// fires ONLY for a workspace that has already been greeted — the has_greeted
+// boot marker (SSOT, see first_boot_greeting.go). A genuine first boot has no
+// marker; its two trigger sites (workspace_restart.go) route through
+// fireRestartContextIfBooted, which SKIPS the snapshot entirely so the
+// first-boot greeting owns that edge. Pre-rule-2, restart-context fired on
+// EVERY restart with no arbitration — a fresh box got a "(no prior session on
+// record)" placeholder that raced the greeting.
+//
 // Layer 2 (user-defined restart_prompt via config.yaml / org.yaml) is
 // out of scope for this file — tracked as a separate follow-up issue.
 package handlers
@@ -69,6 +78,87 @@ func restartContextInFlight(workspaceID string) bool {
 	return ok
 }
 
+// fireRestartContextIfBooted is the first-boot-vs-restart arbitration seam (RFC
+// concierge rule 2). It fires restart-context ONLY for a workspace that has
+// already been greeted (the has_greeted boot marker = a REAL restart), setting
+// the per-restart concurrency gate (restartContextPending) FIRST — before the
+// sender goroutine spawns, so the drain woken by this restart's first heartbeat
+// already sees the gate. On a genuine first boot (marker unset) it SKIPS
+// restart-context entirely: the first-boot greeting owns that edge, and firing
+// here would double up (a "you just restarted / no prior session" nudge racing
+// the greeting).
+//
+// Fails CLOSED (skips) on a marker-read error: rule 2's invariant is absolute —
+// a genuine first boot must NEVER take the restart-context path — so on doubt
+// we skip. A missed restart nudge is a benign degradation; a first boot on the
+// restart path is the exact bug this closes. restartContextPending stays the
+// per-restart concurrency gate, NOT arbitration — it is set here only when we
+// actually fire.
+func (h *WorkspaceHandler) fireRestartContextIfBooted(ctx context.Context, workspaceID string, data restartContextData) {
+	if !shouldFireRestartContext(ctx, workspaceID) {
+		return
+	}
+
+	// Wake-lifecycle owner (PR-D): record the restart-context wake intent + bump
+	// the desired generation, and source the shared idempotency key threaded into
+	// the enqueue/payload below. Best-effort and — critically — NOT a fire gate:
+	// restart-context fires on EVERY genuine restart (arbitrated solely by
+	// has_greeted via shouldFireRestartContext above), but the owner keys
+	// WakeRestartContext once-per-box, so the 2nd+ restart's Decide returns
+	// Fire=false with the SAME per-box key. We ignore Fire and always proceed,
+	// preserving the merged every-restart delivery behavior; the threaded key is
+	// per-workspace, exactly like the legacy "restart-context-<ws>" key it feeds.
+	// Unwired (nil hook) → keyless → enqueueRestartContext uses the legacy key and
+	// the whole path is byte-for-byte pre-PR-D.
+	var wakeKey string
+	if h.wakeDecide != nil {
+		if decision, derr := h.wakeDecide(ctx, workspaceID, WakeRestartContext, ""); derr != nil {
+			log.Printf("restart-context: DecideWake failed for %s (%v) — proceeding with the legacy idempotency key", workspaceID, derr)
+		} else {
+			wakeKey = decision.IdempotencyKey
+		}
+	}
+
+	markRestartContextPending(workspaceID)
+	h.goAsync(func() { h.sendRestartContext(workspaceID, data, wakeKey) })
+}
+
+// markRestartWakeDelivered flips the restart-context wake intent pending →
+// delivered once the snapshot has been dispatched (proxied) or durably enqueued.
+// Nil-safe + key-guarded so the unwired/legacy path is a no-op; best-effort so a
+// marker failure only leaves the intent to re-settle on a later convergence,
+// never blocks or un-does the restart-context delivery.
+func (h *WorkspaceHandler) markRestartWakeDelivered(ctx context.Context, workspaceID, wakeKey string) {
+	if h.wakeMarkDelivered == nil || wakeKey == "" {
+		return
+	}
+	if err := h.wakeMarkDelivered(ctx, workspaceID, wakeKey); err != nil {
+		log.Printf("restart-context: mark wake delivered failed for %s: %v", workspaceID, err)
+	}
+}
+
+// shouldFireRestartContext is the pure first-boot-vs-restart arbitration
+// DECISION (RFC concierge rule 2): restart-context fires ONLY for an
+// already-greeted workspace (has_greeted marker set = a REAL restart). It
+// returns false on a genuine first boot (marker unset) AND, fail-CLOSED, on a
+// marker-read error — because rule 2's invariant is absolute: a genuine first
+// boot must NEVER take the restart-context path. A missed restart nudge is a
+// benign degradation; a first boot on the restart path is the exact bug this
+// closes. Split out from fireRestartContextIfBooted so the decision is unit-
+// testable without spawning the sender goroutine.
+func shouldFireRestartContext(ctx context.Context, workspaceID string) bool {
+	greeted, err := workspaceHasGreeted(ctx, workspaceID)
+	if err != nil {
+		log.Printf("restart-context: has_greeted arbitration read failed for %s (%v) — skipping (fail-closed: a first boot must never take the restart-context path)", workspaceID, err)
+		return false
+	}
+	if !greeted {
+		log.Printf("restart-context: %s not yet greeted (genuine first boot) — skipping restart-context; first-boot greeting owns this edge", workspaceID)
+		return false
+	}
+	return true
+}
+
 // restartContextOnlineTimeout bounds how long we wait for a workspace
 // to re-register after restart before dropping the context message.
 // The Restart HTTP handler has already returned 200 by the time this
@@ -91,9 +181,15 @@ type restartContextData struct {
 }
 
 // buildRestartContextMessage renders the restart context into the
-// exact format proposed in issue #19. Fields that have no data (e.g.
-// first-ever session) are rendered with a neutral placeholder so the
-// agent always sees a consistent shape.
+// exact format proposed in issue #19. Fields that have no data are rendered
+// with a neutral placeholder so the agent always sees a consistent shape.
+//
+// The zero-PrevSessionAt branch is now a DEFENSIVE fallback, not the first-boot
+// case: under RFC concierge rule 2, restart-context fires only for an
+// already-greeted workspace (fireRestartContextIfBooted), and a box that has
+// greeted was online and therefore has a last_heartbeat_at — so a real restart
+// carries a prior session. The placeholder survives only for the pathological
+// marker-set-but-heartbeat-unreadable case, keeping the shape consistent.
 func buildRestartContextMessage(d restartContextData) string {
 	msg := "=== WORKSPACE RESTART CONTEXT ===\n"
 	msg += fmt.Sprintf("Restart at: %s\n", d.RestartAt.UTC().Format(time.RFC3339))
@@ -277,30 +373,40 @@ func waitForFreshHeartbeat(ctx context.Context, workspaceID string, restartStart
 // buildRestartA2APayload wraps the rendered context string in the
 // JSON-RPC 2.0 / A2A message/send shape that the proxy already knows
 // how to normalize. Returns the marshalled body ready for ProxyA2ARequest.
-func buildRestartA2APayload(workspaceID, text string) ([]byte, error) {
+//
+// wakeIdempotencyKey (optional, PR-E) is stamped into params.metadata as
+// wake_idempotency_key when present so the wake owner's key rides the A2A
+// envelope (decision→dispatch→delivery→marker share one key). params.metadata is
+// additionalProperties:true and a sibling of params.message.metadata, so the
+// existing self-source reader is untouched. Omitted = byte-identical to pre-PR-E.
+func buildRestartA2APayload(workspaceID, text string, wakeIdempotencyKey ...string) ([]byte, error) {
+	params := map[string]any{
+		"message": map[string]any{
+			"messageId": uuid.New().String(),
+			"contextId": platformTurnContextID(workspaceID),
+			"role":      "user",
+			"parts":     []any{map[string]any{"kind": "text", "text": text}},
+			"metadata": map[string]any{
+				"source": "platform",
+				"kind":   "restart_context",
+				// SSOT self-message classifier (messagestore.selfSourceTypes):
+				// renders as a system notice, never a blue user bubble —
+				// required since the durable-enqueue path routes this
+				// through the ordinary ingest persist.
+				"source_type":     "self-restart-context",
+				"layer":           1,
+				"restart_context": true,
+			},
+		},
+	}
+	if len(wakeIdempotencyKey) > 0 && wakeIdempotencyKey[0] != "" {
+		params["metadata"] = map[string]any{"wake_idempotency_key": wakeIdempotencyKey[0]}
+	}
 	payload := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      uuid.New().String(),
 		"method":  "message/send",
-		"params": map[string]any{
-			"message": map[string]any{
-				"messageId": uuid.New().String(),
-				"contextId": platformTurnContextID(workspaceID),
-				"role":      "user",
-				"parts":     []any{map[string]any{"kind": "text", "text": text}},
-				"metadata": map[string]any{
-					"source": "platform",
-					"kind":   "restart_context",
-					// SSOT self-message classifier (messagestore.selfSourceTypes):
-					// renders as a system notice, never a blue user bubble —
-					// required since the durable-enqueue path routes this
-					// through the ordinary ingest persist.
-					"source_type":     "self-restart-context",
-					"layer":           1,
-					"restart_context": true,
-				},
-			},
-		},
+		"params":  params,
 	}
 	return json.Marshal(payload)
 }
@@ -310,7 +416,11 @@ func buildRestartA2APayload(workspaceID, text string) ([]byte, error) {
 // the snapshot via the existing A2A proxy. Failures are logged and
 // dropped — the restart itself is already considered successful at
 // this point.
-func (h *WorkspaceHandler) sendRestartContext(workspaceID string, data restartContextData) {
+func (h *WorkspaceHandler) sendRestartContext(workspaceID string, data restartContextData, wakeKeyOpt ...string) {
+	wakeKey := ""
+	if len(wakeKeyOpt) > 0 {
+		wakeKey = wakeKeyOpt[0]
+	}
 	// Release the drain gate on EVERY exit path — delivered, dropped, or
 	// panicking. A leaked gate would stall this workspace's queue until the
 	// process restarts, so this defer is load-bearing, not hygiene.
@@ -330,7 +440,7 @@ func (h *WorkspaceHandler) sendRestartContext(workspaceID string, data restartCo
 		// enqueue instead — the a2a queue drains on the workspace's first
 		// heartbeat, and the expiry keeps a truly-dead workspace from replaying
 		// a stale snapshot hours later.
-		h.enqueueRestartContext(ctx, workspaceID, data, "online-wait timeout")
+		h.enqueueRestartContext(ctx, workspaceID, data, "online-wait timeout", wakeKey)
 		return
 	}
 	// Self-fire guard (Layer 2 of the 2026-05-19 ws-server self-fire fix):
@@ -358,7 +468,7 @@ func (h *WorkspaceHandler) sendRestartContext(workspaceID string, data restartCo
 	}
 
 	text := buildRestartContextMessage(data)
-	body, err := buildRestartA2APayload(workspaceID, text)
+	body, err := buildRestartA2APayload(workspaceID, text, wakeKey)
 	if err != nil {
 		log.Printf("restart-context: failed to marshal payload for %s: %v", workspaceID, err)
 		return
@@ -378,6 +488,8 @@ func (h *WorkspaceHandler) sendRestartContext(workspaceID string, data restartCo
 		log.Printf("restart-context: ProxyA2ARequest failed for %s (status=%d): %v", workspaceID, status, proxyErr)
 		return
 	}
+	// Commit-on-delivery for the wake ledger — the snapshot reached the agent.
+	h.markRestartWakeDelivered(ctx, workspaceID, wakeKey)
 	log.Printf("restart-context: delivered to %s (status=%d, keys=%d)", workspaceID, status, len(data.EnvKeys))
 }
 
@@ -391,8 +503,21 @@ const restartContextQueueTTL = 30 * time.Minute
 // a2a queue (drained on the workspace's heartbeat) instead of dropping it.
 // The idempotency key is derived from the restart timestamp so retries of the
 // same restart collapse to one queued message.
-func (h *WorkspaceHandler) enqueueRestartContext(ctx context.Context, workspaceID string, data restartContextData, why string) {
-	body, err := buildRestartA2APayload(workspaceID, buildRestartContextMessage(data))
+//
+// wakeKey (optional, PR-D/#27) is the wake-lifecycle owner's per-workspace
+// idempotency key. When supplied it REPLACES the hand-rolled
+// "restart-context-<ws>" key as BOTH the queue idempotency key and the payload's
+// params.metadata.wake_idempotency_key, so decision→dispatch→delivery→marker all
+// share one key. It is semantically identical to the legacy key — 1:1 per
+// workspace, so the queue's active-row dedup behaves exactly as before. Omitted
+// (unwired/legacy path, and the direct unit-test call) falls back to the legacy
+// key verbatim.
+func (h *WorkspaceHandler) enqueueRestartContext(ctx context.Context, workspaceID string, data restartContextData, why string, wakeKey ...string) {
+	key := ""
+	if len(wakeKey) > 0 {
+		key = wakeKey[0]
+	}
+	body, err := buildRestartA2APayload(workspaceID, buildRestartContextMessage(data), key)
 	if err != nil {
 		log.Printf("restart-context: failed to marshal payload for %s: %v", workspaceID, err)
 		return
@@ -407,8 +532,12 @@ func (h *WorkspaceHandler) enqueueRestartContext(ctx context.Context, workspaceI
 	// snapshot — three restarts on 2026-07-19 delivered three stacked wake
 	// messages into the same session. EnqueueA2A's active-row conflict keeps
 	// the first pending snapshot; content staleness across a few minutes is
-	// harmless (the message is a generic "you restarted" nudge).
+	// harmless (the message is a generic "you restarted" nudge). The wake owner's
+	// key (when wired) is likewise per-workspace, so this dedup is unchanged.
 	idem := "restart-context-" + workspaceID
+	if key != "" {
+		idem = key
+	}
 	// Priority 90 (> default 50; drain is ORDER BY priority DESC) so the
 	// context snapshot is dispatched BEFORE any queued user message in the
 	// same drain pass — the boot turn should precede the user's turn, which
@@ -419,5 +548,9 @@ func (h *WorkspaceHandler) enqueueRestartContext(ctx context.Context, workspaceI
 		log.Printf("restart-context: enqueue failed for %s (%s): %v — context message lost", workspaceID, why, qErr)
 		return
 	}
+	// Commit-on-enqueue for the wake ledger: the snapshot is durably queued and
+	// will drain on the workspace's heartbeat (mirrors the stall probe marking
+	// delivered right after a successful enqueue). Uses the same detached qCtx.
+	h.markRestartWakeDelivered(qCtx, workspaceID, key)
 	log.Printf("restart-context: %s for %s — queued for heartbeat drain (ttl=%s)", why, workspaceID, restartContextQueueTTL)
 }

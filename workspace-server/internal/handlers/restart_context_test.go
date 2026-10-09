@@ -1,11 +1,78 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/DATA-DOG/go-sqlmock"
 )
+
+// TestRestartContextArbitration_FirstBootSkips pins RFC concierge rule 2: a
+// genuine first boot (has_greeted marker UNSET) must NEVER take the
+// restart-context path. The arbitration decision returns false AND
+// fireRestartContextIfBooted must not claim the per-restart concurrency gate
+// (no sender goroutine spawned) — the first-boot greeting owns that edge.
+func TestRestartContextArbitration_FirstBootSkips(t *testing.T) {
+	mock := setupTestDB(t)
+	const wsID = "ws-firstboot-skip"
+
+	mock.ExpectQuery(`SELECT has_greeted FROM workspaces`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"has_greeted"}).AddRow(false))
+
+	if shouldFireRestartContext(context.Background(), wsID) {
+		t.Fatalf("genuine first boot must NOT fire restart-context")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("DB expectations: %v", err)
+	}
+
+	// The full arbitration wrapper must also leave the concurrency gate clear.
+	mock.ExpectQuery(`SELECT has_greeted FROM workspaces`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"has_greeted"}).AddRow(false))
+	h := &WorkspaceHandler{}
+	h.fireRestartContextIfBooted(context.Background(), wsID, restartContextData{RestartAt: time.Now()})
+	if restartContextInFlight(wsID) {
+		t.Fatalf("first boot must not set the restart-context pending gate")
+	}
+	h.asyncWG.Wait() // no goroutine should have been spawned
+}
+
+// TestRestartContextArbitration_MarkerReadErrorFailsClosed pins the fail-closed
+// invariant: on an unreadable has_greeted marker the decision is SKIP — a first
+// boot must never slip onto the restart-context path on a transient DB error.
+func TestRestartContextArbitration_MarkerReadErrorFailsClosed(t *testing.T) {
+	mock := setupTestDB(t)
+	const wsID = "ws-marker-err"
+	mock.ExpectQuery(`SELECT has_greeted FROM workspaces`).
+		WithArgs(wsID).
+		WillReturnError(errDBDown)
+
+	if shouldFireRestartContext(context.Background(), wsID) {
+		t.Fatalf("marker-read error must fail CLOSED (skip restart-context)")
+	}
+}
+
+// TestRestartContextArbitration_RealRestartFires pins the other side: a REAL
+// restart (has_greeted marker SET) fires restart-context.
+func TestRestartContextArbitration_RealRestartFires(t *testing.T) {
+	mock := setupTestDB(t)
+	const wsID = "ws-real-restart"
+	mock.ExpectQuery(`SELECT has_greeted FROM workspaces`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"has_greeted"}).AddRow(true))
+
+	if !shouldFireRestartContext(context.Background(), wsID) {
+		t.Fatalf("a real restart (marker set) must fire restart-context")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("DB expectations: %v", err)
+	}
+}
 
 func TestHumanDuration(t *testing.T) {
 	cases := []struct {
@@ -27,7 +94,14 @@ func TestHumanDuration(t *testing.T) {
 	}
 }
 
-func TestBuildRestartContextMessage_NoPriorSession(t *testing.T) {
+func TestBuildRestartContextMessage_MissingPriorHeartbeat_DefensiveRender(t *testing.T) {
+	// RFC concierge rule 2: a genuine first boot NO LONGER reaches this builder
+	// — restart-context is arbitrated (fireRestartContextIfBooted) to fire only
+	// for an already-greeted workspace, and a greeted box was online so it
+	// carries a last_heartbeat_at. The zero-PrevSessionAt placeholder is now
+	// purely a DEFENSIVE fallback for the pathological marker-set-but-heartbeat-
+	// unreadable case; this test pins that it still renders a consistent shape
+	// (it is no longer the "fresh box / first boot" scenario it once asserted).
 	d := restartContextData{
 		RestartAt:     time.Date(2026, 4, 13, 12, 0, 0, 0, time.UTC),
 		PrevSessionAt: time.Time{},

@@ -54,13 +54,47 @@
 ARG BASE_IMAGE_REGISTRY=registry.moleculesai.app/molecule-ai
 
 # ── Stage 1: Go platform binary ──────────────────────────────────────
-FROM ${BASE_IMAGE_REGISTRY}/golang:1.25-alpine@sha256:c4ea15b4a7912716eb362a022e2b12317762eca387423760bc59c0f9ae69423c AS go-builder
+# ARGs consumed by a FROM must be declared BEFORE any FROM — an ARG declared
+# inside a stage is stage-scoped and resolves EMPTY in the next FROM line
+# ("invalid reference format"). All three bases are global here and
+# re-declared bare where used.
+ARG GOLANG_BASE=golang:1.25-alpine@sha256:c4ea15b4a7912716eb362a022e2b12317762eca387423760bc59c0f9ae69423c
+ARG NODE_BASE=node:20-alpine@sha256:afdf98210b07b586eb71fa22ba2e432e058e4cd1304d31ed60888755b8c865fb
+FROM ${BASE_IMAGE_REGISTRY}/${GOLANG_BASE} AS go-builder
 WORKDIR /app
 COPY workspace-server/go.mod workspace-server/go.sum ./
 # github-app-auth plugin removed 2026-05-07 (#157): per-agent Gitea
 # identities replaced GitHub-App tokens post-suspension. The sibling
 # COPY + replace directive are gone.
-RUN go mod download
+#
+# Bounded retry (#4968) — CANONICAL copy of this idiom; workspace-server/
+# Dockerfile, Dockerfile.dev and Dockerfile.desktop-sidecar mirror it.
+#
+# WHY: proxy.golang.org intermittently drops the HTTP/2 stream mid-zip
+# ("read https://proxy.golang.org/.../@v/....zip: stream error: stream ID N;
+# INTERNAL_ERROR"). On 2026-07-30 that took two REQUIRED lanes red inside 15
+# minutes on two unrelated PRs — one of them a test-only diff — and on the
+# ephemeral CP lane it cascades into a misleading "NO ARM RAN … Some 'if:'
+# condition is wrong" because the failed build never stamps GATE_ARM.
+#
+# WHY RETRY AND NOT GOPROXY FALLBACKS: `docker build` does NOT inherit the
+# runner's env, so this stage always runs with the base image's default
+# GOPROXY=https://proxy.golang.org,direct. The COMMA separator only falls
+# through to the next entry on a 404/410 — a dropped stream is neither, so Go
+# never tries `direct` and one hiccup is fatal. Adding proxies/`|` fallbacks
+# is a supply-chain vendor decision; tracked separately, see #4968.
+#
+# The `exit 1` on the last attempt is load-bearing: a retry loop that swallows
+# the final error would hide a genuinely-down proxy and is worse than no retry.
+RUN for i in 1 2 3; do \
+        go mod download && break; \
+        if [ "$i" -ge 3 ]; then \
+            echo "go mod download: FAILED after 3 attempts" >&2; \
+            exit 1; \
+        fi; \
+        echo "go mod download: attempt $i failed, retrying in $((i * 5))s" >&2; \
+        sleep $((i * 5)); \
+    done
 COPY workspace-server/ .
 
 # GIT_SHA is baked into the binary via -ldflags so /buildinfo can return
@@ -111,7 +145,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 
 # ── Stage 2: Canvas Next.js standalone ────────────────────────────────
 ARG BASE_IMAGE_REGISTRY
-FROM ${BASE_IMAGE_REGISTRY}/node:20-alpine@sha256:afdf98210b07b586eb71fa22ba2e432e058e4cd1304d31ed60888755b8c865fb AS canvas-builder
+ARG NODE_BASE
+FROM ${BASE_IMAGE_REGISTRY}/${NODE_BASE} AS canvas-builder
 WORKDIR /canvas
 COPY canvas/package.json canvas/package-lock.json* ./
 RUN npm install
@@ -136,7 +171,8 @@ RUN npm run build
 
 # ── Stage 3: Runtime ──────────────────────────────────────────────────
 ARG BASE_IMAGE_REGISTRY
-FROM ${BASE_IMAGE_REGISTRY}/node:20-alpine@sha256:afdf98210b07b586eb71fa22ba2e432e058e4cd1304d31ed60888755b8c865fb
+ARG NODE_BASE
+FROM ${BASE_IMAGE_REGISTRY}/${NODE_BASE}
 RUN apk add --no-cache ca-certificates git tzdata openssh-client aws-cli
 
 # Non-root runtime for the Node.js canvas process.

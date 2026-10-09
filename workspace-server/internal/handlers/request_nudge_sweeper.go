@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
@@ -101,6 +102,30 @@ type RequestNudgeSweeper struct {
 	reNudgeWait time.Duration
 	limit       int
 	enqueue     enqueueFunc
+
+	// decideWake / markWakeDelivered route the nudge through the wake-lifecycle
+	// desired-state owner (PR-D), exactly like the stall watchdog: a fired nudge
+	// mints a wake_intent + bumps workspaces.desired_generation, and the heartbeat
+	// loop can then observe convergence. BOTH nil by default (NewRequestNudgeSweeper
+	// leaves them unset): unwired, the nudge keeps its pre-existing behavior exactly
+	// (enqueue with the hourly-bucketed idempotency key, no generation bump) — the
+	// existing request_nudge_sweeper_test.go asserts that unwired path unchanged.
+	// Production wires them via SetWakeHooks to WorkspaceHandler.DecideWake /
+	// MarkWakeDelivered.
+	decideWake        func(ctx context.Context, workspaceID string, kind WakeKind, dedupSeed string) (WakeDecision, error)
+	markWakeDelivered func(ctx context.Context, workspaceID, idempotencyKey string) error
+}
+
+// SetWakeHooks wires the wake-lifecycle desired-state owner into the inbox nudge
+// (PR-D). Late-wiring nil-safe setter (mirrors StallWatchdog.SetWakeHooks) so
+// NewRequestNudgeSweeper's signature — and every existing test call site — stays
+// unchanged; production calls this after the WorkspaceHandler exists.
+func (s *RequestNudgeSweeper) SetWakeHooks(
+	decide func(ctx context.Context, workspaceID string, kind WakeKind, dedupSeed string) (WakeDecision, error),
+	delivered func(ctx context.Context, workspaceID, idempotencyKey string) error,
+) {
+	s.decideWake = decide
+	s.markWakeDelivered = delivered
 }
 
 // NewRequestNudgeSweeper builds a sweeper bound to the package db.DB
@@ -265,20 +290,51 @@ func (s *RequestNudgeSweeper) Sweep(ctx context.Context) NudgeResult {
 // last_nudged_at UPDATE only fires after a successful enqueue so a failed
 // enqueue is retried next sweep (the items stay un-stamped, hence eligible).
 func (s *RequestNudgeSweeper) nudgeAgent(ctx context.Context, recipientID string, ids []string, now time.Time) error {
-	body, err := buildNudgeBody(len(ids))
-	if err != nil {
-		return fmt.Errorf("build nudge body: %w", err)
-	}
-
 	// Idempotency key bucketed to the current hour so two concurrent sweeper
 	// boots collapse to one queued nudge per agent per hour at the queue layer
 	// too — defense in depth on top of the last_nudged_at rate-limit. Empty
 	// callerID = canvas/system-style enqueue (source_id NULL), matching the
 	// scheduler's internal fire path.
-	idemKey := fmt.Sprintf("inbox-nudge:%s:%d", recipientID, now.Truncate(time.Hour).Unix())
+	hourBucket := now.Truncate(time.Hour).Unix()
+	idemKey := fmt.Sprintf("inbox-nudge:%s:%d", recipientID, hourBucket)
+
+	// Wake-lifecycle GENERATION LOOP (PR-D): when wired, route the nudge through
+	// the desired-state owner so it durably mints a wake_intent and bumps
+	// desired_generation — the same gate the stall watchdog uses. The seed is the
+	// hourly bucket (mirrors idemKey) so re-nudges inside one hour dedup to a
+	// single generation bump. A no-fire decision means a nudge wake for this bucket
+	// was already minted+delivered: skip the (queue-deduped-anyway) re-enqueue AND
+	// the last_nudged_at stamp so the duplicate never advances the generation.
+	// Unwired (hook nil) keeps the pre-PR-D behavior verbatim.
+	if s.decideWake != nil {
+		seed := strconv.FormatInt(hourBucket, 10)
+		decision, decideErr := s.decideWake(ctx, recipientID, WakeNudge, seed)
+		if decideErr != nil {
+			return fmt.Errorf("decide nudge wake: %w", decideErr)
+		}
+		if !decision.Fire {
+			log.Printf("RequestNudgeSweeper: %s nudge wake already minted this window — skipping duplicate nudge", recipientID)
+			return nil
+		}
+		idemKey = decision.IdempotencyKey
+	}
+
+	body, err := buildNudgeBody(recipientID, len(ids), idemKey)
+	if err != nil {
+		return fmt.Errorf("build nudge body: %w", err)
+	}
 
 	if _, _, err := s.enqueue(ctx, recipientID, "", PriorityInfo, body, "message/send", idemKey, nil); err != nil {
 		return fmt.Errorf("enqueue nudge: %w", err)
+	}
+
+	// Commit-on-delivery: the nudge wake has reached the queue, so flip the intent
+	// pending → delivered. Best-effort — a failure only leaves the intent unsettled
+	// (it re-settles on a later convergence), never blocks the nudge. No-op unwired.
+	if s.markWakeDelivered != nil {
+		if err := s.markWakeDelivered(ctx, recipientID, idemKey); err != nil {
+			log.Printf("RequestNudgeSweeper: mark nudge wake delivered failed for %s: %v", recipientID, err)
+		}
 	}
 
 	// Stamp last_nudged_at on exactly the items this nudge covered. ANY($1)
@@ -298,7 +354,20 @@ func (s *RequestNudgeSweeper) nudgeAgent(ctx context.Context, recipientID string
 // buildNudgeBody constructs the A2A `message/send` JSON-RPC body for the nudge.
 // Mirrors the scheduler's body shape (role=user, generated messageId, single
 // text part) so the receiving agent processes it like any other inbound turn.
-func buildNudgeBody(n int) ([]byte, error) {
+//
+// The message carries platform self-source metadata (source="platform",
+// source_type="self-nudge") and the workspace's default-session contextId, the
+// same way buildRestartA2APayload stamps its wake: without source_type the nudge
+// leaks into My Chat as a blue user bubble (messagestore.selfSourceTypes must
+// list "self-nudge"); without contextId it mints a fresh runtime session,
+// fragmenting the conversation (Langfuse session fragmentation, 2026-07-21).
+//
+// wakeIdempotencyKey (optional, PR-E) is stamped into params.metadata as
+// wake_idempotency_key when present so the wake owner's key rides the A2A
+// envelope (decision→dispatch→delivery→marker share one key). params.metadata is
+// additionalProperties:true and a sibling of params.message.metadata, so the
+// self-source reader is untouched. Omitted = byte-identical to pre-PR-E.
+func buildNudgeBody(workspaceID string, n int, wakeIdempotencyKey ...string) ([]byte, error) {
 	plural := "request"
 	if n != 1 {
 		plural = "requests"
@@ -308,15 +377,25 @@ func buildNudgeBody(n int) ([]byte, error) {
 			"Use list_inbox to see them and respond_request / add_request_message to act.",
 		n, plural,
 	)
-	return json.Marshal(map[string]interface{}{
-		"method": "message/send",
-		"params": map[string]interface{}{
-			"message": map[string]interface{}{
-				"role":      "user",
-				"messageId": "inbox-nudge-" + uuid.New().String(),
-				"parts":     []map[string]interface{}{{"kind": "text", "text": text}},
+	params := map[string]interface{}{
+		"message": map[string]interface{}{
+			"role":      "user",
+			"messageId": "inbox-nudge-" + uuid.New().String(),
+			"contextId": platformTurnContextID(workspaceID),
+			"parts":     []map[string]interface{}{{"kind": "text", "text": text}},
+			"metadata": map[string]interface{}{
+				"source":      "platform",
+				"kind":        "inbox_nudge",
+				"source_type": "self-nudge",
 			},
 		},
+	}
+	if len(wakeIdempotencyKey) > 0 && wakeIdempotencyKey[0] != "" {
+		params["metadata"] = map[string]interface{}{"wake_idempotency_key": wakeIdempotencyKey[0]}
+	}
+	return json.Marshal(map[string]interface{}{
+		"method": "message/send",
+		"params": params,
 	})
 }
 

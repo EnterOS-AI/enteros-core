@@ -45,7 +45,7 @@ func TestCreate_BYOKModelNoCredential_422(t *testing.T) {
 	if resp["code"] != "MISSING_BYOK_CREDENTIAL" {
 		t.Errorf("code = %v", resp["code"])
 	}
-	if !strings.Contains(resp["error"].(string), "moonshot/kimi-k2.6") {
+	if !strings.Contains(resp["error"].(string), "minimax/MiniMax-M2.7") {
 		t.Errorf("error must steer to the platform default: %v", resp["error"])
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -72,7 +72,7 @@ func TestCreate_BYOKModelGlobalCredential_Passes(t *testing.T) {
 // without touching the DB at all.
 func TestCreate_PlatformSlashModel_NoQueries(t *testing.T) {
 	mock := setupTestDB(t)
-	ok, why := validateBYOKCredentialSatisfiable(context.Background(), "claude-code", "moonshot/kimi-k2.6", nil)
+	ok, why := validateBYOKCredentialSatisfiable(context.Background(), "claude-code", "minimax/MiniMax-M2.7", nil)
 	if !ok {
 		t.Fatalf("platform model must pass keyless: %s", why)
 	}
@@ -106,9 +106,9 @@ func TestListOfferedModels_ClaudeCode(t *testing.T) {
 	for _, m := range resp.Models {
 		byID[m.Model] = m
 	}
-	kimi, ok := byID["moonshot/kimi-k2.6"]
-	if !ok || !kimi.PlatformBilled || len(kimi.AuthEnv) != 0 {
-		t.Errorf("moonshot/kimi-k2.6 must be platform-billed keyless: %+v (present=%v)", kimi, ok)
+	plat, ok := byID["minimax/MiniMax-M2.7"]
+	if !ok || !plat.PlatformBilled || len(plat.AuthEnv) != 0 {
+		t.Errorf("minimax/MiniMax-M2.7 must be platform-billed keyless: %+v (present=%v)", plat, ok)
 	}
 	byok, ok := byID["claude-sonnet-4-6"]
 	if !ok || byok.PlatformBilled || len(byok.AuthEnv) == 0 {

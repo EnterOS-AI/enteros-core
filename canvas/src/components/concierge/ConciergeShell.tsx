@@ -22,8 +22,9 @@ import { RequestsInbox } from "./RequestsInbox";
 import { MonitorPanel } from "@/components/monitor/MonitorPanel";
 import {
   IcHome, IcOrgMap, IcSettings, IcSearch, IcBell, IcSun, IcMoon, IcChevDown,
-  IcQueue, IcCaret, IcMolecule, IcCheck, IcChat,
+  IcQueue, IcCaret, IcMolecule, IcCheck, IcChat, IcLogs,
 } from "./icons";
+import { DOZZLE_URL } from "@/lib/dozzle";
 
 /* ── status → concept palette ─────────────────────────────────────────── */
 function statusInfo(status: string): { color: string; label: string } {
@@ -346,7 +347,18 @@ export function ConciergeShell() {
     platformRoot &&
     platformRoot.data.status === WORKSPACE_STATUS.Provisioning
   ) {
-    return <BootSequenceScreen node={platformRoot} />;
+    // Full-viewport wrapper: BootSequenceScreen sizes itself with `h-full`,
+    // which resolves to CONTENT height unless an ancestor has a resolved
+    // height. This shell renders straight into the page body (page.tsx), so
+    // without this the boot screen painted as a short top-anchored block with
+    // a dead black band under it instead of the fullscreen boot the design
+    // calls for. Same `fixed inset-0` treatment the pre-gate hold below and
+    // the SelfHostSetupScene mount already use.
+    return (
+      <div className="fixed inset-0" data-testid="concierge-boot-screen">
+        <BootSequenceScreen node={platformRoot} />
+      </div>
+    );
   }
 
   // Pre-gate hold: on a fresh self-host load the always-seeded platform root
@@ -401,6 +413,19 @@ export function ConciergeShell() {
             <span className={s.ico}><IcQueue /></span><span className={s.lbl}>Monitor</span>
           </button>
           <div className={s.spacer} />
+          {/* Dev-only escape hatch to raw container logs (Dozzle). External
+              link, not a TopView — it opens in a new tab rather than taking
+              over the rail's own view state. */}
+          <a
+            data-testid="nav-logs"
+            className={s.navbtn}
+            title="Logs — open Dozzle in a new tab"
+            href={DOZZLE_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <span className={s.ico}><IcLogs /></span><span className={s.lbl}>Logs</span>
+          </a>
           <button data-testid="nav-settings" className={`${s.navbtn} ${topView === "settings" ? s.active : ""}`} title="Settings" onClick={() => nav("settings")}>
             <span className={s.ico}><IcSettings /></span><span className={s.lbl}>Settings</span>
           </button>
@@ -561,8 +586,37 @@ export function ConciergeShell() {
                   </div>
                   <div className={s.embedChat}>
                     {/* key=chatId remounts ChatTab on selection change so the
-                        history/composer state never bleeds between agents. */}
-                    <ChatTab key={chatId} workspaceId={chatId} data={chatNode.data} />
+                        history/composer state never bleeds between agents.
+
+                        MOUNT-GATED on the Home view being active — the same
+                        `{topView === "..." && ...}` gate the Org-map view
+                        already uses for <Canvas/> below. `.view` is a bare
+                        display:none swap, so WITHOUT this gate the Home
+                        ChatTab stays mounted and live while the user is on
+                        the Org map. Because resolveHomeChatTarget follows
+                        `selectedNodeId`, selecting a workspace node on the
+                        map re-points this hidden ChatTab at the SAME
+                        workspace as the visible SidePanel ChatTab — two live
+                        subscribers for one workspace.
+
+                        useChatSocket delivers a live AGENT_MESSAGE via
+                        useCanvasStore.consumeAgentMessages(), which DELETES
+                        the queue on read. Whichever of the two effects ran
+                        first won; when the hidden one won, the visible panel
+                        never saw the message at all and it only surfaced
+                        ~10s later via useChatHistory's RECONCILE_INTERVAL_MS
+                        poll. That is the E2E Chat
+                        "agent /notify delivery reaches the canvas chat"
+                        flake (assertion budget 10s vs ~9.9s delivery), and
+                        for a real user it is a self-initiated agent message
+                        (digest reply, send_message_to_user, proactive
+                        update) taking up to 10 seconds to appear.
+
+                        A display:none panel must not consume live state on
+                        behalf of the panel the user is actually looking at. */}
+                    {topView === "home" && (
+                      <ChatTab key={chatId} workspaceId={chatId} data={chatNode.data} />
+                    )}
                   </div>
                 </section>
               ) : (

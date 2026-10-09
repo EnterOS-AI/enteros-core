@@ -5,7 +5,10 @@ import {
   extractAgentText,
   extractTextsFromParts,
   extractFilesFromTask,
+  isInternalSelfRequest,
+  SELF_SOURCE_TYPES,
 } from "../message-parser";
+import { SELF_SOURCE_TYPES as GENERATED_SELF_SOURCE_TYPES } from "../self-source-types.generated";
 
 describe("extractRequestText", () => {
   it("extracts text from standard A2A request_body", () => {
@@ -413,5 +416,109 @@ describe("extractFilesFromTask", () => {
         size: 12345,
       },
     ]);
+  });
+});
+
+describe("isInternalSelfRequest self-source classification", () => {
+  // A2A request_body shape the runtime persists: the source_type marker
+  // rides on params.metadata (sibling of params.message).
+  const selfBody = (sourceType: string) => ({
+    params: {
+      metadata: { source_type: sourceType },
+      message: { parts: [{ kind: "text", text: "wake nudge" }] },
+    },
+  });
+
+  // Enumeration of the self-source markers, used only to drive the per-marker
+  // classification behavior tests below (each marker must be honored as an
+  // internal self-message). This is NOT the drift guard — a hardcoded list here
+  // can only agree with itself. The genuine SSOT guard is the vendor-parity
+  // test at the end of this block (SELF_SOURCE_TYPES == the generated list),
+  // backed by the SDK's contracts-codegen-drift gate on the upstream schema.
+  const SELF_MARKERS = [
+    "self-cron",
+    "self-harvester",
+    "self-idle",
+    "self-scheduler",
+    "self-goal-nudge",
+    "self-delegation-result",
+    "self-warmup",
+    "self-restart-context",
+    "self-first-boot-greet",
+    "self-lifecycle",
+    "self-stall",
+    "self-nudge",
+  ];
+
+  it.each(SELF_MARKERS)(
+    "classifies %s as an internal self-message (system notice, not user)",
+    (marker) => {
+      expect(SELF_SOURCE_TYPES.has(marker)).toBe(true);
+      expect(isInternalSelfRequest(selfBody(marker), "wake nudge")).toBe(true);
+    },
+  );
+
+  // Regression pins for the markers this change added (canvas had drifted
+  // behind Go and was missing these five).
+  it.each([
+    "self-restart-context",
+    "self-first-boot-greet",
+    "self-lifecycle",
+    "self-stall",
+    "self-nudge",
+  ])("newly-aligned marker %s is honored as self-source", (marker) => {
+    expect(isInternalSelfRequest(selfBody(marker), "")).toBe(true);
+  });
+
+  // SSOT vendor-parity guard (RFC follow-up #29). The marker set is defined
+  // ONCE in the SDK contract
+  // (molecule-ai-sdk contracts/workspace-comms/self-source-types.schema.json)
+  // and codegen'd into the Go `molcontracts.SelfSourceTypes` (consumed by
+  // workspace-server/internal/messagestore) and the vendored TS list
+  // ./self-source-types.generated.ts. This test asserts the runtime-facing
+  // SELF_SOURCE_TYPES set is EXACTLY that generated list (both directions), so
+  // message-parser.ts can never drift from the vendored SSOT. Upstream drift is
+  // caught by the SDK's contracts-codegen-drift gate; the values below flow
+  // from the schema, not a hand-written copy in this repo.
+  //
+  // (This replaces the previous guard that hand-parsed the Go `selfSourceTypes`
+  // map literal from postgres_store.go — that map no longer exists; the Go
+  // consumer now delegates to the generated `molcontracts.IsSelfSourceType`.)
+  it("SELF_SOURCE_TYPES matches the generated self-source SSOT exactly (no drift)", () => {
+    // Sanity: the generated list must be non-empty, else this guard could
+    // vacuously pass if the vendored module were emptied.
+    expect(GENERATED_SELF_SOURCE_TYPES.length).toBeGreaterThan(0);
+    // The vendored list carries no duplicates.
+    expect(new Set(GENERATED_SELF_SOURCE_TYPES).size).toBe(
+      GENERATED_SELF_SOURCE_TYPES.length,
+    );
+    // Exact set equality, both directions: no marker in the generated list
+    // missing from the runtime Set, and none present in the Set but absent
+    // from the generated list.
+    expect([...SELF_SOURCE_TYPES].sort()).toEqual(
+      [...GENERATED_SELF_SOURCE_TYPES].sort(),
+    );
+  });
+
+  it("treats a tagged non-self source_type as a genuine user turn", () => {
+    const body = {
+      params: {
+        metadata: { source_type: "user-typed" },
+        message: { parts: [{ kind: "text", text: "hello" }] },
+      },
+    };
+    expect(isInternalSelfRequest(body, "hello")).toBe(false);
+  });
+
+  it("classifies an untagged legacy delegation-result row via the text prefix", () => {
+    // No source_type marker (legacy row) → falls back to the deprecated
+    // text-prefix classifier.
+    expect(
+      isInternalSelfRequest(null, "Delegation results are ready. Review them."),
+    ).toBe(true);
+  });
+
+  it("leaves an untagged ordinary user message as a user turn", () => {
+    expect(isInternalSelfRequest(null, "can you deploy staging?")).toBe(false);
   });
 });
