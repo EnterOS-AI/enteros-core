@@ -3,7 +3,7 @@ name: stranded-status-janitor
 # Finds commit-status contexts whose LAST row is a merge-blocking ARTIFACT
 # rather than a verdict about the code, which under branch protection
 # status_check_contexts=['*'] blocks a fully-green, fully-approved PR forever.
-# Two shapes, one healing mechanism (re-run — never a fabricated green):
+# Three shapes, one healing mechanism (re-run — never a fabricated green):
 #   * `pending` whose Actions run has already finished (#4979): cross-run
 #     misattribution in Gitea's services/actions/job_emitter.go, and lost
 #     terminal writes.
@@ -14,6 +14,14 @@ name: stranded-status-janitor
 #     executed. When the group is not keyed on the head SHA the evicting run
 #     belongs to a DIFFERENT SHA, so nothing ever re-posts here and the red
 #     latches permanently.
+#   * `failure` from a job that was ASSIGNED to a runner and then never executed
+#     a single step (main 8a797665, run 647884 / job 952902): the runner took
+#     the task and went silent, the server force-closed the job 787s later, and
+#     every step came out stamped at the job's stop time with zero elapsed. The
+#     commit-status row is byte-identical to a genuine red ("Failing after
+#     13m7s"), so only the job's STEP records can tell them apart. That one red
+#     froze the merge train and made ~50 PRs unmergeable for ~22 hours, by which
+#     time the job's log had aged out of retention.
 # See .gitea/scripts/stranded_status_janitor.py for the measured evidence.
 #
 # Trigger: workflow_dispatch ONLY.
