@@ -96,6 +96,17 @@ type MgmtMCPProbe struct {
 	// explicit require-live flag, "this arm did not actually run" is a hard
 	// failure, not an optional arm.
 	RequireCallable bool
+
+	// Claim is what the concierge ITSELF said about the provision turn, parsed
+	// from its real reply (see concierge_self_report_gate.go). Guard B's primary
+	// evidence is and stays the row; this exists so the agent's REPORT can be
+	// reconciled against that row instead of discarded. The zero value
+	// (Observed=false) abstains, so every pre-existing probe is unaffected.
+	Claim ConciergeClaim
+	// ProvisionedWorkspaceID is the id of the row the callable turn actually
+	// produced ("" when absent/not surfaced). It is the ground truth the claim's
+	// published id is reconciled against.
+	ProvisionedWorkspaceID string
 }
 
 // GuardBMode resolves the two Guard B posture booleans from their raw env
@@ -175,11 +186,66 @@ func EvaluateMgmtMCPCallable(p MgmtMCPProbe) (ok bool, reason string) {
 			strings.Join(p.LoadedTools, ","), p.RequiredTool)
 	}
 
+	// 4b. ZERO-EVIDENCE REFUSAL (the vacuous-pass guard).
+	//
+	//     Checks 3 and 4 are both conditional on the tenant having SURFACED the
+	//     signal they read: check 3 only fires when mcp_server_present was
+	//     reported, check 4 only when loaded_mcp_tools was non-empty. That is the
+	//     right tolerance individually — neither field is guaranteed by the
+	//     workspace API — but taken together they leave a hole: a probe in which
+	//     the tenant surfaced NEITHER signal walks past both checks and, on a
+	//     presence-only run, reaches the green return below having verified
+	//     nothing about the management MCP beyond status=online.
+	//
+	//     That is a pass:0/fail:0 verdict wearing a green coat, and it is exactly
+	//     the shape this gate exists to refuse. Note the observed staging fleet
+	//     ALREADY reports mcp_server_present=<absent> (the live gate logs
+	//     `present=false(reported=false)` on every green run), so check 3 is a
+	//     confirmed no-op in production and loaded_mcp_tools is the only positive
+	//     presence signal actually being read today. If the heartbeat producer
+	//     ever stops surfacing that one too, the presence half silently degrades
+	//     to "online, and nothing else was asked".
+	//
+	//     The deploy path is unaffected: staging-tenant-cd arms
+	//     E2E_ASSERT_MGMT_MCP_CALLABLE (and GUARD_B_REQUIRE_CALLABLE), so the
+	//     real A2A turn in check 5 is its positive evidence and this branch
+	//     cannot fire there. It closes the presence-ONLY hole, where there is no
+	//     backstop at all.
+	if !p.AssertCallable && !p.MCPServerPresentReported && len(p.LoadedTools) == 0 {
+		return false, "platform agent reached status=online but the tenant surfaced NEITHER mcp_server_present NOR a non-empty loaded_mcp_tools inventory, and this run did not arm the real A2A callable turn — the verdict would be based on ZERO positive evidence that the management MCP exists (a vacuous pass). Re-run with E2E_ASSERT_MGMT_MCP_CALLABLE=1 (or GUARD_B_REQUIRE_CALLABLE=1) so the callable turn supplies the evidence"
+	}
+
+	// 4c. SELF-REPORT RECONCILIATION (failure mode G9 — see
+	//     concierge_self_report_gate.go). Runs BEFORE check 5 on purpose: check 5
+	//     reds on ANY turn that produced no workspace and says only "not
+	//     genuinely CALLABLE", which reads identically whether the agent
+	//     honestly answered "I don't have that tool" (G5) or asserted "Done, the
+	//     workspace has been created" while creating nothing (G9). Those need
+	//     different fixes, so the fabrication must be NAMED, not folded into the
+	//     generic red.
+	//
+	//     It also catches the shape check 5 scores GREEN: the row landed under
+	//     the requested NAME, and the agent published a DIFFERENT id — so every
+	//     consumer of the reported id addresses a resource that does not exist.
+	//
+	//     This can only ADD failures. It never rescues a missing row: an absent
+	//     or silent self-report abstains and check 5 still decides, which is the
+	//     invariant — a self-report must never be the evidence.
+	if p.AssertCallable {
+		if ok, reason := ReconcileProvisionClaim(p.Claim, p.WorkerProvisioned, p.ProvisionedWorkspaceID); !ok {
+			return false, reason
+		}
+	}
+
 	// 5. The CALLABLE proof (the whole point of Guard B): a real A2A tool-use turn
 	//    must have RUN provision_workspace and produced the workspace. Presence
 	//    without callability is exactly the flaw that let regressions through.
 	if p.AssertCallable && !p.WorkerProvisioned {
-		return false, "platform agent is online with its management MCP present, but a REAL A2A provision_workspace turn did NOT create the requested workspace — the verb is present but not genuinely CALLABLE (a presence-only gate would have false-passed here)"
+		// The red is unconditional — describeCallableFailure only NAMES it (see
+		// callable_failure_class.go). Six materially different failures used to
+		// publish this one sentence, so every investigation started by
+		// re-deriving the class from raw logs that the gate had already parsed.
+		return false, describeCallableFailure(callableRedBaseReason, p.Claim.Texts)
 	}
 
 	if !p.AssertCallable {
@@ -239,4 +305,78 @@ func nonEmpty(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// ── The CREATED-ROW verdict (core#5052) ──────────────────────────────────────
+//
+// Guard B's callable proof asserts a DETERMINISTIC side effect: the concierge
+// ran provision_workspace and a real workspace row appeared. Until core#5052
+// the live test accepted that row on `name` + `kind` ALONE and never looked at
+// `status`, so a workspace that was created and then FAILED to provision still
+// reported "CALLABLE CONFIRMED". That is the exact vacuous-pass shape this gate
+// exists to refuse — the hardest gate in the repo was scoring a row's EXISTENCE
+// as proof of a working verb.
+//
+// The verdict below is deliberately narrow. The claim under test is "the verb
+// genuinely RAN", not "the workspace booted", so a row still mid-provision is
+// NOT a failure — provisioning is asynchronous and the concierge's obligation
+// ends when the row is created. What must never pass is a row that reached a
+// TERMINAL BAD state: `failed` (provision errored) or `removed` (rolled back).
+// Those prove the create did not survive, and a gate that green-lights them is
+// asserting nothing.
+//
+// kind is checked here too so both halves of the row verdict live in one pure,
+// unit-tested place rather than being split between the gate and the live test.
+
+// terminalBadWorkspaceStatuses are the statuses that PROVE a created workspace
+// did not survive its own provision. Kept as a list (not a set literal inline)
+// so the reason string can name exactly what was refused.
+var terminalBadWorkspaceStatuses = []string{"failed", "removed"}
+
+// ClassifyProvisionedWorkspace decides whether the row the concierge created in
+// response to the real A2A provision_workspace turn counts as PROOF that the
+// verb is genuinely callable.
+//
+//	kind   — the row's kind field ("" when the API did not surface it)
+//	status — the row's status field ("" when the API did not surface it)
+//
+// An unobserved (empty) field is tolerated rather than fatal, matching the rest
+// of this gate: the live test leans on the fields the tenant actually exposes
+// and never false-fails on one the API may omit.
+func ClassifyProvisionedWorkspace(kind, status string) (ok bool, reason string) {
+	if kind != "" && kind != "workspace" {
+		return false, fmt.Sprintf(
+			"the concierge created a row named as requested but with kind=%q (want \"workspace\") — that is not a real team-member create, so provision_workspace did not genuinely run",
+			kind)
+	}
+	if containsStr(terminalBadWorkspaceStatuses, status) {
+		return false, fmt.Sprintf(
+			"the concierge created the requested workspace but it reached TERMINAL status=%q — the row exists yet the provision did not survive, so scoring this as CALLABLE would be a vacuous pass (core#5052: the pre-fix gate matched on name+kind and never read status)",
+			status)
+	}
+	return true, fmt.Sprintf(
+		"the concierge created a real kind=%q workspace (status=%s) — provision_workspace genuinely ran",
+		nonEmpty(kind, "workspace"), nonEmpty(status, "<not surfaced>"))
+}
+
+// a2aTurnLogCap bounds the A2A turn body Guard B logs. It must stay well above
+// the runtime's own failure text so a red run is SELF-DIAGNOSING: hermes returns
+// `Model generated invalid tool call: <tool-id>` (the id itself already capped
+// at 80 chars upstream) inside a JSON-RPC message envelope of ~145 chars. The
+// previous cap of 200 sliced that apart mid-identifier and left every red run
+// unexplainable without a live reproduction.
+const a2aTurnLogCap = 4000
+
+// truncate bounds a body for logging, appending an ellipsis when it cuts.
+//
+// Lives here (untagged) so the tagged live tests and the untagged gate/unit
+// tests share ONE definition — the same reason containsStr lives here. It moved
+// out of the staging_e2e-tagged concierge_platform_test.go in core#5052 so
+// a2aTurnLogCap could be proved against a real failure body without a live
+// tenant.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }

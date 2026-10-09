@@ -72,6 +72,26 @@ jobs:
       # Self-host schedule signals (the only additions over lifecycle-stub):
       MOLECULE_DEFAULT_RUNTIME: claude-code
       MOLECULE_LLM_DEFAULT_MODEL: claude-opus-4-7
+      # core#5031: this job substitutes a STUB under the local workspace-template
+      # image name, which every process on this shared daemon otherwise computes
+      # identically (runtime + template HEAD sha + arch). On core#5030 our cleanup
+      # restored that name while the concurrently-scheduled lifecycle e2e was
+      # still resolving it, and the REQUIRED lifecycle gate failed with "Invalid
+      # API key" — a message pointing at secrets rather than at CI scheduling.
+      #
+      # This token gives the job a PRIVATE tag namespace. It is set at JOB level
+      # on purpose: both the platform-server we start (which resolves the tag,
+      # provisioner/local_image_isolation.go) and the e2e script (which writes
+      # it) must read the SAME variable, or the two halves drift apart. run_id +
+      # run_attempt is the run-scoped uniqueness idiom already used by every
+      # other shared resource in this job; the trailing discriminator keeps it
+      # distinct from the lifecycle jobs, which share a run_id with each other.
+      #
+      # Serialising the workflows with a shared `concurrency:` group was the
+      # cheaper option and is deliberately NOT what this does: it would leave the
+      # shared mutable name in place for the next lane to trip over, and it would
+      # cost wall-clock on a required gate forever.
+      MOLECULE_LOCAL_IMAGE_ISOLATION: e2e-${{ github.run_id }}-${{ github.run_attempt }}-shsched
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5

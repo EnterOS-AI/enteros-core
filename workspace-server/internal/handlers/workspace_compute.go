@@ -177,9 +177,15 @@ func instanceTypeAllowedForProvider(provider, instanceType string) bool {
 //	CloudIDs() -> "which providers cost cloud money?"     (billing, instance types)
 //	IDs()/All  -> "which providers may a caller select?"  (validation)   <- this one
 //
-// The ALIASES matter as much as the ids: the CP re-provision path POSTs
-// provider="local", and workspace_set_compute_instance persists the BACKEND KEY,
-// so compute.provider on a real Molecules-Server row literally reads "local".
+// The ALIASES matter as much as the ids, and the alias SET is the SDK's to
+// change: substrate-rename stage 3 (molecule-ai-sdk#200, adopted 2026-08-05)
+// DELETED "local" and "docker", leaving "enteros" — the routing key — as the
+// only alias of molecules-server. Because this allowlist is DERIVED from
+// sdkcp.All rather than written out, that deletion propagated here by rebuild:
+// the retired spellings now 400. Prod was already ahead of the code (all 6
+// organizations.provider rows read "enteros", and CP migration 071 narrowed the
+// CHECK to exclude the old spellings), so this closed a gap where core accepted
+// a value its own database would refuse.
 //
 // Matching stays EXACT/case-sensitive (not sdkcp.IsValidID, which lowercases):
 // "AWS" and "MOLECULES-SERVER" must still 400, as TestValidateWorkspaceCompute_Provider
@@ -365,12 +371,27 @@ func validateWorkspaceCompute(compute models.WorkspaceCompute) error {
 	// "" = default. CP fail-closes an unwired provider with a 422; validating here
 	// gives a clean 400 before the round-trip and is the gate reused by the
 	// switch-provider flow. The allowlist is the FULL selectable set from the SDK
-	// cloudprovider SSOT (ids + aliases), which is why the local Molecules-Server
-	// box — the substrate prod actually runs on — is accepted here.
+	// cloudprovider SSOT (ids + aliases), which is why the self-hosted
+	// Molecules-Server box — the substrate prod actually runs on — is accepted.
+	//
+	// SUBSTRATE RENAME STAGE 3 (molecule-ai-sdk#200, adopted 2026-08-05): the
+	// retired spellings "local" and "docker" are NO LONGER aliases, so they now
+	// fail closed here. The error message derives its alias list from the SDK
+	// rather than naming spellings in prose — the old text hard-coded
+	// "local|docker" and would have kept advertising them after the SSOT dropped
+	// them, which is how a rejected value ends up recommended by its own error.
 	if compute.Provider != "" {
 		if _, ok := workspaceComputeProviderAllowlist[compute.Provider]; !ok {
-			return fmt.Errorf("unsupported compute.provider %q (want one of %s, or the aliases local|docker)",
+			var aliases []string
+			for _, p := range sdkcp.All {
+				aliases = append(aliases, p.Aliases...)
+			}
+			msg := fmt.Sprintf("unsupported compute.provider %q (want one of %s",
 				compute.Provider, strings.Join(sdkcp.IDs(), "|"))
+			if len(aliases) > 0 {
+				msg += ", or the aliases " + strings.Join(aliases, "|")
+			}
+			return fmt.Errorf("%s)", msg)
 		}
 	}
 	// Instance type must belong to the chosen provider (an AWS t3.* is invalid on

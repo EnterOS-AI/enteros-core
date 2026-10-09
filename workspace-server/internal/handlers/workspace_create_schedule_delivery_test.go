@@ -101,6 +101,16 @@ func driveScheduledCreate(t *testing.T, configsDir, templateName string) provisi
 	capture := &captureCPProv{}
 	wh.SetCPProvisioner(capture)
 
+	// A REAL uuid: workspaces.id is `uuid`, and the create path now validates a
+	// caller-supplied parent_id (validateCreateParentID) before the INSERT, so
+	// the old "parent-ws" placeholder is a 400. It would have failed the FK
+	// cast against a real database too — the placeholder only ever worked
+	// because sqlmock does not type-check arguments.
+	const schedParentID = "dddddddd-000a-0000-0000-000000000000"
+	mock.ExpectQuery("SELECT status.*FROM workspaces WHERE id").
+		WithArgs(schedParentID).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("online"))
+
 	// ── Parent-goroutine load-bearing statements (Create body) ──
 	mock.ExpectBegin()
 	mock.ExpectExec(`INSERT INTO workspaces`).
@@ -120,7 +130,7 @@ func driveScheduledCreate(t *testing.T, configsDir, templateName string) provisi
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	body := `{"name":"Sched Create","runtime":"claude-code","model":"minimax/MiniMax-M2.7","template":"` +
-		templateName + `","parent_id":"parent-ws"}`
+		templateName + `","parent_id":"` + schedParentID + `"}`
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))

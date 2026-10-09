@@ -404,7 +404,24 @@ jobs:
           # GREEN. Listing them here fails THIS gate on their failure regardless of the
           # soak; external_runtime + reconciler_heals_terminated stay advisory (not yet
           # reliable — separate promotion once soaked green).
-          E2E_EPHEMERAL_EXTRA_GATING: peer_visibility,concierge_creates_workspace
+          #
+          # concierge_platform_agent GRADUATED: it asserts the platform-agent install
+          # + identity + kind + discovery-peers authz, and has run on EVERY PR under the
+          # ADVISORY soak — so a regression to the concierge lane merged GREEN. That is
+          # exactly what happened: a concierge shipped with NO persona (its config
+          # declared prompt_files: [prompts/concierge.md] while the file was never
+          # materialized) and nothing pre-merge could block it.
+          #
+          # COVERAGE THIS STILL DOES NOT GIVE: this scenario is DB/handler state —
+          # "no boot". It never starts a runtime, builds a system prompt, registers an
+          # MCP, or makes a model call. The present+CALLABLE half
+          # (TestPlatformAgentMgmtMCP_Staging — a real concierge boot driven over A2A to
+          # actually RUN provision_workspace) still runs ONLY post-merge in
+          # staging-tenant-cd, because the real-runtime matrix it needs
+          # (E2E_EPHEMERAL_REAL_RUNTIME_MATRIX) is referenced in comments but was never
+          # implemented. Until it is, a concierge that boots without an identity can
+          # STILL merge green. Pinned by test_concierge_lane_is_merge_blocking.py.
+          E2E_EPHEMERAL_EXTRA_GATING: peer_visibility,concierge_creates_workspace,concierge_platform_agent
         run: |
           bash tests/e2e/ephemeral_cp_happy_path.sh
           echo "GATE_ARM=proof" >> "$GITHUB_ENV"

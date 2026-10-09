@@ -188,16 +188,35 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 	// Wait for the concierge to reach status=online — which RCA #2970 makes
 	// UNREACHABLE unless its management MCP is present — collecting the row-reported
 	// signals (mcp_server_present, loaded_mcp_tools, runtime) into a probe.
-	deadline := time.Now().Add(15 * time.Minute)
+	//
+	// TERMINAL-SIGNAL WAIT (readiness_terminal_signal.go). This loop used to be
+	// positive-edge-only: it polled for status=="online" for a fixed 15 minutes,
+	// logged NOTHING in between, and then reported a timeout. Over the 278
+	// e2e-smoke verdicts in retention that produced 26 reds — the single largest
+	// Guard B failure cluster — and in 24 of them the last status was "failed":
+	// a verdict the control plane had published minutes earlier, with a reason,
+	// in the very body this loop was already parsing. The gate then purged the
+	// org, destroying its own evidence. Four multi-hour staging incidents were
+	// each investigated from logs that said only "never reached online WITHIN
+	// 15m".
+	//
+	// Now every poll yields one of three answers, a status TRANSITION is logged
+	// as it happens (the lifecycle wait always did this; that is why its reds
+	// were diagnosable and these were not), and a published terminal verdict
+	// ends the wait — after, and only after, it has outlived the control plane's
+	// own self-heal window, so a concierge the CP is still remediating is never
+	// called dead early.
+	watch := DeployConciergeOnlineWatch()
 	var probe MgmtMCPProbe
 	probe.ExpectedRuntime = expectedRuntime
 	probe.RequiredTool = requiredTool
 	probe.AssertCallable = assertCallable
 	probe.RequireCallable = requireCallable
 	online := false
-	var lastStatus, lastPresent, lastTools string
-	for time.Now().Before(deadline) {
+	var lastPresent, lastTools, waitFailure string
+	for !online {
 		hs, body := doTenantJSON(t, "GET", "https://"+host+"/workspaces/"+platformID, token, orgID, "")
+		obs := Obs{ReadOK: hs == http.StatusOK}
 		if hs == http.StatusOK {
 			status := jsonField(body, "status")
 			present, presentReported := jsonBool(body, "mcp_server_present")
@@ -207,24 +226,44 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 			probe.MCPServerPresentReported = presentReported
 			probe.LoadedTools = tools
 			probe.ObservedRuntime = observedRuntime(body)
-			lastStatus = status
 			lastPresent = fmt.Sprintf("%v(reported=%v)", present, presentReported)
 			lastTools = strings.Join(tools, ",")
-
-			if status == "online" {
-				online = true
-				break
-			}
+			// last_sample_error is the control plane's OWN reason for a failed
+			// platform agent (markWorkspaceFailed writes it alongside the status
+			// flip; core#5035 kept it un-stripped on this endpoint precisely so a
+			// reader like this one can quote it).
+			obs.Status = status
+			obs.Detail = topLevelString(body, "last_sample_error")
 		}
-		time.Sleep(15 * time.Second)
+		step := watch.Observe(time.Now(), obs)
+		if step.Transitioned && step.Message != "" {
+			t.Logf("    %s mcp_server_present=%s loaded_mcp_tools=[%s]", step.Message, lastPresent, lastTools)
+		}
+		switch step.Decision {
+		case WaitReady:
+			online = true
+		case WaitFailTerminal, WaitFailBudget, WaitFailMisconfigured:
+			waitFailure = step.Message
+		default:
+			time.Sleep(15 * time.Second)
+			continue
+		}
+		if waitFailure != "" {
+			break
+		}
 	}
 	if !online {
-		t.Fatalf("platform agent %s never reached online WITHIN 15m "+
-			"(last status=%q mcp_server_present=%s loaded_mcp_tools=[%s]; required verb=%q).\n"+
-			"This is the test14 / broken-openclaw-pin failure mode: the concierge's mgmt-MCP plugin was "+
+		t.Fatalf("platform agent %s never came online.\n"+
+			"  %s\n"+
+			"  mcp_server_present=%s loaded_mcp_tools=[%s]; required verb=%q.\n"+
+			"  This is the test14 / broken-openclaw-pin failure mode: the concierge's mgmt-MCP plugin was "+
 			"not installed (e.g. a presign:// declared source the deployed runtime cannot resolve) → "+
-			"RCA #2970 fail-closed → the platform agent can never manage the org.",
-			platformID, lastStatus, lastPresent, lastTools, requiredTool)
+			"RCA #2970 fail-closed → the platform agent can never manage the org.\n"+
+			"  CP tenant diagnostics: %s\n"+
+			"  CP boot-events:        %s",
+			platformID, waitFailure, lastPresent, lastTools, requiredTool,
+			bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/diagnostics"),
+			bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/boot-events?limit=20"))
 	}
 
 	// core#5026 — the concierge reached online, so its boot-install report MUST be
@@ -251,7 +290,11 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 	// Presence-only checks (status/inventory) cannot catch a present-but-not-runnable
 	// verb; this can. Only when the deploy gate opts in (E2E_ASSERT_MGMT_MCP_CALLABLE).
 	if assertCallable {
-		probe.WorkerProvisioned = driveProvisionWorkspaceCallable(t, host, token, orgID, platformID)
+		probe.WorkerProvisioned, probe.ProvisionedWorkspaceID, probe.Claim =
+			driveProvisionWorkspaceCallable(t, host, token, orgID, platformID)
+		t.Logf("concierge self-report: observed=%v claims_created=%v published_ids=[%s] row_id=%q",
+			probe.Claim.Observed, probe.Claim.ClaimsCreated,
+			strings.Join(probe.Claim.ClaimedWorkspaceIDs, ","), probe.ProvisionedWorkspaceID)
 	}
 
 	// One verdict, computed by the SAME pure logic the fail-before unit test proves
@@ -313,9 +356,15 @@ func buildSHAMatches(got, want string) bool {
 // driveProvisionWorkspaceCallable sends the concierge a real A2A message/send
 // turn instructing it to call provision_workspace, then polls GET /workspaces for
 // the DETERMINISTIC side effect — a genuine kind='workspace' row with the exact
-// name we asked for. Returns true iff that row appears (the verb genuinely ran).
+// name we asked for. Returns whether that row appeared (the verb genuinely ran),
+// the row's id, and the concierge's OWN self-report about the turn.
 // Cold-start tolerant: retries the A2A POST on 5xx and re-nudges while polling.
-func driveProvisionWorkspaceCallable(t *testing.T, host, token, orgID, platformID string) bool {
+//
+// The self-report is collected but NEVER used as evidence that the verb ran —
+// that stays the row. It is returned so EvaluateMgmtMCPCallable can RECONCILE
+// what the agent said against what actually landed (failure mode G9); see
+// concierge_self_report_gate.go.
+func driveProvisionWorkspaceCallable(t *testing.T, host, token, orgID, platformID string) (bool, string, ConciergeClaim) {
 	t.Helper()
 	worker := fmt.Sprintf("e2e-mcp-callable-%s", newUUIDv4(t)[:8])
 	prompt := fmt.Sprintf("Please create a new team member workspace in this org right now using your platform "+
@@ -327,30 +376,59 @@ func driveProvisionWorkspaceCallable(t *testing.T, host, token, orgID, platformI
 	actBudget := durationOr("E2E_AGENT_ACT_SECS", 420*time.Second)
 	url := "https://" + host + "/workspaces/" + platformID + "/a2a"
 
+	// Every raw A2A response body this turn produced, plus the queue ids the
+	// tenant handed back when it merely ACKED the send. Both feed the
+	// self-report reconciliation below.
+	var turnBodies []string
+	var queueIDs []string
+
 	sendA2A := func() {
 		// Wide per-call window: a cold concierge's first turn opens the LLM
 		// connection + loads the platform MCP subprocess before running the tool.
 		st, resp := doTenantJSONTimeout(t, "POST", url, token, orgID, payload, actBudget)
-		t.Logf("A2A provision_workspace turn → HTTP %d (worker=%s): %s", st, worker, truncate(resp, 200))
+		// core#5052: this used to truncate at 200 chars. The runtime's own
+		// failure text is `Model generated invalid tool call: <name>` wrapped in
+		// a JSON-RPC envelope, and the envelope alone is ~145 chars — so the one
+		// field that names WHY the turn failed (the rejected tool id) was cut off
+		// mid-word on every red run. Two separate investigations of this gate
+		// stalled on `mcp__molecule_…` with the rest destroyed by this call.
+		// The cap exists for log hygiene, not for redaction: make it wide enough
+		// that the diagnostic survives.
+		t.Logf("A2A provision_workspace turn → HTTP %d (worker=%s): %s", st, worker, truncate(resp, a2aTurnLogCap))
+		if strings.TrimSpace(resp) != "" {
+			turnBodies = append(turnBodies, resp)
+		}
+		if qid := QueuedA2AQueueID(resp); qid != "" && !containsStr(queueIDs, qid) {
+			queueIDs = append(queueIDs, qid)
+		}
 	}
 	sendA2A()
 
 	deadline := time.Now().Add(actBudget)
 	nextNudge := time.Now().Add(75 * time.Second)
 	for time.Now().Before(deadline) {
-		if id, kind := findWorkspaceByName(t, host, token, orgID, worker); id != "" {
-			if kind != "" && kind != "workspace" {
-				t.Logf("callable turn produced %q with kind=%q (want workspace) — treating as not-a-real-create", worker, kind)
-				return false
-			}
+		if id, kind, status := findWorkspaceByName(t, host, token, orgID, worker); id != "" {
 			// Best-effort targeted cleanup of the worker the concierge created.
+			// Registered BEFORE the verdict so a row we then REFUSE (kind skew /
+			// terminal-failed) is still torn down rather than leaked into the org.
 			t.Cleanup(func() {
 				_, _ = doTenantJSON(t, "DELETE",
 					"https://"+host+"/workspaces/"+id+"?confirm=true", token, orgID, "")
 			})
-			t.Logf("CALLABLE CONFIRMED: concierge %s ran provision_workspace → workspace %q (id=%s) exists",
-				platformID, worker, id)
-			return true
+			// core#5052: the row verdict is PURE and unit-tested
+			// (ClassifyProvisionedWorkspace / platform_agent_mgmt_mcp_gate_test.go).
+			// It reads `status` as well as `kind` — the pre-fix gate matched on
+			// name+kind only, so a workspace that was created and then FAILED
+			// still reported "CALLABLE CONFIRMED".
+			ok, reason := ClassifyProvisionedWorkspace(kind, status)
+			if !ok {
+				t.Logf("callable turn produced %q (id=%s kind=%q status=%q) but it is NOT callable proof: %s",
+					worker, id, kind, status, reason)
+				return false, id, collectConciergeSelfReport(t, host, token, orgID, platformID, turnBodies, queueIDs)
+			}
+			t.Logf("CALLABLE CONFIRMED: concierge %s ran provision_workspace → workspace %q (id=%s kind=%q status=%q): %s",
+				platformID, worker, id, kind, status, reason)
+			return true, id, collectConciergeSelfReport(t, host, token, orgID, platformID, turnBodies, queueIDs)
 		}
 		if time.Now().After(nextNudge) {
 			t.Logf("worker %q not yet created — re-nudging the concierge (cold-start tolerance)", worker)
@@ -360,7 +438,84 @@ func driveProvisionWorkspaceCallable(t *testing.T, host, token, orgID, platformI
 		time.Sleep(8 * time.Second)
 	}
 	t.Logf("callable turn: workspace %q never appeared within %s — provision_workspace not genuinely callable", worker, actBudget)
-	return false
+	return false, "", collectConciergeSelfReport(t, host, token, orgID, platformID, turnBodies, queueIDs)
+}
+
+// collectConciergeSelfReport retrieves what the concierge ITSELF said about the
+// provision turn and parses it into a ConciergeClaim.
+//
+// WHY IT HAS TO FOLLOW THE QUEUE. On today's staging fleet POST
+// /workspaces/:id/a2a answers {"queued":true,"queue_id":...} — a transport
+// acknowledgement, not the agent's answer. Every green Guard B run in retention
+// logs exactly that and nothing else, which means the gate has NEVER seen a
+// self-report on the modern path. Reconciling only what the POST returns would
+// therefore be a phantom check: armed, and unable to fire. The queue-status
+// endpoint (GET /workspaces/:id/a2a/queue/:queue_id, RFC #2331) is the public
+// route to the stored reply, and the tenant admin token this test already holds
+// is org-privileged, so it can read it.
+//
+// Best-effort by construction: a queue row we cannot read contributes nothing
+// and leaves Claim.Observed=false, which makes the reconciliation ABSTAIN. It
+// must never fail the test on its own — the row is still the evidence, and a
+// gate that reddened because a diagnostic endpoint was slow would be worse than
+// the hole it closes.
+//
+// TWO THINGS MAKE THAT PROPERTY REAL RATHER THAN ASPIRATIONAL:
+//
+//   - the read uses doTenantJSONTimeout, NOT doTenantJSON. doTenantJSON calls
+//     t.Fatalf on a transport error, so a slow or flapping tenant would kill the
+//     whole gate from inside a diagnostic — the exact opposite of the stated
+//     contract, and multiplied by up to one call per nudge. doTenantJSONTimeout
+//     logs and returns (0, ""), which this collector treats as "nothing to add".
+//
+//   - the loop itself lives in CollectSelfReportBodies (untagged), which has no
+//     error return and no fatal path at all, and is unit-tested against a fetch
+//     that only ever transport-fails.
+//
+// PRECISELY WHAT IS AND IS NOT GUARANTEED (round-2 review). doTenantJSONTimeout
+// is not fatal-free: it t.Fatalf's if tenantTopoFromURL rejects the URL or if
+// http.NewRequest cannot build the request — and http.NewRequest DOES reject a
+// control character in a URL. So the guarantee is not "this helper can never
+// fatal"; it is that no input reaching it here can make it fatal. Of the URL's
+// three parts, host and platformID are fixed for the run and already used by
+// every other call in this test, and the queue id — the only value that varies
+// and the only one taken from tenant JSON — is validated to an opaque token by
+// QueuedA2AQueueID before it is ever concatenated. A queue id that is not a
+// plain token is dropped at parse time and never followed.
+//
+// The budget is ONE TOTAL allowance shared across every queue id, not per id:
+// a turn can accumulate ~6 nudges, and a per-id budget would have added
+// double-digit minutes to a hard prod gate.
+func collectConciergeSelfReport(t *testing.T, host, token, orgID, platformID string, bodies, queueIDs []string) ConciergeClaim {
+	t.Helper()
+
+	budget := durationOr("E2E_SELF_REPORT_POLL_SECS", 120*time.Second)
+	deadline := time.Now().Add(budget)
+	perCall := 30 * time.Second
+
+	fetch := func(qid string) (int, string) {
+		url := "https://" + host + "/workspaces/" + platformID + "/a2a/queue/" + qid
+		// NOT doTenantJSON — see the contract note above.
+		st, body := doTenantJSONTimeout(t, "GET", url, token, orgID, "", perCall)
+		if st == http.StatusOK && A2AQueueTerminalStatus(queueStatusOf(body)) {
+			t.Logf("self-report: queue %s reached a terminal status → %s", qid, truncate(body, a2aTurnLogCap))
+		}
+		return st, body
+	}
+	expired := func() bool { return time.Now().After(deadline) }
+	waited := func(string) { time.Sleep(5 * time.Second) }
+
+	before := len(queueIDs)
+	bodies = CollectSelfReportBodies(bodies, queueIDs, fetch, expired, waited)
+
+	claim := ParseConciergeClaim(bodies)
+	if !claim.Observed {
+		t.Logf("self-report: NOT OBSERVED after polling %d queue id(s) within %s — the reconciliation abstains and the created row remains the sole evidence", before, budget)
+	}
+	for i, txt := range claim.Texts {
+		t.Logf("self-report reply[%d]: %s", i, truncate(strings.Join(strings.Fields(txt), " "), a2aTurnLogCap))
+	}
+	return claim
 }
 
 // loadedMCPTools extracts the loaded_mcp_tools string array from a GET
@@ -433,25 +588,32 @@ func a2aMessageSend(t *testing.T, text string) string {
 	return string(b)
 }
 
-// findWorkspaceByName returns (id, kind) of the workspace whose name == want in
-// GET /workspaces, or ("","") if absent. The list rows omit name from the shared
-// parseWorkspaceList row, so this does its own permissive decode.
-func findWorkspaceByName(t *testing.T, host, token, orgID, want string) (id, kind string) {
+// findWorkspaceByName returns (id, kind, status) of the workspace whose
+// name == want in GET /workspaces, or ("","","") if absent. The list rows omit
+// name from the shared parseWorkspaceList row, so this does its own permissive
+// decode.
+//
+// core#5052: `status` is returned as well as `kind`. It used to return only
+// (id, kind), which made Guard B's hardest assertion VACUOUS — a workspace the
+// concierge created that then FAILED to provision still satisfied "CALLABLE
+// CONFIRMED", because nothing ever read its status. The verdict itself lives in
+// the pure, unit-tested ClassifyProvisionedWorkspace.
+func findWorkspaceByName(t *testing.T, host, token, orgID, want string) (id, kind, status string) {
 	t.Helper()
 	hs, body := doTenantJSON(t, "GET", "https://"+host+"/workspaces", token, orgID, "")
 	if hs != http.StatusOK {
-		return "", ""
+		return "", "", ""
 	}
 	var raw []map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(body), &raw); err != nil {
-		return "", ""
+		return "", "", ""
 	}
 	for _, m := range raw {
 		if rawString(m["name"]) == want {
-			return rawString(m["id"]), rawString(m["kind"])
+			return rawString(m["id"]), rawString(m["kind"]), rawString(m["status"])
 		}
 	}
-	return "", ""
+	return "", "", ""
 }
 
 // doTenantJSONTimeout is doTenantJSON with a caller-set client timeout — an A2A

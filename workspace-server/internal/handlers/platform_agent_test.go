@@ -925,13 +925,13 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 		// the RECONCILE path (re-resolve the SSOT). Stub the resolver to the SAME
 		// stored model so reconcile is a no-op (no re-persist) — this subtest is
 		// about the MCP/name wiring, not the model reconcile.
-		setConciergeModelResolver(t, "moonshot/kimi-k2.6", nil)
+		setConciergeModelResolver(t, "minimax/MiniMax-M2.7", nil)
 		mock := setupTestDB(t)
 		mock.ExpectQuery(kindQuery).WithArgs("ws-concierge").
 			WillReturnRows(sqlmock.NewRows([]string{"kind", "runtime"}).AddRow("platform", "claude-code"))
 		mock.ExpectQuery(modelSelQuery).WithArgs("ws-concierge").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
-				AddRow([]byte("moonshot/kimi-k2.6"), 0))
+				AddRow([]byte("minimax/MiniMax-M2.7"), 0))
 		// ensureConciergeProvider existence check (env has no MODEL here → no pin).
 		mock.ExpectQuery(providerSelQuery).WithArgs("ws-concierge").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
@@ -943,7 +943,7 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		env := map[string]string{}
 		cf := map[string][]byte{
-			"config.yaml":      []byte("runtime: claude-code\nmodel: moonshot/kimi-k2.6\n"),
+			"config.yaml":      []byte("runtime: claude-code\nmodel: minimax/MiniMax-M2.7\n"),
 			"system-prompt.md": []byte("# You are {{CONCIERGE_NAME}} — the Org Concierge\n"),
 		}
 		out := h.applyConciergeProvisionConfig(context.Background(), "ws-concierge", "", cf, env, "Molecule AI Agent")
@@ -975,13 +975,13 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 
 	t.Run("idempotent re-provision on the platform agent (no double-substitution)", func(t *testing.T) {
 		// Reconcile no-op (stored == resolved SSOT) — see the subtest above.
-		setConciergeModelResolver(t, "moonshot/kimi-k2.6", nil)
+		setConciergeModelResolver(t, "minimax/MiniMax-M2.7", nil)
 		mock := setupTestDB(t)
 		mock.ExpectQuery(kindQuery).WithArgs("ws-concierge").
 			WillReturnRows(sqlmock.NewRows([]string{"kind", "runtime"}).AddRow("platform", "claude-code"))
 		mock.ExpectQuery(modelSelQuery).WithArgs("ws-concierge").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
-				AddRow([]byte("moonshot/kimi-k2.6"), 0))
+				AddRow([]byte("minimax/MiniMax-M2.7"), 0))
 		mock.ExpectQuery(providerSelQuery).WithArgs("ws-concierge").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
 		// recordDeclaredPlugin: privileged-plugin kind precheck (→platform) + declared INSERT.
@@ -1143,7 +1143,7 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 	t.Run("authoritative resolver returns a non-const model → seed follows it", func(t *testing.T) {
 		// A DIFFERENT routable platform model than the const default, so a pass
 		// proves the resolved value (not platformDefaultModelFallback) drives the seed.
-		const resolvedModel = "moonshot/kimi-k2.6"
+		const resolvedModel = "minimax/MiniMax-M2.7-highspeed"
 		if resolvedModel == platformDefaultModelFallback {
 			t.Fatalf("test invariant broken: resolvedModel must differ from the const to prove the resolver wins")
 		}
@@ -1243,7 +1243,7 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 		// the operator-supplied env as the SSOT.
 		t.Setenv("MOLECULE_ORG_ID", "")
 		t.Setenv("ADMIN_TOKEN", "")
-		const selfHostedModel = "moonshot/kimi-k2.6"
+		const selfHostedModel = "minimax/MiniMax-M2.7-highspeed"
 		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", selfHostedModel)
 		t.Setenv("MOLECULE_DEFAULT_RUNTIME", "claude-code")
 
@@ -1343,10 +1343,14 @@ func TestEnsureConciergeModel_ReconcilesPlatformManagedToSSOT(t *testing.T) {
 	t.Run("platform-managed default reconciles to the SSOT (the M-bump propagates)", func(t *testing.T) {
 		setConciergeModelResolver(t, ssot, nil)
 		mock := setupTestDB(t)
-		// Stored model is the OLD platform default (moonshot) → platform-managed.
+		// Stored model is an OLDER platform-managed default — a different LIVE
+		// platform id than the SSOT — so reconcile must move it. (Was the
+		// moonshot/kimi-k2.6 default; sdk#203 withdrew that id and an unroutable
+		// stored id no longer takes this path, see reconcileExistingConciergeModel's
+		// KNOWN GAP note.)
 		mock.ExpectQuery(modelSelQuery).WithArgs("ws-recon").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
-				AddRow([]byte("moonshot/kimi-k2.6"), 0))
+				AddRow([]byte("minimax/MiniMax-M2.7-highspeed"), 0))
 		// Reconcile overwrites → the SSOT model is persisted.
 		mock.ExpectExec(secretInsert).
 			WithArgs("ws-recon", sqlmock.AnyArg(), sqlmock.AnyArg()).
@@ -1356,9 +1360,9 @@ func TestEnsureConciergeModel_ReconcilesPlatformManagedToSSOT(t *testing.T) {
 		// Hermes model. Reconcile must update the runtime-specific name too; leaving
 		// it stale makes Hermes ignore the corrected generic MODEL values.
 		env := map[string]string{
-			"MODEL":                "moonshot/kimi-k2.6",
-			"MOLECULE_MODEL":       "moonshot/kimi-k2.6",
-			"HERMES_DEFAULT_MODEL": "moonshot/kimi-k2.6",
+			"MODEL":                "minimax/MiniMax-M2.7-highspeed",
+			"MOLECULE_MODEL":       "minimax/MiniMax-M2.7-highspeed",
+			"HERMES_DEFAULT_MODEL": "minimax/MiniMax-M2.7-highspeed",
 		}
 		h.ensureConciergeModel(context.Background(), "ws-recon", "hermes", env)
 
@@ -1422,13 +1426,13 @@ func TestEnsureConciergeModel_ReconcilesPlatformManagedToSSOT(t *testing.T) {
 		mock := setupTestDB(t)
 		mock.ExpectQuery(modelSelQuery).WithArgs("ws-blip").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
-				AddRow([]byte("moonshot/kimi-k2.6"), 0))
+				AddRow([]byte("minimax/MiniMax-M2.7-highspeed"), 0))
 		// No INSERT — keep the existing model rather than wedge the concierge.
 
-		env := map[string]string{"MODEL": "moonshot/kimi-k2.6", "MOLECULE_MODEL": "moonshot/kimi-k2.6"}
+		env := map[string]string{"MODEL": "minimax/MiniMax-M2.7-highspeed", "MOLECULE_MODEL": "minimax/MiniMax-M2.7-highspeed"}
 		h.ensureConciergeModel(context.Background(), "ws-blip", "claude-code", env)
 
-		if env["MODEL"] != "moonshot/kimi-k2.6" || env["MOLECULE_MODEL"] != "moonshot/kimi-k2.6" {
+		if env["MODEL"] != "minimax/MiniMax-M2.7-highspeed" || env["MOLECULE_MODEL"] != "minimax/MiniMax-M2.7-highspeed" {
 			t.Fatalf("resolver blip lost the existing model; env=%v", env)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
@@ -1458,7 +1462,14 @@ func TestApplyConciergeProvisionConfig_MoleculeModelResolvesMinimaxNotMoonshot(t
 	const secretInsert = `INSERT INTO workspace_secrets`
 
 	const ssot = "minimax/MiniMax-M2.7"
-	const deadPin = "moonshot/kimi-k2.6"
+	// The STALE pin under test. Originally the dead moonshot/kimi-k2.6 template
+	// pin; sdk#203 WITHDREW that id, and an unroutable stored id no longer takes
+	// the platform-managed reconcile path (see reconcileExistingConciergeModel's
+	// KNOWN GAP note), so it is retargeted onto an older-but-LIVE platform id.
+	// The assertion under test is unchanged: a stale platform-managed pin must
+	// reconcile to the SSOT on BOTH canonical env names, with no MODEL/
+	// MOLECULE_MODEL split left behind.
+	const deadPin = "minimax/MiniMax-M2.7-highspeed"
 
 	setConciergeModelResolver(t, ssot, nil)
 	t.Setenv("MOLECULE_DEFAULT_RUNTIME", "claude-code")
@@ -1499,7 +1510,7 @@ func TestApplyConciergeProvisionConfig_MoleculeModelResolvesMinimaxNotMoonshot(t
 		t.Errorf("MOLECULE_MODEL (the Config-tab DISPLAY env) did not resolve to minimax; got %q want %q", env["MOLECULE_MODEL"], ssot)
 	}
 	if env["MODEL"] == deadPin || env["MOLECULE_MODEL"] == deadPin {
-		t.Errorf("a dead moonshot pin survived reconcile: MODEL=%q MOLECULE_MODEL=%q — the DISPLAY would still show moonshot", env["MODEL"], env["MOLECULE_MODEL"])
+		t.Errorf("a stale pin survived reconcile: MODEL=%q MOLECULE_MODEL=%q — the DISPLAY would still show the stale model", env["MODEL"], env["MOLECULE_MODEL"])
 	}
 	// The whole point: MODEL and MOLECULE_MODEL must AGREE (no split).
 	if env["MODEL"] != env["MOLECULE_MODEL"] {
@@ -2113,14 +2124,14 @@ func TestDefaultResolveConciergeModel(t *testing.T) {
 	t.Run("self-hosted path reads MOLECULE_LLM_DEFAULT_MODEL env", func(t *testing.T) {
 		t.Setenv("MOLECULE_ORG_ID", "")
 		t.Setenv("ADMIN_TOKEN", "")
-		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "moonshot/kimi-k2.6")
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "minimax/MiniMax-M2.7-highspeed")
 
 		got, err := defaultResolveConciergeModel(context.Background())
 		if err != nil {
 			t.Fatalf("defaultResolveConciergeModel returned error: %v", err)
 		}
-		if got != "moonshot/kimi-k2.6" {
-			t.Errorf("defaultResolveConciergeModel() = %q, want %q", got, "moonshot/kimi-k2.6")
+		if got != "minimax/MiniMax-M2.7-highspeed" {
+			t.Errorf("defaultResolveConciergeModel() = %q, want %q", got, "minimax/MiniMax-M2.7-highspeed")
 		}
 	})
 
