@@ -38,7 +38,7 @@ import (
 // (main.go) gets the same pluginResolver instance so it can share scheme
 // enumeration if a deployment registers extra schemes externally. A nil
 // pluginResolver is harmless: plgh still works with its built-in defaults.
-func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, hostStateDir string, bootTokens *provisioner.BootConfigTokenStore, wh *handlers.WorkspaceHandler, greeter func(workspaceID string, toolCount int), channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) *gin.Engine {
+func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, hostStateDir string, bootTokens *provisioner.BootConfigTokenStore, wh *handlers.WorkspaceHandler, greeter func(workspaceID string, toolCount int), channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) (*gin.Engine, *handlers.AdminPluginDriftHandler) {
 	r := gin.Default()
 
 	// Issue #179 — trust no reverse-proxy headers. Without this call Gin's
@@ -569,6 +569,18 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		beh := handlers.NewBootEventHandler(broadcaster)
 		wsAuth.POST("/boot-event", beh.Report)
 
+		// Plugin boot-install report — SDK contract contracts/plugin-install-report.
+		// DELIBERATELY UNLIKE the boot-step feed directly above it on the two axes
+		// that made a fleet-wide failure unobservable (#4953): every workspace
+		// reports regardless of kind (boot_step_emit is concierge-gated "so an
+		// ordinary, non-concierge tenant boot doesn't spam the endpoint"), and the
+		// report is PERSISTED (a BOOT_STEP is BroadcastOnly — presentation only, so
+		// it answers nothing for an operator asking an hour later). One POST per
+		// boot, not per boot phase.
+		pirh := handlers.NewPluginInstallReportHandler()
+		wsAuth.POST("/plugin-install-report", pirh.Report)
+		wsAuth.GET("/plugin-install-report", pirh.Get)
+
 		// Config
 		cfgh := handlers.NewConfigHandler()
 		wsAuth.GET("/config", cfgh.Get)
@@ -686,7 +698,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		//   C2: MCPRateLimiter caps tool calls at 120/min/token so a long-lived
 		//       opencode session cannot saturate the platform.
 		//   C3: commit_memory/recall_memory with scope=GLOBAL → permission error;
-		//       send_message_to_user excluded unless MOLECULE_MCP_ALLOW_SEND_MESSAGE=true.
+		//       send_message_to_user is included by default and excluded only where
+		//       the MOLECULE_MCP_ALLOW_SEND_MESSAGE kill-switch is set falsy.
 		mcpH := handlers.NewMCPHandler(db.DB, broadcaster, pushNotifier)
 		if memBundle != nil {
 			mcpH.WithMemoryV2(memBundle.Plugin, memBundle.Resolver)
@@ -695,6 +708,18 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.GET("/mcp/stream", mcpRl.Middleware(), mcpH.Stream)
 		wsAuth.POST("/mcp", mcpRl.Middleware(), mcpH.Call)
 	}
+
+	// Desktop computer-use routes (design decision B): the authenticated seam
+	// the IN-CONTAINER agent desktop tool (a2a_tools_desktop.py, later a native
+	// kind:mcp plugin) calls — the platform layer is a gateway, NOT an MCP tool,
+	// so the agent surface stays plugin-extractable. screenshot = eyes (not
+	// lock-gated, §8); input = hands (gateway is fail-closed on the control
+	// lock -> 409 when a human holds control). wsAuth gates on the workspace
+	// bearer, same as the MCP endpoint.
+	wsAuth.GET("/desktop/screenshot", wh.DesktopScreenshot)
+	wsAuth.POST("/desktop/input", wh.DesktopInput)
+	wsAuth.POST("/desktop/navigate", wh.DesktopNavigate)
+	wsAuth.GET("/desktop/control", wh.DesktopControlStatus)
 
 	// Global secrets — /settings/secrets is the canonical path; /admin/secrets kept for backward compat.
 	// Protected by strict AdminAuth: a missing or invalid bearer is rejected in
@@ -753,6 +778,20 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		adH := handlers.NewAdminDelegationsHandler(db.DB)
 		r.GET("/admin/delegations", middleware.AdminAuth(db.DB), adH.List)
 		r.GET("/admin/delegations/stats", middleware.AdminAuth(db.DB), adH.Stats)
+	}
+
+	// Admin — the FLEET read over plugin-install reports (#4981 §1). The
+	// migration's `workspace_plugin_install_reports_not_live` partial index was
+	// created to answer "which workspaces booted with no live plugins" and no
+	// handler issued that query, so the question still needed direct DB access.
+	//
+	// AdminAuth, NOT the wsAuth group the POST/GET pair live in: those are bound
+	// to :id by WorkspaceAuth so a workspace can only see its own report, and this
+	// route returns rows for workspaces the caller never names. Same gate as the
+	// sibling operator reads above.
+	{
+		apirH := handlers.NewAdminPluginInstallReportsHandler(db.DB)
+		r.GET("/admin/plugin-install-reports", middleware.AdminAuth(db.DB), apirH.List)
 	}
 
 	// Admin — explicit registry-backed, single-host workspace image maintenance.
@@ -856,8 +895,14 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 	// Admin — plugin version-subscription drift queue (core#123).
 	// List pending drift entries and apply approved updates.
+	//
+	// driftH is hoisted out of this block and RETURNED so cmd/server can run
+	// the deterministic queue drainer against the same handler
+	// (handlers.StartPluginDriftApplier, core#4977). Setup builds the handler
+	// graph; main owns goroutine lifecycles — the same split the drift
+	// sweeper already uses.
+	driftH := handlers.NewAdminPluginDriftHandler(plgh)
 	{
-		driftH := handlers.NewAdminPluginDriftHandler(plgh)
 		adminAuth := r.Group("", middleware.AdminAuth(db.DB))
 		adminAuth.GET("/admin/plugin-updates-pending", driftH.ListPending)
 		adminAuth.POST("/admin/plugin-updates/:id/apply", driftH.Apply)
@@ -926,6 +971,19 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	wsAuth.PUT("/files/*path", tmplh.WriteFile)
 	wsAuth.DELETE("/files/*path", tmplh.DeleteFile)
 
+	// Per-install plugin settings (layer 6). NOT served through /files/*path on
+	// purpose: that route's side effect is a workspace RESTART, while a settings
+	// edit wants the file changed and the daemon reloaded — no restart, no lost
+	// session. GET returns every key with the layer that supplied it; PATCH is
+	// compare-and-set on overrides_version so a concurrent edit is refused with
+	// 409 rather than silently lost.
+	wsAuth.GET("/plugin-settings/:plugin", tmplh.GetPluginSettings)
+	wsAuth.PATCH("/plugin-settings/:plugin", tmplh.PatchPluginSettings)
+	// The plugin's OWN declaration, read live off the workspace, so the tab can
+	// render a form for a plugin the frontend has never seen. ?format=example
+	// returns the generated .example as text.
+	wsAuth.GET("/plugin-settings/:plugin/declaration", tmplh.GetPluginDeclaration)
+
 	// CORE-served boot-config fetch (the FINAL, platform-agnostic config path —
 	// no R2, no CP). Registered OUTSIDE the WorkspaceAuth group: the runtime holds
 	// a one-time BOOT token (minted by CPProvisioner into MOLECULE_CONFIG_BOOT_TOKEN,
@@ -977,7 +1035,15 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 	// Org Templates
 	orgDir := findOrgDir(configsDir)
-	orgh := handlers.NewOrgHandler(wh, broadcaster, prov, channelMgr, configsDir, orgDir)
+	// M6 / FIX 0: same templateCacheDir the TemplatesHandler above uses, so an
+	// org node's `template:` resolves cache-first exactly like the
+	// workspace-name path already does. One cache, one SSOT.
+	orgh := handlers.NewOrgHandler(wh, broadcaster, prov, channelMgr, configsDir, orgDir).
+		WithTemplateCacheDir(templateCacheDir).
+		// Lets /org/import RE-DELIVER declared plugins[].config to workspaces
+		// that already exist. tmplh already carries the docker client the
+		// delivery primitive needs; org import depends only on the capability.
+		WithPluginSettingsDeliverer(tmplh)
 	// #686: GET /org/templates exposes the org template catalogue (names, roles,
 	// configured system prompts). AdminAuth-gate to match /org/import.
 	r.GET("/org/templates", middleware.AdminAuth(db.DB), orgh.ListTemplates)
@@ -1082,7 +1148,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		r.NoRoute(canvasProxy)
 	}
 
-	return r
+	return r, driftH
 }
 
 func findPluginsDir(configsDir string) string {

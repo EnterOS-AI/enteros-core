@@ -3,6 +3,10 @@ import { test, expect } from "@playwright/test";
 const API = process.env.E2E_API_URL ?? "http://localhost:8080";
 
 interface OrgTemplate {
+  /** Set when the server could not LOAD the template; such an entry renders
+   *  "Unavailable" and is not importable. Non-empty on every broken path
+   *  (unlike `error`, which is empty when the underlying err was nil). */
+  reason?: string;
   dir: string;
   name: string;
   workspaces: number;
@@ -41,8 +45,12 @@ test.describe("Org template import (PLAN.md §20.3)", () => {
     await expect(section).toBeVisible({ timeout: 15000 });
     await expect(section.getByText("Org Templates")).toBeVisible();
 
-    // Wait for the API fetch to populate (auto-waits via toBeVisible)
-    const first = orgs[0];
+    // Wait for the API fetch to populate (auto-waits via toBeVisible).
+    // Pick the first LOADABLE template: /org/templates now returns entries the
+    // server could not load as present-but-unavailable (error/reason,
+    // workspaces: 0), and those render "Unavailable" with no workspace badge.
+    // os.ReadDir sorts lexically, so a broken dir can sort first.
+    const first = orgs.find((o) => !o.reason) ?? orgs[0];
     const label = first.name || first.dir;
     await expect(section.getByText(label, { exact: false })).toBeVisible({ timeout: 15000 });
     await expect(section.getByText(`${first.workspaces}w`)).toBeVisible();
@@ -58,8 +66,11 @@ test.describe("Org template import (PLAN.md §20.3)", () => {
     const section = page.getByTestId("org-templates-section").first();
     await expect(section).toBeVisible({ timeout: 15000 });
 
-    // Wait for the API result to render (one Import button per org)
+    // One "Import org" button per LOADABLE org. A template the server could
+    // not load renders a disabled "Unavailable" button instead, so counting
+    // every entry would over-count once any template is broken.
+    const importable = orgs.filter((o) => !o.reason);
     const buttons = section.getByRole("button", { name: /Import org/i });
-    await expect(buttons).toHaveCount(orgs.length, { timeout: 15000 });
+    await expect(buttons).toHaveCount(importable.length, { timeout: 15000 });
   });
 });

@@ -324,11 +324,11 @@ func TestAuditQuery_Success(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "timestamp", "agent_id", "session_id", "operation",
 			"input_hash", "output_hash", "model_used",
-			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id", "details",
 		}).AddRow(
 			ev.ID, ev.Timestamp, ev.AgentID, ev.SessionID, ev.Operation,
 			nil, nil, nil,
-			ev.HumanOversightFlag, ev.RiskFlag, nil, ev.HMAC, ev.WorkspaceID,
+			ev.HumanOversightFlag, ev.RiskFlag, nil, ev.HMAC, ev.WorkspaceID, ev.Details,
 		))
 
 	h := NewAuditHandler()
@@ -399,7 +399,7 @@ func TestAuditQuery_NoSaltReturnsNullChainValid(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "timestamp", "agent_id", "session_id", "operation",
 			"input_hash", "output_hash", "model_used",
-			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id", "details",
 		}))
 
 	h := NewAuditHandler()
@@ -446,7 +446,7 @@ func TestAuditQuery_EmptyEventsSerializesAsArray(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "timestamp", "agent_id", "session_id", "operation",
 			"input_hash", "output_hash", "model_used",
-			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id", "details",
 		}))
 
 	h := NewAuditHandler()
@@ -494,7 +494,7 @@ func TestAuditQuery_FiltersByAgentID(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "timestamp", "agent_id", "session_id", "operation",
 			"input_hash", "output_hash", "model_used",
-			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id", "details",
 		}))
 
 	h := NewAuditHandler()
@@ -568,7 +568,7 @@ func TestAuditQuery_LimitCap(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "timestamp", "agent_id", "session_id", "operation",
 			"input_hash", "output_hash", "model_used",
-			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id", "details",
 		}))
 
 	h := NewAuditHandler()
@@ -616,11 +616,11 @@ func TestAuditQuery_PaginatedOffsetReturnsNullChainValid(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "timestamp", "agent_id", "session_id", "operation",
 			"input_hash", "output_hash", "model_used",
-			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id", "details",
 		}).AddRow(
 			ev.ID, ev.Timestamp, ev.AgentID, ev.SessionID, ev.Operation,
 			nil, nil, nil,
-			ev.HumanOversightFlag, ev.RiskFlag, nil, ev.HMAC, ev.WorkspaceID,
+			ev.HumanOversightFlag, ev.RiskFlag, nil, ev.HMAC, ev.WorkspaceID, ev.Details,
 		))
 
 	h := NewAuditHandler()
@@ -677,11 +677,11 @@ func TestAuditQuery_SessionFilterReturnsNullChainValid(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "timestamp", "agent_id", "session_id", "operation",
 			"input_hash", "output_hash", "model_used",
-			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id", "details",
 		}).AddRow(
 			ev.ID, ev.Timestamp, ev.AgentID, ev.SessionID, ev.Operation,
 			nil, nil, nil,
-			ev.HumanOversightFlag, ev.RiskFlag, *ev.PrevHMAC, ev.HMAC, ev.WorkspaceID,
+			ev.HumanOversightFlag, ev.RiskFlag, *ev.PrevHMAC, ev.HMAC, ev.WorkspaceID, ev.Details,
 		))
 
 	h := NewAuditHandler()
@@ -729,7 +729,7 @@ func TestAuditQuery_FromFilterReturnsNullChainValid(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "timestamp", "agent_id", "session_id", "operation",
 			"input_hash", "output_hash", "model_used",
-			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id", "details",
 		}))
 
 	h := NewAuditHandler()
@@ -786,11 +786,11 @@ func TestAuditQuery_ChainVerification_Verified(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "timestamp", "agent_id", "session_id", "operation",
 			"input_hash", "output_hash", "model_used",
-			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id", "details",
 		}).AddRow(
 			ev.ID, ev.Timestamp, ev.AgentID, ev.SessionID, ev.Operation,
 			nil, nil, nil,
-			ev.HumanOversightFlag, ev.RiskFlag, nil, ev.HMAC, ev.WorkspaceID,
+			ev.HumanOversightFlag, ev.RiskFlag, nil, ev.HMAC, ev.WorkspaceID, ev.Details,
 		))
 
 	h := NewAuditHandler()
@@ -846,11 +846,11 @@ func TestAuditQuery_ChainVerification_Tampered(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "timestamp", "agent_id", "session_id", "operation",
 			"input_hash", "output_hash", "model_used",
-			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id", "details",
 		}).AddRow(
 			ev.ID, ev.Timestamp, ev.AgentID, ev.SessionID, ev.Operation,
 			nil, nil, nil,
-			ev.HumanOversightFlag, ev.RiskFlag, nil, ev.HMAC, ev.WorkspaceID,
+			ev.HumanOversightFlag, ev.RiskFlag, nil, ev.HMAC, ev.WorkspaceID, ev.Details,
 		))
 
 	h := NewAuditHandler()
@@ -897,7 +897,7 @@ func TestAuditQuery_ChainVerification_DisabledNoSalt(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "timestamp", "agent_id", "session_id", "operation",
 			"input_hash", "output_hash", "model_used",
-			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id", "details",
 		}))
 
 	h := NewAuditHandler()
@@ -944,7 +944,7 @@ func TestAuditQuery_ChainVerification_PartialQuery(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "timestamp", "agent_id", "session_id", "operation",
 			"input_hash", "output_hash", "model_used",
-			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id", "details",
 		}))
 
 	h := NewAuditHandler()

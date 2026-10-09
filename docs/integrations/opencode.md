@@ -74,8 +74,9 @@ client-side allowlist. The current bridge includes these groups:
   namespace-aware v2 search, summary, list, and forget tools.
 
 `delegate_task` and `delegate_task_async` disappear when the workspace has
-`can_delegate=false`. `send_message_to_user` is absent unless the platform
-explicitly sets `MOLECULE_MCP_ALLOW_SEND_MESSAGE=true`.
+`can_delegate=false`. `send_message_to_user` is present by default; it
+disappears only where an operator has set the kill-switch
+`MOLECULE_MCP_ALLOW_SEND_MESSAGE` to a falsy value (`0`/`false`/`no`/`off`).
 
 ## 4. Security and lifecycle
 

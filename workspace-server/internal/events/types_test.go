@@ -57,6 +57,7 @@ func TestAllEventTypes_IsSnapshot(t *testing.T) {
 		"WORKSPACE_PROVISIONING",
 		"WORKSPACE_PROVISION_FAILED",
 		"WORKSPACE_REMOVED",
+		"WORKSPACE_RESTART_DECLINED",
 	}
 	sort.Strings(expected)
 

@@ -199,6 +199,33 @@ print(sum(1 for o in orgs if o.get('slug') == '$SLUG' and o.get('instance_status
     fi
     sleep 5
   done
+  # A slow purge is an INFRA sub-step, not the thing under test. Escalating rc 0->4
+  # here fails the whole scenario — and peer_visibility is in E2E_EPHEMERAL_EXTRA_GATING,
+  # so on the ephemeral CP that turns a PASS into a merge-block. Observed on core#4923
+  # run 584794: the gate printed
+  #   ✅ GATE PASSED — every runtime under test sees its platform peers via the literal MCP call
+  # (3/3 peers on all three runtimes) and was then failed by this line alone.
+  #
+  # The escalation is RIGHT on staging, where a leaked tenant is durable and has caused
+  # a real provisioning outage. It is wrong on the ephemeral CP: that control plane is
+  # destroyed with the job, so a tenant outliving teardown by minutes outlives nothing —
+  # and the remediation this message names (sweep-stale-e2e-orgs, 90m age floor, "a later
+  # main push") does not apply to an ephemeral CP at all, so it points the reader at a
+  # sweeper that will never see this org.
+  #
+  # E2E_CP_ALLOW_EPHEMERAL_LOOPBACK is the discriminator: ephemeral_cp_happy_path.sh sets
+  # it on BOTH peer_visibility invocations (managed and external) and nothing else sets it.
+  # NOT E2E_INFRA_BACKEND=local-docker — staging-tenant-cd.yml and runtime-default-flip-gate.yml
+  # set that too, so it would silently disarm the check on staging, which is the one place
+  # it must keep biting.
+  #
+  # This scenario also provisions FOUR workspaces (parent + three runtimes), more than its
+  # peers, so it is the likeliest to exceed a fixed 120s purge budget for reasons that are
+  # load rather than breakage.
+  if [ "${E2E_CP_ALLOW_EPHEMERAL_LOOPBACK:-0}" = "1" ]; then
+    echo "::warning::[teardown] $SLUG outlived the 120s purge budget on an EPHEMERAL CP. The control plane is torn down with this job, so this is not a durable leak and does NOT fail the gate. (sweep-stale-e2e-orgs does not apply here.) Scenario result is unchanged: rc=$rc" >&2
+    exit "$rc"
+  fi
   echo "::warning::[teardown] $SLUG still present after 120s — investigate now; sweep-stale-e2e-orgs retries on a later main push after its 90m age floor" >&2
   [ "$rc" -eq 0 ] && rc=4
   exit "$rc"
@@ -293,9 +320,14 @@ SECRETS_JSON='{}'
 pv_platform_model_for_runtime() {
   if [ -n "${E2E_MODEL_SLUG:-}" ]; then printf '%s' "$E2E_MODEL_SLUG"; return 0; fi
   case "$1" in
-    claude-code) printf 'anthropic/claude-sonnet-4-6' ;;
-    hermes|openclaw) printf 'moonshot/kimi-k2.6' ;;
-    *) printf 'moonshot/kimi-k2.6' ;;
+    # 2026-08-04: sdk#203 narrowed every platform arm to minimax-only (the
+    # Moonshot vendor account is suspended and the anthropic/* platform ids were
+    # withdrawn under the same directive). Both former defaults now 422
+    # UNREGISTERED_MODEL_FOR_RUNTIME at create, so every runtime uses the ONE
+    # shared platform default here.
+    claude-code) printf 'minimax/MiniMax-M2.7' ;;
+    hermes|openclaw) printf 'minimax/MiniMax-M2.7' ;;
+    *) printf 'minimax/MiniMax-M2.7' ;;
   esac
 }
 

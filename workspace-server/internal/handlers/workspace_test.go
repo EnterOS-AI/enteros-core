@@ -32,6 +32,7 @@ func TestWorkspaceGet_Success(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("cccccccc-0001-0000-0000-000000000000").
@@ -40,6 +41,7 @@ func TestWorkspaceGet_Success(t *testing.T) {
 				"http://localhost:8001", nil, 2, 1, 0.05, "", 3600, "working", "claude-code",
 				"", 10.0, 20.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`["a2a","mcp__molecule-platform__provision_workspace"]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 
 	w := httptest.NewRecorder()
@@ -134,6 +136,7 @@ func TestWorkspaceGet_RemovedReturns410(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
@@ -142,6 +145,7 @@ func TestWorkspaceGet_RemovedReturns410(t *testing.T) {
 				"", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 	mock.ExpectQuery(`SELECT updated_at FROM workspaces`).
 		WithArgs(id).
@@ -201,6 +205,7 @@ func TestWorkspaceGet_RemovedReturns410WithNullRemovedAtOnTimestampFetchFailure(
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
@@ -209,6 +214,7 @@ func TestWorkspaceGet_RemovedReturns410WithNullRemovedAtOnTimestampFetchFailure(
 				"", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 	// Simulate the row vanishing between the two queries.
 	mock.ExpectQuery(`SELECT updated_at FROM workspaces`).
@@ -266,6 +272,7 @@ func TestWorkspaceGet_RemovedWithIncludeQueryReturns200(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
@@ -274,6 +281,7 @@ func TestWorkspaceGet_RemovedWithIncludeQueryReturns200(t *testing.T) {
 				"", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 	// last_outbound_at follow-up query (existing path)
 	mock.ExpectQuery(`SELECT last_outbound_at FROM workspaces`).
@@ -979,11 +987,11 @@ func TestWorkspaceUpdate_RuntimeField(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 	// The PATCH-runtime compat-check reads the RESOLVED model from the
 	// MODEL workspace_secret (SSOT), not the workspaces.model column.
-	// moonshot/kimi-k2.6 is registered for claude-code in the harness's
+	// minimax/MiniMax-M2.7 is registered for claude-code in the harness's
 	// provider registry, so validation passes and the UPDATE proceeds.
 	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs("cccccccc-0006-0000-0000-000000000000").
-		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("moonshot/kimi-k2.6"), 0))
+		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("minimax/MiniMax-M2.7"), 0))
 	// The runtime UPDATE now runs inside the atomic model-reset+runtime tx
 	// (no reset here, so the tx wraps only the UPDATE).
 	mock.ExpectBegin()
@@ -1429,6 +1437,7 @@ func TestWorkspaceGet_FinancialFieldsStripped(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	// Populate with non-zero financial values to confirm they are stripped.
 	mock.ExpectQuery("SELECT w.id, w.name").
@@ -1438,6 +1447,7 @@ func TestWorkspaceGet_FinancialFieldsStripped(t *testing.T) {
 				"http://localhost:9001", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
 				int64(50000), int64(12500), false, true, []byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			)) // budget_limit=500 USD, spend=125 USD
 
 	w := httptest.NewRecorder()
@@ -1472,9 +1482,15 @@ func TestWorkspaceGet_FinancialFieldsStripped(t *testing.T) {
 }
 
 // TestWorkspaceGet_SensitiveFieldsStripped verifies that GET /workspaces/:id
-// does NOT expose current_task, last_sample_error, or workspace_dir. These
-// leak operational surveillance data and host paths to any caller with a
-// valid UUID. (#955)
+// does NOT expose current_task or workspace_dir. These leak operational
+// surveillance data and host paths to any caller with a valid UUID. (#955)
+//
+// last_sample_error was REMOVED from this strip set by molecule-core#5035: it
+// is the platform's own recorded reason for a failed provision, is already
+// published to the same clients via the WORKSPACE_PROVISION_FAILED broadcast
+// and via GET /workspaces, and stripping it here is what made a refused
+// provision indistinguishable from a silent one. See
+// TestWorkspaceGet_SurfacesLastSampleError for the positive assertion.
 func TestWorkspaceGet_SensitiveFieldsStripped(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
@@ -1488,6 +1504,7 @@ func TestWorkspaceGet_SensitiveFieldsStripped(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("cccccccc-0955-0000-0000-000000000000").
@@ -1501,6 +1518,7 @@ func TestWorkspaceGet_SensitiveFieldsStripped(t *testing.T) {
 				"/home/user/secret-projects/client-work",
 				0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 
 	w := httptest.NewRecorder()
@@ -1519,10 +1537,15 @@ func TestWorkspaceGet_SensitiveFieldsStripped(t *testing.T) {
 		t.Fatalf("failed to parse response: %v", err)
 	}
 
-	for _, field := range []string{"current_task", "last_sample_error", "workspace_dir"} {
+	for _, field := range []string{"current_task", "workspace_dir"} {
 		if _, present := resp[field]; present {
 			t.Errorf("%s must not appear in public GET response (got %v)", field, resp[field])
 		}
+	}
+	// #5035: the recorded failure reason IS returned — it is the only
+	// diagnosis surface a tenant has for a failed provision.
+	if got, present := resp["last_sample_error"]; !present || got != "panic: internal error at /secret/path.go:42" {
+		t.Errorf("last_sample_error must be surfaced on the public GET response (#5035), got %v (present=%v)", got, present)
 	}
 
 	// Sanity: discovery fields still present
@@ -1634,7 +1657,7 @@ func TestWorkspaceCreate_TemplateDefaultsMissingRuntimeAndModel(t *testing.T) {
 tier: 2
 runtime: hermes
 runtime_config:
-  model: moonshot/kimi-k2.6
+  model: minimax/MiniMax-M2.7
 `)
 	if err := os.WriteFile(filepath.Join(templateDir, "config.yaml"), cfg, 0o644); err != nil {
 		t.Fatalf("write cfg: %v", err)
@@ -1691,7 +1714,7 @@ func TestWorkspaceCreate_TemplateDefaultsLegacyTopLevelModel(t *testing.T) {
 	cfg := []byte(`name: Legacy Agent
 tier: 1
 runtime: hermes
-model: moonshot/kimi-k2.5
+model: minimax/MiniMax-M2.7-highspeed
 `)
 	if err := os.WriteFile(filepath.Join(templateDir, "config.yaml"), cfg, 0o644); err != nil {
 		t.Fatalf("write cfg: %v", err)
@@ -1748,7 +1771,7 @@ func TestWorkspaceCreate_CallerModelOverridesTemplateDefault(t *testing.T) {
 	}
 	cfg := []byte(`runtime: hermes
 runtime_config:
-  model: moonshot/kimi-k2.6
+  model: minimax/MiniMax-M2.7
 `)
 	if err := os.WriteFile(filepath.Join(templateDir, "config.yaml"), cfg, 0o644); err != nil {
 		t.Fatalf("write cfg: %v", err)
@@ -1778,10 +1801,10 @@ runtime_config:
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	// Caller overrides with a different hermes-valid model — registry permits
-	// both moonshot/kimi-k2.5 and moonshot/kimi-k2.6 for hermes (P4 PR-1 native
-	// set). The template default would have been moonshot/kimi-k2.6; caller
+	// both minimax/MiniMax-M2.7-highspeed and minimax/MiniMax-M2.7 for hermes (the shared
+	// minimax platform family). The template default would have been minimax/MiniMax-M2.7; caller
 	// picks kimi-k2.5 explicitly to prove the override actually fires.
-	body := `{"name":"Custom Hermes","template":"hermes-template","model":"moonshot/kimi-k2.5"}`
+	body := `{"name":"Custom Hermes","template":"hermes-template","model":"minimax/MiniMax-M2.7-highspeed"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -2116,6 +2139,7 @@ func TestWorkspaceGet_Wedged_FreshHeartbeatStaleOutbound(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	// active_tasks=1 (busy), but the GET row carries only what
 	// scanWorkspaceRow scans (which does NOT include last_heartbeat_at).
@@ -2126,6 +2150,7 @@ func TestWorkspaceGet_Wedged_FreshHeartbeatStaleOutbound(t *testing.T) {
 				"", nil, 1, 1, 0.0, "", 60, "mid-turn", "claude-code",
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 	// Follow-up query for last_outbound_at (existing #817 path).
 	mock.ExpectQuery(`SELECT last_outbound_at FROM workspaces`).
@@ -2196,6 +2221,7 @@ func TestWorkspaceGet_Wedged_StaleHeartbeatStaleOutbound(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
@@ -2204,6 +2230,7 @@ func TestWorkspaceGet_Wedged_StaleHeartbeatStaleOutbound(t *testing.T) {
 				"", nil, 1, 1, 0.0, "", 60, "stuck", "claude-code",
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 	mock.ExpectQuery(`SELECT last_outbound_at FROM workspaces`).
 		WithArgs(id).

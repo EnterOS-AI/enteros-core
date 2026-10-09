@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -409,14 +410,7 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	containerRuntime := h.restartRuntimeFromConfig(ctx, id, wsName, dbRuntime, body.ApplyTemplate)
 
 	// Reset to provisioning
-	if _, err := db.DB.ExecContext(ctx,
-		// Clear mcp_unloaded_since so the concierge warming clock (EV2 warm-fail +
-		// online not-ready grace, registry.go) starts fresh for this new provisioning
-		// episode — a stale stamp from a prior online-degrade would instantly re-degrade
-		// the box on its first post-restart beat (core#4457 cluster-2).
-		`UPDATE workspaces SET status = $1, url = '', mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2`, models.StatusProvisioning, id); err != nil {
-		log.Printf("Restart: failed to set provisioning status for %s: %v", id, err)
-	}
+	markProvisioningForRestart(ctx, id)
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), id, map[string]interface{}{
 		"name":    wsName,
 		"tier":    tier,
@@ -496,6 +490,100 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	h.fireRestartContextIfBooted(ctx, id, restartData)
 
 	c.JSON(http.StatusOK, gin.H{"status": "provisioning", "config_dir": configLabel, "reset_session": resetClaudeSession})
+}
+
+// markProvisioningForRestart moves a workspace into the provisioning state at
+// the START of a restart, before anything has been stopped.
+//
+// It deliberately does NOT clear `url` (core#5025 finding 2). The manual restart
+// handler runs this, answers 200, and only then dispatches — so at this point
+// nobody knows yet whether a stop will actually happen. The core#5019 pre-flight
+// can refuse, in which case the container is never touched and keeps serving on
+// exactly the address in that column. Clearing it here made a DECLINED restart
+// strictly worse than the outage it prevented: the heartbeat path writes status
+// and not url, so the workspace flipped back to 'online' with no address at all
+// — healthy-looking and unroutable, with no recovery short of another restart.
+//
+// The url is cleared where it becomes true — clearWorkspaceRouting, called from
+// the stop legs once the container is actually gone.
+//
+// Extracted so the restart entry points and the tests that pin this share ONE
+// statement rather than three copies that can drift a column apart.
+func markProvisioningForRestart(ctx context.Context, workspaceID string) {
+	if _, err := db.DB.ExecContext(ctx,
+		// Clear mcp_unloaded_since so the concierge warming clock (EV2 warm-fail +
+		// online not-ready grace, registry.go) starts fresh for this new provisioning
+		// episode — a stale stamp from a prior online-degrade would instantly re-degrade
+		// the box on its first post-restart beat (core#4457 cluster-2).
+		`UPDATE workspaces SET status = $1, mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2`,
+		models.StatusProvisioning, workspaceID); err != nil {
+		log.Printf("Restart: failed to set provisioning status for %s: %v", workspaceID, err)
+	}
+}
+
+// clearWorkspaceRouting drops everything that points callers at the container
+// that has JUST been destroyed: the persisted url and the cached A2A routing
+// keys. Called from the stop legs at the moment the stop has been issued —
+// never speculatively, because a workspace that was not stopped is still
+// reachable and must keep its address (core#5025 finding 2).
+func (h *WorkspaceHandler) clearWorkspaceRouting(ctx context.Context, workspaceID string) {
+	if db.DB == nil {
+		return
+	}
+	if _, err := db.DB.ExecContext(ctx,
+		`UPDATE workspaces SET url = '', updated_at = now() WHERE id = $1`, workspaceID); err != nil {
+		log.Printf("Restart: failed to clear url for %s: %v", workspaceID, err)
+	}
+	// core#3220: the old container is gone; clear any cached A2A routing keys
+	// so concurrent probes do not resolve to the dead URL while the workspace
+	// is reprovisioning.
+	db.ClearWorkspaceKeys(ctx, workspaceID)
+}
+
+// markRestartDeclined records the terminal outcome of a restart the platform
+// REFUSED to perform (core#5025 finding 3).
+//
+// A decline is not "nothing happened": the platform tried to recover a
+// workspace and could not obtain the image it would have needed. Before this,
+// the auto-restart cycle simply returned — no status write, no event, no row
+// change — so an unrecoverable restart was indistinguishable from one that was
+// never attempted, and the only trace was a log line on a box nobody tails.
+//
+// Deliberately NOT markProvisionFailed. Nothing failed to provision, and the
+// container is still running and still heartbeating: writing status='failed'
+// would misreport a live workspace and is the same class of confident lie as
+// finding 2's empty url. The signal is a durable event plus the
+// operator-visible error column the canvas already renders — visible, durable,
+// and true.
+func (h *WorkspaceHandler) markRestartDeclined(ctx context.Context, workspaceID, wsName, runtime, template string) {
+	msg := "restart declined — the pinned image for runtime=" + runtime +
+		" could not be made available, so the running container was left untouched (core#5019). " +
+		"The workspace is still serving its previous version; it will retry on the next restart."
+
+	// Nil-tolerant on both sinks: recording WHY a restart was refused must never
+	// itself panic the restart path. A handler wired without a broadcaster (or
+	// running before db.DB is set) still gets the log line above the call site.
+	if h.broadcaster != nil {
+		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceRestartDeclined), workspaceID, map[string]interface{}{
+			"name":     wsName,
+			"runtime":  runtime,
+			"template": template,
+			"error":    msg,
+			"reason":   "image_prewarm_declined",
+		})
+	}
+	if db.DB == nil {
+		return
+	}
+
+	// Status is deliberately untouched — see the doc comment. last_sample_error
+	// is the column the canvas surfaces for "what went wrong here", and it is
+	// what makes this distinguishable from a restart nobody ever ran.
+	if _, err := db.DB.ExecContext(ctx,
+		`UPDATE workspaces SET last_sample_error = $2, updated_at = now() WHERE id = $1`,
+		workspaceID, msg); err != nil {
+		log.Printf("markRestartDeclined: db update failed for %s: %v", workspaceID, err)
+	}
 }
 
 func (h *WorkspaceHandler) restartRuntimeFromConfig(ctx context.Context, id, wsName, dbRuntime string, applyTemplate bool) string {
@@ -973,12 +1061,29 @@ func coalesceRestart(workspaceID string, cycle func()) {
 // Docker path, so on SaaS (h.provisioner=nil) the auto-restart cycle silently
 // NPE'd before reaching the reprovision step — which is why every SaaS dead-
 // agent incident pre-this-fix required manual restart from canvas.
-func (h *WorkspaceHandler) stopForRestart(ctx context.Context, workspaceID string) {
+// It takes the PAYLOAD rather than loose runtime/template strings (core#5025):
+// the pre-flight below must resolve the same box the provision that follows will
+// build, and the payload is that single object. Passing the identity fields
+// separately is how the provider drifted away from the provision — the payload's
+// Compute.Provider was simply never read, so the wire named no backend at all
+// and the control plane resolved its default instead.
+func (h *WorkspaceHandler) stopForRestart(ctx context.Context, workspaceID string, payload models.CreateWorkspacePayload) bool {
 	backend := "none"
 	if h.provisioner != nil {
 		backend = "docker"
 	} else if h.cpProv != nil {
 		backend = "cp"
+	}
+	// core#5019 (structural half): PULL BEFORE STOPPING. Ask the control plane
+	// to make the pinned image obtainable BEFORE destroying the container. A
+	// refusal means we keep what the user still has — a running workspace —
+	// rather than trading it for an image that may never arrive.
+	//
+	// Placed above the pre_stop emit on purpose: a declined restart must not
+	// leave a restart.pre_stop marker in the wire log for a stop that never
+	// happened. Ops read that sequence to reconstruct incidents.
+	if !h.ensurePinnedImageBeforeStop(ctx, workspaceID, payload) {
+		return false
 	}
 	provlog.Event("restart.pre_stop", map[string]any{
 		"workspace_id": workspaceID,
@@ -990,12 +1095,177 @@ func (h *WorkspaceHandler) stopForRestart(ctx context.Context, workspaceID strin
 		h.cpStopWithRetry(ctx, workspaceID, "Auto-restart")
 	}
 
-	// core#3220: the old container is gone; clear any cached A2A routing keys
-	// so concurrent probes do not resolve to the dead URL while the workspace
-	// is reprovisioning. Cleared here (rather than in the caller) because this
-	// is the earliest point where the backend Stop has been issued and the
-	// cache is guaranteed stale.
-	db.ClearWorkspaceKeys(ctx, workspaceID)
+	// core#3220 + core#5025: the old container is gone, so drop everything that
+	// still points at it — the persisted url AND the cached A2A routing keys.
+	// Cleared here (rather than in the caller) because this is the earliest
+	// point where the backend Stop has been issued and both are guaranteed
+	// stale, and the LATEST point at which clearing them is still a lie: on the
+	// declined path above we returned without reaching this line, and the
+	// workspace kept its address because it kept its container.
+	h.clearWorkspaceRouting(ctx, workspaceID)
+	return true
+}
+
+// restartPrewarmBudget bounds the ENTIRE pre-flight — every retry and every
+// backoff between them — for one restart.
+//
+// It exists because of what the pre-flight HOLDS, not because of what it does.
+// Without a deadline the call inherits the ensure-image HTTP client's 20-minute
+// budget (deliberately generous: a cold ~7GB pull is the design point), and on
+// the auto-restart path that budget is spent holding the per-workspace
+// restart/provision gate. A registry that hangs would then look exactly like a
+// workspace whose lifecycle has stopped.
+//
+// It is bounded from BOTH sides, and the lower bound is the load-bearing one:
+//
+//   - Below provisioner.EnsureImageClientTimeout(), or it bounds nothing — the
+//     HTTP client would give up first and the gate would be held for the full
+//     client timeout anyway.
+//   - Comfortably above the measured cold-pull design point (the 7.05GB pull
+//     core#5019 was root-caused on). Too SMALL is not the safe direction it
+//     looks like: every restart would decline while a legitimate pull was still
+//     in progress, and a workspace could never adopt a newly promoted pin at
+//     all — the pre-flight would have turned "slow adoption" into "NO
+//     adoption", a worse failure than the one it prevents.
+//
+// Exceeding it declines, which is the cheap outcome: the container is untouched
+// and the next restart cycle asks again, by which time the pull has usually
+// landed. Package-level so tests can shrink it.
+var restartPrewarmBudget = 15 * time.Minute
+
+// ensurePinnedImageBeforeStop reports whether it is safe to destroy this
+// workspace's container — core#5019's structural fix.
+//
+// A "restart" is a full RE-PROVISION: the control plane reads runtime_image_pins
+// at provision time, so adopting a newly promoted pin means obtaining that image
+// (~7GB). Pre-fix the tenant stopped first and discovered the image was missing
+// second, which is why an unobtainable image cost the workspace its container
+// for ~10 minutes. #5020 widened the provision budget so a cold pull usually
+// FINISHES; it does nothing for a pull that cannot succeed at all — a bad
+// digest, a registry outage, a full disk. This is that half.
+//
+// Decision table, and which way each branch fails:
+//
+//	no CP provisioner              -> ALLOW  (self-host/Docker: the local
+//	                                  provisioner owns its own image, there is
+//	                                  no CP seam to ask and nothing to guard)
+//	CP confirms                    -> ALLOW
+//	CP has no such endpoint (404)  -> ALLOW  (deliberate fail-OPEN, see below)
+//	anything else                  -> DECLINE (fail-CLOSED)
+//
+// The 404 branch is the single deliberate fail-open. During a rollout a tenant
+// can run ahead of its control plane; failing closed there would wedge EVERY
+// restart on the fleet, which is a much larger outage than the one being fixed.
+// It is also self-limiting: the moment CP ships the endpoint the branch stops
+// being reachable. Every other outcome fails closed.
+//
+// Not a substitute for the CP-side pre-warm on promote — it is the backstop for
+// when that has not happened. The two are complementary: pre-warm makes the
+// common path fast, this makes the uncommon path non-destructive.
+func (h *WorkspaceHandler) ensurePinnedImageBeforeStop(ctx context.Context, workspaceID string, payload models.CreateWorkspacePayload) bool {
+	if h.cpProv == nil {
+		return true
+	}
+	runtime, template := payload.Runtime, payload.Template
+
+	// core#5025 finding 7: the pre-flight gets its OWN deadline. It used to run
+	// on context.Background() and lean on the 20-minute ensure-image HTTP client
+	// timeout, while holding the per-workspace restart/provision gate — so a
+	// hung pull froze every restart, heal and provision path for that workspace
+	// for twenty minutes. A slow pull is allowed to be slow; it is not allowed
+	// to be indistinguishable from a stopped lifecycle. Exceeding the budget
+	// DECLINES, which costs the user nothing: the container is still running and
+	// the next cycle retries, by which time the pull has usually landed.
+	ctx, cancel := context.WithTimeout(ctx, restartPrewarmBudget)
+	defer cancel()
+
+	req := provisioner.EnsureImageRequest{
+		WorkspaceID: workspaceID,
+		Runtime:     runtime,
+		Template:    template,
+		// core#5025: the provider the PROVISION will use, read off the same
+		// payload that provision receives. Left unset, the wire named no
+		// backend, the control plane resolved the SSOT default (aws), and it
+		// answered "not_applicable" — a 200 — for every workspace on the
+		// local-docker substrate. The tenant treats any 2xx as permission to
+		// stop, so the guard destroyed containers while logging success.
+		Provider: payload.Compute.Provider,
+	}
+
+	// core#5025 finding 4: bounded retry, on the SAME budget as the stop leg
+	// this pre-flight precedes. cpStopWithRetryErr retries because refusing to
+	// act strands the user with a workspace nobody can recover; refusing to
+	// pre-warm strands them identically, and harder — it refuses the restart
+	// outright. One-shot fail-closed meant a ~60s control-plane redeploy
+	// declined every restart on the fleet, and this deployment redeploys the
+	// control plane routinely.
+	//
+	// The two retry knobs are READ from the stop leg rather than re-declared, so
+	// the policies cannot drift into two different numbers that both look
+	// deliberate.
+	var err error
+	var res provisioner.EnsureImageResult
+	delay := cpStopRetryBaseDelay
+	for attempt := 1; attempt <= cpStopRetryAttempts; attempt++ {
+		res, err = h.cpProv.EnsureImage(ctx, req)
+		if err == nil {
+			log.Printf("Restart: %s pinned image ready before stop (runtime=%q template=%q status=%q ref=%q attempt=%d) — core#5019 pull-before-stop",
+				workspaceID, runtime, template, res.Status, res.ImageRef, attempt)
+			return true
+		}
+		if errors.Is(err, provisioner.ErrEnsureImageUnsupported) {
+			log.Printf("Restart: %s control plane has no ensure-image endpoint — proceeding with the pre-core#5019 stop-then-provision ordering (runtime=%q). Upgrade the control plane to close the cold-adoption window.",
+				workspaceID, runtime)
+			return true
+		}
+		// A refusal the control plane MEANT. Retrying returns the same answer
+		// and spends the budget doing it — this is the core#5019 bad-digest
+		// case, and it must decline fast, not slowly.
+		if errors.Is(err, provisioner.ErrEnsureImagePermanent) {
+			break
+		}
+		if attempt == cpStopRetryAttempts {
+			break
+		}
+		log.Printf("Restart: %s pre-warm attempt %d/%d failed (%v) — retrying in %s; a control plane that is momentarily unreachable says nothing about the image",
+			workspaceID, attempt, cpStopRetryAttempts, err, delay)
+		// Sleep with ctx awareness, exactly as cpStopWithRetryErr does: a
+		// budget that only bounds the CALLS and not the waits between them
+		// would still hold the caller for the full backoff chain.
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			err = fmt.Errorf("pre-warm budget %s exhausted after %d attempt(s): %w", restartPrewarmBudget, attempt, err)
+			return h.declineRestart(ctx, workspaceID, runtime, template, err)
+		case <-timer.C:
+		}
+		delay *= 2
+	}
+
+	return h.declineRestart(ctx, workspaceID, runtime, template, err)
+}
+
+// declineRestart is the single exit for "we will not destroy this container".
+//
+// One function rather than a copy at each exit: the budget-exhausted path and
+// the attempts-exhausted path must produce the SAME wire log, or an incident
+// reconstructed from provlog would show a decline for one cause and silence for
+// the other.
+//
+// LOUD by design. The prefix is stable so ops can grep it, and it is worded to
+// be distinguishable from an ordinary provision failure — nothing was broken
+// here, something was PREVENTED from breaking.
+func (h *WorkspaceHandler) declineRestart(_ context.Context, workspaceID, runtime, template string, err error) bool {
+	log.Printf("IMAGE-PREWARM-DECLINED restart workspace_id=%s runtime=%q template=%q err=%q — the workspace was NOT stopped; it keeps its running container (core#5019)",
+		workspaceID, runtime, template, err.Error())
+	provlog.Event("restart.image_prewarm_declined", map[string]any{
+		"workspace_id": workspaceID,
+		"runtime":      runtime,
+		"template":     template,
+		"error":        err.Error(),
+	})
+	return false
 }
 
 // cpStopRetryAttempts caps total Stop attempts (initial + retries). 3 catches
@@ -1223,7 +1493,26 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	// behaviour.
 	h.gracefulPreRestart(ctx, workspaceID)
 
-	h.stopForRestart(ctx, workspaceID)
+	// Payload built BEFORE the stop (core#5025), not after it. The pre-flight
+	// below has to name the box the provision will build, and that box is
+	// payload.Compute.Provider — which this function used to resolve only after
+	// the container was already gone. Constructing it here is what makes the two
+	// halves provably the same question.
+	payload := withStoredCompute(ctx, workspaceID, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime, Template: dbTemplate})
+
+	// core#5019: stopForRestart DECLINES when the pinned image cannot be made
+	// obtainable. The container is still running and still heartbeating, so the
+	// workspace stays exactly as the user left it — but a decline is not a
+	// no-op either (core#5025 finding 3): it is an unrecoverable restart, and
+	// leaving no status behind makes it indistinguishable from "nothing was
+	// tried". markRestartDeclined records the terminal, operator-visible
+	// outcome without pretending a provision failed.
+	if !h.stopForRestart(ctx, workspaceID, payload) {
+		log.Printf("Auto-restart: %s (%s) DECLINED — pinned image for runtime=%q template=%q could not be made available; the running container was left untouched (core#5019)",
+			wsName, workspaceID, dbRuntime, dbTemplate)
+		h.markRestartDeclined(ctx, workspaceID, wsName, dbRuntime, dbTemplate)
+		return
+	}
 
 	if _, err := db.DB.ExecContext(ctx,
 		// Clear mcp_unloaded_since — fresh warming clock for the new provisioning
@@ -1234,9 +1523,6 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), workspaceID, map[string]interface{}{
 		"name": wsName, "tier": tier, "runtime": dbRuntime, "template": dbTemplate,
 	})
-
-	// Runtime from DB — no more config file parsing
-	payload := withStoredCompute(ctx, workspaceID, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime, Template: dbTemplate})
 
 	// RFC#2843 #33 + SaaS restart re-stub fix: restore the persisted template
 	// and resolve its local template dir so the reprovision request carries both
@@ -1317,6 +1603,41 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	h.fireRestartContextIfBooted(ctx, workspaceID, restartData)
 }
 
+// pauseSideEffectBudget is the HARD ceiling on Pause's detached side-effect
+// phase — TOTAL for the whole cascade, not per workspace.
+//
+// Why a ceiling is mandatory: the request context used to be the only thing
+// bounding this work. Detaching from it (see Pause) removes that bound, and a
+// detached operation with no deadline is a different bug — a wedged CP Stop
+// would pin the handler goroutine and its DB connections forever. The context
+// built from this budget is threaded into StopWorkspaceAuto (which carries it
+// into the CP HTTP round-trip) and into every ExecContext below, so the deadline
+// is enforced by the transports themselves, not by a convention.
+//
+// TOTAL, not per-workspace, for the same reason CascadeDelete's
+// captureCarryoverBudget is total (workspace_crud.go): a per-workspace timeout
+// lets an N-descendant cascade run for N × budget, which is not a bound. When
+// the budget is spent mid-cascade the remaining workspaces fast-fail on the
+// expired context and land in the failure list — a truthful partial result
+// rather than an unbounded handler.
+//
+// Sizing: the relevant neighbour is provisioner.cpAPITimeout = 120s, the
+// http.Client timeout on the CP's small JSON calls — "status, stop, console",
+// i.e. literally the Stop this budget has to contain. 60s sits below it
+// deliberately: a single wedged Stop should surface as a reported failure on
+// this budget rather than run the CP client all the way to its own ceiling and
+// take the rest of the cascade with it. (An earlier draft of this comment cited
+// the stop RETRY envelope; that is cpStopWithRetry on the restart/delete paths
+// and is not on the Pause path at all.) A var, not a const, so tests can shrink it.
+var pauseSideEffectBudget = 60 * time.Second
+
+// errPauseClaimMissed reports that the guarded mark-paused UPDATE matched no
+// row: the workspace left the pausable set between the eligibility SELECT and
+// the claim (removed, or already paused by a concurrent caller). The container
+// was stopped, but this Pause is not the operation that parked the row, so it
+// must not report the row as its own work.
+var errPauseClaimMissed = errors.New("mark-paused claim matched no row — the workspace left the pausable set (removed, or paused by a concurrent caller) after the eligibility check")
+
 // Pause handles POST /workspaces/:id/pause
 // Stops the container and sets status to 'paused'. The workspace remains on the canvas
 // but won't receive heartbeats, won't be auto-restarted, and won't consume resources.
@@ -1373,32 +1694,255 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 		return
 	}
 
-	// Stop containers and mark all as paused. StopWorkspaceAuto routes
-	// to whichever backend is wired (CP for SaaS, Docker for self-hosted)
-	// — pre-2026-05-05 this site inlined `if h.provisioner != nil { Stop }`,
-	// which silently leaked EC2s on every SaaS Pause (same drift class as
-	// the team-collapse leak #2813 and the workspace-delete leak #2814,
-	// both closed by PR #2824). StopWorkspaceAuto returns nil on no-backend
-	// (no-op), so the Pause-specific bookkeeping (mark paused, clear keys,
-	// broadcast) still fires regardless of whether anything was actually
-	// stopped — matches the pre-fix behavior on misconfigured deployments.
+	// ── Detach the side effects from the request lifecycle ────────────────────
+	//
+	// Everything above this line is a READ: it may safely die with the request,
+	// because a dead read produces an honest 404/500 and changes nothing.
+	// Everything below MUTATES, and must not be cancellable by the client.
+	//
+	// Pre-fix this whole loop ran on `ctx` — the request context — so an aborted
+	// client connection cancelled the stop, the status write, the key clear and
+	// the event, while the handler still answered 200 {"status":"paused"}.
+	// Observed live on a tenant (core#5019-adjacent, prod exposure is the ~20s
+	// CP-recreate window the deploy pipeline opens ~5×/day):
+	//
+	//	Pause: stop 35cf77b2-… failed: cp provisioner: stop: … context canceled
+	//	Pause: failed to set paused status for 35cf77b2-…: context canceled
+	//	RecordAndBroadcast: insert event error: context canceled
+	//	[GIN] 200 | 4.21s | POST "/workspaces/35cf77b2-…/pause"
+	//
+	// …and eleven seconds later that workspace read status="online" routable=true.
+	// Restart hit this hazard first and documented it (see the goAsync +
+	// context.Background() dispatch above: "detaches the dispatch from the request
+	// lifecycle so an aborted client connection doesn't cancel the in-flight
+	// Stop/provision pair").
+	//
+	// Pause takes the OTHER documented shape — context.WithoutCancel, SYNCHRONOUS,
+	// no goAsync — matching the a2a ingest writes (a2a_proxy_helpers.go: "a client
+	// disconnect … must not lose the row; SYNCHRONOUS (no goAsync): the row must be
+	// durable before the 200"). The distinction is what the response CLAIMS:
+	// Restart answers {"status":"provisioning"}, an honest "queued", so
+	// backgrounding it stays truthful. Pause answers {"status":"paused"}, a claim
+	// about a COMPLETED state — moving the work behind goAsync would leave the body
+	// reading "done" while meaning "queued", re-introducing the same lie through
+	// the other door. Synchronous + WithoutCancel gives the only combination where
+	// a 200 means what it says: the client may vanish, the work still completes,
+	// and the status line below is computed from what actually happened.
+	//
+	// pauseSideEffectBudget is the ceiling this detach must not exceed.
+	opCtx, cancelOp := context.WithTimeout(context.WithoutCancel(ctx), pauseSideEffectBudget)
+	defer cancelOp()
+
+	// StopWorkspaceAuto routes to whichever backend is wired (CP for SaaS, Docker
+	// for self-hosted) — pre-2026-05-05 this site inlined `if h.provisioner != nil
+	// { Stop }`, which silently leaked EC2s on every SaaS Pause (same drift class
+	// as the team-collapse leak #2813 and the workspace-delete leak #2814, both
+	// closed by PR #2824). StopWorkspaceAuto returns nil on no-backend (no-op), so
+	// the Pause bookkeeping still fires on a misconfigured deployment exactly as
+	// before — a no-op is not a failure.
+	//
+	// What CHANGED, beyond the context: a failed stop no longer writes
+	// status='paused' anyway. The old code did, under the comment "orphan sweeper
+	// will reconcile" — which no sweeper does. Precisely:
+	//
+	//   - registry/cp_orphan_sweeper.go (the SaaS/CP reaper) selects ONLY
+	//     `status = 'removed'`.
+	//   - registry/orphan_sweeper.go's container-reaping passes likewise key on
+	//     `status = 'removed'`. Its one pass with a wider predicate
+	//     (`status NOT IN ('removed','provisioning')`, which does include
+	//     'paused') is the STALE-TOKEN REVOCATION pass — it revokes auth tokens,
+	//     it never stops compute, so it could not reconcile this even in
+	//     principle.
+	//   - and that whole file is moot on the plane that matters: StartOrphanSweeper
+	//     is wired under `if prov != nil` (cmd/server/main.go), so in CP/SaaS prod
+	//     it does not run at all.
+	//
+	// So a 'paused' row over a still-running container has no backstop, and would
+	// sit there forever, invisible. The truthful row is the one we leave untouched
+	// (it still says online, which it is), and the caller's retry — now that the
+	// caller is TOLD — is the recovery path. This is the same
+	// loud-fail-instead-of-silent-leak choice the delete path makes
+	// (workspace_crud.go), minus the false row, because delete's 'removed' write is
+	// what its sweeper keys on and 'paused' is not.
+	var failures []gin.H
+	pausedCount := 0
 	for _, ws := range toPause {
-		if err := h.StopWorkspaceAuto(ctx, ws.id); err != nil {
-			log.Printf("Pause: stop %s failed: %v — orphan sweeper will reconcile", ws.id, err)
+		note := func(stage string, err error) {
+			log.Printf("Pause: %s failed for %s (%s): %v", stage, ws.name, ws.id, err)
+			failures = append(failures, gin.H{
+				"workspace_id": ws.id,
+				"name":         ws.name,
+				"stage":        stage,
+				"error":        err.Error(),
+			})
 		}
-		if _, err := db.DB.ExecContext(ctx,
-			`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2`, models.StatusPaused, ws.id); err != nil {
-			log.Printf("Pause: failed to set paused status for %s: %v", ws.id, err)
+
+		if err := h.StopWorkspaceAuto(opCtx, ws.id); err != nil {
+			note("stop", err)
+			continue // compute is still running — do not claim it is paused
 		}
-		db.ClearWorkspaceKeys(ctx, ws.id)
-		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspacePaused), ws.id, map[string]interface{}{
+
+		// Guarded claim. Pre-fix this was `WHERE id = $2` with rowsAffected never
+		// read, so a row that left the pausable set between the eligibility SELECT
+		// and this write was silently reported as paused. The predicate + the
+		// rowsAffected check turn that no-op into a reported failure — the same
+		// property Hibernate's atomic claim buys, without inventing a 'pausing'
+		// status (see the PR body for why that is deliberately out of scope).
+		res, err := db.DB.ExecContext(opCtx,
+			`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2 AND status NOT IN ('removed', 'paused')`,
+			models.StatusPaused, ws.id)
+		// stage "mark_paused" = the container IS stopped and the row still says
+		// online. That state does NOT sit still, and a reader who assumes it does
+		// will predict the wrong behaviour: the row is now a stopped box claiming
+		// to be online, which is exactly what the liveness/health sweeps hunt.
+		// StartHealthSweep and StartLivenessMonitor (neither gated on prov, so
+		// both run in CP/SaaS) and StartCPInstanceReconciler all call
+		// onWorkspaceOffline, which ends in `go wh.RestartByID(workspaceID)` —
+		// and RestartByID's dormant-state guard skips 'paused'/'hibernated' but
+		// NOT 'online', so it proceeds. The platform therefore AUTO-REPROVISIONS
+		// the workspace within a sweep interval. The user asked for a pause and
+		// gets a running workspace back; that is a self-healing outcome rather
+		// than a stranded row, but it is emphatically not "paused", which is why
+		// this is a reported failure and not a silent continue.
+		if err != nil {
+			note("mark_paused", err)
+			continue
+		}
+		claimed, err := res.RowsAffected()
+		if err != nil {
+			note("mark_paused", err)
+			continue
+		}
+		if claimed == 0 {
+			note("claim", errPauseClaimMissed)
+			continue
+		}
+
+		// From here the workspace IS paused: stopped, and the row says so. A
+		// failure below is real and reportable, but it does not un-pause anything,
+		// so it counts toward pausedCount AND toward failures — the caller gets a
+		// 207 telling them the canvas may be stale, not a 500 implying nothing
+		// happened.
+		pausedCount++
+		db.ClearWorkspaceKeys(opCtx, ws.id)
+		if err := h.broadcaster.RecordAndBroadcast(opCtx, string(events.EventWorkspacePaused), ws.id, map[string]interface{}{
 			"name": ws.name,
-		})
+		}); err != nil {
+			note("broadcast", err)
+		}
 	}
 
-	log.Printf("Paused workspace %s (%s) + %d children", wsName, id, len(toPause)-1)
-	c.JSON(http.StatusOK, gin.H{"status": "paused", "paused_count": len(toPause)})
+	// ── Report what actually happened ─────────────────────────────────────────
+	//
+	// Pre-fix this was an UNCONDITIONAL c.JSON(200, {"status":"paused"}) with every
+	// failure above reduced to a log line — the same lie 6d64c183f closed for
+	// hibernate (#4293), in a different handler.
+	//
+	// The status is computed in memory and delivered on the HTTP response. That is
+	// deliberate: the response needs no DB, no Redis and no broadcast, so it is
+	// still reachable when the very subsystem that caused the failure is dead. A
+	// failure reported through a write that the failure itself has broken is not a
+	// report.
+	if len(failures) == 0 {
+		log.Printf("Paused workspace %s (%s) + %d children", wsName, id, len(toPause)-1)
+		c.JSON(http.StatusOK, gin.H{"status": "paused", "paused_count": pausedCount})
+		return
+	}
+	log.Printf("Pause: %s (%s) — %d/%d paused, %d failed", wsName, id, pausedCount, len(toPause), len(failures))
+	if pausedCount == 0 {
+		// Same discipline as the 207 below: say what is known, not a guess about
+		// the workload. This branch covers BOTH a failed stop (workload still
+		// running) and a post-stop failure (workload stopped, row never reached
+		// 'paused'), so any fixed claim about whether it is running is false on one
+		// of them — and wrong in the more expensive direction on the second, since
+		// an operator told the box is up will not go looking for a stopped one.
+		// failures[].stage distinguishes them.
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status": "pause_failed",
+			"error": fmt.Sprintf("no workspace reached the paused state (%d step(s) failed) — see failures[]: stage \"stop\" = the workload was never stopped; "+
+				"stage \"mark_paused\"/\"claim\" = it WAS stopped but its row does not say paused. Re-check status before retrying",
+				len(failures)),
+			"paused_count": 0,
+			"failed_count": len(failures),
+			"failures":     failures,
+		})
+		return
+	}
+	// Partial: the cascade fans out over descendants, so "2 of 3 paused" is a real
+	// outcome and must be representable. Collapsing it into 200 or 500 discards the
+	// only information the caller can act on.
+	//
+	// The message states ONLY what is known at this point — a count, and a pointer
+	// to failures[]. It deliberately does not say "cascade", "were not paused" or
+	// "still running", because none of those hold on every path that reaches here:
+	// a single-workspace pause whose stop and claim both succeeded and whose
+	// telemetry INSERT then failed is a 207 in which there is no cascade, the
+	// workspace WAS paused, and it is NOT running. Prose that contradicts the
+	// payload beside it is the same defect as an unconditional 200 — a human reads
+	// the sentence, not failures[].
+	c.JSON(http.StatusMultiStatus, gin.H{
+		"status": "partially_paused",
+		"error": fmt.Sprintf("%d of %d workspace(s) paused; %d step(s) failed — see failures[] for which workspace and which stage",
+			pausedCount, len(toPause), len(failures)),
+		"paused_count": pausedCount,
+		"failed_count": len(failures),
+		"failures":     failures,
+	})
 }
+
+// resumeSideEffectBudget is the HARD ceiling on the DATABASE work in Resume's
+// detached side-effect phase — TOTAL for the whole cascade, not per workspace.
+//
+// Why a ceiling is mandatory: the request context used to be the only thing
+// bounding this work. Detaching from it (see Resume) removes that bound, and a
+// detached operation with no deadline is a different bug. The context built
+// from this budget is threaded into every ExecContext/QueryContext below, so
+// the deadline is enforced by database/sql itself, not by a convention.
+//
+// What it bounds, precisely: the statements. Per workspace that is one claim
+// UPDATE, one event INSERT and two small SELECTs. 30s is scaled from
+// provisionWorkspaceAuto's no-backend arm, the in-repo precedent for exactly
+// that shape, which allots 10s to "the broadcast + single UPDATE inside
+// markProvisionFailed".
+//
+// What it does NOT bound — say it plainly rather than let the name imply
+// otherwise — is the handler's wall clock. Two things sit outside opCtx:
+//
+//   - provisionWorkspaceAuto takes acquireRestartProvisionGate(ws.id) and
+//     gate.Lock()s it SYNCHRONOUSLY, before its goroutine spawn
+//     (workspace_dispatchers.go). If another provision for the same ws-<id> is
+//     in flight, this handler goroutine blocks on that mutex for as long as the
+//     holder runs — up to provisioner.cpProvisionTimeout (20m). That is
+//     pre-existing, deliberate (it is the core#2771 serialization), shared
+//     verbatim with Create, and strands nothing; but it is not covered here and
+//     no ceiling in this file can cover it.
+//   - the provision itself, which runs on the dispatcher's own
+//     context.WithTimeout(context.Background(), provisioner.ProvisionTimeout).
+//     Already detached, already bounded, correctly not on this budget: a
+//     provision legitimately outlives a DB budget.
+//
+// TOTAL, not per-workspace: a per-workspace timeout lets an N-descendant cascade
+// run for N × budget, which is not a bound. When the budget is spent mid-cascade
+// the remaining workspaces fast-fail on the expired context and land in the
+// failure list — a truthful partial result rather than an unbounded handler.
+// A var, not a const, so tests can shrink it.
+//
+// Sibling note: PR #5102 introduces pauseSideEffectBudget for the equivalent
+// phase in Pause. That PR is still OPEN, so the symbol does not exist in this
+// tree and nothing here may depend on it. Sizing differs anyway and the reason
+// is worth recording for whoever merges second: Pause's detached phase CONTAINS
+// a synchronous CP HTTP round-trip (StopWorkspaceAuto → DELETE
+// /cp/workspaces/:id → provider terminate), so its budget is scaled against
+// provisioner.cpAPITimeout (120s). Resume's phase contains no CP call at all,
+// which is why it is scaled against a DB figure instead.
+var resumeSideEffectBudget = 30 * time.Second
+
+// errResumeClaimMissed reports that the guarded provisioning claim matched no
+// row: the workspace left the paused set between the eligibility SELECT and the
+// claim (removed, or already resumed/woken by a concurrent caller). Nothing was
+// provisioned for it — see the claim-before-provision note in Resume for why
+// that ordering is the whole point.
+var errResumeClaimMissed = errors.New("provisioning claim matched no row — the workspace left the paused set (removed, or resumed by a concurrent caller) after the eligibility check")
 
 // Resume handles POST /workspaces/:id/resume
 // Re-provisions a paused workspace. Config volume is preserved from before the pause.
@@ -1473,25 +2017,127 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 		return
 	}
 
-	// Re-provision all
+	// ── Detach the side effects from the request lifecycle ────────────────────
+	//
+	// Everything above this line is a READ: it may safely die with the request,
+	// because a dead read produces an honest 404/409/500 and changes nothing.
+	// Everything below MUTATES, and must not be cancellable by the client.
+	//
+	// Pre-fix this loop ran on `ctx` — the request context — so an aborted client
+	// connection cancelled the status write and the event while the handler still
+	// answered 200 {"status":"provisioning"}. That is the defect PR #5102 (open
+	// at time of writing) addresses for Pause, in the same file; Resume is the
+	// other copy and does not depend on that PR. Restart hit the
+	// hazard first and documented it (see the goAsync + context.Background()
+	// dispatch above: "detaches the dispatch from the request lifecycle so an
+	// aborted client connection doesn't cancel the in-flight Stop/provision
+	// pair"), and WakeWorkspace — Resume's hibernated-side twin, ~800 lines up —
+	// already runs its whole claim+provision on context.Background().
+	//
+	// Resume's failure mode is NOT Pause's, and is worse. The provision dispatch
+	// below does NOT take this context: provisionWorkspaceAuto spawns its own
+	// goroutine on context.Background(), so it ran to completion whether or not
+	// the status write survived. A cancelled request therefore produced a
+	// workspace whose box was genuinely started and BILLED while its row still
+	// read 'paused' — and 'paused' is precisely the value every recovery path
+	// refuses to touch:
+	//
+	//   - /registry/register's upsert carries
+	//     `WHERE workspaces.status NOT IN ('removed','paused','hibernated')`, so
+	//     the booting box's registration matched no row, wrote no url, and
+	//     returned 200. Silently. That guard's own comment names this handler as
+	//     the thing that must have run first: "Resume/Wake set status=
+	//     'provisioning' first, so their post-relaunch register still promotes
+	//     provisioning→online normally."
+	//   - the heartbeat's `recoverable` predicate lists provisioning/failed/
+	//     offline/awaiting_agent/degraded — 'paused' is excluded by name as
+	//     "terminal or operator-managed", so a live heartbeat returns early.
+	//   - StartLivenessMonitor and StartHealthSweep both carry the same
+	//     NOT IN (…,'paused',…) guard.
+	//   - StartCPOrphanSweeper reaps `status = 'removed'` ONLY, so the running
+	//     instance is never reclaimed.
+	//   - Pause itself 404s ("not found or already paused") on that row, so the
+	//     user cannot even stop the box they are paying for.
+	//
+	// The one door left open is another Resume — which, without the claim below,
+	// provisions a SECOND box and overwrites instance_id with it, orphaning the
+	// first beyond the reach of the sweeper that only looks at 'removed'.
+	// Note the inversion this produces: a provision that FAILS is self-healing
+	// (markProvisionFailed writes status='failed' unguarded, freeing the row),
+	// while a provision that SUCCEEDS strands it permanently.
+	//
+	// Hence the shape below: WithoutCancel + a bounded budget, and the claim is
+	// taken BEFORE the provision is dispatched, never after.
+	opCtx, cancelOp := context.WithTimeout(context.WithoutCancel(ctx), resumeSideEffectBudget)
+	defer cancelOp()
+
+	var failures []gin.H
+	resumedCount := 0
 	for _, ws := range toResume {
-		if _, err := db.DB.ExecContext(ctx,
-			// Clear mcp_unloaded_since — this is the RESUME path (pause/hibernate →
-			// provisioning); a stale warming stamp here is exactly the cluster-2
-			// false-degrade the EV2 review flagged (core#4457).
-			`UPDATE workspaces SET status = $1, mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2`, models.StatusProvisioning, ws.id); err != nil {
-			log.Printf("Resume: failed to set provisioning status for %s: %v", ws.id, err)
+		note := func(stage string, err error) {
+			log.Printf("Resume: %s failed for %s (%s): %v", stage, ws.name, ws.id, err)
+			failures = append(failures, gin.H{
+				"workspace_id": ws.id,
+				"name":         ws.name,
+				"stage":        stage,
+				"error":        err.Error(),
+			})
 		}
-		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), ws.id, map[string]interface{}{
+
+		// Atomic claim, paused→provisioning. Pre-fix this was `WHERE id = $2`
+		// with rowsAffected never read — a blind write, the same shape Pause had
+		// and the opposite of every sibling: WakeWorkspace claims
+		// `WHERE id = $2 AND status = 'hibernated'`, HibernateWorkspace claims
+		// `status='hibernating' WHERE status IN ('online','degraded')`.
+		//
+		// The predicate is load-bearing twice over. It makes a concurrent
+		// double-Resume a no-op for the loser instead of a second provision, and
+		// — because the dispatch below is gated on it — it makes "the row says
+		// provisioning" a PRECONDITION of "a box gets started". That is what
+		// closes the running-box/paused-row strand described above: there is no
+		// longer any path that provisions compute the database does not know
+		// about.
+		//
+		// Clear mcp_unloaded_since — this is the RESUME path (pause/hibernate →
+		// provisioning); a stale warming stamp here is exactly the cluster-2
+		// false-degrade the EV2 review flagged (core#4457).
+		res, err := db.DB.ExecContext(opCtx,
+			`UPDATE workspaces SET status = $1, mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2 AND status = 'paused'`,
+			models.StatusProvisioning, ws.id)
+		if err != nil {
+			note("mark_provisioning", err)
+			continue // nothing was started — the row is untouched and still 'paused'
+		}
+		claimed, raErr := res.RowsAffected()
+		if raErr != nil {
+			note("mark_provisioning", raErr)
+			continue
+		}
+		if claimed == 0 {
+			note("claim", errResumeClaimMissed)
+			continue
+		}
+
+		// From here this Resume OWNS the transition: the row says provisioning, so
+		// the box it is about to start is one the database knows about, and the
+		// register/heartbeat guards above will promote it to online. A failure
+		// below is real and reportable but does not un-resume anything, so it
+		// counts toward resumedCount AND toward failures — the caller gets a 207
+		// telling them the canvas may be stale, not a 500 implying nothing
+		// happened.
+		resumedCount++
+		if err := h.broadcaster.RecordAndBroadcast(opCtx, string(events.EventWorkspaceProvisioning), ws.id, map[string]interface{}{
 			"name": ws.name, "tier": ws.tier, "runtime": ws.runtime, "template": ws.template,
-		})
+		}); err != nil {
+			note("broadcast", err)
+		}
 		// Phase 1 template decoupling: the workspace row stores the template
 		// explicitly, so resume carries it through CreateWorkspacePayload.
-		payload := withStoredCompute(ctx, ws.id, models.CreateWorkspacePayload{Name: ws.name, Tier: ws.tier, Runtime: ws.runtime, Template: ws.template})
+		payload := withStoredCompute(opCtx, ws.id, models.CreateWorkspacePayload{Name: ws.name, Tier: ws.tier, Runtime: ws.runtime, Template: ws.template})
 		// RFC#2843 #33: if the row template is empty (legacy row), restore the
 		// persisted template on SaaS resume so config + prompts re-deliver.
 		if payload.Template == "" && h.cpProv != nil {
-			if storedTmpl := storedWorkspaceTemplate(ctx, ws.id); storedTmpl != "" {
+			if storedTmpl := storedWorkspaceTemplate(opCtx, ws.id); storedTmpl != "" {
 				payload.Template = storedTmpl
 			}
 		}
@@ -1500,9 +2146,85 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 		// no-backend mark-failed fallback identically to Create. Pre-
 		// 2026-05-05 this site inlined the if-cpProv-else dispatch; the
 		// dispatcher is the SoT now.
+		//
+		// It takes no context by design — it builds its own from
+		// context.Background() with provisioner.ProvisionTimeout — so this
+		// dispatch is NOT bounded by resumeSideEffectBudget and must not be
+		// (a provision legitimately outlives a 30s DB budget).
 		h.provisionWorkspaceAuto(ws.id, "", nil, payload)
 	}
 
-	log.Printf("Resuming workspace %s (%s) + %d children", wsName, id, len(toResume)-1)
-	c.JSON(http.StatusOK, gin.H{"status": "provisioning", "resumed_count": len(toResume)})
+	// ── Report what actually happened ─────────────────────────────────────────
+	//
+	// Pre-fix this was an UNCONDITIONAL c.JSON(200, {"status":"provisioning"})
+	// with every failure above reduced to a log line.
+	//
+	// The status is computed in memory and delivered on the HTTP response. That
+	// is deliberate: the response needs no DB, no Redis and no broadcast, so it
+	// is still reachable when the very subsystem that caused the failure is dead.
+	// A failure reported through a write that the failure itself has broken is
+	// not a report.
+	//
+	// Note what "provisioning" keeps meaning on the success arm, and why the
+	// async dispatch above does not make it a lie. It asserts a state that is
+	// DURABLY TRUE AT RESPONSE TIME: the claim committed before this line runs.
+	// Pause's {"status":"paused"} could not make that trade — it asserts a
+	// COMPLETED TERMINAL state, which is why PR #5102 keeps Pause synchronous.
+	// "provisioning" is an honest "queued", and the provision's own outcome
+	// arrives asynchronously as a WORKSPACE_PROVISION_FAILED event plus
+	// status='failed' via markProvisionFailed, exactly as it does for Restart and
+	// Create.
+	//
+	// The residual races are bounded too, which is the property that actually
+	// makes this safe. Post-fix there are exactly two:
+	//
+	//   - claim lands, dispatch never happens (process dies between them). The
+	//     row sits at 'provisioning', and StartProvisioningTimeoutSweep
+	//     (registry/provisiontimeout.go, wired in cmd/server/main.go) flips
+	//     'provisioning' rows older than DefaultProvisioningTimeout — 12m, 30m
+	//     for hermes — to 'failed'. Recoverable: 'failed' is in the heartbeat's
+	//     `recoverable` set and Restart accepts it.
+	//   - claim fails, nothing is dispatched. The row stays 'paused', which is
+	//     the truth, and Resume can be retried.
+	//
+	// So the invariant this handler now holds is: EVERY residual race lands in a
+	// status something can recover from. Pre-fix the SUCCESS path landed in
+	// 'paused'-with-a-running-box, the one status nothing can.
+	if len(failures) == 0 {
+		log.Printf("Resuming workspace %s (%s) + %d children", wsName, id, len(toResume)-1)
+		c.JSON(http.StatusOK, gin.H{"status": "provisioning", "resumed_count": resumedCount})
+		return
+	}
+	log.Printf("Resume: %s (%s) — %d/%d resuming, %d failed", wsName, id, resumedCount, len(toResume), len(failures))
+	if resumedCount == 0 {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status": "resume_failed",
+			"error": fmt.Sprintf("no workspace entered the provisioning state (%d step(s) failed) — see failures[]: stage \"mark_provisioning\" = the status write failed; "+
+				"stage \"claim\" = the workspace was no longer paused. Nothing was provisioned in either case; re-check status before retrying",
+				len(failures)),
+			"resumed_count": 0,
+			"failed_count":  len(failures),
+			"failures":      failures,
+		})
+		return
+	}
+	// Partial: the cascade fans out over descendants, so "2 of 3 resuming" is a
+	// real outcome and must be representable. Collapsing it into 200 or 500
+	// discards the only information the caller can act on.
+	//
+	// The message states ONLY what is known here — a count and a pointer to
+	// failures[] — because no stronger claim holds on every path that reaches
+	// this line: a single-workspace resume whose claim succeeded and whose
+	// telemetry INSERT then failed is a 207 in which there is no cascade and the
+	// workspace IS provisioning. Prose that contradicts the payload beside it is
+	// the same defect as an unconditional 200 — a human reads the sentence, not
+	// failures[].
+	c.JSON(http.StatusMultiStatus, gin.H{
+		"status": "partially_resumed",
+		"error": fmt.Sprintf("%d of %d workspace(s) entered provisioning; %d step(s) failed — see failures[] for which workspace and which stage",
+			resumedCount, len(toResume), len(failures)),
+		"resumed_count": resumedCount,
+		"failed_count":  len(failures),
+		"failures":      failures,
+	})
 }
