@@ -90,12 +90,24 @@ func TestEnsureDefaultConfig_StampsProviderForEverySSOTPlatformModel(t *testing.
 	if len(platformModels) == 0 {
 		t.Fatalf("providers SSOT lists no platform models for runtime %q — the regression matrix would be empty; the SSOT shape changed (this test is the canary)", runtime)
 	}
-	// Headline sentinel: the exact id that booted NOT_CONFIGURED in prod MUST be
-	// in the enumerated set. If a refactor drops it from the platform arm, this
-	// test must still cover it explicitly — fail loud rather than silently
-	// shrinking the matrix.
-	if !containsString(platformModels, "moonshot/kimi-k2.6") {
-		t.Fatalf("the headline incident model \"moonshot/kimi-k2.6\" is no longer in the claude-code platform SSOT set (%v) — regression coverage for the original bug would be lost", platformModels)
+	// Headline sentinel: a specific, currently-offered platform id MUST be in the
+	// enumerated set. If a refactor drops it from the platform arm, this test
+	// must still cover it explicitly — fail loud rather than silently shrinking
+	// the matrix.
+	//
+	// RETARGETED 2026-08-04 off the original incident id "moonshot/kimi-k2.6",
+	// which sdk#203 WITHDREW from every platform arm (the platform's Moonshot
+	// vendor account was suspended for non-payment). A sentinel naming a
+	// withdrawn id would red on a legitimate policy change, so it is re-pointed
+	// at the SSOT default (MOLECULE_LLM_DEFAULT_MODEL) — an id that is on the
+	// arm today and that every platform-billed workspace actually boots on. The
+	// invariant is unchanged and still non-vacuous: an offered-but-not-stamped
+	// platform model still reds. Re-adding moonshot/kimi-k2.6 to the arm puts it
+	// back in `platformModels` and re-arms the parametrized coverage
+	// automatically.
+	const sentinelModel = "minimax/MiniMax-M2.7"
+	if !containsString(platformModels, sentinelModel) {
+		t.Fatalf("the sentinel platform model %q is no longer in the claude-code platform SSOT set (%v) — regression coverage for the original NOT_CONFIGURED bug would be lost", sentinelModel, platformModels)
 	}
 
 	for _, model := range platformModels {

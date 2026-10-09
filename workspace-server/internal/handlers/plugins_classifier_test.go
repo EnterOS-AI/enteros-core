@@ -155,3 +155,69 @@ func TestPluginInstallCanSkipRestart(t *testing.T) {
 		})
 	}
 }
+
+// TestIsGeneratedArtifact — production incident, reno-stars 2026-08-01.
+//
+// The classifier compared a freshly-cloned staged tree against the LIVE tree
+// and counted RUNTIME-GENERATED files as content. A plugin whose daemon
+// pip-installs itself (`.egg-info`) and imports its own modules
+// (`__pycache__/*.pyc`) therefore differed from staging permanently, so every
+// reconcile classified `cold` and triggered a restart — and every restart fires
+// fireReconcileOnline, which reconciles again. An unbreakable loop:
+//
+//	reconcile -> cold -> restart -> online -> reconcile -> cold -> ...
+//
+// Measured on the customer's coordinator: 24-32 restarts/hour, the hermes agent
+// never surviving long enough to complete a single turn. The live tree held 5
+// .pyc plus 1 .egg-info, stable across the whole observation window.
+//
+// Same defect class as core#5009 (a content comparison that counts generated
+// artifacts as content), one layer up in the control plane.
+func TestIsGeneratedArtifact(t *testing.T) {
+	generated := []string{
+		"__pycache__/mod.cpython-311.pyc",
+		"pkg/__pycache__/mod.cpython-311.pyc",
+		"pkg/mod.pyc",
+		"pkg/mod.pyo",
+		"gmail_channel_molecule.egg-info/PKG-INFO",
+		"src/thing.egg-info/SOURCES.txt",
+		".pytest_cache/v/cache/lastfailed",
+		"pkg/.pytest_cache/CACHEDIR.TAG",
+		".mypy_cache/x.json",
+		// setuptools build output — the shape that survived the FIRST version of
+		// this fix and would have left the customer's restart loop running.
+		"build/lib/gmail_channel_molecule/daemon.py",
+		"build/lib.linux-x86_64-3.11/pkg/mod.py",
+		"build/bdist.linux-x86_64/wheel/thing.py",
+		"build/scripts-3.11/entry",
+	}
+	for _, rel := range generated {
+		if !isGeneratedArtifact(rel) {
+			t.Errorf("isGeneratedArtifact(%q) = false, want true — a runtime-generated "+
+				"file counted as plugin content forces a permanent cold-restart loop", rel)
+		}
+	}
+	// Real plugin content must NOT be excluded, or a genuine update stops
+	// triggering the restart it needs.
+	content := []string{
+		"plugin.yaml",
+		"SKILL.md",
+		"skills/gmail-connect/SKILL.md",
+		"gmail_channel_molecule/daemon.py",
+		"mcp/server.py",
+		"daemon-bootstrap.sh",
+		"pyproject.toml",
+		// near-misses that are ordinary files, not generated caches
+		"docs/pycache-notes.md",
+		"pkg/egg-info-reader.py",
+		// a plugin that legitimately ships its own top-level build/ content
+		"build/README.md",
+		"src/build/helper.py",
+	}
+	for _, rel := range content {
+		if isGeneratedArtifact(rel) {
+			t.Errorf("isGeneratedArtifact(%q) = true, want false — excluding real "+
+				"content means a genuine plugin update never restarts the agent", rel)
+		}
+	}
+}

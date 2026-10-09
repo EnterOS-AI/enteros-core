@@ -189,6 +189,24 @@ services:
       # anonymously pullable, so both normally remain unset.
       GHCR_USER: "${GHCR_USER:-}"
       GHCR_TOKEN: "${GHCR_TOKEN:-}"
+      # Langfuse tracing (optional, OFF unless keys are supplied).
+      #
+      # THIS FILE IS WHERE `langfuse-web` IS TRUE. The alias exists because the
+      # langfuse service above declares it on molecule-core-net, and it resolves
+      # in this topology and no other — on the k8s fleet there is no such
+      # Service in any namespace. So the container-network trace endpoint is
+      # named HERE rather than compiled into the provisioner as everyone's
+      # fallback: appendWorkspaceLangfuseEnv has no default host, precisely
+      # because a workspace on a substrate without this alias then retried an
+      # OTLP export against an unresolvable name forever (22,224 error lines in
+      # one tenant over 24h).
+      #
+      # The keys default to empty, so a plain `docker compose up` still boots
+      # untraced — pass real ones (or run scripts/dev-start.sh, which seeds the
+      # deterministic local pair) to turn tracing on.
+      MOLECULE_WORKSPACE_LANGFUSE_HOST: "${MOLECULE_WORKSPACE_LANGFUSE_HOST:-http://langfuse-web:3000}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
     volumes:
       - ./workspace-configs-templates:/configs
       # NOTE: the empty host ./org-templates is intentionally NOT mounted over

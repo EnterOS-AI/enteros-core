@@ -48,6 +48,15 @@ on:
       # that line back down into the parked half — touches ONLY this file, so
       # without this path the guard would not run on the very diff it guards.
       - '.gitea/required-contexts.txt'
+      # core#4977: test_check_onconflict_partial_index.py runs the ON CONFLICT /
+      # partial-index lint against the REAL workspace-server tree + migrations, so the
+      # mutation it exists to catch -- dropping a partial index's predicate from an ON
+      # CONFLICT clause, which Postgres rejects at RUNTIME while compiling, vetting and
+      # sqlmock-ing perfectly clean -- touches ONLY those paths. Without them the guard
+      # would not run on the very diff it guards, same reasoning as #4322/#4346 above.
+      # That exact bug shipped and reached a customer: every drift enqueue failed for
+      # the life of the feature and the queue sat empty. Suite is ~3s.
+      - 'workspace-server/**'
       # The marketplace SSOT test guards this public stub as well as its own
       # test file. A stub-only regression must therefore emit this gate.
       - 'docs/design/rfc-marketplace-delivery.md'
@@ -77,6 +86,15 @@ on:
       # that line back down into the parked half — touches ONLY this file, so
       # without this path the guard would not run on the very diff it guards.
       - '.gitea/required-contexts.txt'
+      # core#4977: test_check_onconflict_partial_index.py runs the ON CONFLICT /
+      # partial-index lint against the REAL workspace-server tree + migrations, so the
+      # mutation it exists to catch -- dropping a partial index's predicate from an ON
+      # CONFLICT clause, which Postgres rejects at RUNTIME while compiling, vetting and
+      # sqlmock-ing perfectly clean -- touches ONLY those paths. Without them the guard
+      # would not run on the very diff it guards, same reasoning as #4322/#4346 above.
+      # That exact bug shipped and reached a customer: every drift enqueue failed for
+      # the life of the feature and the queue sat empty. Suite is ~3s.
+      - 'workspace-server/**'
       # The marketplace SSOT test guards this public stub as well as its own
       # test file. A stub-only regression must therefore emit this gate.
       - 'docs/design/rfc-marketplace-delivery.md'

@@ -21,8 +21,9 @@ package handlers
 //   C1: WorkspaceAuth middleware rejects requests without a valid bearer token.
 //   C2: MCPRateLimiter (120 req/min/token) middleware applied in router.go.
 //   C3: commit_memory / recall_memory with scope=GLOBAL return a permission
-//       error; send_message_to_user is excluded from tools/list unless
-//       MOLECULE_MCP_ALLOW_SEND_MESSAGE=true.
+//       error; send_message_to_user is listed by default and excluded from
+//       tools/list only where the MOLECULE_MCP_ALLOW_SEND_MESSAGE kill-switch
+//       is set falsy.
 
 import (
 	"context"
@@ -31,9 +32,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/envx"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/push"
 	"github.com/gin-gonic/gin"
@@ -453,12 +454,13 @@ var mcpAllTools = []mcpTool{
 }
 
 // mcpToolList returns the filtered tool list for this MCP bridge.
-// C3: send_message_to_user is excluded unless MOLECULE_MCP_ALLOW_SEND_MESSAGE=true.
+// C3: send_message_to_user is listed by default; it is excluded only where the
+// MOLECULE_MCP_ALLOW_SEND_MESSAGE kill-switch is set falsy (mcpSendMessageEnabled).
 // core#2127: delegate_task + delegate_task_async are excluded when the
 // caller's workspace has can_delegate=FALSE (defense-in-depth: a role-locked
 // agent whose prompt is bypassed still cannot discover the tools).
 func mcpToolList(canDelegate bool) []mcpTool {
-	allowSend := os.Getenv("MOLECULE_MCP_ALLOW_SEND_MESSAGE") == "true"
+	allowSend := mcpSendMessageEnabled()
 	var out []mcpTool
 	for _, t := range mcpAllTools {
 		if t.Name == "send_message_to_user" && !allowSend {
@@ -470,6 +472,25 @@ func mcpToolList(canDelegate bool) []mcpTool {
 		out = append(out, t)
 	}
 	return out
+}
+
+// mcpSendMessageEnabled is the SINGLE read site for the send_message_to_user
+// posture, consulted by both the tools/list filter above and the tool
+// implementation (mcp_tools.go toolSendMessageToUser) so the two can never
+// drift into "listed but refuses" or "unlisted but callable".
+//
+// UNCONDITIONAL as of core#5047. The tool was gated on
+// MOLECULE_MCP_ALLOW_SEND_MESSAGE=="true" and that variable was never set
+// anywhere — for 15 weeks send_message_to_user was absent from EVERY MCP
+// tools/list, so no agent could discover it. Shipped capability does not sit
+// behind a default-off flag.
+//
+// The variable survives as an OPERATOR KILL-SWITCH: set it to
+// 0/false/no/off to take the tool away again (deployments that do not want
+// agent→user WebSocket pushes from CLI sessions) with no redeploy. Unset,
+// empty, and truthy all mean ON.
+func mcpSendMessageEnabled() bool {
+	return envx.Enabled("MOLECULE_MCP_ALLOW_SEND_MESSAGE")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

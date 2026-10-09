@@ -7,10 +7,107 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 )
+
+type fakeVNCPresence struct {
+	mu    sync.Mutex
+	calls []int
+}
+
+func (f *fakeVNCPresence) SetVNCPresence(_ context.Context, _ string, connections int, _ time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, connections)
+	return nil
+}
+func (f *fakeVNCPresence) snapshot() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.calls...)
+}
+
+// A live human viewer must be counted and mirrored to the store so the idle
+// sweeper does not reap the desktop under the human (the bug the user hit taking
+// over the display). Overlapping viewers keep the count > 0 until the LAST one
+// leaves.
+func TestGateway_ViewerPresenceCountsAndMirrors(t *testing.T) {
+	g := New(&fakeProv{}, &fakeLocks{}, &fakeActivity{}, tokenFn, &fakeDoer{})
+	vnc := &fakeVNCPresence{}
+	g.SetVNCPresenceRecorder(vnc)
+	const ws = "w1"
+	g.ViewerConnected(context.Background(), ws)    // -> 1
+	g.ViewerConnected(context.Background(), ws)    // -> 2 (overlapping viewer)
+	g.ViewerDisconnected(context.Background(), ws) // -> 1 (still watched)
+	g.ViewerDisconnected(context.Background(), ws) // -> 0 (last one leaves)
+	got := vnc.snapshot()
+	want := []int{1, 2, 1, 0}
+	if len(got) != len(want) {
+		t.Fatalf("presence writes = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("presence writes = %v, want %v", got, want)
+		}
+	}
+}
+
+// HumanNavigate must reject any non-http(s) / hostless URL BEFORE reaching the
+// sidecar (defense in depth against file://, javascript:, chrome://, etc.).
+func TestGateway_HumanNavigate_RejectsUnsafeURL(t *testing.T) {
+	doer := &fakeDoer{code: http.StatusNoContent}
+	g := New(&fakeProv{addr: "wsdesk-abc123:6070"}, &fakeLocks{}, &fakeActivity{}, tokenFn, doer)
+	for _, bad := range []string{"file:///etc/passwd", "javascript:alert(1)", "chrome://settings", "ftp://h/x", "notaurl", ""} {
+		if err := g.HumanNavigate(context.Background(), "w1", bad); !errors.Is(err, ErrInvalidNavigateURL) {
+			t.Fatalf("HumanNavigate(%q) = %v, want ErrInvalidNavigateURL", bad, err)
+		}
+	}
+	if len(doer.reqs) != 0 {
+		t.Fatalf("rejected URLs must never reach the sidecar, got %d reqs", len(doer.reqs))
+	}
+}
+
+// A valid URL is forwarded as a {"type":"navigate","url":...} action to the
+// sidecar /input — and does NOT require the agent lock (the human is the
+// controller; the handler authorizes them separately).
+func TestGateway_HumanNavigate_ForwardsNavigateAction(t *testing.T) {
+	doer := &fakeDoer{code: http.StatusNoContent}
+	g := New(&fakeProv{addr: "wsdesk-abc123:6070"}, &fakeLocks{held: false}, &fakeActivity{}, tokenFn, doer)
+	if err := g.HumanNavigate(context.Background(), "w1", "https://example.com/x"); err != nil {
+		t.Fatalf("HumanNavigate: %v", err)
+	}
+	if len(doer.reqs) != 1 {
+		t.Fatalf("want exactly 1 forwarded request, got %d", len(doer.reqs))
+	}
+	r := doer.reqs[0]
+	if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/input") {
+		t.Fatalf("bad forward target: %s %s", r.Method, r.URL.Path)
+	}
+	body, _ := io.ReadAll(r.Body)
+	var got struct{ Type, URL string }
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("forwarded body not JSON: %s", body)
+	}
+	if got.Type != "navigate" || got.URL != "https://example.com/x" {
+		t.Fatalf("forwarded action = %s, want navigate https://example.com/x", body)
+	}
+}
+
+// A stray disconnect (e.g. a double-close) must never drive the count negative,
+// which would later let a real viewer's +1 land at 0 and the desktop be reaped.
+func TestGateway_ViewerDisconnectNeverGoesNegative(t *testing.T) {
+	g := New(&fakeProv{}, &fakeLocks{}, &fakeActivity{}, tokenFn, &fakeDoer{})
+	vnc := &fakeVNCPresence{}
+	g.SetVNCPresenceRecorder(vnc)
+	g.ViewerDisconnected(context.Background(), "w1")
+	if got := vnc.snapshot(); len(got) != 1 || got[0] != 0 {
+		t.Fatalf("underflow write = %v, want [0]", got)
+	}
+}
 
 // --- fakes ---
 

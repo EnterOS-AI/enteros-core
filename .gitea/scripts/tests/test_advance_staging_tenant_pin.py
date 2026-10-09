@@ -1,11 +1,15 @@
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = ROOT / "scripts" / "deploy" / "advance-staging-tenant-pin.sh"
+
+sys.path.insert(0, str(ROOT / ".gitea" / "scripts"))
+import pin_provenance  # noqa: E402
 
 
 def test_digest_resolution_is_independent_of_a_previous_runner_cache(tmp_path: Path):
@@ -200,6 +204,15 @@ sys.exit(1)
             "TENANT_IMAGE_NAME": "registry.test/molecule-tenant",
             "GITHUB_SHA": github_sha,
             "GITHUB_OUTPUT": str(github_output),
+            # The promote now refuses to run without a CI run id to attribute
+            # the pin write to (see pin_provenance.py). Supplying the same
+            # variables Actions supplies is what makes this test exercise the
+            # real path; the ABSENT case is covered by
+            # test_promote_refused_without_ci_provenance below.
+            "GITHUB_RUN_ID": "900001",
+            "GITHUB_REPOSITORY": "molecule-ai/molecule-core",
+            "GITHUB_WORKFLOW": "staging-tenant-cd",
+            "GITHUB_JOB": "advance-pin",
             "FAKE_CURL_STATE": str(state_dir),
             # This test covers CP runtime-pin promotion, not the boot-default SSOT
             # write this PR adds. That write now needs real Infisical universal-auth
@@ -224,12 +237,18 @@ sys.exit(1)
 
     assert result.returncode == 0, result.stderr + result.stdout
     body = json.loads((state_dir / "body.json").read_text(encoding="utf-8"))
-    assert body == {
-        "template_name": "molecule-tenant",
-        "image_digest": new_digest,
-        "git_sha": github_sha,
-        "notes": "staging tenant image registry.test/molecule-tenant:staging-deadbee",
-    }
+    assert body["template_name"] == "molecule-tenant"
+    assert body["image_digest"] == new_digest
+    assert body["git_sha"] == github_sha
+    # The note is now a PROVENANCE STAMP followed by the free text. Assert the
+    # stamp by parsing it with the same module the auditor uses, not by matching
+    # a formatted string — a guard that only matches text drifts silently the
+    # first time the grammar gains a field.
+    fields = pin_provenance.parse(body["notes"])
+    assert fields["run"] == "900001", body["notes"]
+    assert fields["repo"] == "molecule-ai/molecule-core", body["notes"]
+    assert "registry.test/molecule-tenant:staging-deadbee" in body["notes"]
+    assert len(body["notes"]) <= 500, "the CP rejects notes longer than 500 chars"
     out = github_output.read_text(encoding="utf-8")
     assert f"old_image=registry.test/molecule-tenant:staging-{old_git[:7]}" in out
     assert f"old_digest={old_digest}" in out
@@ -480,3 +499,130 @@ sys.exit(1)
     assert w["secretValue"] == image_tag, (
         f"wrote {w['secretValue']!r}; expected the pullable ref {image_tag!r}"
     )
+
+
+def _fake_promote_env(tmp_path: Path, state_dir: Path, digest: str, git_sha: str) -> dict:
+    """Fakes for a promote that WOULD succeed: a docker daemon that resolves the
+    digest and a curl that records the promote body.
+
+    Shared by the two provenance tests so the ONLY difference between them is
+    the presence of GITHUB_RUN_ID. A negative control that also varies the fakes
+    proves nothing about the variable under test.
+    """
+    docker = tmp_path / "docker"
+    docker.write_text(
+        f"""#!/bin/sh
+if [ "$1" = "pull" ]; then exit 0; fi
+if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then echo "{digest}"; exit 0; fi
+exit 1
+""",
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+
+    curl = tmp_path / "curl"
+    curl.write_text(
+        f"""#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+method, body, url = "GET", "", ""
+i = 0
+while i < len(args):
+    if args[i] == "-X":
+        method = args[i + 1]; i += 2; continue
+    if args[i] == "-d":
+        body = args[i + 1]; i += 2; continue
+    if args[i].startswith("http"):
+        url = args[i]
+    i += 1
+state = os.environ["FAKE_CURL_STATE"]
+if url.endswith("/cp/admin/runtime-image/promote") and method == "POST":
+    open(os.path.join(state, "body.json"), "w").write(body)
+    open(os.path.join(state, "promoted"), "w").write("1")
+    print(body); sys.exit(0)
+if url.endswith("/cp/admin/runtime-image"):
+    promoted = os.path.exists(os.path.join(state, "promoted"))
+    d = "{digest}" if promoted else "sha256:" + "0" * 64
+    g = "{git_sha}" if promoted else "0" * 40
+    print(json.dumps({{"pins": [{{"template_name": "molecule-tenant", "region": "global", "image_digest": d, "git_sha": g}}]}}))
+    sys.exit(0)
+sys.exit(1)
+""",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{tmp_path}{os.pathsep}{env['PATH']}",
+            "CP_ADMIN_API_TOKEN": "test-token",
+            "CP_BASE_URL": "https://staging-api.test",
+            "TENANT_IMAGE_NAME": "registry.test/molecule-tenant",
+            "GITHUB_SHA": git_sha,
+            "GITHUB_OUTPUT": str(tmp_path / "gh-output"),
+            "FAKE_CURL_STATE": str(state_dir),
+            "SKIP_SSOT_WRITE": "1",
+        }
+    )
+    for leaked in ("GITHUB_RUN_ID", "GITHUB_REPOSITORY", "GITHUB_WORKFLOW", "GITHUB_JOB"):
+        env.pop(leaked, None)
+    return env
+
+
+def test_promote_refused_without_ci_provenance(tmp_path: Path):
+    """No GITHUB_RUN_ID => no stamp => NO PIN WRITE. Executed, not grepped.
+
+    This is the mechanism that replaces the convention. The hand path was
+    literally endorsed in a workflow comment ("Reconcile that case by running
+    scripts/deploy/advance-staging-tenant-pin.sh directly"), and a hand promote
+    is indistinguishable from a CI one once written: `promoted_by` is the CP
+    admin token's identity either way.
+
+    The assertion that matters is not the exit code — it is that `body.json`
+    was never written. A guard that fails AFTER the POST has already landed
+    protects nothing.
+    """
+    digest = "sha256:" + "a" * 64
+    git_sha = "b" * 40
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    env = _fake_promote_env(tmp_path, state_dir, digest, git_sha)
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--tag", "staging-deadbee"],
+        cwd=ROOT, env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert not (state_dir / "body.json").exists(), (
+        "the promote POST was sent despite having no CI provenance"
+    )
+    assert "refusing to promote" in result.stderr, result.stderr
+
+
+def test_promote_allowed_with_ci_provenance(tmp_path: Path):
+    """The POSITIVE control: the SAME fakes plus GITHUB_RUN_ID promote fine.
+
+    Varies exactly one input against the test above. Without this, a script
+    that refused every promote for an unrelated reason would still pass the
+    negative test.
+    """
+    digest = "sha256:" + "a" * 64
+    git_sha = "b" * 40
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    env = _fake_promote_env(tmp_path, state_dir, digest, git_sha)
+    env["GITHUB_RUN_ID"] = "900002"
+    env["GITHUB_REPOSITORY"] = "molecule-ai/molecule-core"
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--tag", "staging-deadbee"],
+        cwd=ROOT, env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    body = json.loads((state_dir / "body.json").read_text(encoding="utf-8"))
+    assert pin_provenance.parse(body["notes"])["run"] == "900002", body["notes"]

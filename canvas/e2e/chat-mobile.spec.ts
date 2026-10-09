@@ -1,4 +1,9 @@
-import { test, expect } from "@playwright/test";
+// `test` comes from helpers/net-evidence, not @playwright/test: it is the same
+// runner with a `requestfailed` recorder attached to every page, and with that
+// recording ASSERTED after every test. Without it this file's page loads are
+// unrecorded — the diagnostic prints "NOT RECORDED" for them, so a core#5106
+// recurrence landing here would be undiagnosable and, worse, uncounted.
+import { test, expect } from "./helpers/net-evidence";
 import { startEchoRuntime } from "./fixtures/echo-runtime";
 import { seedWorkspace, startHeartbeat, cleanupWorkspace, seedChatHistory } from "./fixtures/chat-seed";
 

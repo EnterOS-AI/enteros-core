@@ -1,4 +1,9 @@
-# main-red-watchdog — hourly sentinel for post-merge CI red on `main`.
+# main-red-watchdog — sentinel for post-merge CI red on `main`.
+#
+# ⚠️  THIS WORKFLOW IS NOT CURRENTLY FIRING. It has no `schedule:` (the repo
+# runs a zero-cron ratchet) and — unlike status-reaper and
+# stranded-status-janitor — no operator-config cron entry is wired for it.
+# See the `on:` block below for the measurement and the missing wiring.
 #
 # RFC: hongming "main NEVER goes red" directive, Option C of the four-
 # option ladder (B = auto-revert is explicitly rejected per
@@ -31,14 +36,51 @@
 
 name: main-red-watchdog
 
-# Repository policy keeps this dispatch flat (no `inputs:`) until shared
-# callers and lint fixtures are migrated together.
 on:
-  # SCHEDULE RE-ENABLED 2026-05-12 rev3 — interim disable (mc#645) reverted alongside
-  # status-reaper rev3 (widen-window). Job-level timeout-minutes raised 5 → 15 below
-  # to absorb runner-saturation latency without spurious cancels (the original cascade
-  # cause). If runner-saturation root persists, the dedicated-runner-label split
-  # remains the structural next step (tracked separately).
+  # HISTORY. This block used to read "SCHEDULE RE-ENABLED 2026-05-12 rev3".
+  # That claim was FALSE and had been false for 47 days when it was corrected:
+  # the line directly below it declares `workflow_dispatch:` and nothing else.
+  # The 2026-06-27 zero-cron sweep (#3344, ratcheted by
+  # .gitea/scripts/lint_schedule_budget.py) stripped `schedule:` from this
+  # workflow and left the re-enabled comment in place. A reader — human or
+  # agent — checking "is main being watched?" read the comment, not the trigger.
+  #
+  # MEASURED 2026-08-13, not inferred:
+  #   * The complete `?event=workflow_dispatch` run history the Gitea API
+  #     returns for this repo is 368 runs. `main-red-watchdog.yml` appears
+  #     ZERO times in it. `workflow_dispatch` is this workflow's ONLY trigger,
+  #     so it has not executed at all in that window.
+  #   * The last `[main-red] …` issue this workflow ever filed is #3333,
+  #     created 2026-06-27T13:07:20Z. The `[main-red]` series before it lands
+  #     at :07 past the hour — a real hourly cron — and then stops dead on the
+  #     sweep date. Nothing has filed one since.
+  #   * The Gitea Actions API reports this workflow `active`. `active` means
+  #     "not disabled_manually". It is NOT evidence that anything runs it.
+  #
+  # WHAT IS AND IS NOT COVERED WHILE THIS IS DARK. main-canary DOES fire on
+  # push:main and DOES file `[main-canary] …` issues, so Go build/vet/test
+  # breakage on merged main is still caught. main-canary does NOT read main's
+  # COMBINED STATUS, so a red or stranded-pending context on main — a lint, an
+  # e2e lane, a zombie-reaped job (#5122), a cross-run stranded pending (#5044)
+  # — is seen by nothing. That is the live gap; do not read a green
+  # main-canary as "main is green".
+  #
+  # TO RESTORE. Do NOT add `schedule:` here — lint_schedule_budget.py fails the
+  # build on any live `on.schedule`, by directive. Cadence belongs in
+  # operator-config, exactly as this workflow's two siblings already document:
+  #   /etc/cron.d/molecule-core-main-red-watchdog ->
+  #   /usr/local/bin/molecule-core-cron-bot.sh main-red-watchdog
+  # An hourly cadence matches the historical `[main-red]` issue series. NOTE
+  # that status-reaper and stranded-status-janitor document that same wiring
+  # and ALSO appear zero times in the 368-run census above, so installing the
+  # cron file is necessary but has NOT been shown sufficient — verify by
+  # observing a run, not by observing the config.
+  #
+  # Repository policy keeps this dispatch flat (no `inputs:`) until shared
+  # callers and lint fixtures are migrated together.
+  #
+  # Job-level timeout-minutes is 15 (rev3, 2026-05-12, mc#645 revert) to absorb
+  # runner-saturation latency without spurious cancels.
   workflow_dispatch:
 
 # Read commit status + branch ref + issues; write issues (open/PATCH/close).

@@ -23,6 +23,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 )
 
 // errNoOrgRoot is returned by orgRootID when the workspace id has no row (and
@@ -48,18 +49,46 @@ var errNoOrgRoot = errors.New("org root not found for workspace")
 // report two genuinely same-org workspaces as different orgs and 403 a
 // legitimate a2a route. A workspace that already IS an org root has a one-row
 // chain whose id == itself, so it correctly resolves to itself.
-const orgRootSubtreeCTE = `
+// DEPTH BOUND (added with the #5074 re-parent guards): the recursive member
+// carries a hop counter and stops at orgRootMaxChainDepth.
+//
+// Without it this CTE does not terminate on a cyclic parent_id chain. The
+// `WHERE parent_id IS NULL` filter sits OUTSIDE the CTE, so on a cycle no row
+// ever satisfies it and the LIMIT 1 never fires — the recursion just keeps
+// producing rows until the statement is cancelled or the backend runs out of
+// memory. Measured on PG16 against a seeded two-node cycle: `canceling
+// statement due to statement timeout` after the full timeout, every call.
+//
+// That matters because this CTE is the tenant-isolation primitive — sameOrg(),
+// a2a routing, peer discovery, list_peers, broadcast and the org plugin
+// allowlist all reach it. A single cyclic row therefore stalls every one of
+// those paths for the whole statement_timeout, and checkOrgPluginAllowlist
+// fails OPEN afterwards.
+//
+// A chain that exceeds the bound yields NO root row, so orgRootID returns
+// errNoOrgRoot and callers fail CLOSED — the same posture they already take
+// for a missing workspace. That is strictly better than hanging.
+//
+// 64 matches workspace_reparent.go's reparentMaxDepth and exceeds
+// namespace/resolver.go's maxChainDepth of 50, so any chain this resolves is
+// one the memory resolver can also walk to the same root.
+const orgRootMaxChainDepth = 64
+
+// Built from orgRootMaxChainDepth rather than repeating the number, so the
+// bound cannot drift from the constant that documents it.
+var orgRootSubtreeCTE = fmt.Sprintf(`
 	WITH RECURSIVE org_chain AS (
-		SELECT id, parent_id
+		SELECT id, parent_id, 0 AS depth
 		FROM workspaces
 		WHERE id = $1
 		UNION ALL
-		SELECT w.id, w.parent_id
+		SELECT w.id, w.parent_id, c.depth + 1
 		FROM workspaces w
 		JOIN org_chain c ON w.id = c.parent_id
+		WHERE c.depth < %d
 	)
 	SELECT id AS root_id FROM org_chain WHERE parent_id IS NULL LIMIT 1
-`
+`, orgRootMaxChainDepth)
 
 // orgRootID resolves the org root of `workspaceID` by walking the parent_id
 // chain via orgRootSubtreeCTE. Returns errNoOrgRoot when the workspace (or its

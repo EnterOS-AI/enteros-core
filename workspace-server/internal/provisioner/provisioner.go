@@ -1216,37 +1216,80 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 		}
 	}
 	// Langfuse tracing (SSOT reproducibility): when the platform has Langfuse
-	// keys in its env, inject them into EVERY workspace container so the shared
-	// runtime's tracing producer emits — no per-workspace secret needed. The
-	// agent reaches Langfuse over the Docker network, so its HOST is the
-	// container-network URL (MOLECULE_WORKSPACE_LANGFUSE_HOST, default
-	// http://langfuse-web:3000), NOT the platform's host-published one. A
-	// workspace_secrets override still wins (assembled above from cfg.EnvVars).
-	if pk, sk := os.Getenv("LANGFUSE_PUBLIC_KEY"), os.Getenv("LANGFUSE_SECRET_KEY"); pk != "" && sk != "" {
-		host := os.Getenv("MOLECULE_WORKSPACE_LANGFUSE_HOST")
-		if host == "" {
-			host = "http://langfuse-web:3000"
-		}
-		// A workspace/global-secret LANGFUSE_HOST that points at the platform
-		// HOST's loopback (127.0.0.1 / localhost / ::1 — the host-published
-		// Langfuse UI port) is UNREACHABLE from inside the workspace container,
-		// so the tracing producer silently fails ("Unexpected error … contact
-		// support"). Rewrite such a value to the container-network URL. A
-		// non-loopback override (a real cloud.langfuse.com or internal DNS) is
-		// a deliberate external target and is left untouched. Duplicate env
-		// keys resolve last-wins in the container runtime, so appending here
-		// overrides earlier cfg.EnvVars only when the earlier value is absent
-		// or unusable.
-		existing, set := cfg.EnvVars["LANGFUSE_HOST"]
-		if v, ok := cfg.EnvVars["LANGFUSE_PUBLIC_KEY"]; !ok || strings.TrimSpace(v) == "" {
-			env = append(env, fmt.Sprintf("LANGFUSE_PUBLIC_KEY=%s", pk))
-		}
-		if v, ok := cfg.EnvVars["LANGFUSE_SECRET_KEY"]; !ok || strings.TrimSpace(v) == "" {
-			env = append(env, fmt.Sprintf("LANGFUSE_SECRET_KEY=%s", sk))
-		}
-		if !set || isLoopbackHostURL(existing) {
-			env = append(env, fmt.Sprintf("LANGFUSE_HOST=%s", host))
-		}
+	// keys in its env AND a reachable trace endpoint is known, inject them into
+	// EVERY workspace container so the shared runtime's tracing producer emits —
+	// no per-workspace secret needed. See appendWorkspaceLangfuseEnv.
+	env = appendWorkspaceLangfuseEnv(env, cfg.EnvVars)
+	return env
+}
+
+// workspaceLangfuseHostEnv names the platform env var that carries the trace
+// endpoint a WORKSPACE CONTAINER can reach. It is deliberately distinct from
+// LANGFUSE_HOST (which is the PLATFORM's own reader URL — on compose the
+// host-published 127.0.0.1:3001 port) because the two are different addresses
+// of the same service seen from different network namespaces.
+const workspaceLangfuseHostEnv = "MOLECULE_WORKSPACE_LANGFUSE_HOST"
+
+// appendWorkspaceLangfuseEnv appends the LANGFUSE_* tracing entries for one
+// workspace container — or appends NOTHING, which is the ordinary case on any
+// deployment that has not stood Langfuse up.
+//
+// THERE IS NO DEFAULT HOST, AND ITS ABSENCE IS THE POINT.
+//
+// This used to fall back to the literal "http://langfuse-web:3000" — the
+// docker-compose service alias defined in this repo's own docker-compose.yml.
+// It resolves inside the compose topology and NOWHERE ELSE. On the k8s fleet no
+// langfuse-web Service exists in any namespace, so every workspace agent in
+// every tenant retried an OTLP export against a name that cannot resolve,
+// forever. MEASURED over 24h to 2026-09-01: 22,224 error lines in
+// ns/enteros-dinecall-ai and 9,011 in ns/enteros-minori — roughly 90% of all
+// error lines those tenants produced, which is how a real error stops being
+// findable. A value that is correct in exactly one deployment topology is not a
+// default; it is a guess that only that one topology can honour, and it belongs
+// in that topology's config (docker-compose.yml sets this var; dev-start.sh
+// exports it) rather than compiled in as everyone's fallback.
+//
+// THE KEYS ARE GATED ON THE HOST, not merely for tidiness. The Langfuse SDK's
+// own default endpoint is https://cloud.langfuse.com, a public host that DOES
+// resolve — so injecting a key pair with no host would convert a silent local
+// failure into silent egress of tenant trace data to a third party. Gating the
+// whole set on a known-reachable endpoint keeps the FAIL-OPEN contract this
+// block already honours for the keys: nothing configured → nothing injected →
+// the runtime boots untraced.
+func appendWorkspaceLangfuseEnv(env []string, envVars map[string]string) []string {
+	pk, sk := os.Getenv("LANGFUSE_PUBLIC_KEY"), os.Getenv("LANGFUSE_SECRET_KEY")
+	if pk == "" || sk == "" {
+		return env
+	}
+	// A workspace/global-secret LANGFUSE_HOST that points at the platform HOST's
+	// loopback (127.0.0.1 / localhost / ::1 — the host-published Langfuse UI
+	// port) is UNREACHABLE from inside the workspace container, so the tracing
+	// producer silently fails ("Unexpected error … contact support"). Such a
+	// value is rewritten to the container-network URL when one is configured. A
+	// non-loopback override (a real cloud.langfuse.com or internal DNS) is a
+	// deliberate external target and is left untouched. Duplicate env keys
+	// resolve last-wins in the container runtime, so appending here overrides
+	// the earlier cfg.EnvVars entry only when that value is absent or unusable.
+	existing, set := envVars["LANGFUSE_HOST"]
+	existingUsable := set && strings.TrimSpace(existing) != "" && !isLoopbackHostURL(existing)
+	host := strings.TrimSpace(os.Getenv(workspaceLangfuseHostEnv))
+	switch {
+	case existingUsable:
+		// The workspace named its own reachable endpoint; it is already in env
+		// from the cfg.EnvVars pass above and must not be overridden.
+	case host != "":
+		env = append(env, fmt.Sprintf("LANGFUSE_HOST=%s", host))
+	default:
+		// No reachable endpoint is known — not from the platform, not from the
+		// workspace's own secrets (an unset or loopback value is not one). Emit
+		// nothing rather than a hostname that only one topology can resolve.
+		return env
+	}
+	if v, ok := envVars["LANGFUSE_PUBLIC_KEY"]; !ok || strings.TrimSpace(v) == "" {
+		env = append(env, fmt.Sprintf("LANGFUSE_PUBLIC_KEY=%s", pk))
+	}
+	if v, ok := envVars["LANGFUSE_SECRET_KEY"]; !ok || strings.TrimSpace(v) == "" {
+		env = append(env, fmt.Sprintf("LANGFUSE_SECRET_KEY=%s", sk))
 	}
 	return env
 }

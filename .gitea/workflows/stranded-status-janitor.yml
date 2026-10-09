@@ -1,0 +1,120 @@
+name: stranded-status-janitor
+
+# Finds commit-status contexts whose LAST row is a merge-blocking ARTIFACT
+# rather than a verdict about the code, which under branch protection
+# status_check_contexts=['*'] blocks a fully-green, fully-approved PR forever.
+# Three shapes, one healing mechanism (re-run — never a fabricated green):
+#   * `pending` whose Actions run has already finished (#4979): cross-run
+#     misattribution in Gitea's services/actions/job_emitter.go, and lost
+#     terminal writes.
+#   * `failure` that is Gitea's own `cancelled -> failure` stamp (core#5156):
+#     a newer run evicts the QUEUED member of a concurrency group
+#     (`cancel-in-progress: false` protects only the RUNNING one), Gitea writes
+#     `failure`/"Has been cancelled" for a job with started_at=1970 that never
+#     executed. When the group is not keyed on the head SHA the evicting run
+#     belongs to a DIFFERENT SHA, so nothing ever re-posts here and the red
+#     latches permanently.
+#   * `failure` from a job that was ASSIGNED to a runner and then never executed
+#     a single step (main 8a797665, run 647884 / job 952902): the runner took
+#     the task and went silent, the server force-closed the job 787s later, and
+#     every step came out stamped at the job's stop time with zero elapsed. The
+#     commit-status row is byte-identical to a genuine red ("Failing after
+#     13m7s"), so only the job's STEP records can tell them apart. That one red
+#     froze the merge train and made ~50 PRs unmergeable for ~22 hours, by which
+#     time the job's log had aged out of retention.
+# See .gitea/scripts/stranded_status_janitor.py for the measured evidence.
+#
+# Trigger: workflow_dispatch ONLY.
+#   The repo runs a zero-cron ratchet (.gitea/scripts/lint_schedule_budget.py):
+#   an `on.schedule` trigger in any workflow fails CI. Cadence therefore lives
+#   in operator-config, exactly like status-reaper:
+#     /etc/cron.d/molecule-core-stranded-status-janitor ->
+#     /usr/local/bin/molecule-core-cron-bot.sh stranded-status-janitor
+#   A 15-minute cadence matches the script's --min-age-minutes grace.
+#
+# No `concurrency:` block, deliberately, for two reasons: status-reaper
+# documents that the runner cancels queued maintenance ticks even under
+# `cancel-in-progress: false`; and a concurrency group is the precondition for
+# the very Gitea defect this workflow exists to clean up, so a janitor that
+# declares one can strand its own context.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
+jobs:
+  # bp-exempt: maintenance bot, dispatch-only. It emits no (pull_request)
+  # context and is not a merge gate; it reports on OTHER commits' contexts.
+  janitor:
+    name: Sweep for stranded pending contexts
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Fetch CI_STATUS_TOKEN from Infisical SSOT
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; v=json.load(sys.stdin).get("accessToken"); sys.stdout.write(v if isinstance(v,str) else "")')
+          if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; v=json.load(sys.stdin).get("secret",{}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) else "")'
+          }
+          CI_STATUS_TOKEN=$(read_secret CI_STATUS_TOKEN %2Fshared%2Fci-status)
+          echo "::add-mask::$CI_STATUS_TOKEN"
+          if [ -z "$CI_STATUS_TOKEN" ]; then
+            echo "::error::Infisical returned empty CI_STATUS_TOKEN at prod /shared/ci-status - failing closed."
+            exit 1
+          fi
+          echo "CI_STATUS_TOKEN=$CI_STATUS_TOKEN" >> "$GITHUB_ENV"
+          echo "CI_STATUS_TOKEN loaded from Infisical (len=${#CI_STATUS_TOKEN})"
+
+      # Report-only. The script's --heal flag POSTs .../actions/runs/{id}/rerun,
+      # which needs a token with Actions write; CI_STATUS_TOKEN is deliberately
+      # scoped to POST /statuses/{sha} and nothing else, so asking it to re-run
+      # would 403. Detection is the half that can land without widening any
+      # persona's scope. To enable healing, provision a token with Actions
+      # write and append `--heal` here - the code path is implemented and unit
+      # tested (tests/test_stranded_status_janitor.py::TestNeverFabricatesAStatus).
+      #
+      # A non-zero exit means stranded contexts were found. That is the point:
+      # this run should go red and loud, because somebody's PR is silently
+      # unmergeable.
+      #
+      # SCOPE HONESTY (core#5156): with --heal absent, the cancellation class is
+      # DETECTED and reported, not repaired. Repair needs the same Actions-write
+      # token the pending class needs. Until that token exists the operator
+      # remedy for a reported cancellation latch is to re-run the named run (or
+      # push/submit a review so a fresh run re-posts the context) — never to
+      # hand-POST a green over it.
+      - name: Sweep open PRs and main for stranded pending contexts
+        env:
+          GITEA_TOKEN: ${{ env.CI_STATUS_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          python3 .gitea/scripts/stranded_status_janitor.py \
+            --repo "$REPO" \
+            --branch "${{ github.event.repository.default_branch }}" \
+            --min-age-minutes 15

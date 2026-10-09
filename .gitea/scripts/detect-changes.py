@@ -100,6 +100,17 @@ PROFILES: dict[str, dict[str, str]] = {
             # database). Changes to db must trigger the job too.
             r"|^workspace-server/internal/db/"
             r"|^workspace-server/migrations/"
+            # core#4977: the plugin drift detect->apply loop is gated here.
+            # The integration test executes plugins.DriftEligibleQuery — the
+            # sweeper's OWN selection SQL — so a change under internal/plugins/
+            # can break this gate's subject without touching handlers/. The
+            # applier is constructed in internal/router/ and started in
+            # cmd/server/, so an edit that silently unwires it must trigger the
+            # gate too; that is exactly the regression class (a detector with
+            # no consumer) this suite exists to catch.
+            r"|^workspace-server/internal/plugins/"
+            r"|^workspace-server/internal/router/"
+            r"|^workspace-server/cmd/server/"
             r"|^\.gitea/workflows/handlers-postgres-integration\.yml$"
         ),
     },

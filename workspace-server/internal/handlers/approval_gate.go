@@ -196,6 +196,24 @@ func gateDestructive(c *gin.Context, b events.EventEmitter, workspaceID string, 
 //
 // (core#2574) The flag is now an ORG-TOKEN-ONLY switch: the admin-token
 // path is gated regardless of the flag (see gateDestructive).
+//
+// (core#5047) DELIBERATELY LEFT DEFAULT-OFF while its three sibling dark flags
+// were made unconditional. This one is not a dormant capability — it BLOCKS
+// operations, and the caller it would start blocking is live:
+// resolveConciergeAdminCredential (platform_agent.go) mints a MANAGED ORG
+// TOKEN for the concierge whenever MOLECULE_ORG_ID is a real UUID (i.e. on
+// SaaS), and wires it as MOLECULE_ORG_API_KEY for the management MCP. The
+// concierge is therefore an ORG-TOKEN caller in production, and `set_secret`
+// (POST /workspaces/:id/secrets → ActionSecretWrite) plus org-token minting
+// are shipped management tools on that bearer. Turning this on would convert
+// those calls to 202 pending_approval with no approver in the loop and no
+// grant-minting UX on the agent side.
+//
+// The precedent is on the record: when CR2 RC 10818 made the ADMIN-TOKEN half
+// always-on, it broke the E2E API Smoke until tests/e2e/_lib.sh grew the
+// e2e_gated_admin_op auto-approve helper — and that helper covers the
+// admin-token path only. Flipping this needs the same migration for org-token
+// callers (an approval path the concierge can actually complete) FIRST.
 func destructiveGateEnabled() bool {
 	v := os.Getenv("MOLECULE_PLATFORM_APPROVAL_GATE")
 	return v == "1" || v == "true"

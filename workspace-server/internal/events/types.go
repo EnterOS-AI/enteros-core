@@ -68,6 +68,14 @@ const (
 	EventWorkspaceRemoved         EventType = "WORKSPACE_REMOVED"
 	EventWorkspaceAwaitingAgent   EventType = "WORKSPACE_AWAITING_AGENT"
 	EventWorkspaceHeartbeat       EventType = "WORKSPACE_HEARTBEAT"
+	// EventWorkspaceRestartDeclined records a restart the platform REFUSED to
+	// perform because the pinned image could not be made obtainable
+	// (core#5019 pull-before-stop). Distinct from PROVISION_FAILED on purpose:
+	// nothing failed and nothing was destroyed — a destructive step was
+	// PREVENTED, and the workspace is still running its previous version. Without
+	// its own name an unrecoverable restart is indistinguishable from a restart
+	// that was never attempted.
+	EventWorkspaceRestartDeclined EventType = "WORKSPACE_RESTART_DECLINED"
 
 	// Agent assignment + identity.
 	EventAgentAssigned    EventType = "AGENT_ASSIGNED"
@@ -184,4 +192,5 @@ var AllEventTypes = []EventType{
 	EventWorkspaceProvisionFailed,
 	EventWorkspaceProvisioning,
 	EventWorkspaceRemoved,
+	EventWorkspaceRestartDeclined,
 }

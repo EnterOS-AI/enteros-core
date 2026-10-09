@@ -168,6 +168,14 @@ grep -Fq 'CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-langfuse-dev}' "$COMPOSE" 
   || fail "infra clickhouse CLICKHOUSE_PASSWORD default must stay langfuse-dev (lockstep with main compose)"
 grep -Fq -- '- langfuse-web' "$COMPOSE_MAIN" \
   || fail "compose Langfuse must carry the langfuse-web network alias for workspace agents"
+# ...and compose must SAY SO to the platform. The provisioner has no compiled-in
+# default host any more (it injected a name that resolves only here, and every
+# k8s workspace retried an export against it forever), so this file is the only
+# thing that tells the compose platform where the trace sink is. Drop this line
+# and compose-topology tracing goes silently off.
+# shellcheck disable=SC2016
+grep -Fq 'MOLECULE_WORKSPACE_LANGFUSE_HOST: "${MOLECULE_WORKSPACE_LANGFUSE_HOST:-http://langfuse-web:3000}"' "$COMPOSE_MAIN" \
+  || fail "compose platform must pass MOLECULE_WORKSPACE_LANGFUSE_HOST — the provisioner has no default"
 
 # Hermetic Go bootstrap: must exist, be attempted before the go-run/container
 # branch, verify a pinned sha256, and stage inside the toolchains dir (atomic
@@ -198,9 +206,9 @@ grep -Eq '^  minio:' "$COMPOSE" \
   || fail "docker-compose.infra.yml must declare the MinIO service"
 grep -Eq '^  minio-init:' "$COMPOSE" \
   || fail "docker-compose.infra.yml must declare the MinIO bucket bootstrap service"
-grep -Eq 'minio/minio:[^@]+@sha256:' "$COMPOSE" \
+grep -Eq 'image: [^ ]*/minio:[^@ ]+@sha256:[a-f0-9]{64}' "$COMPOSE" \
   || fail "MinIO image must be digest-pinned"
-grep -Eq 'minio/mc:[^@]+@sha256:' "$COMPOSE" \
+grep -Eq 'image: [^ ]*/minio-client:[^@ ]+@sha256:[a-f0-9]{64}' "$COMPOSE" \
   || fail "MinIO client image must be digest-pinned"
 # Every fixed image in both compose files must be digest-pinned. Variable
 # images (canvas/platform, resolved from the internal registry at runtime) are

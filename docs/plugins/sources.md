@@ -51,7 +51,20 @@ path and must not appear in logs or error responses.
 The Gitea resolver also requires a ref in normal deployments. Use an immutable
 form such as `#sha:<full-commit>` or `#tag:<version>` when reproducibility is
 required. A branch ref is accepted and is tracked by resolved commit SHA; it is
-not immutable and may be re-delivered when the branch tip moves.
+not immutable and is re-delivered when the branch tip moves.
+
+Re-delivery is not instantaneous, and it is not push-driven. A moved branch tip
+is picked up by the drift sweeper on its next cycle and applied by the drift
+applier on its next cycle — bounded by the intervals in
+[Plugin convergence](../architecture/plugin-convergence.md), which is the SSOT
+for that loop. A workspace pinned to a branch does **not** need a manual
+restart to converge, but it does not converge within seconds either.
+
+Note also that any ref which is neither `tag:`-prefixed nor `sha:`-prefixed —
+including a bare tag name like `#v0.2.1` — is stored as `ref:<name>` and swept
+as a moving ref. See the convergence doc for why the two cannot be
+distinguished without a forge lookup, and why treating a bare tag as moving is
+harmless.
 
 ## Supply-chain boundaries
 

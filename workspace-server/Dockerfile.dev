@@ -82,7 +82,19 @@ WORKDIR /app/workspace-server
 # These are bind-mount-overridden at runtime, so the COPY here is just
 # to warm the module cache.
 COPY workspace-server/go.mod workspace-server/go.sum ./
-RUN go mod download
+# Bounded retry (#4968) — mirror of Dockerfile.tenant's go-builder; see that
+# file for the full rationale. This image is dev-only (no required lane builds
+# it) but the failure mode and the fix are identical, and a dev losing a build
+# to an upstream hiccup costs the same debugging detour.
+RUN for i in 1 2 3; do \
+        go mod download && break; \
+        if [ "$i" -ge 3 ]; then \
+            echo "go mod download: FAILED after 3 attempts" >&2; \
+            exit 1; \
+        fi; \
+        echo "go mod download: attempt $i failed, retrying in $((i * 5))s" >&2; \
+        sleep $((i * 5)); \
+    done
 
 # Source is bind-mounted at runtime (see docker-compose.dev.yml volumes
 # block) so the Dockerfile doesn't need to COPY it. air watches the

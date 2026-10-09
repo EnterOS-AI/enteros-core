@@ -2,7 +2,7 @@ package handlers
 
 import (
 	"context"
-	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -13,28 +13,41 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// resolveOrgID returns the effective org ID for a workspace: the parent_id
-// when one exists, or the workspace's own ID when it is the org root.
-// Returns an empty string if the workspace is not found.
+// resolveOrgID returns the org ID that keys this workspace's rows in
+// org_plugin_allowlist: the ORG ROOT of its parent_id chain, which is the
+// workspace's own id when it already is the root.
+//
+// This used to read a single `SELECT parent_id` and return the DIRECT PARENT.
+// On the depth-1 tree that shipped for the platform's whole life the two are
+// the same value — a child's parent IS the root — so the bug was invisible.
+// They diverge the moment a tree gains an intermediate layer: a grandchild
+// resolved its "org" to its parent, that parent has no org_plugin_allowlist
+// rows, checkOrgPluginAllowlist's `count == 0` arm below reads that as "no
+// allowlist configured", and the org's plugin governance SILENTLY became
+// allow-all for every workspace at depth >= 2.
+//
+// That matters here specifically: client issue #5074 asks to insert an
+// intermediate team node above an existing child, which is exactly the edit
+// that moves workspaces to depth 2. Re-parenting could not be offered while
+// this held, because granting the request would have quietly disabled plugin
+// governance for the moved subtree. Fixed alongside the re-parent guards.
+//
+// Behaviour is unchanged for every tree that exists today: at depth <= 1 the
+// org root and the direct parent are the same row. Returns an empty string if
+// the workspace is not found. Callers fail OPEN on error (see
+// checkOrgPluginAllowlist) — that posture is unchanged here.
 func resolveOrgID(ctx context.Context, workspaceID string) (string, error) {
 	if db.DB == nil {
 		return "", nil // nil in unit tests
 	}
-	var parentID sql.NullString
-	err := db.DB.QueryRowContext(ctx,
-		`SELECT parent_id FROM workspaces WHERE id = $1`,
-		workspaceID,
-	).Scan(&parentID)
-	if err == sql.ErrNoRows {
+	root, err := orgRootID(ctx, db.DB, workspaceID)
+	if errors.Is(err, errNoOrgRoot) {
 		return "", nil
 	}
 	if err != nil {
 		return "", err
 	}
-	if parentID.Valid && parentID.String != "" {
-		return parentID.String, nil
-	}
-	return workspaceID, nil
+	return root, nil
 }
 
 // checkOrgPluginAllowlist returns (true, reason) when the plugin is blocked

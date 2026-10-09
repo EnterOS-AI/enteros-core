@@ -22,6 +22,7 @@ func workspaceListTestRow(id string, tier driver.Value) []driver.Value {
 		id, "Agent " + id, "worker", tier, "online", []byte("null"), "",
 		nil, 0, 1, 0.0, "", 0, "", "claude-code", "", 0.0, 0.0, false,
 		nil, int64(0), false, true, []byte(`{}`), "workspace", []byte(`[]`),
+		[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 	}
 }
 

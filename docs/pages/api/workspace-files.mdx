@@ -183,6 +183,53 @@ curl -X PUT https://platform.example.com/workspaces/ws-abc123/files/../../etc/pa
 }
 ```
 
+## Listing semantics (`GET /workspaces/:id/files`)
+
+`?root=` selects the root (default `/configs`); `?path=` names a subdirectory
+**relative to that root**; `?depth=` (1–5) bounds recursion.
+
+### Absent is not empty
+
+A listing distinguishes "this directory is empty" from "this backend cannot see
+that path". Conflating them is a false negative: an empty array reads as
+*nothing is there* when the truth may be *rooted elsewhere and cannot descend*.
+
+| HTTP status | Condition |
+|---|---|
+| `200 OK` + `[]` | The directory exists and is empty — **or** a ROOT listing (`?path=` absent) with no file backend for the workspace. |
+| `404 Not Found` | An explicit `?path=` that does not exist under the resolved root. The message names the root, the relative path, and the backend consulted. |
+| `400 Bad Request` | `?path=` is absolute, contains `..`, targets `.hermes`, escapes the root, or names a **file** rather than a directory. |
+
+Directory entries are always emitted, with `"dir": true`. Dotfiles are listed;
+the sole deliberate exception is `.hermes` (runtime private state — rendered
+`.env` with plaintext provider keys, session transcripts, `API_SERVER_KEY`),
+which is denied at the shared `validateRelPath` guard so every backend inherits
+the block.
+
+### `?path=` is relative — always
+
+An absolute `?path=` is rejected rather than resolved against the root. `?root=`
+already selects the root, so `?root=/workspace&path=/configs` states two
+different roots with no non-arbitrary reading; and `validateRelPath` is the
+shared guard for `ListFiles`/`ReadFile`/`WriteFile`/`DeleteFile`, so a second,
+looser grammar for listing alone is exactly where path-escape bugs appear. The
+rejection message names the root the API is already anchored at.
+
+### Provenance: `X-Molecule-Files-Source`
+
+Every `200` listing carries the backend that answered:
+
+| Value | Meaning |
+|---|---|
+| `container` | `docker exec` into the live workspace container — complete. |
+| `eic` | SSH via the EIC tunnel (SaaS EC2) — complete. |
+| `host-mirror` | The docker-less host-side config mirror (#206 molecules-server). **Partial** — it carries only the CP-delivered bundle (`config.yaml`, `prompts/*`). Runtime-created directories (`plugins/`, `skills/`, `.molecule/`) live in the container and are **not** mirrored. |
+| `template-dir` | The host-side seed template — reflects the template, not live state. |
+| `none` | No backend available; the body is `[]`. |
+
+A `host-mirror` listing that omits `plugins/` does **not** mean the workspace has
+no plugins. Read the header before concluding anything from a short listing.
+
 ## Related
 
 - [Platform API Reference](./platform-api.md) — full API endpoint table
