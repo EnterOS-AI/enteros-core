@@ -1,10 +1,20 @@
 name: stranded-status-janitor
 
-# Finds commit-status contexts stuck at `pending` whose Actions run has already
-# finished, which under branch protection status_check_contexts=['*'] blocks a
-# fully-green, fully-approved PR forever. See .gitea/scripts/stranded_status_janitor.py
-# for the two root causes (cross-run misattribution in Gitea's
-# services/actions/job_emitter.go, and lost terminal writes).
+# Finds commit-status contexts whose LAST row is a merge-blocking ARTIFACT
+# rather than a verdict about the code, which under branch protection
+# status_check_contexts=['*'] blocks a fully-green, fully-approved PR forever.
+# Two shapes, one healing mechanism (re-run — never a fabricated green):
+#   * `pending` whose Actions run has already finished (#4979): cross-run
+#     misattribution in Gitea's services/actions/job_emitter.go, and lost
+#     terminal writes.
+#   * `failure` that is Gitea's own `cancelled -> failure` stamp (core#5156):
+#     a newer run evicts the QUEUED member of a concurrency group
+#     (`cancel-in-progress: false` protects only the RUNNING one), Gitea writes
+#     `failure`/"Has been cancelled" for a job with started_at=1970 that never
+#     executed. When the group is not keyed on the head SHA the evicting run
+#     belongs to a DIFFERENT SHA, so nothing ever re-posts here and the red
+#     latches permanently.
+# See .gitea/scripts/stranded_status_janitor.py for the measured evidence.
 #
 # Trigger: workflow_dispatch ONLY.
 #   The repo runs a zero-cron ratchet (.gitea/scripts/lint_schedule_budget.py):
@@ -83,6 +93,13 @@ jobs:
       # A non-zero exit means stranded contexts were found. That is the point:
       # this run should go red and loud, because somebody's PR is silently
       # unmergeable.
+      #
+      # SCOPE HONESTY (core#5156): with --heal absent, the cancellation class is
+      # DETECTED and reported, not repaired. Repair needs the same Actions-write
+      # token the pending class needs. Until that token exists the operator
+      # remedy for a reported cancellation latch is to re-run the named run (or
+      # push/submit a review so a fresh run re-posts the context) — never to
+      # hand-POST a green over it.
       - name: Sweep open PRs and main for stranded pending contexts
         env:
           GITEA_TOKEN: ${{ env.CI_STATUS_TOKEN }}

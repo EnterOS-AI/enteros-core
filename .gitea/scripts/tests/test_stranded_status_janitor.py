@@ -247,6 +247,156 @@ class TestClassifyContext(unittest.TestCase):
         self.assertEqual(verdict, "no-jobs")
 
 
+class TestCancellationLatch(unittest.TestCase):
+    """core#5156 — Gitea's own `cancelled -> failure` stamp is merge-blocking
+    but reports NOTHING about the code.
+
+    Every test here is paired with its negative control. A change that stops
+    cancelled runs from blocking must NOT stop genuinely failing runs from
+    blocking; a guard that suppressed both would "pass" the cancelled case and
+    silently disarm the whole board.
+    """
+
+    def classify(self, status_row, run, jobs, min_age=15, max_attempts=4):
+        return janitor.classify_context(
+            status_row, run, jobs, NOW, min_age, max_attempts
+        )
+
+    # ---- direction 1: a cancelled run must NOT stay red ------------------
+    def test_cancelled_before_start_is_stranded(self):
+        # The exact measured shape of core#5156 run 644628 / job 949071: the
+        # job never started (`started_at` epoch, `run_attempt` 0) yet Gitea
+        # stamped `failure` on the PR head.
+        verdict, detail = self.classify(
+            row(149, "failure", "gitea-merge-queue / queue (pull_request_review)",
+                run=644628, job=949071, description="Has been cancelled"),
+            run_obj(644628, conclusion="cancelled"),
+            [job(949071, conclusion="cancelled", attempt=0)],
+        )
+        self.assertEqual(verdict, "stranded", detail)
+        self.assertIn("CANCELLED", detail)
+
+    def test_cancelled_mid_run_is_also_stranded(self):
+        # A job cancelled AFTER it started is equally uninformative: it never
+        # reached a conclusion about the code.
+        verdict, _ = self.classify(
+            row(85, "failure", "lint-mask-pr-atomicity / lint-mask-pr-atomicity (pull_request)",
+                run=644800, job=949500, description="Has been cancelled"),
+            run_obj(644800, conclusion="cancelled"),
+            [job(949500, conclusion="cancelled", attempt=1)],
+        )
+        self.assertEqual(verdict, "stranded")
+
+    def test_error_state_cancellation_is_also_caught(self):
+        verdict, _ = self.classify(
+            row(90, "error", "ci / build (pull_request)", run=1, job=2,
+                description="Has been cancelled"),
+            run_obj(1, conclusion="cancelled"),
+            [job(2, conclusion="cancelled")],
+        )
+        self.assertEqual(verdict, "stranded")
+
+    # ---- direction 2: a REAL failure must STILL be red -------------------
+    def test_genuine_failure_is_never_selected(self):
+        # The ordinary red. No cancellation description -> not even a candidate,
+        # and it costs no run lookup.
+        verdict, _ = self.classify(
+            row(50, "failure", "CI / all-required (pull_request)", run=1, job=2,
+                description="Failing after 12s"),
+            run_obj(1, conclusion="failure"),
+            [job(2, conclusion="failure")],
+        )
+        self.assertEqual(verdict, "terminal")
+
+    def test_failure_whose_job_really_failed_is_never_selected(self):
+        # THE load-bearing negative control. The description SAYS cancelled but
+        # the job's authoritative `conclusion` says `failure`. The verdict must
+        # follow the API field, not the string — otherwise a red could be
+        # laundered green by writing a description.
+        verdict, detail = self.classify(
+            row(51, "failure", "CI / all-required (pull_request)", run=1, job=2,
+                description="Has been cancelled"),
+            run_obj(1, conclusion="failure"),
+            [job(2, conclusion="failure")],
+        )
+        self.assertEqual(verdict, "real-failure", detail)
+        self.assertIn("genuine red", detail)
+
+    def test_description_match_is_exact_not_substring(self):
+        # A real test failure whose name quotes the phrase must not be laundered.
+        verdict, _ = self.classify(
+            row(52, "failure", "CI / unit (pull_request)", run=1, job=2,
+                description="Has been cancelled by the user unexpectedly"),
+            run_obj(1, conclusion="failure"),
+            [job(2, conclusion="failure")],
+        )
+        self.assertEqual(verdict, "terminal")
+        self.assertFalse(
+            janitor.looks_like_cancellation_stamp(
+                row(52, "failure", "CI / unit", description="has been cancelled!")
+            )
+        )
+
+    def test_success_is_never_touched_even_with_the_description(self):
+        verdict, _ = self.classify(
+            row(53, "success", "CI / unit (pull_request)", run=1, job=2,
+                description="Has been cancelled"),
+            run_obj(1, conclusion="cancelled"),
+            [job(2, conclusion="cancelled")],
+        )
+        self.assertEqual(verdict, "terminal")
+
+    # ---- the same safety invariants as the pending class -----------------
+    def test_fresh_cancellation_is_within_grace(self):
+        # A cancellation whose superseding run is still in flight gets
+        # overwritten on its own; only an AGED one is latched.
+        verdict, detail = self.classify(
+            row(149, "failure", "q / q", run=1, job=2, minutes_ago=2,
+                description="Has been cancelled"),
+            run_obj(1, conclusion="cancelled"),
+            [job(2, conclusion="cancelled")],
+        )
+        self.assertEqual(verdict, "too-fresh")
+        self.assertIn("grace", detail)
+
+    def test_cancellation_without_target_url_is_never_healed(self):
+        verdict, _ = self.classify(
+            row(149, "failure", "q / q", run=None, description="Has been cancelled"),
+            None,
+            [],
+        )
+        self.assertEqual(verdict, "terminal")
+
+    def test_phantom_job_id_refuses_to_act(self):
+        # Cannot prove cancellation for a job that is not in this run.
+        verdict, _ = self.classify(
+            row(149, "failure", "q / q", run=605222, job=895694,
+                description="Has been cancelled"),
+            run_obj(605222, conclusion="cancelled"),
+            [job(896159), job(896160)],
+        )
+        self.assertEqual(verdict, "phantom-job")
+
+    def test_still_running_run_is_left_alone(self):
+        verdict, _ = self.classify(
+            row(149, "failure", "q / q", run=1, job=2,
+                description="Has been cancelled"),
+            run_obj(1, status="in_progress", conclusion=None),
+            [job(2, status="in_progress", conclusion=None)],
+        )
+        self.assertEqual(verdict, "run-active")
+
+    def test_attempt_cap_applies_to_cancellations_too(self):
+        verdict, detail = self.classify(
+            row(149, "failure", "q / q", run=1, job=2,
+                description="Has been cancelled"),
+            run_obj(1, conclusion="cancelled"),
+            [job(2, conclusion="cancelled", attempt=4)],
+        )
+        self.assertEqual(verdict, "attempts-exhausted")
+        self.assertIn("cap 4", detail)
+
+
 class TestPlanReruns(unittest.TestCase):
     def test_one_rerun_per_run_even_when_five_contexts_strand_together(self):
         # Measured: run 605222 stranded 5 contexts at once. One re-run fixes all.
@@ -291,6 +441,66 @@ class TestSweep(unittest.TestCase):
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0]["context"], "staging-tenant-cd / advance-pin")
         self.assertEqual(findings[0]["run_id"], 605222)
+
+    def test_sweep_selects_the_cancellation_latch_and_not_the_real_red(self):
+        # End-to-end through the sweep's two-phase pre-filter, on one SHA
+        # carrying BOTH shapes. The cancelled context must be reported; the
+        # genuinely failing one must not. This is the both-directions assertion
+        # at the level that actually runs in production.
+        sha = "626d2049da9f8ef81b1c301ccf75af2409f3a050"
+        client = FakeClient(
+            statuses={
+                sha: [
+                    row(149, "failure",
+                        "gitea-merge-queue / queue (pull_request_review)",
+                        minutes_ago=60, run=644628, job=949071,
+                        description="Has been cancelled"),
+                    row(150, "failure", "CI / all-required (pull_request)",
+                        minutes_ago=60, run=644630, job=949080,
+                        description="Failing after 3m12s"),
+                    row(151, "success", "Secret scan / Scan (pull_request)",
+                        minutes_ago=60, run=644631, job=949081),
+                ]
+            },
+            runs={
+                644628: run_obj(644628, conclusion="cancelled"),
+                644630: run_obj(644630, conclusion="failure"),
+            },
+            jobs={
+                644628: [job(949071, conclusion="cancelled", attempt=0)],
+                644630: [job(949080, conclusion="failure")],
+            },
+        )
+        findings = janitor.sweep_sha(client, sha, NOW, Args(), label="PR #5156")
+        self.assertEqual(
+            [f["context"] for f in findings],
+            ["gitea-merge-queue / queue (pull_request_review)"],
+        )
+        self.assertEqual(findings[0]["run_id"], 644628)
+        # The genuine red cost no run lookup at all — the description
+        # pre-filter kept the sweep's cost contract intact.
+        self.assertEqual(
+            sorted({c[2] for c in client.calls if c[1] in ("run", "jobs")}),
+            [644628],
+        )
+
+    def test_sweep_leaves_a_cancellation_shaped_row_whose_job_really_failed(self):
+        # Mutation control at sweep level: flip ONLY the job conclusion and the
+        # same row must stop being selected.
+        sha = "626d2049da9f8ef81b1c301ccf75af2409f3a050"
+        client = FakeClient(
+            statuses={
+                sha: [
+                    row(149, "failure",
+                        "gitea-merge-queue / queue (pull_request_review)",
+                        minutes_ago=60, run=644628, job=949071,
+                        description="Has been cancelled"),
+                ]
+            },
+            runs={644628: run_obj(644628, conclusion="failure")},
+            jobs={644628: [job(949071, conclusion="failure")]},
+        )
+        self.assertEqual(janitor.sweep_sha(client, sha, NOW, Args()), [])
 
     def test_sweep_is_clean_when_everything_reached_a_verdict(self):
         sha = "8ed088a682debfa91284bedcf01c3138fa42833e"
