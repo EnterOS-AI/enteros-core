@@ -256,6 +256,48 @@ jobs:
           fi
           echo "roller present: $(wc -l < scripts/deploy/redeploy-tenant-fleet-k8s.sh) lines"
 
+      # ── THE TOOLCHAIN IS A DEPENDENCY, SO IT GETS A PREFLIGHT LIKE ONE ──────
+      #
+      # The step above proves the ROLLER exists. This job also depends on two
+      # things the roller cannot supply: a python3 to run the Infisical SSOT
+      # reader, and a kubectl to census and roll with. Neither was ever declared
+      # anywhere, and the `local-deploy` runner has NEITHER — measured in the
+      # runner's own environment (Alpine 3.23 host-executor pod, ci/deploy-runner
+      # on robot-1), not in a login shell on the node:
+      #
+      #   python3 / python / python3.1x / pypy3 -> ABSENT (no python binary
+      #       anywhere under /usr /bin /sbin /opt); kubectl -> ABSENT; jq -> ABSENT
+      #   PATH of pid 1 (the runner process every step inherits) is identical to
+      #       an interactive shell's, so this is NOT a service-vs-login PATH split
+      #
+      # That is why run 644986 died with `python3: command not found` (exit 127)
+      # on the first push after the k8s arm merged. The remedy is not to hope the
+      # image has them: it is to RESOLVE them by name, up front, into absolute
+      # paths, and to say WHICH one is missing when one is. See
+      # scripts/deploy/require-deploy-toolchain.sh for why provisioning lives
+      # there and why setup-python / a job container / the pod ServiceAccount all
+      # lose on this specific runner.
+      - name: Preflight — resolve the toolchain, or NAME the tool that is missing
+        run: |
+          set -euo pipefail
+          # NOT `... >> "$GITHUB_ENV"`. A capture that is redirected straight into
+          # its destination is written before anything has judged it; validate
+          # first, then write.
+          rc=0
+          resolved="$(bash scripts/deploy/require-deploy-toolchain.sh \
+            'DEPLOY_PYTHON3:python3:python3:--version' \
+            'KUBECTL:kubectl:kubectl:version --client')" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::the deploy toolchain preflight FAILED (exit ${rc}) on runner '${RUNNER_NAME:-<unknown>}'. The ::error:: above names the tool. This job stops here rather than dying mid-step on 'command not found', which is what run 644986 did."
+            exit 1
+          fi
+          if [ -z "$resolved" ]; then
+            echo "::error::the toolchain preflight exited 0 and resolved NOTHING. An empty result would leave every later step back on ambient PATH lookup while this step reported success — the vacuous pass this preflight exists to remove."
+            exit 1
+          fi
+          printf '%s\n' "$resolved" >> "$GITHUB_ENV"
+          printf 'toolchain resolved:\n%s\n' "$resolved"
+
       - name: Resolve the cluster credential from the Infisical SSOT
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
@@ -289,25 +331,95 @@ jobs:
           # So both go through the SAME kubectl the roll already requires. One
           # credential to rotate, one cluster to be wrong about, and the census
           # cannot silently address a different control plane than the roll.
-          KUBECONFIG_BODY="$(python3 .gitea/scripts/infisical-read-secret.py \
-            K8S_FLEET_KUBECONFIG /shared/controlplane prod)"
-          if [ -z "$KUBECONFIG_BODY" ]; then
-            echo "::error::Infisical returned EMPTY for K8S_FLEET_KUBECONFIG (/shared/controlplane, prod)."
-            echo "::error::A declared-but-empty secret produces exactly the vacuous pass this job exists to stop, so this fails rather than rolling zero tenants."
-            echo "::error::NOTE: the pre-existing /shared/controlplane KUBECONFIG key is a PATH ('/etc/molecule/cp-prod.kubeconfig') that resolves only inside the molecule-cp-prod container — it is not kubeconfig CONTENT and a CI runner cannot use it."
+          # THE INTERPRETER IS PINNED, NOT LOOKED UP. Falling back to a bare
+          # `python3` on PATH is exactly what produced `python3: command not
+          # found` mid-step; if the preflight did not hand us one, say so.
+          if [ -z "${DEPLOY_PYTHON3:-}" ] || [ ! -x "${DEPLOY_PYTHON3:-/nonexistent}" ]; then
+            echo "::error::DEPLOY_PYTHON3 is unset or not executable ('${DEPLOY_PYTHON3:-<unset>}') — the toolchain preflight did not run or did not export it. Refusing to fall back to an ambient 'python3'."
             exit 1
           fi
+          if [ -z "${KUBECTL:-}" ] || [ ! -x "${KUBECTL:-/nonexistent}" ]; then
+            echo "::error::KUBECTL is unset or not executable ('${KUBECTL:-<unset>}') — the toolchain preflight did not run or did not export it."
+            exit 1
+          fi
+
+          # ── WHY THIS IS NOT A BARE `V="$(...)"` ANYMORE ───────────────────
+          #
+          # Steps run as `bash --noprofile --norc -e -o pipefail {0}`, and a
+          # simple assignment takes the exit status of its command substitution.
+          # So `KUBECONFIG_BODY="$(reader)"` KILLS THE STEP THE INSTANT THE
+          # READER FAILS — above the `-z` guard written right below it, which
+          # therefore never ran and never printed the diagnostic it exists for.
+          # That is how run 644986 reported nothing but `command not found`.
+          #
+          # Capturing the status into `rc` puts the assignment in an OR-list,
+          # which `set -e` does not act on, so the value is JUDGED before it is
+          # used. `|| true` would be the wrong repair: it converts "the read
+          # failed" into "the read returned empty", collapsing two different
+          # faults into one and mis-naming whichever actually happened.
+          #
+          # `optional` mode is passed so a MISSING key returns 10 instead of
+          # being flattened into the same exit 1 as an auth or transport error.
+          # Both still fail closed — this only decides WHICH sentence gets
+          # printed, and "the operator never seeded the secret" and "the read
+          # broke" want very different next actions.
+          rc=0
+          KUBECONFIG_B64="$("$DEPLOY_PYTHON3" .gitea/scripts/infisical-read-secret.py \
+            K8S_FLEET_KUBECONFIG /shared/controlplane prod optional)" || rc=$?
+          case "$rc" in
+            0) ;;
+            10)
+              echo "::error::K8S_FLEET_KUBECONFIG DOES NOT EXIST at /shared/controlplane (environment 'prod') in the Infisical SSOT. This job's cluster credential was never seeded, so it cannot census or roll anything."
+              echo "::error::OPERATOR STEP: seed K8S_FLEET_KUBECONFIG as the BASE64 of a kubeconfig body. Base64 is not decoration — the SSOT reader rejects any value containing a line break, so a raw multi-line kubeconfig cannot be stored under this key at all."
+              echo "::error::NOTE: the pre-existing /shared/controlplane KUBECONFIG key is a PATH ('/etc/molecule/cp-prod.kubeconfig') that resolves only inside the molecule-cp-prod container — it is not kubeconfig CONTENT and a CI runner cannot use it."
+              exit 1 ;;
+            *)
+              echo "::error::reading K8S_FLEET_KUBECONFIG from the Infisical SSOT FAILED (reader exit ${rc}); the reader's own ::error:: above says why (auth, transport, or a value the reader refuses such as one containing a line break)."
+              echo "::error::Refusing to continue without a cluster credential rather than rolling zero tenants and calling it a deploy."
+              exit 1 ;;
+          esac
+          if [ -z "$KUBECONFIG_B64" ]; then
+            echo "::error::Infisical returned EMPTY for K8S_FLEET_KUBECONFIG (/shared/controlplane, prod)."
+            echo "::error::A declared-but-empty secret produces exactly the vacuous pass this job exists to stop, so this fails rather than rolling zero tenants."
+            exit 1
+          fi
+
+          # DECODE, THEN PROVE IT IS A KUBECONFIG BEFORE ANYTHING TRUSTS IT.
+          # Writing the raw value straight out would hand kubectl a base64 blob
+          # and turn a seeding mistake into an unreadable parse error three steps
+          # later. `wc -c > 0` is not evidence of a kubeconfig either — assert
+          # that kubectl can PARSE it and name a current context.
           umask 077
-          printf '%s' "$KUBECONFIG_BODY" > "$RUNNER_TEMP/fleet.kubeconfig"
+          if ! printf '%s' "$KUBECONFIG_B64" | base64 -d > "$RUNNER_TEMP/fleet.kubeconfig" 2>/dev/null; then
+            echo "::error::K8S_FLEET_KUBECONFIG is not valid base64. Seed it as the base64 encoding of the kubeconfig body (the SSOT reader refuses a raw multi-line value)."
+            exit 1
+          fi
+          ctx=""
+          if ! ctx="$("$KUBECTL" --kubeconfig "$RUNNER_TEMP/fleet.kubeconfig" config current-context 2>/dev/null)" \
+             || [ -z "$ctx" ]; then
+            echo "::error::the decoded K8S_FLEET_KUBECONFIG is not a usable kubeconfig — kubectl cannot read a current-context out of it ($(wc -c < "$RUNNER_TEMP/fleet.kubeconfig") bytes decoded)."
+            exit 1
+          fi
           echo "KUBECONFIG=$RUNNER_TEMP/fleet.kubeconfig" >> "$GITHUB_ENV"
-          echo "kubeconfig materialized ($(wc -c < "$RUNNER_TEMP/fleet.kubeconfig") bytes)"
+          echo "kubeconfig materialized ($(wc -c < "$RUNNER_TEMP/fleet.kubeconfig") bytes, context '${ctx}')"
 
       - name: Resolve the census and the PINNED digest, and prove both are non-empty
         id: resolve
         run: |
           set -euo pipefail
-          command -v kubectl >/dev/null 2>&1 || { echo "::error::kubectl is not on this runner"; exit 1; }
-          kubectl version -o json >/dev/null 2>&1 || { echo "::error::kubectl cannot reach the cluster with the resolved credential"; exit 1; }
+          # `command -v kubectl` is deliberately GONE from here. On this platform
+          # that exact check has already passed vacuously: both control planes
+          # ship the kubectl BINARY and hold no credentials, so every preflight
+          # written as "is the binary there" went green while the capability was
+          # absent. The toolchain preflight resolved an absolute, RUNNABLE
+          # kubectl; what is still worth proving here — and is not implied by the
+          # binary existing — is that it can reach the cluster with the
+          # credential this job just materialized.
+          if [ -z "${KUBECTL:-}" ] || [ ! -x "${KUBECTL:-/nonexistent}" ]; then
+            echo "::error::KUBECTL is unset or not executable ('${KUBECTL:-<unset>}') — the toolchain preflight did not run or did not export it. Refusing to fall back to an ambient 'kubectl'."
+            exit 1
+          fi
+          "$KUBECTL" version -o json >/dev/null 2>&1 || { echo "::error::kubectl ('${KUBECTL}') cannot reach the cluster with the resolved credential"; exit 1; }
 
           # The census command handed to the roller. Written as a file because
           # SUBSTRATE_CENSUS_CMD is eval'd, and a multi-line SQL string through
@@ -315,7 +427,14 @@ jobs:
           cat > "$RUNNER_TEMP/census.sh" <<'CENSUS'
           #!/usr/bin/env bash
           set -euo pipefail
-          exec kubectl exec -i -n "$CP_PROD_NAMESPACE" "$CP_PROD_DB_POD" -- \
+          # $KUBECTL is the absolute path the toolchain preflight resolved and
+          # exported; it reaches here through the roller's inherited environment.
+          # `:?` rather than a `:-kubectl` default ON PURPOSE — a default would
+          # silently put the census back on ambient PATH lookup, which on this
+          # runner means `kubectl: not found` inside an eval'd command, surfacing
+          # as "the fleet is empty" instead of "the census could not run".
+          : "${KUBECTL:?KUBECTL must be exported by the deploy toolchain preflight}"
+          exec "$KUBECTL" exec -i -n "$CP_PROD_NAMESPACE" "$CP_PROD_DB_POD" -- \
             psql -U "$CP_PROD_DB_USER" -d "$CP_PROD_DB_NAME" -At -F "$(printf '\t')" -v ON_ERROR_STOP=1 \
             -c "SELECT o.slug, o.id, s.substrate, s.instance_id FROM org_substrates s JOIN organizations o ON o.id = s.org_id ORDER BY o.slug;"
           CENSUS
@@ -340,9 +459,20 @@ jobs:
           # answer, then take the first line with parameter expansion — no pipe,
           # no signal, and a multi-row answer still cannot slip through because
           # the sha256 shape check below runs on that first line alone.
-          digest_raw="$(kubectl exec -i -n "$CP_PROD_NAMESPACE" "$CP_PROD_DB_POD" -- \
+          # SAME `-e` SHAPE AS THE CREDENTIAL READ, SAME REPAIR. A bare
+          # `digest_raw="$(kubectl exec ...)"` dies on the assignment the moment
+          # the exec or the query fails, ABOVE the sha256 shape check below —
+          # so a broken query would surface as a bare psql/kubectl line and the
+          # carefully-worded "refusing to fall back to a moving tag" diagnostic
+          # would never print. Capture the status, judge it, THEN use the value.
+          digest_rc=0
+          digest_raw="$("$KUBECTL" exec -i -n "$CP_PROD_NAMESPACE" "$CP_PROD_DB_POD" -- \
             psql -U "$CP_PROD_DB_USER" -d "$CP_PROD_DB_NAME" -At -v ON_ERROR_STOP=1 \
-            -c "SELECT image_digest FROM runtime_image_pins WHERE template_name='molecule-tenant' AND region='global';")"
+            -c "SELECT image_digest FROM runtime_image_pins WHERE template_name='molecule-tenant' AND region='global';")" || digest_rc=$?
+          if [ "$digest_rc" -ne 0 ]; then
+            echo "::error::the pinned-digest query FAILED (exit ${digest_rc}) against ${CP_PROD_NAMESPACE}/${CP_PROD_DB_POD}. That is a fault in this job's access to the control-plane database, NOT a statement about what production is pinned to."
+            exit 1
+          fi
           K8S_TENANT_DIGEST="$(printf '%s' "${digest_raw%%$'\n'*}" | tr -d '[:space:]')"
           case "$K8S_TENANT_DIGEST" in
             sha256:[0-9a-f]*) : ;;
