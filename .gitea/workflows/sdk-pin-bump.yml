@@ -217,7 +217,17 @@ jobs:
           git config user.name molecule-sdk-pin-bot
           git checkout -b "$branch"
           git add workspace-server/go.mod workspace-server/go.sum workspace-server/internal/providers/gen/registry_gen.go workspace-server/internal/providers/sync_canonical_test.go
-          git commit -m "chore(sdk): bump sdk/gen/go pin to ${SHA12}"
+          # PROVENANCE TRAILER. lint_sdk_pin_provenance.py refuses an SDK pin
+          # edit that is not attributable to this lane, and the trailer is how
+          # a commit carries that attribution. It is minted from GITHUB_RUN_ID,
+          # so it cannot be produced outside a run — the point is not that a
+          # hand bump is impolite, it is that a hand bump cannot forge this.
+          #
+          # The bot's git identity is NOT the proof (`git commit --author=` is
+          # one flag). The run id is: the guard resolves it through the Actions
+          # API and requires it to be a real sdk-pin-bump.yml run in this repo.
+          stamp="$(python3 .gitea/scripts/pin_provenance.py mint)"
+          git commit -m "chore(sdk): bump sdk/gen/go pin to ${SHA12}" -m "Pin-Provenance: ${stamp}"
           # Belt and braces with persist-credentials:false above: if a future
           # checkout bump reintroduces the header, this drops it so the remote
           # URL's credential is the one that authenticates. `|| true` because the

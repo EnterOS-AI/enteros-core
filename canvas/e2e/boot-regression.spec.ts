@@ -20,7 +20,11 @@
  *    "waiting for boot telemetry".
  */
 
-import { test, expect } from "@playwright/test";
+// `test` comes from helpers/net-evidence, not @playwright/test: it is the same
+// runner with a requestfailed recorder bound to every page, so that when this
+// spec trips the canvas hittability diagnostic the message can name the exact
+// net::ERR_* behind a dead stylesheet (core#5106). Nothing else differs.
+import { test, expect } from "./helpers/net-evidence";
 import type { Page } from "@playwright/test";
 import { startEchoRuntime, type EchoRuntime } from "./fixtures/echo-runtime";
 import {

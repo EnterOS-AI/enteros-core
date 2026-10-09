@@ -81,12 +81,72 @@ jobs:
       # MOLECULE_RUN_CONTRACT_DRIFT_GATES=1 un-skips the two gate tests, which
       # SKIP by default (so ci.yml's `go test ./...` on PRs stays non-blocking).
       # This workflow is the ONLY place they execute for real.
+      #
+      # ── WHY BOTH STEPS ASSERT EXECUTION ───────────────────────────────────
+      # Both were a bare `go test ... -run <regex> -v`, whose only verdict was
+      # go's exit code. Every way these tests can stop running exits 0:
+      #
+      #   * MOLECULE_RUN_CONTRACT_DRIFT_GATES dropped, renamed or typo'd
+      #     -> both tests hit their `if os.Getenv(...) == ""` guard and SKIP;
+      #   * the -run regex stops matching -> "no tests to run", also exit 0.
+      #
+      # That mattered more than usual once ci.yml's no-tests-executed gate
+      # started allowing internal/e2emilestones to skip wholesale ON THE
+      # STRENGTH OF THIS LANE. The allowlist entry in
+      # .gitea/tests-may-skip-wholesale.txt says the package "EXECUTES in
+      # sdk-route-milestone-contract-drift.yml" -- so if this lane could not
+      # tell whether it ran anything, a dropped env var would have left
+      # TestHappyPathMilestonesMatchRunner executing NOWHERE with both gates
+      # green. The exemption would have re-created the exact hole the gate
+      # was written to close, inside the escape hatch meant to be safe.
+      #
+      # An exemption is only as good as the lane it points at, so the lane is
+      # now the thing that proves it. Same idiom as
+      # concierge-creates-workspace-hermetic.yml (require >0 "--- PASS:") plus
+      # the stronger skip hard-fail from handlers-postgres-integration.yml:
+      # in THIS lane a skip is not a neutral outcome, it is the failure.
       - name: Route derive-gate (SDKRoutes vs router.go) — #87
         env:
           MOLECULE_RUN_CONTRACT_DRIFT_GATES: "1"
-        run: go test ./internal/router/ -run 'SDKRoutes' -count=1 -v
+        run: |
+          set -uo pipefail
+          LOG=$(mktemp)
+          rc=0
+          go test ./internal/router/ -run 'SDKRoutes' -count=1 -v 2>&1 | tee "$LOG" || rc=$?
+          npass=$(grep -c -E '^[[:space:]]*--- PASS: ' "$LOG" || true)
+          nskip=$(grep -c -E '^[[:space:]]*--- SKIP: ' "$LOG" || true)
+          echo "route derive-gate: ${npass:-0} executed, ${nskip:-0} skipped"
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+          if [ "${nskip:-0}" -ne 0 ]; then
+            echo "::error::Route derive-gate SKIPPED ${nskip} test(s). MOLECULE_RUN_CONTRACT_DRIFT_GATES did not reach the test, so the SDKRoutes contract was NOT checked — and a skip is indistinguishable from a pass in the job summary. Confirm the env var above still matches contractDriftGateEnv in internal/router."
+            exit 1
+          fi
+          if [ "${npass:-0}" -eq 0 ]; then
+            echo "::error::Route derive-gate executed ZERO tests (0 '--- PASS:' lines) but go test still exited 0 — 'go test -run' exits 0 when the regex matches nothing. Check that 'SDKRoutes' still selects TestSDKRoutesContract in workspace-server/internal/router/."
+            exit 1
+          fi
 
       - name: Milestone derive-gate (HappyPathMilestones vs E2E runner) — #88
         env:
           MOLECULE_RUN_CONTRACT_DRIFT_GATES: "1"
-        run: go test ./internal/e2emilestones/ -run 'HappyPathMilestones' -count=1 -v
+        run: |
+          set -uo pipefail
+          LOG=$(mktemp)
+          rc=0
+          go test ./internal/e2emilestones/ -run 'HappyPathMilestones' -count=1 -v 2>&1 | tee "$LOG" || rc=$?
+          npass=$(grep -c -E '^[[:space:]]*--- PASS: ' "$LOG" || true)
+          nskip=$(grep -c -E '^[[:space:]]*--- SKIP: ' "$LOG" || true)
+          echo "milestone derive-gate: ${npass:-0} executed, ${nskip:-0} skipped"
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+          if [ "${nskip:-0}" -ne 0 ]; then
+            echo "::error::Milestone derive-gate SKIPPED ${nskip} test(s). MOLECULE_RUN_CONTRACT_DRIFT_GATES did not reach the test, so TestHappyPathMilestonesMatchRunner did NOT run. This lane is the sole justification for internal/e2emilestones' entry in .gitea/tests-may-skip-wholesale.txt — a skip here means the package now executes NOWHERE while every gate reports green. Confirm the env var above still matches contractDriftGateEnv in internal/e2emilestones."
+            exit 1
+          fi
+          if [ "${npass:-0}" -eq 0 ]; then
+            echo "::error::Milestone derive-gate executed ZERO tests (0 '--- PASS:' lines) but go test still exited 0. Check that 'HappyPathMilestones' still selects TestHappyPathMilestonesMatchRunner in workspace-server/internal/e2emilestones/."
+            exit 1
+          fi

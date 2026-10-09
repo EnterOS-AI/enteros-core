@@ -87,12 +87,38 @@ const (
 	// DefaultPort is the port the A2A server listens on inside the container.
 	DefaultPort = "8000"
 
-	// ProvisionTimeout bounds the SaaS/CP provision context (cpProv.Start —
-	// the provider provision API call, which returns quickly; the long cold-boot is
-	// owned by the CP bootstrap-watcher + the registry provision-timeout
-	// sweep, not this ctx) and the short DB-lookup nudge at
-	// buildProvisionerConfig. It is deliberately NO LONGER the cap on the
-	// LOCAL docker-build path: a cold `docker build` can legitimately run
+	// ProvisionTimeout BOUNDS NOTHING. As of the CP-mode migration below it has
+	// no remaining call site in this module (the package is internal/, so there
+	// are none outside it either). It is kept as the named record of a value
+	// that must not come back, and because a fresh 3-minute constant is exactly
+	// what someone would otherwise reinvent.
+	//
+	// DO NOT reintroduce it as a provision-context bound. Both times a fixed
+	// 3-minute deadline was applied to "provisioning", it cost a workspace.
+	//
+	// (1) THE CP PROVISION CONTEXT. The claim that this constant could safely
+	// bound it — "cpProv.Start … the provider provision API call, which
+	// returns quickly" — was false, and is the origin of a production defect.
+	// cpProv.Start does NOT return quickly: the control plane resolves the
+	// workspace's image from runtime_image_pins at PROVISION time, so a
+	// workspace created shortly after a runtime-image promote is the one host
+	// that must obtain a freshly promoted multi-GB image (workspace-template-
+	// hermes is 6.89GB) before the call can answer at all. Everything
+	// downstream was sized for that — core#5019 raised provisionHTTPClient to
+	// 20 min, the control plane raised its own pull cap to 30 min with a 2-min
+	// stall window — and this 3-minute ceiling beat all of them, cancelling the
+	// request so the CP's `docker pull` died with it. The signature is
+	// `pull failed: context canceled` in CP stdout, and the workspace is marked
+	// terminally failed. CP-mode callers now derive their deadline from
+	// provisioner.CPProvisionCeiling (see handlers.cpProvisionTimeout), which
+	// is the provision client's own budget and therefore cannot invert.
+	//
+	// The long cold-boot after the box exists is still owned by the CP
+	// bootstrap-watcher + the registry provision-timeout sweep, not by any
+	// context here.
+	//
+	// (2) THE LOCAL DOCKER-BUILD PATH, which it likewise no longer caps:
+	// a cold `docker build` can legitimately run
 	// past 3 min, so the Docker-mode + bundle-import call sites now derive
 	// their deadline from the per-runtime provision timeout (floored at 12m,
 	// see handlers.dockerProvisionTimeout / provisioner.DefaultProvisionCeiling)
@@ -443,10 +469,21 @@ func legacyContainerName(workspaceID string) string {
 	return fmt.Sprintf("ws-%s", id)
 }
 
-// containerNamePrefix is the shared prefix every workspace container
-// name carries (`ws-`). Used by ListWorkspaceContainerIDPrefixes for
-// the Docker name-filter, and by the orphan sweeper to recognise our
-// own containers vs. anything else on the host.
+// containerNamePrefix is the prefix every workspace container THIS
+// package mints carries (`ws-`, see ContainerName). It is a generic
+// workspace descriptor, NOT a brand token, so it survives a rebrand
+// untouched.
+//
+// It is also the Docker name-FILTER used by the list methods below.
+// That filter is a SUBSTRING match, so it also returns the
+// control-plane-minted `<brand>-ws-…` containers that share the daemon
+// — which is exactly what we want, because those are workspace
+// containers too. The precise classification is NOT done here: it is
+// done by parseWorkspaceContainerID in brand_seam.go, which accepts the
+// full union WorkspaceContainerNamePrefixes() returns. Matching on this
+// single token alone would go blind to every brand-prefixed container
+// and false-orphan live workspaces — see brand_seam.go for the failure
+// mode and brand_seam_test.go for its negative control.
 const containerNamePrefix = "ws-"
 
 // LabelManaged is stamped on every workspace container + volume the
@@ -553,12 +590,18 @@ func PlatformInstanceID() string {
 	return platformInstanceID
 }
 
-// ListWorkspaceContainerIDPrefixes returns the 12-char workspace ID
-// prefixes of every running ws-* container the Docker daemon knows
-// about. The 12-char form matches ContainerName's truncation, so the
-// orphan sweeper can intersect this set against `SELECT
-// substring(id::text, 1, 12) FROM workspaces WHERE status = 'removed'`
-// without an extra round-trip per row.
+// ListWorkspaceContainerIDPrefixes returns the workspace ID prefixes of
+// every workspace container the Docker daemon knows about — every name
+// shape in WorkspaceContainerNamePrefixes(): the `ws-<id>` form this
+// package mints AND the `<brand>-ws-<tenant>-<short>` form the control
+// plane's local-docker backend mints on the same daemon, for the current
+// brand and every legacy brand. A `ws-`-only match here false-orphans
+// live brand-prefixed workspaces (see brand_seam.go).
+//
+// Every returned value is a LEADING SUBSTRING of `workspaces.id::text`,
+// so the orphan sweeper can intersect this set against the workspaces
+// table with a single `id::text LIKE ANY(...)` round-trip instead of one
+// query per row.
 //
 // Returns an empty slice on any Docker error (sweeper treats that as
 // "skip this round" — better than a partial scan that misses leaks).
@@ -579,21 +622,20 @@ func (p *Provisioner) ListWorkspaceContainerIDPrefixes(ctx context.Context) ([]s
 	prefixes := make([]string, 0, len(containers))
 	for _, c := range containers {
 		// Container names from the API include a leading slash:
-		// "/ws-abc123def456". Strip both the slash and our prefix
-		// to recover the 12-char workspace ID.
+		// "/ws-abc123def456". parseWorkspaceContainerID strips the
+		// slash and whichever of the union prefixes
+		// (WorkspaceContainerNamePrefixes) the name carries, returning
+		// the workspace-id prefix in `workspaces.id::text` space.
 		//
 		// The Docker name filter is a SUBSTRING match (not a prefix
 		// match), so something like "my-ws-thing" would also be
-		// returned. The HasPrefix check below is load-bearing:
-		// without it those false positives would flow into the
-		// orphan sweeper's DB query as bogus LIKE patterns.
+		// returned. The anchored prefix check inside
+		// parseWorkspaceContainerID is load-bearing: without it those
+		// false positives would flow into the orphan sweeper's DB
+		// query as bogus LIKE patterns.
 		for _, name := range c.Names {
-			n := strings.TrimPrefix(name, "/")
-			if !strings.HasPrefix(n, containerNamePrefix) {
-				continue
-			}
-			id := strings.TrimPrefix(n, containerNamePrefix)
-			if id == "" {
+			id, ok := parseWorkspaceContainerID(name)
+			if !ok {
 				continue
 			}
 			prefixes = append(prefixes, id)
@@ -645,17 +687,17 @@ func (p *Provisioner) ListManagedContainerIDPrefixes(ctx context.Context) ([]str
 	}
 	prefixes := make([]string, 0, len(containers))
 	for _, c := range containers {
-		// Same name-strip dance as ListWorkspaceContainerIDPrefixes —
-		// label filter is exact (not substring), so any false-positive
-		// must be a non-ws-* container we accidentally labeled. Defence
-		// against a future bug that stamps the label on something else.
+		// Same name parse as ListWorkspaceContainerIDPrefixes — label
+		// filter is exact (not substring), so any false-positive must
+		// be a container outside every workspace name shape that we
+		// accidentally labeled. Defence against a future bug that
+		// stamps the label on something else. Going through the shared
+		// seam also means a labeled container minted under a brand
+		// prefix stays visible to the wiped-DB pass instead of leaking
+		// forever behind a `ws-`-only check.
 		for _, name := range c.Names {
-			n := strings.TrimPrefix(name, "/")
-			if !strings.HasPrefix(n, containerNamePrefix) {
-				continue
-			}
-			id := strings.TrimPrefix(n, containerNamePrefix)
-			if id == "" {
+			id, ok := parseWorkspaceContainerID(name)
+			if !ok {
 				continue
 			}
 			prefixes = append(prefixes, id)
@@ -1216,37 +1258,80 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 		}
 	}
 	// Langfuse tracing (SSOT reproducibility): when the platform has Langfuse
-	// keys in its env, inject them into EVERY workspace container so the shared
-	// runtime's tracing producer emits — no per-workspace secret needed. The
-	// agent reaches Langfuse over the Docker network, so its HOST is the
-	// container-network URL (MOLECULE_WORKSPACE_LANGFUSE_HOST, default
-	// http://langfuse-web:3000), NOT the platform's host-published one. A
-	// workspace_secrets override still wins (assembled above from cfg.EnvVars).
-	if pk, sk := os.Getenv("LANGFUSE_PUBLIC_KEY"), os.Getenv("LANGFUSE_SECRET_KEY"); pk != "" && sk != "" {
-		host := os.Getenv("MOLECULE_WORKSPACE_LANGFUSE_HOST")
-		if host == "" {
-			host = "http://langfuse-web:3000"
-		}
-		// A workspace/global-secret LANGFUSE_HOST that points at the platform
-		// HOST's loopback (127.0.0.1 / localhost / ::1 — the host-published
-		// Langfuse UI port) is UNREACHABLE from inside the workspace container,
-		// so the tracing producer silently fails ("Unexpected error … contact
-		// support"). Rewrite such a value to the container-network URL. A
-		// non-loopback override (a real cloud.langfuse.com or internal DNS) is
-		// a deliberate external target and is left untouched. Duplicate env
-		// keys resolve last-wins in the container runtime, so appending here
-		// overrides earlier cfg.EnvVars only when the earlier value is absent
-		// or unusable.
-		existing, set := cfg.EnvVars["LANGFUSE_HOST"]
-		if v, ok := cfg.EnvVars["LANGFUSE_PUBLIC_KEY"]; !ok || strings.TrimSpace(v) == "" {
-			env = append(env, fmt.Sprintf("LANGFUSE_PUBLIC_KEY=%s", pk))
-		}
-		if v, ok := cfg.EnvVars["LANGFUSE_SECRET_KEY"]; !ok || strings.TrimSpace(v) == "" {
-			env = append(env, fmt.Sprintf("LANGFUSE_SECRET_KEY=%s", sk))
-		}
-		if !set || isLoopbackHostURL(existing) {
-			env = append(env, fmt.Sprintf("LANGFUSE_HOST=%s", host))
-		}
+	// keys in its env AND a reachable trace endpoint is known, inject them into
+	// EVERY workspace container so the shared runtime's tracing producer emits —
+	// no per-workspace secret needed. See appendWorkspaceLangfuseEnv.
+	env = appendWorkspaceLangfuseEnv(env, cfg.EnvVars)
+	return env
+}
+
+// workspaceLangfuseHostEnv names the platform env var that carries the trace
+// endpoint a WORKSPACE CONTAINER can reach. It is deliberately distinct from
+// LANGFUSE_HOST (which is the PLATFORM's own reader URL — on compose the
+// host-published 127.0.0.1:3001 port) because the two are different addresses
+// of the same service seen from different network namespaces.
+const workspaceLangfuseHostEnv = "MOLECULE_WORKSPACE_LANGFUSE_HOST"
+
+// appendWorkspaceLangfuseEnv appends the LANGFUSE_* tracing entries for one
+// workspace container — or appends NOTHING, which is the ordinary case on any
+// deployment that has not stood Langfuse up.
+//
+// THERE IS NO DEFAULT HOST, AND ITS ABSENCE IS THE POINT.
+//
+// This used to fall back to the literal "http://langfuse-web:3000" — the
+// docker-compose service alias defined in this repo's own docker-compose.yml.
+// It resolves inside the compose topology and NOWHERE ELSE. On the k8s fleet no
+// langfuse-web Service exists in any namespace, so every workspace agent in
+// every tenant retried an OTLP export against a name that cannot resolve,
+// forever. MEASURED over 24h to 2026-09-01: 22,224 error lines in
+// ns/enteros-dinecall-ai and 9,011 in ns/enteros-minori — roughly 90% of all
+// error lines those tenants produced, which is how a real error stops being
+// findable. A value that is correct in exactly one deployment topology is not a
+// default; it is a guess that only that one topology can honour, and it belongs
+// in that topology's config (docker-compose.yml sets this var; dev-start.sh
+// exports it) rather than compiled in as everyone's fallback.
+//
+// THE KEYS ARE GATED ON THE HOST, not merely for tidiness. The Langfuse SDK's
+// own default endpoint is https://cloud.langfuse.com, a public host that DOES
+// resolve — so injecting a key pair with no host would convert a silent local
+// failure into silent egress of tenant trace data to a third party. Gating the
+// whole set on a known-reachable endpoint keeps the FAIL-OPEN contract this
+// block already honours for the keys: nothing configured → nothing injected →
+// the runtime boots untraced.
+func appendWorkspaceLangfuseEnv(env []string, envVars map[string]string) []string {
+	pk, sk := os.Getenv("LANGFUSE_PUBLIC_KEY"), os.Getenv("LANGFUSE_SECRET_KEY")
+	if pk == "" || sk == "" {
+		return env
+	}
+	// A workspace/global-secret LANGFUSE_HOST that points at the platform HOST's
+	// loopback (127.0.0.1 / localhost / ::1 — the host-published Langfuse UI
+	// port) is UNREACHABLE from inside the workspace container, so the tracing
+	// producer silently fails ("Unexpected error … contact support"). Such a
+	// value is rewritten to the container-network URL when one is configured. A
+	// non-loopback override (a real cloud.langfuse.com or internal DNS) is a
+	// deliberate external target and is left untouched. Duplicate env keys
+	// resolve last-wins in the container runtime, so appending here overrides
+	// the earlier cfg.EnvVars entry only when that value is absent or unusable.
+	existing, set := envVars["LANGFUSE_HOST"]
+	existingUsable := set && strings.TrimSpace(existing) != "" && !isLoopbackHostURL(existing)
+	host := strings.TrimSpace(os.Getenv(workspaceLangfuseHostEnv))
+	switch {
+	case existingUsable:
+		// The workspace named its own reachable endpoint; it is already in env
+		// from the cfg.EnvVars pass above and must not be overridden.
+	case host != "":
+		env = append(env, fmt.Sprintf("LANGFUSE_HOST=%s", host))
+	default:
+		// No reachable endpoint is known — not from the platform, not from the
+		// workspace's own secrets (an unset or loopback value is not one). Emit
+		// nothing rather than a hostname that only one topology can resolve.
+		return env
+	}
+	if v, ok := envVars["LANGFUSE_PUBLIC_KEY"]; !ok || strings.TrimSpace(v) == "" {
+		env = append(env, fmt.Sprintf("LANGFUSE_PUBLIC_KEY=%s", pk))
+	}
+	if v, ok := envVars["LANGFUSE_SECRET_KEY"]; !ok || strings.TrimSpace(v) == "" {
+		env = append(env, fmt.Sprintf("LANGFUSE_SECRET_KEY=%s", sk))
 	}
 	return env
 }

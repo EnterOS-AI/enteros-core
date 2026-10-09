@@ -186,20 +186,27 @@ func QueuedA2AQueueID(body string) string {
 	// whitespace, a slash (which would also re-route the request to a different
 	// endpoint) or an absurd length yields "", the id is never followed, and
 	// the collector simply observes nothing.
-	if !safeQueueIDRe.MatchString(id) || strings.Contains(id, "..") {
+	if !safeQueueIDRe.MatchString(id) || strings.Contains(id, "..") || !queueIDHasAlnumRe.MatchString(id) {
 		return ""
 	}
 	return id
 }
 
+// queueIDHasAlnumRe requires an identifier to contain at least one
+// alphanumeric. Without it "." and ".." and "--" are all legal under
+// safeQueueIDRe's character class — they are PATH SEGMENTS, not ids, and a
+// single "." re-routes a URL just as surely as a slash does.
+
 // safeQueueIDRe admits only an opaque URL-path token: the queue ids the tenant
 // actually mints are UUIDs, and this is deliberately a little wider than that
 // without ever admitting a character that could break or redirect the request.
 //
-// The separate ".." rejection above closes the traversal that needs no slash
-// (round-3 review): "." and ".." are legal under this character class but are
-// path segments, not identifiers.
+// The ".." and alphanumeric rejections above close the traversal that needs no
+// slash (round-3/4 review): "." and ".." are legal under this character class
+// but are path segments, not identifiers.
 var safeQueueIDRe = regexp.MustCompile(`^[A-Za-z0-9._~-]{1,128}$`)
+
+var queueIDHasAlnumRe = regexp.MustCompile(`[A-Za-z0-9]`)
 
 // A2AQueueTerminalStatus reports whether a queue row has stopped moving, so the
 // live poller knows when the agent's answer is as final as it will get. An
@@ -418,11 +425,28 @@ const (
 // WHAT IS DELIBERATELY *NOT* HERE — the comma. A comma routinely sits INSIDE a
 // single assertion ("The workspace, created moments ago, is online"), so
 // treating it as a boundary would cut the veto scope below the width of one
-// clause and under-veto far more than it fixes. The consequence is stated
-// plainly rather than papered over: a negation separated from its verb by a
-// comma alone ("The workspace was not, in the end, created") is NOT vetoed, so
-// that reply is scored as a claim. Bounded — a mislabel on an already-red turn,
-// never a green — but real, and not covered.
+// clause.
+//
+// THE CONSEQUENCE, MEASURED (an earlier revision of this comment stated it
+// backwards, claiming a comma-separated negation goes unvetoed — the opposite
+// is true, and the difference matters because it points at a real miss the
+// wrong claim was hiding):
+//
+// Because the comma is NOT a boundary, the clause spans it, so a negation
+// separated from its verb by commas alone IS vetoed —
+// "The workspace was not, in the end, created" scores false, correctly. What
+// the wide scope costs is the other direction: a negation in a DIFFERENT
+// comma-clause of the same sentence suppresses a genuine claim.
+//
+//	"The old one was not usable, so the workspace was created."      -> missed
+//	"I could not reach the registry, but the workspace has been created." -> missed
+//	"Nothing failed, and the workspace was created."                 -> missed
+//
+// Those are detector misses, not verdict errors: a missed claim can only cost
+// a fabrication its specific G9 message (it still reds via check 5), and since
+// the identity branch no longer consults the classifier at all, it cannot
+// affect whether a wrong published id is caught. Characterised and kept visible
+// from the corpus side by TestKnownNotCovered_CommaScopedNegation.
 const sentenceDelims = ".;!?:\n—–()"
 
 // clauseBounds returns the span of the verb's OWN sentence, clipped to the

@@ -177,10 +177,24 @@ func TestLogProvisionPanic_PersistFailureLogged(t *testing.T) {
 	}
 
 	logged := buf.String()
-	// markProvisionFailed logs `markProvisionFailed: db update failed for <id>: <err>`
-	// when its UPDATE fails. That's the line that proves we surfaced the
-	// persist failure rather than swallowing it.
-	if !strings.Contains(logged, "markProvisionFailed: db update failed for ws-panic-persist-fail") {
+	// markProvisionFailed logs `markProvisionFailed: db update FAILED for <id>
+	// (<err>) — …` when its UPDATE fails. That's the line that proves we
+	// surfaced the persist failure rather than swallowing it.
+	//
+	// The wording got louder when the write was reordered ahead of the broadcast
+	// and made immune to the caller's cancellation: a failure here is now
+	// unambiguously a real database problem rather than the context race this
+	// path used to lose to, so the line says outright that the row does not
+	// carry the reason. Asserted in two parts — the marker and the workspace id
+	// — so a future rewording of the prose does not silently stop proving
+	// anything.
+	if !strings.Contains(logged, "markProvisionFailed: db update FAILED") {
 		t.Errorf("expected markProvisionFailed db-update-failure log line; got: %q", logged)
+	}
+	if !strings.Contains(logged, "ws-panic-persist-fail") {
+		t.Errorf("the db-update-failure log does not name the workspace; got: %q", logged)
+	}
+	if !strings.Contains(logged, sql.ErrConnDone.Error()) {
+		t.Errorf("the db-update-failure log does not carry the underlying error; got: %q", logged)
 	}
 }
