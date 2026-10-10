@@ -39,6 +39,24 @@ Rules (4 fatal + 1 fatal cross-file + 1 heuristic-warn):
   10. Docker health checks must not run `docker info | head` under pipefail.
       `head` closes the pipe early, `docker info` can exit nonzero from
       SIGPIPE, and the step can falsely report Docker daemon failure.
+  11. DUPLICATE MAPPING KEYS anywhere in a workflow file. Gitea's workflow
+      parser REJECTS a duplicate key and refuses to schedule the file at
+      all, but `yaml.safe_load` treats duplicates as legal and silently
+      keeps the LAST one. That asymmetry is the dangerous part: the file
+      reads fine to every Python-side check while the workflow simply stops
+      existing in CI.
+      Observed 2026-08-10 on `local-provision-e2e.yml`: a second `env:` on a
+      step that already had one. Gitea never scheduled the workflow, so BOTH
+      of its contexts stopped being posted; the PR read 43/43 success with an
+      entire workflow deleted from CI, and `Lint workflow YAML`,
+      lint-phantom-gate, lint-bp-context-emit-match,
+      lint-required-context-exists-in-bp and lint-required-no-paths ALL
+      posted success on that commit. Meanwhile safe_load had dropped three
+      secrets from the step's env without a word.
+      A missing status is invisible under branch protection `['*']` ("every
+      POSTED context must be success"), so absence is not merely undetected —
+      it is MORE likely to look green. Hence: fatal, and checked with a
+      loader that rejects duplicates rather than through `safe_load`.
 
 Per `feedback_smoke_test_vendor_truth_not_shape_match`, legacy fixtures retain
 the exact incident shapes. They test the repository policy, not a claim about
@@ -436,6 +454,78 @@ def check_docker_info_head_pipefail(filename: str, doc: Any) -> list[str]:
 # Driver
 # ---------------------------------------------------------------------------
 
+class DuplicateKeyError(yaml.YAMLError):
+    """Raised when a workflow mapping declares the same key twice.
+
+    Subclasses YAMLError so any caller that already handles "this file does
+    not parse" keeps working — a duplicate key IS a parse failure as far as
+    Gitea is concerned, even though PyYAML tolerates it.
+    """
+
+    def __init__(self, key: object, line: int, column: int) -> None:
+        self.key = key
+        self.line = line
+        self.column = column
+        super().__init__(
+            f"duplicate mapping key {key!r} at line {line}, column {column}"
+        )
+
+
+class NoDuplicateKeyLoader(yaml.SafeLoader):
+    """SafeLoader that REJECTS duplicate mapping keys instead of taking the last.
+
+    Still a SafeLoader subclass, so it cannot construct arbitrary Python
+    objects; it only makes the mapping constructor strict. Deliberately NOT
+    `yaml.safe_load`, whose permissive mapping constructor is exactly what
+    hides this defect.
+    """
+
+
+def _construct_mapping_no_duplicates(
+    loader: yaml.SafeLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict:
+    mapping: dict = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError:
+            # Unhashable key — malformed YAML; let the normal loader path
+            # surface it rather than masking it as a duplicate.
+            duplicate = False
+        if duplicate:
+            raise DuplicateKeyError(
+                key, key_node.start_mark.line + 1, key_node.start_mark.column + 1
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+NoDuplicateKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_mapping_no_duplicates,
+)
+
+
+def load_workflow_strict(raw: str):
+    """Parse a workflow, rejecting duplicate mapping keys.
+
+    Returns the parsed document. Raises DuplicateKeyError (a YAMLError) on a
+    duplicate, or yaml.YAMLError on any other parse failure.
+
+    On `yaml.load` with an explicit Loader: this is NOT unsafe load. The
+    generic advice "use safe_load instead" does not apply and would defeat
+    the rule outright, because safe_load's permissive mapping constructor is
+    the exact behaviour being guarded against — it accepts duplicates and
+    keeps the last. `NoDuplicateKeyLoader` derives from `yaml.SafeLoader`, so
+    it inherits SafeLoader's constructor table and still refuses
+    `!!python/object` and friends; the sole override makes mappings STRICTER.
+    Same pattern as `_LineLoader(yaml.SafeLoader)` in
+    lint_continue_on_error_tracking.py.
+    """
+    return yaml.load(raw, Loader=NoDuplicateKeyLoader)  # noqa: S506 — SafeLoader subclass, stricter not looser
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description="Lint Gitea Actions workflow YAML for repository-policy violations."
@@ -468,7 +558,25 @@ def main(argv: list[str] | None = None) -> int:
         rel = os.path.relpath(path)
         try:
             raw = Path(path).read_text()
-            doc = yaml.safe_load(raw)
+            # Rule 11: parse with the duplicate-rejecting loader, NOT
+            # safe_load. Gitea refuses to schedule a file with a duplicate
+            # key, while safe_load silently keeps the last one — so a
+            # safe_load-based lint reports success on a workflow that has
+            # vanished from CI. Parsed once here and reused by every check
+            # below, so the strict rule cannot be bypassed.
+            doc = load_workflow_strict(raw)
+        except DuplicateKeyError as e:
+            fatal_errors.append(
+                f"::error file={rel},line={e.line}::duplicate mapping key "
+                f"{e.key!r} (line {e.line}, column {e.column}). Gitea's "
+                f"workflow parser REJECTS duplicate keys and will not "
+                f"schedule this file, so every status it posts silently "
+                f"disappears — which reads as green under branch protection "
+                f"['*'], not as a failure. Note `yaml.safe_load` accepts "
+                f"this and keeps only the LAST {e.key!r}, dropping the "
+                f"earlier one's contents. Merge the blocks into one key."
+            )
+            continue
         except yaml.YAMLError as e:
             fatal_errors.append(
                 f"::error file={rel}::YAML parse error: {e}. Cannot lint "

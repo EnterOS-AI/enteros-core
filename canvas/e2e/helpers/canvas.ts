@@ -1,5 +1,5 @@
 import { expect, type Page } from "@playwright/test";
-import { networkFailuresFor } from "./net-evidence";
+import { formatFailure, networkFailuresFor } from "./net-evidence";
 
 /** Enter the Org-map view so the Canvas (React Flow graph) mounts. */
 export async function enterMapView(page: Page): Promise<void> {
@@ -440,7 +440,7 @@ export async function collectHittabilityDiagnostic(page: Page, testId: string): 
     : net.failures.length === 0
       ? "network failures = none (recorder was attached for the whole test)"
       : `network failures (${net.failures.length}, recorder attached):\n    ` +
-        net.failures.join("\n    ");
+        net.failures.map(formatFailure).join("\n    ");
   return `${inPage}\n  ${netSection}`;
 }
 

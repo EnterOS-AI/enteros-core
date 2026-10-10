@@ -24,14 +24,29 @@ SCRIPT = ROOT / "scripts" / "deploy" / "advance-staging-tenant-pin.sh"
 
 
 def _fake_curl_cp_only(bindir: Path, digest: str, git_sha: str) -> None:
-    """A curl stub answering only the CP pin read (the SKIP_SSOT_WRITE=1 path)."""
+    """A curl stub answering only the CP pin read (the SKIP_SSOT_WRITE=1 path).
+
+    It emulates curl's -w: the CP client reads the body AND the HTTP status from
+    ONE stdout stream (body, newline, %{http_code}). A stub that printed only the
+    body would hand the script an empty status, which it correctly refuses to
+    read as success.
+    """
     curl = bindir / "curl"
     payload = (
         '{"pins":[{"template_name":"molecule-tenant","region":"global",'
         f'"image_digest":"{digest}","git_sha":"{git_sha}"}}]}}'
     )
     curl.write_text(
-        "#!/bin/sh\ncat <<'JSON'\n" + payload + "\nJSON\n",
+        "#!/bin/sh\n"
+        'fmt=""\n'
+        'prev=""\n'
+        'for a in "$@"; do\n'
+        '  [ "$prev" = "-w" ] && fmt="$a"\n'
+        '  prev="$a"\n'
+        "done\n"
+        "printf '%s' '" + payload + "'\n"
+        "if [ -n \"$fmt\" ]; then printf '\\n200'; fi\n"
+        "exit 0\n",
         encoding="utf-8",
     )
     curl.chmod(0o755)
@@ -53,6 +68,15 @@ def _run(env_extra: dict, tmp_path: Path, path_value: str) -> subprocess.Complet
             "TENANT_IMAGE_NAME": "registry.test/molecule-tenant",
             "GITHUB_OUTPUT": str(tmp_path / "github-output"),
             "SKIP_SSOT_WRITE": "1",
+            # The promote refuses without a CI run id to attribute the pin
+            # write to (pin_provenance.py). Set it EXPLICITLY rather than
+            # inheriting whatever the runner happens to export: a test that
+            # only passes because it is running inside Actions is a test that
+            # fails on a developer box for a reason unrelated to what it
+            # asserts. The absent case has its own test in
+            # test_advance_staging_tenant_pin.py.
+            "GITHUB_RUN_ID": "900010",
+            "GITHUB_REPOSITORY": "molecule-ai/molecule-core",
         }
     )
     env.pop("DIGEST_SOURCE", None)

@@ -255,7 +255,7 @@ tenant_call() { local m="$1" p="$2"; shift 2; curl "${CURL_COMMON[@]}" -X "$m" "
 log "4/6 provisioning a fresh '$SEO_TEMPLATE' workspace"
 WS=$(tenant_call POST /workspaces --max-time 90 \
   -H "Content-Type: application/json" \
-  -d "{\"name\":\"seo-delivery-e2e\",\"runtime\":\"claude-code\",\"template\":\"$SEO_TEMPLATE\"}")
+  -d "{\"name\":\"seo-delivery-e2e\",\"runtime\":\"hermes\",\"template\":\"$SEO_TEMPLATE\"}")
 WID=$(echo "$WS" | python3 -c "import json,sys;print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
 [ -z "$WID" ] && fail "workspace create missing id: $WS"
 ok "seo-agent workspace id=$WID"

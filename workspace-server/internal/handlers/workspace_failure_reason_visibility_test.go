@@ -47,6 +47,7 @@ var workspaceRowColumns = []string{
 	"budget_limit", "monthly_spend",
 	"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 	"loaded_mcp_tools",
+	"mcp_surface",
 }
 
 // ==================== (1) READ ====================
@@ -69,6 +70,7 @@ func TestWorkspaceGet_SurfacesLastSampleError(t *testing.T) {
 				nil, 0, 1, 0.0, renoStarsStoredReason, 0, "", "claude-code",
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 	mock.ExpectQuery(`SELECT last_outbound_at FROM workspaces`).
 		WithArgs(id).
@@ -122,6 +124,7 @@ func TestWorkspaceGet_LastSampleErrorEmptyWhenUnset(t *testing.T) {
 				nil, 0, 1, 0.0, "", 10, "", "claude-code",
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 	mock.ExpectQuery(`SELECT last_outbound_at FROM workspaces`).
 		WithArgs(id).
@@ -179,6 +182,7 @@ func TestWorkspaceList_KeepsLastSampleError(t *testing.T) {
 			AddRow("e0abf57d-e2bb-4aee-8834-15d3e78f7977", "SEO Agent", "", 4, "failed", []byte(`null`), "",
 				nil, 0, 1, 0.0, renoStarsStoredReason, 0, "", "claude-code",
 				"", 0.0, 0.0, false, nil, int64(0), false, true, []byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 
 	w := httptest.NewRecorder()
