@@ -65,6 +65,9 @@ on:
       # test_deploy_comment_accuracy.py; changes to either harness must run it.
       - 'tests/e2e/test_staging_concierge_creates_workspace_e2e.sh'
       - 'tests/e2e/test_staging_full_saas.sh'
+      # test_dind_self_reaping.py drives the per-job dind harness; a PR editing only
+      # the harness must still run the guard that pins its self-reaping.
+      - 'tests/harness/dind.sh'
   pull_request:
     branches: [main, staging]
     paths:
@@ -103,6 +106,9 @@ on:
       # test_deploy_comment_accuracy.py; changes to either harness must run it.
       - 'tests/e2e/test_staging_concierge_creates_workspace_e2e.sh'
       - 'tests/e2e/test_staging_full_saas.sh'
+      # test_dind_self_reaping.py drives the per-job dind harness; a PR editing only
+      # the harness must still run the guard that pins its self-reaping.
+      - 'tests/harness/dind.sh'
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app

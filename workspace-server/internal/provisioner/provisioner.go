@@ -346,6 +346,12 @@ type Provisioner struct {
 	// for the entire provisioning phase — on a first local-build boot that
 	// is 5+ silent minutes that read as a hang. nil = no-op.
 	bootStep func(workspaceID, status, message string)
+	// removedCheck (SetWorkspaceRemovedCheck) and the in-flight Start registry
+	// (CancelInflightStart) close the delete-vs-provision race — see
+	// start_delete_guard.go.
+	removedCheck func(ctx context.Context, workspaceID string) bool
+	inflightMu   sync.Mutex
+	inflight     map[string]map[*inflightStart]struct{}
 }
 
 // SetBootStepEmitter wires provisioning-phase boot telemetry (see the
@@ -792,10 +798,33 @@ func resolveStartWorkspaceHostURL(hostPort, boundPort string) string {
 }
 
 // Start provisions and starts a workspace container.
+//
+// The run is registered per workspace so a delete can cancel it and wait for it
+// (CancelInflightStart); a Start abandoned for that reason — or because its
+// removed-check fired — returns ErrWorkspaceRemoved with nothing left behind.
 func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, error) {
 	if p == nil || p.cli == nil {
 		return "", ErrNoBackend
 	}
+	callerCtx := ctx
+	ctx, done := p.trackStart(ctx, cfg.WorkspaceID)
+	defer done()
+	url, err := p.start(ctx, callerCtx, cfg)
+	if err != nil && !errors.Is(err, errRemovedAndDiscarded) && errors.Is(context.Cause(ctx), ErrWorkspaceRemoved) {
+		// Cancelled by a delete mid-flight: whatever step failed on the cancelled
+		// ctx may have left a volume (or a created-not-started container) behind.
+		// Only start's own discard counts as done: a Docker call the cancel cut
+		// off returns an error that itself wraps ErrWorkspaceRemoved.
+		p.discardRemovedWorkspace(ctx, cfg.WorkspaceID)
+		return "", fmt.Errorf("%w: %s (start cancelled: %v)", ErrWorkspaceRemoved, cfg.WorkspaceID, err)
+	}
+	return url, err
+}
+
+// start does the work of Start. ctx is cancelled by a delete
+// (CancelInflightStart); callerCtx is the ctx Start was called with, which only
+// the local image build runs under (buildLocalImageUnlessRemoved).
+func (p *Provisioner) start(ctx, callerCtx context.Context, cfg WorkspaceConfig) (string, error) {
 	p.emitBootStep(cfg.WorkspaceID, "running", "provisioning compute (docker)")
 	name := ContainerName(cfg.WorkspaceID)
 	// KI-013 deploy safety: prefer legacy truncated config volume if it
@@ -855,7 +884,7 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	// the operator chose explicitly.
 	if cfg.Image == "" && cfg.Runtime != "" {
 		if src := Resolve(); src.Mode == RegistryModeLocal {
-			builtTag, buildErr := p.buildLocalImageWithTelemetry(ctx, cfg.WorkspaceID, cfg.Runtime)
+			builtTag, buildErr := p.buildLocalImageUnlessRemoved(ctx, callerCtx, cfg.WorkspaceID, cfg.Runtime)
 			if buildErr != nil {
 				return "", fmt.Errorf("local-build mode: ensure image for runtime %q: %w", cfg.Runtime, buildErr)
 			}
@@ -920,7 +949,7 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 
 	hostCfg := &container.HostConfig{
 		Binds:         binds,
-		RestartPolicy: container.RestartPolicy{Name: "unless-stopped"},
+		RestartPolicy: workspaceRestartPolicy(),
 		PortBindings: nat.PortMap{
 			nat.Port(DefaultPort + "/tcp"): []nat.PortBinding{
 				{HostIP: "127.0.0.1", HostPort: hostPort}, // Pre-allocated stable host port (#2851)
@@ -997,6 +1026,30 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 			name, image, clip(imgInspect.ID, 19), clip(imgInspect.Created, 19))
 	}
 
+	// RC09: the image step above can take minutes (a cold local build), and a
+	// DELETE may have landed meanwhile. Creating ws-<id> now would resurrect a
+	// removed workspace as a crash-looping orphan. Check, and discard instead.
+	if p.workspaceRemoved(ctx, cfg.WorkspaceID) {
+		p.discardRemovedWorkspace(ctx, cfg.WorkspaceID)
+		return "", fmt.Errorf("%w: %s (before container create)", errRemovedAndDiscarded, cfg.WorkspaceID)
+	}
+	// Create the /workspace volume LABELLED too when the tier keeps that bind
+	// (ApplyTierConfig drops it for tier 1; a host-path bind is no volume).
+	// Left to the bind, Docker creates it without labels, and a delete keeps
+	// it by design — so once its container is gone nothing could tell which
+	// platform instance it belongs to. Idempotent for an existing volume.
+	if wsVolume := WorkspaceVolumeName(cfg.WorkspaceID); bindsNamedVolume(hostCfg.Binds, wsVolume) {
+		if _, err := p.cli.VolumeCreate(ctx, volume.CreateOptions{Name: wsVolume, Labels: managedLabels()}); err != nil {
+			return "", fmt.Errorf("failed to ensure workspace volume %s: %w", wsVolume, err)
+		}
+	}
+	// Re-assert the LABELLED config volume right before the create (idempotent).
+	// The bind below auto-creates a missing named volume WITHOUT labels, which
+	// leaves an instance-scoped janitor nothing to recognise it by.
+	if _, err := p.cli.VolumeCreate(ctx, volume.CreateOptions{Name: configVolume, Labels: managedLabels()}); err != nil {
+		return "", fmt.Errorf("failed to ensure config volume %s: %w", configVolume, err)
+	}
+
 	// Create and start container. If the image still isn't available,
 	// Docker returns a generic "No such image" error that's opaque to
 	// operators — wrap it with the resolved tag and the exact pull
@@ -1032,6 +1085,14 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 		// Clean up created container on start failure
 		_ = p.cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
 		return "", fmt.Errorf("failed to start container: %w", err)
+	}
+
+	// RC09 backstop for the window between the check above and this point: a
+	// delete that marked the row while we created/started must not be outlived
+	// by the container it could not see yet.
+	if p.workspaceRemoved(ctx, cfg.WorkspaceID) {
+		p.discardRemovedWorkspace(ctx, cfg.WorkspaceID)
+		return "", fmt.Errorf("%w: %s (after container start)", errRemovedAndDiscarded, cfg.WorkspaceID)
 	}
 
 	// Verify the started container uses the expected image
@@ -1894,7 +1955,14 @@ func (p *Provisioner) migrateVolumeIfNeeded(ctx context.Context, newName, legacy
 	if err != nil {
 		return fmt.Errorf("create migration container: %w", err)
 	}
-	defer p.cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+	defer func() {
+		// Detached from ctx: a delete cancels the Start's ctx (RC09), possibly
+		// mid-copy, and a remove on a cancelled ctx never reaches the daemon —
+		// the copy container would outlive the Start, holding both volumes.
+		rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		_ = p.cli.ContainerRemove(rmCtx, resp.ID, container.RemoveOptions{Force: true})
+	}()
 
 	if err := p.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		return fmt.Errorf("start migration container: %w", err)

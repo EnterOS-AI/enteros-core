@@ -346,6 +346,11 @@ func main() {
 					"message":      message,
 				})
 			})
+			// Delete-vs-provision race (RC09): Start re-checks the row right
+			// before ContainerCreate and after ContainerStart, so a provision
+			// in flight when its workspace is deleted — by any caller,
+			// including the bundle importer — leaves no container behind.
+			p.SetWorkspaceRemovedCheck(handlers.WorkspaceIsRemoved)
 			prov = p
 			defer prov.Close()
 			log.Println("Provisioner: Docker")

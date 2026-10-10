@@ -595,9 +595,13 @@ func (h *WorkspaceHandler) markProvisionFailed(ctx context.Context, workspaceID,
 	}
 
 	// Leg 1 — the durable record, on its guaranteed reserve.
+	//
+	// `status != 'removed'`: removed is terminal. A provision that fails after a
+	// DELETE marked the row (the delete-vs-provision race, RC09) must not flip
+	// the deleted workspace back to a visible 'failed'.
 	writeCtx, cancelWrite := provisionFailureLegContext(ctx, provisionFailureRecordReserve)
 	_, dbErr := db.DB.ExecContext(writeCtx,
-		`UPDATE workspaces SET status = $3, last_sample_error = $2, updated_at = now() WHERE id = $1`,
+		`UPDATE workspaces SET status = $3, last_sample_error = $2, updated_at = now() WHERE id = $1 AND status != 'removed'`,
 		workspaceID, msg, models.StatusFailed)
 	cancelWrite()
 	if dbErr != nil {

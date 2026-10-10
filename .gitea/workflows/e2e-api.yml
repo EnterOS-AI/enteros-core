@@ -186,6 +186,11 @@ jobs:
       # we let Docker assign an ephemeral host port.
       PG_CONTAINER: pg-e2e-api-${{ github.run_id }}-${{ github.run_attempt }}
       REDIS_CONTAINER: redis-e2e-api-${{ github.run_id }}-${{ github.run_attempt }}
+      # The platform started below provisions ws-<id> containers on the shared
+      # host daemon. Production keeps them unless-stopped; here one that
+      # outlives the run must exit once and stay collectable, not crash-loop on
+      # the runner host (RC09: ~300k restarts each, for months).
+      MOLECULE_WORKSPACE_RESTART_POLICY: "no"
     steps:
       - name: No-op pass (paths filter excluded this commit)
         if: needs.detect-changes.outputs.api != 'true'
@@ -274,15 +279,15 @@ jobs:
       - name: Start Postgres (docker)
         if: needs.detect-changes.outputs.api == 'true'
         run: |
-          # Defensive cleanup — only matches THIS run's container name,
-          # so it cannot kill a sibling run's postgres. (Pre-fix the
-          # name was static and this rm hit other runs' containers.)
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          # The shared starter first removes THIS run's container name only
+          # (`rm -fv`), so it cannot kill a sibling run's postgres, and puts
+          # PGDATA on a tmpfs so no anonymous volume exists for any teardown —
+          # or a cancelled job's missing one — to strand (see its header).
           # `-p 127.0.0.1::5432` requests an ephemeral host port; we read it back
           # below and export DATABASE_URL.
-          docker run -d --name "$PG_CONTAINER" \
+          bash .gitea/scripts/ci-service-container.sh postgres "$PG_CONTAINER" postgres:16 \
             -e POSTGRES_USER=dev -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=molecule \
-            -p 127.0.0.1::5432 postgres:16 >/dev/null
+            -p 127.0.0.1::5432 >/dev/null
           # Resolve the host-side port assignment. `docker port` prints
           # `0.0.0.0:NNNN` (and on host-net runners may also print an
           # IPv6 line — take the first IPv4 line).
@@ -315,8 +320,7 @@ jobs:
       - name: Start Redis (docker)
         if: needs.detect-changes.outputs.api == 'true'
         run: |
-          docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$REDIS_CONTAINER" -p 127.0.0.1::6379 redis:7 >/dev/null
+          bash .gitea/scripts/ci-service-container.sh redis "$REDIS_CONTAINER" redis:7 -p 127.0.0.1::6379 >/dev/null
           REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           if [ -z "$REDIS_PORT" ]; then
             REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | head -1 | awk -F: '{print $NF}')
@@ -683,11 +687,42 @@ jobs:
           if [ -f workspace-server/platform.pid ]; then
             kill "$(cat workspace-server/platform.pid)" 2>/dev/null || true
           fi
+      - name: Remove this run's workspace containers + volumes (platform-instance scoped)
+        # The platform provisions ws-<id> containers on the runner's shared host
+        # daemon (bundle import, priority runtimes) and only its own 60s orphan
+        # sweeper ever removed them — which the step above just killed. Workspaces
+        # deleted mid-provision were left crash-looping for months (RC09). Remove
+        # every container labelled with THIS platform's instance id —
+        # sha256(DATABASE_URL)[:16]; the DSN carries this run's own ephemeral PG
+        # port, so a concurrent run's workspaces never match — plus their
+        # ws-<id>-* volumes (derived from the containers: the bind-created ones
+        # carry no labels). Runs after "Stop platform" so nothing new is created.
+        if: always() && needs.detect-changes.outputs.api == 'true'
+        run: |
+          if [ -z "${DATABASE_URL:-}" ]; then
+            echo "No DATABASE_URL — the platform never started; nothing to remove."
+            exit 0
+          fi
+          # "Stop platform" only signals it. Wait (bounded) until our own server
+          # has exited, so nothing it is still doing creates a container after
+          # the listing below. Not `kill -0`: the pid is the `timeout` wrapper,
+          # reparented to the job container's PID 1 (`sleep`, which reaps
+          # nothing), so once it exits it stays a zombie that `kill -0` still
+          # finds and the loop always ran its full 30s. Read the state instead.
+          PID="$(cat workspace-server/platform.pid 2>/dev/null || true)"
+          for _ in $(seq 1 30); do
+            [ -n "$PID" ] || break
+            st="$(awk '/^State:/ {print $2}' "/proc/$PID/status" 2>/dev/null || true)"
+            case "$st" in ''|Z|X) break ;; esac
+            sleep 1
+          done
+          bash .gitea/scripts/ws-orphan-reap.sh instance "$DATABASE_URL" \
+            || echo "::warning::instance-scoped workspace teardown did not complete — see above"
       - name: Stop service containers
         # always() so containers don't leak when test steps fail. The
         # cleanup is best-effort: if the container is already gone
         # (e.g. concurrent rerun race), don't fail the job.
         if: always() && needs.detect-changes.outputs.api == 'true'
         run: |
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$REDIS_CONTAINER" 2>/dev/null || true
