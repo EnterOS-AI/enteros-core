@@ -26,11 +26,12 @@ vi.mock("@/lib/api", () => ({
   },
 }));
 
-vi.mock("@/store/canvas", () => ({
-  useCanvasStore: vi.fn((selector?: (s: unknown) => unknown) =>
-    selector ? selector({ wsStatus: "connected", agentMessages: {}, consumeAgentMessages: () => [] }) : {},
-  ),
-}));
+vi.mock("@/store/canvas", () => {
+  const state = { wsStatus: "connected", agentMessages: {}, consumeAgentMessages: () => [], agentMessageConsumers: {}, retainAgentMessages: () => {}, releaseAgentMessages: () => {} };
+  const hook = (selector?: (s: unknown) => unknown) => (selector ? selector(state) : state);
+  hook.getState = () => state;
+  return { useCanvasStore: hook };
+});
 
 beforeEach(() => {
   apiPost.mockReset();

@@ -283,7 +283,7 @@ func TestHeartbeatHandler_OfflineToOnline(t *testing.T) {
 	// Expect prevTask SELECT
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-offline").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	// Expect heartbeat UPDATE
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -349,11 +349,12 @@ func TestHeartbeatHandler_ProvisioningToOnline(t *testing.T) {
 	// is a NOT-NULL workspace_status ENUM, and COALESCE(status, '') coerces ''
 	// to the enum → Postgres `invalid input value for enum workspace_status: ""`
 	// → the whole row scan fails → prevStatus stays "" → this reconcile trigger
-	// NEVER fires (the live #32 regression). Requiring `, status FROM workspaces`
-	// here makes a re-introduced COALESCE(status, ...) fail this unit test.
-	mock.ExpectQuery("SELECT COALESCE\\(current_task, ''\\), COALESCE\\(monthly_spend, 0\\), status FROM workspaces").
+	// NEVER fires (the live #32 regression). Requiring `status, desired_generation
+	// FROM workspaces` here makes a re-introduced COALESCE(status, ...) fail this
+	// unit test (desired_generation is the PR-C generation-loop read on the row).
+	mock.ExpectQuery("SELECT COALESCE\\(current_task, ''\\), COALESCE\\(monthly_spend, 0\\), status, desired_generation FROM workspaces").
 		WithArgs("ws-provisioning").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "provisioning"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "provisioning", int64(0)))
 
 	// Heartbeat UPDATE — its inline CASE flips provisioning→online.
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -407,7 +408,7 @@ func TestHeartbeatHandler_FailedToOnline(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-failed").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-failed", 0.0, "", 1, 3000, "", nil).
@@ -457,7 +458,7 @@ func TestHeartbeatHandler_AwaitingAgentToOnline(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-external").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-external", 0.0, "", 0, 60, "", nil).
@@ -542,7 +543,7 @@ func TestHeartbeatHandler_DBUpdateError(t *testing.T) {
 	// Expect prevTask SELECT
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-dberr").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	// Heartbeat UPDATE fails
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -578,7 +579,7 @@ func TestHeartbeatHandler_OnlineStaysOnline(t *testing.T) {
 	// Expect prevTask SELECT
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-stable").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	// Expect heartbeat UPDATE
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -626,7 +627,7 @@ func TestHeartbeatHandler_RuntimeWedged_FlipsOnlineToDegraded(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-wedged").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	// Heartbeat UPDATE — sample_error carries the wedge reason from the
 	// workspace's _runtime_state_payload() helper.
@@ -681,7 +682,7 @@ func TestHeartbeatHandler_DegradedRecoversOnlyAfterWedgeClears(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-still-wedged").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-still-wedged", 0.0, "still broken", 0, 800, "", nil).
@@ -727,7 +728,7 @@ func TestHeartbeatHandler_DegradedToOnline_AfterWedgeClears(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-recovered").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-recovered", 0.0, "", 0, 30, "", nil).
@@ -974,7 +975,7 @@ func TestHeartbeat_SkipsRemovedRows(t *testing.T) {
 	// prevTask lookup
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-zombie").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	// UPDATE must include `AND status != 'removed'`. 0 rows affected is fine —
 	// this is the tombstoned case the fix protects against.
@@ -1013,7 +1014,7 @@ func TestHeartbeatHandler_BackfillsAgentCard_WhenNull(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-nocard").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-nocard", 0.0, "", 0, 0, "", nil).
@@ -1053,7 +1054,7 @@ func TestHeartbeatHandler_SkipsAgentCardBackfill_WhenAlreadySet(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-hascard").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-hascard", 0.0, "", 0, 0, "", nil).
@@ -1098,7 +1099,7 @@ func TestHeartbeatHandler_BackfillAgentCard_ClearsRegisterFailure(t *testing.T) 
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-degraded-register-fail").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-degraded-register-fail", 0.0, "", 0, 0, "", nil).
@@ -1752,7 +1753,7 @@ func TestHeartbeat_MonthlySpend_WithinBounds(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-spend-ok").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	// Expect the 7-argument UPDATE (with monthly_spend = $7).
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -1788,7 +1789,7 @@ func TestHeartbeat_MonthlySpend_NegativeClamped(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-spend-neg").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	// Clamped to 0 → no monthly_spend field → 6-argument UPDATE.
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -1824,7 +1825,7 @@ func TestHeartbeat_MonthlySpend_OverflowClamped(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-spend-overflow").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	// Expect the 7-argument UPDATE with monthly_spend clamped to 1_000_000_000_000.
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -1860,7 +1861,7 @@ func TestHeartbeat_MonthlySpend_ExactCap(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-spend-cap").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-spend-cap", 0.0, "", 0, 0, "", int64(1_000_000_000_000), nil).
@@ -1895,7 +1896,7 @@ func TestHeartbeat_MonthlySpend_Zero_NoUpdate(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-spend-zero").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	// 6-argument UPDATE — monthly_spend NOT included.
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -2558,7 +2559,7 @@ func TestHeartbeatHandler_DeliversPlatformInboundSecret(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-with-secret").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-with-secret", 0.0, "", 0, 100, "", nil).
@@ -2613,7 +2614,7 @@ func TestHeartbeatHandler_LazyHealsPlatformInboundSecret(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-needs-heal").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-needs-heal", 0.0, "", 0, 100, "", nil).
@@ -2669,7 +2670,7 @@ func TestHeartbeatHandler_OmitsSecretOnHealFailure(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-heal-fails").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-heal-fails", 0.0, "", 0, 100, "", nil).
@@ -3034,7 +3035,7 @@ func TestHeartbeat_RecentRegisterFailure_DegradesWorkspace(t *testing.T) {
 	// prevTask SELECT
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-degrade-reg").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	// heartbeat UPDATE
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -3084,7 +3085,7 @@ func TestHeartbeat_RecentRegisterFailure_BlocksRecovery(t *testing.T) {
 	// prevTask SELECT
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-no-recover").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	// heartbeat UPDATE
 	mock.ExpectExec("UPDATE workspaces SET").

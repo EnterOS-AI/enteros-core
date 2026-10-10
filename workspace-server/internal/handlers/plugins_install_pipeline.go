@@ -269,7 +269,9 @@ func (h *PluginsHandler) resolveAndStage(ctx context.Context, req installRequest
 		}
 	}
 
-	stagedDir, err := os.MkdirTemp("", "molecule-plugin-fetch-*")
+	// h.stagingRoot is "" in production, which is exactly os.MkdirTemp's
+	// "use the system temp dir" contract — see WithStagingRoot.
+	stagedDir, err := os.MkdirTemp(h.stagingRoot, "molecule-plugin-fetch-*")
 	if err != nil {
 		return nil, newHTTPErr(http.StatusInternalServerError, gin.H{"error": "failed to create staging dir"})
 	}

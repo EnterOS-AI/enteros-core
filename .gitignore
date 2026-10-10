@@ -159,3 +159,8 @@ backups/
 /test-pmm-*.txt
 /tick-reflections-*.md
 tests/harness/cp-stub/cp-stub
+
+# Local harness/build scratch — produced by `make bundle-deps` and
+# tests/harness/dind.sh, never committed. Both were accidentally staged once.
+/.manifest-stripped.json
+tests/harness/.dind-certs-*/

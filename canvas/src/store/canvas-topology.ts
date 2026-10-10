@@ -574,6 +574,13 @@ export function buildNodesAndEdges(
         // A2A delivery mode (task #227). Absent on older ws-server builds
         // — leave undefined so the chat UI's "?? 'push'" fallback applies.
         deliveryMode: ws.delivery_mode,
+        // Greeting-first UI readiness. Server reports whether the first-boot
+        // greeting has landed (greeted). On reload this seeds the node so an
+        // already-greeted online workspace renders "ready" immediately instead
+        // of flashing "warming". Absent on older builds → undefined → treated as
+        // greeted (no warming). We only surface warming for a workspace the
+        // server explicitly reports as online-but-not-yet-greeted.
+        greeted: ws.greeted,
         compute: ws.compute,
         // Org-level platform agent ('platform') vs ordinary workspace. The map
         // view hides the platform root (it's the undeletable org anchor) via

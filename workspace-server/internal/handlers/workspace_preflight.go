@@ -3,6 +3,8 @@ package handlers
 import (
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -59,6 +61,101 @@ func missingRequiredEnv(configFiles map[string][]byte, envVars map[string]string
 		}
 	}
 	return missing
+}
+
+// provisionInjectedEnvPrefixes / provisionInjectedEnvKeys enumerate the env
+// names the provision pipeline assembles AFTER loadWorkspaceSecrets — model +
+// provider resolution (applyRuntimeModelEnv / applyPlatformManagedLLMEnv),
+// role + parent propagation, per-agent git identity + HTTP creds
+// (applyAgentGitIdentity / applyAgentGitHTTPCreds), the declared-plugin list,
+// and the external env-mutator chain (gh-identity, which contributes
+// role-derived attribution vars).
+//
+// The create boundary CANNOT see any of them: the workspace has no assembled
+// env yet. So a required_env entry in this set is UNDECIDABLE at create and is
+// excluded from the create-time gate — the provision-time preflight
+// (missingRequiredEnv over the fully assembled env) remains the authority for
+// those, exactly as before. Everything else must come from a secret at org
+// (global_secrets) or workspace (workspace_secrets) scope, both of which ARE
+// readable at create — that is the decidable class the gate covers, and the
+// class the reno-stars TENANT_* refusal fell into (molecule-core#5035).
+//
+// Prefixes, not just exact names, because the mutator chain is plugin-supplied
+// and its exact key set is not knowable from this repo. Erring toward "the
+// platform might supply it" keeps the gate from 422-ing a create that would
+// have succeeded; the cost of a miss is only that the refusal happens at
+// provision time instead of at POST — which, with #5035's read fix, is now
+// visible either way.
+var provisionInjectedEnvPrefixes = []string{
+	"MOLECULE_",
+	"GIT_",
+	"GITHUB_",
+	"GITEA_",
+	"GH_",
+	"ANTHROPIC_",
+	"OPENAI_",
+	"CLAUDE_",
+}
+
+var provisionInjectedEnvKeys = map[string]struct{}{
+	"MODEL":                {},
+	"MODEL_PROVIDER":       {},
+	"LLM_PROVIDER":         {},
+	"HERMES_DEFAULT_MODEL": {},
+	"PARENT_ID":            {},
+	"TZ":                   {},
+}
+
+// isProvisionInjectedEnv reports whether the provision pipeline may set `name`
+// itself, making its absence at the create boundary uninformative.
+func isProvisionInjectedEnv(name string) bool {
+	if _, ok := provisionInjectedEnvKeys[name]; ok {
+		return true
+	}
+	for _, p := range provisionInjectedEnvPrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// createBoundaryMissingRequiredEnv returns the required_env entries that a
+// POST /workspaces can already prove will not be satisfiable — i.e. the ones
+// missing from the org/workspace secret env AND that no provision-time
+// injector can supply (see isProvisionInjectedEnv).
+//
+// molecule-core#5035: without this, a create whose template declares
+// unsatisfiable required_env returned 201 Created and the refusal landed ~2
+// seconds LATER inside the provision goroutine, as a `failed` row. The caller
+// was told nothing. This is the same check (missingRequiredEnv) against the
+// same config source, moved to the boundary where the caller can still act on
+// it.
+//
+// Fails OPEN in every ambiguous case — no config.yaml in the delivered files
+// and none on disk at templatePath → nil. The provision-time preflight is
+// unchanged and remains the backstop.
+func createBoundaryMissingRequiredEnv(configFiles map[string][]byte, templatePath string, envVars map[string]string) []string {
+	src := configFiles
+	if _, ok := src["config.yaml"]; !ok {
+		src = nil
+	}
+	if src == nil && templatePath != "" {
+		if b, err := os.ReadFile(filepath.Join(templatePath, "config.yaml")); err == nil {
+			src = map[string][]byte{"config.yaml": b}
+		}
+	}
+	if src == nil {
+		return nil
+	}
+	var decidable []string
+	for _, name := range missingRequiredEnv(src, envVars) {
+		if isProvisionInjectedEnv(name) {
+			continue
+		}
+		decidable = append(decidable, name)
+	}
+	return decidable
 }
 
 // formatMissingEnvError builds the user-facing message for a provision

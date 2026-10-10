@@ -97,7 +97,7 @@ func TestConciergeDefaultSchedules_SelfHostDeliversBothWithToolRefs(t *testing.T
 		"runtime: hermes\n"+conciergeRealDefaultSchedulesBlock)
 	h := &WorkspaceHandler{configsDir: dir}
 
-	composed, err := h.composeConciergeRuntimeConfig("hermes")
+	composed, err := h.composeConciergeRuntimeConfig("hermes", "Acme Concierge")
 	if err != nil {
 		t.Fatalf("composeConciergeRuntimeConfig error: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestConciergeDefaultSchedules_SaaSSeedsNeither(t *testing.T) {
 		"runtime: hermes\n"+conciergeRealDefaultSchedulesBlock)
 	h := &WorkspaceHandler{configsDir: dir}
 
-	composed, err := h.composeConciergeRuntimeConfig("hermes")
+	composed, err := h.composeConciergeRuntimeConfig("hermes", "Acme Concierge")
 	if err != nil {
 		t.Fatalf("composeConciergeRuntimeConfig error: %v", err)
 	}

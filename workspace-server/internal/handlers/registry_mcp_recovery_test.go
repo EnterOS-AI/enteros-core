@@ -38,7 +38,7 @@ func TestHeartbeatHandler_PlatformMCPMissing_FiresRecoveryReconcile(t *testing.T
 	// deadlock-break fire can fire here).
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-mcp-fail").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	// Main heartbeat UPDATE.
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -106,7 +106,7 @@ func TestHeartbeatHandler_PlatformModelMissing_DoesNotFireReconcile(t *testing.T
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-model-fail").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-model-fail", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -208,7 +208,7 @@ func TestHeartbeatHandler_PlatformMCPPresentButEmptyTools_FiresRecoveryReconcile
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-mcp-empty-tools").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-mcp-empty-tools", 0.0, "", 0, 60, "", nil).

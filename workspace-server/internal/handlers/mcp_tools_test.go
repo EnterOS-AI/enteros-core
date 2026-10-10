@@ -75,6 +75,45 @@ func TestExtractA2AText_TaskStatusMessageText(t *testing.T) {
 	}
 }
 
+// The full A2A shape matrix is owned + exhaustively tested by internal/a2aresp
+// (see a2aresp.TestText_ShapeMatrix / TestFiles_ShapeMatrix). extractA2AText is
+// now a thin wrapper over a2aresp.Text, so this pins only the wrapper's ADDED
+// contract: the "[error]" prefix and the raw-JSON diagnostic fallback that
+// check_task_status and greetingTextFromReply depend on.
+func TestExtractA2AText_WrapperContract(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"delegates a bare-message greeting to a2aresp.Text",
+			`{"jsonrpc":"2.0","result":{"kind":"message","parts":[{"kind":"text","text":"Hey there"}]}}`, "Hey there"},
+		{"a2a error surfaces with [error] prefix",
+			`{"error":{"message":"workspace not found"}}`, "[error] workspace not found"},
+		{"no text part falls back to raw result JSON (not empty)",
+			`{"result":{"kind":"task","status":{"state":"working"}}}`, `{"kind":"task","status":{"state":"working"}}`},
+		{"invalid json returns raw body",
+			`not json`, `not json`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := extractA2AText([]byte(tc.body)); got != tc.want {
+				t.Errorf("%s\n  got  %q\n  want %q", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestGreetingTextFromReply_BareMessage locks the END-TO-END greeting gate for
+// the exact live 2026-07-26 shape: the bare A2A Message must be accepted as the
+// greeting (not rejected as a raw-JSON envelope and degraded to the fallback).
+func TestGreetingTextFromReply_BareMessage(t *testing.T) {
+	body := []byte(`{"jsonrpc":"2.0","id":"b0953329","result":{"kind":"message","messageId":"1e5add40","parts":[{"kind":"text","text":"Hey there — I'm your Org Concierge."}]}}`)
+	if got := greetingTextFromReply(body); got != "Hey there — I'm your Org Concierge." {
+		t.Errorf("greetingTextFromReply dropped a valid bare-message greeting → fallback would ship\n  got %q", got)
+	}
+}
+
 func TestExtractA2AText_ArtifactsText(t *testing.T) {
 	body, _ := json.Marshal(map[string]interface{}{
 		"result": map[string]interface{}{
@@ -193,24 +232,24 @@ func TestExtractA2AText_FallbackMarshalsResult(t *testing.T) {
 	}
 }
 
-func TestExtractA2AText_PriorityArtifactsOverMessage(t *testing.T) {
-	// Both artifacts and message present → artifacts takes priority (checked first).
+func TestExtractA2AText_ArtifactsPrecedence(t *testing.T) {
+	// extractA2AText extracts the reply via a2aresp.Text, which uses SHAPE
+	// PRECEDENCE (the first shape that yields text wins — no cross-shape gluing),
+	// so a {message, artifacts} response returns the artifacts text: artifacts
+	// precede message in the precedence order (parts → artifacts →
+	// status.message → message).
 	body, _ := json.Marshal(map[string]interface{}{
 		"result": map[string]interface{}{
 			"artifacts": []interface{}{
 				map[string]interface{}{
 					"parts": []interface{}{
-						map[string]interface{}{
-							"text": "from artifacts",
-						},
+						map[string]interface{}{"text": "from artifacts"},
 					},
 				},
 			},
 			"message": map[string]interface{}{
 				"parts": []interface{}{
-					map[string]interface{}{
-						"text": "from message",
-					},
+					map[string]interface{}{"text": "from message"},
 				},
 			},
 		},
@@ -218,7 +257,7 @@ func TestExtractA2AText_PriorityArtifactsOverMessage(t *testing.T) {
 	got := extractA2AText(body)
 	want := "from artifacts"
 	if got != want {
-		t.Errorf("artifacts should take priority: got %q, want %q", got, want)
+		t.Errorf("artifacts precedence: got %q, want %q", got, want)
 	}
 }
 

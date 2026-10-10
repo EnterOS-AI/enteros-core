@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/a2aresp"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 )
@@ -643,42 +644,11 @@ func (m *Manager) extractReplyText(respBody []byte, statusCode int) string {
 	if statusCode < 200 || statusCode >= 300 {
 		return fmt.Sprintf("Error: agent returned HTTP %d", statusCode)
 	}
-
-	var resp map[string]interface{}
-	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return ""
-	}
-
-	// Try result.parts[].text (standard A2A response)
-	if result, ok := resp["result"].(map[string]interface{}); ok {
-		if parts, ok := result["parts"].([]interface{}); ok {
-			for _, p := range parts {
-				if part, ok := p.(map[string]interface{}); ok {
-					if text, ok := part["text"].(string); ok {
-						return text
-					}
-				}
-			}
-		}
-		// Try result.artifacts[].parts[].text
-		if artifacts, ok := result["artifacts"].([]interface{}); ok {
-			for _, a := range artifacts {
-				if artifact, ok := a.(map[string]interface{}); ok {
-					if parts, ok := artifact["parts"].([]interface{}); ok {
-						for _, p := range parts {
-							if part, ok := p.(map[string]interface{}); ok {
-								if text, ok := part["text"].(string); ok {
-									return text
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	return ""
+	// Delegate to the a2aresp SSOT for the full shape matrix. This copy
+	// previously handled only result.parts + result.artifacts and DROPPED the
+	// task status.message and nested message shapes — the same drift class that
+	// silently dropped the concierge greeting on the handlers path.
+	return a2aresp.Text(respBody)
 }
 
 func (m *Manager) loadHistory(ctx context.Context, key string) []map[string]string {

@@ -77,6 +77,20 @@ func delegationCorrelationJSON(delegationID string) string {
 // terminalization itself — a row stuck in-flight forever is worse than a
 // missing notification, and the sweeper will not revisit a terminal row.
 func emitTerminalDelegationReply(ctx context.Context, callerID, calleeID, delegationID, status, errorDetail string) (replyWriteFailed bool) {
+	return emitTerminalDelegationReplyWithResult(ctx, callerID, calleeID, delegationID,
+		status, errorDetail, "")
+}
+
+// emitTerminalDelegationReplyWithResult is emitTerminalDelegationReply plus the
+// target's ANSWER (#4338).
+//
+// The sweeper and the MCP failure path have no result to report, so they keep the
+// wrapper above. The async MCP COMPLETION path does: delegate_task_async does not
+// block, so this inbox row is not merely a notification that the delegation ended —
+// it is the only place the caller's agent ever receives the thing it delegated for.
+// Sending "Delegation completed" with an empty body would tell the agent its work is
+// done and withhold the work.
+func emitTerminalDelegationReplyWithResult(ctx context.Context, callerID, calleeID, delegationID, status, errorDetail, resultPreview string) (replyWriteFailed bool) {
 	// NO-OP BY CONSTRUCTION WHILE THE LEDGER IS DARK.
 	//
 	// The sweeper is started UNCONDITIONALLY (cmd/server/main.go) — it is not
@@ -116,7 +130,7 @@ func emitTerminalDelegationReply(ctx context.Context, callerID, calleeID, delega
 	// The inbox push runs even if the ledger row failed — a missing dashboard row
 	// is not a reason to also deny the agent its notification. Its failure counts
 	// too: it is the write the agent actually reads.
-	if pushDelegationResultToInbox(ctx, callerID, calleeID, delegationID, status, "", errorDetail) {
+	if pushDelegationResultToInbox(ctx, callerID, calleeID, delegationID, status, resultPreview, errorDetail) {
 		replyWriteFailed = true
 	}
 	return replyWriteFailed
@@ -810,7 +824,7 @@ handleSuccess:
 	// queued JSON is the agent's reply. Fixes the chat-leak where the
 	// LLM echoed "Delegation completed (workspace agent busy ...)" to
 	// the user.
-	if status == http.StatusAccepted && isQueuedProxyResponse(respBody) {
+	if queued, _ := QueuedA2AResponse(respBody); status == http.StatusAccepted && queued {
 		log.Printf("Delegation %s: target %s busy — queued for drain", delegationID, targetID)
 		// activity_logs ONLY — deliberately not the ledger.
 		//
@@ -1452,21 +1466,6 @@ func isDeliveryConfirmedSuccess(proxyErr *proxyA2AError, status int, respBody []
 		return false
 	}
 	return true
-}
-
-// isQueuedProxyResponse reports whether the proxy returned a body shaped like
-// `{"queued": true, "queue_id": ..., "queue_depth": ..., "message": ...}` —
-// the busy-target enqueue path in a2a_proxy_helpers.go. Caller checks this
-// alongside HTTP 202 to distinguish a successful agent reply from a deferred
-// dispatch; without the distinction we'd write the queued-message JSON into
-// the delegation result row and the LLM would surface it as agent output.
-func isQueuedProxyResponse(body []byte) bool {
-	var resp map[string]interface{}
-	if json.Unmarshal(body, &resp) != nil {
-		return false
-	}
-	queued, _ := resp["queued"].(bool)
-	return queued
 }
 
 func extractResponseText(body []byte) string {

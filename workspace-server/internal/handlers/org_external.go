@@ -50,10 +50,24 @@ const (
 	// fetch. Composition that genuinely needs >4 layers is a smell.
 	maxExternalDepth = 4
 
-	// externalCacheDirName is the per-template cache subdir under rootDir.
-	// Content-addressable: keyed by (repo, sha). Operators add this to
+	// externalCacheDirName is the per-template cache subdir under the cache
+	// root. Content-addressable: keyed by (repo, sha). Operators add this to
 	// .gitignore — cache is platform-mutated, not source-tracked.
 	externalCacheDirName = ".external-cache"
+
+	// externalCacheDirEnv relocates the `!external` cache off the template
+	// tree entirely.
+	//
+	// By default the cache lands under <rootDir>/.external-cache — and rootDir
+	// is /org-templates, which is COPIED INTO THE IMAGE. Writing platform-
+	// mutated state into a baked, read-only tree is why core#4889 had to
+	// `--chown=platform:platform /org-templates` just to make an org template
+	// importable: chowning an immutable tree is the symptom, not the cure.
+	//
+	// Point this at any writable path (a volume, CONFIGS_DIR, a tmpfs) and the
+	// image tree stays untouched. The cache is content-addressable and fully
+	// disposable — losing it costs one re-fetch.
+	externalCacheDirEnv = "MOLECULE_EXTERNAL_CACHE_DIR"
 
 	// gitFetchTimeout caps a single clone operation. Conservative —
 	// org template fetches are typically <100KB.
@@ -306,11 +320,25 @@ type gitFetcher struct{}
 // as partially-written and re-fetched.
 const cacheCompleteMarker = ".complete"
 
+// externalCacheBase returns the directory the `!external` cache lives under.
+//
+// MOLECULE_EXTERNAL_CACHE_DIR wins when set; otherwise the historical
+// <rootDir>/.external-cache is used, so behaviour is unchanged for anyone who
+// does not set it. The env value is used as given — an operator pointing this
+// somewhere is making a deliberate deployment choice, unlike the untrusted
+// YAML paths elsewhere in this file.
+func externalCacheBase(rootDir string) string {
+	if dir := strings.TrimSpace(os.Getenv(externalCacheDirEnv)); dir != "" {
+		return dir
+	}
+	return filepath.Join(rootDir, externalCacheDirName)
+}
+
 // Fetch resolves ref → SHA via `git ls-remote`, then `git clone --depth=1`
 // if the cache dir is missing or incomplete. Auth via MOLECULE_GITEA_TOKEN
 // injected via http.extraHeader (never via URL).
 func (g *gitFetcher) Fetch(ctx context.Context, rootDir, host, repoPath, ref string) (string, string, error) {
-	cacheRoot := filepath.Join(rootDir, externalCacheDirName, safeRepoCacheDir(host, repoPath))
+	cacheRoot := filepath.Join(externalCacheBase(rootDir), safeRepoCacheDir(host, repoPath))
 	if err := os.MkdirAll(cacheRoot, 0o755); err != nil {
 		return "", "", fmt.Errorf("mkdir cache root: %w", err)
 	}

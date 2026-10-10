@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, type KeyboardEvent } from "react";
+import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
 import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
 import { getConfigurationError, getConfigurationStatus } from "@/store/canvas-topology";
@@ -10,6 +10,12 @@ import { STATUS_CONFIG, TIER_CONFIG } from "@/lib/design-tokens";
 import { useOrgDeployState } from "@/components/canvas/useOrgDeployState";
 import { OrgCancelButton } from "@/components/canvas/OrgCancelButton";
 import { isExternalLikeRuntime } from "@/lib/externalRuntimes";
+
+/** How long a freshly-online workspace may render the "warming / composing
+ *  greeting" state before the UI falls back to "ready". Bounds the greeting-
+ *  first hint so a workspace whose greeting never lands (greeting disabled,
+ *  agent error, missed AGENT_MESSAGE) never pulses forever. Cosmetic-only. */
+const WARMING_FALLBACK_MS = 12_000;
 
 /** Descendant count for the "N sub" badge — children are first-class nodes
  *  rendered as full cards inside this one via React Flow's native parentId,
@@ -56,7 +62,35 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
     data.status === "online" &&
     getConfigurationStatus(data.agentCard) === "not_configured";
   const configurationError = getConfigurationError(data.agentCard);
-  const effectiveStatus = isMisconfigured ? "not_configured" : data.status;
+
+  // Greeting-first UI readiness (decoupled from serving status). The workspace
+  // flips to status="online" robustly (it IS serving), but until its first-boot
+  // greeting lands we render a "warming / composing greeting" state instead of
+  // full "ready" — so "online" never claims ready before the agent has spoken.
+  // greeted is set live by the AGENT_MESSAGE handler and hydrated from GET
+  // /workspaces on reload. A per-node fallback timer clears warming so a
+  // workspace whose greeting never lands (greeting disabled, agent error) still
+  // settles to ready rather than pulsing forever. Misconfigured wins (an
+  // actionable error beats a transient warming hint). Absent greeted (older
+  // builds) is treated as greeted — no warming.
+  const shouldWarm =
+    data.status === "online" && data.greeted === false && !isMisconfigured;
+  const [warmTimedOut, setWarmTimedOut] = useState(false);
+  useEffect(() => {
+    if (!shouldWarm) {
+      setWarmTimedOut(false);
+      return;
+    }
+    const t = window.setTimeout(() => setWarmTimedOut(true), WARMING_FALLBACK_MS);
+    return () => window.clearTimeout(t);
+  }, [shouldWarm]);
+  const isWarming = shouldWarm && !warmTimedOut;
+
+  const effectiveStatus = isMisconfigured
+    ? "not_configured"
+    : isWarming
+      ? "warming"
+      : data.status;
   const statusCfg = STATUS_CONFIG[effectiveStatus] || STATUS_CONFIG.offline;
   const tierCfg = TIER_CONFIG[data.tier] || { label: `T${data.tier}`, color: "text-ink-mid bg-surface-card border border-line" };
   const tooltipExtra = isMisconfigured && configurationError
@@ -112,7 +146,9 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
       aria-label={
         isMisconfigured && configurationError
           ? `${data.name} workspace — agent not configured: ${configurationError}`
-          : `${data.name} workspace — ${data.status}`
+          : isWarming
+            ? `${data.name} workspace — online, composing greeting`
+            : `${data.name} workspace — ${data.status}`
       }
       title={isMisconfigured && configurationError ? `Agent not configured: ${configurationError}` : undefined}
       aria-pressed={isSelected}

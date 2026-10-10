@@ -83,12 +83,19 @@ concurrency:
   # unconvergeable (a ghost can red a genuine pass) and, at volume, serialized
   # every open PR into a multi-hour backlog on one slot.
   #
-  # cancel-in-progress is now safe (it was not before): a superseded run's
-  # entire topology is one `docker rm -fv` of its dind, so a cancel cannot
-  # leak a half-torn-down namespace. A new push supersedes its own older run
-  # instead of queueing behind it (the RFC's finding-#2 shape).
+  # cancel-in-progress is FALSE, as in harness-replays.yml and
+  # template-delivery-e2e.yml. It was true, on the claim that a cancel cannot
+  # leak because the run's topology is one `docker rm -fv` of its dind. It did
+  # leak: that rm is the `if: always()` "Teardown dind" step, and the deployed
+  # act_runner skips always() steps on a cancelled job. Every superseded run's
+  # dind kept running until the host's harness-reaper `docker rm -f`'d it ~2h
+  # later — no -v — stranding its ~8 GB /var/lib/docker volume (~1 TB on one
+  # runner host; 189 of 190 reaped dinds were cancelled runs). dind.sh now also
+  # reaps a dind whose job container is gone, but nothing here cancels a run in
+  # the first place: a newer push queues behind its own PR's run. Keying stays
+  # per-PR, so the cross-PR queue #4122 removed does not come back.
   group: e2e-ephemeral-happy-path-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
@@ -111,7 +118,7 @@ env:
   # TO BUMP: `git ls-remote https://git.moleculesai.app/molecule-ai/molecule-controlplane.git refs/heads/main`
   # and paste the SHA here, in its own PR, so the CP change is reviewed as what it
   # is — a change to what gates core.
-  CP_EPHEMERAL_REF: f6457ba5e2ef958b3815860fb728d14d488d77c8
+  CP_EPHEMERAL_REF: 17b6988c37e63bc50a34fc916b97407c54c0f7d4
 
 jobs:
   # Emits no context listed in required-contexts.txt — but it DOES post
@@ -206,7 +213,8 @@ jobs:
       # Per-job DISPOSABLE dind (tests/harness/dind.sh — the harness-replays
       # pattern, task#78): the WHOLE topology (PG, CP, tenants, workspaces,
       # image builds) lives inside a nested daemon and dies with one atomic
-      # `docker rm -fv`, even on cancel. This is the structural fix for the
+      # `docker rm -fv` (the Teardown step, or on cancel the dind's own owner
+      # watchdog). This is the structural fix for the
       # shared docker-host interference that killed the gate's first CI runs
       # (host-loopback docker-proxy dying mid-run with every container healthy;
       # mc#4081) AND for cross-run tenant leaks (an early `down` implementation
@@ -404,16 +412,35 @@ jobs:
           # GREEN. Listing them here fails THIS gate on their failure regardless of the
           # soak; external_runtime + reconciler_heals_terminated stay advisory (not yet
           # reliable — separate promotion once soaked green).
-          E2E_EPHEMERAL_EXTRA_GATING: peer_visibility,concierge_creates_workspace
+          #
+          # concierge_platform_agent GRADUATED: it asserts the platform-agent install
+          # + identity + kind + discovery-peers authz, and has run on EVERY PR under the
+          # ADVISORY soak — so a regression to the concierge lane merged GREEN. That is
+          # exactly what happened: a concierge shipped with NO persona (its config
+          # declared prompt_files: [prompts/concierge.md] while the file was never
+          # materialized) and nothing pre-merge could block it.
+          #
+          # COVERAGE THIS STILL DOES NOT GIVE: this scenario is DB/handler state —
+          # "no boot". It never starts a runtime, builds a system prompt, registers an
+          # MCP, or makes a model call. The present+CALLABLE half
+          # (TestPlatformAgentMgmtMCP_Staging — a real concierge boot driven over A2A to
+          # actually RUN provision_workspace) still runs ONLY post-merge in
+          # staging-tenant-cd, because the real-runtime matrix it needs
+          # (E2E_EPHEMERAL_REAL_RUNTIME_MATRIX) is referenced in comments but was never
+          # implemented. Until it is, a concierge that boots without an identity can
+          # STILL merge green. Pinned by test_concierge_lane_is_merge_blocking.py.
+          E2E_EPHEMERAL_EXTRA_GATING: peer_visibility,concierge_creates_workspace,concierge_platform_agent
         run: |
           bash tests/e2e/ephemeral_cp_happy_path.sh
           echo "GATE_ARM=proof" >> "$GITHUB_ENV"
 
-      # Atomic teardown: one rm destroys the entire nested topology (CP, PG,
-      # tenants, workspaces, volumes, networks, built images) — even after a
-      # cancel that skipped every other cleanup. Leaks structurally impossible.
+      # Atomic teardown: one `docker rm -fv` destroys the entire nested topology
+      # (CP, PG, tenants, workspaces, volumes, networks, built images). A
+      # cancelled job never reaches this step (act_runner skips always() steps
+      # on cancel); that dind reaps itself — and its volume — via dind.sh's
+      # owner watchdog once this job's container is gone.
       - name: Teardown dind
-        # always() so a cancelled/failed run still reaps its dind — but gated on
+        # always() so a failed run still reaps its dind — but gated on
         # the same non-fork condition as the start step (an ungated always()
         # step on the fork no-op path was exactly the template-delivery chdir
         # failure, core#4057).
@@ -469,7 +496,7 @@ jobs:
           set -euo pipefail
           ARM="${GATE_ARM:-}"
           if [ -z "$ARM" ]; then
-            echo "::error::NO ARM RAN. Every step in this job skipped, so the job would have posted SUCCESS on a REQUIRED context having proved nothing. Some `if:` condition is wrong — the gate did not run, and it did not honestly no-op either."
+            echo "::error::NO ARM RAN. Every step in this job skipped, so the job would have posted SUCCESS on a REQUIRED context having proved nothing. Some 'if:' condition is wrong — the gate did not run, and it did not honestly no-op either."
             exit 1
           fi
           echo "arm=$ARM"

@@ -75,6 +75,15 @@ func (r *recordingCPProv) StopAndPrune(_ context.Context, _ string) error {
 	panic("recordingCPProv.StopAndPrune not expected in concurrent-repro test")
 }
 
+// EnsureImage satisfies the core#5019 pull-before-stop seam. These stubs
+// predate it; answering "ready" keeps their pre-#5019 behaviour EXACTLY
+// (the guard allows, the restart proceeds) so this stub carries no opinion
+// about the new branch. Tests that exercise the DECLINE path use
+// prewarmCPProv in workspace_restart_pull_before_stop_test.go.
+func (r *recordingCPProv) EnsureImage(_ context.Context, _ provisioner.EnsureImageRequest) (provisioner.EnsureImageResult, error) {
+	return provisioner.EnsureImageResult{Status: "ready"}, nil
+}
+
 func (r *recordingCPProv) GetConsoleOutput(_ context.Context, _ string) (string, error) {
 	panic("recordingCPProv.GetConsoleOutput not expected in concurrent-repro test")
 }

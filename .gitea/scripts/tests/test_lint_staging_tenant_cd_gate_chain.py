@@ -28,56 +28,55 @@ def write_workflow(tmp_path: Path, body: str) -> Path:
     return path
 
 
-def test_accepts_guarded_runtime_readiness_fleet_gate(tmp_path: Path):
-    workflow = write_workflow(
-        tmp_path,
-        """
-        jobs:
-          await-image:
-            steps:
-              - run: echo image ready
-          advance-pin:
-            needs: [await-image]
-            steps:
-              - run: bash scripts/deploy/advance-staging-tenant-pin.sh --tag staging-deadbee
-          redeploy-fleet:
-            needs: [advance-pin, await-image]
-            steps:
-              - run: bash scripts/deploy/redeploy-staging-fleet.sh --tag staging-deadbee
-          runtime-image-readiness:
-            needs: [advance-pin]
-            runs-on: local-deploy
-            timeout-minutes: 30
-            steps:
-              - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-              - run: bash scripts/deploy/require-local-deploy-daemon.sh
-              - env:
-                  CP_BASE_URL: https://staging-api.moleculesai.app
-                  INFISICAL_BASE: https://key.moleculesai.app
-                  INFISICAL_ENV: staging
-                  INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
-                  INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
-                  INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
-                run: bash scripts/deploy/prepare-staging-runtime-images.sh
-          e2e-smoke:
-            needs: [redeploy-fleet, runtime-image-readiness]
-            steps:
-              - run: echo "E2E_EXPECT_TENANT_BUILD_SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
-              - run: go test -tags staging_e2e ./internal/staginge2e/
-          rollback-pin:
-            needs: [advance-pin, redeploy-fleet, runtime-image-readiness, e2e-smoke]
+# ---------------------------------------------------------------------------
+# ran-sentinel fixtures
+# ---------------------------------------------------------------------------
+# The lint now also requires that every job whose `result` is consumed as a
+# verdict proves it ACTUALLY RAN (see scripts/deploy/ran-sentinel.sh). These
+# snippets are the minimum wiring a fixture needs to get PAST that rule, so the
+# pre-existing gate-shape assertions below still test what they were written to
+# test. Behaviour of the sentinel itself is proven by executing the real step
+# bodies in .gitea/scripts/tests/test_ran_sentinel.py.
+SENTINEL_OUTPUTS = """            outputs:
+              ran_begin: ${{ steps.ran_begin.outputs.token }}
+              ran_end: ${{ steps.ran_end.outputs.token }}
+"""
+SENTINEL_BEGIN = """              - id: ran_begin
+                run: echo begin
+"""
+SENTINEL_END = """              - id: ran_end
+                if: always()
+                run: echo end
+"""
+ROLLBACK_AUDIT_JOB = """          rollback-audit:
+            needs: [advance-pin, redeploy-fleet, runtime-image-readiness, e2e-smoke, rollback-pin]
             if: always()
             steps:
-              - run: |
-                  bash scripts/deploy/advance-staging-tenant-pin.sh --image "$OLD_IMAGE"
-                  bash scripts/deploy/redeploy-staging-fleet.sh --image "$OLD_IMAGE"
-        """,
-    )
+              - env:
+                  B: ${{ needs.rollback-pin.outputs.ran_begin }}
+                  E: ${{ needs.rollback-pin.outputs.ran_end }}
+                run: echo audit
+"""
+ROLLBACK_SENTINEL_READS = """              - env:
+                  REDEPLOY_BEGIN: ${{ needs.redeploy-fleet.outputs.ran_begin }}
+                  REDEPLOY_END: ${{ needs.redeploy-fleet.outputs.ran_end }}
+                  READINESS_BEGIN: ${{ needs.runtime-image-readiness.outputs.ran_begin }}
+                  READINESS_END: ${{ needs.runtime-image-readiness.outputs.ran_end }}
+                  E2E_BEGIN: ${{ needs.e2e-smoke.outputs.ran_begin }}
+                  E2E_END: ${{ needs.e2e-smoke.outputs.ran_end }}
+                run: . scripts/deploy/ran-sentinel.sh
+"""
+
+
+def test_accepts_guarded_runtime_readiness_fleet_gate(tmp_path: Path):
+    """The full canonical shape, including the ran-sentinel wiring, passes."""
+    workflow = write_workflow(tmp_path, readiness_workflow())
 
     result = run_lint(workflow)
 
     assert result.returncode == 0, result.stdout
     assert "no CP deploy/reload path" in result.stdout
+    assert "ran-sentinel" in result.stdout
 
 
 def test_rejects_railway_reload_in_staging_tenant_ci(tmp_path: Path):
@@ -206,14 +205,14 @@ def readiness_workflow(*, runner="local-deploy", action=None, rollback_readiness
               - run: echo pin
           redeploy-fleet:
             needs: [advance-pin]
-            steps:
-              - run: echo roll
-          runtime-image-readiness:
+{SENTINEL_OUTPUTS}            steps:
+{SENTINEL_BEGIN}              - run: echo roll
+{SENTINEL_END}          runtime-image-readiness:
             needs: [advance-pin]
             runs-on: {runner}
             timeout-minutes: 30
-            steps:
-              - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+{SENTINEL_OUTPUTS}            steps:
+{SENTINEL_BEGIN}              - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
               - run: bash scripts/deploy/require-local-deploy-daemon.sh
               - env:
                   CP_BASE_URL: https://staging-api.moleculesai.app
@@ -223,17 +222,16 @@ def readiness_workflow(*, runner="local-deploy", action=None, rollback_readiness
                   INFISICAL_CLIENT_SECRET: ${{{{ secrets.INFISICAL_CI_CLIENT_SECRET }}}}
                   INFISICAL_PROJECT_ID: ${{{{ secrets.INFISICAL_CI_PROJECT_ID }}}}
                 run: {action}
-          e2e-smoke:
+{SENTINEL_END}          e2e-smoke:
             needs: [redeploy-fleet, runtime-image-readiness]
-            steps:
-              - run: echo "E2E_EXPECT_TENANT_BUILD_SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
+{SENTINEL_OUTPUTS}            steps:
+{SENTINEL_BEGIN}              - run: echo "E2E_EXPECT_TENANT_BUILD_SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
               - run: go test -tags staging_e2e ./internal/staginge2e/
-          rollback-pin:
+{SENTINEL_END}          rollback-pin:
             needs: [{rollback_needs}]
             if: always()
-            steps:
-              - run: echo rollback
-    """
+{SENTINEL_OUTPUTS}            steps:
+{SENTINEL_BEGIN}{ROLLBACK_SENTINEL_READS}{SENTINEL_END}{ROLLBACK_AUDIT_JOB}    """
 
 
 def test_requires_runtime_image_readiness_before_e2e(tmp_path: Path):
@@ -444,3 +442,127 @@ def test_await_image_cannot_mask_failure(tmp_path: Path):
 
     assert result.returncode == 1
     assert "`await-image` has a continue-on-error key" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# ran-sentinel structural rules
+# ---------------------------------------------------------------------------
+# These prove the new rules can FAIL. The lint is only the structural half —
+# that the wiring exists and cannot be quietly deleted or defanged. The
+# BEHAVIOUR (a missing sentinel suppresses the rollback, reports loudly, and is
+# non-vacuous on an empty token) is proven by executing the real step bodies in
+# .gitea/scripts/tests/test_ran_sentinel.py.
+
+
+def test_rejects_a_job_with_no_begin_marker(tmp_path: Path):
+    body = readiness_workflow().replace(
+        "              - id: ran_begin\n                run: echo begin\n"
+        '              - run: echo "E2E_EXPECT_TENANT_BUILD_SHA=$GITHUB_SHA"',
+        '              - run: echo "E2E_EXPECT_TENANT_BUILD_SHA=$GITHUB_SHA"',
+    )
+    result = run_lint(write_workflow(tmp_path, body))
+
+    assert result.returncode == 1, result.stdout
+    assert "ran-sentinel BEGIN" in result.stdout
+    assert "e2e-smoke" in result.stdout
+
+
+def test_rejects_a_begin_marker_that_is_not_the_first_step(tmp_path: Path):
+    """A step ahead of BEGIN could fail and forge a phantom."""
+    body = readiness_workflow().replace(
+        "              - id: ran_begin\n"
+        "                run: echo begin\n"
+        "              - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+        "              - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd\n"
+        "              - id: ran_begin\n"
+        "                run: echo begin",
+    )
+    result = run_lint(write_workflow(tmp_path, body))
+
+    assert result.returncode == 1, result.stdout
+    assert "FIRST step" in result.stdout
+
+
+def test_rejects_a_conditional_begin_marker(tmp_path: Path):
+    """A false `if:` on BEGIN would forge a phantom on demand."""
+    body = readiness_workflow().replace(
+        "              - id: ran_begin\n                run: echo begin\n",
+        "              - id: ran_begin\n"
+        "                if: github.event_name == 'never'\n"
+        "                run: echo begin\n",
+        1,
+    )
+    result = run_lint(write_workflow(tmp_path, body))
+
+    assert result.returncode == 1, result.stdout
+    assert "unconditional" in result.stdout
+
+
+def test_rejects_an_end_marker_that_is_not_always(tmp_path: Path):
+    """Without always(), a genuine FAILURE emits no END and looks like a phantom.
+
+    That is the one direction the design may not take: it would SUPPRESS a
+    rollback that is genuinely owed.
+    """
+    body = readiness_workflow().replace(
+        "              - id: ran_end\n                if: always()\n",
+        "              - id: ran_end\n                if: success()\n",
+        1,
+    )
+    result = run_lint(write_workflow(tmp_path, body))
+
+    assert result.returncode == 1, result.stdout
+    assert "always()" in result.stdout
+    assert "SUPPRESSES" in result.stdout
+
+
+def test_rejects_a_sentinel_no_consumer_can_read(tmp_path: Path):
+    body = readiness_workflow().replace(SENTINEL_OUTPUTS, "", 1)
+    result = run_lint(write_workflow(tmp_path, body))
+
+    assert result.returncode == 1, result.stdout
+    assert "outputs:" in result.stdout
+
+
+def test_rejects_a_rollback_that_decides_from_result_alone(tmp_path: Path):
+    """The exact pre-sentinel shape: `result` consumed with no proof it ran."""
+    body = readiness_workflow().replace(ROLLBACK_SENTINEL_READS, "              - run: echo rollback\n", 1)
+    result = run_lint(write_workflow(tmp_path, body))
+
+    assert result.returncode == 1, result.stdout
+    assert "never reads" in result.stdout
+    assert "phantom-red" in result.stdout
+
+
+def test_rejects_a_rollback_that_reimplements_the_classifier(tmp_path: Path):
+    body = readiness_workflow().replace(
+        "                run: . scripts/deploy/ran-sentinel.sh\n",
+        "                run: echo rollback\n",
+        1,
+    )
+    result = run_lint(write_workflow(tmp_path, body))
+
+    assert result.returncode == 1, result.stdout
+    assert "ran-sentinel.sh" in result.stdout
+
+
+def test_rejects_removing_the_rollback_auditor(tmp_path: Path):
+    """rollback-pin's own sentinel needs a consumer or it proves nothing."""
+    body = readiness_workflow().replace(ROLLBACK_AUDIT_JOB, "", 1)
+    result = run_lint(write_workflow(tmp_path, body))
+
+    assert result.returncode == 1, result.stdout
+    assert "rollback-audit" in result.stdout
+    assert "885373" in result.stdout
+
+
+def test_rejects_an_auditor_that_audits_nothing(tmp_path: Path):
+    body = readiness_workflow().replace(
+        "                  B: ${{ needs.rollback-pin.outputs.ran_begin }}\n",
+        "                  B: unused\n",
+        1,
+    )
+    result = run_lint(write_workflow(tmp_path, body))
+
+    assert result.returncode == 1, result.stdout
+    assert "audit nothing" in result.stdout

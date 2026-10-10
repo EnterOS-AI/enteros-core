@@ -48,6 +48,15 @@ on:
       # that line back down into the parked half — touches ONLY this file, so
       # without this path the guard would not run on the very diff it guards.
       - '.gitea/required-contexts.txt'
+      # core#4977: test_check_onconflict_partial_index.py runs the ON CONFLICT /
+      # partial-index lint against the REAL workspace-server tree + migrations, so the
+      # mutation it exists to catch -- dropping a partial index's predicate from an ON
+      # CONFLICT clause, which Postgres rejects at RUNTIME while compiling, vetting and
+      # sqlmock-ing perfectly clean -- touches ONLY those paths. Without them the guard
+      # would not run on the very diff it guards, same reasoning as #4322/#4346 above.
+      # That exact bug shipped and reached a customer: every drift enqueue failed for
+      # the life of the feature and the queue sat empty. Suite is ~3s.
+      - 'workspace-server/**'
       # The marketplace SSOT test guards this public stub as well as its own
       # test file. A stub-only regression must therefore emit this gate.
       - 'docs/design/rfc-marketplace-delivery.md'
@@ -56,6 +65,9 @@ on:
       # test_deploy_comment_accuracy.py; changes to either harness must run it.
       - 'tests/e2e/test_staging_concierge_creates_workspace_e2e.sh'
       - 'tests/e2e/test_staging_full_saas.sh'
+      # test_dind_self_reaping.py drives the per-job dind harness; a PR editing only
+      # the harness must still run the guard that pins its self-reaping.
+      - 'tests/harness/dind.sh'
   pull_request:
     branches: [main, staging]
     paths:
@@ -77,6 +89,15 @@ on:
       # that line back down into the parked half — touches ONLY this file, so
       # without this path the guard would not run on the very diff it guards.
       - '.gitea/required-contexts.txt'
+      # core#4977: test_check_onconflict_partial_index.py runs the ON CONFLICT /
+      # partial-index lint against the REAL workspace-server tree + migrations, so the
+      # mutation it exists to catch -- dropping a partial index's predicate from an ON
+      # CONFLICT clause, which Postgres rejects at RUNTIME while compiling, vetting and
+      # sqlmock-ing perfectly clean -- touches ONLY those paths. Without them the guard
+      # would not run on the very diff it guards, same reasoning as #4322/#4346 above.
+      # That exact bug shipped and reached a customer: every drift enqueue failed for
+      # the life of the feature and the queue sat empty. Suite is ~3s.
+      - 'workspace-server/**'
       # The marketplace SSOT test guards this public stub as well as its own
       # test file. A stub-only regression must therefore emit this gate.
       - 'docs/design/rfc-marketplace-delivery.md'
@@ -85,6 +106,9 @@ on:
       # test_deploy_comment_accuracy.py; changes to either harness must run it.
       - 'tests/e2e/test_staging_concierge_creates_workspace_e2e.sh'
       - 'tests/e2e/test_staging_full_saas.sh'
+      # test_dind_self_reaping.py drives the per-job dind harness; a PR editing only
+      # the harness must still run the guard that pins its self-reaping.
+      - 'tests/harness/dind.sh'
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app

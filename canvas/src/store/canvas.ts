@@ -85,6 +85,16 @@ export { WORKSPACE_KIND } from "@/lib/workspace-kind";
 export interface WorkspaceNodeData extends Record<string, unknown> {
   name: string;
   status: string;
+  /** Greeting-first UI readiness (decoupled from serving status): true once the
+   *  agent's first-boot greeting has landed in chat. While status="online" but
+   *  greeted is false, the node renders a "warming up / composing greeting"
+   *  state instead of full "ready" — the workspace IS serving, it just hasn't
+   *  spoken yet. Set live by the AGENT_MESSAGE handler and, on reload, hydrated
+   *  from the GET /workspaces `greeted` field so an already-greeted workspace
+   *  doesn't flash warming. A per-node UI timeout also clears warming so a
+   *  workspace whose greeting never lands (greeting disabled, agent error) still
+   *  settles to ready. Absent on older builds → treat as greeted (no warming). */
+  greeted?: boolean;
   tier: number;
   agentCard: Record<string, unknown> | null;
   activeTasks: number;
@@ -356,9 +366,24 @@ interface CanvasState {
   batchRestart: () => Promise<void>;
   batchPause: () => Promise<void>;
   batchDelete: () => Promise<void>;
-  /** Agent-pushed messages keyed by workspace ID. ChatTab consumes and clears these. */
+  /** Agent-pushed messages keyed by workspace ID — a LIVE HAND-OFF to a mounted
+   *  chat view, NOT a durable mailbox. It buffers only for workspaces that
+   *  currently have a retained consumer, and it is discarded when the last one
+   *  releases. Anything delivered while no chat view is mounted is dropped on
+   *  purpose: the platform has already persisted it, so the next mount hydrates
+   *  it from GET /chat-history. A queue that outlives its consumer gets
+   *  re-rendered on remount ON TOP of the hydrated copy and the user sees the
+   *  message twice. */
   agentMessages: Record<string, Array<{ id: string; content: string; timestamp: string; messageId?: string; attachments?: Array<{ name: string; uri: string; mimeType?: string; size?: number }> }>>;
   consumeAgentMessages: (workspaceId: string) => Array<{ id: string; content: string; timestamp: string; messageId?: string; attachments?: Array<{ name: string; uri: string; mimeType?: string; size?: number }> }>;
+  /** Number of mounted chat views currently able to render live agent messages
+   *  for a workspace. Gates whether `agentMessages` buffers at all. */
+  agentMessageConsumers: Record<string, number>;
+  /** Register a mounted chat view as a live consumer for `workspaceId`. */
+  retainAgentMessages: (workspaceId: string) => void;
+  /** Unregister a chat view. When the LAST consumer for a workspace releases,
+   *  its pending queue is discarded — see `agentMessages`. */
+  releaseAgentMessages: (workspaceId: string) => void;
   /** WebSocket connection status — drives the live indicator in the Toolbar. */
   wsStatus: "connected" | "connecting" | "disconnected";
   setWsStatus: (status: "connected" | "connecting" | "disconnected") => void;
@@ -511,6 +536,32 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       set({ agentMessages: rest });
     }
     return msgs;
+  },
+  agentMessageConsumers: {},
+  retainAgentMessages: (workspaceId) => {
+    const { agentMessageConsumers } = get();
+    set({
+      agentMessageConsumers: {
+        ...agentMessageConsumers,
+        [workspaceId]: (agentMessageConsumers[workspaceId] ?? 0) + 1,
+      },
+    });
+  },
+  releaseAgentMessages: (workspaceId) => {
+    const { agentMessageConsumers, agentMessages } = get();
+    const remaining = (agentMessageConsumers[workspaceId] ?? 0) - 1;
+    if (remaining > 0) {
+      set({
+        agentMessageConsumers: { ...agentMessageConsumers, [workspaceId]: remaining },
+      });
+      return;
+    }
+    // Last consumer gone: drop the counter AND any queue it never drained.
+    // The queue is a live hand-off; an undrained one is a duplicate waiting to
+    // happen, because the next mount hydrates the same message from the DB.
+    const { [workspaceId]: _c, ...restConsumers } = agentMessageConsumers;
+    const { [workspaceId]: _m, ...restMessages } = agentMessages;
+    set({ agentMessageConsumers: restConsumers, agentMessages: restMessages });
   },
   setViewport: (v) => set({ viewport: v }),
   saveViewport: async (x, y, zoom) => {

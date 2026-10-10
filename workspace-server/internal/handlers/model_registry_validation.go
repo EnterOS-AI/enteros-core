@@ -96,8 +96,13 @@ func validateRegisteredModelForRuntime(runtime, model string) (bool, string) {
 // boot — a known provider in providers.yaml?"
 //
 // Live trigger (adk-demo Assistant, 2026-06-03): workspace config
-// `model=moonshot/kimi-k2.6` (claude-code) → adapter derives `provider=moonshot`
-// → `ValueError: provider=moonshot not in providers registry` at BOOT. The
+// `model=minimax/MiniMax-M2.7` (claude-code) → adapter derives a provider name
+// → `ValueError: provider=<name> not in providers registry` at BOOT. The
+// original 2026-06-03 report used `model=moonshot/kimi-k2.6` (→
+// `provider=moonshot`); that id was WITHDRAWN from every platform arm on
+// 2026-08-04 (sdk#203, suspended Moonshot vendor account) and now fails the
+// model-side check first, so the example is refreshed onto a currently-live
+// platform id to keep it reproducible. The structural class is unchanged. The
 // save was accepted (no validation at the API boundary), and the failure only
 // surfaced when the agent tried to register. CI never saw it. The drift gate
 // (RFC#580) validates TEMPLATES against the registry, NOT per-workspace
@@ -253,7 +258,13 @@ func validateBYOKCredentialSatisfiable(ctx context.Context, runtime, model strin
 		}
 	}
 	return false, fmt.Sprintf(
-		"model %q resolves to BYOK provider %q but no credential it accepts (%s) exists at workspace or org scope — the workspace would be created and then fail provisioning with MISSING_BYOK_CREDENTIAL. Add one of those secrets first, or pick a platform-billed model (the vendor/model slash form, e.g. moonshot/kimi-k2.6 — no key needed).",
+		// The example MUST name a model that is actually on a platform arm today,
+		// or this message sends the user straight into a 422. Refreshed
+		// 2026-08-04 off moonshot/kimi-k2.6, which sdk#203 withdrew when the
+		// platform's Moonshot vendor account was suspended; minimax/MiniMax-M2.7
+		// is the SSOT default (MOLECULE_LLM_DEFAULT_MODEL) and is on every
+		// runtime's platform arm.
+		"model %q resolves to BYOK provider %q but no credential it accepts (%s) exists at workspace or org scope — the workspace would be created and then fail provisioning with MISSING_BYOK_CREDENTIAL. Add one of those secrets first, or pick a platform-billed model (the vendor/model slash form, e.g. minimax/MiniMax-M2.7 — no key needed).",
 		model, prov.Name, strings.Join(prov.AuthEnv, ", "))
 }
 

@@ -53,9 +53,14 @@ function makeStore(
   edges: Edge[] = [],
   selectedNodeId: string | null = null,
   agentMessages: Record<string, Array<{ id: string; content: string; timestamp: string }>> = {},
-  liveAnnouncement = ""
+  liveAnnouncement = "",
+  // Per-workspace count of mounted chat views. `agentMessages` is a LIVE
+  // HAND-OFF: the handler only buffers for a workspace that has one, so the
+  // buffering tests below must declare a consumer the way a mounted ChatTab
+  // does. Defaulting to NONE keeps the unmounted case the explicit default.
+  agentMessageConsumers: Record<string, number> = {}
 ) {
-  const state = { nodes, edges, selectedNodeId, agentMessages, liveAnnouncement };
+  const state = { nodes, edges, selectedNodeId, agentMessages, liveAnnouncement, agentMessageConsumers };
   const get = () => state;
   const set = vi.fn((partial: Record<string, unknown>) => {
     Object.assign(state, partial);
@@ -105,6 +110,60 @@ describe("handleCanvasEvent – WORKSPACE_ONLINE", () => {
       handleCanvasEvent(makeMsg({ event: "WORKSPACE_ONLINE", workspace_id: `ws-${i}` }), get, set);
     }
     expect(__pendingOnlineSizeForTest()).toBe(1000);
+  });
+
+  // Greeting-first UI readiness: a FIRST boot (provisioning→online) has not
+  // greeted yet, so greeted=false drives the "warming / composing greeting"
+  // node state; a recovery flip (not from provisioning) does not re-greet and
+  // goes straight to ready (greeted=true).
+  it("marks a first-boot (from provisioning) online node greeted=false (warming)", () => {
+    const node = makeNode("ws-1", { status: "provisioning" });
+    const { get, set } = makeStore([node]);
+    handleCanvasEvent(makeMsg({ event: "WORKSPACE_ONLINE", workspace_id: "ws-1" }), get, set);
+    const updated = (set.mock.calls[0][0] as { nodes: Node<WorkspaceNodeData>[] }).nodes;
+    expect(updated.find((n) => n.id === "ws-1")!.data.greeted).toBe(false);
+  });
+
+  it("marks a recovery flip (from offline) online node greeted=true (no warming)", () => {
+    const node = makeNode("ws-1", { status: "offline" });
+    const { get, set } = makeStore([node]);
+    handleCanvasEvent(makeMsg({ event: "WORKSPACE_ONLINE", workspace_id: "ws-1" }), get, set);
+    const updated = (set.mock.calls[0][0] as { nodes: Node<WorkspaceNodeData>[] }).nodes;
+    expect(updated.find((n) => n.id === "ws-1")!.data.greeted).toBe(true);
+  });
+
+  it("keeps greeted=true across a re-online for an already-greeted node", () => {
+    const node = makeNode("ws-1", { status: "provisioning", greeted: true });
+    const { get, set } = makeStore([node]);
+    handleCanvasEvent(makeMsg({ event: "WORKSPACE_ONLINE", workspace_id: "ws-1" }), get, set);
+    const updated = (set.mock.calls[0][0] as { nodes: Node<WorkspaceNodeData>[] }).nodes;
+    expect(updated.find((n) => n.id === "ws-1")!.data.greeted).toBe(true);
+  });
+});
+
+describe("handleCanvasEvent – AGENT_MESSAGE greeting-first readiness", () => {
+  it("marks the node greeted=true when a real agent message arrives", () => {
+    const node = makeNode("ws-1", { status: "online", greeted: false });
+    const { get, set } = makeStore([node]);
+    handleCanvasEvent(
+      makeMsg({ event: "AGENT_MESSAGE", workspace_id: "ws-1", payload: { message: "Hi, I'm your concierge." } }),
+      get,
+      set,
+    );
+    const patch = set.mock.calls[0][0] as { nodes?: Node<WorkspaceNodeData>[] };
+    expect(patch.nodes?.find((n) => n.id === "ws-1")!.data.greeted).toBe(true);
+  });
+
+  it("does not touch nodes when the node is already greeted (no needless re-render)", () => {
+    const node = makeNode("ws-1", { status: "online", greeted: true });
+    const { get, set } = makeStore([node]);
+    handleCanvasEvent(
+      makeMsg({ event: "AGENT_MESSAGE", workspace_id: "ws-1", payload: { message: "Follow-up message." } }),
+      get,
+      set,
+    );
+    const patch = set.mock.calls[0][0] as { nodes?: Node<WorkspaceNodeData>[] };
+    expect(patch.nodes).toBeUndefined();
   });
 });
 
@@ -630,10 +689,83 @@ describe("handleCanvasEvent – TASK_UPDATED", () => {
 // AGENT_MESSAGE
 // ---------------------------------------------------------------------------
 
+describe("handleCanvasEvent – agent pushes are a LIVE HAND-OFF, not a mailbox", () => {
+  // `agentMessages` exists to hand a live frame to a MOUNTED chat view. If it
+  // buffers while nothing is mounted, the next chat view to mount replays the
+  // queue AND hydrates the same message from GET /chat-history, so the user
+  // sees it twice (a fresh client-minted id means no dedupe collides, and the
+  // 10s reconcile only collapses it after the fact). The platform has already
+  // persisted the message, so dropping it here loses nothing.
+  const node = makeNode("ws-1");
+
+  it("does NOT buffer an AGENT_MESSAGE when no chat view is mounted", () => {
+    const { get, set } = makeStore([node], [], null, {}, "", {}); // no consumers
+    handleCanvasEvent(
+      makeMsg({ event: "AGENT_MESSAGE", workspace_id: "ws-1", payload: { message: "hi" } }),
+      get,
+      set,
+    );
+    const patch = (set.mock.calls[0]?.[0] ?? {}) as Record<string, unknown>;
+    expect(patch).not.toHaveProperty("agentMessages");
+    expect(get().agentMessages["ws-1"]).toBeUndefined();
+  });
+
+  it("does NOT buffer an A2A_RESPONSE when no chat view is mounted", () => {
+    const { get, set } = makeStore([node], [], null, {}, "", {});
+    handleCanvasEvent(
+      makeMsg({
+        event: "A2A_RESPONSE",
+        workspace_id: "ws-1",
+        payload: { response_body: { result: { parts: [{ kind: "text", text: "reply" }] } } },
+      }),
+      get,
+      set,
+    );
+    for (const call of set.mock.calls) {
+      expect(call[0]).not.toHaveProperty("agentMessages");
+    }
+    expect(get().agentMessages["ws-1"]).toBeUndefined();
+  });
+
+  it("still flips the node's `greeted` flag with no chat view mounted", () => {
+    // The greeting flag is NODE UI state, not a chat hand-off: the map must
+    // stop showing "warming up" whether or not anyone has the chat open.
+    const ungreeted = { ...node, data: { ...node.data, greeted: false } };
+    const { get, set } = makeStore([ungreeted], [], null, {}, "", {});
+    handleCanvasEvent(
+      makeMsg({ event: "AGENT_MESSAGE", workspace_id: "ws-1", payload: { message: "hello" } }),
+      get,
+      set,
+    );
+    expect(get().nodes[0].data.greeted).toBe(true);
+  });
+
+  it("DOES buffer once a chat view is mounted", () => {
+    const { get, set } = makeStore([node], [], null, {}, "", { "ws-1": 1 });
+    handleCanvasEvent(
+      makeMsg({ event: "AGENT_MESSAGE", workspace_id: "ws-1", payload: { message: "hi" } }),
+      get,
+      set,
+    );
+    expect(get().agentMessages["ws-1"]).toHaveLength(1);
+  });
+
+  it("buffers per workspace — a consumer on ws-1 does not open the gate for ws-2", () => {
+    const other = makeNode("ws-2");
+    const { get, set } = makeStore([node, other], [], null, {}, "", { "ws-1": 1 });
+    handleCanvasEvent(
+      makeMsg({ event: "AGENT_MESSAGE", workspace_id: "ws-2", payload: { message: "hi" } }),
+      get,
+      set,
+    );
+    expect(get().agentMessages["ws-2"]).toBeUndefined();
+  });
+});
+
 describe("handleCanvasEvent – AGENT_MESSAGE", () => {
   it("appends a message to agentMessages for the workspace", () => {
     const node = makeNode("ws-1");
-    const { get, set } = makeStore([node], [], null, {});
+    const { get, set } = makeStore([node], [], null, {}, "", { "ws-1": 1 });
 
     handleCanvasEvent(
       makeMsg({
@@ -658,7 +790,7 @@ describe("handleCanvasEvent – AGENT_MESSAGE", () => {
   it("appends to existing messages rather than replacing them", () => {
     const node = makeNode("ws-1");
     const existing = [{ id: "old-id", content: "prior msg", timestamp: "2024-01-01T00:00:00Z" }];
-    const { get, set } = makeStore([node], [], null, { "ws-1": existing });
+    const { get, set } = makeStore([node], [], null, { "ws-1": existing }, "", { "ws-1": 1 });
 
     handleCanvasEvent(
       makeMsg({
@@ -715,7 +847,7 @@ describe("handleCanvasEvent – AGENT_MESSAGE", () => {
 
   it("passes through valid attachments onto the new message", () => {
     const node = makeNode("ws-1");
-    const { get, set } = makeStore([node], [], null, {});
+    const { get, set } = makeStore([node], [], null, {}, "", { "ws-1": 1 });
     const att = {
       uri: "workspace:/tmp/build.zip",
       name: "build.zip",
@@ -746,7 +878,7 @@ describe("handleCanvasEvent – AGENT_MESSAGE", () => {
     // file" with no caption. The fix renders the bubble whenever EITHER
     // text or attachments are present.
     const node = makeNode("ws-1");
-    const { get, set } = makeStore([node], [], null, {});
+    const { get, set } = makeStore([node], [], null, {}, "", { "ws-1": 1 });
 
     handleCanvasEvent(
       makeMsg({
@@ -777,7 +909,7 @@ describe("handleCanvasEvent – AGENT_MESSAGE", () => {
     // could still emit empty entries. Drop them rather than rendering
     // blank/broken chips.
     const node = makeNode("ws-1");
-    const { get, set } = makeStore([node], [], null, {});
+    const { get, set } = makeStore([node], [], null, {}, "", { "ws-1": 1 });
 
     handleCanvasEvent(
       makeMsg({
@@ -807,7 +939,7 @@ describe("handleCanvasEvent – AGENT_MESSAGE", () => {
 
   it("ignores non-array attachments payloads", () => {
     const node = makeNode("ws-1");
-    const { get, set } = makeStore([node], [], null, {});
+    const { get, set } = makeStore([node], [], null, {}, "", { "ws-1": 1 });
 
     handleCanvasEvent(
       makeMsg({
@@ -853,7 +985,7 @@ describe("handleCanvasEvent – AGENT_MESSAGE", () => {
 describe("handleCanvasEvent – A2A_RESPONSE", () => {
   it("extracts text from response_body and stores as agentMessage", () => {
     const node = makeNode("ws-1");
-    const { get, set } = makeStore([node], [], null, {});
+    const { get, set } = makeStore([node], [], null, {}, "", { "ws-1": 1 });
 
     handleCanvasEvent(
       makeMsg({

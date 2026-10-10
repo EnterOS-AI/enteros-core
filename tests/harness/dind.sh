@@ -8,9 +8,16 @@
 # fixed compose project + ports — the chronic non-hermetic "Harness Replays"
 # reds. The robust fix (principal's call; a scheduled sweeper was rejected as a
 # band-aid) is to run the whole stack inside a DISPOSABLE per-job docker:dind
-# daemon: everything lives inside it and dies with one atomic `docker rm -f`,
-# even on cancel — leaks become structurally impossible. Feasibility proven by
-# .gitea/workflows/dind-smoke.yml.
+# daemon: everything lives inside it and dies with one atomic `docker rm -fv`.
+# Feasibility proven by .gitea/workflows/dind-smoke.yml.
+#
+# "Even on cancel" needs more than `down`: the deployed act_runner skips
+# `if: always()` steps on a cancelled job, so the `down` step never ran and the
+# dind kept running until a host reaper `docker rm -f`'d it — no -v — stranding
+# its ~8 GB anonymous /var/lib/docker volume (~1 TB leaked on one host). So the
+# dind now REAPS ITSELF: a watchdog inside it (DIND_WATCHDOG below) stops it once
+# the job container that started it is gone, or at DIND_MAX_LIFETIME, and `--rm`
+# then removes the container together with that volume.
 #
 #   dind.sh up    start a disposable dind, wait healthy, and export to
 #                 $GITHUB_ENV: DOCKER_HOST/DOCKER_TLS_VERIFY/DOCKER_CERT_PATH so
@@ -20,6 +27,7 @@
 #                 loopback); HARNESS_BIND_ADDR=0.0.0.0 so cf-proxy binds all dind
 #                 interfaces (reachable through the forward).
 #   dind.sh down  docker rm -fv the ONE dind — destroys the whole nested topology.
+#   dind.sh watchdog  print the program the dind runs as PID 1 (tests/inspection).
 #
 # The harness *.sh (up/down/seed/run-all-replays) need NO changes: they call bare
 # `docker compose`, which follows DOCKER_HOST, and read BASE/CP_STUB_BASE from env.
@@ -34,51 +42,183 @@ DIND_IMAGE="${DIND_IMAGE:-registry.moleculesai.app/molecule-ai/docker:27-dind}"
 # Run-scoped, deterministic name so `down` finds it without carrying state.
 NS="${DIND_NS:-${GITHUB_RUN_ID:-local}-${GITHUB_JOB:-harness}}"
 DIND="dind-harness-${NS}"
-CERTS_VOL="${DIND}-certs"
 CERTDIR="${GITHUB_WORKSPACE:-$PWD}/.dind-certs-${NS}"
+api_port=""   # set by up() once the dind has published 2376; read by nested_docker
+# Hard cap on the dind's life, in seconds, whatever its owner is doing. 3h is the
+# runner's job ceiling (act_runner `timeout: 3h`; the job container's PID 1 is
+# `sleep 10800`), and the dind starts after its job does, so no live job can
+# still need its dind at that age. Raise it only together with the runner timeout.
+DIND_MAX_LIFETIME="${DIND_MAX_LIFETIME:-10800}"
+
+# The dind's PID 1. It runs dockerd as a child and polls the HOST daemon (over a
+# bind of the host socket) for the OWNER — the job container that ran `up`. Once
+# the daemon positively answers "not running" twice in a row, or the lifetime cap
+# is hit, it stops dockerd and exits; `--rm` then removes the container AND its
+# anonymous /var/lib/docker volume. A failed query (daemon busy or unreachable) is
+# not evidence the owner is gone: it keeps polling, and only the cap applies.
+# While the owner lives, the dind stays up even if dockerd died, so `up` can
+# still read its logs. POSIX sh: it runs under the image's busybox.
+DIND_WATCHDOG="$(cat <<'WATCHDOG'
+dockerd-entrypoint.sh & d=$!
+stop=""
+trap 'stop=1; kill -TERM "$d" 2>/dev/null' TERM INT
+t0=$(date +%s)
+miss=0
+while [ -z "$stop" ]; do
+  if [ $(( $(date +%s) - t0 )) -ge "$DIND_MAX_LIFETIME" ]; then
+    echo "[dind-watchdog] lifetime cap ${DIND_MAX_LIFETIME}s reached; stopping" >&2
+    break
+  fi
+  if [ -n "${DIND_OWNER:-}" ]; then
+    if up=$(docker -H unix:///run/dind-host-docker.sock ps -q --no-trunc --filter "id=$DIND_OWNER" 2>/dev/null); then
+      if [ -n "$up" ]; then miss=0; else miss=$((miss + 1)); fi
+      if [ "$miss" -ge 2 ]; then
+        echo "[dind-watchdog] owner container $DIND_OWNER is gone; stopping" >&2
+        break
+      fi
+    fi
+  fi
+  sleep "${DIND_WATCHDOG_INTERVAL:-5}"
+done
+kill -TERM "$d" 2>/dev/null
+i=0
+while kill -0 "$d" 2>/dev/null && [ "$i" -lt 30 ]; do sleep 1; i=$((i + 1)); done
+WATCHDOG
+)"
+
+# Two EXPLICIT daemon targets. Which daemon a bare `docker` hits depends on
+# inherited env (GITHUB_ENV persists DOCKER_HOST into every later step of the
+# job), so "bare docker" is ambiguous inside this script and has already caused
+# one silent misroute: `up` used to `export DOCKER_HOST` before its failure
+# diagnostics, which aimed `docker logs "$DIND"` at the NESTED daemon — the one
+# it had just declared unreachable — so it died on the same missing ca.pem and
+# the dind logs naming the real cause were never captured. Never call bare
+# `docker` here; say which daemon you mean.
+#
+#   host_docker   — the runner's daemon, where the $DIND container itself lives.
+#                   ALL lifecycle + diagnostic calls.
+#   nested_docker — the dind's own daemon, reachable only over TLS. ONLY the
+#                   reachability probe.
+host_docker() {  # runner's daemon: strip any inherited dind wiring
+  env -u DOCKER_HOST -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH docker "$@"
+}
+nested_docker() {  # the dind's daemon, addressed explicitly (never exported)
+  DOCKER_HOST="tcp://127.0.0.1:${api_port}" DOCKER_TLS_VERIFY=1 \
+    DOCKER_CERT_PATH="$CERTDIR" docker "$@"
+}
 
 ephemeral_port() {  # $1=container-port/tcp → host loopback port
-  docker port "$DIND" "$1" 2>/dev/null | awk -F: '/127\.0\.0\.1:/ {print $2; exit}' \
-    || docker port "$DIND" "$1" 2>/dev/null | head -1 | awk -F: '{print $NF}'
+  host_docker port "$DIND" "$1" 2>/dev/null | awk -F: '/127\.0\.0\.1:/ {print $2; exit}' \
+    || host_docker port "$DIND" "$1" 2>/dev/null | head -1 | awk -F: '{print $NF}'
+}
+
+# The dind's OWNER: the job container this script runs in (act_runner gives each
+# job its own container on the host daemon). Not `hostname` — this fleet's job
+# containers are network=host, so that is the HOST's name. Docker bind-mounts
+# /etc/hostname from <data-root>/containers/<id>/hostname, so mountinfo names the
+# container. DIND_OWNER overrides the detection. Prints the full id ONLY if the
+# host daemon confirms it is a RUNNING container: a wrong id would read as "owner
+# gone" on the watchdog's first polls and kill a live job's dind.
+owner_container() {
+  local id="${DIND_OWNER:-}"
+  if [ -z "$id" ]; then
+    id="$(sed -n 's#^[^ ]* [^ ]* [^ ]* [^ ]*/containers/\([0-9a-f]\{64\}\)/hostname /etc/hostname .*#\1#p' \
+      /proc/self/mountinfo 2>/dev/null)"
+    id="${id%%$'\n'*}"
+  fi
+  [ -n "$id" ] || return 0
+  host_docker inspect -f '{{if .State.Running}}{{.Id}}{{end}}' "$id" 2>/dev/null || true
 }
 
 up() {
-  docker info >/dev/null 2>&1 || { echo "::error::docker daemon not reachable"; exit 2; }
-  docker rm -fv "$DIND" >/dev/null 2>&1 || true
-  docker volume rm "$CERTS_VOL" >/dev/null 2>&1 || true
-  docker volume create "$CERTS_VOL" >/dev/null
+  case "$DIND_MAX_LIFETIME" in
+    ''|*[!0-9]*) echo "::error::DIND_MAX_LIFETIME must be a whole number of seconds (got '$DIND_MAX_LIFETIME')"; exit 2 ;;
+  esac
+  DIND_MAX_LIFETIME=$((10#$DIND_MAX_LIFETIME))
+  [ "$DIND_MAX_LIFETIME" -gt 0 ] || { echo "::error::DIND_MAX_LIFETIME must be > 0"; exit 2; }
+  host_docker info >/dev/null 2>&1 || { echo "::error::docker daemon not reachable"; exit 2; }
+  host_docker rm -fv "$DIND" >/dev/null 2>&1 || true
   # --privileged is REQUIRED for a nested dockerd. If denied, the runner forbids
   # privileged → this approach needs the rootless-dind fallback (fail loud). We
   # also publish the harness's cf-proxy(8080) + cp-stub(9090) ports off the dind
   # to host loopback NOW, so once the nested compose binds them (0.0.0.0 inside
   # the dind) the job reaches them via 127.0.0.1:<ephemeral> — the same host-
   # loopback idiom the pg/redis steps already use, no cross-network wiring.
-  if ! docker run -d --name "$DIND" --privileged \
-      -e DOCKER_TLS_CERTDIR=/certs -v "${CERTS_VOL}:/certs" \
+  #
+  # /certs is deliberately NOT a mount. It used to be a NAMED volume
+  # ("${DIND}-certs"), which is the one object in this design that `docker rm
+  # -fv "$DIND"` cannot reap — a named volume dies ONLY via an explicit
+  # `docker volume rm`, i.e. only if the teardown step actually runs. Cancels,
+  # job timeouts and SIGKILLs skip it, run IDs are never revisited, and a plain
+  # `docker volume prune` skips NAMED volumes (they need `--all`), so nothing
+  # ever swept them: 85 orphaned dind-harness-*-certs accumulated on the fleet.
+  # Leaving /certs in the container's own writable layer restores the header's
+  # invariant — ONE object, destroyed atomically by ONE `docker rm -fv`, with no
+  # second fallible command. The dind entrypoint still generates the full client
+  # cert set there; we only ever read it back out with `docker cp`.
+  #
+  # `--rm` + DIND_WATCHDOG as PID 1 make that ONE object reap itself when this
+  # job's container goes away (cancel, timeout, SIGKILL — the cases where `down`
+  # never runs). `--rm` alone is not enough: an explicit `docker rm -f` (no -v)
+  # by anyone else still strands the volume; the watchdog exiting on its own is
+  # what triggers the auto-remove WITH the volume. The labels let a host janitor
+  # tell an orphan (owner gone) from a live job's dind without guessing by age.
+  local owner sock="" ; owner="$(owner_container)"
+  if [ -n "$owner" ]; then
+    # Hand the watchdog the SAME daemon socket the job container got.
+    sock="$(host_docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/run/docker.sock"}}{{.Source}}{{end}}{{end}}' "$owner" 2>/dev/null)"
+    [ -n "$sock" ] || owner=""
+  fi
+  local -a watch=()
+  if [ -n "$owner" ]; then
+    watch=(--mount "type=bind,source=${sock},target=/run/dind-host-docker.sock" -e "DIND_OWNER=${owner}")
+  else
+    echo "::warning::[dind] could not identify the job container that owns $DIND — if this job is cancelled, nothing stops it before its ${DIND_MAX_LIFETIME}s lifetime cap, and a host reaper that removes it first with \`docker rm -f\` (no -v) strands its /var/lib/docker volume." >&2
+  fi
+  if ! host_docker run -d --rm --name "$DIND" --privileged \
+      --label "molecule.ci.dind-owner=${owner:-unknown}" \
+      --label "molecule.ci.run=${GITHUB_RUN_ID:-local}" \
+      -e DOCKER_TLS_CERTDIR=/certs -e "DIND_MAX_LIFETIME=${DIND_MAX_LIFETIME}" \
+      ${watch[@]+"${watch[@]}"} \
       -p 127.0.0.1::2376 -p 127.0.0.1::8080 -p 127.0.0.1::9090 \
-      "$DIND_IMAGE" >/dev/null; then
-    echo "::error::'docker run --privileged' denied on this runner — the per-job dind isolation needs the rootless-dind fallback (task #78)."
+      --entrypoint sh "$DIND_IMAGE" -c "$DIND_WATCHDOG" >/dev/null; then
+    echo "::error::'docker run --privileged' of the dind failed on this runner — privileged denied (the per-job dind isolation then needs the rootless-dind fallback, task #78), or the host socket bind for the owner watchdog (${sock:-none}) was refused."
     exit 1
   fi
-  local api_port; api_port="$(ephemeral_port 2376/tcp)"
+  echo "[dind] $DIND owner=${owner:-unknown} max-lifetime=${DIND_MAX_LIFETIME}s" >&2
+  api_port="$(ephemeral_port 2376/tcp)"
   local http_port; http_port="$(ephemeral_port 8080/tcp)"
   local cp_port; cp_port="$(ephemeral_port 9090/tcp)"
   [ -n "$api_port" ] && [ -n "$http_port" ] && [ -n "$cp_port" ] || {
-    echo "::error::dind did not publish all expected ports (2376=$api_port 8080=$http_port 9090=$cp_port)"; docker logs "$DIND" 2>&1 | tail -40; exit 1; }
+    echo "::error::dind did not publish all expected ports (2376=$api_port 8080=$http_port 9090=$cp_port)"; host_docker logs "$DIND" 2>&1 | tail -40; exit 1; }
   rm -rf "$CERTDIR"; mkdir -p "$CERTDIR"
+  # The TLS client needs ALL THREE of ca.pem/cert.pem/key.pem. `docker cp` of
+  # /certs/client/. is NOT atomic, so this loop used to gate on cert.pem ALONE
+  # and could break the instant cert.pem landed — before ca.pem existed. Every
+  # subsequent `docker info` then failed INSTANTLY client-side with
+  #   unable to resolve docker endpoint: open .../ca.pem: no such file or directory
+  # and the reachability loop below blamed a nested dockerd that was very
+  # possibly healthy the whole time ("never became reachable over DOCKER_HOST"
+  # after a 63.5s `up`: ~3s of certs then 30 instant client-side failures).
+  # Gate on the whole set — the loop must not break until the client can
+  # actually connect.
   local got=""
   for _ in $(seq 1 30); do
-    if docker cp "$DIND:/certs/client/." "$CERTDIR/" >/dev/null 2>&1 && [ -f "$CERTDIR/cert.pem" ]; then got=1; break; fi
+    if host_docker cp "$DIND:/certs/client/." "$CERTDIR/" >/dev/null 2>&1 \
+       && [ -f "$CERTDIR/ca.pem" ] && [ -f "$CERTDIR/cert.pem" ] && [ -f "$CERTDIR/key.pem" ]; then
+      got=1; break
+    fi
     sleep 2
   done
-  [ -n "$got" ] || { echo "::error::dind never produced client TLS certs"; docker logs "$DIND" 2>&1 | tail -40; exit 1; }
-  export DOCKER_HOST="tcp://127.0.0.1:${api_port}" DOCKER_TLS_VERIFY=1 DOCKER_CERT_PATH="$CERTDIR"
+  [ -n "$got" ] || { echo "::error::dind never produced a COMPLETE client TLS cert set (need ca.pem+cert.pem+key.pem in $CERTDIR)"; host_docker logs "$DIND" 2>&1 | tail -40; exit 1; }
   local ok=""
-  for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && { ok=1; break; }; sleep 2; done
-  [ -n "$ok" ] || { echo "::error::nested dockerd never became reachable over DOCKER_HOST"; docker logs "$DIND" 2>&1 | tail -60; exit 1; }
+  for _ in $(seq 1 30); do nested_docker info >/dev/null 2>&1 && { ok=1; break; }; sleep 2; done
+  # NOTE: host_docker, not bare docker. This diagnostic must read the logs of
+  # the dind CONTAINER (host daemon); aiming it at the nested daemon we just
+  # declared unreachable is how the real cause stayed invisible.
+  [ -n "$ok" ] || { echo "::error::nested dockerd never became reachable over DOCKER_HOST"; host_docker logs "$DIND" 2>&1 | tail -60; exit 1; }
   {
     echo "DIND=$DIND"
-    echo "DIND_CERTS_VOL=$CERTS_VOL"
     echo "DIND_CERTDIR=$CERTDIR"
     echo "DOCKER_HOST=tcp://127.0.0.1:${api_port}"
     echo "DOCKER_TLS_VERIFY=1"
@@ -92,17 +232,36 @@ up() {
 
 down() {
   # Operate on the HOST daemon (where the dind container itself lives), NOT the
-  # nested one — unset the wiring `up` exported. One rm then destroys every
-  # nested container/volume/network/image the harness made, atomically.
-  unset DOCKER_HOST DOCKER_TLS_VERIFY DOCKER_CERT_PATH
-  docker rm -fv "$DIND" >/dev/null 2>&1 || true
-  docker volume rm "$CERTS_VOL" >/dev/null 2>&1 || true
+  # nested one — host_docker strips the wiring `up` wrote into $GITHUB_ENV, which
+  # every later step of the job inherits. ONE rm now destroys every nested
+  # container/volume/network/image the harness made, atomically: with /certs no
+  # longer a named volume there is no second object needing a second, separately
+  # fallible command. `-v` is load-bearing: it reaps the image's anonymous
+  # /var/lib/docker volume (the whole nested image store, ~8 GB); `rm -f` alone
+  # strands it. A job killed before this step never runs it — that dind is reaped
+  # by its own watchdog (see `up`) once this job's container is gone.
+  #
+  # Report what was ACTUALLY reaped. `down` derives $DIND from DIND_NS /
+  # GITHUB_RUN_ID / GITHUB_JOB; if a teardown step's env ever drifts from its
+  # `up` step's, this reaps a name that never existed — and every command here
+  # is `|| true`, so the old unconditional "its whole topology is gone" printed
+  # a clean success over a total no-op. Say which it was.
+  local existed=""
+  host_docker inspect "$DIND" >/dev/null 2>&1 && existed=1
+  host_docker rm -fv "$DIND" >/dev/null 2>&1 || true
   rm -rf "$CERTDIR" 2>/dev/null || true
-  echo "[dind] $DIND down — its whole topology is gone" >&2
+  if [ -n "$existed" ]; then
+    echo "[dind] $DIND down — its whole topology is gone" >&2
+  else
+    # NOT an error: a job whose `up` never ran (earlier step failed, or the
+    # no-op path) legitimately has nothing to reap. But never call it a teardown.
+    echo "::warning::[dind] no container named $DIND existed — nothing was torn down. If an 'up' ran in this job, its DIND_NS/GITHUB_RUN_ID/GITHUB_JOB differed from this step's and the dind is now ORPHANED." >&2
+  fi
 }
 
 case "$CMD" in
-  up)   up ;;
-  down) down ;;
-  *)    echo "usage: $0 up|down" >&2; exit 2 ;;
+  up)       up ;;
+  down)     down ;;
+  watchdog) printf '%s\n' "$DIND_WATCHDOG" ;;
+  *)        echo "usage: $0 up|down|watchdog" >&2; exit 2 ;;
 esac

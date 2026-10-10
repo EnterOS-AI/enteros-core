@@ -259,12 +259,17 @@ func TestRenderTemplateSchedulesYAML_IndentedFirstLinePromptsRenderPortably(t *t
 	}
 }
 
-// TestRenderTemplateSchedulesYAML_RejectsNonContractNames — review REQUIRED:
-// the runtime schema enforces ^[a-z0-9]+(?:-[a-z0-9]+)*$ (≤128 chars) on
-// names; a name that fails it renders core-side but is silently skipped by
-// the runtime's seeding → split-brain vs the DB grid now, silent loss at
-// P4b. Core must skip exactly what the runtime would skip.
-func TestRenderTemplateSchedulesYAML_RejectsNonContractNames(t *testing.T) {
+// TestRenderTemplateSchedulesYAML_NormalisesNonContractNames — the runtime
+// schema enforces ^[a-z0-9]+(?:-[a-z0-9]+)*$ (≤128 chars) on names; a name that
+// fails it would be silently skipped by the runtime's seeding.
+//
+// The load-bearing invariant is UNCHANGED and still asserted below: core must
+// never emit a name the runtime would reject. What changed is the disposition —
+// core used to SKIP such an entry, which is why 35 of the 37 schedules declared
+// across the template repos had never fired. It now SLUGIFIES on write, since
+// the grammar belongs to the grid rather than to the template author. An
+// already-valid name is still emitted byte-identical.
+func TestRenderTemplateSchedulesYAML_NormalisesNonContractNames(t *testing.T) {
 	schedules := []OrgSchedule{
 		{Name: "Morning Digest", CronExpr: "0 9 * * *", Prompt: "p"},                          // space + uppercase
 		{Name: "digest_1", CronExpr: "0 9 * * *", Prompt: "p"},                                // underscore
@@ -274,16 +279,40 @@ func TestRenderTemplateSchedulesYAML_RejectsNonContractNames(t *testing.T) {
 		{Name: "kebab-sibling-2", CronExpr: "0 9 * * *", Prompt: "p"},                         // valid
 	}
 	block, rendered, skipped := renderTemplateSchedulesYAML(schedules, t.TempDir(), "", "WS Names")
-	if rendered != 1 || skipped != 5 {
-		t.Fatalf("rendered=%d skipped=%d, want 1/5\n%s", rendered, skipped, block)
+	if rendered != 6 || skipped != 0 {
+		t.Fatalf("rendered=%d skipped=%d, want 6/0 — every name is slugifiable\n%s", rendered, skipped, block)
 	}
 	entries := parseRenderedSchedules(t, []byte(block))
-	if len(entries) != 1 || entries[0]["name"] != "kebab-sibling-2" {
-		t.Fatalf("only the kebab sibling may render, got: %#v", entries)
+	got := make([]string, 0, len(entries))
+	for _, e := range entries {
+		got = append(got, e["name"].(string))
+	}
+	want := []string{
+		"morning-digest",                        // space + uppercase
+		"digest-1",                              // underscore
+		"check-ci",                              // uppercase
+		"leading",                               // leading dash trimmed
+		strings.Repeat("a", maxScheduleNameLen), // truncated to the cap
+		"kebab-sibling-2",                       // already valid — byte-identical
+	}
+	if len(got) != len(want) {
+		t.Fatalf("emitted %d names, want %d: %#v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry %d: emitted %q, want %q", i, got[i], want[i])
+		}
+	}
+	// THE INVARIANT: whatever core emits, the runtime must accept. Nothing that
+	// fails the grid grammar may reach the delivered block.
+	for _, n := range got {
+		if !scheduleNamePattern.MatchString(n) || len(n) > maxScheduleNameLen {
+			t.Errorf("core emitted %q, which the runtime would silently skip", n)
+		}
 	}
 	for _, absent := range []string{"Morning Digest", "digest_1", "check-CI", "-leading"} {
 		if strings.Contains(block, absent) {
-			t.Errorf("non-contract name %q leaked into the rendered block", absent)
+			t.Errorf("raw non-contract name %q leaked into the rendered block", absent)
 		}
 	}
 }

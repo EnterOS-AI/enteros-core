@@ -1,4 +1,8 @@
-import { test, expect } from "@playwright/test";
+// `test` comes from helpers/net-evidence, not @playwright/test: it is the same
+// runner with a requestfailed recorder bound to every page, so that when this
+// spec trips the canvas hittability diagnostic the message can name the exact
+// net::ERR_* behind a dead stylesheet (core#5106). Nothing else differs.
+import { test, expect } from "./helpers/net-evidence";
 import type { Page } from "@playwright/test";
 import { startEchoRuntime } from "./fixtures/echo-runtime";
 import {
@@ -8,27 +12,22 @@ import {
   seedChatHistory,
   queryPsql,
 } from "./fixtures/chat-seed";
+import { enterMapView, clickWorkspaceNode } from "./helpers/canvas";
 
 const PLATFORM_URL = process.env.E2E_PLATFORM_URL ?? "http://localhost:8080";
 const API = process.env.E2E_API_URL ?? PLATFORM_URL;
-
-/** Enter the Org-map view so the Canvas (React Flow graph) mounts. */
-async function enterMapView(page: Page): Promise<void> {
-  const btn = page.getByTestId("nav-map");
-  await expect(btn, "rail button nav-map missing").toBeVisible({ timeout: 10_000 });
-  await btn.click();
-}
 
 /** Open the seeded workspace's Chat side panel (scoped to the visible panel). */
 async function openChatPanel(page: Page, workspaceName: string): Promise<void> {
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.goto("/");
   await enterMapView(page);
-  await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
 
-  // Scope to the map-side panel (#2587) so we don't accidentally hit the
-  // hidden ConciergeShell copy of ChatTab.
-  await page.getByTestId(`workspace-node-${workspaceName}`).click();
+  // clickWorkspaceNode waits for the canvas fitView to settle before clicking,
+  // so the node isn't under the fixed top chrome (the E2E Chat node-click
+  // flake), and is scoped by data-testid (#2587) so it can't hit the hidden
+  // ConciergeShell copy of ChatTab.
+  await clickWorkspaceNode(page, workspaceName);
   // Selecting the node mounts SidePanel — a `fixed right-0 z-50 animate-in
   // slide-in-from-right duration-200` overlay (SidePanel.tsx:122) rendered
   // INSIDE <main id="canvas-main"> (Canvas.tsx:305). No `#tab-chat` click is

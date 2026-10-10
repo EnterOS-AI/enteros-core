@@ -280,6 +280,29 @@ describe("WorkspaceNode — status states", () => {
     expect(screen.getByText("ONLINE")).toBeTruthy();
   });
 
+  // Greeting-first UI readiness: an online workspace that has not greeted yet
+  // (greeted=false) renders the "warming / composing greeting" state, decoupled
+  // from the (robust) serving status. Once greeted — or on older builds where
+  // greeted is absent — it shows plain online/ready.
+  it("shows warming (composing greeting) for an online node that has not greeted", () => {
+    renderNode({ status: "online", greeted: false });
+    expect(screen.getByLabelText(/online, composing greeting/i)).toBeTruthy();
+    // Not yet "ready": the plain online label must not be shown while warming.
+    expect(screen.queryByText("ONLINE")).toBeNull();
+  });
+
+  it("shows plain online (no warming) once the node is greeted", () => {
+    renderNode({ status: "online", greeted: true });
+    expect(screen.queryByLabelText(/composing greeting/i)).toBeNull();
+    expect(screen.getByText("ONLINE")).toBeTruthy();
+  });
+
+  it("does not warm when greeted is absent (older ws-server builds)", () => {
+    renderNode({ status: "online" }); // greeted undefined
+    expect(screen.queryByLabelText(/composing greeting/i)).toBeNull();
+    expect(screen.getByText("ONLINE")).toBeTruthy();
+  });
+
   it("shows degraded error preview when status is degraded and lastSampleError is set", () => {
     renderNode({ status: "degraded", lastSampleError: "Connection timeout" });
     expect(screen.getByText("Connection timeout")).toBeTruthy();

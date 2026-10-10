@@ -78,6 +78,13 @@ schema-owned features with dedicated migrations. Their expiry and retention
 columns have feature-specific semantics; do not apply the Redis liveness TTL to
 them.
 
+`workspace_plugins.tracked_ref` and `plugin_update_queue` drive the plugin
+detect/apply loop; the semantics of `tracked_ref` (including why a bare tag is
+stored as `ref:<name>`) and the rule for when `installed_sha` may be advanced
+are specified in [Plugin convergence](./plugin-convergence.md). Do not infer
+convergence from `installed_sha` alone — it is only re-pinned when the new
+bytes actually reached the box.
+
 ## Redis
 
 Redis contains ephemeral liveness and routing caches:
@@ -102,5 +109,6 @@ Related documentation:
 
 - [Event log](./event-log.md)
 - [Registry and heartbeat](../api-protocol/registry-and-heartbeat.md)
+- [Plugin convergence](./plugin-convergence.md)
 - [Workspace provisioning](./provisioner.md)
 - [Workspace tiers](./workspace-tiers.md)

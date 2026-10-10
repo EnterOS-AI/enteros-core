@@ -10,7 +10,13 @@ import {
   type Edge,
   BackgroundVariant,
 } from "@xyflow/react";
-import "@xyflow/react/dist/style.css";
+// NOTE: `@xyflow/react/dist/style.css` is deliberately NOT imported here.
+// Importing it from this client component puts it in the PAGE css chunk,
+// which Next delivers as a preload + an RSC-payload stylesheet that React
+// inserts during hydration — leaving a measurable window in which this
+// canvas renders unstyled and every node click lands on the background svg.
+// It is imported from `src/app/globals.css` instead so it ships as a
+// render-blocking LAYOUT stylesheet. See the comment block there.
 
 import { useCanvasStore } from "@/store/canvas";
 import { WORKSPACE_KIND } from "@/lib/workspace-kind";
@@ -385,7 +391,11 @@ function CanvasInner() {
           role="status"
           aria-live="polite"
           aria-atomic="true"
-          className="sr-only"
+          // pointer-events-none: this is a screen-reader-only status region; it
+          // must never intercept canvas pointer events. Without it, it was one
+          // of the fixed overlays that stole workspace-node clicks during canvas
+          // load (the E2E Chat node-click flake).
+          className="sr-only pointer-events-none"
         >
           {liveAnnouncement || (
             nodes.filter((n) => !n.parentId).length === 0
