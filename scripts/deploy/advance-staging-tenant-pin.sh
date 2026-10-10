@@ -63,6 +63,28 @@ TAG=""
 GIT_SHA="${TENANT_PIN_GIT_SHA:-}"
 DRY_RUN=0
 CURL=(curl -fsS -A curl/8.4.0 --doh-url https://cloudflare-dns.com/dns-query)
+# Same transport as CURL, MINUS -f. `-f` makes curl exit 22 and DISCARD the
+# response body, so every CP error on this path collapsed to a bare
+# `curl: (22) The requested URL returned error: NNN` with the actionable
+# sentence thrown away. The CP calls below capture status and body explicitly
+# instead (see cp_request). Deliberately NOT --fail-with-body: that needs curl
+# >= 7.76, and this runs on whatever curl the runner image ships plus an
+# operator laptop; -o/-w has worked since curl 7.x and costs nothing here.
+CURL_RAW=(curl -sS -A curl/8.4.0 --doh-url https://cloudflare-dns.com/dns-query)
+# Bounded poll-retry budget for the CP's documented-retryable 409 (see
+# promote_pin). Env-overridable so a caller can shorten it; never unbounded.
+PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS="${PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS:-180}"
+PROMOTE_CONFLICT_RETRY_INTERVAL_SECONDS="${PROMOTE_CONFLICT_RETRY_INTERVAL_SECONDS:-5}"
+# The loop's only progress term is the interval, so a zero or non-numeric one
+# turns a bounded retry into an infinite one — refuse it up front rather than
+# discover it during an incident. A budget of 0 IS valid: it means "try once,
+# never wait", which is how a caller opts out of retrying.
+case "$PROMOTE_CONFLICT_RETRY_INTERVAL_SECONDS" in
+  ''|*[!0-9]*|0) echo "FATAL: PROMOTE_CONFLICT_RETRY_INTERVAL_SECONDS must be a positive integer (got '${PROMOTE_CONFLICT_RETRY_INTERVAL_SECONDS}') — a zero interval makes the bounded retry unbounded" >&2; exit 2;;
+esac
+case "$PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS" in
+  ''|*[!0-9]*) echo "FATAL: PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS must be a non-negative integer (got '${PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS}')" >&2; exit 2;;
+esac
 
 usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 while [ "$#" -gt 0 ]; do
@@ -248,17 +270,114 @@ fi
 CP_TOKEN="$(fetch_cp_token)"
 mask "$CP_TOKEN"
 
-cp_json() {
-  local method="$1" path="$2" body="${3:-}"
+# cp_request performs one CP call and records BOTH halves of the answer in
+# CP_LAST_STATUS / CP_LAST_BODY. Nothing here decides success — that is
+# cp_assert_ok's and promote_pin's job — because the status is exactly what
+# tells a retryable conflict apart from a terminal 4xx, and the body is the only
+# place the CP explains itself.
+CP_LAST_STATUS=""
+CP_LAST_BODY=""
+cp_request() {
+  local method="$1" path="$2" body="${3:-}" raw=""
+  CP_LAST_STATUS=""
+  CP_LAST_BODY=""
+  # Body and status come back over the SAME stdout, separated by the newline
+  # -w prepends, and are split below. No -o tempfile: this script exports
+  # MSYS_NO_PATHCONV=1, so a POSIX mktemp path handed to a native curl on a
+  # git-bash box resolves to a different file than `cat` would read, and the
+  # body would silently come back empty — a "captured" body that is always
+  # blank is worse than no capture at all.
+  #
+  # Without -f, curl exits 0 for an HTTP error and still emits the body, so a
+  # 4xx/5xx reaches us intact. A TRANSPORT failure (refused, DNS, TLS) still
+  # exits non-zero and %{http_code} is then `000`: `|| true` keeps set -e from
+  # killing us before we can report it, and `000` is not 2xx so it stays fatal.
   if [ -n "$body" ]; then
-    "${CURL[@]}" -X "$method" "${CP_BASE_URL%/}$path" \
+    raw="$("${CURL_RAW[@]}" -w $'\n%{http_code}' -X "$method" "${CP_BASE_URL%/}$path" \
       -H "Authorization: Bearer $CP_TOKEN" \
       -H "Content-Type: application/json" \
-      -d "$body"
+      -d "$body")" || true
   else
-    "${CURL[@]}" -X "$method" "${CP_BASE_URL%/}$path" \
-      -H "Authorization: Bearer $CP_TOKEN"
+    raw="$("${CURL_RAW[@]}" -w $'\n%{http_code}' -X "$method" "${CP_BASE_URL%/}$path" \
+      -H "Authorization: Bearer $CP_TOKEN")" || true
   fi
+  # The status is whatever follows the LAST newline; everything before it is the
+  # body. If curl never ran at all, raw is empty and both stay empty — which
+  # cp_assert_ok treats as failure, never as success.
+  case "$raw" in
+    *$'\n'*)
+      CP_LAST_STATUS="${raw##*$'\n'}"
+      CP_LAST_BODY="${raw%$'\n'*}"
+      ;;
+  esac
+}
+
+# cp_assert_ok is fail-CLOSED: only a literal 2xx passes. An empty status (curl
+# never ran), `000` (never reached the CP), or anything non-2xx is fatal AND
+# prints what the CP said. Written as an explicit 2xx allowlist rather than a
+# "not an error" test so that an unset/empty CP_LAST_STATUS cannot slip through
+# as success — the failure mode this whole change exists to remove.
+cp_assert_ok() {
+  local method="$1" path="$2"
+  case "${CP_LAST_STATUS:-}" in
+    2[0-9][0-9]) return 0 ;;
+  esac
+  echo "FATAL: CP $method $path returned HTTP ${CP_LAST_STATUS:-<none>}: ${CP_LAST_BODY:-<empty body>}" >&2
+  exit 1
+}
+
+cp_json() {
+  local method="$1" path="$2" body="${3:-}"
+  cp_request "$method" "$path" "$body"
+  cp_assert_ok "$method" "$path"
+  printf '%s' "$CP_LAST_BODY"
+}
+
+# promote_pin POSTs the pin write, poll-retrying ONLY the CP's documented-
+# retryable conflict, inside a stated budget.
+#
+# WHY 409 IS RETRYABLE. The CP's molecule-tenant UPSERT is
+#   INSERT ... SELECT ... WHERE $1 <> 'molecule-tenant'
+#                            OR pg_try_advisory_xact_lock(<TenantImageRolloutAdvisoryLockID>)
+# Three actors contend on that advisory lock: a fresh-tenant provision holds it
+# SHARED for the whole orchestration, a fleet rollout holds it exclusively, and
+# this promote takes an exclusive xact TRY. A held fence fails the try, the
+# SELECT yields no row, and the CP maps sql.ErrNoRows to 409 with a body that
+# literally says "retry after the rollout completes". The fence is session-
+# scoped: no TTL, no table row, nothing to clean up — it disappears when the
+# other operation finishes. On 2026-08-07 that made an ~11s window fail the
+# staging merge train outright.
+#
+# WHY NOT RETRY EVERYTHING. 400 (validation) and 503 (no database wired) are
+# terminal: re-POSTing an identical request that the CP has already rejected on
+# its merits just burns the budget and hides the error. Only 409 loops.
+promote_pin() {
+  local body="$1" attempt=0 waited=0
+  while :; do
+    attempt=$((attempt + 1))
+    cp_request POST /cp/admin/runtime-image/promote "$body"
+    case "${CP_LAST_STATUS:-}" in
+      2[0-9][0-9])
+        if [ "$attempt" -gt 1 ]; then
+          log "promote accepted on attempt $attempt after ${waited}s of pin-mutation contention"
+        fi
+        return 0
+        ;;
+      409)
+        if [ "$waited" -ge "$PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS" ]; then
+          echo "FATAL: CP still reports the molecule-tenant pin-mutation conflict after ${waited}s over $attempt attempts (retry budget ${PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS}s, interval ${PROMOTE_CONFLICT_RETRY_INTERVAL_SECONDS}s). A fleet rollout or tenant provision has held the advisory fence for longer than this job is willing to wait; re-run once it completes, or raise PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS. Last CP response: ${CP_LAST_BODY:-<empty body>}" >&2
+          exit 1
+        fi
+        log "CP returned 409 on attempt $attempt (${waited}s of ${PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS}s budget used): ${CP_LAST_BODY:-<empty body>}"
+        sleep "$PROMOTE_CONFLICT_RETRY_INTERVAL_SECONDS"
+        waited=$((waited + PROMOTE_CONFLICT_RETRY_INTERVAL_SECONDS))
+        ;;
+      *)
+        echo "FATAL: CP POST /cp/admin/runtime-image/promote returned HTTP ${CP_LAST_STATUS:-<none>} — not a retryable conflict: ${CP_LAST_BODY:-<empty body>}" >&2
+        exit 1
+        ;;
+    esac
+  done
 }
 
 # ---- LOCAL_TENANT_IMAGE (the CP boot-default SSOT) read/write ----
@@ -444,7 +563,9 @@ PROVFAIL
 fi
 body="$(python3 -c 'import json,sys; print(json.dumps({"template_name":"molecule-tenant","image_digest":sys.argv[1],"git_sha":sys.argv[2],"notes":sys.argv[3]}))' \
   "$DIGEST" "$GIT_SHA" "$NOTES")"
-cp_json POST /cp/admin/runtime-image/promote "$body" >/dev/null
+# Called in the PARENT shell, not a command substitution: promote_pin's `exit 1`
+# must end the script, and a subshell exit would only end the subshell.
+promote_pin "$body"
 
 after="$(cp_json GET /cp/admin/runtime-image)"
 now_digest="$(printf '%s' "$after" | python3 -c '
