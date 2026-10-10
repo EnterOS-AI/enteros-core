@@ -204,7 +204,15 @@ jobs:
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 'stable'
+          # EXACT pin, not 'stable'. 'stable' is a moving target that turned main red
+          # twice with no code change: the roll to Go 1.27.1 (staticcheck panic, fixed
+          # by bumping golangci-lint to v2.13.2 — see the Install step below) and, on
+          # 2026-10-08/09, the roll to Go 1.27.2, under which golangci-lint v2.13.2 fails
+          # on the stdlib itself: "could not import os ... could not load export data"
+          # (main 061dc2f5, run 761868 — reproduced on rerun; 1.27.1 was green at 3a438e87).
+          # Toolchain bumps are now deliberate: raise this pin in a PR whose own Platform
+          # (Go) run proves build, vet, golangci-lint and the race gate on the new version.
+          go-version: '1.27.1'
           # cache:false — the self-hosted runner bind-mounts a persistent
           # GOCACHE/GOMODCACHE (/var/cache/ci-go-{build,mod}); actions/cache is
           # redundant and corrupts it by untarring over the bind mount ("File
@@ -1015,6 +1023,19 @@ jobs:
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Fleet roll cannot pass vacuously (both substrates)
         run: bash scripts/deploy/tests/test-k8s-fleet-roller.sh
+
+      # The STAGING lane's k8s arm. The gate above wraps its docker-arm cases in
+      # `if docker info`, so on a runner with no daemon the single most important
+      # assertion about this lane — that a roll with no census source and no
+      # docker tenant still REFUSES — silently does not run. This one supplies a
+      # fake docker as well as a fake kubectl, so that case always executes. It
+      # also drives resolve-k8s-fleet-census.sh through every failure it can
+      # have, and proves fleet-drift-audit.sh refuses an exclusion naming a
+      # tenant that is not measurably drifted (the property that keeps
+      # EXCLUDE_SLUGS from being --allow-empty spelled differently).
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
+        name: Staging fleet k8s arm is wired, and cannot pass vacuously
+        run: bash scripts/deploy/tests/test-staging-fleet-k8s-wiring.sh
 
       # The k8s deploy arm's first live run died with `python3: command not
       # found` because the tool it called was never declared anywhere and the

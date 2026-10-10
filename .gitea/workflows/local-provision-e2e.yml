@@ -236,7 +236,16 @@ jobs:
           refs=$(grep -hoE 'image: [^ ]+@sha256:[a-f0-9]{64}' docker-compose.yml docker-compose.infra.yml | sed 's/^image: //' | sort -u)
           rc=0
           for ref in $refs; do
-            plats=$(docker buildx imagetools inspect "$ref" 2>/dev/null | grep -E '^[[:space:]]+Platform:' | awk '{print $2}')
+            # Inspect failures are caught explicitly. Previously, under the
+            # runner's `set -e -o pipefail`, an image that could not be
+            # inspected (removed upstream, auth wall) killed this step inside
+            # the `plats=$(...)` assignment with NO message (core#5208).
+            if ! out=$(docker buildx imagetools inspect "$ref" 2>&1); then
+              echo "::error::CANNOT INSPECT: $ref — $(printf '%s' "$out" | tail -1)"
+              rc=1
+              continue
+            fi
+            plats=$(printf '%s\n' "$out" | grep -E '^[[:space:]]+Platform:' | awk '{print $2}' || true)
             if ! printf '%s\n' "$plats" | grep -qx 'linux/amd64' \
                || ! printf '%s\n' "$plats" | grep -q '^linux/arm64'; then
               echo "::error::NOT MULTI-ARCH: $ref [$(printf '%s' "$plats" | tr '\n' ' ')]"

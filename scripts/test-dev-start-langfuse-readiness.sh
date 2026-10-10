@@ -206,9 +206,9 @@ grep -Eq '^  minio:' "$COMPOSE" \
   || fail "docker-compose.infra.yml must declare the MinIO service"
 grep -Eq '^  minio-init:' "$COMPOSE" \
   || fail "docker-compose.infra.yml must declare the MinIO bucket bootstrap service"
-grep -Eq 'minio/minio:[^@]+@sha256:' "$COMPOSE" \
+grep -Eq 'image: [^ ]*/minio:[^@ ]+@sha256:[a-f0-9]{64}' "$COMPOSE" \
   || fail "MinIO image must be digest-pinned"
-grep -Eq 'minio/mc:[^@]+@sha256:' "$COMPOSE" \
+grep -Eq 'image: [^ ]*/minio-client:[^@ ]+@sha256:[a-f0-9]{64}' "$COMPOSE" \
   || fail "MinIO client image must be digest-pinned"
 # Every fixed image in both compose files must be digest-pinned. Variable
 # images (canvas/platform, resolved from the internal registry at runtime) are

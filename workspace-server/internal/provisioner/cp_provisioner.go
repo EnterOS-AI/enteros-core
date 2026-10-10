@@ -197,6 +197,27 @@ const cpAPITimeout = 120 * time.Second
 // restart but a workspace left down (core#5019).
 const cpProvisionTimeout = 20 * time.Minute
 
+// CPProvisionCeiling exposes the provision POST's budget so a CALLER can size
+// its own context against the thing that actually has to finish inside it.
+//
+// Exported for the same reason EnsureImageClientTimeout() is: a caller deadline
+// SMALLER than this constant bounds nothing. It cancels the request before the
+// client can ever time out, so widening the client achieves precisely nothing,
+// and the failure does not even surface here — it surfaces on the CONTROL PLANE
+// as `context canceled` in the middle of a multi-GB pull, with no client-side
+// timeout anywhere in the logs to point at.
+//
+// That inversion is not hypothetical. provisionWorkspaceCP bounded the whole
+// provision at provisioner.ProvisionTimeout (3 min) while core#5019 had already
+// widened this client to 20 min and the control plane had raised its own pull
+// cap to 30 min with a 2-minute stall window. The 3-minute context beat all
+// three, and a workspace created shortly after a runtime-image promote was
+// marked terminally failed while the pull was still making steady progress.
+//
+// Callers must size their context at OR ABOVE this value. handlers has a test
+// pinning that relation, which is what stops the inversion returning quietly.
+func CPProvisionCeiling() time.Duration { return cpProvisionTimeout }
+
 func (p *CPProvisioner) provisionAuthHeaders(req *http.Request) {
 	if p.sharedSecret != "" {
 		req.Header.Set("Authorization", "Bearer "+p.sharedSecret)
