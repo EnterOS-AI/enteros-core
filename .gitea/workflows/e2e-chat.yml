@@ -208,16 +208,16 @@ jobs:
             cts=$(date -u -d "$created" +%s 2>/dev/null) || continue
             if [ $(( now - cts )) -gt 7200 ]; then
               echo "sweeping stale e2e-chat container $c (created $created)"
-              timeout 30 docker rm -f "$c" >/dev/null 2>&1 || true
+              timeout 30 docker rm -fv "$c" >/dev/null 2>&1 || true
             fi
           done
 
       - name: Start Postgres (docker)
         run: |
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$PG_CONTAINER" \
+          # tmpfs PGDATA + run label + `rm -fv` pre-clean: see the script header.
+          bash .gitea/scripts/ci-service-container.sh postgres "$PG_CONTAINER" postgres:16 \
             -e POSTGRES_USER=dev -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=molecule \
-            -p 127.0.0.1::5432 postgres:16 >/dev/null
+            -p 127.0.0.1::5432 >/dev/null
           PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           if [ -z "$PG_PORT" ]; then
             PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | head -1 | awk -F: '{print $NF}')
@@ -241,8 +241,7 @@ jobs:
 
       - name: Start Redis (docker)
         run: |
-          docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$REDIS_CONTAINER" -p 127.0.0.1::6379 redis:7 >/dev/null
+          bash .gitea/scripts/ci-service-container.sh redis "$REDIS_CONTAINER" redis:7 -p 127.0.0.1::6379 >/dev/null
           REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           if [ -z "$REDIS_PORT" ]; then
             REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | head -1 | awk -F: '{print $NF}')
@@ -603,7 +602,20 @@ jobs:
             e2e/schedule-tab.spec.ts \
             e2e/boot-regression.spec.ts \
             e2e/css-diagnostic.spec.ts \
+            e2e/net-evidence-guard.spec.ts \
             --reporter=list 2>&1 | tee /tmp/pw-chat.out
+          # net-evidence-guard.spec.ts is listed because a guard that is not
+          # SELECTED does not run, and this one is the thing that stops
+          # core#5106 recurring silently. It needs no platform and no canvas —
+          # it serves its own `/_next/static/**` on an ephemeral port — so it
+          # cannot add a dependency to this step.
+          #
+          # It contains ONE `test.fail()` (an expected-failure over a body that
+          # asserts nothing, so the only thing that can produce the failure is
+          # the guard firing in teardown — that is the mutation-proof). An
+          # expected-failure counts under `passed` and prints no `skipped`, so
+          # the two REQUIRE-LIVE assertions below are unaffected. Measured on
+          # @playwright/test 1.59.1: `11 passed`, zero skipped.
           # The guard used to be `grep -qE '[0-9]+ (passed|failed|skipped)'` — which
           # ACCEPTED `skipped` as proof of execution, while its own comment claimed
           # "a silent all-skip can never report green". It could: an all-skipped run
@@ -669,5 +681,5 @@ jobs:
         run: |
           # timeout-wrap so a wedged docker daemon can't hang this always() step
           # (a hung rm here is one way containers leak in the first place).
-          timeout 30 docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          timeout 30 docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
+          timeout 30 docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
+          timeout 30 docker rm -fv "$REDIS_CONTAINER" 2>/dev/null || true

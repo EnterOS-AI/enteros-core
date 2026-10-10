@@ -1530,10 +1530,15 @@ func normalizeA2APayload(body []byte) ([]byte, string, *proxyA2AError) {
 // needs. The workspace id is a UUID (dash-delimited, no colons), so the
 // resulting id survives any runtime session-id sanitisation unchanged.
 //
-// Delegates to sessionid.DefaultContextID — the ONE authority for this
-// convention (the provisioner injects the SAME value into each workspace
-// container as MOLECULE_DEFAULT_SESSION_CONTEXT_ID, and the shared runtime
-// consumes it). The convention can only move in sessionid.
+// Delegates to sessionid.DefaultContextID — the platform-side authority for this
+// convention. It governs the id stamped as message.contextId on canvas /
+// restart-context / first-boot turns (those genuinely run in the user's
+// session). Runtime-internal self-wakes keep their OWN routing context_id and
+// converge only their Langfuse session_id runtime-side (tracing.TracingExecutor),
+// mirroring this same "canvas-<ws>" literal — there is deliberately NO
+// cross-container env handshake (an earlier MOLECULE_DEFAULT_SESSION_CONTEXT_ID
+// injection was removed; it let the runtime's id diverge from this one). Keep
+// the runtime's tracing literal in sync with sessionid if this ever moves.
 func canvasSessionContextID(workspaceID string) string {
 	return sessionid.DefaultContextID(workspaceID)
 }

@@ -36,7 +36,7 @@ cd "$HARNESS_ROOT"
 source "$HARNESS_ROOT/_curl.sh"
 
 TEMPLATE="${DELIVERY_TEMPLATE:-seo-agent}"
-RUNTIME="${DELIVERY_RUNTIME:-claude-code}"
+RUNTIME="${DELIVERY_RUNTIME:-hermes}"
 # 2026-08-04: sdk#203 withdrew moonshot/* from the platform arms; the old
 # default now 422s at workspace-create. Use the SSOT platform default.
 MODEL="${DELIVERY_MODEL:-minimax/MiniMax-M2.7}"
@@ -62,8 +62,8 @@ log "=== template-asset-delivery gate — tenant image = PR build; template=$TEM
 
 # ─── 0. satisfy the template's OWN required_env before provisioning ──────────
 #
-# The seo-agent template declares `runtime_config.required_env` (TENANT_NAME,
-# TENANT_DOMAIN, TENANT_DOMAIN_APEX, TENANT_DOMAIN_FULL, TENANT_TIMEZONE).
+# The seo-agent template declares `runtime_config.required_env` (HERMES_CRON_APPROVAL_MODE,
+# TENANT_NAME, TENANT_DOMAIN, TENANT_DOMAIN_APEX, TENANT_DOMAIN_FULL, TENANT_TIMEZONE).
 # Preflight #5 (workspace_provision_shared.go) ABORTS the provision when any of
 # them is unset, so cpProv.Start never runs and
 # PersistConfigBundleHostSide (cp_provisioner.go) never writes the host-side

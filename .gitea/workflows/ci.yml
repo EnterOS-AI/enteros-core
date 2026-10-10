@@ -204,7 +204,15 @@ jobs:
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: 'stable'
+          # EXACT pin, not 'stable'. 'stable' is a moving target that turned main red
+          # twice with no code change: the roll to Go 1.27.1 (staticcheck panic, fixed
+          # by bumping golangci-lint to v2.13.2 — see the Install step below) and, on
+          # 2026-10-08/09, the roll to Go 1.27.2, under which golangci-lint v2.13.2 fails
+          # on the stdlib itself: "could not import os ... could not load export data"
+          # (main 061dc2f5, run 761868 — reproduced on rerun; 1.27.1 was green at 3a438e87).
+          # Toolchain bumps are now deliberate: raise this pin in a PR whose own Platform
+          # (Go) run proves build, vet, golangci-lint and the race gate on the new version.
+          go-version: '1.27.1'
           # cache:false — the self-hosted runner bind-mounts a persistent
           # GOCACHE/GOMODCACHE (/var/cache/ci-go-{build,mod}); actions/cache is
           # redundant and corrupts it by untarring over the bind mount ("File
@@ -292,7 +300,45 @@ jobs:
         run: go vet ./...
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+        # v2.13.2, not v2.12.2, and the bump is a CRASH FIX rather than an
+        # upgrade for its own sake.
+        #
+        # v2.12.2 bundles honnef.co/go/tools v0.7.0, which PREDATES Go 1.27 and
+        # cannot lower a construct in the Go 1.27 stdlib to its IR. This job
+        # takes `go-version: stable`, which rolled to Go 1.27.1 — and staticcheck
+        # then panics rather than reporting a finding:
+        #
+        #   buildir: panic during analysis: unexpected expr: *ast.KeyValueExpr
+        #     honnef.co/go/tools@v0.7.0/go/ir/builder.go:888 (expr0)
+        #     ... builder.go:3027 (returnStmt)
+        #   Running error: can't run linter goanalysis_metalinter
+        #   fact_purity: package "poll" (isInitialPkg: false, needAnalyzeSource: true):
+        #     interface conversion: interface {} is nil, not *buildir.IR
+        #
+        # The typedness / nilness / SA5012 / fact_purity panics all CASCADE from
+        # that first buildir failure; the IR is nil for every consumer after it.
+        #
+        # THREE CONDITIONS MUST COINCIDE, which is why it looked like one PR's
+        # fault. Reproduced locally, and the reproduction is the evidence:
+        #   1. GOOS=linux — `internal/poll`'s Linux-only files are what break the
+        #      IR builder. It never reproduces on darwin, warm or cold.
+        #   2. A COLD cache — `needAnalyzeSource: true` says stdlib was analyzed
+        #      from SOURCE rather than read from cached facts. The runner
+        #      bind-mounts a shared GOCACHE, so this only bites after the
+        #      toolchain rolls and invalidates it.
+        #   3. Go 1.27.
+        # Under all three, UNMODIFIED main panics identically — so the crash is
+        # not attributable to whatever PR happens to be in flight. And because
+        # every Go step here is gated on `platform == 'true'`, PRs that do not
+        # touch workspace-server/** pass this job without ever running the
+        # linter: a green history is not evidence the linter is healthy.
+        #
+        # v2.13.2 bundles honnef.co/go/tools v0.8.1, which handles Go 1.27.
+        # VERIFIED under the exact failing conditions (linux + cold cache +
+        # Go 1.27.1): 0 panics, 0 issues — the bump fixes the crash without
+        # surfacing new findings. Pinning `go-version` back to 1.26.x would also
+        # stop the crash, but only defers the incompatibility to the next roll.
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Run golangci-lint
         run: $(go env GOPATH)/bin/golangci-lint run --timeout 3m ./...
@@ -965,6 +1011,45 @@ jobs:
         name: Promoted runtime images are ready before staging E2E
         run: bash scripts/deploy/tests/test-prepare-staging-runtime-images.sh
 
+      # A fleet roll that rolls NOTHING must never report success. The docker
+      # roller did exactly that on a k8s-substrate control plane: its label
+      # filter matched zero containers, it logged "nothing to roll" and exited 0,
+      # so the production fleet-roll step went green while every tenant pod stayed
+      # on its provisioning-time image. This drives BOTH rollers against a fake
+      # kubectl and asserts an EXIT CODE for each scenario in which a naive roller
+      # would pass: empty target set, every target scaled to zero, control-plane/
+      # cluster drift, and a rollout that returns success without moving the
+      # digest the pods are actually running.
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
+        name: Fleet roll cannot pass vacuously (both substrates)
+        run: bash scripts/deploy/tests/test-k8s-fleet-roller.sh
+
+      # The STAGING lane's k8s arm. The gate above wraps its docker-arm cases in
+      # `if docker info`, so on a runner with no daemon the single most important
+      # assertion about this lane — that a roll with no census source and no
+      # docker tenant still REFUSES — silently does not run. This one supplies a
+      # fake docker as well as a fake kubectl, so that case always executes. It
+      # also drives resolve-k8s-fleet-census.sh through every failure it can
+      # have, and proves fleet-drift-audit.sh refuses an exclusion naming a
+      # tenant that is not measurably drifted (the property that keeps
+      # EXCLUDE_SLUGS from being --allow-empty spelled differently).
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
+        name: Staging fleet k8s arm is wired, and cannot pass vacuously
+        run: bash scripts/deploy/tests/test-staging-fleet-k8s-wiring.sh
+
+      # The k8s deploy arm's first live run died with `python3: command not
+      # found` because the tool it called was never declared anywhere and the
+      # `local-deploy` runner does not carry it. This drives the toolchain
+      # preflight against a fake package manager and asserts BOTH directions —
+      # a present tool still resolves and a missing one produces a NAMED
+      # ::error:: — because a "fix" that simply failed every run would also
+      # have "handled" the missing interpreter. It also pins the shell shape
+      # itself: a bare `V="$(...)"` under `bash -e` dies ABOVE its own guard,
+      # while the rc-captured form reaches the guard and still fails closed.
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
+        name: Deploy toolchain preflight fails by NAME, and its good path still runs
+        run: bash scripts/deploy/tests/test-require-deploy-toolchain.sh
+
       # Enter OS rebrand Phase 2 (internal#1089): the ADVISORY enteros.ai edge
       # probe the deploy workflows run after the blocking daemon-side gate.
       # Drives the real script against a fake docker/curl and proves: dual
@@ -1209,7 +1294,11 @@ jobs:
             scripts/deploy/prepare-staging-runtime-images.sh \
             scripts/deploy/tests/test-prepare-staging-runtime-images.sh \
             scripts/deploy/probe-enteros-buildinfo.sh \
-            scripts/deploy/tests/test-probe-enteros-buildinfo.sh
+            scripts/deploy/tests/test-probe-enteros-buildinfo.sh \
+            scripts/deploy/redeploy-tenant-fleet-k8s.sh \
+            scripts/deploy/tests/test-k8s-fleet-roller.sh \
+            scripts/deploy/require-deploy-toolchain.sh \
+            scripts/deploy/tests/test-require-deploy-toolchain.sh
 
   # mc#959 root-fix (sre)
 
