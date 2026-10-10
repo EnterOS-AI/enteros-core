@@ -26,12 +26,12 @@
 # Optional env:
 #   E2E_RUNTIME                  hermes (default) | claude-code | codex | openclaw
 #                                | seo-agent
-#                                  - seo-agent: a claude-code-adapter template
-#                                    VARIANT (not a distinct registry runtime).
-#                                    Selected via the `template` field (config.yaml
-#                                    resolves runtime=claude-code); reuses the
-#                                    same MiniMax/claude-code key path. See the
-#                                    TEMPLATE derivation + SECRETS_JSON block.
+#                                  - seo-agent: a hermes template VARIANT (not a
+#                                    distinct registry runtime). Selected via the
+#                                    `template` field (config.yaml resolves
+#                                    runtime=hermes); platform-proxy MiniMax only,
+#                                    and HERMES_CRON_APPROVAL_MODE is seeded. See
+#                                    the TEMPLATE derivation + SECRETS_JSON block.
 #   E2E_PROVISION_TIMEOUT_SECS   default 900 (15 min cold-provision budget)
 #   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS  default 3600 (60 min — hermes
 #                                cold-boot worst-case + slack). Raised from
@@ -1098,6 +1098,17 @@ print(json.dumps({
 }))
 ")
 fi
+# seo-agent (hermes) declares HERMES_CRON_APPROVAL_MODE in its required_env:
+# hermes hard-denies code on scheduled turns without it, and preflight 422s
+# the create when it is missing. Merge it into whatever key path was chosen.
+if [ "${RUNTIME:-}" = "seo-agent" ]; then
+  SECRETS_JSON=$(SECRETS_JSON="$SECRETS_JSON" python3 -c "
+import json, os
+d = json.loads(os.environ['SECRETS_JSON'] or '{}')
+d['HERMES_CRON_APPROVAL_MODE'] = 'allow'
+print(json.dumps(d))
+")
+fi
 
 # Idle-digest sub-step (task #219): with E2E_IDLE_DIGEST_CHECK=on (the
 # ephemeral gate), inject the shrunken fire interval so the contract-driven
@@ -1310,9 +1321,9 @@ log "    MODEL_SLUG=$MODEL_SLUG"
 # ─── runtime → provision-selector resolution ────────────────────────────
 # Most runtimes are selected directly by the `runtime` field. seo-agent is
 # the exception: it is NOT a registry runtime (absent from manifest.json +
-# runtime_registry.go knownRuntimes) — it is a claude-code-adapter template
+# runtime_registry.go knownRuntimes) — it is a hermes template
 # VARIANT selected by the `template` field. The ws-server Create handler reads
-# the template's config.yaml, which declares `runtime: claude-code`, and
+# the template's config.yaml, which declares `runtime: hermes`, and
 # resolves the concrete runtime from there (workspace.go:290-336). So for
 # seo-agent we send template="seo-agent" and OMIT runtime, letting the
 # template resolve it — sending an explicit runtime="seo-agent" would
@@ -1355,7 +1366,7 @@ if _plugins:
 tmpl = os.environ.get('E2E_WS_TEMPLATE', '')
 if tmpl:
     # Template-selected variant (seo-agent): the template's config.yaml
-    # resolves runtime=claude-code server-side. Do NOT also send an explicit
+    # resolves runtime=hermes server-side. Do NOT also send an explicit
     # runtime — seo-agent is not a registry runtime and would 422.
     payload['template'] = tmpl
 else:
@@ -1368,7 +1379,7 @@ print(json.dumps(payload))
 }
 
 if [ -n "$PROVISION_TEMPLATE" ]; then
-  log "5/11 Provisioning parent workspace (runtime=$RUNTIME via template=$PROVISION_TEMPLATE → claude-code adapter)..."
+  log "5/11 Provisioning parent workspace (runtime=$RUNTIME via template=$PROVISION_TEMPLATE → hermes adapter)..."
 else
   log "5/11 Provisioning parent workspace (runtime=$RUNTIME)..."
 fi

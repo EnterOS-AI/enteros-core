@@ -22,6 +22,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -901,6 +902,64 @@ func (h *WorkspaceHandler) clearWorkspaceInstanceIDAfterStop(ctx context.Context
 	}
 }
 
+// inflightProvisionWait bounds how long a delete waits, in total, for cancelled
+// in-flight provisions to unwind. Past it the teardown proceeds; the start's own
+// removed-check (provisioner.SetWorkspaceRemovedCheck) discards anything it
+// still creates.
+const inflightProvisionWait = 15 * time.Second
+
+// inflightStartCanceller is the optional provisioner capability
+// cancelInflightProvisions uses. The Docker provisioner must keep implementing
+// it — a rename would make the type assertion fail silently and deletes would
+// stop waiting for in-flight provisions — hence the compile-time pin.
+type inflightStartCanceller interface {
+	CancelInflightStart(workspaceID string, wait time.Duration) bool
+}
+
+var _ inflightStartCanceller = (*provisioner.Provisioner)(nil)
+
+// cancelInflightProvisions cancels the provisioner.Start calls still running
+// for ids and waits (bounded) for them to return — cancel all first, then wait,
+// so they unwind concurrently. Docker backend only: the CP backend has no local
+// start to cancel, and test stubs without the method are skipped.
+func (h *WorkspaceHandler) cancelInflightProvisions(ids []string) {
+	c, ok := h.provisioner.(inflightStartCanceller)
+	if !ok {
+		return
+	}
+	for _, id := range ids {
+		c.CancelInflightStart(id, 0)
+	}
+	deadline := time.Now().Add(inflightProvisionWait)
+	for _, id := range ids {
+		if !c.CancelInflightStart(id, time.Until(deadline)) {
+			log.Printf("CascadeDelete %s: an in-flight provision is still unwinding after %s — its removed-check will discard what it creates", id, inflightProvisionWait)
+		}
+	}
+}
+
+// WorkspaceIsRemoved reports whether a workspace has been deleted: its row is
+// status='removed', or gone entirely (a ?purge=true delete). It is the probe the
+// Docker provisioner runs right before ContainerCreate and right after
+// ContainerStart (provisioner.SetWorkspaceRemovedCheck), so a provision that
+// was in flight when its workspace was deleted cannot leave a container behind.
+// A query error answers false: a DB blip must not kill a legitimate provision.
+func WorkspaceIsRemoved(ctx context.Context, workspaceID string) bool {
+	if db.DB == nil {
+		return false
+	}
+	var status string
+	err := db.DB.QueryRowContext(ctx, `SELECT status FROM workspaces WHERE id = $1`, workspaceID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true
+	}
+	if err != nil {
+		log.Printf("WorkspaceIsRemoved(%s): status lookup failed: %v — treating as not removed", workspaceID, err)
+		return false
+	}
+	return status == string(models.StatusRemoved)
+}
+
 // CascadeDelete performs the cascade-removal sequence used by the HTTP
 // DELETE handler and by OrgImport's reconcile mode: walk descendants, mark
 // self+descendants 'removed' first (#73 race guard), stop containers / EC2s,
@@ -967,6 +1026,14 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 		pq.Array(allIDs)); err != nil {
 		log.Printf("CascadeDelete token revocation for %s: %v", id, err)
 	}
+	// RC09: a provision for any of these workspaces may still be in flight —
+	// create, restart and bundle import each run provisioner.Start in their own
+	// goroutine, and a cold local build keeps it there for minutes. The rows are
+	// 'removed' as of the UPDATE above, so cancel those starts and wait for them
+	// to unwind BEFORE tearing down. Otherwise the start finishes after this
+	// teardown and creates ws-<id> anyway, which then crash-looped on an empty
+	// config volume with nothing left to stop it.
+	h.cancelInflightProvisions(allIDs)
 	// cleanupCtx is the non-cancelable, time-bounded teardown context: detached
 	// from the request ctx via context.WithoutCancel so a canceled / timed-out
 	// DELETE still runs the stop → remove-volume → broadcast sequence to

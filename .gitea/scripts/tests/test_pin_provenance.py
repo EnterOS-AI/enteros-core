@@ -17,6 +17,7 @@ import datetime as _dt
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -333,9 +334,218 @@ def _writer_run(**over):
 
 def test_verify_run_rejects_a_nonexistent_run(monkeypatch):
     monkeypatch.setattr(pp, "fetch_run", lambda *a, **k: None)
+    monkeypatch.setattr(pp, "fetch_commit_statuses", lambda *a, **k: [])
     with pytest.raises(pp.StampError) as exc:
         pp.verify_run(dict(STAMP_FIELDS), pp.DEFAULT_GITEA, None)
     assert "does NOT exist" in str(exc.value)
+    assert not isinstance(exc.value, pp.PurgedRun)
+
+
+# --- a 404 is either a fabricated id or a run lost to retention -------------
+#
+# Real values. The staging row's stamp cited run 693892, the staging-tenant-cd
+# push run for main a2348b19 (2026-09-03, rollback-pin). Gitea's
+# gitea-row-retention CronJob hard-deleted it after 30 days, and on 2026-10-07
+# the audit reported "a fabricated run id". 25 of the 171 statuses on a2348b19
+# still referenced the run. The two shapes below are copied from that commit's
+# status list, along with the reaper's status, which has an account as creator.
+
+PURGED_RUN = "693892"
+PURGED_SHA = "a2348b19b7c4a26f7bfd808f6e2aedfd1a2b7c87"
+PURGED_FIELDS = {
+    "run": PURGED_RUN,
+    "repo": "molecule-ai/molecule-core",
+    "wf": "staging-tenant-cd",
+    "job": "rollback-pin",
+    "sha": PURGED_SHA,
+}
+
+
+def _status(context: str, target_url: str, creator=None) -> dict:
+    return {
+        "status": "success",
+        "context": context,
+        "target_url": target_url,
+        "creator": creator,
+    }
+
+
+PURGED_RUN_STATUSES = [
+    _status(
+        "staging-tenant-cd / rollback-pin (revert pin if the fleet roll failed) (push)",
+        f"/molecule-ai/molecule-core/actions/runs/{PURGED_RUN}/jobs/1002512",
+    ),
+    _status(
+        "staging-tenant-cd / rollback-audit (prove rollback-pin itself actually executed) (push)",
+        f"/molecule-ai/molecule-core/actions/runs/{PURGED_RUN}/jobs/1002513",
+    ),
+    _status(
+        "pin-provenance-guard / Pin provenance (push)",
+        "/molecule-ai/molecule-core/actions/runs/693885/jobs/1002498",
+    ),
+    _status(
+        "Secret scan / Scan diff for credential-shaped strings (push)",
+        "",
+        creator={"login": "claude-status-reaper", "id": 94},
+    ),
+]
+
+
+def _absent(monkeypatch, statuses):
+    monkeypatch.setattr(pp, "fetch_run", lambda *a, **k: None)
+    if isinstance(statuses, Exception):
+        def boom(*a, **k):
+            raise statuses
+        monkeypatch.setattr(pp, "fetch_commit_statuses", boom)
+    else:
+        monkeypatch.setattr(pp, "fetch_commit_statuses", lambda *a, **k: list(statuses))
+
+
+def test_a_run_purged_by_retention_is_reported_as_purged_not_fabricated(monkeypatch):
+    """The 2026-10-07 regression, reproduced with that day's values."""
+    _absent(monkeypatch, PURGED_RUN_STATUSES)
+    with pytest.raises(pp.PurgedRun) as exc:
+        pp.verify_run(dict(PURGED_FIELDS), pp.DEFAULT_GITEA, None)
+    msg = str(exc.value)
+    assert "NOT evidence of a fabricated id" in msg
+    assert "'staging-tenant-cd'" in msg
+    assert "2 commit status(es) on a2348b19b7c4" in msg
+
+
+def test_a_purged_run_is_still_a_violation_in_the_audit(monkeypatch, tmp_path):
+    """The label changes. The verdict does not: rc 1, one violation."""
+    _absent(monkeypatch, PURGED_RUN_STATUSES)
+    notes = (
+        f"[ci-pin-provenance v1 repo=molecule-ai/molecule-core wf=staging-tenant-cd "
+        f"run={PURGED_RUN} job=rollback-pin sha={PURGED_SHA}] tenant image "
+        f"registry.moleculesai.app/molecule-ai/molecule-tenant:staging-aeec8e4"
+    )
+    buf = io.StringIO()
+    rc = pp.audit(
+        [("cp_staging", _pins(tmp_path, "p.json", FRESH_DIGEST, notes))],
+        gitea_url=pp.DEFAULT_GITEA,
+        token=None,
+        online=True,
+        out=buf,
+        landed_at=LANDED,
+    )
+    out = buf.getvalue()
+    assert rc == 1, out
+    assert "UNVERIFIABLE STAMP" in out
+    assert "FORGED STAMP" not in out
+    assert "violations: 1" in out
+    assert "stamped: 0" in out
+
+
+def test_a_status_posted_by_an_account_is_not_a_trace_of_the_run(monkeypatch):
+    """Anyone with write access can POST a status naming any run. The reaper's
+    shape (an account as creator) must not turn a fabricated id into 'purged'."""
+    forged = _status(
+        "staging-tenant-cd / rollback-pin (revert pin if the fleet roll failed) (push)",
+        f"/molecule-ai/molecule-core/actions/runs/{PURGED_RUN}/jobs/1002512",
+        creator={"login": "someone", "id": 7},
+    )
+    _absent(monkeypatch, [forged])
+    with pytest.raises(pp.StampError) as exc:
+        pp.verify_run(dict(PURGED_FIELDS), pp.DEFAULT_GITEA, None)
+    assert not isinstance(exc.value, pp.PurgedRun)
+    assert "does NOT exist" in str(exc.value)
+
+
+def test_statuses_of_a_different_run_are_not_a_trace_of_this_one(monkeypatch):
+    """Run 693885 is a real neighbour on the same commit. A prefix match on
+    '69388' or a loose 'runs/' search would wrongly accept it."""
+    _absent(monkeypatch, PURGED_RUN_STATUSES)
+    with pytest.raises(pp.StampError) as exc:
+        pp.verify_run(dict(PURGED_FIELDS, run="69389"), pp.DEFAULT_GITEA, None)
+    assert not isinstance(exc.value, pp.PurgedRun)
+
+
+def test_a_purged_run_of_a_non_pin_workflow_is_still_cover_for_nothing(monkeypatch):
+    """Same as test_verify_run_rejects_a_run_from_a_non_pin_workflow, for the
+    case where the cited run has been purged."""
+    _absent(monkeypatch, PURGED_RUN_STATUSES)
+    with pytest.raises(pp.StampError) as exc:
+        pp.verify_run(dict(PURGED_FIELDS, run="693885"), pp.DEFAULT_GITEA, None)
+    assert not isinstance(exc.value, pp.PurgedRun)
+    assert "not a single pin-writing workflow" in str(exc.value)
+
+
+def test_unreadable_statuses_fail_closed_and_never_say_purged(monkeypatch):
+    """An unread signal is not laundered into either the softer label or a pass."""
+    _absent(monkeypatch, pp.Undetermined("HTTP 502 reading the commit statuses"))
+    with pytest.raises(pp.StampError) as exc:
+        pp.verify_run(dict(PURGED_FIELDS), pp.DEFAULT_GITEA, None)
+    assert not isinstance(exc.value, pp.PurgedRun)
+    assert "could not be read" in str(exc.value)
+
+
+def test_a_stamp_without_a_full_sha_gets_no_status_lookup(monkeypatch):
+    """`sha=` is what the statuses are read under. An abbreviated or missing one
+    is not looked up, so it cannot name a ref."""
+    def must_not_be_called(*a, **k):
+        raise AssertionError("statuses read for a stamp without a full sha")
+
+    monkeypatch.setattr(pp, "fetch_run", lambda *a, **k: None)
+    monkeypatch.setattr(pp, "fetch_commit_statuses", must_not_be_called)
+    for sha in ("-", "a2348b19"):
+        with pytest.raises(pp.StampError) as exc:
+            pp.verify_run(dict(PURGED_FIELDS, sha=sha), pp.DEFAULT_GITEA, None)
+        assert not isinstance(exc.value, pp.PurgedRun)
+
+
+def test_an_existing_run_never_reads_commit_statuses(monkeypatch):
+    """The fallback is for a 404 only. A run that exists is judged by the
+    Actions API alone, as before."""
+    def must_not_be_called(*a, **k):
+        raise AssertionError("statuses read although the run exists")
+
+    monkeypatch.setattr(pp, "fetch_run", lambda *a, **k: _writer_run())
+    monkeypatch.setattr(pp, "fetch_commit_statuses", must_not_be_called)
+    assert "promote-prod-tenant-pin.yml" in pp.verify_run(
+        dict(STAMP_FIELDS), pp.DEFAULT_GITEA, None
+    )
+
+
+def test_pin_writer_names_match_the_workflow_files():
+    """The status context carries the workflow's `name:`, not its file. If a
+    pin writer is renamed, this mapping must change with it."""
+    assert set(pp.PIN_WRITER_WORKFLOW_NAMES) == set(pp.PIN_WRITER_WORKFLOWS)
+    for fname, name in pp.PIN_WRITER_WORKFLOW_NAMES.items():
+        text = (ROOT / ".gitea" / "workflows" / fname).read_text(encoding="utf-8")
+        m = re.search(r"(?m)^name:\s*['\"]?(.+?)['\"]?\s*$", text)
+        assert m, f"{fname} declares no top-level name:"
+        assert m.group(1) == name, f"{fname} is named {m.group(1)!r}, mapping says {name!r}"
+
+
+def test_fetch_commit_statuses_reads_past_a_short_page(monkeypatch):
+    """A server that caps pages below the requested limit must still be read
+    to the end. Stopping on the first short page would miss the trace."""
+    pages = {1: [{"id": i} for i in range(30)], 2: [{"id": 99}], 3: []}
+    seen = []
+
+    class _Resp:
+        def __init__(self, body):
+            self._body = body
+
+        def read(self):
+            return json.dumps(self._body).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=0):
+        page = int(req.full_url.rsplit("page=", 1)[1])
+        seen.append(page)
+        return _Resp(pages[page])
+
+    monkeypatch.setattr(pp.urllib.request, "urlopen", fake_urlopen)
+    got = pp.fetch_commit_statuses(PURGED_SHA, "molecule-ai/molecule-core", pp.DEFAULT_GITEA, None)
+    assert len(got) == 31
+    assert seen == [1, 2, 3]
 
 
 def test_verify_run_rejects_a_run_from_a_non_pin_workflow(monkeypatch):
