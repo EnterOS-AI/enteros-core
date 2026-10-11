@@ -37,13 +37,17 @@
 # ------------------------------------------------------
 # Targets are not guessed from namespace names and not taken from a status
 # column. The census asks the control plane which orgs are on which substrate
-# (org_substrates.substrate), then finds each k8s org's workload by the labels
-# the provisioner stamps on it:
+# (org_substrates.substrate) and where each k8s org lives
+# (org_substrates.instance_id, which for a k8s org IS its namespace), then finds
+# the org's workload INSIDE that namespace by the labels the provisioner stamps:
 #     molecule.component=tenant, molecule.managed-by=controlplane,
 #     molecule.org-id=<uuid>, molecule.org-slug=<slug>
 # Matching on molecule.org-id (the CP's own primary key) means the CP row and the
-# cluster object are joined on identity, not on a derived name — a namespace
-# rename cannot silently empty the target set.
+# cluster object are joined on identity, not on a name: a Deployment that does
+# not carry this org's id is not this org's tenant, whatever namespace it is in.
+# A tenant that is not in the namespace the control plane records is reported
+# (FAIL:no-workload, naming the namespace searched) — never hunted for
+# cluster-wide. See LEAST PRIVILEGE below.
 #
 # Deliberately NOT keyed on org_instances.status. That column is known to drift:
 # it reads 'running' for orgs that have no tenant pod at all. A roller keyed on a
@@ -74,12 +78,26 @@
 #                         staging-<sha> tag when not set)
 #   ROLLOUT_TIMEOUT       per-workload rollout wait (default 300s)
 #   TENANT_CONTAINER      container name inside the pod (default: tenant)
+#   TENANT_NAMESPACE_PREFIX  prefix for a census row whose instance_id is EMPTY
+#                         (default: enteros — the SDK's branding.ResourcePrefix,
+#                         from which the provisioner names every namespace)
 #   EXCLUDE_SLUGS         same as --exclude, for CI env wiring
 #
 # SAFETY: --dry-run performs zero mutations. --exclude / EXCLUDE_SLUGS hard-skip
 # named slugs before any mutation. This script only ever issues `kubectl set
 # image` on a tenant Deployment; it never scales, drains, evicts, deletes or
 # restarts anything, and never touches a PVC, namespace or StatefulSet.
+#
+# LEAST PRIVILEGE: every cluster call is scoped to ONE tenant namespace, so the
+# credential needs, in each tenant namespace and nowhere else:
+#     deployments.apps  get, list, watch, patch  (label lookup, current image,
+#                                                 set image, rollout status)
+#     pods              list                     (serving pods and their imageIDs)
+#     pods/proxy        get                      (/buildinfo of each serving pod;
+#                                                 only when EXPECTED_BUILD_SHA applies)
+# No cluster-scoped grant and no pods/exec. `kubectl version` reads /version,
+# which any authenticated identity may. The census is not part of this: the
+# default one is psql, and a SUBSTRATE_CENSUS_CMD brings whatever it needs.
 set -euo pipefail
 
 log() { printf '>> [k8s-fleet] %s\n' "$*" >&2; }
@@ -89,10 +107,13 @@ TENANT_IMAGE="${TENANT_IMAGE:-registry.moleculesai.app/molecule-ai/molecule-tena
 KUBECTL="${KUBECTL:-kubectl}"
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-300s}"
 TENANT_CONTAINER="${TENANT_CONTAINER:-tenant}"
+TENANT_NAMESPACE_PREFIX="${TENANT_NAMESPACE_PREFIX:-enteros}"
 IMAGE="" ; TAG="" ; DIGEST="" ; DRY_RUN=0 ; ONLY="" ; ALLOW_EMPTY=0
 EXCLUDE="${EXCLUDE_SLUGS:-}"
 
-usage() { sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+# The whole header comment, however long it grows (a fixed line range silently
+# cut off Usage/Env as soon as a section was added above them).
+usage() { sed -n '2,/^set -euo pipefail$/{/^#/p;}' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --image)       IMAGE="$2"; shift 2;;
@@ -306,10 +327,26 @@ converged_pods() {
   printf '%s' "$pods"; return 0
 }
 
+# buildinfo_sha <ns> <pod>: the git_sha the pod's own /buildinfo reports, read
+# through the API server's pod proxy (GET on pods/proxy) — NOT `kubectl exec`.
+# Reading a public build identifier must not need the power to run commands in
+# every tenant pod. 8080 is the tenant container's `api` port, the Go server
+# that serves /buildinfo and answers the pod's probes; the body is the same
+# {"git_sha":"<sha>"} the in-pod wget used to read, parsed the same way.
+#
+# Any failure yields an EMPTY sha, which the caller fails as
+# FAIL:buildinfo-mismatch; it can never pass. That includes the NETWORK half:
+# the API server dials the pod itself, and a tenant namespace is default-deny,
+# admitting ingress only from kube-system and same-namespace pods. Measured
+# 2026-10-11 on the k3s fleet: tenants on the API server's own node answered,
+# tenants on the worker nodes got a 502 from the proxy.
+#
+# </dev/null because the caller runs this inside `while read … <<< "$pods"`: a
+# KUBECTL wrapper that reads stdin (ssh does) would swallow the remaining pod
+# lines, and those replicas would never be probed at all.
 buildinfo_sha() {
   local ns="$1" pod="$2" body
-  body="$($KUBECTL -n "$ns" exec "$pod" -c "$TENANT_CONTAINER" -- \
-            wget -qO- http://localhost:8080/buildinfo 2>/dev/null || true)"
+  body="$($KUBECTL get --raw "/api/v1/namespaces/${ns}/pods/${pod}:8080/proxy/buildinfo" </dev/null 2>/dev/null || true)"
   printf '%s' "$body" | sed -n 's/.*"git_sha"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
 }
 
@@ -328,35 +365,83 @@ record() { REPORT+=("$1|$2|$3|$4|$5"); }
 
 TENANT_SELECTOR="molecule.component=tenant,molecule.managed-by=controlplane"
 
+# k8s_sanitize_org <slug>: the namespace segment the provisioner derives from a
+# slug — molecule-controlplane's k8sSanitizeOrg (kubernetes_names.go), mirrored:
+# lowercased, every run of characters outside [a-z0-9] collapsed to one '-',
+# leading/trailing '-' trimmed, capped at 40 and re-trimmed, "org" if empty.
+k8s_sanitize_org() {
+  local s
+  s="$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+        | LC_ALL=C sed -e 's/[^a-z0-9][^a-z0-9]*/-/g' -e 's/^-//' -e 's/-$//')"
+  s="$(printf '%s' "${s:0:40}" | sed -e 's/-$//')"
+  printf '%s' "${s:-org}"
+}
+
+# The namespaced lookup's stderr, so an API error can be told apart from "no
+# such workload" (see below).
+LOOKUP_ERR="$(mktemp)"
+# `|| true`: under set -e a failing EXIT-trap command becomes the script's exit
+# status, and cleanup must never turn a verified roll into a red one.
+trap 'rm -f "$LOOKUP_ERR" || true' EXIT
+
 for i in "${!SEL_SLUGS[@]}"; do
   slug="${SEL_SLUGS[$i]}" ; orgid="${SEL_ORGIDS[$i]}"
   sel="${TENANT_SELECTOR},molecule.org-id=${orgid}"
 
-  # Locate the workload by CP identity (org-id label), cluster-wide. No name
-  # derivation: if the object is not labelled with this org's id, it is not this
-  # org's tenant, whatever it is called.
-  loc="$($KUBECTL get deploy -A -l "$sel" \
-          -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}' 2>/dev/null || true)"
+  # WHICH NAMESPACE: the control plane's record, never a search. For a k8s org
+  # the census instance_id IS the namespace — the provisioner returns the
+  # Namespace name as the InstanceID and the control plane stamps it into
+  # org_substrates.instance_id (molecule-controlplane migration 068;
+  # Kubernetes.resolveNamespace decodes it the same way). So a tenant recorded
+  # under an older brand prefix (mol-<slug>) is looked for where it really is.
+  # Only an EMPTY instance_id — a substrate flip blanks it until the next
+  # provision stamps it — falls back to the control plane's own derivation,
+  # K8sNamespaceName: <TENANT_NAMESPACE_PREFIX>-<sanitised slug>.
+  inst="$(printf '%s' "${SEL_INSTIDS[$i]}" | tr -d '[:space:]')"
+  if [ -n "$inst" ]; then
+    ns="$inst"; ns_from="the namespace the control plane recorded as its census instance_id"
+  else
+    ns="${TENANT_NAMESPACE_PREFIX}-$(k8s_sanitize_org "$slug")"
+    ns_from="derived as ${TENANT_NAMESPACE_PREFIX}-<slug> because the census instance_id is EMPTY"
+  fi
+
+  # Locate the workload by CP identity (org-id label) INSIDE that namespace.
+  # Deliberately no cluster-wide fallback: the credential holds no cluster-wide
+  # list, and "look everywhere" would quietly roll a tenant that is not where the
+  # control plane believes it is.
+  lrc=0
+  loc="$($KUBECTL -n "$ns" get deploy -l "$sel" \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}' 2>"$LOOKUP_ERR")" || lrc=$?
+  if [ "$lrc" -ne 0 ]; then
+    # An API error is an ACCESS fault — most often no role in this namespace —
+    # not evidence that the tenant is missing. Calling it no-workload would send
+    # the operator after control-plane drift that does not exist.
+    err "${slug}: could not list Deployments in namespace '${ns}', ${ns_from}: $(tr '\n' ' ' < "$LOOKUP_ERR" | cut -c1-400)"
+    err "${slug}: that is a fault in this credential's access to '${ns}', not a statement about the tenant"
+    record "$slug" "$ns" "-" "-" "FAIL:lookup-error"
+    FAILED=$((FAILED+1)); continue
+  fi
   nmatch="$(printf '%s' "$loc" | grep -c . || true)"
 
   if [ "$nmatch" -eq 0 ]; then
-    # CP says this org is on k8s, but no tenant Deployment carries its id. This is
-    # real drift and must be loud: the CP's org_instances.status column is known to
-    # read 'running' for orgs in exactly this state.
-    err "${slug}: control plane says substrate=k8s (instance_id='${SEL_INSTIDS[$i]}') but NO tenant Deployment carries molecule.org-id=${orgid}"
+    # CP says this org is on k8s, but no tenant Deployment in its namespace
+    # carries its id. This is real drift and must be loud: the CP's
+    # org_instances.status column is known to read 'running' for orgs in
+    # exactly this state.
+    err "${slug}: control plane says substrate=k8s (instance_id='${SEL_INSTIDS[$i]}') but NO tenant Deployment in namespace '${ns}' carries molecule.org-id=${orgid}"
+    err "${slug}: '${ns}' is ${ns_from}; no other namespace is searched"
     err "${slug}: control-plane state and cluster reality disagree — not silently skipping"
-    record "$slug" "-" "-" "-" "FAIL:no-workload"
+    record "$slug" "$ns" "-" "-" "FAIL:no-workload"
     FAILED=$((FAILED+1)); continue
   fi
   if [ "$nmatch" -gt 1 ]; then
-    err "${slug}: ${nmatch} Deployments carry molecule.org-id=${orgid} — ambiguous, refusing to roll"
-    record "$slug" "-" "-" "-" "FAIL:ambiguous"
+    err "${slug}: ${nmatch} Deployments in namespace '${ns}' carry molecule.org-id=${orgid} — ambiguous, refusing to roll"
+    record "$slug" "$ns" "-" "-" "FAIL:ambiguous"
     FAILED=$((FAILED+1)); continue
   fi
 
-  ns="$(printf '%s' "$loc" | cut -f1)"
-  dep="$(printf '%s' "$loc" | cut -f2)"
-  reps="$(printf '%s' "$loc" | cut -f3)"
+  dep="$(printf '%s' "$loc" | cut -f1)"
+  reps="$(printf '%s' "$loc" | cut -f2)"
   [ -n "$reps" ] || reps=0
 
   before="$(live_pods "$ns" "$sel" | pod_digests)"
@@ -452,6 +537,7 @@ for i in "${!SEL_SLUGS[@]}"; do
       got="$(buildinfo_sha "$ns" "$pod")"
       if ! sha_matches "$got" "$EXPECTED_BUILD_SHA"; then
         err "${slug}: ${pod} /buildinfo git_sha='${got:-<empty>}' does not match expected ${EXPECTED_BUILD_SHA}"
+        [ -n "$got" ] || err "${slug}: nothing came back through the pod proxy — this credential lacks get on pods/proxy in '${ns}', or the API server cannot reach ${pod}:8080 (see buildinfo_sha)"
         build_failed=1
       else
         log "  ${pod} /buildinfo git_sha=${got} matches ${EXPECTED_BUILD_SHA}"

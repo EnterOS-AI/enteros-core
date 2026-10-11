@@ -13,6 +13,16 @@ on rollback: Kubernetes can still list the superseded pod first while it drains.
 Every serving replica must match the target. Missing image IDs, mixed digests,
 unreadable pods, and mismatched build information fail verification.
 
+The roller only looks for a tenant in one namespace. That is the namespace the
+census records as `org_substrates.instance_id`, or `enteros-<slug>` when that
+column is empty. A tenant found nowhere else fails as `FAIL:no-workload`, and an
+API error such as a missing role fails as `FAIL:lookup-error`. Each pod's
+`/buildinfo` is read through the API server's pod proxy, not `exec`. So the
+credential needs, in each tenant namespace only, Deployments
+get/list/watch/patch, Pods list and `pods/proxy` get. The proxy can reach only
+pods that the tenant NetworkPolicy lets the API server reach, and a `/buildinfo`
+read that cannot connect fails verification.
+
 Run the local regression suites with Bash:
 
 ```sh

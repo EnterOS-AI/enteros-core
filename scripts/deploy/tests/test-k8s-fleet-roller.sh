@@ -19,6 +19,14 @@
 # "after" fixture. That is what makes the landed-vs-not distinction testable with
 # no cluster: a fixture whose after-state keeps the OLD digest is precisely a
 # deploy that returned success and moved nothing.
+#
+# The fake ALSO plays the roller's LEAST-PRIVILEGE credential. What that
+# credential is not granted — a cluster-wide read (-A / --all-namespaces),
+# `exec` into a pod, any call in a namespace it holds no role in — is refused the
+# way the API server refuses it (non-zero exit, `Error from server (Forbidden)`),
+# and every call is logged so the cases below can assert WHICH calls the roller
+# made. A fake that answered `exec` and `-A` happily is exactly how a regression
+# back to either would stay green.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$here/../redeploy-tenant-fleet-k8s.sh"
@@ -35,15 +43,22 @@ REPO="registry.example.invalid/molecule-ai/molecule-tenant"
 ORG_A="aaaaaaaa-0000-4000-8000-0000000000aa"
 ORG_B="bbbbbbbb-0000-4000-8000-0000000000bb"
 ORG_C="cccccccc-0000-4000-8000-0000000000cc"
+ORG_E="eeeeeeee-0000-4000-8000-0000000000ee"
 
 # ── fake kubectl ─────────────────────────────────────────────────────────────
 cat > "$tmp/bin/kubectl" <<'FAKE'
 #!/usr/bin/env bash
 # Fixture-driven kubectl. State lives in $K8RT:
-#   deploys      ns \t name \t replicas \t org-id \t image
-#   pods         ns, name, org-id, imageID, deletionTimestamp, phase, ready, git_sha (TSV)
-#                Omitted phase/ready fields default to Running/true.
-#   pods.after   optional; `set image` promotes it over `pods`
+#   deploys        ns \t name \t replicas \t org-id \t image
+#   pods           ns, name, org-id, imageID, deletionTimestamp, phase, ready, git_sha (TSV)
+#                  Omitted phase/ready fields default to Running/true.
+#   pods.after     optional; `set image` promotes it over `pods`
+#   forbidden-ns   optional; namespaces the credential holds NO role in
+#   proxy.fail     optional; the API server cannot reach the pod (pods/proxy 503)
+#   calls.log      every invocation, one line: "ns=<ns> <args...>"
+#   buildinfo.log  every pod whose /buildinfo was requested through pods/proxy
+# A pod's /buildinfo reports its git_sha column, or FAKE_BUILDINFO_SHA (default
+# deadbee) when that column is empty.
 set -uo pipefail
 ns="" ; args=()
 while [ "$#" -gt 0 ]; do
@@ -53,10 +68,22 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 set -- "${args[@]:-}"
+printf 'ns=%s %s\n' "$ns" "$*" >> "$K8RT/calls.log"
 org_of_sel() { printf '%s' "${*}" | sed -n 's/.*molecule\.org-id=\([0-9a-f-]*\).*/\1/p'; }
+forbid() { echo "Error from server (Forbidden): $*" >&2; exit 1; }
+no_role_in() { [ -f "$K8RT/forbidden-ns" ] && grep -qxF -- "$1" "$K8RT/forbidden-ns"; }
+
+# ── the least-privilege RBAC this fake enforces ──────────────────────────────
+for a in "$@"; do
+  case "$a" in
+    -A|--all-namespaces) forbid "cannot list at the cluster scope (the roller's credential is namespaced only)";;
+  esac
+done
+[ -z "$ns" ] || ! no_role_in "$ns" || forbid "the credential holds no role in namespace \"$ns\""
 
 case "${1:-}" in
   version) echo '{"clientVersion":{"gitVersion":"fake"}}'; exit 0;;
+  exec) forbid "cannot create resource \"pods/exec\" in namespace \"$ns\" (tenant /buildinfo is read through pods/proxy)";;
   set)
     # set image deployment/<name> <container>=<ref>
     printf '%s\n' "$*" >> "$K8RT/set-image.log"
@@ -65,21 +92,40 @@ case "${1:-}" in
   rollout)
     [ -f "$K8RT/rollout.fail" ] && exit 1
     exit 0;;
-  exec)
-    printf '%s\n' "$2" >> "$K8RT/exec.log"
-    awk -F'\t' -v ns="$ns" -v pod="$2" '$1==ns && $2==pod {printf "{\"git_sha\":\"%s\"}\n",$8}' "$K8RT/pods"
-    exit 0;;
   get) shift;;
   *) exit 0;;
 esac
 
 case "${1:-}" in
+  --raw)
+    # The pods/proxy subresource: /api/v1/namespaces/<ns>/pods/<pod>:<port>/proxy/<path>
+    p="${2:-}"
+    case "$p" in
+      /api/v1/namespaces/*/pods/*/proxy/*) ;;
+      *) echo "Error from server (NotFound): the server could not find the requested resource" >&2; exit 1;;
+    esac
+    rest="${p#/api/v1/namespaces/}"; pns="${rest%%/*}"; rest="${rest#*/pods/}"
+    target="${rest%%/proxy/*}"; path="${rest#*/proxy/}"
+    pod="${target%%:*}"; port=""; [ "$target" = "$pod" ] || port="${target#*:}"
+    printf '%s\n' "$pod" >> "$K8RT/buildinfo.log"
+    ! no_role_in "$pns" || forbid "cannot get resource \"pods/proxy\" in namespace \"$pns\""
+    awk -F'\t' -v n="$pns" -v p="$pod" '$1==n && $2==p {f=1} END {exit !f}' "$K8RT/pods" \
+      || { echo "Error from server (NotFound): pods \"$pod\" not found" >&2; exit 1; }
+    [ ! -f "$K8RT/proxy.fail" ] \
+      || { echo "Error from server (ServiceUnavailable): error trying to reach service: dial tcp ${pod}:${port}: connect: connection refused" >&2; exit 1; }
+    # Only the tenant API port serves /buildinfo; anything else is a 404 from the pod.
+    if [ "$port" != "8080" ] || [ "$path" != "buildinfo" ]; then
+      echo "Error from server (NotFound): the server could not find the requested resource" >&2; exit 1
+    fi
+    sha="$(awk -F'\t' -v n="$pns" -v p="$pod" '$1==n && $2==p {print $8; exit}' "$K8RT/pods")"
+    printf '{"git_sha":"%s"}\n' "${sha:-${FAKE_BUILDINFO_SHA:-deadbee}}"
+    ;;
   deploy|deployment|deployments)
     shift
-    sel="$*"
-    if printf '%s' "$sel" | grep -q -- '-A'; then
-      org="$(org_of_sel "$sel")"
-      awk -F'\t' -v o="$org" '$4==o {printf "%s\t%s\t%s\n",$1,$2,$3}' "$K8RT/deploys"
+    if [ "${1:-}" = "-l" ]; then
+      # namespaced list by label selector -> name \t replicas
+      org="$(org_of_sel "${2:-}")"
+      awk -F'\t' -v o="$org" -v ns="$ns" '$1==ns && $4==o {printf "%s\t%s\n",$2,$3}' "$K8RT/deploys"
     else
       # -o go-template asking for the current image of one deployment
       name="$1"
@@ -118,9 +164,12 @@ FAKE
 chmod +x "$tmp/bin/kubectl"
 export PATH="$tmp/bin:$PATH"
 
+# row <field>... — one TAB-separated fixture line.
+row() { local IFS=$'\t'; printf '%s\n' "$*"; }
+
 reset_state() {
-  : > "$K8RT/exec.log"
-  : > "$K8RT/set-image.log"; rm -f "$K8RT/rollout.fail" "$K8RT/pods.after"
+  : > "$K8RT/set-image.log"; : > "$K8RT/calls.log"; : > "$K8RT/buildinfo.log"
+  rm -f "$K8RT/rollout.fail" "$K8RT/pods.after" "$K8RT/forbidden-ns" "$K8RT/proxy.fail"
   # alpha: 1 replica, serving the OLD digest. zero: 0 replicas, no pods.
   printf '%s\n' \
     "ns-alpha	enteros-tenant	1	$ORG_A	$REPO@$D_OLD" \
@@ -200,10 +249,10 @@ printf '%s\n' \
   "ns-alpha	serving-a	$ORG_A	$REPO@$D_NEW		Running	true	cafe1234" \
   "ns-alpha	serving-b	$ORG_A	$REPO@$D_NEW		Running	true	cafe1234" > "$K8RT/pods.after"
 EXPECTED_BUILD_SHA=cafe1234 check "rollback ignores a draining old pod listed first" 0 "ROLLED" "$CENSUS_A" --digest "$D_NEW"
-if [ "$(sort "$K8RT/exec.log")" = $'serving-a\nserving-b' ]; then
+if [ "$(sort "$K8RT/buildinfo.log")" = $'serving-a\nserving-b' ]; then
   echo "ok: buildinfo probed every serving replica and no stragglers"; PASS=$((PASS+1))
 else
-  echo "FAIL: buildinfo probed the wrong pod set"; cat "$K8RT/exec.log"; FAILED=$((FAILED+1))
+  echo "FAIL: buildinfo probed the wrong pod set"; cat "$K8RT/buildinfo.log"; FAILED=$((FAILED+1))
 fi
 reset_state
 printf '%s\n' \
@@ -238,6 +287,113 @@ if grep -qF "${REPO}@${D_NEW}" "$K8RT/set-image.log"; then
 else
   echo "FAIL: set image did not re-pin against the workload's existing repo"; cat "$K8RT/set-image.log"; FAILED=$((FAILED+1))
 fi
+
+# logged <label> <fixed string>: the roller made this exact kubectl call.
+logged() {
+  if grep -qF -- "$2" "$K8RT/calls.log"; then echo "ok: $1"; PASS=$((PASS+1)); return; fi
+  echo "FAIL: $1 — no kubectl call contains '$2'"; sed 's/^/    /' "$K8RT/calls.log"; FAILED=$((FAILED+1))
+}
+# never_logged <label> <ERE>: the roller made NO kubectl call like this.
+never_logged() {
+  local hits
+  hits="$(grep -E -- "$2" "$K8RT/calls.log" || true)"
+  if [ -z "$hits" ]; then echo "ok: $1"; PASS=$((PASS+1)); return; fi
+  echo "FAIL: $1"; printf '%s\n' "$hits" | sed 's/^/    /'; FAILED=$((FAILED+1))
+}
+NO_CLUSTER_WIDE='(^| )(-A|--all-namespaces)( |$)'
+NO_EXEC='^ns=[^ ]* exec( |$)'
+
+echo "== the tenant is looked up INSIDE its namespace, never cluster-wide =="
+# The census instance_id IS the namespace: the k8s provisioner returns the
+# Namespace name as the InstanceID and the control plane records it there.
+reset_state
+row ns-alpha enteros-tenant-abc "$ORG_A" "$REPO@$D_NEW" > "$K8RT/pods.after"
+check "a tenant is found in the namespace its census row records" 0 "ROLLED" "$CENSUS_A" --digest "$D_NEW"
+logged "the Deployment lookup is scoped to that namespace" \
+  "ns=ns-alpha get deploy -l molecule.component=tenant,molecule.managed-by=controlplane,molecule.org-id=$ORG_A"
+never_logged "no call reads cluster-wide (-A / --all-namespaces)" "$NO_CLUSTER_WIDE"
+never_logged "no call execs into a pod" "$NO_EXEC"
+
+reset_state
+# alpha's Deployment carries alpha's org-id but sits somewhere the control plane
+# does not record. A cluster-wide lookup would have found and rolled it; the
+# namespaced one must say where it looked instead of hunting for it.
+row ns-elsewhere enteros-tenant 1 "$ORG_A" "$REPO@$D_OLD" > "$K8RT/deploys"
+check "a tenant outside its recorded namespace is FAIL:no-workload, naming where it looked" 1 \
+  "NO tenant Deployment in namespace 'ns-alpha'" "$CENSUS_A" --digest "$D_NEW"
+never_logged "not finding it there did not trigger a cluster-wide search" "$NO_CLUSTER_WIDE"
+# CONTROL: the same fixture IS a findable tenant when the census points at it, so
+# the FAIL above is the namespace scoping and not a fixture that never took.
+check "control: pointed at ns-elsewhere, the same Deployment is found" 0 "DRYRUN:planned" \
+  "printf 'alpha\t$ORG_A\tk8s\tns-elsewhere\n'" --digest "$D_NEW" --dry-run
+
+reset_state
+# An EMPTY instance_id (a substrate flip blanks it until the next provision
+# stamps it) falls back to the control plane's own derivation, K8sNamespaceName:
+# <prefix>-<slug>, sanitised the way the provisioner sanitises it ("--" collapses,
+# a trailing "-" is trimmed).
+row enteros-gamma-two enteros-tenant 1 "$ORG_E" "$REPO@$D_OLD" >> "$K8RT/deploys"
+row enteros-gamma-two enteros-tenant-g "$ORG_E" "$REPO@$D_OLD" >> "$K8RT/pods"
+row enteros-gamma-two enteros-tenant-g "$ORG_E" "$REPO@$D_NEW" > "$K8RT/pods.after"
+check "an empty instance_id falls back to <prefix>-<sanitised slug>" 0 "ROLLED" \
+  "printf 'gamma--two-\t$ORG_E\tk8s\t\n'" --digest "$D_NEW"
+logged "the fallback namespace is enteros-gamma-two" "ns=enteros-gamma-two get deploy -l "
+
+reset_state
+row acme-gamma-two enteros-tenant 1 "$ORG_E" "$REPO@$D_OLD" >> "$K8RT/deploys"
+row acme-gamma-two enteros-tenant-g "$ORG_E" "$REPO@$D_OLD" >> "$K8RT/pods"
+row acme-gamma-two enteros-tenant-g "$ORG_E" "$REPO@$D_NEW" > "$K8RT/pods.after"
+export TENANT_NAMESPACE_PREFIX=acme
+check "TENANT_NAMESPACE_PREFIX drives the fallback (it mirrors the SDK brand prefix)" 0 "ROLLED" \
+  "printf 'gamma--two-\t$ORG_E\tk8s\t\n'" --digest "$D_NEW"
+unset TENANT_NAMESPACE_PREFIX
+
+reset_state
+# A tenant provisioned under the previous brand prefix lives in mol-<slug>, and
+# its instance_id says so. A row that names its namespace is used as recorded,
+# never re-derived.
+row mol-delta enteros-tenant 1 "$ORG_E" "$REPO@$D_OLD" >> "$K8RT/deploys"
+row mol-delta enteros-tenant-d "$ORG_E" "$REPO@$D_OLD" >> "$K8RT/pods"
+row mol-delta enteros-tenant-d "$ORG_E" "$REPO@$D_NEW" > "$K8RT/pods.after"
+check "a recorded mol-<slug> namespace is used as recorded" 0 "ROLLED" \
+  "printf 'delta\t$ORG_E\tk8s\tmol-delta\n'" --digest "$D_NEW"
+logged "the lookup went to mol-delta" "ns=mol-delta get deploy -l "
+
+reset_state
+# No role in the tenant's namespace (e.g. its RoleBinding was never created) is
+# an ACCESS fault. Reporting it as "no workload" would send the operator after
+# control-plane drift that does not exist.
+echo ns-alpha > "$K8RT/forbidden-ns"
+check "no role in the tenant namespace is FAIL:lookup-error, not drift" 1 "FAIL:lookup-error" \
+  "$CENSUS_A" --digest "$D_NEW"
+check "the lookup error carries the API server's own reason" 1 "Error from server (Forbidden)" \
+  "$CENSUS_A" --digest "$D_NEW"
+
+echo "== /buildinfo is read through the API server's pod proxy, never exec =="
+# --tag <env>-<sha> carries no digest, so /buildinfo is the ONLY identity check:
+# these cases prove its answer is actually used, in both directions.
+reset_state
+row ns-alpha enteros-tenant-abc "$ORG_A" "$REPO@$D_NEW" > "$K8RT/pods.after"
+export FAKE_BUILDINFO_SHA="0badc0de0123456789abcdef0123456789abcdef"
+check "/buildinfo reporting the expected git_sha => ROLLED" 0 \
+  "/buildinfo git_sha=${FAKE_BUILDINFO_SHA} matches 0badc0de" "$CENSUS_A" --tag staging-0badc0de
+logged "the probe is GET pods/proxy on the tenant API port" \
+  "get --raw /api/v1/namespaces/ns-alpha/pods/enteros-tenant-abc:8080/proxy/buildinfo"
+never_logged "no call execs into a pod" "$NO_EXEC"
+
+reset_state
+row ns-alpha enteros-tenant-abc "$ORG_A" "$REPO@$D_NEW" > "$K8RT/pods.after"
+export FAKE_BUILDINFO_SHA="feedface0123456789abcdef0123456789abcdef"
+check "/buildinfo reporting another git_sha => FAIL:buildinfo-mismatch" 1 "FAIL:buildinfo-mismatch" \
+  "$CENSUS_A" --tag staging-0badc0de
+
+reset_state
+row ns-alpha enteros-tenant-abc "$ORG_A" "$REPO@$D_NEW" > "$K8RT/pods.after"
+export FAKE_BUILDINFO_SHA="0badc0de0123456789abcdef0123456789abcdef"
+touch "$K8RT/proxy.fail"
+check "a pod proxy that cannot reach the pod reads as an EMPTY git_sha and fails closed" 1 \
+  "git_sha='<empty>'" "$CENSUS_A" --tag staging-0badc0de
+unset FAKE_BUILDINFO_SHA
 
 echo "== the docker roller must not silently pass on an empty fleet =="
 dchk() { # dchk <label> <expect_rc> <needle> <extra args...>
