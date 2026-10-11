@@ -7,7 +7,7 @@ GitHub organization, Railway/Render wrapper, or production credential bundle.
 
 - Docker with Compose v2
 - Node.js 20+
-- Go 1.25+
+- Go 1.25+ for host mode (optional with Docker platform mode)
 - `jq`
 - a model-provider credential supported by the runtime you select
 
@@ -23,6 +23,17 @@ The script owns local environment generation, fail-closed admin authentication,
 infrastructure startup, manifest-backed template/plugin setup, workspace-server
 startup, and Canvas startup. Follow the URLs it prints; the Canvas default is
 `http://localhost:3000` when that port is available.
+
+On Windows (Git Bash), the platform builds and runs in Docker by default.
+Linux/macOS prefer host Go. Use `--docker-platform` or `--host-platform` to
+select explicitly. Both modes finish compilation before the 180-second health
+deadline starts; cold builds can take several minutes. Docker mode uses the
+local template/plugin registry populated by setup and reads the same `.env`.
+
+Startup failures print the last process or container output before cleanup.
+Logs default to `/tmp/molecule-platform.log` and `/tmp/molecule-canvas.log`;
+set `MOLECULE_DEV_LOG_DIR` to place them elsewhere. Normal shutdown preserves
+database and object-store volumes. `--fresh` explicitly deletes that data.
 
 On first load, complete the server-derived platform-agent setup shown by Canvas.
 Runtime/provider/model choices come from current APIs and template metadata; do
@@ -104,6 +115,8 @@ active workflow's setup and exact pinned dependency.
 | Symptom | Check |
 |---|---|
 | Canvas receives 401 | `ADMIN_TOKEN` and `NEXT_PUBLIC_ADMIN_TOKEN` match |
+| Windows blocks a Go executable | use the default Docker mode, or explicitly run `./scripts/dev-start.sh --docker-platform` |
+| Platform exits during startup | the printed log tail includes the build, configuration, or migration error; Docker logs are saved before cleanup |
 | Workspace stays provisioning/offline | backend availability, provision logs, registration, heartbeat, and runtime credentials |
 | Template palette is empty | `manifest.json` sources were fetched and the template cache can read them |
 | Chat has no reply | workspace is online, the selected runtime booted, and the real provider credential is valid |

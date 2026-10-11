@@ -599,6 +599,7 @@ jobs:
           # here under `set -e`; passWithNoTests:false makes a zero-match selection
           # non-zero too. The assertions below are belt-and-braces.
           npx playwright test e2e/chat-desktop.spec.ts e2e/chat-mobile.spec.ts e2e/chat-separation.spec.ts \
+            e2e/local-entry.spec.ts e2e/concierge-chat-rendering.spec.ts \
             e2e/schedule-tab.spec.ts \
             e2e/boot-regression.spec.ts \
             e2e/css-diagnostic.spec.ts \

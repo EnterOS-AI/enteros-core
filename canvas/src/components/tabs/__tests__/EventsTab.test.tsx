@@ -23,7 +23,7 @@ import { EventsTab } from "../EventsTab";
 
 // Hoist mockGet so vi.mock factory can reference it (vi.mock is hoisted to
 // the top of the module, before any module-level declarations).
-const mockGet = vi.hoisted(() => vi.fn<[], Promise<unknown[]>>());
+const mockGet = vi.hoisted(() => vi.fn<(path: string) => Promise<unknown[]>>());
 
 vi.mock("@/lib/api", () => ({
   api: { get: mockGet },
@@ -293,37 +293,19 @@ describe("EventsTab — error state", () => {
 });
 
 describe("EventsTab — auto-refresh", () => {
-  // Use vi.spyOn to mock setInterval/clearInterval so we can control timer
-  // firing without Vitest's fake-timer APIs (which create infinite loops when
-  // timers schedule microtasks that schedule more timers).
   let setIntervalSpy: ReturnType<typeof vi.spyOn>;
   let clearIntervalSpy: ReturnType<typeof vi.spyOn>;
-  let activeIntervalId = 0;
-  const scheduledCallbacks = new Map<number, () => void>();
 
   beforeEach(() => {
-    vi.useRealTimers();
+    vi.useFakeTimers();
     mockGet.mockReset();
-    activeIntervalId = 0;
-    scheduledCallbacks.clear();
-    setIntervalSpy = vi.spyOn(globalThis, "setInterval").mockImplementation(
-      (cb: () => void) => {
-        const id = ++activeIntervalId;
-        scheduledCallbacks.set(id, cb);
-        return id;
-      },
-    );
-    clearIntervalSpy = vi.spyOn(globalThis, "clearInterval").mockImplementation(
-      (id: number) => {
-        scheduledCallbacks.delete(id);
-      },
-    );
+    setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+    clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
   });
 
   afterEach(() => {
     cleanup();
-    setIntervalSpy?.mockRestore();
-    clearIntervalSpy?.mockRestore();
+    vi.restoreAllMocks();
     vi.useRealTimers();
   });
 
@@ -340,9 +322,7 @@ describe("EventsTab — auto-refresh", () => {
       10000,
     );
 
-    // Fire the captured interval callback (simulates 10s elapsing)
-    const callback = [...scheduledCallbacks.values()][0];
-    act(() => { callback(); });
+    act(() => { vi.advanceTimersByTime(10_000); });
     await flush();
     expect(mockGet).toHaveBeenCalledWith("/events/ws-1");
   });
@@ -359,6 +339,6 @@ describe("EventsTab — auto-refresh", () => {
     unmount();
     expect(clearIntervalSpy).toHaveBeenCalled();
     // The callback should no longer be scheduled
-    expect(scheduledCallbacks.size).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

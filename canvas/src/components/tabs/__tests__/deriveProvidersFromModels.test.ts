@@ -10,10 +10,7 @@
 import { describe, expect, it } from "vitest";
 import { deriveProvidersFromModels } from "../ConfigTab";
 
-// Local type mirror (not exported from ConfigTab)
-interface ModelSpec {
-  id?: string;
-}
+type ModelSpec = Parameters<typeof deriveProvidersFromModels>[0][number];
 
 describe("deriveProvidersFromModels", () => {
   it("returns empty array for empty input", () => {

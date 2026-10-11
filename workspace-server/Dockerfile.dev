@@ -48,7 +48,7 @@ ARG BASE_IMAGE_REGISTRY=registry.moleculesai.app/molecule-ai
 #     --build-arg GOLANG_BASE=golang:1.25-alpine \
 #     -f workspace-server/Dockerfile.dev .
 ARG GOLANG_BASE=golang:1.25-alpine@sha256:c4ea15b4a7912716eb362a022e2b12317762eca387423760bc59c0f9ae69423c
-FROM ${BASE_IMAGE_REGISTRY}/${GOLANG_BASE}
+FROM ${BASE_IMAGE_REGISTRY}/${GOLANG_BASE} AS toolchain
 
 # air + git (for go mod) + ca-certs (for TLS) + tzdata (for time-zone DB)
 # + docker-cli + docker-cli-buildx so the platform binary can shell out to
@@ -103,5 +103,14 @@ RUN for i in 1 2 3; do \
 ENV CGO_ENABLED=0
 ENV GOFLAGS="-buildvcs=false"
 
+# dev-start builds before the readiness deadline starts and runs the server
+# directly so a boot failure is the container's exit status. The default final
+# stage below keeps make dev's Air workflow.
+FROM toolchain AS dev-start
+COPY workspace-server/ ./
+RUN go build -o /usr/local/bin/molecule-platform ./cmd/server
+CMD ["molecule-platform"]
+
+FROM toolchain AS live-reload
 # Run air with the .air.toml in the bind-mounted source dir.
 CMD ["air", "-c", ".air.toml"]

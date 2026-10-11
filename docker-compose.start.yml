@@ -1,0 +1,27 @@
+# Used by scripts/dev-start.sh for a compiled development server in Docker.
+# Build the local source before starting the readiness clock. Templates come
+# from setup.sh's local registry; no production .tenant-bundle-deps is required.
+services:
+  platform:
+    image: ${COMPOSE_PROJECT_NAME:-molecule-core}-platform-dev
+    build:
+      dockerfile: workspace-server/Dockerfile.dev
+      target: dev-start
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://dev:dev@postgres:5432/molecule?sslmode=disable}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      # These paths and the listen address are inside the container.
+      BIND_ADDR: "0.0.0.0"
+      CONFIGS_DIR: /configs
+      TEMPLATE_CACHE_DIR: /configs
+      ORG_TEMPLATES_DIR: /org-templates
+      PLUGINS_DIR: /plugins
+      MOLECULE_GITEA_TOKEN: ${MOLECULE_GITEA_TOKEN:-}
+      MOLECULE_TEMPLATE_REPO_TOKEN: ${MOLECULE_TEMPLATE_REPO_TOKEN:-}
+    volumes:
+      - ./org-templates:/org-templates
+    # A failed first boot must remain failed so the launcher can diagnose it.
+    restart: "no"
+    init: true

@@ -251,7 +251,7 @@ describe("EmptyState — templates", () => {
     _deploy.deploying = "seo-agent";
     renderEmpty();
     await flush();
-    expect(screen.getByRole("button", { name: "+ Create blank workspace" }).disabled).toBe(true);
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "+ Create blank workspace" }).disabled).toBe(true);
   });
 });
 

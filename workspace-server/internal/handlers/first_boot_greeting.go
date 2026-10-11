@@ -130,11 +130,11 @@ const greetRollbackTimeout = 5 * time.Second
 func firstBootFallbackText(toolCount int) string {
 	if toolCount > 0 {
 		return fmt.Sprintf(
-			"Hi! I'm your Org Concierge — online and ready, with %d management tools connected (including provision_workspace, which lets me create new agents for you).\n\n"+
-				"A few things you can try:\n"+
-				"• \"Create a research agent that tracks AI news for me\"\n"+
-				"• \"Set up a small dev team for my project\"\n"+
-				"• \"What can you do?\"\n\n"+
+			"Hi! I'm your Org Concierge — online and ready, with %d management tools connected (including `provision_workspace`, which lets me create new agents for you).\n\n"+
+				"A few things you can try:\n\n"+
+				"- \"Create a research agent that tracks AI news for me\"\n"+
+				"- \"Set up a small dev team for my project\"\n"+
+				"- \"What can you do?\"\n\n"+
 				"What are we building?",
 			toolCount)
 	}

@@ -114,7 +114,7 @@ case "${1:-}" in
   pods|pod)
     shift; sel="$*"; org="$(org_of_sel "$sel")"
     if printf '%s' "$sel" | grep -q 'imageID'; then
-      awk -F'\t' -v o="$org" -v ns="$ns" '$1==ns && $3==o {print $4}' "$K8RT/pods"
+      awk -F'\t' -v o="$org" -v ns="$ns" '$1==ns && $3==o {printf "%s\t%s\n",$2,$4}' "$K8RT/pods"
     else
       awk -F'\t' -v o="$org" -v ns="$ns" '$1==ns && $3==o {print $2}' "$K8RT/pods"
     fi;;

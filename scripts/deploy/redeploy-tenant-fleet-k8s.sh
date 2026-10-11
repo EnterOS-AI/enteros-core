@@ -243,8 +243,8 @@ if [ "$FOUND" -eq 0 ]; then
 fi
 
 # ── Per-tenant helpers ───────────────────────────────────────────────────────
-# live_digests <ns> <selector>: the distinct digests the SERVING pods report, one
-# per line. Reads .status.containerStatuses[].imageID — what the kubelet actually
+# live_pods <ns> <selector>: pod name and imageID for each ready tenant container
+# in a nonterminating Running pod. Reads .status.containerStatuses[].imageID — what the kubelet actually
 # pulled and started — NOT .spec.template.spec.containers[].image, which is only
 # what someone asked for. A `set image` that the cluster could not satisfy leaves
 # .spec updated and the old bytes serving traffic; only imageID can tell them apart.
@@ -254,48 +254,56 @@ fi
 # a perfectly good roll look like it had landed on two different digests at once.
 # Excluding non-Running pods likewise keeps a Pending/Completed straggler from
 # voting on what is currently serving.
-live_digests() {
+live_pods() {
   local ns="$1" sel="$2"
   $KUBECTL -n "$ns" get pods -l "$sel" -o go-template='
 {{- range .items -}}
+  {{- $pod := .metadata.name -}}
   {{- if not .metadata.deletionTimestamp -}}
     {{- if eq .status.phase "Running" -}}
       {{- range .status.containerStatuses -}}
-        {{- if eq .name "'"${TENANT_CONTAINER}"'" -}}{{ .imageID }}{{ "\n" }}{{- end -}}
+        {{- if and (eq .name "'"${TENANT_CONTAINER}"'") .ready -}}
+          {{ $pod }}{{ "\t" }}{{ .imageID }}{{ "\n" }}
+        {{- end -}}
       {{- end -}}
     {{- end -}}
   {{- end -}}
-{{- end -}}' 2>/dev/null | sed -n 's/.*@\(sha256:[0-9a-f]\{64\}\).*/\1/p' | sort -u
+{{- end -}}' 2>/dev/null
 }
 
-serving_pods() {
-  local ns="$1" sel="$2"
-  $KUBECTL -n "$ns" get pods -l "$sel" -o go-template='
-{{- range .items -}}
-  {{- if not .metadata.deletionTimestamp -}}
-    {{- if eq .status.phase "Running" -}}{{ .metadata.name }}{{ "\n" }}{{- end -}}
-  {{- end -}}
-{{- end -}}' 2>/dev/null | grep -c . || true
+# Keep pod identity and image identity together. Missing imageIDs remain visible
+# so one healthy replica cannot hide another replica with unverifiable bytes.
+pod_digests() {
+  local pod image
+  while IFS=$'\t' read -r pod image; do
+    [ -n "$pod" ] || continue
+    if [[ "$image" =~ (sha256:[0-9a-f]{64})$ ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}"
+    else
+      printf '%s\n' '<missing-imageID>'
+    fi
+  done | sort -u | paste -sd',' -
 }
 
-# converged_digests <ns> <sel>: live_digests, but allowing a bounded settle window
-# for superseded pods to finish draining. Returns the comma-joined digest set. If
+# converged_pods <ns> <sel>: one serving-pod snapshot for digest AND build checks,
+# allowing a bounded settle window for superseded pods to finish draining. If
 # it never converges to a single digest the caller fails — a pod stranded on the
 # old bytes past the window is a real "roll did not land", not a timing artefact.
 CONVERGE_ATTEMPTS="${CONVERGE_ATTEMPTS:-20}"
 CONVERGE_SLEEP="${CONVERGE_SLEEP:-3}"
-converged_digests() {
-  local ns="$1" sel="$2" d=""
+converged_pods() {
+  local ns="$1" sel="$2" d="" pods=""
   for _ in $(seq 1 "$CONVERGE_ATTEMPTS"); do
-    d="$(live_digests "$ns" "$sel" | paste -sd',' -)"
+    pods="$(live_pods "$ns" "$sel")" || return 1
+    d="$(pod_digests <<< "$pods")"
     case "$d" in
       "" ) ;;                       # no serving pod yet — keep waiting
       *,* ) ;;                      # still mixed — old pod draining
-      * ) printf '%s' "$d"; return 0;;
+      * ) printf '%s' "$pods"; return 0;;
     esac
     sleep "$CONVERGE_SLEEP"
   done
-  printf '%s' "$d"; return 0
+  printf '%s' "$pods"; return 0
 }
 
 buildinfo_sha() {
@@ -351,7 +359,7 @@ for i in "${!SEL_SLUGS[@]}"; do
   reps="$(printf '%s' "$loc" | cut -f3)"
   [ -n "$reps" ] || reps=0
 
-  before="$(live_digests "$ns" "$sel" | paste -sd',' -)"
+  before="$(live_pods "$ns" "$sel" | pod_digests)"
   [ -n "$before" ] || before="<no-running-pod>"
 
   # ── Vacuous-roll guard: a 0-replica Deployment ────────────────────────────
@@ -408,8 +416,13 @@ for i in "${!SEL_SLUGS[@]}"; do
   fi
 
   # ── VERIFY AGAINST THE PODS, NOT THE COMMAND ──────────────────────────────
-  after="$(converged_digests "$ns" "$sel")"
-  npods="$(serving_pods "$ns" "$sel")"
+  if ! pods="$(converged_pods "$ns" "$sel")"; then
+    err "${slug}: cannot read serving pods after rollout"
+    record "$slug" "$ns" "$before" "-" "FAIL:pod-read"
+    FAILED=$((FAILED+1)); continue
+  fi
+  after="$(pod_digests <<< "$pods")"
+  npods="$(printf '%s\n' "$pods" | grep -c . || true)"
 
   if [ -z "$after" ] || [ "${npods:-0}" -eq 0 ]; then
     err "${slug}: rollout reported success but NO running pod reports an imageID — nothing is executing the new image"
@@ -428,15 +441,26 @@ for i in "${!SEL_SLUGS[@]}"; do
     record "$slug" "$ns" "$before" "$after" "FAIL:digest-mismatch"
     FAILED=$((FAILED+1)); continue
   fi
+  if [ "$after" = '<missing-imageID>' ]; then
+    err "${slug}: serving pods have no verifiable imageID"
+    record "$slug" "$ns" "$before" "$after" "FAIL:missing-imageID"
+    FAILED=$((FAILED+1)); continue
+  fi
   if [ -n "$EXPECTED_BUILD_SHA" ]; then
-    pod="$($KUBECTL -n "$ns" get pods -l "$sel" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-    got="$(buildinfo_sha "$ns" "$pod")"
-    if ! sha_matches "$got" "$EXPECTED_BUILD_SHA"; then
-      err "${slug}: ${pod} /buildinfo git_sha='${got:-<empty>}' does not match expected ${EXPECTED_BUILD_SHA}"
+    build_failed=0
+    while IFS=$'\t' read -r pod _; do
+      got="$(buildinfo_sha "$ns" "$pod")"
+      if ! sha_matches "$got" "$EXPECTED_BUILD_SHA"; then
+        err "${slug}: ${pod} /buildinfo git_sha='${got:-<empty>}' does not match expected ${EXPECTED_BUILD_SHA}"
+        build_failed=1
+      else
+        log "  ${pod} /buildinfo git_sha=${got} matches ${EXPECTED_BUILD_SHA}"
+      fi
+    done <<< "$pods"
+    if [ "$build_failed" -ne 0 ]; then
       record "$slug" "$ns" "$before" "$after" "FAIL:buildinfo-mismatch"
       FAILED=$((FAILED+1)); continue
     fi
-    log "  /buildinfo git_sha=${got} matches ${EXPECTED_BUILD_SHA}"
   fi
 
   log "  after  (live): ${after}  [${npods} pod(s)]"

@@ -1652,7 +1652,7 @@ func TestPluginDownload_TarPackFailureReturns5xxNotTruncated200(t *testing.T) {
 	pluginsDir := t.TempDir()
 	pluginRoot := filepath.Join(pluginsDir, "broken-plugin")
 	os.MkdirAll(pluginRoot, 0o755)
-	os.WriteFile(filepath.Join(pluginRoot, "plugin.yaml"), []byte("name: broken-plugin\n"), 0o644)
+	os.WriteFile(filepath.Join(pluginRoot, "plugin.yaml"), []byte("name: broken-plugin\nversion: 1.0.0\ndescription: Unreadable archive fixture\n"), 0o644)
 	// Make a directory we can't read by chmod 000 — streamDirAsTar's
 	// filepath.Walk will surface a permission error.
 	unread := filepath.Join(pluginRoot, "unread")

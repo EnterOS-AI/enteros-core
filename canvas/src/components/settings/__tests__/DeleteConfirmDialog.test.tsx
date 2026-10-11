@@ -34,7 +34,7 @@ import { DeleteConfirmDialog } from "../DeleteConfirmDialog";
 // ─── Mocks ─────────────────────────────────────────────────────────────────────
 
 const _mockDeleteSecret = vi.fn<() => Promise<void>>();
-const _mockFetchDependents = vi.fn<() => Promise<string[]>>();
+const _mockFetchDependents = vi.fn<(workspaceId: string, name: string) => Promise<string[]>>();
 
 vi.mock("@/stores/secrets-store", () => ({
   useSecretsStore: (selector?: (s: { deleteSecret: () => Promise<void> }) => unknown) => {
