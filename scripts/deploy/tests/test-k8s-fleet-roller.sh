@@ -196,7 +196,7 @@ reset_state
 printf '%s\n' \
   "ns-alpha	draining-old	$ORG_A	$REPO@$D_OLD	2026-10-11T00:00:00Z	Running	true	0badc0de" \
   "ns-alpha	pending-old	$ORG_A	$REPO@$D_OLD		Pending	false	0badc0de" \
-  "ns-alpha	unready-old	$ORG_A	$REPO@$D_OLD		Running	false	0badc0de" \
+  "ns-alpha	unready-new	$ORG_A	$REPO@$D_NEW		Running	false	cafe1234" \
   "ns-alpha	serving-a	$ORG_A	$REPO@$D_NEW		Running	true	cafe1234" \
   "ns-alpha	serving-b	$ORG_A	$REPO@$D_NEW		Running	true	cafe1234" > "$K8RT/pods.after"
 EXPECTED_BUILD_SHA=cafe1234 check "rollback ignores a draining old pod listed first" 0 "ROLLED" "$CENSUS_A" --digest "$D_NEW"
