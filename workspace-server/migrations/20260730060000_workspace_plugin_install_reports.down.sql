@@ -1,0 +1,2 @@
+DROP INDEX IF EXISTS workspace_plugin_install_reports_not_live;
+DROP TABLE IF EXISTS workspace_plugin_install_reports;

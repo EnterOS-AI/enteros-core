@@ -28,6 +28,10 @@ READINESS_TIMEOUT="${RUNTIME_IMAGE_READINESS_TIMEOUT_SECONDS:-1200}"
 PULL_TIMEOUT="${RUNTIME_IMAGE_PULL_TIMEOUT_SECONDS:-600}"
 PULL_ATTEMPTS="${RUNTIME_IMAGE_PULL_ATTEMPTS:-2}"
 RETRY_DELAY="${RUNTIME_IMAGE_PULL_RETRY_DELAY_SECONDS:-5}"
+# How much of a failed `docker pull`'s output to echo. The useful part (the
+# error) is at the END of the stream, so we tail rather than head. Bounded so a
+# pathological pull cannot flood the job log.
+PULL_LOG_TAIL_LINES="${RUNTIME_IMAGE_PULL_LOG_TAIL_LINES:-40}"
 
 for name in CP_BASE_URL INFISICAL_BASE INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET INFISICAL_PROJECT_ID; do
   [[ -n "${!name:-}" ]] || fail "$name is required"
@@ -61,6 +65,7 @@ INFISICAL_BASE="$(validate_https_origin INFISICAL_BASE "$INFISICAL_BASE")"
 require_positive_int RUNTIME_IMAGE_READINESS_TIMEOUT_SECONDS "$READINESS_TIMEOUT"
 require_positive_int RUNTIME_IMAGE_PULL_TIMEOUT_SECONDS "$PULL_TIMEOUT"
 require_positive_int RUNTIME_IMAGE_PULL_ATTEMPTS "$PULL_ATTEMPTS"
+require_positive_int RUNTIME_IMAGE_PULL_LOG_TAIL_LINES "$PULL_LOG_TAIL_LINES"
 case "$RETRY_DELAY" in
   ''|*[!0-9]*) fail "RUNTIME_IMAGE_PULL_RETRY_DELAY_SECONDS must be a non-negative integer" ;;
 esac
@@ -213,21 +218,80 @@ while IFS=$'\t' read -r runtime image_name digest image_ref; do
 done < "$plan_tsv"
 [[ "$image_count" -gt 0 ]] || fail "validated readiness plan is empty"
 
+# exact_repo_digest_present reports whether the daemon ALREADY carries the exact
+# immutable image_ref among the image's RepoDigests. This is byte-for-byte the
+# same assertion the post-pull verification below makes — see the `grep -Fx`
+# after the pull loop.
+exact_repo_digest_present() {
+  local ref="$1" digests
+  digests="$(timeout --foreground --signal=TERM --kill-after=10s 30s \
+    docker "${DOCKER_PIN_ARGS[@]}" image inspect \
+    --format '{{range .RepoDigests}}{{println .}}{{end}}' "$ref" 2>/dev/null)" || return 1
+  grep -Fx -- "$ref" <<< "$digests" >/dev/null
+}
+
+# Lives inside tmp_dir so the EXISTING `trap cleanup EXIT INT TERM` (set above,
+# alongside the credential-bearing catalog/pin fixtures) reaps it. Do NOT give
+# this its own trap — bash replaces handlers rather than chaining them, so a
+# second `trap ... EXIT` would silently disarm that cleanup and leak tmp_dir.
+pull_log="$tmp_dir/docker-pull.log"
+
 while IFS=$'\t' read -r runtime image_ref; do
   pulled=0
   attempt=1
-  while [[ "$attempt" -le "$PULL_ATTEMPTS" ]]; do
+
+  # core#5065 — skip the pull when the post-condition already holds.
+  #
+  # This gate's contract is "the exact promoted RepoDigest is present on the
+  # provisioner daemon". The pull was only ever the MEANS of reaching that
+  # post-condition; the `grep -Fx` verification below is the contract itself.
+  # So when the exact RepoDigest is already on the daemon there is nothing left
+  # for a pull to establish, and re-pulling only adds a dependency on the
+  # transport.
+  #
+  # That dependency is what broke main. registry.moleculesai.app is a Cloudflare
+  # tunnel back to the home-PC origin (<2.5MB/s, HTTP Range not honoured, so a
+  # stalled layer restarts at byte 0). The hermes template's 1.438GB layer never
+  # converged: run 620363 / job 916973 on commit dd1841976 burned both bounded
+  # attempts (~240s each, ~410MB and ~360MB transferred) and failed the job —
+  # while `docker image inspect` on that very daemon already listed the exact
+  # ref, and a container started from it cleanly. e2e-smoke `needs:` this job,
+  # so it was SKIPPED, and deploy-production is gated on e2e-smoke.
+  #
+  # Digest-pinned refs make this safe: the ref is content-addressed, so a local
+  # RepoDigest match cannot be stale or wrong by construction. A genuinely new
+  # promoted digest is still absent, still pulled, and still fails closed.
+  if exact_repo_digest_present "$image_ref"; then
+    echo ">> [runtime-image-readiness] present runtime=$runtime exact_repo_digest already on daemon — skipping redundant pull ref=$image_ref"
+    pulled=1
+  fi
+
+  while [[ "$pulled" -eq 0 && "$attempt" -le "$PULL_ATTEMPTS" ]]; do
     remaining=$((deadline - $(date +%s)))
     [[ "$remaining" -gt 0 ]] || fail "global ${READINESS_TIMEOUT}s budget exhausted before runtime $runtime became ready"
     attempt_budget="$PULL_TIMEOUT"
     [[ "$attempt_budget" -le "$remaining" ]] || attempt_budget="$remaining"
     echo ">> [runtime-image-readiness] pull runtime=$runtime attempt=$attempt/$PULL_ATTEMPTS budget=${attempt_budget}s ref=$image_ref"
     set +e
+    # Redirect to a file rather than inheriting the runner's pty. Attached to a
+    # tty, `docker pull` renders per-layer progress with ANSI cursor moves and
+    # NO newlines, so an entire multi-GB pull arrives as ONE log line. Gitea
+    # truncates a log line at 64 KiB — job 916973's two pull lines were both
+    # exactly 65565 bytes — which silently discarded docker's actual error
+    # message at the end of the stream. The job could therefore only ever report
+    # `rc=1`, making every pull failure look identical and undiagnosable.
+    # Redirected, docker emits plain newline-delimited progress and the real
+    # error survives; we echo the tail below so it lands in the log.
     timeout --foreground --signal=TERM --kill-after=10s "${attempt_budget}s" \
-      docker "${DOCKER_PIN_ARGS[@]}" pull "$image_ref"
+      docker "${DOCKER_PIN_ARGS[@]}" pull "$image_ref" > "$pull_log" 2>&1
     pull_rc=$?
     set -e
     if [[ "$pull_rc" -eq 0 ]]; then pulled=1; break; fi
+    # rc=124 is `timeout` killing the pull at the attempt budget; anything else
+    # is docker's own exit. Both want the tail.
+    echo "-- [runtime-image-readiness] docker pull output for runtime=$runtime (rc=$pull_rc, last ${PULL_LOG_TAIL_LINES} lines):" >&2
+    tail -n "$PULL_LOG_TAIL_LINES" "$pull_log" >&2 || true
+    echo "-- [runtime-image-readiness] end docker pull output for runtime=$runtime" >&2
     if [[ "$attempt" -lt "$PULL_ATTEMPTS" ]]; then
       echo "::warning::runtime image readiness: pull failed for runtime=$runtime rc=$pull_rc; retrying within the global budget" >&2
       if [[ "$RETRY_DELAY" -ne 0 ]]; then

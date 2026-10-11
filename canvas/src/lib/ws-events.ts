@@ -16,6 +16,7 @@ export const WS_EVENTS = {
   WorkspaceProvisioning: "WORKSPACE_PROVISIONING",
   WorkspaceProvisionFailed: "WORKSPACE_PROVISION_FAILED",
   WorkspaceRemoved: "WORKSPACE_REMOVED",
+  WorkspaceUpdated: "WORKSPACE_UPDATED",
   AgentCardUpdated: "AGENT_CARD_UPDATED",
   AgentMessage: "AGENT_MESSAGE",
   TaskUpdated: "TASK_UPDATED",

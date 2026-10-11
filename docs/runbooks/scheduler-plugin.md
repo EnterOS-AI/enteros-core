@@ -139,8 +139,13 @@ daemon env  MOLECULE_TRIGGER_POLL_SECONDS=…
 inside `WorkspaceHandler.Create` — the local-template leg and the SaaS
 fetched-bytes leg — and the rendered files ride the provision bundle. Editing a
 template's `plugins[].config` therefore does not reach an existing workspace;
-that workspace has to be provisioned again. A live-edit path (layer 6) is **not in
-`main`** — the delivery module's own scope comment says so explicitly.
+that workspace has to be provisioned again.
+
+The live-edit path (**layer 6**) IS in `main` and is **on by default** since
+core#5047: an operator override is re-overlaid onto the delivered bytes on
+every (re-)provision, so the edit survives on the box. The kill-switch
+`MOLECULE_PLUGIN_SETTINGS_LAYERS=0|false|no|off` reverts to pure template
+delivery with no redeploy.
 
 See `docs/plugins/authoring-configuration.md` for the declaration contract and
 `docs/plugins/template-plugin-config.md` for setting the values.

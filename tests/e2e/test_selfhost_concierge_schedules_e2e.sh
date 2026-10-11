@@ -70,6 +70,8 @@
 #   E2E_TEMPLATES_DIR    required; == the platform's CONFIGS_DIR (template root)
 #   E2E_WS_MANIFEST      optional; concierge id is appended for run-scoped teardown
 #   ONLINE_TIMEOUT       default 300 (concierge provision->online budget)
+#   CONTAINER_READY_TIMEOUT default 60 (online -> container actually running;
+#                                 core#4980 — the two are separate events)
 #   GRID_TIMEOUT         default 120 (schedules-proxy readiness budget)
 #   CACHE_TAG            optional pin of the provisioner cache tag (else Gitea sha)
 #
@@ -81,6 +83,11 @@ export BASE
 # shellcheck disable=SC1091
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
+# Container-readiness wait policy (core#4980). Offline-tested by
+# lib/test_container_running_wait_unit.sh.
+# shellcheck disable=SC1091
+# shellcheck source=lib/container_running_wait.sh
+source "$(dirname "$0")/lib/container_running_wait.sh"
 
 ADMIN_TOKEN="${ADMIN_TOKEN:-${MOLECULE_ADMIN_TOKEN:-}}"
 export ADMIN_TOKEN MOLECULE_ADMIN_TOKEN="${ADMIN_TOKEN}"
@@ -91,7 +98,39 @@ RUNTIME="claude-code"
 STUB_DIR="$(cd "$(dirname "$0")/stub-runtime" && pwd)"
 CACHE_REPO="molecule-local/workspace-template-${RUNTIME}"
 GITEA_BRANCH_API="${GITEA_BRANCH_API:-https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-ai-workspace-template-${RUNTIME}/branches/main}"
-LATEST_TAG="${CACHE_REPO}:latest"
+
+# ---- core#5031: private tag namespace --------------------------------------
+# This script tags a STUB over a name every process on the daemon computes
+# identically (runtime + template HEAD sha + arch). On core#5030 our cleanup
+# restored that name while the concurrently-running lifecycle e2e was still
+# resolving it, and that REQUIRED gate failed with "Invalid API key".
+# MOLECULE_LOCAL_IMAGE_ISOLATION is the single source for a private suffix that
+# provisioner/local_image_isolation.go applies to the same two tags, so what we
+# write is exactly what the platform we start resolves — and nothing else can
+# name it. Unset (local dev) the tags are byte-identical to before.
+LOCAL_IMAGE_ISOLATION="${MOLECULE_LOCAL_IMAGE_ISOLATION:-}"
+ISOLATION_SUFFIX=""
+if [ -n "$LOCAL_IMAGE_ISOLATION" ]; then
+  # Same rule as LocalImageIsolation() in Go, and fail CLOSED for the same
+  # reason: a run that believes it is isolated and silently is not is worse than
+  # one that never claimed to be.
+  case "$LOCAL_IMAGE_ISOLATION" in
+    [a-z0-9]*[!a-z0-9._-]*|[!a-z0-9]*)
+      echo "ERROR: MOLECULE_LOCAL_IMAGE_ISOLATION=$LOCAL_IMAGE_ISOLATION is not usable in a Docker tag" >&2
+      echo "       (must start with [a-z0-9]; only lower-case letters, digits, '.', '_', '-')" >&2
+      exit 2
+      ;;
+  esac
+  if [ "${#LOCAL_IMAGE_ISOLATION}" -gt 48 ]; then
+    echo "ERROR: MOLECULE_LOCAL_IMAGE_ISOLATION is ${#LOCAL_IMAGE_ISOLATION} chars; max 48" >&2
+    exit 2
+  fi
+  ISOLATION_SUFFIX="--${LOCAL_IMAGE_ISOLATION}"
+fi
+# Third shared name: both e2e scripts build to molecule-local/stub-runtime:latest.
+STUB_IMAGE="molecule-local/stub-runtime:latest${ISOLATION_SUFFIX}"
+
+LATEST_TAG="${CACHE_REPO}:latest${ISOLATION_SUFFIX}"
 CACHE_TAG="${CACHE_TAG:-}"
 ORIG_CACHE_IMAGE_ID=""
 
@@ -118,9 +157,17 @@ _container_name() {  # canonical ws container name for an id
 
 cleanup() {
   local rc=$?
-  # Restore the provisioner cache tag to whatever it pointed at before, so a stub
-  # run never leaves the real claude-code tag aliased to the lightweight stub.
-  if [ -n "$ORIG_CACHE_IMAGE_ID" ] && [ -n "$CACHE_TAG" ]; then
+  if [ -n "$ISOLATION_SUFFIX" ]; then
+    # core#5031: these names are ours alone — there is nothing behind them to
+    # restore, and a restore is precisely what clobbered a concurrent run. Drop
+    # them so the private namespace does not accumulate on the shared daemon.
+    for t in "$CACHE_TAG" "$LATEST_TAG" "$STUB_IMAGE"; do
+      [ -n "$t" ] && docker rmi "$t" >/dev/null 2>&1 || true
+    done
+  elif [ -n "$ORIG_CACHE_IMAGE_ID" ] && [ -n "$CACHE_TAG" ]; then
+    # No isolation (local developer run): restore the provisioner cache tag to
+    # whatever it pointed at before, so a stub run never leaves the real
+    # claude-code tag aliased to the lightweight stub.
     docker tag "$ORIG_CACHE_IMAGE_ID" "$CACHE_TAG" >/dev/null 2>&1 || true
   fi
   exit $rc
@@ -212,16 +259,19 @@ except Exception: print('')" 2>/dev/null)
   else
     CACHE_ARCH_SUFFIX="$(go env GOARCH)"
   fi
-  CACHE_TAG="${CACHE_REPO}:${CACHE_SHA}-${CACHE_ARCH_SUFFIX}"
+  CACHE_TAG="${CACHE_REPO}:${CACHE_SHA}-${CACHE_ARCH_SUFFIX}${ISOLATION_SUFFIX}"
 fi
 log "provisioner cache tag: $CACHE_TAG"
+if [ -n "$ISOLATION_SUFFIX" ]; then
+  log "core#5031: PRIVATE image namespace for this run (MOLECULE_LOCAL_IMAGE_ISOLATION=$LOCAL_IMAGE_ISOLATION)"
+fi
 ORIG_CACHE_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$CACHE_TAG" 2>/dev/null || true)"
 
-if ! docker build --platform=linux/amd64 -t molecule-local/stub-runtime:latest "$STUB_DIR" >/tmp/stub_sched_build.log 2>&1; then
+if ! docker build --platform=linux/amd64 -t "$STUB_IMAGE" "$STUB_DIR" >/tmp/stub_sched_build.log 2>&1; then
   echo "stub image build failed:"; tail -25 /tmp/stub_sched_build.log; die "stub build failed"
 fi
-docker tag molecule-local/stub-runtime:latest "$CACHE_TAG"
-docker tag molecule-local/stub-runtime:latest "$LATEST_TAG"
+docker tag "$STUB_IMAGE" "$CACHE_TAG"
+docker tag "$STUB_IMAGE" "$LATEST_TAG"
 pass "stub built + tagged -> $CACHE_TAG (+ :latest)"
 echo ""
 
@@ -342,7 +392,31 @@ while true; do
   sleep 5
 done
 CNAME="$(_container_name "$CONCIERGE_ID")"
-docker ps --format '{{.Names}}' | grep -Fxq "$CNAME" || die "concierge online but container $CNAME not running"
+# core#4980 — status `online` is NOT the signal this step needs. Core flips the
+# row when the agent registers; the container being up is a SEPARATE event, and
+# on a loaded runner it lags by seconds. Asserting `docker ps` the instant the
+# status flipped reddened this REQUIRED lane on a comment-only PR. Everything
+# below (docker exec, the config read) depends on a RUNNING container, so wait
+# for THAT — bounded, with both fail arms reachable and distinguishable:
+#   * exited/dead -> the container started and died; fail FAST (no budget burn).
+#   * never running within the bound -> distinct message, distinct cause.
+CONTAINER_READY_TIMEOUT="${CONTAINER_READY_TIMEOUT:-60}"
+CWAIT_RC=0
+wait_container_running "$CNAME" "$CONTAINER_READY_TIMEOUT" 2 || CWAIT_RC=$?
+case "$CWAIT_RC" in
+  0) : ;;
+  2)
+    echo "--- concierge container logs (tail) ---"
+    docker logs "$CNAME" 2>&1 | tail -n 60 || true
+    die "concierge container $CNAME is '${CONTAINER_WAIT_LAST_STATE}' — it started and DIED; the runtime aborted, this is not a readiness lag"
+    ;;
+  3) die "wait_container_running called with bad arguments (container='$CNAME' timeout='$CONTAINER_READY_TIMEOUT')" ;;
+  *)
+    echo "--- ws-* containers on this daemon ---"
+    docker ps -a --format '{{.Names}} {{.Status}}' 2>/dev/null | grep -E '^ws-' || echo "  (none)"
+    die "concierge reported online but container $CNAME never reached running within ${CONTAINER_READY_TIMEOUT}s (last docker state='${CONTAINER_WAIT_LAST_STATE:-<absent>}')"
+    ;;
+esac
 pass "concierge online (container $CNAME running)"
 echo ""
 

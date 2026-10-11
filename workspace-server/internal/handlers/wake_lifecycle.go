@@ -1,10 +1,16 @@
 package handlers
 
 // wake_lifecycle.go — the DESIRED-STATE OWNER for a workspace's proactive WAKE
-// intents. DORMANT in this PR (PR-B): nothing in production calls DecideWake or
-// the Mark* transitions yet; the emitters and the heartbeat convergence loop are
-// wired in later PRs. The methods exist, are unit-tested in isolation, and pin
-// the generation + ledger + dedup contract everything else will build on.
+// intents. WIRED IN PRODUCTION: the first-boot greeting routes through DecideWake
+// via GreetWakeHooks (router.go), the restart-context / stall-watchdog / nudge
+// emitters via WorkspaceHandler.SetWakeHooks / StallWatchdog.SetWakeHooks /
+// RequestNudgeSweeper.SetWakeHooks (cmd/server/main.go), and the heartbeat
+// convergence loop calls MarkWakeSettled via SetWakeSettler. (This header
+// originally read "DORMANT in this PR (PR-B)" — true when the owner first landed
+// in #4883, before the emitters/heartbeat were wired in #4888/#4890; that is now
+// stale.) The methods pin the generation + ledger + dedup contract, and greet-
+// once / restart-once ARBITRATION deliberately stays with the has_greeted marker
+// — DecideWake supplies the idempotency key + generation and is NOT the fire-gate.
 //
 // SCOPE: WAKE intents ONLY — the proactive moments the platform makes the agent
 // speak first: the first-boot greeting, restart-context, idle/stall/nudge

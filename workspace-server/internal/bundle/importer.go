@@ -2,6 +2,7 @@ package bundle
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -106,8 +107,14 @@ func Import(
 			// provision_timeout_seconds lookup — the default ceiling suffices.
 			provCtx, cancel := context.WithTimeout(context.Background(), provisioner.DefaultProvisionCeiling())
 			defer cancel()
+			// A DELETE that lands while this runs cancels the Start and waits
+			// for it (provisioner.CancelInflightStart); the Start then tears
+			// down what it made and returns ErrWorkspaceRemoved. The row is
+			// 'removed' — do not mark it failed.
 			url, err := prov.Start(provCtx, cfg)
-			if err != nil {
+			if errors.Is(err, provisioner.ErrWorkspaceRemoved) {
+				log.Printf("bundle import: workspace %s was deleted while provisioning — start abandoned: %v", wsID, err)
+			} else if err != nil {
 				markFailed(provCtx, wsID, broadcaster, err)
 			} else if url != "" {
 				if _, err := db.DB.ExecContext(provCtx, `UPDATE workspaces SET url = $1 WHERE id = $2`, url, wsID); err != nil {
@@ -159,8 +166,9 @@ func markFailed(ctx context.Context, wsID string, broadcaster *events.Broadcaste
 	// markProvisionFailed in workspace-server/internal/handlers/
 	// workspace_provision_shared.go.
 	msg := err.Error()
+	// `status != 'removed'`: a workspace deleted mid-provision stays removed.
 	if _, dbErr := db.DB.ExecContext(ctx,
-		`UPDATE workspaces SET status = $1, last_sample_error = $2, updated_at = now() WHERE id = $3`,
+		`UPDATE workspaces SET status = $1, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status != 'removed'`,
 		models.StatusFailed, msg, wsID); dbErr != nil {
 		log.Printf("bundle import: failed to mark workspace %s as failed: %v", wsID, dbErr)
 	}

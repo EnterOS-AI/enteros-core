@@ -832,6 +832,268 @@ def detect_disabled_pr_emitters(
     }
 
 
+def _job_display_names(jobs: dict) -> dict[str, str]:
+    """job KEY -> the name Gitea puts in the status context.
+
+    Gitea builds `{workflow.name} / {job.name} (event)` and falls back to the
+    job KEY when the job has no `name:`. Both spellings must resolve or the
+    lint reports a phantom S1 on every job that happens to carry a `name:`."""
+    out: dict[str, str] = {}
+    for key, val in jobs.items():
+        name = val.get("name") if isinstance(val, dict) else None
+        out[key] = name if isinstance(name, str) and name else key
+    return out
+
+
+def _needs_of(job: Any) -> list[str]:
+    if not isinstance(job, dict):
+        return []
+    needs = job.get("needs", [])
+    if isinstance(needs, str):
+        return [needs]
+    if isinstance(needs, list):
+        return [n for n in needs if isinstance(n, str)]
+    return []
+
+
+def _needs_closure(jobs: dict, start: str) -> list[str]:
+    """`start` plus every job reachable through `needs:` edges, transitively.
+
+    Skip propagates the WHOLE way down this closure: Gitea does not start a job
+    whose `needs:` was skipped (the repo deliberately does NOT use
+    `if: always()` — see the all-required sentinel comment in ci.yml), so an
+    `if:` anywhere in here can turn the ENFORCED context `skipped`. A one-level
+    check would miss the two-hop shape entirely."""
+    seen: set[str] = set()
+    stack = [start]
+    while stack:
+        cur = stack.pop()
+        if cur in seen or cur not in jobs:
+            continue
+        seen.add(cur)
+        stack.extend(_needs_of(jobs.get(cur)))
+    return sorted(seen)
+
+
+def detect_skippable_enforced_gates(
+    enforced: list[str], workflows_dir: str = ".gitea/workflows"
+) -> tuple[list[str], dict]:
+    """Guard S core: an ENFORCED context must be STRUCTURALLY UNABLE to post
+    `skipped` (or to post nothing at all).
+
+    WHY THIS IS A HOLE AND NOT A STYLE RULE
+    ---------------------------------------
+    Branch protection on main is `status_check_contexts: ["*"]`. The wildcard
+    requires every POSTED status to be success and treats `skipped` as passing,
+    so a required check that stops running merges GREEN. Only
+    gitea-merge-queue.py fail-closes on `skipped`
+    (`enforced_file_contexts_green`) — and the queue is not the only way a PR
+    reaches main. Everything that merges through the UI/API is gated by `["*"]`
+    alone.
+
+    Guard F proves the producer WORKFLOW is `active`; lint-required-no-paths
+    proves it carries no `on: paths:` filter; lint_no_coe_on_required proves no
+    `continue-on-error` masks a red. None of them looks at the two remaining
+    ways an active, unfiltered, unmasked workflow still posts nothing usable:
+
+      S1 — the enforced context names a JOB that does not exist in the producer
+           workflow. A job rename/delete leaves the workflow `active` (Guard F
+           green) while the context is never emitted again.
+
+      S2 — the producer job, or any job in its transitive `needs:` closure,
+           carries a job-level `if:`. A false `if:` makes that job `skipped`,
+           and the skip propagates down every `needs:` edge to the enforced
+           context.
+
+    S2 is the generalisation of a live observation: on PR #4911 / #5016
+    `CI / Platform (Go)` did not succeed, Gitea never started
+    `CI / all-required`, and the sentinel posted `skipped` (run 593358, job
+    879124). Those two were held only because the FAILURE was also posted and
+    `["*"]` blocks on a posted failure. Swap the failure for a skip — put a
+    job-level `if:` on any of the sentinel's six `needs:` — and the board is
+    all-green-or-skipped with the entire CI aggregator having enforced nothing.
+
+    Note the deliberate asymmetry with ci_job_names() (F1): F1 EXCLUDES
+    `if:`-gated jobs from the set that must appear under the sentinel's
+    `needs:` — event-scoped jobs legitimately do not run on every trigger. That
+    exclusion says nothing about whether such a job may BE a need, and today
+    nothing forbids it. This guard forbids it, which is the missing half.
+
+    Returns (findings, debug). Empty findings == clean.
+    """
+    findings: list[str] = []
+    # Fail-closed on the vacuous input. An empty enforced set is the exact
+    # signature this repo keeps re-learning (`pass:0 fail:0`): a guard that
+    # covers nothing reports success.
+    if not enforced:
+        findings.append(
+            "S0 — the ENFORCED context set is EMPTY. That is a vacuous pass, "
+            "not a clean repo: this guard would be checking nothing. Verify "
+            f"{ENFORCED_CONTEXTS_FILE} exists and has entries ABOVE the first "
+            "`# pending-#NNNN` marker."
+        )
+        return findings, {"enforced_count": 0, "ok": [], "s1": [], "s2": []}
+
+    # workflow name -> (path, doc)
+    docs: dict[str, tuple[str, dict]] = {}
+    for path in workflow_files(workflows_dir):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                doc = yaml.safe_load(fh)
+        except (OSError, yaml.YAMLError) as exc:
+            # A file we cannot parse is a file whose jobs are INVISIBLE to this
+            # lint. `continue` here would be the same hole one level up.
+            findings.append(
+                f"S3 — workflow {path} does not parse ({exc}); its jobs are "
+                "invisible to this guard, which cannot then prove anything. "
+                "Fix the YAML."
+            )
+            continue
+        if not isinstance(doc, dict):
+            findings.append(f"S3 — workflow {path} is not a YAML mapping.")
+            continue
+        name = doc.get("name")
+        if isinstance(name, str) and name:
+            docs[name] = (path, doc)
+
+    s1: list[dict] = []
+    s2: list[dict] = []
+    ok: list[dict] = []
+    for ctx in enforced:
+        wf_name = producer_workflow_name(ctx, set(docs))
+        if wf_name is None:
+            # Guard F's P2 already reports this class; repeat it here so this
+            # lint is self-contained and cannot silently pass a context it
+            # could not resolve.
+            s1.append({"context": ctx, "reason": "no producer workflow"})
+            continue
+        path, doc = docs[wf_name]
+        jobs = doc.get("jobs")
+        if not isinstance(jobs, dict):
+            findings.append(
+                f"S3 — workflow {path} (name '{wf_name}') has no `jobs:` "
+                f"mapping, so ENFORCED context '{ctx}' can never be emitted."
+            )
+            continue
+        want = ctx[len(wf_name) + len(" / ") :] if ctx != wf_name else ""
+        display = _job_display_names(jobs)
+        job_key = next((k for k, disp in display.items() if disp == want), None)
+        if job_key is None and want in jobs:
+            job_key = want
+        if job_key is None:
+            s1.append(
+                {
+                    "context": ctx,
+                    "producer_file": path,
+                    "wanted_job": want,
+                    "reason": "no job in the producer workflow emits this name",
+                }
+            )
+            continue
+        closure = _needs_closure(jobs, job_key)
+        gated = [
+            {"job": j, "if": jobs[j].get("if")}
+            for j in closure
+            if isinstance(jobs.get(j), dict) and jobs[j].get("if") is not None
+        ]
+        if gated:
+            s2.append(
+                {
+                    "context": ctx,
+                    "producer_file": path,
+                    "job": job_key,
+                    "skippable": gated,
+                }
+            )
+        else:
+            ok.append({"context": ctx, "job": job_key, "closure": closure})
+
+    if s1:
+        findings.append(
+            "S1 — ENFORCED required-contexts.txt entries with NO emitting JOB "
+            "(the context can never be posted; under `[*]` an absent context "
+            "is not required at all, so the gate silently disappears):\n"
+            + "\n".join(
+                "  - {c}\n      {r}{extra}".format(
+                    c=e["context"],
+                    r=e["reason"],
+                    extra=(
+                        f"\n      producer: {e['producer_file']} "
+                        f"(looked for job named '{e['wanted_job']}')"
+                        if "producer_file" in e
+                        else ""
+                    ),
+                )
+                for e in s1
+            )
+        )
+    if s2:
+        findings.append(
+            "S2 — ENFORCED required-contexts.txt entries that can post "
+            "`skipped`. A job-level `if:` in the context's `needs:` closure "
+            "makes the job skippable, Gitea does not start a dependent whose "
+            "`needs:` was skipped, and branch protection `[*]` treats "
+            "`skipped` as PASSING — so the gate enforces nothing on any merge "
+            "that does not go through gitea-merge-queue.py:\n"
+            + "\n".join(
+                "  - {c}\n      producer: {f} (job '{j}')\n{g}".format(
+                    c=e["context"],
+                    f=e["producer_file"],
+                    j=e["job"],
+                    g="\n".join(
+                        f"      skippable job '{g['job']}' has job-level "
+                        f"if: {g['if']!r}"
+                        for g in e["skippable"]
+                    ),
+                )
+                for e in s2
+            )
+        )
+    debug = {
+        "enforced_count": len(enforced),
+        "workflows_parsed": len(docs),
+        "s1": s1,
+        "s2": s2,
+        "ok": ok,
+    }
+    return findings, debug
+
+
+def run_skippable_gate_lint() -> int:
+    """`--skippable-gate-lint` entrypoint (Guard S). HARD lint: exits non-zero.
+
+    Needs NO Gitea credentials — it reads only the checked-in SSOT
+    (`.gitea/required-contexts.txt`) and `.gitea/workflows/*`, so it runs on
+    any PR including ones with no secret access."""
+    enforced = load_enforced_file_contexts(ENFORCED_CONTEXTS_FILE)
+    findings, debug = detect_skippable_enforced_gates(enforced)
+    print("::group::Guard S — skippable-enforced-gate lint debug")
+    print(json.dumps(debug, indent=2, sort_keys=True))
+    print("::endgroup::")
+    if findings:
+        print(
+            "::error::Guard S FAILED — an ENFORCED required context can post "
+            "`skipped` or post nothing at all. Under branch protection "
+            "`status_check_contexts: [\"*\"]` that is a GREEN board: only the "
+            "merge queue fail-closes on `skipped`, and most merges do not go "
+            "through it. Fix: remove the job-level `if:` from the job(s) named "
+            "below (gate the STEPS instead — a per-step-gated job still "
+            "reaches a terminal SUCCESS), restore the missing job name, or "
+            "PARK the context below a `# pending-#NNNN` marker if it is "
+            "genuinely not ready to enforce."
+        )
+        for f in findings:
+            print(f)
+        return 1
+    print(
+        f"::notice::Guard S PASSED — all {len(enforced)} ENFORCED "
+        "required-contexts.txt entries resolve to a real job whose `needs:` "
+        "closure carries no job-level `if:`, so none of them can post "
+        "`skipped`."
+    )
+    return 0
+
+
 def run_disabled_pr_emitter_lint() -> int:
     """`--disabled-pr-emitter-lint` entrypoint (Guard G). HARD lint: exits
     non-zero so a wedge-producing disabled workflow is caught at PR time instead
@@ -1325,6 +1587,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "under the `[*]` branch protection. EXITS NON-ZERO on an offender. Runs "
         "standalone (does not need the drift env contract).",
     )
+    p.add_argument(
+        "--skippable-gate-lint",
+        action="store_true",
+        help="Guard S: assert every ENFORCED required-contexts.txt entry "
+        "resolves to a real JOB whose transitive `needs:` closure carries no "
+        "job-level `if:` — i.e. the context cannot post `skipped` or vanish. "
+        "Branch protection `[*]` treats `skipped` as passing, so a skippable "
+        "required gate merges green on every path except the merge queue. "
+        "EXITS NON-ZERO on an offender. Needs NO Gitea credentials.",
+    )
     return p.parse_args(argv)
 
 
@@ -1340,6 +1612,11 @@ def main(argv: list[str] | None = None) -> int:
     # Guard G is standalone for the same reason as Guard F.
     if args.disabled_pr_emitter_lint:
         return run_disabled_pr_emitter_lint()
+
+    # Guard S is standalone AND credential-free — it reads only checked-in
+    # files, so it must run before the env contract too.
+    if args.skippable_gate_lint:
+        return run_skippable_gate_lint()
 
     _require_runtime_env()
 

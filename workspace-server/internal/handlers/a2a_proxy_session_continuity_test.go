@@ -46,11 +46,11 @@ import (
 )
 
 // TestSessionContinuity_BeltUsesTheOneAuthority pins that the a2a proxy belt /
-// platform self-turns derive their contextId from the SINGLE authority
-// (sessionid.DefaultContextID) — the SAME value the provisioner injects into the
-// workspace container as MOLECULE_DEFAULT_SESSION_CONTEXT_ID for the runtime's
-// self-wakes. If a future refactor re-inlines a "canvas-" literal here, the
-// platform id and the provisioned runtime id could drift; this fails first.
+// platform self-turns derive their contextId from the SINGLE platform-side
+// authority (sessionid.DefaultContextID) rather than re-inlining a "canvas-"
+// literal. The runtime's self-wake trace convergence (tracing.TracingExecutor)
+// mirrors the same convention independently; if this ever moves, that runtime
+// literal must move with it. This guards the platform side against local drift.
 func TestSessionContinuity_BeltUsesTheOneAuthority(t *testing.T) {
 	const ws = "11111111-2222-3333-4444-555555555555"
 	if got, want := canvasSessionContextID(ws), sessionid.DefaultContextID(ws); got != want {

@@ -62,18 +62,18 @@ assert_eq "claude-code + Anthropic API key → Anthropic API model" "$got" "clau
 got=$(unset E2E_MODEL_SLUG; E2E_MINIMAX_API_KEY="mx-priority" E2E_ANTHROPIC_API_KEY="sk-ant-loser" pick_model_slug claude-code)
 assert_eq "claude-code + both keys → MiniMax priority (bare)"     "$got" "MiniMax-M2.7"
 
-# ── seo-agent (claude-code-adapter template variant) ──
-# seo-agent shares the claude-code dispatch branch (it reuses the claude-code
-# adapter + the same copied providers block). Pin that it resolves IDENTICALLY
-# to claude-code for every key path so a future refactor can't accidentally
-# fork seo-agent's model selection from claude-code's.
-run_test "seo-agent → claude-code default alias"                  seo-agent   "sonnet"
+# ── seo-agent (hermes template variant, platform-proxy models only) ──
+# Since seo-agent template #29 the variant runs on hermes and registers only
+# platform-proxy MiniMax models, so every key path must resolve to the same
+# slash-namespaced platform model (a BYOK key must NOT fork it to a
+# claude-code-only bare/Anthropic id, which hermes would 422).
+run_test "seo-agent → platform MiniMax model"                     seo-agent   "minimax/MiniMax-M2.7"
 
 got=$(unset E2E_MODEL_SLUG E2E_ANTHROPIC_API_KEY; E2E_MINIMAX_API_KEY="mx-test" pick_model_slug seo-agent)
-assert_eq "seo-agent + MiniMax key → bare MiniMax model (==claude-code)" "$got" "MiniMax-M2.7"
+assert_eq "seo-agent + MiniMax key → platform MiniMax model"      "$got" "minimax/MiniMax-M2.7"
 
 got=$(unset E2E_MODEL_SLUG E2E_MINIMAX_API_KEY; E2E_ANTHROPIC_API_KEY="sk-ant-test" pick_model_slug seo-agent)
-assert_eq "seo-agent + Anthropic key → Anthropic model (==claude-code)" "$got" "claude-sonnet-4-6"
+assert_eq "seo-agent + Anthropic key → platform MiniMax model"    "$got" "minimax/MiniMax-M2.7"
 
 # ── Fallback for unknown runtime ──
 # Picks slash-form (hermes-shaped) since hermes is the historical
@@ -102,8 +102,8 @@ assert_eq "platform path beats a stray BYOK key (no mask)"         "$got" "minim
 got=$(unset E2E_MODEL_SLUG; E2E_LLM_PATH=platform E2E_DEFAULT_PLATFORM_MODEL="minimax/MiniMax-M3" pick_model_slug claude-code)
 assert_eq "platform path honours E2E_DEFAULT_PLATFORM_MODEL"        "$got" "minimax/MiniMax-M3"
 
-got=$(unset E2E_DEFAULT_PLATFORM_MODEL; E2E_MODEL_SLUG="anthropic/claude-opus-4-7" E2E_LLM_PATH=platform pick_model_slug claude-code)
-assert_eq "E2E_MODEL_SLUG still wins over platform path"            "$got" "anthropic/claude-opus-4-7"
+got=$(unset E2E_DEFAULT_PLATFORM_MODEL; E2E_MODEL_SLUG="minimax/MiniMax-M3" E2E_LLM_PATH=platform pick_model_slug claude-code)
+assert_eq "E2E_MODEL_SLUG still wins over platform path"            "$got" "minimax/MiniMax-M3"
 
 # ── Override via E2E_MODEL_SLUG ──
 # When the operator sets E2E_MODEL_SLUG, the per-runtime dispatch is

@@ -974,6 +974,44 @@ if not isinstance(tools, list): print(''); sys.exit(0)
 print(json.dumps(tools))"
 }
 
+# concierge_provision_diagnosis: read the DISCRIMINATING fields out of the SAME
+# workspace body the loaded_mcp_tools gate is already polling, and say what the
+# empty inventory actually means (molecule-controlplane#2854).
+#
+# The old failure text asserted "the mgmt-MCP tools failed to load at init" for
+# EVERY empty inventory. That is one of at least three distinct causes, and it
+# is the wrong one for the most common: core#5057, where CPProvisioner.Start's
+# single-shot POST to /cp/workspaces/provision hit a transient error, the box
+# was NEVER CREATED, and the row went straight to status=failed with an empty
+# instance_id. There are no MCP tools because there is no container — nothing
+# ever got as far as "init". Blaming the MCP loader sent an earlier
+# investigation down the wrong path for a long time, and the data needed to
+# tell the cases apart was sitting in the body being polled the whole time.
+concierge_provision_diagnosis() {
+  tenant_call GET "/workspaces/$CONCIERGE_ID" 2>/dev/null | python3 -c "
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: print('workspace body unreadable — cannot classify'); sys.exit(0)
+if not isinstance(d, dict): print('workspace body not an object — cannot classify'); sys.exit(0)
+status = d.get('status') or '<none>'
+inst = d.get('instance_id') or ''
+err = d.get('last_sample_error') or ''
+base = 'status=%s instance_id=%s' % (status, inst if inst else '<EMPTY>')
+if not inst and status in ('failed', 'provisioning'):
+    print(base + ' -> THE BOX WAS NEVER CREATED. This is a PROVISION failure, not an '
+          'MCP-load failure: with no instance there is no container and nothing ever '
+          'reached init. Prime suspect is core#5057 (single-shot POST to '
+          '/cp/workspaces/provision, no retry). last_sample_error=' + (err or '<none>'))
+elif status == 'failed':
+    print(base + ' -> the box was created but the workspace is FAILED; the MCP inventory '
+          'is a downstream symptom. last_sample_error=' + (err or '<none>'))
+elif status in ('online', 'degraded'):
+    print(base + ' -> the box EXISTS and is ' + status + ', so an empty inventory really '
+          'does point at the management-MCP failing to load at init.')
+else:
+    print(base + ' -> unclassified; inspect the workspace row.')"
+}
+
 # Poll until the required tool is present, or the budget is exhausted. We keep the
 # last non-empty inventory read so a HARD FAIL can report what WAS loaded.
 mcp_deadline=$(( $(date +%s) + MCP_TOOLS_SECS ))
@@ -998,10 +1036,10 @@ elif [ -n "$LOADED_TOOLS" ] && [ "$LOADED_TOOLS" != "[]" ]; then
   # concierge booted with a management-MCP that is missing provision_workspace.
   fail "loaded_mcp_tools present but $(required_provision_tool_id) not reported within ${MCP_TOOLS_SECS}s — the concierge's management MCP did not expose the provision tool. HARD GATE (never-skip): runtime#181 producer landed 2026-06-25; a healthy concierge reports ~46 tools incl. this one. Tools: $(echo "$LOADED_TOOLS" | head -c 400)"
 else
-  # Field absent/empty for the whole budget: the mgmt-MCP tools failed to load at
-  # init (broken concierge boot). runtime#181 producer landed 2026-06-25, so an
-  # empty inventory is a real failure, not a not-yet-landed producer.
-  fail "loaded_mcp_tools absent/empty after ${MCP_TOOLS_SECS}s — the concierge reported NO management-MCP tools. HARD GATE (never-skip): runtime#181 producer landed 2026-06-25 and a healthy concierge reports ~46 tools incl. $(required_provision_tool_id); an empty inventory means the mgmt-MCP failed to load at init."
+  # Field absent/empty for the whole budget. Do NOT assert a cause — read the
+  # discriminating fields out of the same body we have been polling and report
+  # what actually happened (molecule-controlplane#2854).
+  fail "loaded_mcp_tools absent/empty after ${MCP_TOOLS_SECS}s — the concierge reported NO management-MCP tools. HARD GATE (never-skip): runtime#181 producer landed 2026-06-25 and a healthy concierge reports ~46 tools incl. $(required_provision_tool_id). DIAGNOSIS: $(concierge_provision_diagnosis)"
 fi
 
 # Pre-state: the worker MUST NOT exist yet (so its later appearance is causally

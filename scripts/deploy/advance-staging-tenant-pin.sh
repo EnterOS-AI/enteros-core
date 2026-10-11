@@ -12,6 +12,14 @@
 #   advance-staging-tenant-pin.sh --image registry.../molecule-tenant@sha256:<digest> --git-sha <sha>
 #   advance-staging-tenant-pin.sh --tag staging-<sha> --dry-run
 #
+# Digest resolution:
+#   DIGEST_SOURCE=docker    (default) docker pull + docker image inspect.
+#   DIGEST_SOURCE=registry  resolve over the registry HTTP API; needs REG_USER /
+#                           REG_TOKEN and NO docker daemon. Use this wherever a
+#                           docker socket is absent or undesirable. It still needs
+#                           python3, as does the rest of this script — a runner
+#                           image without python3 cannot run this script at all.
+#
 # Required auth:
 #   CP_ADMIN_API_TOKEN, or INFISICAL_CLIENT_ID / INFISICAL_CLIENT_SECRET /
 #   INFISICAL_PROJECT_ID so the script can fetch CP_ADMIN_API_TOKEN from
@@ -35,9 +43,17 @@ INFISICAL_PATH="${INFISICAL_PATH:-/shared/controlplane-admin}"   # CP admin toke
 # makes FRESH provisions dynamic (no CP restart), but LOCAL_TENANT_IMAGE is the
 # default a rebooted / freshly-provisioned CP falls back to. Rolling the pin but
 # leaving this stale is EXACTLY how prod broke every fresh org (the pin was fixed
-# on running containers, never written back to the boot SSOT — see
-# molecule-controlplane/scripts/deploy/local-cp-prod-pin-promote.sh). So this
+# on running containers, never written back to the boot SSOT). So this
 # script now writes BOTH, on every path, and verifies the write landed.
+#
+# HISTORICAL NOTE. This used to point at
+# molecule-controlplane/scripts/deploy/local-cp-prod-pin-promote.sh. That script
+# was DELETED from molecule-controlplane main on 2026-07-18 by 1442cd9868
+# ("fix: make provider rollout fail closed end to end"), together with its guard
+# test internal/provisioner/prod_pin_promote_script_test.go. It was replaced by
+# the CP_PROMOTE_PROD_API_TOKEN capability described in
+# molecule-controlplane/docs/operations/production-promote-capability.md. Do not
+# send anyone to the old path; it 404s.
 CP_SSOT_PATH="${CP_SSOT_PATH:-/shared/controlplane}"
 SSOT_SECRET_NAME="${SSOT_SECRET_NAME:-LOCAL_TENANT_IMAGE}"
 TENANT_IMAGE_NAME="${TENANT_IMAGE_NAME:-registry.moleculesai.app/molecule-ai/molecule-tenant}"
@@ -47,6 +63,28 @@ TAG=""
 GIT_SHA="${TENANT_PIN_GIT_SHA:-}"
 DRY_RUN=0
 CURL=(curl -fsS -A curl/8.4.0 --doh-url https://cloudflare-dns.com/dns-query)
+# Same transport as CURL, MINUS -f. `-f` makes curl exit 22 and DISCARD the
+# response body, so every CP error on this path collapsed to a bare
+# `curl: (22) The requested URL returned error: NNN` with the actionable
+# sentence thrown away. The CP calls below capture status and body explicitly
+# instead (see cp_request). Deliberately NOT --fail-with-body: that needs curl
+# >= 7.76, and this runs on whatever curl the runner image ships plus an
+# operator laptop; -o/-w has worked since curl 7.x and costs nothing here.
+CURL_RAW=(curl -sS -A curl/8.4.0 --doh-url https://cloudflare-dns.com/dns-query)
+# Bounded poll-retry budget for the CP's documented-retryable 409 (see
+# promote_pin). Env-overridable so a caller can shorten it; never unbounded.
+PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS="${PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS:-180}"
+PROMOTE_CONFLICT_RETRY_INTERVAL_SECONDS="${PROMOTE_CONFLICT_RETRY_INTERVAL_SECONDS:-5}"
+# The loop's only progress term is the interval, so a zero or non-numeric one
+# turns a bounded retry into an infinite one — refuse it up front rather than
+# discover it during an incident. A budget of 0 IS valid: it means "try once,
+# never wait", which is how a caller opts out of retrying.
+case "$PROMOTE_CONFLICT_RETRY_INTERVAL_SECONDS" in
+  ''|*[!0-9]*|0) echo "FATAL: PROMOTE_CONFLICT_RETRY_INTERVAL_SECONDS must be a positive integer (got '${PROMOTE_CONFLICT_RETRY_INTERVAL_SECONDS}') — a zero interval makes the bounded retry unbounded" >&2; exit 2;;
+esac
+case "$PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS" in
+  ''|*[!0-9]*) echo "FATAL: PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS must be a non-negative integer (got '${PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS}')" >&2; exit 2;;
+esac
 
 usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 while [ "$#" -gt 0 ]; do
@@ -77,10 +115,79 @@ if [ -z "$GIT_SHA" ] && [ -n "$TAG" ]; then
   esac
 fi
 
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${REPO_ROOT:-$(CDPATH='' cd -- "$SCRIPT_DIR/../.." && pwd)}"
+# docker (default, unchanged) | registry (pure HTTP, no docker daemon)
+DIGEST_SOURCE="${DIGEST_SOURCE:-docker}"
+
+# Resolve <name>:<tag> to its sha256 digest over the registry HTTP API, with no
+# docker daemon and no docker socket.
+#
+# WHY THIS EXISTS. The PRODUCTION promote lane could not be scheduled at all:
+# `runs-on:` is an AND over labels, and its old `[docker-host, local-deploy]`
+# matched zero of the 29 registered runners (22 carry docker-host, none of those
+# carries local-deploy; the five local-deploy pods carry exactly ['local-deploy']).
+# Its one run, 624317, sat at started_at=1970-01-01 until it was cancelled.
+#
+# Relabelling alone could not fix it while the script needed a docker socket, so
+# the docker DEPENDENCY is removed here instead. The lane now runs on docker-host
+# and reaches the control planes over public HTTPS; it needs no docker socket, and
+# this path lets a runner WITHOUT one resolve a digest correctly.
+#
+# It delegates to .gitea/scripts/registry-manifest-state.py, which is already
+# the SSOT for the registry ref grammar and the manifest read: it rejects
+# redirects, bounds the response, and asserts the advertised
+# Docker-Content-Digest matches a fresh hash of the manifest bytes. Re-writing
+# that here is how the two copies drift apart.
+#
+# EQUIVALENCE, verified 2026-08-08 against live state rather than asserted:
+#   staging-f3c9eaf -> sha256:747d3df6…  == the live pin on molecule-cp-prod
+#   staging-1802ebe -> sha256:f1972d8c…  == the live pin on molecule-cp-staging
+# i.e. this path reproduces exactly the values production already holds.
+resolve_digest_registry() {
+  local resolver="$REPO_ROOT/.gitea/scripts/registry-manifest-state.py" out rc
+  [ -f "$resolver" ] || {
+    echo "FATAL: DIGEST_SOURCE=registry needs $resolver, which is missing" >&2
+    return 1
+  }
+  for v in REG_USER REG_TOKEN; do
+    [ -n "${!v:-}" ] || {
+      echo "FATAL: $v is required when DIGEST_SOURCE=registry (registry read credentials)" >&2
+      return 1
+    }
+  done
+  set +e
+  out="$(REG_USER="$REG_USER" REG_TOKEN="$REG_TOKEN" python3 "$resolver" "$IMAGE")"
+  rc=$?
+  set -e
+  if [ "$rc" = "10" ]; then
+    # Exit 10 is the resolver's ONLY "tag is absent" signal. It must never be
+    # smoothed into an empty digest: an absent tag is a real, loud failure —
+    # promoting a pin to a tag the registry does not serve is precisely how prod
+    # was left pointing at `staging-7d78136`, a 404 on both registry hosts.
+    echo "FATAL: registry has no manifest for $IMAGE (tag absent) — refusing to resolve a digest" >&2
+    return 1
+  fi
+  if [ "$rc" != "0" ] || [ -z "$out" ]; then
+    echo "FATAL: cannot resolve $IMAGE over the registry API (rc=$rc)" >&2
+    return 1
+  fi
+  printf '%s\n' "$out"
+}
+
 resolve_digest() {
   case "$IMAGE" in
     *@sha256:*) printf '%s\n' "${IMAGE##*@}"; return 0;;
   esac
+  if [ "$DIGEST_SOURCE" = "registry" ]; then
+    log "resolving $IMAGE over the registry HTTP API (no docker)"
+    resolve_digest_registry
+    return $?
+  fi
+  if [ "$DIGEST_SOURCE" != "docker" ]; then
+    echo "FATAL: DIGEST_SOURCE must be 'docker' or 'registry' (got '$DIGEST_SOURCE')" >&2
+    return 1
+  fi
   # Jobs carrying this script may run on a different Gitea runner from the
   # upstream image-availability gate. The registry tag is the shared handoff;
   # a previous runner's Docker cache is not. Pull on this runner before
@@ -163,17 +270,114 @@ fi
 CP_TOKEN="$(fetch_cp_token)"
 mask "$CP_TOKEN"
 
-cp_json() {
-  local method="$1" path="$2" body="${3:-}"
+# cp_request performs one CP call and records BOTH halves of the answer in
+# CP_LAST_STATUS / CP_LAST_BODY. Nothing here decides success — that is
+# cp_assert_ok's and promote_pin's job — because the status is exactly what
+# tells a retryable conflict apart from a terminal 4xx, and the body is the only
+# place the CP explains itself.
+CP_LAST_STATUS=""
+CP_LAST_BODY=""
+cp_request() {
+  local method="$1" path="$2" body="${3:-}" raw=""
+  CP_LAST_STATUS=""
+  CP_LAST_BODY=""
+  # Body and status come back over the SAME stdout, separated by the newline
+  # -w prepends, and are split below. No -o tempfile: this script exports
+  # MSYS_NO_PATHCONV=1, so a POSIX mktemp path handed to a native curl on a
+  # git-bash box resolves to a different file than `cat` would read, and the
+  # body would silently come back empty — a "captured" body that is always
+  # blank is worse than no capture at all.
+  #
+  # Without -f, curl exits 0 for an HTTP error and still emits the body, so a
+  # 4xx/5xx reaches us intact. A TRANSPORT failure (refused, DNS, TLS) still
+  # exits non-zero and %{http_code} is then `000`: `|| true` keeps set -e from
+  # killing us before we can report it, and `000` is not 2xx so it stays fatal.
   if [ -n "$body" ]; then
-    "${CURL[@]}" -X "$method" "${CP_BASE_URL%/}$path" \
+    raw="$("${CURL_RAW[@]}" -w $'\n%{http_code}' -X "$method" "${CP_BASE_URL%/}$path" \
       -H "Authorization: Bearer $CP_TOKEN" \
       -H "Content-Type: application/json" \
-      -d "$body"
+      -d "$body")" || true
   else
-    "${CURL[@]}" -X "$method" "${CP_BASE_URL%/}$path" \
-      -H "Authorization: Bearer $CP_TOKEN"
+    raw="$("${CURL_RAW[@]}" -w $'\n%{http_code}' -X "$method" "${CP_BASE_URL%/}$path" \
+      -H "Authorization: Bearer $CP_TOKEN")" || true
   fi
+  # The status is whatever follows the LAST newline; everything before it is the
+  # body. If curl never ran at all, raw is empty and both stay empty — which
+  # cp_assert_ok treats as failure, never as success.
+  case "$raw" in
+    *$'\n'*)
+      CP_LAST_STATUS="${raw##*$'\n'}"
+      CP_LAST_BODY="${raw%$'\n'*}"
+      ;;
+  esac
+}
+
+# cp_assert_ok is fail-CLOSED: only a literal 2xx passes. An empty status (curl
+# never ran), `000` (never reached the CP), or anything non-2xx is fatal AND
+# prints what the CP said. Written as an explicit 2xx allowlist rather than a
+# "not an error" test so that an unset/empty CP_LAST_STATUS cannot slip through
+# as success — the failure mode this whole change exists to remove.
+cp_assert_ok() {
+  local method="$1" path="$2"
+  case "${CP_LAST_STATUS:-}" in
+    2[0-9][0-9]) return 0 ;;
+  esac
+  echo "FATAL: CP $method $path returned HTTP ${CP_LAST_STATUS:-<none>}: ${CP_LAST_BODY:-<empty body>}" >&2
+  exit 1
+}
+
+cp_json() {
+  local method="$1" path="$2" body="${3:-}"
+  cp_request "$method" "$path" "$body"
+  cp_assert_ok "$method" "$path"
+  printf '%s' "$CP_LAST_BODY"
+}
+
+# promote_pin POSTs the pin write, poll-retrying ONLY the CP's documented-
+# retryable conflict, inside a stated budget.
+#
+# WHY 409 IS RETRYABLE. The CP's molecule-tenant UPSERT is
+#   INSERT ... SELECT ... WHERE $1 <> 'molecule-tenant'
+#                            OR pg_try_advisory_xact_lock(<TenantImageRolloutAdvisoryLockID>)
+# Three actors contend on that advisory lock: a fresh-tenant provision holds it
+# SHARED for the whole orchestration, a fleet rollout holds it exclusively, and
+# this promote takes an exclusive xact TRY. A held fence fails the try, the
+# SELECT yields no row, and the CP maps sql.ErrNoRows to 409 with a body that
+# literally says "retry after the rollout completes". The fence is session-
+# scoped: no TTL, no table row, nothing to clean up — it disappears when the
+# other operation finishes. On 2026-08-07 that made an ~11s window fail the
+# staging merge train outright.
+#
+# WHY NOT RETRY EVERYTHING. 400 (validation) and 503 (no database wired) are
+# terminal: re-POSTing an identical request that the CP has already rejected on
+# its merits just burns the budget and hides the error. Only 409 loops.
+promote_pin() {
+  local body="$1" attempt=0 waited=0
+  while :; do
+    attempt=$((attempt + 1))
+    cp_request POST /cp/admin/runtime-image/promote "$body"
+    case "${CP_LAST_STATUS:-}" in
+      2[0-9][0-9])
+        if [ "$attempt" -gt 1 ]; then
+          log "promote accepted on attempt $attempt after ${waited}s of pin-mutation contention"
+        fi
+        return 0
+        ;;
+      409)
+        if [ "$waited" -ge "$PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS" ]; then
+          echo "FATAL: CP still reports the molecule-tenant pin-mutation conflict after ${waited}s over $attempt attempts (retry budget ${PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS}s, interval ${PROMOTE_CONFLICT_RETRY_INTERVAL_SECONDS}s). A fleet rollout or tenant provision has held the advisory fence for longer than this job is willing to wait; re-run once it completes, or raise PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS. Last CP response: ${CP_LAST_BODY:-<empty body>}" >&2
+          exit 1
+        fi
+        log "CP returned 409 on attempt $attempt (${waited}s of ${PROMOTE_CONFLICT_RETRY_BUDGET_SECONDS}s budget used): ${CP_LAST_BODY:-<empty body>}"
+        sleep "$PROMOTE_CONFLICT_RETRY_INTERVAL_SECONDS"
+        waited=$((waited + PROMOTE_CONFLICT_RETRY_INTERVAL_SECONDS))
+        ;;
+      *)
+        echo "FATAL: CP POST /cp/admin/runtime-image/promote returned HTTP ${CP_LAST_STATUS:-<none>} — not a retryable conflict: ${CP_LAST_BODY:-<empty body>}" >&2
+        exit 1
+        ;;
+    esac
+  done
 }
 
 # ---- LOCAL_TENANT_IMAGE (the CP boot-default SSOT) read/write ----
@@ -290,9 +494,78 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
+# PROVENANCE, MINTED NOT ASSERTED. `notes` is the ONLY field on this row that
+# can distinguish a pipeline write from a hand-run one: `promoted_by` renders as
+# the CP admin token's identity (`api-token-<8 hex>`, measured on both control
+# planes 2026-08-09) whether the caller is a runner or a laptop holding the same
+# token. So the note now carries a `[ci-pin-provenance …]` stamp anchored on
+# GITHUB_RUN_ID, and .gitea/scripts/pin_provenance.py refuses to mint one
+# without a run id.
+#
+# THAT REFUSAL IS THE POINT. Outside Actions there is no run id, so there is no
+# stamp, so this script cannot promote — the documented "just run
+# advance-staging-tenant-pin.sh directly" path is closed for the DB pin. There
+# is deliberately no bypass variable: a bypass is a convention with an `if`
+# around it, and this task was assigned precisely because conventions had not
+# held. The boot-SSOT reconcile path above (DB pin already at target) is
+# untouched and still usable by hand — it mutates no pin.
+#
+# WHAT THIS DOES *NOT* CLOSE, said plainly so nobody infers more than is true:
+# this refusal binds THIS SCRIPT, not the control plane. A raw
+#   curl -X POST …/cp/admin/runtime-image/promote -d '{"notes":"whatever"}'
+# still succeeds — the promote dispatcher's `GuardPromote` hook is deliberately
+# unset for `runtimeImagePinResource` (molecule-controlplane
+# internal/handlers/pin_runtime_image.go). Such a write is DETECTED after the
+# fact by pin-provenance-guard's live audit, not prevented. Making it
+# impossible means implementing that hook; that is a control-plane change and a
+# prod CP deploy, not something this script can do.
+#
+# THE MINTER IS RESOLVED FROM $SCRIPT_DIR, NOT $REPO_ROOT. REPO_ROOT is
+# caller-overridable (resolve_digest_registry above honours it, and tests point
+# it at a synthetic tree holding only the resolver). Resolving a provenance
+# dependency through an overridable variable means `REPO_ROOT=/tmp/empty` turns
+# the promote path off — it fails CLOSED, so it is a denial rather than a
+# bypass, but it is still an env var deciding whether provenance happens.
+# BASH_SOURCE cannot be overridden that way, and the minter always ships next to
+# this script. Measured: CI run 638189 failed exactly here, with
+#   python3: can't open file '…/root/.gitea/scripts/pin_provenance.py'
+# on the two suites that set a synthetic REPO_ROOT.
+minter="$SCRIPT_DIR/../../.gitea/scripts/pin_provenance.py"
+if [ ! -f "$minter" ]; then
+  minter="$REPO_ROOT/.gitea/scripts/pin_provenance.py"
+fi
+if [ ! -f "$minter" ]; then
+  echo "FATAL: pin_provenance.py is missing (looked next to this script and under REPO_ROOT). A pin write must carry provenance; refusing." >&2
+  exit 1
+fi
+set +e
+NOTES="$(python3 "$minter" mint --notes "tenant image ${IMAGE}")"
+mint_rc=$?
+set -e
+if [ "$mint_rc" != "0" ] || [ -z "$NOTES" ]; then
+  cat >&2 <<'PROVFAIL'
+FATAL: refusing to promote the molecule-tenant pin without CI provenance.
+
+  This write is the source of truth for what a tenant runs, and it must be
+  attributable to a pipeline run. pin_provenance.py could not mint a stamp,
+  which outside CI means exactly one thing: GITHUB_RUN_ID is unset.
+
+  Promote through the pipeline instead:
+    staging     .gitea/workflows/staging-tenant-cd.yml   (runs on push to main)
+    production  .gitea/workflows/promote-prod-tenant-pin.yml  (dispatch; the
+                apply path additionally requires the freeze off AND
+                PROD_TENANT_PIN_PROMOTE_ARMED=true)
+
+  If you are reconciling a drifted LOCAL_TENANT_IMAGE boot secret while the DB
+  pin is already correct, that path does not come through here and still works.
+PROVFAIL
+  exit 1
+fi
 body="$(python3 -c 'import json,sys; print(json.dumps({"template_name":"molecule-tenant","image_digest":sys.argv[1],"git_sha":sys.argv[2],"notes":sys.argv[3]}))' \
-  "$DIGEST" "$GIT_SHA" "staging tenant image ${IMAGE}")"
-cp_json POST /cp/admin/runtime-image/promote "$body" >/dev/null
+  "$DIGEST" "$GIT_SHA" "$NOTES")"
+# Called in the PARENT shell, not a command substitution: promote_pin's `exit 1`
+# must end the script, and a subshell exit would only end the subshell.
+promote_pin "$body"
 
 after="$(cp_json GET /cp/admin/runtime-image)"
 now_digest="$(printf '%s' "$after" | python3 -c '

@@ -117,6 +117,22 @@ func StartPluginDriftSweeper(ctx context.Context, resolver PluginResolver) {
 	}
 }
 
+// DriftEligibleQuery is the row-selection the sweeper runs each cycle: every
+// plugin opted into tracking that has a content baseline to compare against.
+//
+// Exported so the real-Postgres integration gate can execute THIS query rather
+// than a hand-copied restatement of it. That distinction is the whole point:
+// the core#4977 defect was that this predicate matched zero rows in
+// production while every unit test passed, because sqlmock returns canned rows
+// without ever evaluating a WHERE clause.
+const DriftEligibleQuery = `
+	SELECT wp.id, wp.workspace_id, wp.plugin_name, wp.source_raw,
+	       wp.tracked_ref, wp.installed_sha
+	  FROM workspace_plugins wp
+	 WHERE wp.tracked_ref != 'none'
+	   AND wp.installed_sha IS NOT NULL
+`
+
 // sweepDriftOnce runs one full drift-detection cycle.
 // Errors are non-fatal — each row is handled independently so a single
 // slow row doesn't block the rest of the sweep.
@@ -124,13 +140,7 @@ func sweepDriftOnce(parent context.Context, resolver PluginResolver) {
 	ctx, cancel := context.WithTimeout(parent, 10*time.Minute)
 	defer cancel()
 
-	rows, err := db.DB.QueryContext(ctx, `
-		SELECT wp.id, wp.workspace_id, wp.plugin_name, wp.source_raw,
-		       wp.tracked_ref, wp.installed_sha
-		  FROM workspace_plugins wp
-		 WHERE wp.tracked_ref != 'none'
-		   AND wp.installed_sha IS NOT NULL
-	`)
+	rows, err := db.DB.QueryContext(ctx, DriftEligibleQuery)
 	if err != nil {
 		log.Printf("Plugin drift sweeper: SELECT failed: %v", err)
 		return
@@ -180,40 +190,44 @@ func sweepDriftOnce(parent context.Context, resolver PluginResolver) {
 	}
 }
 
-// resolveLatestSHA resolves the tracked ref to its current upstream SHA.
-// Handles both github:// and local:// sources; local sources are skipped
-// (no meaningful upstream to drift against).
-func resolveLatestSHA(ctx context.Context, resolver PluginResolver, sourceRaw, trackedRef string) (string, error) {
-	// Strip the scheme prefix to get the raw spec.
-	// sourceRaw is stored as the full string, e.g. "github://owner/repo#tag:v1.0.0"
+// driftSpecForTrackedRef builds the resolver spec for one sweep row: the
+// source's scheme is stripped and its #fragment replaced with the fragment
+// implied by tracked_ref.
+//
+// "tag:"/"sha:" values are passed through as-is — the resolvers understand
+// those prefixes. A "ref:<name>" value must be UNWRAPPED to a bare "#<name>",
+// because the prefix is our storage encoding, not something a forge can
+// resolve; sending "#ref:main" to git would look up a ref literally named
+// "ref:main" and fail (core#4977).
+func driftSpecForTrackedRef(sourceRaw, trackedRef string, schemes []string) string {
 	spec := sourceRaw
-	for _, scheme := range resolver.Schemes() {
+	for _, scheme := range schemes {
 		if strings.HasPrefix(spec, scheme+"://") {
 			spec = strings.TrimPrefix(spec, scheme+"://")
 			break
 		}
 	}
 
-	// Parse the ref from the tracked_ref field (e.g. "tag:v1.0.0").
-	// Prepend it as a # suffix so the resolver can fetch the right ref.
-	var refSuffix string
-	switch {
-	case strings.HasPrefix(trackedRef, "tag:"):
-		refSuffix = "#" + trackedRef
-	case strings.HasPrefix(trackedRef, "sha:"):
-		refSuffix = "#" + trackedRef
-	default:
-		// Bare ref (shouldn't happen per validateTrackedRef, but be safe).
-		refSuffix = "#" + trackedRef
+	fragment := trackedRef
+	if strings.HasPrefix(trackedRef, "ref:") {
+		fragment = strings.TrimPrefix(trackedRef, "ref:")
 	}
 
-	// If spec already has a # fragment, replace it with the tracked ref.
-	// (In practice source_raw always has one, but handle both cases.)
-	if strings.Contains(spec, "#") {
-		spec = strings.SplitN(spec, "#", 2)[0] + refSuffix
-	} else {
-		spec = spec + refSuffix
+	base := spec
+	if idx := strings.Index(spec, "#"); idx >= 0 {
+		base = spec[:idx]
 	}
+	return base + "#" + fragment
+}
+
+// resolveLatestSHA resolves the tracked ref to its current upstream SHA.
+// Handles both github:// and local:// sources; local sources are skipped
+// (no meaningful upstream to drift against).
+func resolveLatestSHA(ctx context.Context, resolver PluginResolver, sourceRaw, trackedRef string) (string, error) {
+	// Strip the scheme and replace the source's own #fragment with the one
+	// tracked_ref implies. tracked_ref is authoritative here: a "ref:<name>"
+	// value is unwrapped to a bare "#<name>" so the forge sees a real ref.
+	spec := driftSpecForTrackedRef(sourceRaw, trackedRef, resolver.Schemes())
 
 	// Pick the resolver by scheme. gitea:// sources (private-repo-subpath,
 	// RFC#2843) need the GiteaResolver — it injects the PAT and clones the
@@ -287,6 +301,20 @@ func ResolveSourceSHA(ctx context.Context, resolver PluginResolver, sourceRaw st
 }
 
 // queueDriftEntry inserts a pending drift entry into plugin_update_queue.
+//
+// The ON CONFLICT clause MUST repeat `WHERE status = 'pending'`. The uniqueness
+// it infers is the PARTIAL index plugin_update_queue_pending_unique
+// (workspace_id, plugin_name) WHERE status = 'pending'; Postgres will not infer
+// a partial index unless the predicate matches, and instead rejects the whole
+// statement with "there is no unique or exclusion constraint matching the ON
+// CONFLICT specification".
+//
+// core#4977: without the predicate EVERY enqueue failed. The sweeper logs that
+// error and continues, so drift was detected forever and never queued — the
+// queue sat permanently empty and nothing ever converged. Confirmed live: a
+// workspace with real drift logged "drift detected ... queue drift ... failed"
+// on every sweep. Covered by a real-Postgres gate; sqlmock cannot catch it
+// because it never runs the planner.
 // ON CONFLICT (workspace_id, plugin_name) WHERE status = 'pending' DO NOTHING
 // makes this idempotent — re-drift while a row is already pending is a no-op.
 // Uses the partial unique index plugin_update_queue_pending_unique as the
@@ -296,7 +324,7 @@ func queueDriftEntry(ctx context.Context, workspaceID, pluginName, trackedRef, c
 		INSERT INTO plugin_update_queue
 		  (workspace_id, plugin_name, tracked_ref, current_sha, latest_sha)
 		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (workspace_id, plugin_name) DO NOTHING
+		ON CONFLICT (workspace_id, plugin_name) WHERE status = 'pending' DO NOTHING
 	`, workspaceID, pluginName, trackedRef, currentSHA, latestSHA)
 	return err
 }

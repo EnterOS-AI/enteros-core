@@ -34,6 +34,15 @@ import (
 type CPProvisionerAPI interface {
 	Start(ctx context.Context, cfg WorkspaceConfig) (string, error)
 	Stop(ctx context.Context, workspaceID string) error
+	// EnsureImage asks the control plane to make this workspace's pinned image
+	// obtainable BEFORE the caller stops anything (core#5019, structural half).
+	//
+	// Deliberately on THIS interface rather than behind an optional type
+	// assertion on *CPProvisioner: the guard's whole value is that a restart
+	// path cannot reach Stop without having asked first, and an optional
+	// interface is exactly the shape that lets a fake — or a future second
+	// implementation — silently skip the question and still compile.
+	EnsureImage(ctx context.Context, req EnsureImageRequest) (EnsureImageResult, error)
 	// StopAndPrune is Stop + "erase the durable data volume" (internal#734),
 	// for the permanent-delete-with-erase flow ONLY. Restart/recreate use Stop.
 	StopAndPrune(ctx context.Context, workspaceID string) error
@@ -68,6 +77,18 @@ type CPProvisioner struct {
 	adminToken    string // X-Molecule-Admin-Token — per-tenant identity (controlplane #118/#130)
 	cpAdminAPIKey string // Authorization: Bearer — gates /cp/admin/* (read-only ops routes; distinct secret from sharedSecret)
 	httpClient    *http.Client
+	// provisionHTTPClient carries ONLY the provision POST. core#5019: a
+	// workspace adopting a newly promoted template pin is stopped before the
+	// CP is asked to provision it, and the CP cannot answer until it holds the
+	// pinned image (~7GB). Sharing the 120s budget meant a cold pull blew the
+	// deadline and left the workspace with no container at all.
+	provisionHTTPClient *http.Client
+	// ensureImageHTTPClient carries ONLY the ensure-image pre-flight (core#5019,
+	// structural half). Separate from provisionHTTPClient because the two bound
+	// different operations: this one may spend minutes making a ~7GB pinned image
+	// present BEFORE the workspace is stopped; the provision that follows it is
+	// then fast. See cpEnsureImageTimeout.
+	ensureImageHTTPClient *http.Client
 	// hostStateDir is the base dir for the host-side /configs mirror the Files
 	// API serves from when there is no docker.sock into the runtime container
 	// (#206 molecules-server). Empty disables the mirror (config still delivers
@@ -145,12 +166,14 @@ func NewCPProvisioner() (*CPProvisioner, error) {
 	}
 
 	return &CPProvisioner{
-		baseURL:       baseURL,
-		orgID:         orgID,
-		sharedSecret:  sharedSecret,
-		adminToken:    adminToken,
-		cpAdminAPIKey: cpAdminAPIKey,
-		httpClient:    &http.Client{Timeout: 120 * time.Second},
+		baseURL:               baseURL,
+		orgID:                 orgID,
+		sharedSecret:          sharedSecret,
+		adminToken:            adminToken,
+		cpAdminAPIKey:         cpAdminAPIKey,
+		httpClient:            &http.Client{Timeout: cpAPITimeout},
+		provisionHTTPClient:   &http.Client{Timeout: cpProvisionTimeout},
+		ensureImageHTTPClient: &http.Client{Timeout: cpEnsureImageTimeout},
 	}, nil
 }
 
@@ -162,6 +185,39 @@ func NewCPProvisioner() (*CPProvisioner, error) {
 // deployments without a real CP still work (those don't hit a CP that
 // enforces either gate). In prod both are set by the controlplane
 // bootstrap, so both headers land on every outbound call.
+// cpAPITimeout bounds the small JSON calls to the CP (status, stop, console).
+// They are request/response only and must not hang a caller.
+const cpAPITimeout = 120 * time.Second
+
+// cpProvisionTimeout bounds the provision POST. The CP may have to pull a
+// multi-GB workspace image before it can answer -- guaranteed right after a
+// template promote, when no host has the new digest yet. Measured: a cold
+// 7.05GB pull, then the identical call returned in 13s once the image was
+// local. This is deliberately generous; the failure it prevents is not a slow
+// restart but a workspace left down (core#5019).
+const cpProvisionTimeout = 20 * time.Minute
+
+// CPProvisionCeiling exposes the provision POST's budget so a CALLER can size
+// its own context against the thing that actually has to finish inside it.
+//
+// Exported for the same reason EnsureImageClientTimeout() is: a caller deadline
+// SMALLER than this constant bounds nothing. It cancels the request before the
+// client can ever time out, so widening the client achieves precisely nothing,
+// and the failure does not even surface here — it surfaces on the CONTROL PLANE
+// as `context canceled` in the middle of a multi-GB pull, with no client-side
+// timeout anywhere in the logs to point at.
+//
+// That inversion is not hypothetical. provisionWorkspaceCP bounded the whole
+// provision at provisioner.ProvisionTimeout (3 min) while core#5019 had already
+// widened this client to 20 min and the control plane had raised its own pull
+// cap to 30 min with a 2-minute stall window. The 3-minute context beat all
+// three, and a workspace created shortly after a runtime-image promote was
+// marked terminally failed while the pull was still making steady progress.
+//
+// Callers must size their context at OR ABOVE this value. handlers has a test
+// pinning that relation, which is what stops the inversion returning quietly.
+func CPProvisionCeiling() time.Duration { return cpProvisionTimeout }
+
 func (p *CPProvisioner) provisionAuthHeaders(req *http.Request) {
 	if p.sharedSecret != "" {
 		req.Header.Set("Authorization", "Bearer "+p.sharedSecret)
@@ -189,13 +245,21 @@ func (p *CPProvisioner) adminAuthHeaders(req *http.Request) {
 }
 
 type cpProvisionRequest struct {
-	OrgID        string `json:"org_id"`
-	WorkspaceID  string `json:"workspace_id"`
-	Runtime      string `json:"runtime"`
-	Template     string `json:"template,omitempty"`
-	Tier         int    `json:"tier"`
-	InstanceType string `json:"instance_type,omitempty"`
-	DiskGB       int32  `json:"disk_gb,omitempty"`
+	OrgID       string `json:"org_id"`
+	WorkspaceID string `json:"workspace_id"`
+	// IdempotencyKey lets the CP dedupe a RETRY of this provision attempt
+	// (core#5057). Minted once per Start call and reused across that call's
+	// retries; the CP records the terminal response against
+	// (org_id, idempotency_key) and replays it rather than provisioning a
+	// second box. omitempty so the wire shape is unchanged for a CP that does
+	// not yet understand the field — an older CP simply ignores it and the
+	// retry degrades to the pre-#5057 risk profile.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	Runtime        string `json:"runtime"`
+	Template       string `json:"template,omitempty"`
+	Tier           int    `json:"tier"`
+	InstanceType   string `json:"instance_type,omitempty"`
+	DiskGB         int32  `json:"disk_gb,omitempty"`
 	// Provider routes the CP to the compute backend for this workspace box
 	// (multi-provider RFC, per-workspace). Distinct from the LLM/model provider.
 	Provider string `json:"provider,omitempty"`
@@ -376,13 +440,20 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 		InstanceType:    cfg.InstanceType,
 		DiskGB:          cfg.DiskGB,
 		DataPersistence: cfg.DataPersistence,
-		Provider:        cfg.Provider,
-		Kind:            kind,
-		Display:         cfg.Display,
-		PlatformURL:     cfg.PlatformURL,
-		Env:             env,
-		ConfigFiles:     configFiles,
-		TemplateAssets:  templateAssets,
+		// core#5025: resolved through the SAME seam as EnsureImage and Stop.
+		// cfg.Provider arrives from payload.Compute.Provider, which the canvas
+		// compute VALIDATOR drops whenever the persisted id is outside the
+		// cloud/billable picker set (the local Molecules-Server box is not in
+		// it) — so a workspace could be pre-warmed for the box named on its row
+		// and then provisioned with no provider at all. The pre-flight is only a
+		// guard if it resolves the box the provision actually builds.
+		Provider:       p.providerForWorkspace(ctx, cfg.WorkspaceID, cfg.Provider),
+		Kind:           kind,
+		Display:        cfg.Display,
+		PlatformURL:    cfg.PlatformURL,
+		Env:            env,
+		ConfigFiles:    configFiles,
+		TemplateAssets: templateAssets,
 	}
 
 	body, err := json.Marshal(req)
@@ -391,43 +462,145 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	}
 
 	url := p.baseURL + "/cp/workspaces/provision"
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("cp provisioner: create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	p.provisionAuthHeaders(httpReq)
 
-	resp, err := p.httpClient.Do(httpReq)
-	if err != nil {
-		return "", fmt.Errorf("cp provisioner: send: %w", err)
+	// Provisioning gets its own budget -- see cpProvisionTimeout.
+	provisionClient := p.provisionHTTPClient
+	if provisionClient == nil {
+		provisionClient = p.httpClient
 	}
-	defer func() { _ = resp.Body.Close() }()
 
-	// Cap body read at 64 KiB — the CP only ever returns small JSON
-	// responses; an unbounded read could be weaponized into log-flood
-	// DoS by a compromised upstream.
-	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	if readErr != nil {
-		return "", fmt.Errorf("cp provisioner: read response body: %w", readErr)
-	}
-	var result cpProvisionResponse
-	unmarshalErr := json.Unmarshal(respBody, &result)
-
-	if resp.StatusCode != http.StatusCreated {
-		// Prefer the structured {"error":"..."} field. Do NOT fall back
-		// to string(respBody) — our logs ingest errors, and an upstream
-		// misconfiguration that echoed the Authorization header or
-		// request body into the response would leak bearer tokens.
-		errMsg := result.Error
-		if errMsg == "" {
-			errMsg = fmt.Sprintf("<unstructured body, %d bytes>", len(respBody))
+	// core#5057 — bounded, ctx-aware retry of the provision POST.
+	//
+	// This call was single-shot, so a transient failure on the hop meant the box
+	// was NEVER CREATED: Start returned an error, provisionWorkspaceCP called
+	// markProvisionFailed, and nothing re-drove it (StartProvisioningTimeoutSweep
+	// only flips stuck rows to 'failed'). e2e-smoke then polled loaded_mcp_tools
+	// for 240s against a workspace with no box. Seen as `remote error: tls: bad
+	// record MAC` and as Cloudflare 524/502 under load — non-deterministic: the
+	// same commit passed at 20:36 and failed at 22:06, and it also struck the
+	// commit already running in production.
+	//
+	// It was the outlier on this path. Stop retries (cpStopWithRetryErr, 3
+	// attempts, ctx-aware) and the instance_id persist retries (3 attempts,
+	// exponential backoff) — but the call that CREATES the box did not.
+	// (CPProvisioner.EnsureImage is sometimes cited as a retrying neighbour. It
+	// is NOT — cp_ensure_image.go is a single client.Do with no loop; the local
+	// ensureImagePresent is likewise single-attempt best-effort. Stop is the
+	// real precedent, and the shape below follows cpStopWithRetryErr, the only
+	// ctx-aware retry in the tree.)
+	//
+	// SAFETY. Retrying is sound ONLY because the CP now dedupes on a
+	// client-supplied idempotency key (controlplane#2882, migration 073).
+	// Re-entry into the CP handler is otherwise DESTRUCTIVE: the AWS path
+	// terminates the pre-existing instance and the local-docker path
+	// `docker rm -f`s the container, so a blind retry of a request that DID land
+	// would tear down the box the first attempt created. ONE key is minted per
+	// Start call and reused across every attempt — that is exactly what makes
+	// attempt N a retry of attempt 1 rather than a second provision. DO NOT move
+	// the mint inside the loop.
+	attempts := cpProvisionRetryAttempts
+	if key, keyErr := newProvisionIdempotencyKey(); keyErr != nil {
+		// Without a key the CP cannot dedupe, so retrying would risk
+		// double-provisioning. Fall back to the old single-shot behaviour rather
+		// than retry unsafely.
+		log.Printf("CPProvisioner.Start: could not mint an idempotency key for %s (%v) — falling back to a SINGLE un-retried attempt", cfg.WorkspaceID, keyErr)
+		attempts = 1
+	} else {
+		req.IdempotencyKey = key
+		if body, err = json.Marshal(req); err != nil {
+			return "", fmt.Errorf("cp provisioner: marshal with idempotency key: %w", err)
 		}
-		return "", fmt.Errorf("cp provisioner: provision failed (%d): %s", resp.StatusCode, errMsg)
 	}
 
-	if unmarshalErr != nil {
-		return "", fmt.Errorf("cp provisioner: decode 201 response: %w", unmarshalErr)
+	var (
+		result  cpProvisionResponse
+		lastErr error
+	)
+	delay := cpProvisionRetryBaseDelay
+	for attempt := 1; ; attempt++ {
+		httpReq, reqErr := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+		if reqErr != nil {
+			return "", fmt.Errorf("cp provisioner: create request: %w", reqErr)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		p.provisionAuthHeaders(httpReq)
+
+		var (
+			statusCode int
+			respBody   []byte
+		)
+		resp, doErr := provisionClient.Do(httpReq)
+		if doErr == nil {
+			// Cap body read at 64 KiB — the CP only ever returns small JSON
+			// responses; an unbounded read could be weaponized into log-flood
+			// DoS by a compromised upstream.
+			var readErr error
+			respBody, readErr = io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+			statusCode = resp.StatusCode
+			_ = resp.Body.Close()
+			if readErr != nil {
+				doErr = fmt.Errorf("read response body: %w", readErr)
+			}
+		}
+
+		if doErr != nil {
+			// Transport error: the request may or may not have reached the CP.
+			// This is the `tls: bad record MAC` case, and precisely why the
+			// idempotency key is a precondition for retrying at all.
+			lastErr = fmt.Errorf("cp provisioner: send: %w", doErr)
+		} else {
+			result = cpProvisionResponse{}
+			unmarshalErr := json.Unmarshal(respBody, &result)
+			if statusCode == http.StatusCreated {
+				if unmarshalErr != nil {
+					return "", fmt.Errorf("cp provisioner: decode 201 response: %w", unmarshalErr)
+				}
+				if attempt > 1 {
+					log.Printf("CPProvisioner.Start: provision for %s succeeded on attempt %d/%d — same idempotency key, so this is the SAME box, not a second one", cfg.WorkspaceID, attempt, attempts)
+				}
+				lastErr = nil
+				break
+			}
+			// Prefer the structured {"error":"..."} field. Do NOT fall back
+			// to string(respBody) — our logs ingest errors, and an upstream
+			// misconfiguration that echoed the Authorization header or
+			// request body into the response would leak bearer tokens.
+			errMsg := result.Error
+			if errMsg == "" {
+				errMsg = fmt.Sprintf("<unstructured body, %d bytes>", len(respBody))
+			}
+			lastErr = fmt.Errorf("cp provisioner: provision failed (%d): %s", statusCode, errMsg)
+			if !retryableProvisionStatus(statusCode, result.Error) {
+				// A deterministic rejection (400 privileged_env_forbidden, 403,
+				// 422 RUNTIME_PIN_MISSING, ...) will fail identically forever.
+				// Retrying it only burns the provision budget.
+				return "", lastErr
+			}
+		}
+
+		if attempt >= attempts {
+			break
+		}
+		log.Printf("CPProvisioner.Start: provision attempt %d/%d for %s failed (%v) — retrying in %s", attempt, attempts, cfg.WorkspaceID, lastErr, delay)
+		// ctx-aware sleep, matching cpStopWithRetryErr: a cancelled or
+		// timed-out provision must not sit in a bare time.Sleep.
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", fmt.Errorf("cp provisioner: provision aborted during retry backoff: %w (last error: %v)", ctx.Err(), lastErr)
+		case <-timer.C:
+		}
+		delay *= 2
+		if delay > cpProvisionRetryMaxDelay {
+			delay = cpProvisionRetryMaxDelay
+		}
+	}
+	if lastErr != nil {
+		// Greppable, mirroring the LEAK-SUSPECT line cpStopWithRetryErr emits on
+		// exhaustion.
+		log.Printf("PROVISION-EXHAUSTED cpProv.Start workspace_id=%s attempts=%d last_err=%v", cfg.WorkspaceID, attempts, lastErr)
+		return "", lastErr
 	}
 
 	log.Printf("CP provisioner: workspace %s → provider instance %s (%s)", cfg.WorkspaceID, result.InstanceID, result.State)

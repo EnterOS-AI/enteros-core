@@ -58,6 +58,49 @@ func TestValidateTrackedRef(t *testing.T) {
 	}
 }
 
+// TestValidateTrackedRef_AcceptsBareRefForm: a plugin pinned to a ref that is
+// neither a tag: nor a sha: pin — i.e. a branch ("#main") or a bare tag name
+// ("#v0.2.1") — must be storable as "ref:<name>".
+//
+// WHY: the drift sweeper selects `WHERE tracked_ref != 'none'`. Before this
+// form existed, every bare-ref plugin normalized to "none" and was therefore
+// invisible to the sweeper — on the reno-stars tenant that made ALL 5
+// workspace_plugins rows unsweepable and the sweeper vacuously green (it
+// selected zero rows and reported no drift). See core#4977.
+//
+// "ref:" rather than "branch:" on purpose: "#v0.2.1" and "#main" are
+// syntactically identical and cannot be classified without a forge lookup.
+// "ref:" is honest about that — and resolving an immutable tag simply yields a
+// constant SHA, so a tag stored this way never reports drift.
+func TestValidateTrackedRef_AcceptsBareRefForm(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+		err  bool
+	}{
+		{"ref:main", "ref:main", false},
+		{"ref:develop", "ref:develop", false},
+		{"ref:v0.2.1", "ref:v0.2.1", false}, // bare tag name, unclassifiable
+		{"ref:", "", true},                  // empty after prefix
+	}
+	for _, tc := range cases {
+		got, err := validateTrackedRef(tc.in)
+		if tc.err {
+			if err == nil {
+				t.Errorf("validateTrackedRef(%q) = (%q, nil); want error", tc.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("validateTrackedRef(%q) error: %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("validateTrackedRef(%q) = %q; want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 // TestRecordWorkspacePluginInstall_PrivilegedPluginEntitlement mirrors the
 // recordDeclaredPlugin gate in the INSTALL path (workspace_plugins). The
 // privileged org-management MCP plugin must only be installable on the

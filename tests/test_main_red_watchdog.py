@@ -228,7 +228,8 @@ def test_is_red_no_statuses(wd_module):
 
 
 # --------------------------------------------------------------------------
-# Per-entry vendor-truth key (rev4) — see status-reaper rev4 sibling
+# Per-entry vendor-truth key (rev4) — was cross-referenced to the status-reaper
+# rev4 sibling, which was REMOVED in chore/delete-uninstalled-status-reaper
 #
 # Gitea 1.22.6 returns per-entry items in combined.statuses[] with key
 # `status`, not `state`. Pre-rev4 code only read `state` → failed[]

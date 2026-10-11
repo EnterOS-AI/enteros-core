@@ -189,6 +189,33 @@ services:
       # anonymously pullable, so both normally remain unset.
       GHCR_USER: "${GHCR_USER:-}"
       GHCR_TOKEN: "${GHCR_TOKEN:-}"
+      # Langfuse tracing (optional, OFF unless keys are supplied).
+      #
+      # THIS FILE IS WHERE `langfuse-web` IS TRUE. The alias exists because the
+      # langfuse service above declares it on molecule-core-net, and it resolves
+      # in this topology and no other — on the k8s fleet there is no such
+      # Service in any namespace. So the container-network trace endpoint is
+      # named HERE rather than compiled into the provisioner as everyone's
+      # fallback: appendWorkspaceLangfuseEnv has no default host, precisely
+      # because a workspace on a substrate without this alias then retried an
+      # OTLP export against an unresolvable name forever (22,224 error lines in
+      # one tenant over 24h).
+      #
+      # The keys default to empty, so a plain `docker compose up` still boots
+      # untraced — pass real ones (or run scripts/dev-start.sh, which seeds the
+      # deterministic local pair) to turn tracing on.
+      MOLECULE_WORKSPACE_LANGFUSE_HOST: "${MOLECULE_WORKSPACE_LANGFUSE_HOST:-http://langfuse-web:3000}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
+      # The platform reader is on the Docker network; LANGFUSE_HOST in the
+      # host environment is the browser URL used by NEXTAUTH_URL above.
+      LANGFUSE_HOST: "http://langfuse-web:3000"
+      MOLECULE_OBJECT_STORE_BACKEND: "${MOLECULE_OBJECT_STORE_BACKEND:-minio}"
+      MOLECULE_OBJECT_STORE_REGION: "${MOLECULE_OBJECT_STORE_REGION:-us-east-1}"
+      MOLECULE_WORKSPACE_DATA_ENDPOINT: "${MOLECULE_WORKSPACE_DATA_ENDPOINT:-http://minio:9000}"
+      MOLECULE_WORKSPACE_DATA_BUCKET: "${MOLECULE_WORKSPACE_DATA_BUCKET:-molecule-workspace-data}"
+      MOLECULE_WORKSPACE_DATA_ACCESS_KEY_ID: "${MOLECULE_WORKSPACE_DATA_ACCESS_KEY_ID:-${MINIO_ROOT_USER:-molecule-dev-minio}}"
+      MOLECULE_WORKSPACE_DATA_SECRET_ACCESS_KEY: "${MOLECULE_WORKSPACE_DATA_SECRET_ACCESS_KEY:-${MINIO_ROOT_PASSWORD:-molecule-dev-minio-password}}"
     volumes:
       - ./workspace-configs-templates:/configs
       # NOTE: the empty host ./org-templates is intentionally NOT mounted over
@@ -222,7 +249,7 @@ services:
     healthcheck:
       # Plain GET — `--spider` would issue HEAD, which returns 404 because
       # /health is registered as GET only.
-      test: ["CMD-SHELL", "wget -qO /dev/null --tries=1 http://localhost:${PLATFORM_PORT:-8080}/health || exit 1"]
+      test: ["CMD-SHELL", "wget -qO /dev/null --tries=1 --timeout=2 http://127.0.0.1:${PLATFORM_PORT:-8080}/health || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 10

@@ -7,7 +7,7 @@ interface Props {
   workspaceId: string;
 }
 
-interface Trace {
+export interface Trace {
   id: string;
   name: string;
   timestamp: string;

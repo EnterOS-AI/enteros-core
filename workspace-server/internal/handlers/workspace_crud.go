@@ -16,12 +16,14 @@ import (
 	"runtime/debug"
 	"strings"
 	"time"
+	"unicode"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/approvals"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -143,6 +145,13 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		})
 		return
 	}
+	if rawName, renaming := body["name"]; renaming {
+		name, ok := rawName.(string)
+		if !ok || strings.TrimSpace(name) == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "name must be a non-empty string"})
+			return
+		}
+	}
 
 	// #685/#688: validate string fields for length and injection safety.
 	strField := func(key string) string {
@@ -158,6 +167,9 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	if name, renaming := body["name"].(string); renaming {
+		body["name"] = strings.TrimSpace(name)
 	}
 	if wsDir, ok := body["workspace_dir"]; ok && wsDir != nil {
 		if dirStr, isStr := wsDir.(string); isStr && dirStr != "" {
@@ -223,14 +235,91 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	var exists bool
 	if err := db.DB.QueryRowContext(ctx,
 		`SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)`, id,
-	).Scan(&exists); err != nil || !exists {
+	).Scan(&exists); err != nil {
+		log.Printf("Update workspace lookup error for %s: %v", id, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to look up workspace"})
+		return
+	}
+	if !exists {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
 		return
 	}
 
+	// parent_id is applied FIRST and as a guarded, single-transaction
+	// operation (workspace_reparent.go). See that file's header for the
+	// privilege analysis; the short version is that `workspaces` has no
+	// org_id column, so parent_id IS the org boundary that memory ACLs,
+	// sameOrg() delegation routing, peer discovery and org-token auth all
+	// derive from. It ran here for years as an unvalidated
+	// `UPDATE workspaces SET parent_id = $2` whose error was swallowed by a
+	// log.Printf, so a rejected write still answered 200 "updated".
+	//
+	// Applied BEFORE the name/role/tier writes below so a rejected move
+	// leaves NOTHING written — those are independent non-transactional
+	// statements, and returning after them would half-apply the request.
+	rawParent, patchingParent := body["parent_id"]
+	var reparent *reparentOutcome
+	if patchingParent {
+		// A combined rename+move is ambiguous against
+		// workspaces_parent_name_uniq — the collision check would run
+		// against the OLD name while the caller expects the new one — and
+		// cannot be made atomic with the untransacted name write below.
+		// Reject rather than pick an order and be silently wrong.
+		if _, alsoRenaming := body["name"]; alsoRenaming {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "parent_id and name cannot be changed in the same request; issue them as two PATCHes",
+				"code":  reparentCodeAmbiguous,
+			})
+			return
+		}
+		out, err := applyReparent(ctx, db.DB, id, rawParent)
+		if err != nil {
+			var rej *reparentError
+			if errors.As(err, &rej) {
+				resp := gin.H{"error": rej.Message, "code": rej.Code}
+				for k, v := range rej.Details {
+					resp[k] = v
+				}
+				log.Printf("Update: PATCH parent_id on %s REJECTED (%s): %s", id, rej.Code, rej.Message)
+				c.JSON(rej.Status, resp)
+				return
+			}
+			// A real DB failure. Must NOT fall through to 200 the way the
+			// pre-fix log.Printf did.
+			log.Printf("Update parent_id error for %s: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to re-parent workspace"})
+			return
+		}
+		reparent = out
+	}
+
 	if name, ok := body["name"]; ok {
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET name = $2, updated_at = now() WHERE id = $1`, id, name); err != nil {
+		result, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET name = $2, updated_at = now() WHERE id = $1 AND status != 'removed'`, id, name)
+		if err != nil {
+			if isParentNameUniqueViolation(err) {
+				c.JSON(http.StatusConflict, gin.H{"error": "a workspace with this name already exists under the same parent", "code": "WORKSPACE_NAME_CONFLICT"})
+				return
+			}
 			log.Printf("Update name error for %s: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rename workspace"})
+			return
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			log.Printf("Update name result error for %s: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to confirm workspace rename"})
+			return
+		}
+		if rows == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
+			return
+		}
+		// All rename clients share this path. Publish after persistence so
+		// other open pages update without reloading or restarting the agent.
+		payload := gin.H{"name": name}
+		if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceUpdated), id, payload); err != nil {
+			log.Printf("Update name event error for %s: %v", id, err)
+			h.broadcaster.BroadcastOnly(id, string(events.EventWorkspaceUpdated), payload)
 		}
 	}
 	if role, ok := body["role"]; ok {
@@ -241,11 +330,6 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	if tier, ok := body["tier"]; ok {
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET tier = $2, updated_at = now() WHERE id = $1`, id, tier); err != nil {
 			log.Printf("Update tier error for %s: %v", id, err)
-		}
-	}
-	if parentID, ok := body["parent_id"]; ok {
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET parent_id = $2, updated_at = now() WHERE id = $1`, id, parentID); err != nil {
-			log.Printf("Update parent_id error for %s: %v", id, err)
 		}
 	}
 	if collapsed, ok := body["collapsed"]; ok {
@@ -501,6 +585,58 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	}
 
 	resp := gin.H{"status": "updated"}
+	if name, renaming := body["name"]; renaming {
+		resp["workspace_id"] = id
+		resp["name"] = name
+	}
+	if reparent != nil && reparent.Changed {
+		// The move is a PRIVILEGE change, not a cosmetic one: the workspace
+		// drops read+write on the old team namespace and gains read+write on
+		// the new one — including RETROACTIVE read of everything the
+		// destination team ever wrote, because memory_records.namespace is a
+		// string frozen at write time in a datastore this process reaches
+		// only over HTTP (see workspace_reparent.go). Nothing can migrate
+		// those rows without dragging the OLD siblings' shared memories along
+		// with them, so the honest handling is to state the delta at the call
+		// site rather than let it be discovered later.
+		//
+		// For an ordinary move org:<root> is absent from both lists because
+		// the same-org invariant means it cannot change. An ADOPTION is the
+		// one exception and DOES list it — the workspace trades a writable
+		// org:<self> for a read-only org:<newRoot> — which is why the lists
+		// are built in applyReparent rather than assumed here.
+		resp["reparented"] = gin.H{
+			"old_parent_id":     reparent.OldParent,
+			"new_parent_id":     reparent.NewParent,
+			"org_root_id":       reparent.OrgRoot,
+			"adopted_into_org":  reparent.Adopted,
+			"namespaces_lost":   reparent.Lost,
+			"namespaces_gained": reparent.Gained,
+			"memories_migrated": false,
+			"memories_migrated_note": "memories written under the old team namespace stay there and remain " +
+				"readable by the former siblings; they are NOT moved",
+		}
+		// The container was provisioned with a PARENT_ID env var
+		// (workspace_provision_shared.go) that is now stale and is only
+		// rebuilt on the next provision/restart. No in-repo runtime reads it,
+		// but a restart is the only thing that refreshes it, so say so rather
+		// than leave the drift unreported.
+		needsRestart = true
+
+		// adopted_into_org is carried here as well as in the response: an
+		// adoption is the only case where a workspace CHANGES ORG, so it is
+		// the single most security-relevant bit of the event. An auditor
+		// reading the ledger must not have to infer it by comparing
+		// old_parent_id against org_root_id.
+		RecordAuditEvent(ctx, db.DB, auditEntryFromGin(c, id, "workspace.reparent", true, map[string]any{
+			"old_parent_id":     reparent.OldParent,
+			"new_parent_id":     reparent.NewParent,
+			"org_root_id":       reparent.OrgRoot,
+			"adopted_into_org":  reparent.Adopted,
+			"namespaces_lost":   reparent.Lost,
+			"namespaces_gained": reparent.Gained,
+		}))
+	}
 	if needsRestart {
 		resp["needs_restart"] = true
 	}
@@ -785,6 +921,89 @@ func destructiveDeleteCounts(ctx context.Context, id string) (childCount int) {
 	return childCount
 }
 
+// clearWorkspaceInstanceIDAfterStop NULLs a workspace's instance_id once its
+// compute is confirmed stopped, so a cleanly-deleted workspace never enters the
+// CP orphan sweeper's queue in the first place.
+//
+// The statement intentionally mirrors the sweeper's own clearing UPDATE in
+// internal/registry/cp_orphan_sweeper.go — the sweeper's SELECT predicate and
+// both writers of this field must stay in sync. The sweeper remains the
+// backstop for the case this cannot cover: a stop that FAILED, whose row keeps
+// instance_id populated on purpose.
+//
+// Best-effort by contract. Teardown has already succeeded by the time we get
+// here, so a DB error must not fail the delete; it is logged and left to the
+// sweeper. Defensive against a nil global handle, matching cpSweepOnce.
+func (h *WorkspaceHandler) clearWorkspaceInstanceIDAfterStop(ctx context.Context, wsID string) {
+	if db.DB == nil {
+		return
+	}
+	if _, err := db.DB.ExecContext(ctx,
+		`UPDATE workspaces SET instance_id = NULL, updated_at = now() WHERE id = $1`,
+		wsID,
+	); err != nil {
+		log.Printf("CascadeDelete %s clear instance_id failed: %v — leaving row for orphan sweeper", wsID, err)
+	}
+}
+
+// inflightProvisionWait bounds how long a delete waits, in total, for cancelled
+// in-flight provisions to unwind. Past it the teardown proceeds; the start's own
+// removed-check (provisioner.SetWorkspaceRemovedCheck) discards anything it
+// still creates.
+const inflightProvisionWait = 15 * time.Second
+
+// inflightStartCanceller is the optional provisioner capability
+// cancelInflightProvisions uses. The Docker provisioner must keep implementing
+// it — a rename would make the type assertion fail silently and deletes would
+// stop waiting for in-flight provisions — hence the compile-time pin.
+type inflightStartCanceller interface {
+	CancelInflightStart(workspaceID string, wait time.Duration) bool
+}
+
+var _ inflightStartCanceller = (*provisioner.Provisioner)(nil)
+
+// cancelInflightProvisions cancels the provisioner.Start calls still running
+// for ids and waits (bounded) for them to return — cancel all first, then wait,
+// so they unwind concurrently. Docker backend only: the CP backend has no local
+// start to cancel, and test stubs without the method are skipped.
+func (h *WorkspaceHandler) cancelInflightProvisions(ids []string) {
+	c, ok := h.provisioner.(inflightStartCanceller)
+	if !ok {
+		return
+	}
+	for _, id := range ids {
+		c.CancelInflightStart(id, 0)
+	}
+	deadline := time.Now().Add(inflightProvisionWait)
+	for _, id := range ids {
+		if !c.CancelInflightStart(id, time.Until(deadline)) {
+			log.Printf("CascadeDelete %s: an in-flight provision is still unwinding after %s — its removed-check will discard what it creates", id, inflightProvisionWait)
+		}
+	}
+}
+
+// WorkspaceIsRemoved reports whether a workspace has been deleted: its row is
+// status='removed', or gone entirely (a ?purge=true delete). It is the probe the
+// Docker provisioner runs right before ContainerCreate and right after
+// ContainerStart (provisioner.SetWorkspaceRemovedCheck), so a provision that
+// was in flight when its workspace was deleted cannot leave a container behind.
+// A query error answers false: a DB blip must not kill a legitimate provision.
+func WorkspaceIsRemoved(ctx context.Context, workspaceID string) bool {
+	if db.DB == nil {
+		return false
+	}
+	var status string
+	err := db.DB.QueryRowContext(ctx, `SELECT status FROM workspaces WHERE id = $1`, workspaceID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true
+	}
+	if err != nil {
+		log.Printf("WorkspaceIsRemoved(%s): status lookup failed: %v — treating as not removed", workspaceID, err)
+		return false
+	}
+	return status == string(models.StatusRemoved)
+}
+
 // CascadeDelete performs the cascade-removal sequence used by the HTTP
 // DELETE handler and by OrgImport's reconcile mode: walk descendants, mark
 // self+descendants 'removed' first (#73 race guard), stop containers / EC2s,
@@ -851,6 +1070,14 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 		pq.Array(allIDs)); err != nil {
 		log.Printf("CascadeDelete token revocation for %s: %v", id, err)
 	}
+	// RC09: a provision for any of these workspaces may still be in flight —
+	// create, restart and bundle import each run provisioner.Start in their own
+	// goroutine, and a cold local build keeps it there for minutes. The rows are
+	// 'removed' as of the UPDATE above, so cancel those starts and wait for them
+	// to unwind BEFORE tearing down. Otherwise the start finishes after this
+	// teardown and creates ws-<id> anyway, which then crash-looped on an empty
+	// config volume with nothing left to stop it.
+	h.cancelInflightProvisions(allIDs)
 	// cleanupCtx is the non-cancelable, time-bounded teardown context: detached
 	// from the request ctx via context.WithoutCancel so a canceled / timed-out
 	// DELETE still runs the stop → remove-volume → broadcast sequence to
@@ -894,6 +1121,20 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 			stopErrs = append(stopErrs, fmt.Errorf("stop %s: %w", wsID, err))
 			return
 		}
+		// Compute is confirmed stopped, so no live instance is attached any
+		// more — clear instance_id. Without this, a fully successful delete
+		// still left the row matching the CP orphan sweeper's queue predicate
+		// (status='removed' AND instance_id IS NOT NULL), so every deleted
+		// workspace entered the sweeper and needed a second, redundant CP
+		// round-trip to leave it again. When that round-trip returned non-2xx
+		// the row never left, and the sweeper retried it every 60s forever
+		// (prod, 2026-07-30 → 2026-08-03: four reno-stars workspaces).
+		//
+		// NOTE the ordering: this runs ONLY after a successful stop. The
+		// failure branch above deliberately returns with instance_id intact —
+		// that is the durable "possible leak, go re-drive it" signal the
+		// sweeper exists to consume, and it must stay.
+		h.clearWorkspaceInstanceIDAfterStop(cleanupCtx, wsID)
 		if h.provisioner != nil {
 			if err := h.provisioner.RemoveVolume(cleanupCtx, wsID); err != nil {
 				log.Printf("CascadeDelete %s volume removal warning: %v", wsID, err)
@@ -1133,6 +1374,9 @@ func validateWorkspaceFields(name, role, model, runtime string) error {
 		if strings.ContainsAny(f.val, "\n\r") {
 			return fmt.Errorf("%s must not contain newline characters", f.label)
 		}
+	}
+	if strings.IndexFunc(name, unicode.IsControl) >= 0 {
+		return fmt.Errorf("name must not contain control characters")
 	}
 	// name and role only: reject YAML-special characters (#685).
 	for _, f := range []struct{ label, val string }{

@@ -278,11 +278,20 @@ export function DisplayTab({ workspaceId }: Props) {
         />
       </div>
       {sessionUrl ? (
-        <DesktopStream
-          sessionUrl={sessionUrl}
-          latestSessionUrlRef={latestSessionUrlRef}
-          reacquireSession={reacquireSession}
-        />
+        <>
+          {control?.controller === "user" && (
+            <DesktopUrlBar
+              workspaceId={workspaceId}
+              sessionUrl={sessionUrl}
+              latestSessionUrlRef={latestSessionUrlRef}
+            />
+          )}
+          <DesktopStream
+            sessionUrl={sessionUrl}
+            latestSessionUrlRef={latestSessionUrlRef}
+            reacquireSession={reacquireSession}
+          />
+        </>
       ) : (
         <div className="flex flex-1 items-center justify-center p-8 text-center">
           <div>
@@ -540,6 +549,73 @@ function isDisplayEventTarget(container: HTMLElement | null, target: EventTarget
   if (target instanceof Node && container.contains(target)) return true;
   const active = document.activeElement;
   return active instanceof Node && container.contains(active);
+}
+
+// DesktopUrlBar lets a human who holds display control point the browser at a
+// URL. The sidecar's Chromium runs in --kiosk mode (no address bar), so without
+// this a person taking over the display has no way to navigate. The platform
+// route (/desktop/navigate) forwards it to the control server, which loads the
+// URL in the running instance — no effect on the agent's coordinate contract.
+function DesktopUrlBar({
+  workspaceId,
+  sessionUrl,
+  latestSessionUrlRef,
+}: {
+  workspaceId: string;
+  sessionUrl: string;
+  latestSessionUrlRef: { current: string | null };
+}) {
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const go = async () => {
+    let target = url.trim();
+    if (!target) return;
+    if (!/^https?:\/\//i.test(target)) target = `https://${target}`;
+    setBusy(true);
+    setErr(null);
+    try {
+      // The control token is embedded in the freshest signed session URL —
+      // proves to /desktop/navigate that we are the current control holder.
+      const token = displayWebSocketConnection(latestSessionUrlRef.current || sessionUrl).token;
+      await api.post(`/workspaces/${workspaceId}/desktop/navigate`, { url: target, token });
+      setUrl("");
+    } catch {
+      setErr("Couldn't open that URL");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-2 border-b border-line/50 px-4 py-2">
+      <input
+        type="text"
+        value={url}
+        onChange={(e) => {
+          setUrl(e.target.value);
+          if (err) setErr(null);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") void go();
+        }}
+        placeholder="Open a URL — the kiosk browser has no address bar"
+        aria-label="Desktop URL"
+        disabled={busy}
+        className="min-w-0 flex-1 rounded border border-line/60 bg-surface px-2 py-1 text-xs text-ink placeholder:text-ink-mid focus:outline-none focus:ring-1 focus:ring-accent"
+      />
+      <button
+        type="button"
+        onClick={() => void go()}
+        disabled={busy || !url.trim()}
+        className="shrink-0 rounded bg-accent px-3 py-1 text-xs font-medium text-white disabled:opacity-50"
+      >
+        {busy ? "Opening…" : "Go"}
+      </button>
+      {err && <span className="shrink-0 text-[10px] text-red-500">{err}</span>}
+    </div>
+  );
 }
 
 function displayWebSocketConnection(sessionUrl: string): { url: string; token: string } {

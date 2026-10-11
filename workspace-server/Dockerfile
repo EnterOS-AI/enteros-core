@@ -68,7 +68,19 @@ COPY workspace-server/go.mod workspace-server/go.sum ./
 # identities replaced the GitHub-App-installation token flow after the
 # 2026-05-06 suspension. Pre-removal this stage COPY'd the sibling
 # plugin repo + injected a `replace` directive; both are gone.
-RUN go mod download
+# Bounded retry (#4968) — mirror of Dockerfile.tenant's go-builder; see that
+# file for the full rationale (proxy.golang.org drops HTTP/2 streams; the
+# image's default GOPROXY comma-list does not fall through on a stream error).
+# The `exit 1` keeps a genuinely-down proxy FAILING the build.
+RUN for i in 1 2 3; do \
+        go mod download && break; \
+        if [ "$i" -ge 3 ]; then \
+            echo "go mod download: FAILED after 3 attempts" >&2; \
+            exit 1; \
+        fi; \
+        echo "go mod download: attempt $i failed, retrying in $((i * 5))s" >&2; \
+        sleep $((i * 5)); \
+    done
 COPY workspace-server/ .
 # GIT_SHA mirror of Dockerfile.tenant — see that file for the rationale.
 ARG GIT_SHA=dev

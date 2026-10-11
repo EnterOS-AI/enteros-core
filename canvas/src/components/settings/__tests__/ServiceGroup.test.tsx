@@ -38,15 +38,16 @@ vi.mock("../SecretRow", () => ({
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
 function makeService(icon: string, label: string): ServiceConfig {
-  return { icon, label, docsUrl: "https://example.com/docs" };
+  return { icon, label, docsUrl: "https://example.com/docs", keyNames: [], testSupported: false };
 }
 
 function makeSecret(name: string): Secret {
   return {
     name,
-    value: "sk-test-••••••••••••",
+    masked_value: "sk-test-••••••••••••",
     group: "custom" as SecretGroup,
-    masked: true,
+    status: "unverified",
+    updated_at: "2026-01-01T00:00:00Z",
   };
 }
 

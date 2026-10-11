@@ -162,6 +162,31 @@ func readBodyWithLimit(r io.Reader, limit int, kind string) ([]byte, error) {
 // gets `{"error":"workspace agent unreachable","restarting":true}` instead
 // of Cloudflare's opaque 502 error page. Without these, dead workspaces hang
 // long enough that CF gives up first and shows its own page.
+// a2aAlwaysAuthEnv turns on "attach the platform_inbound_secret to EVERY
+// outbound A2A dispatch", not just to URLs the SSRF classifier calls
+// external. Default OFF.
+//
+// Observable behavior change (a new Authorization header on container-local
+// dispatches), so it is flagged for staging burn-in before the default
+// flips — same posture as DELEGATION_RESULT_INBOX_PUSH.
+//
+// Rollout ordering matters and is one-way: this must be ON, and the fleet
+// verified, BEFORE any workspace sets MOLECULE_A2A_REQUIRE_AUTH. Enforcing
+// first 503s every live agent. Readiness is measured per workspace via
+// GET /internal/a2a-auth-status on the workspace runtime; a 200 there proves
+// the tenant's copy of the secret matches the workspace's, which is exactly
+// what enforcement will check.
+//
+// Rollback: unset the var and restart the tenant. Nothing persists.
+const a2aAlwaysAuthEnv = "MOLECULE_A2A_ALWAYS_AUTH"
+
+// a2aAlwaysAuthEnabled reports whether outbound A2A dispatches attach the
+// bearer regardless of URL shape. envx.Bool: an unparseable value falls
+// through to the safe default (off) rather than silently enabling.
+func a2aAlwaysAuthEnabled() bool {
+	return envx.Bool(a2aAlwaysAuthEnv, false)
+}
+
 var a2aClient = &http.Client{
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
@@ -951,34 +976,14 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		}
 	}
 
-	// core#3319: external agents (public /a2a/inbound endpoints) must receive
-	// the workspace's platform_inbound_secret in the Authorization header.
-	// Internal container addresses are unchanged. Reuses the same per-workspace
-	// bearer that already gates /internal/* forwards (chat_files.go).
-	inboundSecret := ""
-	if isExternalAgentURL(workspaceID, agentURL) {
-		secret, healed, secretErr := readOrLazyHealInboundSecret(ctx, workspaceID, "ProxyA2A")
-		if secretErr != nil {
-			log.Printf("ProxyA2A: no platform_inbound_secret for external workspace %s: %v", workspaceID, secretErr)
-			return 0, nil, &proxyA2AError{
-				Status: http.StatusServiceUnavailable,
-				Response: gin.H{
-					"error":  "workspace not yet enrolled in inbound auth (RFC #2312)",
-					"detail": "Failed to read platform_inbound_secret. Reprovision the workspace if this persists.",
-				},
-			}
-		}
-		if healed {
-			return 0, nil, &proxyA2AError{
-				Status: http.StatusServiceUnavailable,
-				Response: gin.H{
-					"error":               "workspace re-registering — please retry in 30 seconds",
-					"detail":              "Inbound auth secret was just minted. Workspace will pick it up on its next heartbeat.",
-					"retry_after_seconds": 30,
-				},
-			}
-		}
-		inboundSecret = secret
+	// Inbound-auth credential for this dispatch. The full rationale for
+	// why this is no longer keyed on URL shape lives on
+	// resolveA2AInboundSecret in a2a_inbound_auth.go.
+	inboundSecret, secretProxyErr := resolveA2AInboundSecret(
+		ctx, workspaceID, agentURL, readOrLazyHealInboundSecret, a2aAlwaysAuthEnabled(),
+	)
+	if secretProxyErr != nil {
+		return 0, nil, secretProxyErr
 	}
 
 	startTime := time.Now()
@@ -1297,16 +1302,12 @@ func (h *WorkspaceHandler) resolveAgentURL(ctx context.Context, workspaceID stri
 	// rewritten to the workspace container's Docker-bridge hostname.
 	// External runtimes are not managed containers; their local test/runtime
 	// URL is the target and must not be synthesized into ws-<id>:8000.
-	if strings.HasPrefix(agentURL, "http://127.0.0.1:") && h.provisioner != nil && platformInDocker {
-		var wsRuntime string
-		if err := db.DB.QueryRowContext(ctx,
-			`SELECT COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`,
-			workspaceID,
-		).Scan(&wsRuntime); err != nil {
-			log.Printf("ProxyA2A: runtime lookup before Docker URL rewrite failed for %s: %v", workspaceID, err)
-		}
-		if !isExternalLikeRuntime(wsRuntime) {
-			agentURL = provisioner.InternalURL(workspaceID)
+	agentURL, err = h.rewriteForDocker(ctx, agentURL, workspaceID)
+	if err != nil {
+		log.Printf("ProxyA2A: route lookup failed for %s: %v", workspaceID, err)
+		return "", &proxyA2AError{
+			Status:   http.StatusInternalServerError,
+			Response: gin.H{"error": "failed to resolve workspace route"},
 		}
 	}
 	// SSRF defence: reject private/metadata URLs before making outbound call.
@@ -1525,10 +1526,15 @@ func normalizeA2APayload(body []byte) ([]byte, string, *proxyA2AError) {
 // needs. The workspace id is a UUID (dash-delimited, no colons), so the
 // resulting id survives any runtime session-id sanitisation unchanged.
 //
-// Delegates to sessionid.DefaultContextID — the ONE authority for this
-// convention (the provisioner injects the SAME value into each workspace
-// container as MOLECULE_DEFAULT_SESSION_CONTEXT_ID, and the shared runtime
-// consumes it). The convention can only move in sessionid.
+// Delegates to sessionid.DefaultContextID — the platform-side authority for this
+// convention. It governs the id stamped as message.contextId on canvas /
+// restart-context / first-boot turns (those genuinely run in the user's
+// session). Runtime-internal self-wakes keep their OWN routing context_id and
+// converge only their Langfuse session_id runtime-side (tracing.TracingExecutor),
+// mirroring this same "canvas-<ws>" literal — there is deliberately NO
+// cross-container env handshake (an earlier MOLECULE_DEFAULT_SESSION_CONTEXT_ID
+// injection was removed; it let the runtime's id diverge from this one). Keep
+// the runtime's tracing literal in sync with sessionid if this ever moves.
 func canvasSessionContextID(workspaceID string) string {
 	return sessionid.DefaultContextID(workspaceID)
 }

@@ -27,10 +27,10 @@ import { ChannelsTab } from "../ChannelsTab";
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
 
-const mockGet = vi.hoisted(() => vi.fn<[], Promise<unknown>>());
-const mockPost = vi.hoisted(() => vi.fn<[], Promise<unknown>>());
-const mockPatch = vi.hoisted(() => vi.fn<[], Promise<unknown>>());
-const mockDel = vi.hoisted(() => vi.fn<[], Promise<unknown>>());
+const mockGet = vi.hoisted(() => vi.fn<(path: string, body?: unknown) => Promise<unknown>>());
+const mockPost = vi.hoisted(() => vi.fn<(path: string, body?: unknown) => Promise<unknown>>());
+const mockPatch = vi.hoisted(() => vi.fn<(path: string, body?: unknown) => Promise<unknown>>());
+const mockDel = vi.hoisted(() => vi.fn<(path: string, body?: unknown) => Promise<unknown>>());
 
 vi.mock("@/lib/api", () => ({
   api: {
@@ -742,12 +742,8 @@ describe("ChannelsTab", () => {
   // ── Auto-refresh ──────────────────────────────────────────────────────────
 
   it("reloads data every 15 seconds", async () => {
-    // Spy on setInterval so we can fire it immediately instead of waiting 15s.
-    let scheduledCallback: () => void;
-    const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval").mockImplementation(() => {});
-    const setIntervalSpy = vi.spyOn(globalThis, "setInterval").mockImplementation(
-      (cb: () => void) => { scheduledCallback = cb; return 1; },
-    );
+    vi.useFakeTimers();
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
 
     setupLoad([], [TELEGRAM_ADAPTER]);
     render(<ChannelsTab workspaceId="ws-test" />);
@@ -757,13 +753,14 @@ describe("ChannelsTab", () => {
     expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 15000);
 
     // Simulate 15s elapsing by calling the captured interval callback.
-    act(() => { scheduledCallback!(); });
+    act(() => { vi.advanceTimersByTime(15_000); });
     await flush();
 
     expect(mockGet.mock.calls.length).toBeGreaterThan(initialCount);
 
-    clearIntervalSpy.mockRestore();
+    cleanup();
     setIntervalSpy.mockRestore();
+    vi.useRealTimers();
   });
 
   // ── SchemaField ──────────────────────────────────────────────────────────

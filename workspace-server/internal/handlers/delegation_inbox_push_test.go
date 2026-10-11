@@ -175,8 +175,26 @@ func TestUpdateStatus_FlagOn_PushesA2AReceiveOnFailed(t *testing.T) {
 		WithArgs("failed", "boom", "ws-source", "deleg-10").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	// 2. NEW: PR-2 a2a_receive row for inbox-poller (failure path doesn't
-	// have the existing delegate_result INSERT — only the new push).
+	// 2. delegate_result row. The comment here used to claim the failure path
+	// "doesn't have the existing delegate_result INSERT — only the new push",
+	// and no expectation was declared for it. It does have one: the handler
+	// issues a 5-arg delegate_result INSERT first, sqlmock rejected it
+	// ("arguments do not match: expected 8, but got 5" — it was being compared
+	// against the a2a_receive expectation below), the handler swallowed the
+	// error, and the a2a_receive INSERT then satisfied that expectation. So
+	// ExpectationsWereMet() stayed clean and this test passed while asserting
+	// nothing about a write that had failed.
+	mock.ExpectExec(`INSERT INTO activity_logs`).
+		WithArgs(
+			"ws-source",
+			sqlmock.AnyArg(), // source_id
+			sqlmock.AnyArg(), // summary
+			sqlmock.AnyArg(), // response_body
+			"boom",           // error_detail
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// 3. NEW: PR-2 a2a_receive row for inbox-poller.
 	mock.ExpectExec(`INSERT INTO activity_logs`).
 		WithArgs(
 			"ws-source", "ws-source",

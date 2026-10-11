@@ -80,7 +80,12 @@ func setupTestDB(t *testing.T) sqlmock.Sqlmock {
 	// Drain globalGoAsync stragglers from prior tests BEFORE swapping the
 	// global db.DB (see setupTestDBForQueueTests — same -race class).
 	waitGlobalAsyncForTest()
-	mockDB, mock, err := sqlmock.New()
+	// The mock is reached through a serialising driver shim: go-sqlmock hands
+	// every pooled connection the same *sqlmock, so database/sql's per-connection
+	// lock does not protect it, and any handler that dispatches goroutines while
+	// its own request goroutine keeps issuing statements corrupts the expectation
+	// list under -race. See sqlmock_serialised_test.go.
+	mockDB, rawMockDB, mock, err := newSerialisedSqlmock()
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
 	}
@@ -116,6 +121,9 @@ func setupTestDB(t *testing.T) sqlmock.Sqlmock {
 		drainTestAsync()
 		db.DB = prevDB
 		mockDB.Close()
+		// rawMockDB owns the mock's entry in go-sqlmock's DSN pool; closing it
+		// last keeps that entry alive for as long as mockDB might still use it.
+		rawMockDB.Close()
 	})
 
 	// The wsauth.platform_inbound_secret cache (#189) is package-level
@@ -561,13 +569,16 @@ func TestWorkspaceList(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	rows := sqlmock.NewRows(columns).
 		AddRow("ws-1", "Agent One", "worker", 1, "online", []byte("null"), "http://localhost:8001",
 			nil, 0, 1, 0.0, "", 100, "", "claude-code", "", 10.0, 20.0, false, nil, int64(0), false, true, []byte(`{}`), "workspace", []byte(`[]`),
+			[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 		).
 		AddRow("ws-2", "Agent Two", "manager", 2, "provisioning", []byte("null"), "",
 			nil, 0, 1, 0.0, "", 0, "", "claude-code", "", 50.0, 60.0, false, nil, int64(0), false, true, []byte(`{}`), "workspace", []byte(`[]`),
+			[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 		)
 
 	mock.ExpectQuery("SELECT w.id, w.name").
@@ -1290,6 +1301,7 @@ func TestWorkspaceGet_CurrentTask(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("dddddddd-0004-0000-0000-000000000000").
@@ -1297,6 +1309,7 @@ func TestWorkspaceGet_CurrentTask(t *testing.T) {
 			"dddddddd-0004-0000-0000-000000000000", "Task Worker", "worker", 1, "online", []byte("null"), "http://localhost:9000",
 			nil, 2, 1, 0.0, "", 300, "Analyzing document", "claude-code", "", 10.0, 20.0, false,
 			nil, int64(0), false, true, []byte(`{}`), "workspace", []byte(`[]`),
+			[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 		))
 
 	w := httptest.NewRecorder()

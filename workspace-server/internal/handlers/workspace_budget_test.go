@@ -35,6 +35,7 @@ var wsColumns = []string{
 	"budget_limit", "monthly_spend",
 	"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 	"loaded_mcp_tools",
+	"mcp_surface",
 }
 
 // ==================== GET — financial fields stripped from open endpoint ====================
@@ -59,6 +60,7 @@ func TestWorkspaceBudget_Get_NilLimit(t *testing.T) {
 				false, // broadcast_enabled
 				true,  // talk_to_user_enabled
 				[]byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 
 	w := httptest.NewRecorder()
@@ -105,6 +107,7 @@ func TestWorkspaceBudget_Get_WithLimit(t *testing.T) {
 				int64(123),  // monthly_spend = $1.23 in DB
 				false, true, // broadcast_enabled, talk_to_user_enabled
 				[]byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 
 	w := httptest.NewRecorder()
