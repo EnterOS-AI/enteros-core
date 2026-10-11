@@ -4,6 +4,7 @@ import type { WorkspaceNodeData, BootStep } from "./canvas";
 import { parseA2AResponse } from "@/components/tabs/chat/a2a-response";
 import { appendBootLog, mergeBootStep, parseBootStepWire } from "./boot-telemetry";
 import type { BootStepWire } from "./boot-telemetry";
+import { WS_EVENTS } from "@/lib/ws-events";
 
 // ---------------------------------------------------------------------------
 // Monotonically increasing counter used to assign grid positions.
@@ -103,6 +104,16 @@ export function handleCanvasEvent(
   const { nodes, edges, selectedNodeId } = get();
 
   switch (msg.event) {
+    case WS_EVENTS.WorkspaceUpdated: {
+      const { name } = msg.payload;
+      if (typeof name !== "string" || !name.trim()) break;
+      set({
+        nodes: nodes.map((node) => node.id === msg.workspace_id
+          ? { ...node, data: { ...node.data, name } }
+          : node),
+      });
+      break;
+    }
     case "WORKSPACE_ONLINE": {
       const existing = nodes.find((n) => n.id === msg.workspace_id);
       const nodeName = existing?.data.name ?? (msg.payload.name as string) ?? "Workspace";

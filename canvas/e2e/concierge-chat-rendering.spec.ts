@@ -15,6 +15,7 @@ async function mockChat(page: Page, content: string, reply: { status: number; bo
   status: 502, body: { error: "failed to reach workspace agent" },
 }) {
   let socket: WebSocketRoute | undefined;
+  let workspace = { ...root };
   await page.routeWebSocket("**/ws*", (ws) => { socket = ws; });
   await page.route((url) => !url.pathname.startsWith("/_next/") && (
     url.pathname.startsWith("/workspaces") || url.pathname.startsWith("/cp/") ||
@@ -26,7 +27,7 @@ async function mockChat(page: Page, content: string, reply: { status: number; bo
     const method = route.request().method();
     let body: unknown = [];
     let status = 200;
-    if (path === "/workspaces") body = [root];
+    if (path === "/workspaces") body = [workspace];
     else if (path.endsWith("/chat-history")) body = {
       messages: [{ id: "greeting:agent", role: "agent", content, timestamp: "2026-10-10T20:00:00Z" }],
       reached_end: true,
@@ -50,7 +51,7 @@ async function mockChat(page: Page, content: string, reply: { status: number; bo
       }
     } else if (path === "/org/identity") body = { name: "Chat test", org_id: "", slug: "", platform_managed_available: false };
     else if (path === "/cp/auth/me") status = 401;
-    else if (path === `/workspaces/${root.id}`) body = root;
+    else if (path === `/workspaces/${root.id}`) body = workspace;
     await route.fulfill({
       status: method === "OPTIONS" ? 204 : status,
       contentType: "application/json",
@@ -63,7 +64,28 @@ async function mockChat(page: Page, content: string, reply: { status: number; bo
       body: method === "OPTIONS" ? "" : JSON.stringify(body),
     });
   });
+  return {
+    rename(name: string) {
+      workspace = { ...workspace, name };
+      expect(socket).toBeDefined();
+      socket!.send(JSON.stringify({
+        event: "WORKSPACE_UPDATED", workspace_id: root.id,
+        timestamp: new Date().toISOString(), payload: { name },
+      }));
+    },
+  };
 }
+
+test("an agent rename updates the sidebar and open chat header and survives reload", async ({ page }) => {
+  const server = await mockChat(page, markdownGreeting);
+  await page.goto("/en");
+  await expect(page.getByTestId("chat-panel").getByRole("textbox", { name: "Message to agent" })).toBeVisible();
+  server.rename("Personal Brand Workspace");
+  await expect(page.getByText("Personal Brand Workspace", { exact: true })).toHaveCount(2);
+  await page.reload();
+  await expect(page.getByText("Personal Brand Workspace", { exact: true })).toHaveCount(2);
+  await expect(page.getByTestId("chat-panel").getByRole("listitem")).toHaveCount(3);
+});
 
 for (const viewport of [{ width: 816, height: 714 }, { width: 773, height: 530 }]) {
   test(`preserves stored line breaks and exposes send failures at ${viewport.width}x${viewport.height}`, async ({ page }) => {

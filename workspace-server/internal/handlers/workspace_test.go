@@ -941,6 +941,9 @@ func TestWorkspaceUpdate_MultipleFields(t *testing.T) {
 	mock.ExpectExec("UPDATE workspaces SET name").
 		WithArgs("cccccccc-0005-0000-0000-000000000000", "Updated Agent").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WithArgs("WORKSPACE_UPDATED", "cccccccc-0005-0000-0000-000000000000", `{"name":"Updated Agent"}`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("UPDATE workspaces SET role").
 		WithArgs("cccccccc-0005-0000-0000-000000000000", "manager").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -1370,6 +1373,9 @@ func TestWorkspaceUpdate_CosmeticField_NoBearer_FailOpen_NoTokens(t *testing.T) 
 	mock.ExpectExec("UPDATE workspaces SET name").
 		WithArgs("cccccccc-000d-0000-0000-000000000000", "Cosmetic").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WithArgs("WORKSPACE_UPDATED", "cccccccc-000d-0000-0000-000000000000", `{"name":"Cosmetic"}`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1579,6 +1585,9 @@ func TestWorkspaceUpdate_BudgetLimitIgnored(t *testing.T) {
 	// name update is the only expected write
 	mock.ExpectExec("UPDATE workspaces SET name").
 		WithArgs("cccccccc-0011-0000-0000-000000000000", "Safe Name").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WithArgs("WORKSPACE_UPDATED", "cccccccc-0011-0000-0000-000000000000", `{"name":"Safe Name"}`).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()

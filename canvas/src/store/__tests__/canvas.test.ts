@@ -109,6 +109,37 @@ describe("selectNode", () => {
 
 // ---------- hydrate ----------
 
+describe("workspace rename events", () => {
+  it("updates only the name while preserving identity, selection, hierarchy and state", () => {
+    const original = makeNode({ id: "child", name: "Before", parentId: "parent", activeTasks: 2 });
+    const sibling = makeNode({ id: "other", name: "Sibling" });
+    useCanvasStore.setState({ nodes: [original, sibling], selectedNodeId: "child" });
+    useCanvasStore.getState().applyEvent(makeMsg({
+      event: "WORKSPACE_UPDATED", workspace_id: "child", payload: { name: "Personal Brand" },
+    }));
+    const state = useCanvasStore.getState();
+    expect(state.nodes).toEqual([
+      { ...original, data: { ...original.data, name: "Personal Brand" } }, sibling,
+    ]);
+    expect(state.nodes[1]).toBe(sibling);
+    expect(state.selectedNodeId).toBe("child");
+  });
+
+  it.each([{}, { name: null }, { name: 123 }, { name: " " }])("ignores malformed updates: %j", (payload) => {
+    const node = makeNode({ id: "child", name: "Before" });
+    useCanvasStore.setState({ nodes: [node] });
+    useCanvasStore.getState().applyEvent(makeMsg({ event: "WORKSPACE_UPDATED", workspace_id: "child", payload }));
+    expect(useCanvasStore.getState().nodes[0]).toBe(node);
+  });
+
+  it("does not resurrect a removed workspace on a late rename event", () => {
+    useCanvasStore.getState().applyEvent(makeMsg({
+      event: "WORKSPACE_UPDATED", workspace_id: "removed", payload: { name: "Personal Brand" },
+    }));
+    expect(useCanvasStore.getState().nodes).toEqual([]);
+  });
+});
+
 describe("hydrate", () => {
   it("converts WorkspaceData[] to nodes", () => {
     const workspaces = [

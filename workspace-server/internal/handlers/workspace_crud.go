@@ -16,6 +16,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"time"
+	"unicode"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/approvals"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
@@ -144,6 +145,13 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		})
 		return
 	}
+	if rawName, renaming := body["name"]; renaming {
+		name, ok := rawName.(string)
+		if !ok || strings.TrimSpace(name) == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "name must be a non-empty string"})
+			return
+		}
+	}
 
 	// #685/#688: validate string fields for length and injection safety.
 	strField := func(key string) string {
@@ -159,6 +167,9 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	if name, renaming := body["name"].(string); renaming {
+		body["name"] = strings.TrimSpace(name)
 	}
 	if wsDir, ok := body["workspace_dir"]; ok && wsDir != nil {
 		if dirStr, isStr := wsDir.(string); isStr && dirStr != "" {
@@ -224,7 +235,12 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	var exists bool
 	if err := db.DB.QueryRowContext(ctx,
 		`SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)`, id,
-	).Scan(&exists); err != nil || !exists {
+	).Scan(&exists); err != nil {
+		log.Printf("Update workspace lookup error for %s: %v", id, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to look up workspace"})
+		return
+	}
+	if !exists {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
 		return
 	}
@@ -278,8 +294,32 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	}
 
 	if name, ok := body["name"]; ok {
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET name = $2, updated_at = now() WHERE id = $1`, id, name); err != nil {
+		result, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET name = $2, updated_at = now() WHERE id = $1 AND status != 'removed'`, id, name)
+		if err != nil {
+			if isParentNameUniqueViolation(err) {
+				c.JSON(http.StatusConflict, gin.H{"error": "a workspace with this name already exists under the same parent", "code": "WORKSPACE_NAME_CONFLICT"})
+				return
+			}
 			log.Printf("Update name error for %s: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rename workspace"})
+			return
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			log.Printf("Update name result error for %s: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to confirm workspace rename"})
+			return
+		}
+		if rows == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
+			return
+		}
+		// All rename clients share this path. Publish after persistence so
+		// other open pages update without reloading or restarting the agent.
+		payload := gin.H{"name": name}
+		if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceUpdated), id, payload); err != nil {
+			log.Printf("Update name event error for %s: %v", id, err)
+			h.broadcaster.BroadcastOnly(id, string(events.EventWorkspaceUpdated), payload)
 		}
 	}
 	if role, ok := body["role"]; ok {
@@ -545,6 +585,10 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	}
 
 	resp := gin.H{"status": "updated"}
+	if name, renaming := body["name"]; renaming {
+		resp["workspace_id"] = id
+		resp["name"] = name
+	}
 	if reparent != nil && reparent.Changed {
 		// The move is a PRIVILEGE change, not a cosmetic one: the workspace
 		// drops read+write on the old team namespace and gains read+write on
@@ -1330,6 +1374,9 @@ func validateWorkspaceFields(name, role, model, runtime string) error {
 		if strings.ContainsAny(f.val, "\n\r") {
 			return fmt.Errorf("%s must not contain newline characters", f.label)
 		}
+	}
+	if strings.IndexFunc(name, unicode.IsControl) >= 0 {
+		return fmt.Errorf("name must not contain control characters")
 	}
 	// name and role only: reject YAML-special characters (#685).
 	for _, f := range []struct{ label, val string }{
