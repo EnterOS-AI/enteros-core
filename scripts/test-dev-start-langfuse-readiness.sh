@@ -181,7 +181,8 @@ grep -Fq 'MOLECULE_WORKSPACE_LANGFUSE_HOST: "${MOLECULE_WORKSPACE_LANGFUSE_HOST:
 # branch, verify a pinned sha256, and stage inside the toolchains dir (atomic
 # same-fs rename — no half-install a later run would trust).
 bootstrap_fn_line=$(line_of '^bootstrap_go_toolchain\(\) \{')
-go_branch_line=$(line_of '^if command -v go >/dev/null 2>&1; then$')
+# shellcheck disable=SC2016
+go_branch_line=$(line_of '^if \[ "\$PLATFORM_MODE" = host \] && ! go_is_usable; then$')
 [ "$bootstrap_fn_line" -lt "$go_branch_line" ] \
   || fail "Go bootstrap must be defined before the platform go-run branch"
 grep -Eq '^GO_SHA256_(DARWIN|LINUX)_(ARM64|AMD64)="[a-f0-9]{64}"' "$DEV_START" \

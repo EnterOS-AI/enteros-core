@@ -8,7 +8,7 @@
  */
 import React from "react";
 import { render, screen, fireEvent, cleanup, act, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { ContextMenu } from "../ContextMenu";
 import { useCanvasStore } from "@/store/canvas";
 import { showToast } from "../Toaster";
@@ -23,14 +23,12 @@ vi.mock("../Toaster", () => ({
 // ─── Mock API ────────────────────────────────────────────────────────────────
 // Mock api.post/patch via vi.spyOn — avoids vi.mock hoisting issues.
 // Set up in beforeEach, cleaned up in afterEach.
-let mockPost: ReturnType<typeof vi.fn>;
-let mockPatch: ReturnType<typeof vi.fn>;
+let mockPost: MockInstance<typeof api.post>;
+let mockPatch: MockInstance<typeof api.patch>;
 
 function setupApiMocks() {
-  mockPost = vi.fn().mockResolvedValue(undefined as void);
-  mockPatch = vi.fn().mockResolvedValue(undefined as void);
-  vi.spyOn(api, "post").mockImplementation(mockPost);
-  vi.spyOn(api, "patch").mockImplementation(mockPatch);
+  mockPost = vi.spyOn(api, "post").mockResolvedValue(undefined);
+  mockPatch = vi.spyOn(api, "patch").mockResolvedValue(undefined);
 }
 
 function resetApiMocks() {

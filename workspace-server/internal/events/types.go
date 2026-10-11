@@ -61,6 +61,7 @@ const (
 	EventWorkspaceProvisioning    EventType = "WORKSPACE_PROVISIONING"
 	EventWorkspaceProvisionFailed EventType = "WORKSPACE_PROVISION_FAILED"
 	EventWorkspaceOnline          EventType = "WORKSPACE_ONLINE"
+	EventWorkspaceUpdated         EventType = "WORKSPACE_UPDATED"
 	EventWorkspaceOffline         EventType = "WORKSPACE_OFFLINE"
 	EventWorkspaceDegraded        EventType = "WORKSPACE_DEGRADED"
 	EventWorkspaceHibernated      EventType = "WORKSPACE_HIBERNATED"
@@ -193,4 +194,5 @@ var AllEventTypes = []EventType{
 	EventWorkspaceProvisioning,
 	EventWorkspaceRemoved,
 	EventWorkspaceRestartDeclined,
+	EventWorkspaceUpdated,
 }

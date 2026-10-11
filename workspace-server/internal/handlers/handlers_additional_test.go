@@ -326,6 +326,9 @@ func TestWorkspaceUpdate_NameOnly(t *testing.T) {
 	mock.ExpectExec("UPDATE workspaces SET name").
 		WithArgs("dddddddd-0003-0000-0000-000000000000", "New Name").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WithArgs("WORKSPACE_UPDATED", "dddddddd-0003-0000-0000-000000000000", `{"name":"New Name"}`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)

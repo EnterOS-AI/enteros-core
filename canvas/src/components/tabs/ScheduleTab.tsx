@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useId } from "react";
 import { api } from "@/lib/api";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 
-interface Schedule {
+export interface Schedule {
   id: string;
   workspace_id: string;
   name: string;

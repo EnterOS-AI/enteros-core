@@ -41,7 +41,8 @@ cat > "$tmp/bin/kubectl" <<'FAKE'
 #!/usr/bin/env bash
 # Fixture-driven kubectl. State lives in $K8RT:
 #   deploys      ns \t name \t replicas \t org-id \t image
-#   pods         ns \t podname \t org-id \t imageID          (the CURRENT serving set)
+#   pods         ns, name, org-id, imageID, deletionTimestamp, phase, ready, git_sha (TSV)
+#                Omitted phase/ready fields default to Running/true.
 #   pods.after   optional; `set image` promotes it over `pods`
 set -uo pipefail
 ns="" ; args=()
@@ -64,6 +65,10 @@ case "${1:-}" in
   rollout)
     [ -f "$K8RT/rollout.fail" ] && exit 1
     exit 0;;
+  exec)
+    printf '%s\n' "$2" >> "$K8RT/exec.log"
+    awk -F'\t' -v ns="$ns" -v pod="$2" '$1==ns && $2==pod {printf "{\"git_sha\":\"%s\"}\n",$8}' "$K8RT/pods"
+    exit 0;;
   get) shift;;
   *) exit 0;;
 esac
@@ -85,10 +90,24 @@ case "${1:-}" in
     shift
     sel="$*"
     org="$(org_of_sel "$sel")"
+    # Emulate the requested projection/filter, including the old unfiltered
+    # items[0] query: a draining first pod must reproduce the regression.
+    filtered=0
+    if [[ "$sel" == *deletionTimestamp* && "$sel" == *Running* ]]; then filtered=1; fi
+    ready=0
+    [[ "$sel" != *.ready* ]] || ready=1
+    rows="$(awk -F'\t' -v o="$org" -v ns="$ns" -v f="$filtered" -v r="$ready" '
+      $1==ns && $3==o && (!f || ($5=="" && ($6=="" || $6=="Running"))) && (!r || $7!="false")' "$K8RT/pods")"
     if printf '%s' "$sel" | grep -q 'imageID'; then
-      awk -F'\t' -v o="$org" -v ns="$ns" '$1==ns && $3==o {print $4}' "$K8RT/pods"
+      if [[ "$sel" == *metadata.name* ]]; then
+        awk -F'\t' 'NF {printf "%s\t%s\n",$2,$4}' <<< "$rows"
+      else
+        awk -F'\t' 'NF {print $4}' <<< "$rows"
+      fi
+    elif [[ "$sel" == *'items[0]'* ]]; then
+      awk -F'\t' 'NR==1 {print $2}' <<< "$rows"
     elif printf '%s' "$sel" | grep -q 'metadata.name'; then
-      awk -F'\t' -v o="$org" -v ns="$ns" '$1==ns && $3==o {print $2}' "$K8RT/pods"
+      awk -F'\t' 'NF {print $2}' <<< "$rows"
     else
       awk -F'\t' -v o="$org" -v ns="$ns" '$1==ns && $3==o {print $2}' "$K8RT/pods"
     fi
@@ -100,6 +119,7 @@ chmod +x "$tmp/bin/kubectl"
 export PATH="$tmp/bin:$PATH"
 
 reset_state() {
+  : > "$K8RT/exec.log"
   : > "$K8RT/set-image.log"; rm -f "$K8RT/rollout.fail" "$K8RT/pods.after"
   # alpha: 1 replica, serving the OLD digest. zero: 0 replicas, no pods.
   printf '%s\n' \
@@ -170,6 +190,36 @@ check "no serving pod after the roll => fatal" 1 "FAIL:no-pod-after" "$CENSUS_A"
 reset_state
 touch "$K8RT/rollout.fail"
 check "rollout that never completes => fatal" 1 "FAIL:rollout-timeout" "$CENSUS_A" --digest "$D_NEW"
+
+echo "== digest and build checks use the same serving replicas =="
+reset_state
+printf '%s\n' \
+  "ns-alpha	draining-old	$ORG_A	$REPO@$D_OLD	2026-10-11T00:00:00Z	Running	true	0badc0de" \
+  "ns-alpha	pending-old	$ORG_A	$REPO@$D_OLD		Pending	false	0badc0de" \
+  "ns-alpha	unready-new	$ORG_A	$REPO@$D_NEW		Running	false	cafe1234" \
+  "ns-alpha	serving-a	$ORG_A	$REPO@$D_NEW		Running	true	cafe1234" \
+  "ns-alpha	serving-b	$ORG_A	$REPO@$D_NEW		Running	true	cafe1234" > "$K8RT/pods.after"
+EXPECTED_BUILD_SHA=cafe1234 check "rollback ignores a draining old pod listed first" 0 "ROLLED" "$CENSUS_A" --digest "$D_NEW"
+if [ "$(sort "$K8RT/exec.log")" = $'serving-a\nserving-b' ]; then
+  echo "ok: buildinfo probed every serving replica and no stragglers"; PASS=$((PASS+1))
+else
+  echo "FAIL: buildinfo probed the wrong pod set"; cat "$K8RT/exec.log"; FAILED=$((FAILED+1))
+fi
+reset_state
+printf '%s\n' \
+  "ns-alpha	serving-a	$ORG_A	$REPO@$D_NEW		Running	true	cafe1234" \
+  "ns-alpha	serving-b	$ORG_A	$REPO@$D_NEW		Running	true	0badc0de" > "$K8RT/pods.after"
+EXPECTED_BUILD_SHA=cafe1234 check "a second replica with stale buildinfo fails" 1 "FAIL:buildinfo-mismatch" "$CENSUS_A" --digest "$D_NEW"
+reset_state
+printf '%s\n' \
+  "ns-alpha	serving-a	$ORG_A	$REPO@$D_NEW" \
+  "ns-alpha	serving-b	$ORG_A	$REPO@$D_OLD" > "$K8RT/pods.after"
+check "a serving old replica is not mistaken for a draining pod" 1 "FAIL:mixed-digests" "$CENSUS_A" --digest "$D_NEW"
+reset_state
+printf '%s\n' \
+  "ns-alpha	serving-a	$ORG_A	$REPO@$D_NEW" \
+  "ns-alpha	serving-b	$ORG_A	" > "$K8RT/pods.after"
+check "a replica without an imageID cannot hide behind a healthy replica" 1 "FAIL:mixed-digests" "$CENSUS_A" --digest "$D_NEW"
 
 echo "== the roll must be verifiable at all =="
 reset_state

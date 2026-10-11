@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -219,6 +220,13 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 	h.mintWorkspaceSecrets(ctx, workspaceID, &cfg)
 
 	url, err := h.provisioner.Start(ctx, cfg)
+	if errors.Is(err, provisioner.ErrWorkspaceRemoved) {
+		// RC09: deleted while this provision was in flight. Start already tore
+		// down what it made; the row is 'removed' and must stay that way —
+		// markProvisionFailed would resurrect it as 'failed'.
+		log.Printf("Provisioner: workspace %s was deleted while provisioning — start abandoned: %v", workspaceID, err)
+		return
+	}
 	if err != nil {
 		// F1086 / #1206: persist a generic message so the canvas and
 		// GET /workspaces/:id expose something actionable without leaking
@@ -1234,6 +1242,15 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 		// slug prefix (minimax/…, anthropic/…, openai/…, etc.) when the
 		// provider isn't explicitly set.
 		envVars["HERMES_DEFAULT_MODEL"] = model
+		// The platform registry uses minimax:Model for BYOK; Hermes's
+		// provider/bridge input uses minimax/Model. Project only the native
+		// setting: MODEL and MOLECULE_MODEL must keep the canonical id so
+		// provider selection and billing still distinguish BYOK from platform.
+		// Without this, the custom-provider bridge forwards the colon prefix
+		// to MiniMax, which rejects it as an unknown model.
+		if strings.HasPrefix(model, "minimax:") {
+			envVars["HERMES_DEFAULT_MODEL"] = "minimax/" + strings.TrimPrefix(model, "minimax:")
+		}
 	}
 }
 
@@ -2051,13 +2068,37 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 	log.Printf("CPProvisioner: goroutine entered for %s (runtime=%s, mode=cp)", workspaceID, payload.Runtime)
 	defer h.logProvisionPanic(workspaceID, "cp")
 
-	ctx, cancel := context.WithTimeout(context.Background(), provisioner.ProvisionTimeout)
+	// CP-mode ctx bounds the pinned-image pre-flight + cpProv.Start. Derived
+	// from the CP provision budget (cpProvisionTimeout, floored at
+	// provisioner.CPProvisionCeiling), NOT the fixed 3-min
+	// provisioner.ProvisionTimeout: the control plane resolves the pin at
+	// provision time and may have to obtain a multi-GB image before it can
+	// answer, and a ctx shorter than the provision client's own budget cancels
+	// that pull mid-flight — the control plane logs `pull failed: context
+	// canceled` and the workspace is marked terminally failed. See
+	// cp_provision_budget.go. Mirrors the Docker-mode migration above.
+	budget := h.cpProvisionTimeout(payload.Runtime)
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
+	log.Printf("CPProvisioner: cp-mode provision ctx for %s bounded at %s (runtime=%s, provision-client budget=%s)",
+		workspaceID, budget, payload.Runtime, provisioner.CPProvisionCeiling())
 
 	prepared, abort := h.prepareProvisionContext(ctx, workspaceID, templatePath, configFiles, payload, false)
 	if prepared == nil {
 		log.Printf("CPProvisioner: prepare failed for %s: %s", workspaceID, abort.Msg)
 		h.markProvisionFailed(ctx, workspaceID, abort.Msg, abort.Extra)
+		return
+	}
+
+	// core#5019, create half: PULL BEFORE PROVISIONING. EnsureImage was wired
+	// only on the restart path; a fresh org's first workspace — the path a new
+	// customer takes, and the one the control plane labels
+	// stage=create_workspace in these failures — never asked. Ask now, so the
+	// provision that follows is a cache hit rather than the thing that has to
+	// wait for 6.89GB. A refusal the control plane MEANT fails here, fast and
+	// with a reason, instead of minutes later with none.
+	if reason := h.ensurePinnedImageBeforeProvision(ctx, workspaceID, payload, budget); reason != "" {
+		h.markProvisionFailed(ctx, workspaceID, reason, nil)
 		return
 	}
 
@@ -2069,10 +2110,15 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 
 	machineID, err := h.cpProv.Start(ctx, prepared.Config)
 	if err != nil {
-		// F1086 / #1206: CP errors can include machine type, AMI IDs, VPC
-		// paths — use generic message for broadcast and last_sample_error.
+		// F1086 / #1206 still holds: CP errors can include machine type, AMI
+		// IDs and VPC paths, and none of it may reach a tenant-visible column.
+		// What changed is HOW: the error is CLASSIFIED into one of a closed set
+		// of compile-time constants (cpProvisionFailureReason) instead of being
+		// collapsed to one. Publishing a single constant is why five weeks of
+		// post-promote image failures were invisible to the gate AND to the
+		// customer's canvas. The full error is logged here, exactly as before.
 		log.Printf("CPProvisioner: workspace start failed for %s: %v", workspaceID, err)
-		h.markProvisionFailed(ctx, workspaceID, "provisioning failed", nil)
+		h.markProvisionFailed(ctx, workspaceID, cpProvisionFailureReason(err), nil)
 		return
 	}
 

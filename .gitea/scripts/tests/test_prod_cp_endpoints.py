@@ -253,15 +253,26 @@ def _ssot_harness(tmp_path: Path, initial: dict[str, str]) -> tuple[Path, Path]:
 import os, sys, json, urllib.parse
 S = os.environ["FAKE_STATE"]
 args = sys.argv[1:]
-method, body, url = "GET", "", ""
+method, body, url, wfmt = "GET", "", "", ""
 i = 0
 while i < len(args):
     a = args[i]
     if a == "-X": method = args[i+1]; i += 2; continue
     if a == "-d": body = args[i+1]; i += 2; continue
-    if a in ("-H", "--doh-url", "-A", "-o", "-w"): i += 2; continue
+    if a == "-w": wfmt = args[i+1]; i += 2; continue
+    if a in ("-H", "--doh-url", "-A", "-o"): i += 2; continue
     if a.startswith("http"): url = a
     i += 1
+
+def respond(payload, code=200):
+    # Emulate curl's -w. The CP client reads body AND status from one stdout
+    # stream; the Infisical calls pass no -w and get the bare body, exactly as
+    # the real curl would.
+    sys.stdout.write(payload)
+    if wfmt:
+        sys.stdout.write(wfmt.replace("%{http_code}", str(code)))
+    sys.exit(0)
+
 u = urllib.parse.urlparse(url)
 env = (urllib.parse.parse_qs(u.query).get("environment") or [""])[0]
 P = lambda f: os.path.join(S, f)
@@ -279,10 +290,10 @@ if "/api/v3/secrets/raw/LOCAL_TENANT_IMAGE" in url:
     except OSError: v = ""
     print(json.dumps({"secret": {"secretValue": v}})); sys.exit(0)
 if url.endswith("/cp/admin/runtime-image"):
-    print(json.dumps({"pins": [{"template_name": "molecule-tenant", "region": "global",
-                                "image_digest": open(P("pin_cp.test")).read(), "git_sha": "old"}]})); sys.exit(0)
+    respond(json.dumps({"pins": [{"template_name": "molecule-tenant", "region": "global",
+                                  "image_digest": open(P("pin_cp.test")).read(), "git_sha": "old"}]}))
 if url.endswith("/cp/admin/runtime-image/promote"):
-    open(P("pin_cp.test"), "w").write(json.loads(body)["image_digest"]); print("{}"); sys.exit(0)
+    open(P("pin_cp.test"), "w").write(json.loads(body)["image_digest"]); respond("{}")
 sys.exit(22)
 '''
     (tmp_path / "curl.py").write_text(body, encoding="utf-8")

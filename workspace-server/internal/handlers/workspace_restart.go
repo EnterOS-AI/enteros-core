@@ -549,36 +549,152 @@ func (h *WorkspaceHandler) clearWorkspaceRouting(ctx context.Context, workspaceI
 // change — so an unrecoverable restart was indistinguishable from one that was
 // never attempted, and the only trace was a log line on a box nobody tails.
 //
-// Deliberately NOT markProvisionFailed. Nothing failed to provision, and the
-// container is still running and still heartbeating: writing status='failed'
-// would misreport a live workspace and is the same class of confident lie as
-// finding 2's empty url. The signal is a durable event plus the
-// operator-visible error column the canvas already renders — visible, durable,
-// and true.
+// Deliberately NOT markProvisionFailed WHEN THE PREMISE HOLDS. Nothing failed
+// to provision, and the container is still running and still heartbeating:
+// writing status='failed' would misreport a live workspace and is the same
+// class of confident lie as finding 2's empty url. The signal is a durable
+// event plus the operator-visible error column the canvas already renders —
+// visible, durable, and true.
+//
+// ⚠️ THE PREMISE IS NOT UNIVERSAL (core#5136, Guard B job 915241). "the
+// container is still running and still heartbeating" is an ASSUMPTION about
+// the caller's state, and it is FALSE on a FIRST BOOT. A fresh org's concierge
+// is booted by POST /workspaces/:id/restart against a row that has never had a
+// container at all: platform_agent.go inserts it with status='offline' and
+// last_heartbeat_at NULL, and the row is 'provisioning' by the time this runs
+// only because markProvisioningForRestart (the manual handler, which is the
+// sole caller of RestartWorkspaceAutoOpts) put it there. The same is true of
+// any workspace whose very first boot is dispatched through a restart path.
+// There is then nothing to protect and nothing "still serving its previous
+// version" — the decline is the TERMINAL outcome of a boot that will never
+// happen, and writing only last_sample_error leaves the row in 'provisioning'
+// with NO published verdict.
+//
+// Measured consequence: on 2026-08-05 a staging concierge's hermes image pull
+// stalled (CP `ensure-image` 502 x3, "pull stalled (no progress for 2m0s)").
+// The decline landed at 08:55:58 — a real answer, 7m20s in. Nothing published
+// it. No container ever started, so no heartbeat ever reached evaluateStatus
+// and its 300s warm-fail safety net never armed; the only remaining verdict
+// producer was the provisioning-timeout sweep, which clocks on updated_at —
+// the very column this function bumps — and which gives hermes 30 minutes. The
+// row therefore read 'provisioning' with an empty tool inventory for the full
+// 15 minutes Guard B waited, and the gate reported the wrong cause (a missing
+// management-MCP plugin). For a user the same shape is a canvas node stuck on
+// "Provisioning" that never turns red.
+//
+// So the decline now VERIFIES its own premise instead of asserting it, in one
+// conditional UPDATE: a row that is still 'provisioning' AND has never recorded
+// a heartbeat had no previous version to keep, and is failed with the real
+// reason. Every other row — online, degraded, paused, hibernated, or a
+// provisioning row whose container HAS registered (the manual-restart path
+// writes status='provisioning' before dispatching, so this case is live and
+// must not be touched) — keeps exactly the prior behaviour. The guard is in the
+// WHERE clause, so a concurrent promotion or delete wins the race rather than
+// being clobbered.
+//
+// BOTH conjuncts are load-bearing and neither is redundant. status alone would
+// fail every legitimate manual decline, because that handler has already
+// written 'provisioning'. last_heartbeat_at alone would fail a paused or
+// hibernated row that was created but never booted. And NULL there is a sound
+// proxy for "never had a running agent": nothing in the repo ever writes
+// last_heartbeat_at = NULL — Register and Heartbeat only ever set it to now() —
+// so the column is monotonic from NULL to non-NULL, once, at first contact.
+//
+// This is not a new timeout and not a retry: the signal already existed and
+// arrived on time. It was being swallowed.
 func (h *WorkspaceHandler) markRestartDeclined(ctx context.Context, workspaceID, wsName, runtime, template string) {
 	msg := "restart declined — the pinned image for runtime=" + runtime +
 		" could not be made available, so the running container was left untouched (core#5019). " +
 		"The workspace is still serving its previous version; it will retry on the next restart."
 
-	// Nil-tolerant on both sinks: recording WHY a restart was refused must never
+	strandedMsg := "first boot declined — the pinned image for runtime=" + runtime +
+		" could not be made available, so no container was ever started (core#5019). " +
+		"This workspace has never had a running agent, so nothing is serving and no heartbeat " +
+		"will arrive to change this status; marking failed rather than holding 'provisioning' " +
+		"with no verdict (core#5136)."
+
+	// Decide WHICH decline this is before announcing it, so the event body can
+	// never carry the "still serving its previous version" claim on a row where
+	// it is untrue. Nil-tolerant: recording WHY a restart was refused must never
 	// itself panic the restart path. A handler wired without a broadcaster (or
 	// running before db.DB is set) still gets the log line above the call site.
+	stranded := false
+	if db.DB != nil {
+		res, err := db.DB.ExecContext(ctx, `
+			UPDATE workspaces
+			   SET status            = $3,
+			       last_sample_error = $2,
+			       updated_at        = now()
+			 WHERE id = $1
+			   AND status = 'provisioning'
+			   AND last_heartbeat_at IS NULL`,
+			workspaceID, strandedMsg, models.StatusFailed)
+		if err != nil {
+			// Fail-open to the historical behaviour: an unknown row state must
+			// not be reported as a boot failure on a guess.
+			log.Printf("markRestartDeclined: stranded-boot check failed for %s: %v", workspaceID, err)
+		} else if rows, rowsErr := res.RowsAffected(); rowsErr != nil {
+			// UNREACHABLE with lib/pq, stated rather than left as a question.
+			// The Exec above returned no error, so the driver has a command tag,
+			// and pq answers RowsAffected from it as driver.RowsAffected — a bare
+			// int64 whose RowsAffected() returns a nil error unconditionally. The
+			// only pq path that errors here is the empty statement, and this
+			// statement is a literal.
+			//
+			// If a future driver did return an error we would not know whether the
+			// row was failed, and an unknown write outcome must never be reported
+			// as a boot failure — so this deliberately falls through to the
+			// historical path. The worst case is then a stale advisory string: a
+			// row we may have just failed also gets the "still serving its previous
+			// version" last_sample_error. status is the SSOT and is already correct
+			// in that case; last_sample_error is the canvas's display reason, so the
+			// residue is cosmetic and self-corrects on the next write.
+			log.Printf("markRestartDeclined: RowsAffected error for %s: %v", workspaceID, rowsErr)
+		} else if rows > 0 {
+			stranded = true
+			log.Printf("IMAGE-PREWARM-DECLINED-STRANDED workspace_id=%s runtime=%q template=%q — the workspace had NO running container to keep (never heartbeated); provisioning→failed with the real reason (core#5136)",
+				workspaceID, runtime, template)
+		}
+	}
+
+	declineMsg := msg
+	reason := "image_prewarm_declined"
+	if stranded {
+		declineMsg = strandedMsg
+		reason = "image_prewarm_declined_no_container"
+	}
+
 	if h.broadcaster != nil {
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceRestartDeclined), workspaceID, map[string]interface{}{
 			"name":     wsName,
 			"runtime":  runtime,
 			"template": template,
-			"error":    msg,
-			"reason":   "image_prewarm_declined",
+			"error":    declineMsg,
+			"reason":   reason,
 		})
+		if stranded {
+			// The canvas only flips a node into its fail state on
+			// WORKSPACE_PROVISION_FAILED (the same reason the provisioning-timeout
+			// sweep emits _FAILED rather than _TIMEOUT). Without this the status
+			// column would say failed while the node kept spinning.
+			h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisionFailed), workspaceID, map[string]interface{}{
+				"name":    wsName,
+				"runtime": runtime,
+				"error":   strandedMsg,
+				"source":  "image_prewarm_declined_no_container",
+			})
+		}
 	}
-	if db.DB == nil {
+	if db.DB == nil || stranded {
+		// stranded: the conditional UPDATE above already wrote last_sample_error
+		// alongside the status, and it wrote the accurate message.
 		return
 	}
 
-	// Status is deliberately untouched — see the doc comment. last_sample_error
-	// is the column the canvas surfaces for "what went wrong here", and it is
-	// what makes this distinguishable from a restart nobody ever ran.
+	// Status is deliberately untouched here — the container this decline
+	// protected is still up. last_sample_error is the column the canvas
+	// surfaces for "what went wrong here", and it is what makes this
+	// distinguishable from a restart nobody ever ran.
 	if _, err := db.DB.ExecContext(ctx,
 		`UPDATE workspaces SET last_sample_error = $2, updated_at = now() WHERE id = $1`,
 		workspaceID, msg); err != nil {

@@ -15,8 +15,9 @@
 # /statuses/{sha}. It never checks out PR HEAD code. The Gitea token has
 # write:repository scope for statuses only.
 #
-# Sibling: .gitea/workflows/status-reaper.yml (default-branch push-suffix
-# compensation). Same persona provisioning model.
+# Former sibling: .gitea/workflows/status-reaper.yml (default-branch push-suffix
+# compensation) — REMOVED in chore/delete-uninstalled-status-reaper. Same persona
+# provisioning model; this workflow is independent and unaffected.
 
 name: umbrella-reaper
 
@@ -34,8 +35,9 @@ on:
 permissions:
   contents: read
 
-# NOTE: NO `concurrency:` block is intentional — same reasoning as
-# status-reaper.yml. Historical runner behavior cancelled queued ticks; the
+# NOTE: NO `concurrency:` block is intentional — same reasoning as the removed
+# status-reaper.yml (chore/delete-uninstalled-status-reaper). Historical runner
+# behavior cancelled queued ticks; the
 # POST is idempotent, so concurrent dispatches remain safe.
 
 jobs:

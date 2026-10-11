@@ -27,12 +27,14 @@ name: stranded-status-janitor
 # Trigger: workflow_dispatch ONLY.
 #   The repo runs a zero-cron ratchet (.gitea/scripts/lint_schedule_budget.py):
 #   an `on.schedule` trigger in any workflow fails CI. Cadence therefore lives
-#   in operator-config, exactly like status-reaper:
+#   in operator-config, exactly like status-reaper did (status-reaper was REMOVED
+#   in chore/delete-uninstalled-status-reaper; this janitor is unaffected):
 #     /etc/cron.d/molecule-core-stranded-status-janitor ->
 #     /usr/local/bin/molecule-core-cron-bot.sh stranded-status-janitor
 #   A 15-minute cadence matches the script's --min-age-minutes grace.
 #
-# No `concurrency:` block, deliberately, for two reasons: status-reaper
+# No `concurrency:` block, deliberately, for two reasons: status-reaper (removed
+# in chore/delete-uninstalled-status-reaper, but its finding stands)
 # documents that the runner cancels queued maintenance ticks even under
 # `cancel-in-progress: false`; and a concurrency group is the precondition for
 # the very Gitea defect this workflow exists to clean up, so a janitor that

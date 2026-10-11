@@ -16,12 +16,14 @@ import (
 	"runtime/debug"
 	"strings"
 	"time"
+	"unicode"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/approvals"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -143,6 +145,13 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		})
 		return
 	}
+	if rawName, renaming := body["name"]; renaming {
+		name, ok := rawName.(string)
+		if !ok || strings.TrimSpace(name) == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "name must be a non-empty string"})
+			return
+		}
+	}
 
 	// #685/#688: validate string fields for length and injection safety.
 	strField := func(key string) string {
@@ -158,6 +167,9 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	if name, renaming := body["name"].(string); renaming {
+		body["name"] = strings.TrimSpace(name)
 	}
 	if wsDir, ok := body["workspace_dir"]; ok && wsDir != nil {
 		if dirStr, isStr := wsDir.(string); isStr && dirStr != "" {
@@ -223,7 +235,12 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	var exists bool
 	if err := db.DB.QueryRowContext(ctx,
 		`SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)`, id,
-	).Scan(&exists); err != nil || !exists {
+	).Scan(&exists); err != nil {
+		log.Printf("Update workspace lookup error for %s: %v", id, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to look up workspace"})
+		return
+	}
+	if !exists {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
 		return
 	}
@@ -277,8 +294,32 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	}
 
 	if name, ok := body["name"]; ok {
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET name = $2, updated_at = now() WHERE id = $1`, id, name); err != nil {
+		result, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET name = $2, updated_at = now() WHERE id = $1 AND status != 'removed'`, id, name)
+		if err != nil {
+			if isParentNameUniqueViolation(err) {
+				c.JSON(http.StatusConflict, gin.H{"error": "a workspace with this name already exists under the same parent", "code": "WORKSPACE_NAME_CONFLICT"})
+				return
+			}
 			log.Printf("Update name error for %s: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rename workspace"})
+			return
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			log.Printf("Update name result error for %s: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to confirm workspace rename"})
+			return
+		}
+		if rows == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
+			return
+		}
+		// All rename clients share this path. Publish after persistence so
+		// other open pages update without reloading or restarting the agent.
+		payload := gin.H{"name": name}
+		if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceUpdated), id, payload); err != nil {
+			log.Printf("Update name event error for %s: %v", id, err)
+			h.broadcaster.BroadcastOnly(id, string(events.EventWorkspaceUpdated), payload)
 		}
 	}
 	if role, ok := body["role"]; ok {
@@ -544,6 +585,10 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	}
 
 	resp := gin.H{"status": "updated"}
+	if name, renaming := body["name"]; renaming {
+		resp["workspace_id"] = id
+		resp["name"] = name
+	}
 	if reparent != nil && reparent.Changed {
 		// The move is a PRIVILEGE change, not a cosmetic one: the workspace
 		// drops read+write on the old team namespace and gains read+write on
@@ -901,6 +946,64 @@ func (h *WorkspaceHandler) clearWorkspaceInstanceIDAfterStop(ctx context.Context
 	}
 }
 
+// inflightProvisionWait bounds how long a delete waits, in total, for cancelled
+// in-flight provisions to unwind. Past it the teardown proceeds; the start's own
+// removed-check (provisioner.SetWorkspaceRemovedCheck) discards anything it
+// still creates.
+const inflightProvisionWait = 15 * time.Second
+
+// inflightStartCanceller is the optional provisioner capability
+// cancelInflightProvisions uses. The Docker provisioner must keep implementing
+// it — a rename would make the type assertion fail silently and deletes would
+// stop waiting for in-flight provisions — hence the compile-time pin.
+type inflightStartCanceller interface {
+	CancelInflightStart(workspaceID string, wait time.Duration) bool
+}
+
+var _ inflightStartCanceller = (*provisioner.Provisioner)(nil)
+
+// cancelInflightProvisions cancels the provisioner.Start calls still running
+// for ids and waits (bounded) for them to return — cancel all first, then wait,
+// so they unwind concurrently. Docker backend only: the CP backend has no local
+// start to cancel, and test stubs without the method are skipped.
+func (h *WorkspaceHandler) cancelInflightProvisions(ids []string) {
+	c, ok := h.provisioner.(inflightStartCanceller)
+	if !ok {
+		return
+	}
+	for _, id := range ids {
+		c.CancelInflightStart(id, 0)
+	}
+	deadline := time.Now().Add(inflightProvisionWait)
+	for _, id := range ids {
+		if !c.CancelInflightStart(id, time.Until(deadline)) {
+			log.Printf("CascadeDelete %s: an in-flight provision is still unwinding after %s — its removed-check will discard what it creates", id, inflightProvisionWait)
+		}
+	}
+}
+
+// WorkspaceIsRemoved reports whether a workspace has been deleted: its row is
+// status='removed', or gone entirely (a ?purge=true delete). It is the probe the
+// Docker provisioner runs right before ContainerCreate and right after
+// ContainerStart (provisioner.SetWorkspaceRemovedCheck), so a provision that
+// was in flight when its workspace was deleted cannot leave a container behind.
+// A query error answers false: a DB blip must not kill a legitimate provision.
+func WorkspaceIsRemoved(ctx context.Context, workspaceID string) bool {
+	if db.DB == nil {
+		return false
+	}
+	var status string
+	err := db.DB.QueryRowContext(ctx, `SELECT status FROM workspaces WHERE id = $1`, workspaceID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true
+	}
+	if err != nil {
+		log.Printf("WorkspaceIsRemoved(%s): status lookup failed: %v — treating as not removed", workspaceID, err)
+		return false
+	}
+	return status == string(models.StatusRemoved)
+}
+
 // CascadeDelete performs the cascade-removal sequence used by the HTTP
 // DELETE handler and by OrgImport's reconcile mode: walk descendants, mark
 // self+descendants 'removed' first (#73 race guard), stop containers / EC2s,
@@ -967,6 +1070,14 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 		pq.Array(allIDs)); err != nil {
 		log.Printf("CascadeDelete token revocation for %s: %v", id, err)
 	}
+	// RC09: a provision for any of these workspaces may still be in flight —
+	// create, restart and bundle import each run provisioner.Start in their own
+	// goroutine, and a cold local build keeps it there for minutes. The rows are
+	// 'removed' as of the UPDATE above, so cancel those starts and wait for them
+	// to unwind BEFORE tearing down. Otherwise the start finishes after this
+	// teardown and creates ws-<id> anyway, which then crash-looped on an empty
+	// config volume with nothing left to stop it.
+	h.cancelInflightProvisions(allIDs)
 	// cleanupCtx is the non-cancelable, time-bounded teardown context: detached
 	// from the request ctx via context.WithoutCancel so a canceled / timed-out
 	// DELETE still runs the stop → remove-volume → broadcast sequence to
@@ -1263,6 +1374,9 @@ func validateWorkspaceFields(name, role, model, runtime string) error {
 		if strings.ContainsAny(f.val, "\n\r") {
 			return fmt.Errorf("%s must not contain newline characters", f.label)
 		}
+	}
+	if strings.IndexFunc(name, unicode.IsControl) >= 0 {
+		return fmt.Errorf("name must not contain control characters")
 	}
 	// name and role only: reject YAML-special characters (#685).
 	for _, f := range []struct{ label, val string }{

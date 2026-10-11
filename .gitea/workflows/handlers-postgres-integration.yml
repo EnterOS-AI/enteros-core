@@ -114,12 +114,16 @@ jobs:
           PUSH_BEFORE: ${{ github.event.before }}
         run: |
           BASE_SHA="${PR_BASE_SHA:-$PUSH_BEFORE}"
+          # --push-before falls back to PUSH_BEFORE (as ci.yml / e2e-api.yml do):
+          # act_runner does not set GITHUB_EVENT_BEFORE, and an EMPTY push base
+          # makes detect-changes treat the push as "everything changed", so every
+          # push to main started a pgvector container for nothing.
           python3 .gitea/scripts/detect-changes.py \
             --profile handlers-postgres \
             --event-name "${{ github.event_name }}" \
             --pr-base-sha "$PR_BASE_SHA" \
             --base-ref "$PR_BASE_REF" \
-            --push-before "${GITHUB_EVENT_BEFORE:-}" || {
+            --push-before "${GITHUB_EVENT_BEFORE:-$PUSH_BEFORE}" || {
             # Script crash / uncaught error: fail open so the integration gate
             # runs rather than silently no-oping a potentially-breaking PR.
             echo "handlers=true" >> "$GITHUB_OUTPUT"
@@ -199,20 +203,17 @@ jobs:
             exit 1
           fi
 
-          # If a stale container with the same name exists (rerun on
-          # the same run_id), wipe it first.
-          docker rm -f "${PG_NAME}" >/dev/null 2>&1 || true
-
-          docker run -d \
-            --name "${PG_NAME}" \
+          # The shared starter wipes a stale same-named container first
+          # (rerun on the same run_id) with `rm -fv`, and puts PGDATA on a
+          # tmpfs so no anonymous volume is left behind (see its header).
+          bash .gitea/scripts/ci-service-container.sh postgres "${PG_NAME}" pgvector/pgvector:pg15 \
             --network "${PG_NETWORK}" \
             --health-cmd "pg_isready -U postgres" \
             --health-interval 5s \
             --health-timeout 5s \
             --health-retries 10 \
             -e POSTGRES_PASSWORD=test \
-            -e POSTGRES_DB=molecule \
-            pgvector/pgvector:pg15 >/dev/null
+            -e POSTGRES_DB=molecule >/dev/null
 
           # Read back the bridge IP. Always present immediately after
           # `docker run -d` for bridge networks.
@@ -588,5 +589,5 @@ jobs:
           # always() so containers don't leak when migrations or tests
           # fail. The cleanup is best-effort: if the container is
           # already gone (e.g. concurrent rerun race), don't fail the job.
-          docker rm -f "${PG_NAME}" >/dev/null 2>&1 || true
+          docker rm -fv "${PG_NAME}" >/dev/null 2>&1 || true
           echo "Cleaned up ${PG_NAME}"

@@ -114,7 +114,7 @@ describe("MobileCanvas — render", () => {
     render(
       <MobileCanvas dark={true} onOpen={vi.fn()} onSpawn={vi.fn()} />,
     );
-    const fab = document.querySelector('button[aria-label="Spawn new agent"]');
+    const fab = document.querySelector<HTMLButtonElement>('button[aria-label="Spawn new agent"]');
     expect(fab).toBeTruthy();
   });
 
@@ -122,7 +122,7 @@ describe("MobileCanvas — render", () => {
     render(
       <MobileCanvas dark={true} onOpen={vi.fn()} onSpawn={vi.fn()} />,
     );
-    const buttons = document.querySelectorAll('button[type="button"]');
+    const buttons = document.querySelectorAll<HTMLButtonElement>('button[type="button"]');
     // 3 nodes + spawn FAB = 4 buttons
     expect(buttons.length).toBeGreaterThanOrEqual(4);
   });
@@ -140,7 +140,7 @@ describe("MobileCanvas — render", () => {
     render(
       <MobileCanvas dark={true} onOpen={vi.fn()} onSpawn={vi.fn()} />,
     );
-    const reset = document.querySelector('button[aria-label="Reset zoom"]');
+    const reset = document.querySelector<HTMLButtonElement>('button[aria-label="Reset zoom"]');
     expect(reset).toBeNull();
   });
 
@@ -148,7 +148,7 @@ describe("MobileCanvas — render", () => {
     render(
       <MobileCanvas dark={true} onOpen={vi.fn()} onSpawn={vi.fn()} />,
     );
-    const fab = document.querySelector('button[aria-label="Spawn new agent"]');
+    const fab = document.querySelector<HTMLButtonElement>('button[aria-label="Spawn new agent"]');
     expect(fab).toBeTruthy();
     const legend = Array.from(document.querySelectorAll("div")).find(
       (d) => d.textContent?.includes("Legend"),
@@ -165,7 +165,7 @@ describe("MobileCanvas — interaction", () => {
     render(
       <MobileCanvas dark={true} onOpen={onOpen} onSpawn={vi.fn()} />,
     );
-    const nodeButtons = Array.from(document.querySelectorAll('button[type="button"]')).filter(
+    const nodeButtons = Array.from(document.querySelectorAll<HTMLButtonElement>('button[type="button"]')).filter(
       (b) => b.textContent?.includes("Alpha Agent"),
     );
     expect(nodeButtons.length).toBeGreaterThanOrEqual(1);
@@ -178,7 +178,7 @@ describe("MobileCanvas — interaction", () => {
     render(
       <MobileCanvas dark={true} onOpen={vi.fn()} onSpawn={onSpawn} />,
     );
-    const fab = document.querySelector('button[aria-label="Spawn new agent"]')!;
+    const fab = document.querySelector<HTMLButtonElement>('button[aria-label="Spawn new agent"]')!;
     fab.click();
     expect(onSpawn).toHaveBeenCalledTimes(1);
   });

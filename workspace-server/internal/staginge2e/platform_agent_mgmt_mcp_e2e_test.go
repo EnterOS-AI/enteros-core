@@ -215,7 +215,18 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 	online := false
 	var lastPresent, lastTools, waitFailure string
 	for !online {
-		hs, body := doTenantJSON(t, "GET", "https://"+host+"/workspaces/"+platformID, token, orgID, "")
+		// NOT doTenantJSON. doTenantJSON t.Fatalf's on a transport error, which
+		// made Obs.ReadOK=false — the "a failed read is not evidence, it only
+		// advances the budget" arm the watch documents and unit-tests —
+		// UNREACHABLE for the most likely way a poll fails. One dropped
+		// connection in up to 60 polls over 15 minutes could therefore end this
+		// HARD GATE with a bare transport error instead of a verdict, and that
+		// red reverts the staging pin and rerolls the fleet. See
+		// guardb_poll_read_nonfatal.go for the full rationale and the measured
+		// (zero-occurrence) scope; collectConciergeSelfReport already made this
+		// exact argument for a strictly less important caller.
+		hs, body := doTenantJSONTimeout(t, "GET", "https://"+host+"/workspaces/"+platformID,
+			token, orgID, "", conciergePollReadTimeout)
 		obs := Obs{ReadOK: hs == http.StatusOK}
 		if hs == http.StatusOK {
 			status := jsonField(body, "status")
@@ -616,8 +627,19 @@ func findWorkspaceByName(t *testing.T, host, token, orgID, want string) (id, kin
 	return "", "", ""
 }
 
-// doTenantJSONTimeout is doTenantJSON with a caller-set client timeout — an A2A
-// tool-use turn on a cold concierge can exceed doTenantJSON's default 90s.
+// doTenantJSONTimeout is doTenantJSON with a caller-set client timeout AND —
+// the load-bearing half for its two other callers — a NON-FATAL transport
+// failure: it logs and returns (0, "") where doTenantJSON t.Fatalf's.
+//
+// Three callers, one reason each:
+//   - the A2A turn: a tool-use turn on a cold concierge can exceed the default
+//     90s, and a transport timeout there is not fatal because the deterministic
+//     side-effect poll is the real assertion;
+//   - collectConciergeSelfReport: a diagnostic must never be able to fail the
+//     gate (see its contract note);
+//   - the concierge readiness poll: an unreadable poll must reach the watch's
+//     Obs.ReadOK=false arm instead of ending the gate (see
+//     guardb_poll_read_nonfatal.go).
 func doTenantJSONTimeout(t *testing.T, method, url, token, orgID, body string, timeout time.Duration) (int, string) {
 	t.Helper()
 	rewritten, top, err := tenantTopoFromURL(url)
@@ -635,9 +657,12 @@ func doTenantJSONTimeout(t *testing.T, method, url, token, orgID, body string, t
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		// A transport timeout on a long LLM turn is not fatal to the test — the
-		// deterministic side-effect poll is the real assertion; surface it softly.
-		t.Logf("A2A %s %s transport error (non-fatal, will poll side effect): %v", method, url, err)
+		// A transport failure is not fatal to the test for ANY of this helper's
+		// callers — the A2A turn has the deterministic side-effect poll behind
+		// it, the self-report is a diagnostic, and the readiness poll feeds a
+		// watch that models an unreadable read as "no information". Surface it
+		// softly and let the caller decide.
+		t.Logf("tenant %s %s transport error (non-fatal; the caller treats this as no information): %v", method, url, err)
 		return 0, ""
 	}
 	defer resp.Body.Close()

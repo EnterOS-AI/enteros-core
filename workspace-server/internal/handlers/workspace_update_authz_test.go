@@ -60,6 +60,9 @@ func TestWorkspaceUpdate_WorkspaceTokenCanPatchCosmeticFields(t *testing.T) {
 	mock.ExpectExec("UPDATE workspaces SET name").
 		WithArgs(workspaceID, "Updated Name").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WithArgs("WORKSPACE_UPDATED", workspaceID, `{"name":"Updated Name"}`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)

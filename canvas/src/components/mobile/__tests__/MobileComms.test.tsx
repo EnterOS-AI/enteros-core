@@ -107,7 +107,7 @@ describe("MobileComms — render", () => {
   });
 
   it("shows loading state when fetching", async () => {
-    let resolve!: () => void;
+    let resolve!: (value: unknown) => void;
     apiGetSpy.mockImplementation(
       () => new Promise((r) => { resolve = r; }),
     );

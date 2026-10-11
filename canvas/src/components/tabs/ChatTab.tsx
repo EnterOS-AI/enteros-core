@@ -158,7 +158,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
     onUserMessage: (msg) => history.setMessages((prev) => [...prev, msg]),
     onAgentMessage: (msg) => history.setMessages((prev) => appendMessageDeduped(prev, msg)),
   });
-  const { sending, uploading, sendMessage, error: sendError, clearError: clearSendError, releaseSendGuards, sendingFromAPIRef } = chatSend;
+  const { sending, uploading, sendMessage, error: sendError, clearError: clearSendError, releaseSendGuards, failSend, sendingFromAPIRef } = chatSend;
 
   // core#2598: if the WebSocket reconnects (or connects for the first
   // time after the tab opened), reconcile My Chat against the persisted
@@ -246,14 +246,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
       if (!sendingFromAPIRef.current) return;
       releaseSendGuards(messageId);
     },
-    onSendError: (err, messageId) => {
-      if (sendingFromAPIRef.current) {
-        // Per-send release: when the error broadcast carries a messageId,
-        // finish only that token. Legacy no-id path releases one token.
-        releaseSendGuards(messageId);
-        setError(err);
-      }
-    },
+    onSendError: failSend,
   });
 
   // Agent reachability
@@ -745,6 +738,9 @@ function MyChatPanel({ workspaceId, data }: Props) {
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
                     components={{
+                      // Chat line breaks are intentional (including older
+                      // greetings stored with Unicode bullets).
+                      p: ({ children }) => <p className="whitespace-pre-wrap break-words">{children}</p>,
                       // Default ReactMarkdown renders `<a href="...">`
                       // with no target and no scheme handling, so:
                       //

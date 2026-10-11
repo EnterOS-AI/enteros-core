@@ -110,6 +110,17 @@ func (h *WorkspaceHandler) fireRestartContextIfBooted(ctx context.Context, works
 	// per-workspace, exactly like the legacy "restart-context-<ws>" key it feeds.
 	// Unwired (nil hook) → keyless → enqueueRestartContext uses the legacy key and
 	// the whole path is byte-for-byte pre-PR-D.
+	//
+	// DECISION (RFC wake-lifecycle follow-up, resolved): the desired generation
+	// is deliberately bumped ONCE-PER-BOX for restart-context, NOT per restart.
+	// desired_generation exists so the runtime can signal "I have reconciled to
+	// core's latest intent" for wakes that occur WITHOUT a restart (idle / stall
+	// / nudge / first-boot-greet); a restart is ITSELF a full runtime reconcile,
+	// so it needs no generation signal to provoke one. A per-restart bump would
+	// mint an unbounded wake_intents row on every restart with no consumer, for
+	// byte-identical user-facing delivery (the once-per-box intent is delivered
+	// then settled by the next heartbeat convergence). Once-per-box is the
+	// correct semantics; do not seed this Decide with a per-restart value.
 	var wakeKey string
 	if h.wakeDecide != nil {
 		if decision, derr := h.wakeDecide(ctx, workspaceID, WakeRestartContext, ""); derr != nil {
