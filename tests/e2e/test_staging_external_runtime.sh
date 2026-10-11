@@ -141,10 +141,11 @@ require_transition() {  # $1 = human label
   log "    [require-live] transition ${TRANSITIONS_VERIFIED}/${EXPECTED_TRANSITIONS} proven: $1"
 }
 
-# Redact bearer tokens from any HTTP body before logging (mirrors the
-# full-saas sanitize_http_body so transient-error logs never leak creds).
+# Redact credential-shaped values from HTTP bodies before logging. Keep the
+# implementation in the shared E2E redactor so compound keys such as
+# platform_inbound_secret cannot drift between harnesses.
 sanitize_http_body() {
-  sed -E 's/(Bearer|token)[[:space:]]+[A-Za-z0-9._-]+/\1 REDACTED/g'
+  python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/redact_secrets.py" --max-chars 4000 || printf '%s' '<redaction failed>'
 }
 
 # Bounded retry-on-transient for POST /registry/register. The tenant edge
@@ -279,7 +280,7 @@ CREATE_RESP=$(admin_call POST /cp/admin/orgs \
   -d "{\"slug\":\"$SLUG\",\"name\":\"E2E ext $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\",\"provider\":\"$PROVIDER\"}")
 set -e
 ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
-[ -z "$ORG_ID" ] && fail "Org create response missing 'id': $(printf '%s' "$CREATE_RESP" | sanitize_http_body 2>/dev/null || printf '%s' "$CREATE_RESP")"
+[ -z "$ORG_ID" ] && fail "Org create response missing 'id': $(printf '%s' "$CREATE_RESP" | sanitize_http_body 2>/dev/null)"
 ok "Org created (id=$ORG_ID)"
 
 # ─── 2. Wait for tenant provisioning ────────────────────────────────────
@@ -402,7 +403,7 @@ try:
 except Exception:
     print('')
 ")
-[ -z "$WS_ID" ] && fail "Workspace create missing id: $(printf '%s' "$WS_CREATE_RESP" | sanitize_http_body 2>/dev/null || printf '%s' "$WS_CREATE_RESP")"
+[ -z "$WS_ID" ] && fail "Workspace create missing id: $(printf '%s' "$WS_CREATE_RESP" | sanitize_http_body 2>/dev/null)"
 [ "$WS_RESP_STATUS" != "awaiting_agent" ] && fail "Expected response status=awaiting_agent, got $WS_RESP_STATUS"
 ok "Workspace created (id=$WS_ID, response status=awaiting_agent)"
 
@@ -471,7 +472,7 @@ REGISTER_DELIVERY_MODE=$(echo "$REGISTER_BODY_JSON" | python3 -c "import json,sy
 if [ "$REGISTER_DELIVERY_MODE" = "poll" ]; then
   ok "delivery_mode=poll (register response echoed explicit value)"
 else
-  fail "Register response delivery_mode=$REGISTER_DELIVERY_MODE (expected poll). Body: $REGISTER_BODY_JSON"
+  fail "Register response delivery_mode=$REGISTER_DELIVERY_MODE (expected poll). Body: $(printf '%s' "$REGISTER_BODY_JSON" | sanitize_http_body)"
 fi
 
 # ─── 6. Stop heartbeating; wait past REMOTE_LIVENESS_STALE_AFTER ────────
@@ -559,7 +560,7 @@ try:
 except Exception:
     print('')
 ")
-  [ -z "$wid" ] && fail "[$rt] create missing id: $resp"
+  [ -z "$wid" ] && fail "[$rt] create missing id: $(printf '%s' "$resp" | sanitize_http_body)"
   [ "$status" = "awaiting_agent" ] || fail "[$rt] create status='$status' (expected awaiting_agent — external/poll path)"
   [ -z "$auth" ] && fail "[$rt] create returned no workspace auth token — register impossible"
 
