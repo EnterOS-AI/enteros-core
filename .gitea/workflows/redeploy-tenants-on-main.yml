@@ -520,6 +520,14 @@ jobs:
           args="--digest $PINNED_DIGEST"
           if [ "$DRY" = "1" ]; then args="$args --dry-run"; fi
 
+          # The roller's REQUIRED_TENANT_NAMESPACES default is the STAGING
+          # canary, which is never in this lane's census. Production has no
+          # required canary namespace, so this opts out EXPLICITLY, as a shell
+          # assignment rather than a templated value that could silently arrive
+          # empty. The roller's other anti-vacuity gates (found:0, no tenant in
+          # scope, eligible-but-none-rolled) still apply.
+          export REQUIRED_TENANT_NAMESPACES=
+
           # 2>&1 IS LOAD-BEARING, AND ITS ABSENCE WAS A SHIPPING DEFECT.
           #
           # The roller writes its ENTIRE human-readable output to stderr: log() is

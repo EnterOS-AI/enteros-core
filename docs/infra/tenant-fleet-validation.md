@@ -23,6 +23,16 @@ get/list/watch/patch, Pods list and `pods/proxy` get. The proxy can reach only
 pods that the tenant NetworkPolicy lets the API server reach, and a `/buildinfo`
 read that cannot connect fails verification.
 
+Those grants are RoleBindings in an explicit list of tenant namespaces. There is
+no cluster-wide grant and no policy that generates grants per namespace. Before
+touching a tenant, the roller asks `kubectl auth can-i patch deployments -n
+<ns>`. A plain "no" is reported as `skipped-out-of-scope`. An error, or a "no"
+with a reason, fails the tenant. A run fails if no tenant was in scope. It also
+fails unless every namespace in `REQUIRED_TENANT_NAMESPACES` ends rolled with
+each serving pod's `/buildinfo` verified (in `--dry-run`, planned). The default
+is the staging canary, `enteros-staging-canary-k8s`, and the production lane
+sets it empty.
+
 Run the local regression suites with Bash:
 
 ```sh
