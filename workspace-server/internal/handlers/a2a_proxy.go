@@ -1302,16 +1302,12 @@ func (h *WorkspaceHandler) resolveAgentURL(ctx context.Context, workspaceID stri
 	// rewritten to the workspace container's Docker-bridge hostname.
 	// External runtimes are not managed containers; their local test/runtime
 	// URL is the target and must not be synthesized into ws-<id>:8000.
-	if strings.HasPrefix(agentURL, "http://127.0.0.1:") && h.provisioner != nil && platformInDocker {
-		var wsRuntime string
-		if err := db.DB.QueryRowContext(ctx,
-			`SELECT COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`,
-			workspaceID,
-		).Scan(&wsRuntime); err != nil {
-			log.Printf("ProxyA2A: runtime lookup before Docker URL rewrite failed for %s: %v", workspaceID, err)
-		}
-		if !isExternalLikeRuntime(wsRuntime) {
-			agentURL = provisioner.InternalURL(workspaceID)
+	agentURL, err = h.rewriteForDocker(ctx, agentURL, workspaceID)
+	if err != nil {
+		log.Printf("ProxyA2A: route lookup failed for %s: %v", workspaceID, err)
+		return "", &proxyA2AError{
+			Status:   http.StatusInternalServerError,
+			Response: gin.H{"error": "failed to resolve workspace route"},
 		}
 	}
 	// SSRF defence: reject private/metadata URLs before making outbound call.

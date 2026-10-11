@@ -1,7 +1,7 @@
 import type { Node, Edge } from "@xyflow/react";
 import type { WSMessage } from "./socket";
 import type { WorkspaceNodeData, BootStep } from "./canvas";
-import { extractResponseText, extractFilesFromTask } from "@/components/tabs/chat/message-parser";
+import { parseA2AResponse } from "@/components/tabs/chat/a2a-response";
 import { appendBootLog, mergeBootStep, parseBootStepWire } from "./boot-telemetry";
 import type { BootStepWire } from "./boot-telemetry";
 
@@ -606,10 +606,10 @@ export function handleCanvasEvent(
       // which delivery path raced to completion first).
       const responseBody = msg.payload.response_body as Record<string, unknown> | undefined;
       if (responseBody) {
-        const text = extractResponseText(responseBody);
-        const attachments = extractFilesFromTask(
-          (responseBody.result ?? responseBody) as Record<string, unknown>,
-        );
+        const { text, attachments, pending, error } = parseA2AResponse(responseBody);
+        // Failures are handled by useChatSocket, never buffered as successful
+        // replies (which would clear the error banner and complete the send).
+        if (pending || error) break;
         if (text || attachments.length > 0) {
           const { agentMessages, agentMessageConsumers } = get();
           // Same live-hand-off rule as AGENT_MESSAGE above: no mounted chat

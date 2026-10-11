@@ -1526,6 +1526,8 @@ describe("growParentsToFitChildren", () => {
           type: "workspace",
           position: { x: 0, y: 0 },
           data: {
+            needsRestart: false,
+            budgetLimit: null,
             name: "Parent",
             status: "online",
             tier: 1,
@@ -1551,6 +1553,8 @@ describe("growParentsToFitChildren", () => {
           type: "workspace",
           position: { x: 0, y: 0 },
           data: {
+            needsRestart: false,
+            budgetLimit: null,
             name: "Child",
             status: "online",
             tier: 1,
@@ -1591,6 +1595,8 @@ describe("growParentsToFitChildren", () => {
           width: 100,
           height: 100,
           data: {
+            needsRestart: false,
+            budgetLimit: null,
             name: "Parent",
             status: "online",
             tier: 1,
@@ -1613,6 +1619,8 @@ describe("growParentsToFitChildren", () => {
           type: "workspace",
           position: { x: 0, y: 0 },
           data: {
+            needsRestart: false,
+            budgetLimit: null,
             name: "Child",
             status: "online",
             tier: 1,
@@ -1648,6 +1656,8 @@ describe("growParentsToFitChildren", () => {
           type: "workspace",
           position: { x: 0, y: 0 },
           data: {
+            needsRestart: false,
+            budgetLimit: null,
             name: "Parent",
             status: "online",
             tier: 1,
@@ -1673,6 +1683,8 @@ describe("growParentsToFitChildren", () => {
           type: "workspace",
           position: { x: 0, y: 0 },
           data: {
+            needsRestart: false,
+            budgetLimit: null,
             name: "Child",
             status: "online",
             tier: 1,
@@ -1716,6 +1728,8 @@ describe("arrangeChildren", () => {
           type: "workspace",
           position: { x: 50, y: 50 },
           data: {
+            needsRestart: false,
+            budgetLimit: null,
             name: "Orphan",
             status: "online",
             tier: 1,
@@ -1751,6 +1765,8 @@ describe("arrangeChildren", () => {
           type: "workspace",
           position: { x: 0, y: 0 },
           data: {
+            needsRestart: false,
+            budgetLimit: null,
             name: "Parent",
             status: "online",
             tier: 1,
@@ -1772,6 +1788,8 @@ describe("arrangeChildren", () => {
           type: "workspace",
           position: { x: 9999, y: 9999 }, // existing position should be overwritten
           data: {
+            needsRestart: false,
+            budgetLimit: null,
             name: "Zoe",
             status: "online",
             tier: 1,
@@ -1793,6 +1811,8 @@ describe("arrangeChildren", () => {
           type: "workspace",
           position: { x: 9999, y: 9999 },
           data: {
+            needsRestart: false,
+            budgetLimit: null,
             name: "Alice",
             status: "online",
             tier: 1,
@@ -1836,6 +1856,8 @@ describe("arrangeChildren", () => {
           type: "workspace",
           position: { x: 100, y: 200 },
           data: {
+            needsRestart: false,
+            budgetLimit: null,
             name: "Grandparent",
             status: "online",
             tier: 1,
@@ -1856,6 +1878,8 @@ describe("arrangeChildren", () => {
           type: "workspace",
           position: { x: 16, y: 130 }, // relative to grandparent
           data: {
+            needsRestart: false,
+            budgetLimit: null,
             name: "Parent",
             status: "online",
             tier: 1,
@@ -1877,6 +1901,8 @@ describe("arrangeChildren", () => {
           type: "workspace",
           position: { x: 9999, y: 9999 },
           data: {
+            needsRestart: false,
+            budgetLimit: null,
             name: "Child",
             status: "online",
             tier: 1,

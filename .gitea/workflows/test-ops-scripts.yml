@@ -31,6 +31,7 @@ on:
     branches: [main, staging]
     paths:
       - 'scripts/**'
+      - 'docker-compose*.yml'
       - '.gitea/scripts/**'
       # #4322: test_managed_flags_wiring.py asserts every workflow STEP rolling the
       # staging fleet wires STAGING_TENANT_FLAGS in — so ALL workflow files must run it,
@@ -72,6 +73,7 @@ on:
     branches: [main, staging]
     paths:
       - 'scripts/**'
+      - 'docker-compose*.yml'
       - '.gitea/scripts/**'
       # #4322: test_managed_flags_wiring.py asserts every workflow STEP rolling the
       # staging fleet wires STAGING_TENANT_FLAGS in — so ALL workflow files must run it,
@@ -248,3 +250,8 @@ jobs:
         # usable, so dev-start.sh must wait for that path before starting
         # Langfuse and must not print the ready banner until Langfuse HTTP works.
         run: bash scripts/test-dev-start-langfuse-readiness.sh
+
+      - name: dev-start.sh platform startup behavior
+        run: |
+          node --test scripts/test-dev-port.cjs
+          bash scripts/test-dev-start-platform.sh

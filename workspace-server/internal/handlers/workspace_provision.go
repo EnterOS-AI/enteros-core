@@ -1242,6 +1242,15 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 		// slug prefix (minimax/…, anthropic/…, openai/…, etc.) when the
 		// provider isn't explicitly set.
 		envVars["HERMES_DEFAULT_MODEL"] = model
+		// The platform registry uses minimax:Model for BYOK; Hermes's
+		// provider/bridge input uses minimax/Model. Project only the native
+		// setting: MODEL and MOLECULE_MODEL must keep the canonical id so
+		// provider selection and billing still distinguish BYOK from platform.
+		// Without this, the custom-provider bridge forwards the colon prefix
+		// to MiniMax, which rejects it as an unknown model.
+		if strings.HasPrefix(model, "minimax:") {
+			envVars["HERMES_DEFAULT_MODEL"] = "minimax/" + strings.TrimPrefix(model, "minimax:")
+		}
 	}
 }
 
