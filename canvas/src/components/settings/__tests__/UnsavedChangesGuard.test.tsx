@@ -158,7 +158,7 @@ describe("UnsavedChangesGuard — interaction", () => {
       />,
     );
     // Keep editing (Cancel) → fires onOpenChange(false) → onKeepEditing
-    const keepBtn = document.querySelector('.guard-dialog__keep-btn');
+    const keepBtn = document.querySelector<HTMLButtonElement>('.guard-dialog__keep-btn');
     expect(keepBtn).not.toBeNull();
     keepBtn!.click();
     expect(onKeepEditing).toHaveBeenCalledTimes(1);

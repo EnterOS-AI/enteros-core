@@ -1,9 +1,10 @@
 import type { Node, Edge } from "@xyflow/react";
 import type { WSMessage } from "./socket";
 import type { WorkspaceNodeData, BootStep } from "./canvas";
-import { extractResponseText, extractFilesFromTask } from "@/components/tabs/chat/message-parser";
+import { parseA2AResponse } from "@/components/tabs/chat/a2a-response";
 import { appendBootLog, mergeBootStep, parseBootStepWire } from "./boot-telemetry";
 import type { BootStepWire } from "./boot-telemetry";
+import { WS_EVENTS } from "@/lib/ws-events";
 
 // ---------------------------------------------------------------------------
 // Monotonically increasing counter used to assign grid positions.
@@ -103,6 +104,16 @@ export function handleCanvasEvent(
   const { nodes, edges, selectedNodeId } = get();
 
   switch (msg.event) {
+    case WS_EVENTS.WorkspaceUpdated: {
+      const { name } = msg.payload;
+      if (typeof name !== "string" || !name.trim()) break;
+      set({
+        nodes: nodes.map((node) => node.id === msg.workspace_id
+          ? { ...node, data: { ...node.data, name } }
+          : node),
+      });
+      break;
+    }
     case "WORKSPACE_ONLINE": {
       const existing = nodes.find((n) => n.id === msg.workspace_id);
       const nodeName = existing?.data.name ?? (msg.payload.name as string) ?? "Workspace";
@@ -606,10 +617,10 @@ export function handleCanvasEvent(
       // which delivery path raced to completion first).
       const responseBody = msg.payload.response_body as Record<string, unknown> | undefined;
       if (responseBody) {
-        const text = extractResponseText(responseBody);
-        const attachments = extractFilesFromTask(
-          (responseBody.result ?? responseBody) as Record<string, unknown>,
-        );
+        const { text, attachments, pending, error } = parseA2AResponse(responseBody);
+        // Failures are handled by useChatSocket, never buffered as successful
+        // replies (which would clear the error banner and complete the send).
+        if (pending || error) break;
         if (text || attachments.length > 0) {
           const { agentMessages, agentMessageConsumers } = get();
           // Same live-hand-off rule as AGENT_MESSAGE above: no mounted chat

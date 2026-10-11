@@ -191,8 +191,7 @@ describe("useChatSocket — surface error_detail to onSendError (internal#212)",
 
   // Pair with the above: poll-mode acknowledgement must NOT prematurely
   // call onSendComplete — the spinner has to stay up until the actual
-  // AGENT_MESSAGE reply lands. (The reply-success path with duration_ms
-  // still calls onSendComplete; that's the push-mode case.)
+  // actual reply lands. Transport activity alone does not prove success.
   it("does NOT call onSendComplete on a poll-mode queued a2a_receive (spinner must persist)", () => {
     const onSendComplete = vi.fn();
     renderHook(() =>
@@ -243,7 +242,7 @@ describe("useChatSocket — surface error_detail to onSendError (internal#212)",
 });
 
 describe("useChatSocket — token-specific completion on all paths (CR2 #11466 / Researcher #11471)", () => {
-  it("passes message_id through the ACTIVITY_LOGGED error branch so onSendComplete/error are token-specific", () => {
+  it("passes message_id to the error callback without signaling success", () => {
     const onSendComplete = vi.fn();
     const onSendError = vi.fn();
     renderHook(() =>
@@ -270,17 +269,18 @@ describe("useChatSocket — token-specific completion on all paths (CR2 #11466 /
       });
     });
 
-    expect(onSendComplete).toHaveBeenCalledTimes(1);
-    expect(onSendComplete).toHaveBeenCalledWith("msg-a");
+    expect(onSendComplete).not.toHaveBeenCalled();
     expect(onSendError).toHaveBeenCalledTimes(1);
     expect(onSendError.mock.calls[0][1]).toBe("msg-a");
   });
 
-  it("falls back to legacy no-messageId completion only when message_id is absent", () => {
+  it("passes an uncorrelated legacy error when message_id is absent", () => {
     const onSendComplete = vi.fn();
+    const onSendError = vi.fn();
     renderHook(() =>
       useChatSocket("ws-self", {
         onSendComplete,
+        onSendError,
       }),
     );
 
@@ -300,8 +300,9 @@ describe("useChatSocket — token-specific completion on all paths (CR2 #11466 /
       });
     });
 
-    expect(onSendComplete).toHaveBeenCalledTimes(1);
-    expect(onSendComplete.mock.calls[0][0]).toBeUndefined();
+    expect(onSendComplete).not.toHaveBeenCalled();
+    expect(onSendError).toHaveBeenCalledTimes(1);
+    expect(onSendError.mock.calls[0][1]).toBeUndefined();
   });
 
   it("completes EVERY consumed agent message by its message_id, not just the first (batch consume)", () => {

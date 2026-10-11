@@ -20,9 +20,9 @@
 import React from "react";
 import { render, screen, fireEvent, cleanup, act } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { TracesTab } from "../TracesTab";
+import { TracesTab, type Trace } from "../TracesTab";
 
-const mockGet = vi.hoisted(() => vi.fn<[], Promise<unknown>>());
+const mockGet = vi.hoisted(() => vi.fn<(path: string, body?: unknown) => Promise<unknown>>());
 
 vi.mock("@/lib/api", () => ({
   api: { get: mockGet },
@@ -30,7 +30,7 @@ vi.mock("@/lib/api", () => ({
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 
-const TRACE_FIXTURE = {
+const TRACE_FIXTURE: Trace = {
   id: "trace-abc123",
   name: "security-scan",
   timestamp: new Date(Date.now() - 60000).toISOString(),
@@ -42,7 +42,7 @@ const TRACE_FIXTURE = {
   usage: { input: 120, output: 85, total: 205 },
 };
 
-function trace(overrides: Partial<typeof TRACE_FIXTURE> = {}): typeof TRACE_FIXTURE {
+function trace(overrides: Partial<Trace> = {}): Trace {
   return { ...TRACE_FIXTURE, ...overrides };
 }
 
