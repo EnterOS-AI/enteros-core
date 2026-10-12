@@ -97,7 +97,7 @@ SEO_TEMPLATE="${E2E_SEO_TEMPLATE:-seo-agent}"
 # 2026-08-04: sdk#203 withdrew moonshot/* from every platform arm (suspended
 # vendor account), so the old default now 422s UNREGISTERED_MODEL_FOR_RUNTIME at
 # create. minimax/MiniMax-M3 is the SSOT default (MOLECULE_LLM_DEFAULT_MODEL).
-EXPECTED_MODEL="${E2E_EXPECTED_MODEL:-minimax/MiniMax-M3}"
+EXPECTED_MODEL="${E2E_EXPECTED_MODEL:-minimax/MiniMax-M2.7}"
 # The plugin the seo-agent template now DECLARES. Install name = last path
 # segment of the source contract; this source has NO subpath, so the name is the
 # repo name (workspace-server gitea resolver).
