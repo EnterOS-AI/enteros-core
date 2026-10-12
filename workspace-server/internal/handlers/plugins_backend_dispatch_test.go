@@ -14,9 +14,10 @@ package handlers
 // local-docker tenants.
 //
 // The fix gates the EIC branch on isEC2InstanceID (a real "i-<hex>" id), so a
-// container-name instance_id falls through to the docker path (or, with no
-// docker client wired, fails LOUD with 503 instead of the silent 90s EIC
-// timeout). This mirrors the Files API fix in files_backend_dispatch.go.
+// container-name instance_id falls through to the docker path, or, with no
+// docker client wired, to delivery by PULL (install: declare + re-materialize;
+// uninstall: drop the installed and declared rows) instead of the silent 90s
+// EIC timeout. This mirrors the Files API fix in files_backend_dispatch.go.
 //
 // These tests are deterministic and require NO live Docker/AWS/staging: they
 // stub installPluginViaEIC / uninstallPluginViaEIC to fail the test loudly if
@@ -92,15 +93,14 @@ func TestPluginInstall_LocalDocker_DoesNotHitEIC(t *testing.T) {
 }
 
 // TestPluginUninstall_LocalDocker_DeliversByPull is the uninstall sibling of the
-// install pull path (delta A, #206/#230): a docker-less local-docker tenant
-// (instance_id is a container name, no docker client wired) must NOT reach
+// install pull path (#206/#230): a docker-less local-docker tenant (instance_id
+// is a container name, no docker client wired) must NOT reach
 // uninstallPluginViaEIC and must NOT 503-dead-end. It delivers the UNINSTALL by
 // PULL — dropping BOTH DB rows (workspace_plugins + workspace_declared_plugins)
 // and restarting so the fresh container's recomputed MOLECULE_DECLARED_PLUGINS
 // omits the plugin.
 //
-// Pre-change this test would FAIL (old code returned 503 for the docker-less
-// uninstall).
+// FAILS on main, which answers 503 for the docker-less uninstall.
 func TestPluginUninstall_LocalDocker_DeliversByPull(t *testing.T) {
 	stubUninstallPluginViaEIC(t, func(_ context.Context, instanceID, _, _ string) error {
 		t.Errorf("uninstallPluginViaEIC called with instanceID=%q for a local-docker workspace; "+

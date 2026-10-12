@@ -44,52 +44,6 @@ const (
 // /configs/plugins/<name>/ on the next boot. The AGENT never fetches; the box does.
 var errNoPushTarget = errors.New("no docker-push target: deliver by pull (re-materialize)")
 
-// pluginDeliveryMode enumerates how a post-boot plugin install/uninstall reaches
-// a workspace's runtime container.
-type pluginDeliveryMode int
-
-const (
-	// deliverByPush copies the plugin bytes INTO the running container — docker
-	// CopyToContainer (self-host ws-<id>, or a molecules-server container when a
-	// docker client is wired) or EIC SSH (genuine EC2). The legacy model.
-	deliverByPush pluginDeliveryMode = iota
-	// deliverByPull records the plugin in the DB (declared ∪ installed) and lets
-	// the runtime's boot materializer FETCH it (gitea://) into /configs/plugins
-	// on the next (re)provision. The operator target for the molecules-server /
-	// local-docker backend: the box pulls, the AGENT never fetches — no
-	// docker.sock, no AWS EIC.
-	deliverByPull
-)
-
-// pullOnlyDelivery reports the PLUGIN_DELIVERY_PULL_ONLY policy. Default TRUE:
-// the molecules-server / local-docker backend delivers plugins by PULL as the
-// PRIMARY model — even when a docker client is wired — matching the operator
-// target (retire the docker-push; the box pulls its declared plugins at boot).
-// Set PLUGIN_DELIVERY_PULL_ONLY=false to revert a docker-capable molecules-server
-// tenant to the legacy docker CopyToContainer push (reversible rollback).
-// Genuine EC2 is unaffected: it is shape-gated to EIC before this policy is
-// consulted (see deliveryModeForInstance / deliverToContainer).
-func pullOnlyDelivery() bool {
-	return envx.Bool("PLUGIN_DELIVERY_PULL_ONLY", true)
-}
-
-// deliveryModeForInstance selects the delivery model for a SaaS-dispatch
-// instance_id shape. A genuine EC2 id (i-<hex>) always PUSHES (EIC) — the caller
-// handles that branch before consulting this. For the molecules-server /
-// local-docker backend (a container-name instance_id) PULL is the PRIMARY model
-// per the operator target, unless PLUGIN_DELIVERY_PULL_ONLY=false restores push.
-// Making this an explicit selector (rather than an inline h.docker==nil check)
-// is what turns pull from a mere fallback into the primary, reversible policy.
-func deliveryModeForInstance(instanceID string) pluginDeliveryMode {
-	if isEC2InstanceID(instanceID) {
-		return deliverByPush
-	}
-	if pullOnlyDelivery() {
-		return deliverByPull
-	}
-	return deliverByPush
-}
-
 // httpErr is the typed error returned by Install helpers. The handler
 // matches it with errors.As and emits the attached status + body. Using
 // a typed error instead of a 5-value tuple keeps helper signatures Go-
@@ -495,26 +449,20 @@ func (h *PluginsHandler) deliverToContainer(ctx context.Context, workspaceID str
 		}
 
 		// molecules-server / local-docker backend: instance_id IS the running
-		// container name on the local docker daemon.
-		//
-		// DELIVERY POLICY (operator target, #206/#230): PULL is the PRIMARY model
-		// here — the box pulls its declared plugins at boot; we do NOT push bytes
-		// into the container. We fall back to the legacy docker CopyToContainer
-		// push ONLY when the operator explicitly opts out
-		// (PLUGIN_DELIVERY_PULL_ONLY=false) AND a docker client is wired. This is
-		// the delta that makes pull the primary model rather than a mere
-		// h.docker==nil fallback: even with a docker client present, a
-		// molecules-server tenant now delivers by pull by default.
-		if deliveryModeForInstance(instanceID) == deliverByPush && h.docker != nil {
+		// container name on the local docker daemon. Deliver straight into it
+		// via the SAME docker primitive the findRunningContainer branch uses —
+		// findRunningContainer looked for "ws-<id>" and never matches the CP's
+		// "mol-ws-*" name, so we key delivery on the instance_id container name.
+		if h.docker != nil {
 			return h.deliverViaDocker(ctx, workspaceID, instanceID, r)
 		}
 
-		// Pull-only (default) or no docker client wired (#206: no docker.sock
-		// mounted) — the docker-PUSH is RETIRED: signal the caller to deliver by
-		// PULL (re-materialize) so the runtime's boot materializer pulls the
-		// declared plugins. No 503 dead-end, no AWS EIC 90s→502.
-		log.Printf("Plugin install: workspace %s delivering by PULL (instance_id=%s, pull_only=%t, docker_wired=%t) — the box pulls its declared plugins at boot; retiring the docker-push",
-			workspaceID, instanceID, pullOnlyDelivery(), h.docker != nil)
+		// Non-EC2 instance id (local-docker) but no docker client wired — the
+		// docker-less tenant (#206: no docker.sock mounted). The docker-PUSH is
+		// RETIRED here: signal the caller to deliver by PULL (re-materialize) so
+		// the runtime's boot materializer pulls the declared plugins. No more 503
+		// dead-end, no AWS EIC 90s→502.
+		log.Printf("Plugin install: workspace %s is docker-less (instance_id=%s, no docker client) — retiring the docker-push, delivering by pull (re-materialize)", workspaceID, instanceID)
 		return false, errNoPushTarget
 	}
 
@@ -548,20 +496,18 @@ func (h *PluginsHandler) reMaterialize(ctx context.Context, workspaceID, pluginN
 	return false, nil
 }
 
-// pullUninstall delivers an UNINSTALL by PULL — the docker-less counterpart to
-// reMaterialize that replaces the retired docker-exec / AWS-EIC push. It removes
-// the plugin from BOTH the installed set (workspace_plugins) and the declared
-// set (workspace_declared_plugins) so desiredPluginSources (declared ∪
-// installed) no longer emits it, then triggers a restart. On the fresh
-// molecules-server container, workspace_provision re-stamps
-// MOLECULE_DECLARED_PLUGINS WITHOUT the plugin, so the boot materializer simply
-// doesn't fetch it and /configs/plugins/<name> is gone — byte-identical to how a
-// never-declared plugin is "absent". The AGENT never touches the container; the
-// box rebuilds its plugin tree purely from the recomputed env.
+// pullUninstall is the uninstall counterpart of reMaterialize, used only where
+// there is no push target (see Uninstall / uninstallByPull). It removes the
+// plugin from BOTH the installed set (workspace_plugins) and the declared set
+// (workspace_declared_plugins), so desiredPluginSources (declared ∪ installed)
+// no longer emits it, then schedules a restart. The next provision stamps
+// MOLECULE_DECLARED_PLUGINS without the plugin and the runtime's boot
+// materializer drops its directory (uninstallByPull documents how, and where
+// that stops).
 //
-// Both deletes are load-bearing here (unlike the docker/EIC paths where the
-// container rm is the real removal and the row delete is best-effort cleanup):
-// on the pull path the DB IS the uninstall, so a delete failure is surfaced to
+// Both deletes are load-bearing here, unlike the docker/EIC paths where the
+// container rm is the real removal and the row delete is best-effort cleanup:
+// on the pull path the DB IS the uninstall, so a delete failure is returned to
 // the caller rather than swallowed — a surviving row would re-materialize the
 // plugin on the next boot. Returns whether a restart was scheduled.
 func (h *PluginsHandler) pullUninstall(ctx context.Context, workspaceID, pluginName string) (bool, error) {

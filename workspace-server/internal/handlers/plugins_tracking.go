@@ -430,11 +430,12 @@ func deleteWorkspacePluginRow(ctx context.Context, workspaceID, pluginName strin
 // next restart. Deleting BOTH rows keeps the plugin out of the recomputed
 // desired set, so the fresh container simply never fetches it.
 //
-// Scope note (see plugins_install.go risks): this removes a USER-installed
-// declaration cleanly. A TEMPLATE-declared plugin is re-injected from the
-// config.yaml payload by CP (injectTemplateDeclaredPlugins) on the next
-// provision, so deleting the declared row alone does not permanently remove a
-// template plugin — that is desired-state behavior, not a bug in this path.
+// Scope note (see uninstallByPull for the full list of limits): this removes a
+// USER-installed declaration cleanly. A TEMPLATE-declared plugin is re-injected
+// from the config.yaml payload by CP (injectTemplateDeclaredPlugins) on the
+// next provision, so deleting the declared row alone does not permanently
+// remove a template plugin — that is desired-state behavior, not a bug in this
+// path.
 func deleteDeclaredPluginRow(ctx context.Context, workspaceID, pluginName string) error {
 	if db.DB == nil {
 		return nil // nil in unit tests; no-op since the row is test-only
