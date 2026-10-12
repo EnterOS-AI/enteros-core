@@ -45,7 +45,7 @@ name: pin-provenance-guard
 #               SAME ungated authenticated-admin path…", pin_runtime_image.go).
 #               Until that hook rejects an unstamped molecule-tenant promote,
 #               this lane catches a hand write AFTER it has already changed what
-#               fresh provisions get — on the next push to main or dispatch,
+#               fresh provisions get — on the next operational audit dispatch,
 #               not at the moment of the write.
 #
 # Do not read the word "blocking" below as "prevented" for the tenant half. It
@@ -66,7 +66,7 @@ name: pin-provenance-guard
 #       though the arm above is green. Without it a broken guard and a healthy
 #       repo look identical.
 #
-#   tenant-pin audit (push/dispatch, BLOCKING)   reads the live
+#   tenant-pin audit (manual dispatch, operational)   reads the live
 #       (molecule-tenant, global) row from EVERY production control plane and
 #       requires a provenance stamp on it.
 #
@@ -76,7 +76,8 @@ name: pin-provenance-guard
 # rejected once, in writing, in required-contexts.txt ("a branch push is not a
 # review"). The PR arm is therefore the two offline arms — which are real,
 # deterministic and blocking, not a vacuous self-check. The audit runs where the
-# credential is safe: on push to main and on dispatch.
+# credential is safe: a manual dispatch on main. Push and PR runs validate
+# code only; existing production data cannot invalidate code CI.
 #
 # NO paths: filter. A pin's provenance is a property of the DIFF and of ANOTHER
 # system's state; a paths filter would let a pin edit dodge the guard by
@@ -237,7 +238,7 @@ jobs:
 
       - name: Read the production CP admin token from the Infisical SSOT
         id: cptoken
-        if: ${{ github.event_name != 'pull_request' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
         env:
           INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
@@ -275,7 +276,7 @@ jobs:
           echo "prod CP admin token loaded from the Infisical SSOT (len=${#cp_token})"
 
       - name: Audit — the live tenant pin on EVERY control plane
-        if: ${{ github.event_name != 'pull_request' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
         env:
           PIN_PROVENANCE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITEA_HOST: https://git.moleculesai.app

@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = ROOT / "scripts" / "deploy" / "advance-staging-tenant-pin.sh"
@@ -20,7 +22,8 @@ sys.path.insert(0, str(ROOT / ".gitea" / "scripts"))
 import pin_provenance  # noqa: E402
 
 
-def test_digest_resolution_is_independent_of_a_previous_runner_cache(tmp_path: Path):
+@pytest.mark.parametrize("refs_mode", ["matching", "foreign", "empty", "ambiguous"])
+def test_digest_resolution_is_independent_of_a_previous_runner_cache(tmp_path: Path, refs_mode):
     """A downstream job must pull the tag before inspecting its local daemon.
 
     Gitea may schedule ``await-image`` and ``advance-pin`` on different runners.
@@ -30,6 +33,14 @@ def test_digest_resolution_is_independent_of_a_previous_runner_cache(tmp_path: P
     digest = "sha256:" + "9" * 64
     github_sha = "deadbeef1234567890abcdef1234567890abcdef"
     pulled = tmp_path / "pulled"
+    refs = {
+        "matching": ["registry.other/tenant@sha256:" + "0" * 64,
+                     "registry.test/molecule-tenant@" + digest],
+        "foreign": ["registry.other/tenant@" + digest],
+        "empty": [],
+        "ambiguous": ["registry.test/molecule-tenant@" + digest,
+                      "registry.test/molecule-tenant@sha256:" + "1" * 64],
+    }[refs_mode]
 
     docker = tmp_path / "docker"
     docker.write_text(
@@ -39,7 +50,11 @@ if [ "$1" = "pull" ] && [ "$2" = "registry.test/molecule-tenant:staging-deadbee"
   exit 0
 fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [ -f "{pulled}" ]; then
-  echo "{digest}"
+  if [ "$5" = '{{{{.Id}}}}' ]; then
+    echo 'sha256:{"2" * 64}'
+  else
+    echo '{json.dumps(refs)}'
+  fi
   exit 0
 fi
 exit 1
@@ -93,7 +108,12 @@ exit 0
         check=False,
     )
 
-    assert result.returncode == 0, result.stderr + result.stdout
+    if refs_mode == "matching":
+        assert result.returncode == 0, result.stderr + result.stdout
+        assert f"new_digest={digest}" in (tmp_path / "github-output").read_text()
+    else:
+        assert result.returncode != 0, result.stderr + result.stdout
+        assert "exactly one manifest digest" in result.stderr
     assert pulled.exists(), "the downstream runner never pulled the registry tag"
 
 
@@ -108,7 +128,7 @@ if [ "$1" = "pull" ]; then
   exit 42
 fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
-  echo "{stale_digest}"
+  echo '["registry.test/molecule-tenant@{stale_digest}"]'
   exit 0
 fi
 exit 1
@@ -166,7 +186,7 @@ if [ "$1" = "pull" ]; then
   exit 0
 fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [ "$3" = "registry.test/molecule-tenant:staging-deadbee" ]; then
-  echo "{new_digest}"
+  echo '["registry.test/molecule-tenant@{new_digest}"]'
   exit 0
 fi
 exit 1
@@ -316,7 +336,7 @@ if [ "$1" = "pull" ]; then
   exit 0
 fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
-  echo "{resolved}"
+  echo '["registry.test/molecule-tenant@{resolved}"]'
   exit 0
 fi
 exit 1
@@ -386,7 +406,7 @@ if [ "$1" = "pull" ]; then
   exit 0
 fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
-  echo "{resolved}"
+  echo '["registry.test/molecule-tenant@{resolved}"]'
   exit 0
 fi
 exit 1
@@ -487,6 +507,8 @@ sys.exit(1)
             "CP_BASE_URL": "https://staging-api.test",
             "TENANT_IMAGE_NAME": "registry.test/molecule-tenant",
             "GITHUB_SHA": "f" * 40,
+            "GITHUB_RUN_ID": "900004",
+            "GITHUB_REPOSITORY": "molecule-ai/molecule-core",
             "GITHUB_OUTPUT": str(tmp_path / "github-output"),
             "FAKE_CURL_STATE": str(state_dir),
             # Real Infisical creds are required now — supply fakes so the write RUNS.
@@ -999,7 +1021,7 @@ def _fake_promote_env(tmp_path: Path, state_dir: Path, digest: str, git_sha: str
     docker.write_text(
         f"""#!/bin/sh
 if [ "$1" = "pull" ]; then exit 0; fi
-if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then echo "{digest}"; exit 0; fi
+if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then echo '["registry.test/molecule-tenant@{digest}"]'; exit 0; fi
 exit 1
 """,
         encoding="utf-8",
@@ -1123,3 +1145,33 @@ def test_promote_allowed_with_ci_provenance(tmp_path: Path):
     assert result.returncode == 0, result.stdout + result.stderr
     body = json.loads((state_dir / "body.json").read_text(encoding="utf-8"))
     assert pin_provenance.parse(body["notes"])["run"] == "900002", body["notes"]
+
+
+@pytest.mark.parametrize("ci_retry", [True, False])
+def test_same_image_retry_refreshes_ci_evidence_only_in_ci(tmp_path: Path, ci_retry):
+    """A failed run may have written the pin before its boot-secret write failed."""
+    import staging_release
+
+    digest, sha = "sha256:" + "a" * 64, "b" * 40
+    state = tmp_path / "state"
+    state.mkdir()
+    env = _fake_promote_env(tmp_path, state, digest, sha)
+    (state / "promoted").write_text("1")
+    old_notes = f"[ci-pin-provenance v1 repo=molecule-ai/molecule-core wf=staging-tenant-cd run=900001 job=advance-pin sha={sha}]"
+    (state / "body.json").write_text(json.dumps({"notes": old_notes}))
+    if ci_retry:
+        env.update(GITHUB_RUN_ID="900002", GITHUB_REPOSITORY="molecule-ai/molecule-core",
+                   GITHUB_WORKFLOW="staging-tenant-cd", GITHUB_JOB="advance-pin")
+    result = subprocess.run([BASH, str(SCRIPT), "--image", f"registry.test/molecule-tenant@{digest}",
+                             "--git-sha", sha], cwd=ROOT, env=env, text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr + result.stdout
+    pin = json.loads((state / "body.json").read_text())
+    if not ci_retry:
+        assert pin == {"notes": old_notes}, "a non-CI reconcile must not mutate the DB pin"
+        return
+    assert pin_provenance.parse(pin["notes"])["run"] == "900002"
+    run = {"id": 900002, "head_sha": sha, "head_branch": "main", "event": "workflow_dispatch",
+           "path": "staging-tenant-cd.yml@refs/heads/main", "status": "completed", "conclusion": "success"}
+    jobs = [{"name": name, "status": "completed", "conclusion": "success", "started_at": "2026-10-11T12:00:00Z"}
+            for name in staging_release.REQUIRED_JOBS]
+    assert staging_release.qualify(pin, run, jobs, "molecule-ai/molecule-core")["staging_run"] == "900002"

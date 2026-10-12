@@ -1,81 +1,32 @@
 #!/usr/bin/env bash
-# resolve-k8s-fleet-census.sh — materialise the cluster credential and a PROVEN
-# substrate census for the k8s arm of a tenant fleet roll.
+# Resolve Kubernetes credentials and capture a control-plane substrate census.
+# Shared by staging rollout/recovery, production release, and inventory audit.
+# Cluster and SQL failures are fatal. Empty inventory requires --allow-empty;
+# release callers use it when a pin update can precede the first tenant.
 #
-# WHY THIS IS A SCRIPT AND NOT INLINE YAML
-# ----------------------------------------
-# The production lane (.gitea/workflows/redeploy-tenants-on-main.yml, job
-# `redeploy-k8s`) does this inline because it has exactly ONE call site. The
-# staging lane has TWO — the forward roll in `redeploy-fleet` and the fleet
-# revert inside `rollback-pin` — and the second one CANNOT be a set of preceding
-# job steps: if credential resolution ran as a step ahead of the revert, an
-# absent/broken credential would fail the job BEFORE the pin was reverted, and
-# leave staging pinned to a candidate that had already failed. The revert must
-# put the pin back FIRST and only then resolve a cluster credential for the
-# fleet re-roll.
+# Usage: resolve-k8s-fleet-census.sh --env-out <file> [--work-dir <dir>] [--allow-empty]
+# Writes KUBECONFIG, SUBSTRATE_CENSUS_CMD and FLEET_CENSUS_TSV to the env file.
+# Callers source it only after successful completion. The kubeconfig is 0600.
 #
-# So the logic lives here, called from both places, rather than being hand-copied
-# into a second YAML block that can drift. That is the same reason
-# redeploy-staging-fleet.sh exists as one shared swap script instead of two.
-#
-# WHAT IT PROVES BEFORE IT RETURNS
-#   * the toolchain was resolved by the caller into absolute, executable paths
-#     (KUBECTL, DEPLOY_PYTHON3) — never an ambient PATH lookup, which on the
-#     local-deploy runner has already produced `python3: command not found`
-#     mid-step (prod run 644986);
-#   * K8S_FLEET_KUBECONFIG exists in the Infisical SSOT, is valid base64, decodes
-#     to something kubectl can read a current-context out of;
-#   * kubectl can actually REACH the cluster with that credential;
-#   * the census command runs, returns rows, and at least one of them is on the
-#     k8s substrate.
-#
-# The last point is the important one. The roller
-# (redeploy-tenant-fleet-k8s.sh) has its own zero-row refusal, but a census
-# broken HERE surfaces there as "the fleet is empty", which reads as a fact about
-# staging rather than a fact about this wiring. This script fails first, and says
-# which of the four coordinates (namespace / pod / user / database) it was using.
-#
-# It DOES NOT resolve the target digest. On this lane the digest is an OUTPUT of
-# advance-pin (`new_digest` / `old_digest`) — the exact digest this run promoted
-# through the CP admin API — so re-reading runtime_image_pins over psql would add
-# a round trip AND a race with any concurrent promote, for a value we already
-# hold. The production lane queries the table only because its k8s arm has no
-# advance-pin upstream to inherit from.
-#
-# Usage:
-#   resolve-k8s-fleet-census.sh --env-out <file> [--work-dir <dir>]
-#
-# On success writes KEY=value lines to <file> (and nothing to stdout):
-#   KUBECONFIG            path to the materialised kubeconfig (mode 0600)
-#   SUBSTRATE_CENSUS_CMD  path to an executable census command
-#   FLEET_CENSUS_TSV      path to the census output already captured
-# The caller sources it (`set -a; . <file>; set +a`) or appends it to
-# $GITHUB_ENV *after* validating the capture.
-#
-# Env (no-hardcoding; every one is overridable so a cutover needs no code change):
-#   KUBECTL             absolute path to kubectl        (REQUIRED, from the toolchain preflight)
-#   DEPLOY_PYTHON3      absolute path to python3        (REQUIRED, from the toolchain preflight)
-#   CP_CENSUS_NAMESPACE namespace holding the CP database pod
-#   CP_CENSUS_DB_POD    the CP database pod
-#   CP_CENSUS_DB_USER   psql role
-#   CP_CENSUS_DB_NAME   database name
-#   INFISICAL_SECRET_PATH   Infisical folder holding K8S_FLEET_KUBECONFIG (default /shared/controlplane)
-#   INFISICAL_SECRET_ENV    Infisical environment slug (default: staging)
+# Required environment:
+#   KUBECTL / DEPLOY_PYTHON3: resolved executable toolchain paths
+#   CP_CENSUS_NAMESPACE / CP_CENSUS_DB_POD / CP_CENSUS_DB_USER / CP_CENSUS_DB_NAME
 #   INFISICAL_CI_CLIENT_ID / INFISICAL_CI_CLIENT_SECRET / INFISICAL_PROJECT_ID
-#
-# SAFETY: read-only against the cluster and the control-plane database. It issues
-# `kubectl config current-context`, `kubectl version`, and one `kubectl exec …
-# psql -c SELECT`. It mutates nothing.
+# Optional: INFISICAL_SECRET_PATH (default /shared/controlplane),
+#           INFISICAL_SECRET_ENV (default staging), RUNNER_TEMP.
+# Read-only: fetches K8S_FLEET_KUBECONFIG, validates connectivity, and runs SELECT.
+# The release target digest comes from the qualified artifact, never this census.
 set -euo pipefail
 
 err() { printf '::error::%s\n' "$*" >&2; }
 log() { printf '>> [census] %s\n' "$*" >&2; }
 
-ENV_OUT="" ; WORK_DIR=""
+ENV_OUT="" ; WORK_DIR="" ; ALLOW_EMPTY=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --env-out)  ENV_OUT="$2"; shift 2;;
     --work-dir) WORK_DIR="$2"; shift 2;;
+    --allow-empty) ALLOW_EMPTY=1; shift;;
     -h|--help)  sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     *) err "unknown arg: $1"; exit 2;;
   esac
@@ -222,11 +173,11 @@ fi
 rows="$(grep -c . "$TSV" || true)"
 k8s_rows="$(awk -F'\t' '$3=="k8s"' "$TSV" | grep -c . || true)"
 log "census: rows=${rows} k8s=${k8s_rows}"
-if [ "${rows:-0}" -eq 0 ]; then
+if [ "${rows:-0}" -eq 0 ] && [ "$ALLOW_EMPTY" != "1" ]; then
   err "the substrate census returned ZERO rows. A control plane that knows about no tenants on any substrate is a broken query or the wrong database, not an empty fleet."
   exit 1
 fi
-if [ "${k8s_rows:-0}" -eq 0 ]; then
+if [ "${k8s_rows:-0}" -eq 0 ] && [ "$ALLOW_EMPTY" != "1" ]; then
   err "the census found ${rows} org(s) and NONE on the k8s substrate, so the k8s arm would roll nothing — the exact vacuous pass this wiring exists to remove."
   exit 1
 fi
