@@ -967,7 +967,7 @@ func conciergeDefaultRuntime() string {
 // the proxy, never to a tenant BYOK key. A genuine CP transport/auth FAILURE
 // still fails closed (defaultResolveConciergeModel) — the fallback covers "SSOT
 // unset", not "SSOT unreachable".
-const platformDefaultModelFallback = "minimax/MiniMax-M2.7"
+const platformDefaultModelFallback = "minimax/MiniMax-M3"
 
 // conciergeModelResolver resolves the concierge's seed model at provision time.
 // It is a variable so tests can stub it. The default implementation fetches the

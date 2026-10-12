@@ -54,13 +54,13 @@ run_test "claude-code → OAuth/default alias"                      claude-code 
 # bare resolves to provider=minimax BYOK. Pinned by the matrix test's
 # colon-vs-slash-vs-bare triple in derive_provider_matrix_test.go.
 got=$(unset E2E_MODEL_SLUG E2E_ANTHROPIC_API_KEY; E2E_MINIMAX_API_KEY="mx-test" pick_model_slug claude-code)
-assert_eq "claude-code + MiniMax key → bare registered MiniMax model" "$got" "MiniMax-M2.7"
+assert_eq "claude-code + MiniMax key → bare registered MiniMax model" "$got" "MiniMax-M3"
 
 got=$(unset E2E_MODEL_SLUG E2E_MINIMAX_API_KEY; E2E_ANTHROPIC_API_KEY="sk-ant-test" pick_model_slug claude-code)
 assert_eq "claude-code + Anthropic API key → Anthropic API model" "$got" "claude-sonnet-4-6"
 
 got=$(unset E2E_MODEL_SLUG; E2E_MINIMAX_API_KEY="mx-priority" E2E_ANTHROPIC_API_KEY="sk-ant-loser" pick_model_slug claude-code)
-assert_eq "claude-code + both keys → MiniMax priority (bare)"     "$got" "MiniMax-M2.7"
+assert_eq "claude-code + both keys → MiniMax priority (bare)"     "$got" "MiniMax-M3"
 
 # ── seo-agent (hermes template variant, platform-proxy models only) ──
 # Since seo-agent template #29 the variant runs on hermes and registers only
@@ -85,7 +85,7 @@ run_test "empty runtime → slash-form fallback"                     ""         
 
 # ── Platform-managed path (E2E_LLM_PATH=platform) ──
 # Selects the slash-namespaced platform model, defaulting to the shared platform
-# SSOT default (minimax/MiniMax-M2.7 — MOLECULE_LLM_DEFAULT_MODEL), takes
+# SSOT default (minimax/MiniMax-M3 — MOLECULE_LLM_DEFAULT_MODEL), takes
 # precedence over the per-key BYOK branches, and is itself overridden by
 # E2E_MODEL_SLUG. These pins guard the harness's ability to drive the platform
 # arm with the SAME default a fresh tenant resolves.
@@ -94,16 +94,16 @@ echo "Test: pick_model_slug — platform-managed path (E2E_LLM_PATH=platform)"
 echo
 
 got=$(unset E2E_MODEL_SLUG E2E_DEFAULT_PLATFORM_MODEL; E2E_LLM_PATH=platform pick_model_slug claude-code)
-assert_eq "claude-code + platform path → shared SSOT default model" "$got" "minimax/MiniMax-M2.7"
+assert_eq "claude-code + platform path → shared SSOT default model" "$got" "minimax/MiniMax-M3"
 
 got=$(unset E2E_MODEL_SLUG E2E_DEFAULT_PLATFORM_MODEL; E2E_LLM_PATH=platform E2E_MINIMAX_API_KEY="mx-stray" pick_model_slug claude-code)
-assert_eq "platform path beats a stray BYOK key (no mask)"         "$got" "minimax/MiniMax-M2.7"
+assert_eq "platform path beats a stray BYOK key (no mask)"         "$got" "minimax/MiniMax-M3"
 
-got=$(unset E2E_MODEL_SLUG; E2E_LLM_PATH=platform E2E_DEFAULT_PLATFORM_MODEL="minimax/MiniMax-M3" pick_model_slug claude-code)
-assert_eq "platform path honours E2E_DEFAULT_PLATFORM_MODEL"        "$got" "minimax/MiniMax-M3"
+got=$(unset E2E_MODEL_SLUG; E2E_LLM_PATH=platform E2E_DEFAULT_PLATFORM_MODEL="minimax/MiniMax-M2.7-highspeed" pick_model_slug claude-code)
+assert_eq "platform path honours E2E_DEFAULT_PLATFORM_MODEL"        "$got" "minimax/MiniMax-M2.7-highspeed"
 
-got=$(unset E2E_DEFAULT_PLATFORM_MODEL; E2E_MODEL_SLUG="minimax/MiniMax-M3" E2E_LLM_PATH=platform pick_model_slug claude-code)
-assert_eq "E2E_MODEL_SLUG still wins over platform path"            "$got" "minimax/MiniMax-M3"
+got=$(unset E2E_DEFAULT_PLATFORM_MODEL; E2E_MODEL_SLUG="minimax/MiniMax-M2.7-highspeed" E2E_LLM_PATH=platform pick_model_slug claude-code)
+assert_eq "E2E_MODEL_SLUG still wins over platform path"            "$got" "minimax/MiniMax-M2.7-highspeed"
 
 # ── Override via E2E_MODEL_SLUG ──
 # When the operator sets E2E_MODEL_SLUG, the per-runtime dispatch is

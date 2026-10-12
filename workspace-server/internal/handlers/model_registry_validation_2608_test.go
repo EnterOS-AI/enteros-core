@@ -45,7 +45,7 @@ func TestCreate_BYOKModelNoCredential_422(t *testing.T) {
 	if resp["code"] != "MISSING_BYOK_CREDENTIAL" {
 		t.Errorf("code = %v", resp["code"])
 	}
-	if !strings.Contains(resp["error"].(string), "minimax/MiniMax-M2.7") {
+	if !strings.Contains(resp["error"].(string), platformDefaultModelFallback) {
 		t.Errorf("error must steer to the platform default: %v", resp["error"])
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -72,7 +72,7 @@ func TestCreate_BYOKModelGlobalCredential_Passes(t *testing.T) {
 // without touching the DB at all.
 func TestCreate_PlatformSlashModel_NoQueries(t *testing.T) {
 	mock := setupTestDB(t)
-	ok, why := validateBYOKCredentialSatisfiable(context.Background(), "claude-code", "minimax/MiniMax-M2.7", nil)
+	ok, why := validateBYOKCredentialSatisfiable(context.Background(), "claude-code", platformDefaultModelFallback, nil)
 	if !ok {
 		t.Fatalf("platform model must pass keyless: %s", why)
 	}

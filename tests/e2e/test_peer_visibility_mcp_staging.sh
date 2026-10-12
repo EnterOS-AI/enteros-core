@@ -77,6 +77,8 @@ set -uo pipefail
 # local.sh). Only provisioning/teardown differs per backend.
 # shellcheck source=tests/e2e/lib/peer_visibility_assert.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/peer_visibility_assert.sh"
+# shellcheck source=tests/e2e/lib/model_slug.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/model_slug.sh"
 # Shared ephemeral-topology contract (derive_tenant_topology). Default (all
 # MOLECULE_TENANT_* unset) reproduces exact staging routing byte-for-byte; the
 # ephemeral runner points MOLECULE_TENANT_URL at the CP base +
@@ -314,21 +316,10 @@ SECRETS_JSON='{}'
 # needed; this gate only needs the workspace to boot + list peers, not heavy
 # LLM work), validated against the controlplane providers SSOT
 # (internal/providers/providers.yaml runtimes.<rt>.providers[platform].models):
-#   claude-code → anthropic/claude-sonnet-4-6   (platform claude model)
-#   hermes/openclaw → moonshot/kimi-k2.6         (their only platform family)
+# All three runtimes use the shared platform default from lib/model_slug.sh.
 # E2E_MODEL_SLUG overrides for operator-dispatched runs.
 pv_platform_model_for_runtime() {
-  if [ -n "${E2E_MODEL_SLUG:-}" ]; then printf '%s' "$E2E_MODEL_SLUG"; return 0; fi
-  case "$1" in
-    # 2026-08-04: sdk#203 narrowed every platform arm to minimax-only (the
-    # Moonshot vendor account is suspended and the anthropic/* platform ids were
-    # withdrawn under the same directive). Both former defaults now 422
-    # UNREGISTERED_MODEL_FOR_RUNTIME at create, so every runtime uses the ONE
-    # shared platform default here.
-    claude-code) printf 'minimax/MiniMax-M2.7' ;;
-    hermes|openclaw) printf 'minimax/MiniMax-M2.7' ;;
-    *) printf 'minimax/MiniMax-M2.7' ;;
-  esac
+  E2E_LLM_PATH=platform pick_model_slug "$1"
 }
 
 log "4/6 provisioning parent + one sibling per runtime under test (mode=${PV_PROVISION_MODE})..."

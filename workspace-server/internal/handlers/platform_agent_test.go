@@ -487,9 +487,9 @@ func setConciergeModelResolver(t *testing.T, model string, err error) {
 // TestConciergeRuntimeGeneralization_Defaults is the PROVE-FAIL gate for the P3b
 // model + template + runtime defaults (items 1, 2, 3).
 func TestConciergeRuntimeGeneralization_Defaults(t *testing.T) {
-	t.Run("the ONE shared platform-default fallback model is minimax/MiniMax-M2.7 (CTO P3b)", func(t *testing.T) {
-		if platformDefaultModelFallback != "minimax/MiniMax-M2.7" {
-			t.Fatalf("platformDefaultModelFallback = %q, want %q — the single shared platform-default model (used only when the MOLECULE_LLM_DEFAULT_MODEL SSOT is unset) is MiniMax", platformDefaultModelFallback, "minimax/MiniMax-M2.7")
+	t.Run("the ONE shared platform-default fallback model is minimax/MiniMax-M3 (CTO P3b)", func(t *testing.T) {
+		if platformDefaultModelFallback != "minimax/MiniMax-M3" {
+			t.Fatalf("platformDefaultModelFallback = %q, want %q — the single shared platform-default model (used only when the MOLECULE_LLM_DEFAULT_MODEL SSOT is unset) is MiniMax", platformDefaultModelFallback, "minimax/MiniMax-M3")
 		}
 	})
 
@@ -541,7 +541,7 @@ func TestConciergeRuntimeGeneralization_Defaults(t *testing.T) {
 		}
 	})
 
-	// CROSS-RUNTIME PARITY (gap CLOSED): the shared default minimax/MiniMax-M2.7
+	// CROSS-RUNTIME PARITY (gap CLOSED): the shared default minimax/MiniMax-M3
 	// MUST derive to the platform-managed `platform` arm on EVERY concierge-capable
 	// runtime, so a fresh concierge on any of them runs the shared default
 	// proxy-billed (no tenant MINIMAX_API_KEY). This was historically a registry
@@ -1338,7 +1338,7 @@ func TestEnsureConciergeModel_ReconcilesPlatformManagedToSSOT(t *testing.T) {
 	h := &WorkspaceHandler{}
 	const modelSelQuery = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`
 	const secretInsert = `INSERT INTO workspace_secrets`
-	const ssot = "minimax/MiniMax-M2.7"
+	const ssot = "minimax/MiniMax-M3"
 
 	t.Run("platform-managed default reconciles to the SSOT (the M-bump propagates)", func(t *testing.T) {
 		setConciergeModelResolver(t, ssot, nil)
@@ -1461,7 +1461,7 @@ func TestApplyConciergeProvisionConfig_MoleculeModelResolvesMinimaxNotMoonshot(t
 	const declaredInsert = `INSERT INTO workspace_declared_plugins`
 	const secretInsert = `INSERT INTO workspace_secrets`
 
-	const ssot = "minimax/MiniMax-M2.7"
+	const ssot = "minimax/MiniMax-M3"
 	// The STALE pin under test. Originally the dead moonshot/kimi-k2.6 template
 	// pin; sdk#203 WITHDREW that id, and an unroutable stored id no longer takes
 	// the platform-managed reconcile path (see reconcileExistingConciergeModel's

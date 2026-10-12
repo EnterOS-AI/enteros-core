@@ -11,7 +11,7 @@
 #                                    default + 401, see PR #1714.)
 #
 #   claude-code → auth-aware:
-#                  E2E_MINIMAX_API_KEY    → "MiniMax-M2.7"
+#                  E2E_MINIMAX_API_KEY    → "MiniMax-M3"
 #                                           (BARE registered BYOK id — see the
 #                                            claude-code dispatch arm below for
 #                                            why bare, not the colon form)
@@ -37,7 +37,7 @@
 #
 #   E2E_LLM_PATH=platform selects a platform-managed model id (slash-namespaced,
 #   no tenant key — Molecule owns billing via the CP LLM proxy). The default
-#   MIRRORS the SSOT default (minimax/MiniMax-M2.7) — see the constant below.
+#   MIRRORS the SSOT default (minimax/MiniMax-M3) — see the constant below.
 #   It was "moonshot/kimi-k2.6" (the headline incident combo) until sdk#203
 #   withdrew every moonshot/* id from the platform arms on 2026-08-04 (suspended
 #   vendor account); that id now 422s at create. Override the specific
@@ -59,7 +59,7 @@
 
 # Default platform-managed model for the platform-boot regression path. This
 # MIRRORS the platform SSOT default (MOLECULE_LLM_DEFAULT_MODEL =
-# minimax/MiniMax-M2.7 in Infisical /shared/controlplane/llm), so the e2e
+# minimax/MiniMax-M3 in Infisical /shared/controlplane/llm), so the e2e
 # exercises the SAME default a fresh tenant resolves — not a stale literal. The
 # authoritative value is the env override E2E_DEFAULT_PLATFORM_MODEL (which the
 # CI injects from the staging KMS SSOT); this is only the baked fallback. Must
@@ -69,7 +69,7 @@
 # member of that arm derives provider=platform). Resolved INSIDE pick_model_slug
 # via ${E2E_DEFAULT_PLATFORM_MODEL:-...} so callers can override it (or unset it)
 # without tripping `set -u`.
-E2E_DEFAULT_PLATFORM_MODEL_FALLBACK="minimax/MiniMax-M2.7"
+E2E_DEFAULT_PLATFORM_MODEL_FALLBACK="minimax/MiniMax-M3"
 
 # Usage: pick_model_slug <runtime>
 #   stdout: the slug string
@@ -100,29 +100,10 @@ pick_model_slug() {
     seo-agent)   printf 'minimax/MiniMax-M2.7' ;;
     claude-code)
       if [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then
-        # BARE registered BYOK id `MiniMax-M2.7`, NOT the colon form
-        # `minimax:MiniMax-M2.7`. On the claude-code runtime the three MiniMax
-        # spellings have three DISTINCT, intentional outcomes (provider-registry
-        # SSOT, internal#718; pinned by workspace-server/internal/providers/
-        # derive_provider_matrix_test.go, the #2263/#2274 "colon-vs-slash-vs-bare
-        # triple"):
-        #   * bare  "MiniMax-M2.7"        -> provider=minimax  (BYOK, MINIMAX_API_KEY)
-        #   * slash "minimax/MiniMax-M2.7" -> provider=platform (CP proxy bills)
-        #   * colon "minimax:MiniMax-M2.7" -> UNREGISTERED 422  (the claude-code
-        #         adapter CANNOT strip the `minimax:` prefix, so the id is not a
-        #         registered model for runtime claude-code; create-validation,
-        #         internal#718, rejects it)
-        # The bare form is registered in the claude-code `minimax` arm
-        # (registry_gen.go:88 Models=[MiniMax-M2,MiniMax-M2.7,
-        # MiniMax-M2.7-highspeed,MiniMax-M3]) and derives provider=minimax (BYOK
-        # via MINIMAX_API_KEY), so it satisfies the #1994 byok-not-platform guard
-        # (test_staging_full_saas.sh) AND passes create-validation — unlike the
-        # colon form, which 422'd "5/11 Provisioning parent workspace" with
-        # UNREGISTERED_MODEL_FOR_RUNTIME on real staging (job 295075).
-        # NOTE: the colon form IS the correct BYOK-minimax id on openclaw/hermes
-        # (those adapters DO strip `minimax:` — matrix test), but this dispatch
-        # arm only emits for claude-code, where bare is the right form.
-        printf 'MiniMax-M2.7'
+        # Claude Code's registered BYOK form is the bare MiniMax-M3 id.
+        # The slash form selects platform billing; the colon form is rejected
+        # by this runtime. Keep this path on the supplied MiniMax credential.
+        printf 'MiniMax-M3'
       elif [ -n "${E2E_ANTHROPIC_API_KEY:-}" ]; then
         printf 'claude-sonnet-4-6'
       else

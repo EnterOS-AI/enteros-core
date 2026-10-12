@@ -41,7 +41,7 @@ jobs:
     env:
       MOLECULE_CP_URL: ${{ vars.CP_URL || 'https://staging-api.moleculesai.app' }}
       # 2026-08-04: sdk#203 withdrew moonshot/* from the platform arms.
-      E2E_EXPECTED_MODEL: minimax/MiniMax-M2.7
+      E2E_EXPECTED_MODEL: minimax/MiniMax-M3
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
