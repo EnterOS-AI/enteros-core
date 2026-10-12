@@ -240,7 +240,7 @@ test.describe("canvas hittability diagnostic", () => {
     expect(diag).toContain(".react-flow__background rule = PRESENT");
   });
 
-  test("the delivery shapes are told apart by Resource Timing and net::ERR_*", async ({ page }) => {
+  test("the delivery shapes are told apart by Resource Timing and net::ERR_*", async ({ page, connectOptions }) => {
     const diag = await diagnose(page, { ruleIn: "layout", killLayout: true });
 
     // Served cleanly: settled, readable, with a status and a first byte.
@@ -249,9 +249,8 @@ test.describe("canvas hittability diagnostic", () => {
     // separates this from a cut transfer, and it is the shape CI observed.
     expect(diag).toMatch(/\/layout\.css\n\s+sheet=present cssRules=THREW[\s\S]*?\n\s+timing: status=0 start=\+\d+ms firstByte=NEVER/);
     // Cut transfer: the server DID answer and bytes DID arrive; the sheet is
-    // readable and empty, not unreadable. Same net::ERR_CONNECTION_RESET as the
-    // dead sheet above — which is exactly why the CSSOM state, not the net
-    // error alone, decides what happened.
+    // readable and empty, not unreadable. The CSSOM state distinguishes these
+    // shapes even when the transport reports the same error for both.
     expect(diag).toMatch(/\/truncated\.css\n\s+sheet=present cssRules=readable rules=0 \(SERVED BUT EMPTY\/TRUNCATED\)\n\s+timing: status=200 start=\+\d+ms firstByte=\+\d+ms/);
     // Still in flight: no Resource Timing entry is buffered until a load
     // settles, so the absence of an entry is the proof, not a gap in the
@@ -261,12 +260,15 @@ test.describe("canvas hittability diagnostic", () => {
     // from the cut transfer above in both the CSSOM and the timing — same
     // status, same first byte, same readable-0-rule sheet.
     expect(diag).toMatch(/\/short-fin\.css\n\s+sheet=present cssRules=readable rules=0 \(SERVED BUT EMPTY\/TRUNCATED\)\n\s+timing: status=200 start=\+\d+ms firstByte=\+\d+ms/);
-    // And the exact Chromium error, which no in-page API exposes at all — the
-    // ONLY thing that separates the two rows above, and the reason this channel
-    // is load-bearing rather than a second opinion.
+    // Loopback forwarding terminates TCP at the Playwright client. A server
+    // reset becomes EOF across that connection: before headers Chromium sees
+    // EMPTY_RESPONSE; after headers it sees CONTENT_LENGTH_MISMATCH. Direct
+    // local runs still observe the original RST. Assert the exact expected
+    // error for each transport, preserving every CSSOM/timing assertion above.
     expect(diag).toContain("network failures (");
-    expect(diag).toMatch(/\/layout\.css -> net::ERR_CONNECTION_RESET/);
-    expect(diag).toMatch(/\/truncated\.css -> net::ERR_CONNECTION_RESET/);
+    const forwarded = connectOptions?.exposeNetwork === "<loopback>";
+    expect(diag).toContain(`/layout.css -> net::${forwarded ? "ERR_EMPTY_RESPONSE" : "ERR_CONNECTION_RESET"}`);
+    expect(diag).toContain(`/truncated.css -> net::${forwarded ? "ERR_CONTENT_LENGTH_MISMATCH" : "ERR_CONNECTION_RESET"}`);
     expect(diag).toMatch(/\/short-fin\.css -> net::ERR_CONTENT_LENGTH_MISMATCH/);
   });
 
