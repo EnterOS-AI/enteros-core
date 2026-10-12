@@ -19,8 +19,9 @@ type ChannelAdapter interface {
 
 	// ConfigSchema describes the config fields each adapter needs. The UI
 	// renders the connect-channel form from this list, so each platform's
-	// field set (Telegram bot_token+chat_id, Lark webhook_url+verify_token,
-	// Slack bot_token+channel_id, Discord webhook_url) can be captured
+	// field set (Telegram bot_token+chat_id+webhook_secret, Lark
+	// webhook_url+chat_id+verify_token, Slack bot_token+channel_id+
+	// signing_secret, Discord webhook_url+chat_id+public_key) can be captured
 	// correctly without per-platform UI branching. Adapters must return the
 	// same schema on every call — the order is the rendering order.
 	ConfigSchema() []ConfigField
@@ -57,8 +58,7 @@ type ConfigField struct {
 	// Sensitive means the value must not be logged or shown unmasked in
 	// read APIs after creation. Canvas uses this to redact the value in
 	// list responses; server-side encryption is governed by sensitiveFields
-	// in secret.go (today: bot_token + webhook_secret only — this flag is
-	// forward-looking until that list is widened).
+	// in secret.go.
 	Sensitive bool `json:"sensitive"`
 	// Placeholder is rendered as the input's placeholder attribute.
 	Placeholder string `json:"placeholder,omitempty"`

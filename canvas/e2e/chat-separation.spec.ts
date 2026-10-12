@@ -1,4 +1,8 @@
-import { test, expect } from "@playwright/test";
+// `test` comes from helpers/net-evidence, not @playwright/test: it is the same
+// runner with a requestfailed recorder bound to every page, so that when this
+// spec trips the canvas hittability diagnostic the message can name the exact
+// net::ERR_* behind a dead stylesheet (core#5106). Nothing else differs.
+import { test, expect } from "./helpers/net-evidence";
 import type { Page } from "@playwright/test";
 import { startEchoRuntime } from "./fixtures/echo-runtime";
 import {
@@ -8,31 +12,50 @@ import {
   seedChatHistory,
   queryPsql,
 } from "./fixtures/chat-seed";
+import { enterMapView, clickWorkspaceNode } from "./helpers/canvas";
 
 const PLATFORM_URL = process.env.E2E_PLATFORM_URL ?? "http://localhost:8080";
 const API = process.env.E2E_API_URL ?? PLATFORM_URL;
-
-/** Enter the Org-map view so the Canvas (React Flow graph) mounts. */
-async function enterMapView(page: Page): Promise<void> {
-  const btn = page.getByTestId("nav-map");
-  await expect(btn, "rail button nav-map missing").toBeVisible({ timeout: 10_000 });
-  await btn.click();
-}
 
 /** Open the seeded workspace's Chat side panel (scoped to the visible panel). */
 async function openChatPanel(page: Page, workspaceName: string): Promise<void> {
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.goto("/");
   await enterMapView(page);
-  await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
 
-  // Scope to the map-side panel (#2587) so we don't accidentally hit the
-  // hidden ConciergeShell copy of ChatTab.
-  await page.getByTestId(`workspace-node-${workspaceName}`).click();
-  await page.locator("#tab-chat").click();
+  // clickWorkspaceNode waits for the canvas fitView to settle before clicking,
+  // so the node isn't under the fixed top chrome (the E2E Chat node-click
+  // flake), and is scoped by data-testid (#2587) so it can't hit the hidden
+  // ConciergeShell copy of ChatTab.
+  await clickWorkspaceNode(page, workspaceName);
+  // Selecting the node mounts SidePanel — a `fixed right-0 z-50 animate-in
+  // slide-in-from-right duration-200` overlay (SidePanel.tsx:122) rendered
+  // INSIDE <main id="canvas-main"> (Canvas.tsx:305). No `#tab-chat` click is
+  // needed: the panel already opens on the Chat tab (the canvas store's
+  // panelTab defaults to "chat" and the goto("/") above resets the in-memory
+  // store), and clicking ANY element inside the panel while it is still
+  // sliding in makes Playwright's actionability hit-test resolve the click
+  // point to the full-viewport canvas-main ancestor ("<main id=canvas-main>
+  // intercepts pointer events") until the test times out. This was the E2E
+  // Chat flake (2026-07-24): load-dependent, because whether the 200ms slide
+  // has settled by hit-test time depends on CI scheduling.
   await page.waitForSelector("#panel-chat [data-testid='chat-panel']:visible", {
     timeout: 5_000,
   });
+  // Settle gate (the actual fix): wait for the slide-in to FINISH so every
+  // later click — here and in the test bodies that run after this beforeEach —
+  // lands on a stationary panel, not a mid-animation one. Web Animations API,
+  // filtered to FINITE animations so the infinite status-dot pulse
+  // (motion-safe:animate-pulse) can't leave `.finished` unresolved. No fixed
+  // sleep, no force-click — it waits exactly as long as the animation runs.
+  await page.evaluate(() =>
+    Promise.all(
+      document
+        .getAnimations()
+        .filter((a) => a.effect?.getComputedTiming().iterations !== Infinity)
+        .map((a) => a.finished.catch(() => {})),
+    ),
+  );
   await expect(page.locator("#panel-chat [data-testid='chat-panel']:visible textarea").first()).toBeEnabled({
     timeout: 15_000,
   });
@@ -43,8 +66,9 @@ const panelLocator = (page: Page) =>
 /** Post a message to the workspace via the A2A proxy so activity rows exist.
  *  `source` determines the auth shape, which in turn determines
  *  activity_logs.source_id:
- *    - "canvas": no workspace-resolving auth, no X-Workspace-ID → callerID
- *      empty → source_id NULL (the /activity?source=canvas filter).
+ *    - "canvas": admin bearer, no X-Workspace-ID → authenticated human
+ *      caller with an empty callerID → source_id NULL (the
+ *      /activity?source=canvas filter).
  *    - "agent": workspace bearer token → callerID = workspace →
  *      source_id = workspace_id (the /activity?source=agent filter).
  */
@@ -55,12 +79,19 @@ async function postA2AMessage(
   workspaceAuthToken: string,
 ) {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (source === "agent") {
+  if (source === "canvas") {
+    const adminToken = process.env.E2E_ADMIN_TOKEN ?? process.env.ADMIN_TOKEN;
+    if (!adminToken) {
+      throw new Error("canvas-source A2A seed requires E2E_ADMIN_TOKEN or ADMIN_TOKEN");
+    }
+    headers.Authorization = `Bearer ${adminToken}`;
+  } else {
     headers.Authorization = `Bearer ${workspaceAuthToken}`;
   }
-  // canvas-source intentionally sends no bearer and no X-Workspace-ID so the
-  // proxy cannot derive a workspace callerID. This is the only way to produce
-  // the source_id NULL rows that the source=canvas endpoint keys on.
+  // canvas-source intentionally omits X-Workspace-ID. The authenticated admin
+  // credential classifies it as a human Canvas caller without inventing a
+  // workspace identity, which produces the source_id NULL rows that the
+  // source=canvas endpoint keys on.
 
   const res = await fetch(`${PLATFORM_URL}/workspaces/${workspaceId}/a2a`, {
     method: "POST",
@@ -101,12 +132,14 @@ test.describe("Chat Sub-Tabs", () => {
   let cleanup: () => Promise<void> = async () => {};
   let workspaceId = "";
   let workspaceName = "";
+  let workspaceAuthToken = "";
 
   test.beforeAll(async () => {
     const echo = await startEchoRuntime();
     const ws = await seedWorkspace(echo.baseURL);
     workspaceId = ws.id;
     workspaceName = ws.name;
+    workspaceAuthToken = ws.authToken;
     const stopHeartbeat = startHeartbeat(ws.id, ws.authToken);
 
     cleanup = async () => {
@@ -157,6 +190,83 @@ test.describe("Chat Sub-Tabs", () => {
     await expect(panel.locator("textarea").first()).not.toBeVisible();
   });
 
+  // THE separation assertion (incident 2026-07-12, enter-os / CEO Assistant).
+  //
+  // Every other test in this describe checks the SHELL — that the two sub-tabs
+  // exist, switch, and keep an input box. None of them checked the CONTENT: that
+  // an agent's message actually lands in Agent Comms and NOT in the human's My
+  // Chat. So when the workspace-server broadcast a USER_MESSAGE frame for EVERY
+  // inbound A2A message — peer agents included — a peer's reply rendered as a
+  // blue user bubble in the operator's own conversation and the suite stayed
+  // green. A gate that checks the tabs but never the routing is not a gate.
+  //
+  // Two properties are load-bearing here and neither can be dropped:
+  //   1. The panel is ALREADY OPEN when the message is posted. The leak was a
+  //      LIVE WebSocket frame (ChatTab's onUserMessageBroadcast); it never
+  //      survived a reload, because GET /chat-history correctly excludes rows
+  //      with a non-NULL source_id. Post-then-open would silently pass against
+  //      the buggy build.
+  //   2. The message is posted through the REAL A2A proxy with a workspace
+  //      bearer (postA2AMessage "agent"), so the server derives a caller
+  //      workspace and writes source_id — the exact non-canvas caller class the
+  //      broadcast gate keys on. A stubbed WS frame would prove nothing.
+  test("an agent-sourced message lands in Agent Comms, NOT in My Chat", async ({ page }) => {
+    const panel = panelLocator(page);
+    const text = `peer-agent traffic ${Date.now()}`;
+
+    // BOTH sub-panels are always mounted (ChatTab hides the inactive one with a
+    // `hidden` class so its aria-controls target keeps existing). So a locator
+    // scoped to the chat panel matches text in EITHER sub-tab — useless for a
+    // test whose whole question is "which sub-tab is it in?". Scope to the two
+    // panel ids, and match EXACTLY, so the agent's "Echo: <text>" reply cannot
+    // satisfy an assertion about the message itself.
+    const myChat = panel.locator("#chat-panel-my-chat");
+    const agentComms = panel.locator("#chat-panel-agent-comms");
+    const exact = (scope: typeof myChat, t: string) => scope.getByText(t, { exact: true });
+
+    // My Chat is open and its socket is live — the exact state the operator was
+    // in when the peer's message appeared in their chat.
+    await expect(panel.getByRole("tab", { name: "My Chat" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    await postA2AMessage(workspaceId, "agent", text, workspaceAuthToken);
+
+    // It must show up in Agent Comms...
+    await panel.getByRole("tab", { name: "Agent Comms" }).click();
+    await expect(
+      exact(agentComms, text).first(),
+      "an agent-to-agent message did not reach Agent Comms — the panel that exists to show it",
+    ).toBeVisible({ timeout: 15_000 });
+
+    // ...and must NOT be in the human's chat. Checked AFTER Agent Comms has
+    // rendered it, so the message has demonstrably arrived at the client: a
+    // still-in-flight message would make this assertion pass vacuously.
+    //
+    // toHaveCount(0), not not.toBeVisible(): the My Chat panel is display:none
+    // while Agent Comms is selected, so "not visible" would be trivially true
+    // even for a leaked bubble sitting in its DOM. Absence is the claim.
+    await panel.getByRole("tab", { name: "My Chat" }).click();
+    await expect(
+      exact(myChat, text),
+      "agent-to-agent traffic was injected into the human's My Chat — it renders as if the " +
+        "user typed it, then vanishes on reload because chat-history excludes source_id=<agent>. " +
+        "The live USER_MESSAGE broadcast must apply the same rule as the chat-history reader " +
+        "(workspace-server: isChatHistoryVisible / source_id IS NULL).",
+    ).toHaveCount(0);
+
+    // The other half of the exchange: the agent's REPLY to that message is just
+    // as much agent-to-agent traffic. If only the inbound side were suppressed,
+    // the human would see a reply to a message they never saw — a conversation
+    // with one side missing.
+    await expect(
+      myChat.getByText(`Echo: ${text}`),
+      "the agent's REPLY to a peer's message leaked into the human's My Chat — the inbound " +
+        "message is correctly hidden, so the operator sees a reply to a message that was " +
+        "never shown to them",
+    ).toHaveCount(0);
+  });
+
   test("switching back to My Chat preserves messages", async ({ page }) => {
     const panel = panelLocator(page);
 
@@ -191,8 +301,8 @@ test.describe("Activity API Source Filter", () => {
     const stopHeartbeat = startHeartbeat(ws.id, ws.authToken);
 
     // Seed BOTH source classes deterministically through the real A2A proxy:
-    //  - canvas-source: no workspace-resolving auth → callerID empty →
-    //    source_id NULL (matches /activity?source=canvas).
+    //  - canvas-source: authenticated admin bearer without X-Workspace-ID →
+    //    callerID empty → source_id NULL (matches /activity?source=canvas).
     //  - agent-source: workspace bearer token → callerID = workspace →
     //    source_id = workspace_id (matches /activity?source=agent).
     await postA2AMessage(workspaceId, "canvas", "canvas source probe", authToken);

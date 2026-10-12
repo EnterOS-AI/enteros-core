@@ -17,10 +17,11 @@ package handlers
 // Same code path on local Docker and SaaS — the v1 docker-exec /
 // docker-cp paths were structurally broken in SaaS because
 // workspace-server's local Docker client has no visibility into
-// EC2-hosted workspaces (#2308 root cause). Both surfaces now use the
+// provider-managed workspaces (#2308 root cause). Both surfaces now use the
 // per-workspace platform_inbound_secret minted at provision time
 // (RFC #2312 PR-F) for auth, and the workspace's HTTP server mounts
-// the corresponding receiver at workspace/main.py.
+// the corresponding receiver in
+// molecule-ai-workspace-runtime/molecule_runtime/main.py.
 //
 // Split from templates.go because these endpoints have a different
 // security model (no /configs write, no template fallback) and a
@@ -50,6 +51,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/pendinguploads"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/uploads"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 )
 
 // ChatFilesHandler serves file upload + download for chat. Holds a
@@ -68,7 +70,7 @@ type ChatFilesHandler struct {
 
 	// httpClient is broken out so tests can swap in an httptest.Server
 	// transport. Prod uses a default with a generous Timeout to cover
-	// the 100 MB worst case on a slow EC2 link without leaving a
+	// the 100 MB worst case on a slow provider link without leaving a
 	// connection hanging forever on a sick workspace.
 	httpClient *http.Client
 
@@ -183,7 +185,15 @@ func resolveWorkspaceForwardCreds(c *gin.Context, ctx context.Context, workspace
 	if err := db.DB.QueryRowContext(ctx,
 		`SELECT COALESCE(url, ''), delivery_mode FROM workspaces WHERE id = $1`, workspaceID,
 	).Scan(&wsURL, &deliveryMode); err != nil {
-		log.Printf("chat_files %s: workspace lookup failed for %s: %v", op, workspaceID, err)
+		log.Printf("resolve-forward-creds %s: workspace lookup failed for %s: %v", op, workspaceID, err)
+		// A deadline/cancel (e.g. the schedule-create budget elapsed, or the
+		// client disconnected mid-request) is transient — a 404 would misreport
+		// the workspace as MISSING. Surface a retryable 503 in that case; a
+		// genuine missing/other lookup error stays 404.
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "workspace lookup timed out, retry"})
+			return "", "", false
+		}
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
 		return "", "", false
 	}
@@ -213,8 +223,8 @@ func resolveWorkspaceForwardCreds(c *gin.Context, ctx context.Context, workspace
 		// dispatch path, ever".
 		if !deliveryMode.Valid || deliveryMode.String != "push" {
 			c.JSON(http.StatusUnprocessableEntity, gin.H{
-				"error":  "workspace has no callback URL — chat " + op + " requires push-mode + public URL",
-				"detail": "This workspace registered without a publicly-reachable URL (delivery_mode is not 'push'). The platform cannot dispatch chat uploads to it. Re-register the workspace with a public URL in push mode (e.g. via ngrok / Cloudflare tunnel) to enable chat file " + op + ".",
+				"error":  "workspace has no callback URL — " + op + " requires push-mode + a public URL",
+				"detail": "This workspace registered without a publicly-reachable URL (delivery_mode is not 'push'). The platform cannot HTTP-forward to it. Re-register the workspace with a public URL in push mode (e.g. via ngrok / Cloudflare tunnel) to enable " + op + ".",
 			})
 			return "", "", false
 		}
@@ -393,6 +403,44 @@ func (h *ChatFilesHandler) Upload(c *gin.Context) {
 	h.streamWorkspaceResponse(c, "upload", workspaceID, forwardURL, req, []string{"Content-Type"})
 }
 
+// containerDownloadPathError validates a download `path` query and returns the
+// user-facing 400 message when it is invalid, or "" when it is safe to forward.
+//
+// The path is a LINUX CONTAINER path (/workspace/..., /configs/...), NOT a host
+// path, so it is validated with FORWARD-SLASH semantics on every OS. Using
+// os-specific path/filepath here breaks a Windows-host platform (native
+// `go run`): filepath.IsAbs("/workspace/x") is FALSE on Windows and
+// filepath.Clean rewrites separators to `\`, so EVERY chat-attachment download
+// 400s even though the workspace serves the file fine (2026-07-24 regression).
+// This mirrors the platform-uniform invariant internal/wirepath enforces
+// elsewhere — the chat-download path was missed. Because the checks are pure
+// forward-slash string logic, one Linux-CI unit test proves the Windows behavior.
+func containerDownloadPathError(p string) string {
+	// A container absolute path always begins with "/".
+	if !strings.HasPrefix(p, "/") {
+		return "path must be absolute"
+	}
+	// Must land under one of the allowed roots — mirrors the ReadFile security
+	// model, preventing arbitrary reads of /etc or other system paths.
+	rooted := false
+	for root := range allowedRoots {
+		if p == root || strings.HasPrefix(p, root+"/") {
+			rooted = true
+			break
+		}
+	}
+	if !rooted {
+		return "path must be under /configs, /workspace, /home, or /plugins"
+	}
+	// Reject non-canonical / traversal paths. wirepath.Normalize is forward-slash
+	// path.Clean — NOT filepath.Clean, which would rewrite "/" to "\" on a Windows
+	// host and false-reject a legitimate container path.
+	if wirepath.Normalize(p) != p || strings.Contains(p, "..") {
+		return "invalid path"
+	}
+	return ""
+}
+
 // Download handles GET /workspaces/:id/chat/download?path=<abs path>.
 // Forwards over HTTP to the workspace's own /internal/file/read endpoint
 // (RFC #2312 PR-D), replacing the docker-cp tar-stream extraction that
@@ -420,28 +468,8 @@ func (h *ChatFilesHandler) Download(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "path query required"})
 		return
 	}
-	if !filepath.IsAbs(path) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "path must be absolute"})
-		return
-	}
-	// Path must land under one of the allowed roots — mirrors the
-	// ReadFile security model and prevents arbitrary reads of /etc
-	// or other system paths via this endpoint.
-	rooted := false
-	for root := range allowedRoots {
-		if path == root || strings.HasPrefix(path, root+"/") {
-			rooted = true
-			break
-		}
-	}
-	if !rooted {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "path must be under /configs, /workspace, /home, or /plugins"})
-		return
-	}
-	// Reject anything that canonicalises differently or contains a
-	// traversal segment. Defence-in-depth on top of the prefix check.
-	if filepath.Clean(path) != path || strings.Contains(path, "..") {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid path"})
+	if errMsg := containerDownloadPathError(path); errMsg != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
 		return
 	}
 
@@ -540,14 +568,15 @@ func lookupUploadDeliveryMode(c *gin.Context, ctx context.Context, workspaceID s
 
 // unsafeFilenameChars matches every character that isn't in the safe
 // alphanumeric + dot/dash/underscore set. Mirrors the Python regex
-// _UNSAFE_FILENAME_CHARS in workspace/internal_chat_uploads.py — drift
+// _UNSAFE_FILENAME_CHARS in the standalone runtime's
+// molecule_runtime/internal_chat_uploads.py — drift
 // here would mean canvas-emitted URIs differ between push and poll
 // paths for the same upload.
 var unsafeFilenameChars = regexp.MustCompile(`[^a-zA-Z0-9._\-]`)
 
 // SanitizeFilename reduces a user-supplied filename to a safe form.
-// Behaviorally identical to sanitize_filename in workspace/
-// internal_chat_uploads.py. Exported so tests in other packages can
+// Behaviorally identical to sanitize_filename in the standalone runtime's
+// molecule_runtime/internal_chat_uploads.py. Exported so tests in other packages can
 // pin behavior parity, and so a future shared library can move both
 // implementations behind one source of truth.
 func SanitizeFilename(name string) string {
@@ -608,7 +637,7 @@ type uploadedFile struct {
 // Phase 3 metrics will hook these structured logs.
 func (h *ChatFilesHandler) uploadPollMode(c *gin.Context, ctx context.Context, workspaceID string) {
 	// Parse multipart with the same per-file/per-form limits the
-	// workspace-side handler uses (workspace/internal_chat_uploads.py:
+	// standalone runtime handler uses (molecule_runtime/internal_chat_uploads.py:
 	// max_files=64, max_fields=32). gin's MultipartForm does not
 	// expose those limits directly — the underlying ParseMultipartForm
 	// caps memory at 32 MB by default and spills to disk. For poll-

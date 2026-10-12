@@ -22,14 +22,16 @@ class MockWebSocket {
   static instances: MockWebSocket[] = [];
 
   url: string;
+  protocols: string[];
   onopen: (() => void) | null = null;
   onmessage: ((event: { data: string }) => void) | null = null;
   onclose: (() => void) | null = null;
   onerror: (() => void) | null = null;
   closeCallCount = 0;
 
-  constructor(url: string) {
+  constructor(url: string, protocols?: string | string[]) {
     this.url = url;
+    this.protocols = typeof protocols === "string" ? [protocols] : (protocols ?? []);
     MockWebSocket.instances.push(this);
   }
 
@@ -106,6 +108,23 @@ describe("connectSocket", () => {
     connectSocket();
     const ws = getLastWS();
     expect(ws.url).toMatch(/^ws/);
+  });
+
+  it("carries the canvas admin bearer in a WebSocket subprotocol, never the URL", () => {
+    const previous = process.env.NEXT_PUBLIC_ADMIN_TOKEN;
+    process.env.NEXT_PUBLIC_ADMIN_TOKEN = "local-dev-admin";
+    try {
+      connectSocket();
+      const ws = getLastWS();
+      expect(ws.protocols).toEqual([
+        "molecule-auth.6c6f63616c2d6465762d61646d696e",
+        "molecule-ws",
+      ]);
+      expect(ws.url).not.toContain("local-dev-admin");
+    } finally {
+      if (previous === undefined) delete process.env.NEXT_PUBLIC_ADMIN_TOKEN;
+      else process.env.NEXT_PUBLIC_ADMIN_TOKEN = previous;
+    }
   });
 
   it("sets up onopen, onmessage, onclose, onerror handlers", () => {

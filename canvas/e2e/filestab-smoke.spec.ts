@@ -38,7 +38,7 @@ test("FilesTab renders after split", async ({ page, request }) => {
   });
 
   await page.goto("/");
-  await expect(page).toHaveTitle(/Molecule AI/);
+  await expect(page).toHaveTitle(/Enter OS/);
 
   // Screenshot: landing
   await page.screenshot({ path: "/tmp/filestab-1-landing.png", fullPage: false });

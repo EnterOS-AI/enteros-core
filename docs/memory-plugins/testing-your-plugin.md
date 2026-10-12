@@ -173,9 +173,10 @@ Then ask an agent to call `commit_memory_v2` and `search_memory`. If
 both round-trip cleanly, you're done.
 
 For the full E2E flow (including the namespace resolver, MCP layer,
-and security perimeter), see [PR-11's plugin-swap test](../../workspace-server/test/e2e/memory_plugin_swap_test.go).
+and security perimeter), see the
+[plugin-swap test](../../workspace-server/internal/memory/e2e/swap_test.go).
 
 ## Reporting bugs
 
 If you find a contract ambiguity or missing edge case, file an issue
-against `Molecule-AI/molecule-core` referencing RFC #2728.
+against `molecule-ai/molecule-core` on Gitea, referencing RFC #2728.

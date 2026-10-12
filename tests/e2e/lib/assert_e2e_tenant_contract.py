@@ -158,6 +158,21 @@ INTENTIONALLY_ABSENT = {
 }
 
 
+# Build-tag-gated, test-ONLY routes: the tenant DOES serve these, but only in an
+# E2E/debug build (registered behind a Go build tag), so they never appear in the
+# default router.go text this parser reads. An e2e script that calls one is NOT
+# hitting a dead route — the route exists in the image under test — so exempt it
+# from the "path the tenant does NOT route" failure. Keep this list tiny and
+# justified; each entry is a promise that the route is real in the test build.
+#
+#   POST /workspaces/:id/test-busy — busy-injection hook that pins a workspace's
+#   active_tasks high so scenario 10b can force-hibernate a GENUINELY busy box
+#   (core#4528, RFC #92). Never compiled into the production tenant binary.
+KNOWN_TEST_ONLY_ROUTES = {
+    ("POST", "/workspaces/:x/test-busy"),
+}
+
+
 def is_routable(method: str, path: str, routes: set[tuple[str, str]]) -> bool:
     return any(m == method and matches(path, r) for m, r in routes)
 
@@ -197,6 +212,8 @@ def check_routes(routes: set[tuple[str, str]]) -> tuple[int, list[str]]:
                 checked += 1
                 if (method, normalize(path)) in INTENTIONALLY_ABSENT:
                     continue
+                if (method, normalize(path)) in KNOWN_TEST_ONLY_ROUTES:
+                    continue  # build-tag-gated route: real in the test image, absent from router.go text
                 if not is_routable(method, path, routes):
                     bad.append(f"  {script.relative_to(ROOT)}:{lineno}: {method} {path}\n"
                                f"      normalized: {normalize(path)}  -- not in router.go")

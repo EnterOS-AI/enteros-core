@@ -20,12 +20,12 @@ import (
 
 // syncBuf is a goroutine-safe writer that wraps bytes.Buffer with a mutex.
 // Used to capture subprocess stderr without racing the os/exec stderr-copy
-// goroutine: ``cmd.Stderr = io.Writer`` spawns a background goroutine that
+// goroutine: “cmd.Stderr = io.Writer“ spawns a background goroutine that
 // reads from the subprocess's stderr fd and calls Write on our writer, so
 // reading the buffer from another goroutine (e.g., on wait-for-port
 // timeout while the tunnel may still be writing) without synchronization
-// is a data race that ``go test -race`` would flag. ``strings.Builder``
-// and bare ``bytes.Buffer`` aren't goroutine-safe; this tiny shim is the
+// is a data race that “go test -race“ would flag. “strings.Builder“
+// and bare “bytes.Buffer“ aren't goroutine-safe; this tiny shim is the
 // cheapest fix.
 type syncBuf struct {
 	mu sync.Mutex
@@ -81,12 +81,12 @@ func unwrapGoError(errMsg string) string {
 //
 // Stages mirrored from handleRemoteConnect:
 //
-//	1. ssh-keygen          (ephemeral session keypair)
-//	2. send-ssh-public-key (AWS EIC API push, IAM-gated)
-//	3. pick-free-port      (local port for the tunnel)
-//	4. open-tunnel         (aws ec2-instance-connect open-tunnel start)
-//	5. wait-for-port       (the tunnel actually listens)
-//	6. ssh-probe           (`ssh ... 'echo MARKER'` — proves end-to-end auth+shell)
+//  1. ssh-keygen          (ephemeral session keypair)
+//  2. send-ssh-public-key (AWS EIC API push, IAM-gated)
+//  3. pick-free-port      (local port for the tunnel)
+//  4. open-tunnel         (aws ec2-instance-connect open-tunnel start)
+//  5. wait-for-port       (the tunnel actually listens)
+//  6. ssh-probe           (`ssh ... 'echo MARKER'` — proves end-to-end auth+shell)
 //
 // Local Docker workspaces (no instance_id row) get a smaller probe:
 // container-found + container-running. Same response shape so callers
@@ -152,8 +152,8 @@ type diagnoseStep struct {
 	Detail     string `json:"detail,omitempty"`
 }
 
-// diagnoseResult is the full report. ``OK`` is true only when every step
-// passed; ``FirstFailure`` names the step that broke the chain so callers
+// diagnoseResult is the full report. “OK“ is true only when every step
+// passed; “FirstFailure“ names the step that broke the chain so callers
 // can route alerts (e.g., "send-ssh-public-key" → IAM team; "ssh-probe" →
 // SG/sshd team).
 type diagnoseResult struct {

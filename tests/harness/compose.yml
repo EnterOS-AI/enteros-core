@@ -12,7 +12,7 @@
 #          ├─ Host: harness-tenant-beta.localhost  → tenant-beta
 #          │   ↓
 #          │   tenant-beta + postgres-beta
-#          └─ cp-stub + redis (shared infra; CP is Railway-singleton in prod,
+#          └─ cp-stub + redis (shared infra; CP is a separately deployed service,
 #                              redis is shared cluster)
 #
 # The two-tenant topology catches:
@@ -32,7 +32,7 @@
 #   CP_STUB_PEERS_MODE — peers failure mode for replay scripts.
 
 services:
-  # ─── Shared infra (matches prod: CP is Railway-singleton, redis shared) ───
+  # ─── Shared infra (matches the split service model: one CP, Redis shared) ───
   redis:
     image: redis:7-alpine
     networks: [harness-net]

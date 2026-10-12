@@ -20,10 +20,9 @@ package channels
 // force-upgrade everything can re-save each channel via the Canvas Update
 // button.
 //
-// Only `bot_token` and `webhook_secret` are considered secret. Other fields
-// (chat_id, channel_name, enable_polling, etc.) stay in cleartext so the
-// SQL-level `channel_config->>'chat_id'` lookups in the webhook receiver
-// remain efficient.
+// Bot tokens, shared verification secrets, and credential-bearing webhook
+// URLs are encrypted. Routing identifiers (chat_id, channel_id, names, etc.)
+// stay in cleartext so webhook receivers can query them efficiently.
 
 import (
 	"encoding/base64"
@@ -36,7 +35,7 @@ import (
 // rest. Add a new key here to extend coverage — do NOT widen this to the
 // whole config: it would break SQL field-access for non-secret keys like
 // `chat_id` that the webhook receiver queries.
-var sensitiveFields = []string{"bot_token", "webhook_secret"}
+var sensitiveFields = []string{"bot_token", "webhook_secret", "webhook_url", "verify_token", "signing_secret"}
 
 // ciphertextPrefix marks values encrypted by EncryptSensitiveFields so
 // DecryptSensitiveFields can tell "new encrypted value" from a legacy
@@ -126,4 +125,25 @@ func DecryptSensitiveFields(config map[string]interface{}) error {
 		config[field] = string(pt)
 	}
 	return nil
+}
+
+// RedactSensitiveFields removes credential material before channel_config is
+// returned by a read API. Bot tokens retain a small prefix/suffix so operators
+// can distinguish configured bots; shared secrets and credential-bearing URLs
+// are fully redacted.
+func RedactSensitiveFields(config map[string]interface{}) {
+	if config == nil {
+		return
+	}
+	for _, field := range sensitiveFields {
+		value, ok := config[field].(string)
+		if !ok || value == "" {
+			continue
+		}
+		if field == "bot_token" && len(value) > 8 {
+			config[field] = value[:4] + "..." + value[len(value)-4:]
+			continue
+		}
+		config[field] = "***"
+	}
 }

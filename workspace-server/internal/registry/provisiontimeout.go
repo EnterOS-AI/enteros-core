@@ -26,11 +26,12 @@ type ProvisionTimeoutEmitter interface {
 // has its own 3-minute context timeout (provisioner.ProvisionTimeout)
 // but that only bounds the docker API call — a container that started
 // but crashes before /registry/register never triggers that path and
-// would sit in provisioning forever. 10 minutes covers pathological
-// image-pull + user-data execution on a cold EC2 worker while still
-// getting well ahead of the "15+ minute" stuck state users see in
-// production.
-// Bumped 10 -> 12 min: a fresh-provision cold boot was measured at
+// would sit in provisioning forever. The original 10-minute floor covered
+// pathological image-pull + user-data execution on the then-current EC2
+// backend while still getting ahead of the "15+ minute" stuck state.
+//
+// Historical basis for the 10 -> 12 min bump: a fresh-provision cold boot on
+// the retired AWS backend was measured at
 // ~7 min on a clean instance (i-052962296ad0c7240, 2026-06-10:
 // launched 14:51:01Z, registered (/registry/register 200) 14:58:04Z;
 // cloud-init blame = 381s in config-scripts_user, ~1m47s of it the ECR
@@ -38,7 +39,10 @@ type ProvisionTimeoutEmitter interface {
 // 10-min sweep, which then false-fails a workspace that is still
 // healthily booting and registers seconds later (the recurring MiniMax
 // workspace-0c96b3ab failure). 12 min clears the observed ~7 min boot
-// plus tail slack while staying ahead of the genuinely-stuck state.
+// plus tail slack while staying ahead of the genuinely-stuck state. Current
+// molecules-server provisioning does not use EC2 cloud-init or ECR; the
+// provider-agnostic timeout remains a conservative upper bound for any
+// container that starts but never registers.
 // NOTE: the CP-side bootstrap-watcher
 // (controlplane internal/provisioner/bootstrap_watcher.go
 // bootstrapTimeoutFn) still ENDS its serial-console crash-diagnosis at

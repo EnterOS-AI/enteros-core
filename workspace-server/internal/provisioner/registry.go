@@ -6,14 +6,15 @@ import (
 	"strings"
 )
 
-// defaultRegistryPrefix is the upstream OSS face for all workspace template
-// images. Self-hosted Molecule deployments without the MOLECULE_IMAGE_REGISTRY
-// override pull from here.
-const defaultRegistryPrefix = "ghcr.io/molecule-ai"
+// defaultRegistryPrefix is the current Molecule Gitea container registry.
+// Named runtimes in an unset-registry self-host still use Resolve()'s
+// local-build path; this fallback covers legacy callers and explicit image
+// references without sending them to the retired GitHub registry.
+const defaultRegistryPrefix = "registry.moleculesai.app/molecule-ai"
 
 // knownRuntimes is the canonical list of workspace template runtimes shipped
 // in main. Any runtime added here MUST also have a standalone template repo
-// (Molecule-AI/molecule-ai-workspace-template-<name>) and an entry in the
+// (molecule-ai/molecule-ai-workspace-template-<name>) and an entry in the
 // publish-template-image workflow that builds it.
 //
 // Order matters for deterministic test snapshots; keep alphabetical.
@@ -66,28 +67,22 @@ func DefaultRuntime() string {
 	return defaultRuntime()
 }
 
-// RegistryPrefix returns the registry prefix all workspace-template image
-// references should use. Defaults to ghcr.io/molecule-ai (the upstream OSS
-// face) and is overridden by the MOLECULE_IMAGE_REGISTRY env var in
-// production tenants where we mirror images to a private registry.
+// RegistryPrefix returns the registry prefix for workspace-template image
+// references. It defaults to Molecule's Gitea registry and is overridden by
+// MOLECULE_IMAGE_REGISTRY for an operator-controlled mirror.
 //
-// The override is set at deploy time (Railway env, EC2 user-data) — never
-// from user-supplied input — so the value is trusted by the time it reaches
-// this code. Validation is deliberately minimal: an operator-supplied
-// prefix that points at a registry the EC2 can't authenticate to will fail
+// The override is deployment configuration, never request input, so the value
+// is trusted by the time it reaches this code. Validation is deliberately
+// minimal: a prefix that points at a registry the host cannot authenticate to
+// will fail
 // loudly at docker-pull time, which is the right blast radius.
 //
 // Example values:
 //
-//	(unset)                                              → ghcr.io/molecule-ai (OSS default)
-//	"123456789012.dkr.ecr.us-east-2.amazonaws.com/molecule-ai"  → AWS ECR mirror
-//	"git.moleculesai.app/molecule-ai"                    → self-hosted Gitea Container Registry (future)
+//	(unset)                                     → registry.moleculesai.app/molecule-ai
+//	"registry.example.com/acme"                → operator-controlled mirror
 //
-// Auth is registry-specific and configured outside this function:
-//   - GHCR: GHCR_USER/GHCR_TOKEN env vars consumed by ghcrAuthHeader()
-//   - ECR: docker credential helper (amazon-ecr-credential-helper) configured
-//     in EC2 user-data; ~/.docker/config.json has credHelpers entry; the
-//     daemon resolves auth automatically on every pull.
+// Auth is registry-specific and configured outside this function.
 func RegistryPrefix() string {
 	if v := os.Getenv("MOLECULE_IMAGE_REGISTRY"); v != "" {
 		return v
@@ -106,9 +101,8 @@ func RegistryPrefix() string {
 //
 // Examples:
 //
-//	"ghcr.io/molecule-ai"                                    → "ghcr.io"
-//	"123456789012.dkr.ecr.us-east-2.amazonaws.com/molecule-ai" → "123456789012.dkr.ecr.us-east-2.amazonaws.com"
-//	"git.moleculesai.app/molecule-ai"                        → "git.moleculesai.app"
+//	"registry.moleculesai.app/molecule-ai" → "registry.moleculesai.app"
+//	"registry.example.com/acme"            → "registry.example.com"
 //
 // If RegistryPrefix() ever returns a bare host (no `/`), we return it as-is
 // rather than letting strings.SplitN produce an empty string — defensive
@@ -124,7 +118,7 @@ func RegistryHost() string {
 // RuntimeImage returns the canonical image reference for the given runtime,
 // using the current RegistryPrefix() and the moving `:latest` tag.
 //
-// SHA-pinned references for production thin-AMI launches are applied by CP
+// SHA-pinned references for managed launches are applied by CP
 // (molecule-controlplane) at its provisioner layer using CP's
 // migrations/027_runtime_image_pins table, which is the single SSOT for
 // runtime image pins. The local digest-pin reader that previously lived at

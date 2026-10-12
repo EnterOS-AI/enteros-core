@@ -78,7 +78,7 @@ delete_user_task(user_task_id)          → delete own task
 So every agent (any workspace, via MCP) can create AND manage its own asks —
 `request_user_action` is the create; `list_/update_/delete_user_task` are the
 read/update/delete, all scoped to tasks the calling workspace raised. None are
-gated behind `MOLECULE_MCP_ALLOW_SEND_MESSAGE` (that gate is specific to
+affected by `MOLECULE_MCP_ALLOW_SEND_MESSAGE` (that kill-switch is specific to
 `send_message_to_user`); raising/managing an ask is always allowed.
 
 ### Events
@@ -105,5 +105,6 @@ count. Replaces the interim schedules wiring.
 
 Phase 0 migration ships idempotently (`IF NOT EXISTS`). Backend + MCP tool +
 canvas wiring land together behind the concierge Home (already gated as the new
-UI). Full molecule-core SOP gate applies (tier label + qa-review +
-security-review + green CI).
+UI). The molecule-core merge gate applies (green CI `['*']` + secret-scan, plus
+reserved-path-review when a reserved path is touched; the qa-review /
+security-review / sop-checklist ceremony was retired 2026-07-11/14).

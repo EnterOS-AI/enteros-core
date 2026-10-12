@@ -5,9 +5,9 @@
 // (claude-code reads ~/.claude/projects/<cwd>/<session>.jsonl). Other
 // runtimes return supported:false.
 //
-// Why this lives in the platform: docker exec works for local dev but
-// not for remote (Phase 30) workspaces on Fly Machines. The platform's
-// network proxy is the only path that scales to both.
+// Why this lives in the platform: direct container access is a local-only
+// diagnostic. The authenticated network proxy works for both local and
+// provider-managed workspaces.
 package handlers
 
 import (
@@ -109,9 +109,9 @@ func NewTranscriptHandler() *TranscriptHandler {
 // without needing to spin up an http.Transport.
 func safeDialer() *net.Dialer {
 	return &net.Dialer{
-		Timeout:    10 * time.Second,
-		KeepAlive:  30 * time.Second,
-		Control:    safeDialControl,
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   safeDialControl,
 	}
 }
 
@@ -163,13 +163,13 @@ func safeDialControl(network, address string, _ syscall.RawConn) error {
 			return &ssrfDialError{host: host, reason: errors.New("hostname resolution returned no addresses")}
 		}
 		for _, candidate := range ips {
-			if safeErr := isSafeURL("http://" + candidate.String() + "/"); safeErr != nil {
+			if safeErr := isSafeURL("http://" + net.JoinHostPort(candidate.String(), "80") + "/"); safeErr != nil {
 				return &ssrfDialError{ip: candidate, reason: safeErr}
 			}
 		}
 		return nil
 	}
-	if safeErr := isSafeURL("http://" + ip.String() + "/"); safeErr != nil {
+	if safeErr := isSafeURL("http://" + net.JoinHostPort(ip.String(), "80") + "/"); safeErr != nil {
 		return &ssrfDialError{ip: ip, reason: safeErr}
 	}
 	return nil
@@ -187,8 +187,8 @@ func safeDialControl(network, address string, _ syscall.RawConn) error {
 // so it propagates out of DialContext as the dial error — the
 // http.Client surfaces it to the caller.
 type ssrfDialError struct {
-	ip     net.IP   // set when the IP is known (blocked-IP case)
-	host   string   // set when the hostname couldn't be resolved (LookupIP error / empty)
+	ip     net.IP // set when the IP is known (blocked-IP case)
+	host   string // set when the hostname couldn't be resolved (LookupIP error / empty)
 	reason error
 }
 
@@ -292,4 +292,3 @@ func (h *TranscriptHandler) Get(c *gin.Context) {
 	}
 	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), body)
 }
-

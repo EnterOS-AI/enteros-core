@@ -33,7 +33,7 @@ func TestRefreshEnvFromCP_AppliesCPResponse(t *testing.T) {
 			t.Errorf("org id header: got %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"MOLECULE_CP_SHARED_SECRET":"new-secret","MOLECULE_CP_URL":"https://api.moleculesai.app","DISPLAY_SESSION_SIGNING_SECRET":"display-secret","MOLECULE_LLM_BASE_URL":"https://api.moleculesai.app/api/v1/internal/llm/openai/v1","MOLECULE_LLM_USAGE_TOKEN":"tenant-admin-token","MOLECULE_LLM_DEFAULT_MODEL":"moonshot/kimi-k2.6"}`)
+		fmt.Fprint(w, `{"MOLECULE_CP_SHARED_SECRET":"new-secret","MOLECULE_CP_URL":"https://api.moleculesai.app","DISPLAY_SESSION_SIGNING_SECRET":"display-secret","MOLECULE_LLM_BASE_URL":"https://api.moleculesai.app/api/v1/internal/llm/openai/v1","MOLECULE_LLM_USAGE_TOKEN":"tenant-admin-token","MOLECULE_LLM_DEFAULT_MODEL":"minimax/MiniMax-M2.7"}`)
 	}))
 	defer srv.Close()
 
@@ -57,7 +57,7 @@ func TestRefreshEnvFromCP_AppliesCPResponse(t *testing.T) {
 	if got := os.Getenv("MOLECULE_LLM_USAGE_TOKEN"); got != "tenant-admin-token" {
 		t.Errorf("MOLECULE_LLM_USAGE_TOKEN: got %q", got)
 	}
-	if got := os.Getenv("MOLECULE_LLM_DEFAULT_MODEL"); got != "moonshot/kimi-k2.6" {
+	if got := os.Getenv("MOLECULE_LLM_DEFAULT_MODEL"); got != "minimax/MiniMax-M2.7" {
 		t.Errorf("MOLECULE_LLM_DEFAULT_MODEL: got %q", got)
 	}
 }
@@ -496,5 +496,43 @@ func TestEnsureManagedTenantLLMEnv_HappyPathNoRetry(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Errorf("happy path must make exactly 1 CP call (no retry), got %d", got)
+	}
+}
+
+// TestAssertSaaSTenantHasAdminToken (core#4485): a Molecule-managed tenant
+// (MOLECULE_ORG_ID set) with no ADMIN_TOKEN must REFUSE boot — otherwise
+// AdminAuth's Tier-3 fallback accepts any workspace token as org-admin. Self-
+// hosted / local-dev (no MOLECULE_ORG_ID) must still boot, keeping the deprecated
+// Tier-3 path. Gated on MOLECULE_ORG_ID (the CP-provisioner signal), NOT
+// MOLECULE_DEPLOY_MODE. Negative-controlled: both refuse arms and pass arms;
+// a whitespace-only ADMIN_TOKEN counts as unset.
+func TestAssertSaaSTenantHasAdminToken(t *testing.T) {
+	cases := []struct {
+		name       string
+		deployMode string
+		orgID      string
+		adminToken string
+		wantErr    bool
+	}{
+		{"self-host: no org, no admin token -> ok (Tier-3 exempt)", "", "", "", false},
+		{"self-host: DEPLOY_MODE=self-hosted, no org, no admin -> ok", "self-hosted", "", "", false},
+		{"managed: org set + DEPLOY_MODE=self-hosted, no admin -> refuse (CP-provisioned on ORG_ID alone)", "self-hosted", "org-abc", "", true},
+		{"managed: org set, admin token set -> ok", "", "org-abc", "secret", false},
+		{"managed: org set, NO admin token -> refuse", "", "org-abc", "", true},
+		{"managed: org set, whitespace admin token -> refuse", "", "org-abc", "   ", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("MOLECULE_DEPLOY_MODE", tc.deployMode)
+			t.Setenv("MOLECULE_ORG_ID", tc.orgID)
+			t.Setenv("ADMIN_TOKEN", tc.adminToken)
+			err := assertSaaSTenantHasAdminToken()
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected boot refusal, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected nil (must not break this deploy), got %v", err)
+			}
+		})
 	}
 }

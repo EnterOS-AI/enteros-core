@@ -53,9 +53,9 @@ def test_all_required_is_needs_aggregator_not_a_polling_gate():
 
 
 def test_all_required_does_not_use_if_always():
-    """Plain `needs:` works on Gitea 1.22.6 / act_runner v0.6.1; `needs:` +
-    `if: always()` is BROKEN (feedback_gitea_needs_works_only_ifalways_broken)
-    and would let a non-success need pass the gate. The sentinel must use
+    """Preserve the legacy 1.22.6 / act_runner v0.6.1 compatibility guard:
+    `needs:` + `if: always()` let a non-success need pass the gate
+    (feedback_gitea_needs_works_only_ifalways_broken). The sentinel must use
     plain `needs:` WITHOUT a job-level `if: always()`.
     """
     workflow = load_workflow("ci.yml")
@@ -138,3 +138,16 @@ def test_all_required_step_uses_extracted_script():
     assert "check()" not in run_block, (
         "all-required step still contains inline check() function — re-inline regression"
     )
+
+
+def test_ops_scripts_runs_audit_force_merge_shell_contract():
+    """The shell integration test is not collected by pytest, so the ops
+    workflow must invoke it explicitly."""
+    workflow = load_workflow("test-ops-scripts.yml")
+    steps = workflow["jobs"]["test"].get("steps", [])
+    run_blocks = [step.get("run", "") for step in steps if isinstance(step, dict)]
+
+    assert any(
+        "bash .gitea/scripts/tests/test_audit_force_merge.sh" in run
+        for run in run_blocks
+    ), "test-ops-scripts.yml must execute the audit-force-merge shell contract"

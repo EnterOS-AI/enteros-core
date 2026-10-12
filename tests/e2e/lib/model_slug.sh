@@ -36,8 +36,11 @@
 #   because the generated config.yaml lacked the derived `provider: platform`.
 #
 #   E2E_LLM_PATH=platform selects a platform-managed model id (slash-namespaced,
-#   no tenant key — Molecule owns billing via the CP LLM proxy). The default is
-#   "moonshot/kimi-k2.6", the headline incident combo. Override the specific
+#   no tenant key — Molecule owns billing via the CP LLM proxy). The default
+#   MIRRORS the SSOT default (minimax/MiniMax-M2.7) — see the constant below.
+#   It was "moonshot/kimi-k2.6" (the headline incident combo) until sdk#203
+#   withdrew every moonshot/* id from the platform arms on 2026-08-04 (suspended
+#   vendor account); that id now 422s at create. Override the specific
 #   platform model with E2E_MODEL_SLUG. The provision branch in
 #   test_staging_full_saas.sh sends NO secrets for this path (platform-managed
 #   needs none), so the workspace must boot online purely on the proxy env the
@@ -88,18 +91,14 @@ pick_model_slug() {
   fi
   case "$runtime" in
     hermes)      printf 'openai/gpt-4o' ;;
-    # seo-agent is a claude-code-adapter template VARIANT selected by
-    # template name (template="seo-agent"), not a distinct registry runtime
-    # (it is absent from manifest.json + runtime_registry.go). Its config.yaml
-    # declares `runtime: claude-code` and copies the claude-code `providers:`
-    # block (providers.yaml:21 "The same block is copy-pasted into the seo-agent
-    # template"), so its model dispatch is IDENTICAL to claude-code's: the BARE
-    # registered MiniMax BYOK id (the staging-default key path), else direct
-    # Anthropic, else the OAuth `sonnet` alias. Sharing the claude-code branch
-    # keeps the SSOT one place — a seo-agent run is just a claude-code run
-    # behind a productized template skin, and (because the runtime resolves to
-    # claude-code server-side) its model must be a *claude-code-registered* form.
-    claude-code|seo-agent)
+    # seo-agent is a template VARIANT selected by template name
+    # (template="seo-agent"), not a distinct registry runtime. Since the
+    # seo-agent template moved to `runtime: hermes` (seo-agent template #29,
+    # manifest pin 34a1bd8) its config.yaml offers only platform-proxy
+    # MiniMax models, so every key path resolves to the slash-namespaced
+    # platform model the template registers.
+    seo-agent)   printf 'minimax/MiniMax-M2.7' ;;
+    claude-code)
       if [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then
         # BARE registered BYOK id `MiniMax-M2.7`, NOT the colon form
         # `minimax:MiniMax-M2.7`. On the claude-code runtime the three MiniMax
@@ -122,7 +121,7 @@ pick_model_slug() {
         # UNREGISTERED_MODEL_FOR_RUNTIME on real staging (job 295075).
         # NOTE: the colon form IS the correct BYOK-minimax id on openclaw/hermes
         # (those adapters DO strip `minimax:` — matrix test), but this dispatch
-        # arm only emits for claude-code/seo-agent, where bare is the right form.
+        # arm only emits for claude-code, where bare is the right form.
         printf 'MiniMax-M2.7'
       elif [ -n "${E2E_ANTHROPIC_API_KEY:-}" ]; then
         printf 'claude-sonnet-4-6'

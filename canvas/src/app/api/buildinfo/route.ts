@@ -9,13 +9,14 @@ import { NextResponse } from "next/server";
 //   1. BUILD_SHA — server-only env baked into the canvas Docker image at
 //      build time (Dockerfile `ARG BUILD_SHA` → `ENV BUILD_SHA`, wired
 //      from `${{ github.sha }}` in publish-canvas-image.yml). This is the
-//      authoritative source for the fleet's ECR-image deploy path, which
-//      does NOT run on Vercel. Read server-side here (App Router route
+//      authoritative source for images published to the Gitea registry.
+//      Read server-side here (App Router route
 //      handler runs on the standalone Node server, `output: "standalone"`),
 //      so it is intentionally NOT a NEXT_PUBLIC_ var — keeping it out of
 //      the client bundle.
-//   2. VERCEL_GIT_COMMIT_SHA — Vercel injects this at build time when the
-//      canvas is deployed via Vercel rather than the Docker image.
+//   2. VERCEL_GIT_COMMIT_SHA — retained only for compatible downstream or
+//      preview deployments that still use Vercel; it is not Molecule's
+//      production deployment path.
 //   3. "dev" — local `next dev` / test harness, where neither is set. Same
 //      sentinel workspace-server uses pre-ldflags-injection, so both
 //      surfaces speak the same vocabulary and an unconfigured deploy

@@ -17,7 +17,7 @@ import type { MetadataRoute } from "next";
 // Note: `sitemap` is published via the sibling `sitemap.ts` route; we
 // reference it explicitly here so crawlers don't have to guess.
 const SITE_URL =
-  process.env.NEXT_PUBLIC_SITE_URL ?? "https://app.moleculesai.app";
+  process.env.NEXT_PUBLIC_SITE_URL ?? "https://app.enteros.ai";
 
 export default function robots(): MetadataRoute.Robots {
   return {

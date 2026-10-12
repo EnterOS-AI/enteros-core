@@ -19,13 +19,12 @@ set -uo pipefail
 # just 200s.
 #
 # Auth model (matches workspace-server/internal/middleware/wsauth_middleware.go):
-#   * WorkspaceAuth (/workspaces/:id/*) is STRICT once a token exists — a
-#     bearer-less request 401s (devmode fail-open needs MOLECULE_ENV=dev AND
-#     ADMIN_TOKEN unset, neither of which the e2e-api job sets).
+#   * WorkspaceAuth (/workspaces/:id/*) is strict: bearer-less protected
+#     requests fail in every environment.
 #   * AdminAuth routes accept the platform ADMIN_TOKEN (post-#2286) OR, when no
 #     ADMIN_TOKEN is configured, any valid workspace bearer (Tier-3 fallback) —
-#     so the workspace token we mint authenticates admin routes in BOTH the
-#     pre-#2286 (no ADMIN_TOKEN) and post-#2286 (ADMIN_TOKEN set) CI shapes.
+#     but a fresh install must first bootstrap with ADMIN_TOKEN because there is
+#     no bearer-less create path.
 #
 # Local-run shape (mirrors the e2e-api job — real PG+Redis+platform):
 #   DATABASE_URL=... REDIS_URL=... ADMIN_TOKEN=... ./platform-server &
@@ -63,10 +62,9 @@ body_and_code() {
 echo "=== Keyless feature HTTP-contract E2E (required lane) ==="
 echo ""
 
-# Platform admin bearer when the job set one (#2286 shape). When ADMIN_TOKEN is
-# configured, AdminAuth's Tier-1 fail-open is OFF even before the first token
-# exists, so admin-gated create / list / delete must carry it from the start.
-# Pre-#2286 (no ADMIN_TOKEN) this is empty → fail-open create works bare.
+# Platform admin bearer. Admin-gated create / list / delete must carry a valid
+# credential from the start; a fresh install never accepts a bare request.
+e2e_require_admin_token || exit 2
 ENV_ADMIN="${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}"
 ENV_ADMIN_AUTH=()
 [ -n "$ENV_ADMIN" ] && ENV_ADMIN_AUTH=(-H "Authorization: Bearer $ENV_ADMIN")
@@ -130,17 +128,36 @@ assert_contains "GET /terminal/diagnose (no auth → 401)" "401" \
 
 # ===========================================================================
 # 2. Webhooks (public) — POST /webhooks/:type
-#    Public, no auth. telegram adapter: empty update body → (nil,nil) → 200
-#    ignored; non-JSON → parse error → 400; unknown type → 404.
+#    The route is public at HTTP middleware level, but provider credentials are
+#    mandatory. Prove Telegram's row-bound secret header end to end without a
+#    real Bot API call: webhook_secret selects webhook mode, so manager reload
+#    does not start long polling.
 # ===========================================================================
 echo "--- /webhooks/:type ---"
-BC=$(body_and_code POST "$BASE/webhooks/telegram" -H "Content-Type: application/json" -d '{}')
+
+# No configured Telegram row/secret: fail closed before payload parsing.
+assert_contains "POST /webhooks/telegram (no configured credential → 401)" "401" \
+  "$(http_code POST "$BASE/webhooks/telegram" -H 'Content-Type: application/json' -d '{}')"
+
+TG_WEBHOOK_SECRET="e2e_webhook_secret_123"
+TG_BOT_TOKEN="424242:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+TG_CREATE=$(curl -s -X POST "$BASE/workspaces/$WS_ID/channels" "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  -d "{\"channel_type\":\"telegram\",\"config\":{\"bot_token\":\"$TG_BOT_TOKEN\",\"chat_id\":\"-1009876543210\",\"webhook_secret\":\"$TG_WEBHOOK_SECRET\"},\"enabled\":true}")
+assert_contains "POST /channels (Telegram webhook-mode row created)" '"channel_type":"telegram"' "$TG_CREATE"
+
+BC=$(body_and_code POST "$BASE/webhooks/telegram" \
+  -H "Content-Type: application/json" \
+  -H "X-Telegram-Bot-Api-Secret-Token: $TG_WEBHOOK_SECRET" \
+  -d '{}')
 WH_CODE=$(printf '%s' "$BC" | tail -n1)
 WH_BODY=$(printf '%s' "$BC" | sed '$d')
-assert_contains "POST /webhooks/telegram (non-message update → 200)" "200" "$WH_CODE"
-assert_contains "POST /webhooks/telegram (status ignored)" '"status":"ignored"' "$WH_BODY"
-assert_contains "POST /webhooks/telegram (bad JSON → 400)" "400" \
-  "$(http_code POST "$BASE/webhooks/telegram" -H 'Content-Type: application/json' -d 'not-json')"
+assert_contains "POST /webhooks/telegram (matching secret → 200)" "200" "$WH_CODE"
+assert_contains "POST /webhooks/telegram (authenticated non-message ignored)" '"status":"ignored"' "$WH_BODY"
+assert_contains "POST /webhooks/telegram (wrong secret → 401)" "401" \
+  "$(http_code POST "$BASE/webhooks/telegram" -H 'Content-Type: application/json' -H 'X-Telegram-Bot-Api-Secret-Token: wrong' -d '{}')"
+assert_contains "POST /webhooks/telegram (authenticated bad JSON → 400)" "400" \
+  "$(http_code POST "$BASE/webhooks/telegram" -H 'Content-Type: application/json' -H "X-Telegram-Bot-Api-Secret-Token: $TG_WEBHOOK_SECRET" -d 'not-json')"
 assert_contains "POST /webhooks/<unknown> (→ 404)" "404" \
   "$(http_code POST "$BASE/webhooks/nope-not-a-channel" -H 'Content-Type: application/json' -d '{}')"
 
@@ -171,12 +188,32 @@ assert_contains "GET /budget (no auth → 401)" "401" "$(http_code GET "$BASE/wo
 
 # ===========================================================================
 # 4. Audit — GET /workspaces/:id/audit (wsAuth)
-#    EU AI Act ledger query (#594). Fresh ws → empty events, total 0,
-#    chain_valid null (AUDIT_LEDGER_SALT unset). Failure: bad RFC3339 from → 400.
+#    EU AI Act ledger query (#594). chain_valid null (AUDIT_LEDGER_SALT unset).
+#    Failure: bad RFC3339 from → 400.
+#
+#    A freshly-created workspace has EXACTLY ONE event: its own
+#    `workspace.create`. This assertion used to expect `"total":0`, which was
+#    only ever true because audit_events had no writer at all — the table was
+#    empty in prod for every tenant, which is the defect the audit producer
+#    fixes. `total 0 on a fresh ws` was therefore asserting the bug. The
+#    lifecycle producer instruments exactly five operations (workspace.create /
+#    .delete / .purge, auth_token.mint / .revoke — see AuditOp* in
+#    internal/handlers/audit_write.go), and none of the sections above this one
+#    (terminal-diagnose, webhooks, budget) touch any of them, so the count here
+#    is a stable 1 rather than order-dependent.
 # ===========================================================================
 echo "--- /audit ---"
 AUD=$(curl -s "$BASE/workspaces/$WS_ID/audit" "${AUTH[@]}")
-assert_contains "GET /audit (total 0 on fresh ws)" '"total":0' "$AUD"
+assert_contains "GET /audit (fresh ws has exactly its own create event)" '"total":1' "$AUD"
+assert_contains "GET /audit (the event is workspace.create)" '"operation":"workspace.create"' "$AUD"
+# The whole point of the producer: the event names its SUBJECT. A row that
+# records that *something* happened but not *to what* is the prod gap that left
+# a 2026-07-23 client-tenant workspace creation with no attributable record.
+assert_contains "GET /audit (create event is attributable to this workspace)" "\"workspace_id\":\"$WS_ID\"" "$AUD"
+# `details` is a TEXT column holding compact JSON (TEXT, not JSONB, so the bytes
+# read back are the bytes HMAC-signed), so it arrives JSON-escaped inside the
+# response — hence the backslashes. assert_contains greps -F, fixed-string.
+assert_contains "GET /audit (details name the subject)" '\"workspace_name\":\"Keyless Fixture\"' "$AUD"
 assert_contains "GET /audit (chain_valid null without salt)" '"chain_valid":null' "$AUD"
 assert_contains "GET /audit (bad 'from' → 400)" "400" \
   "$(http_code GET "$BASE/workspaces/$WS_ID/audit?from=not-a-date" "${AUTH[@]}")"

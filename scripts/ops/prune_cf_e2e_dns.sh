@@ -103,7 +103,7 @@ need() {
   fi
 }
 
-# Accept canonical operator-host names OR CI-scoped names.
+# Accept legacy canonical names OR CI-scoped names.
 CF_API_TOKEN="${CF_API_TOKEN:-${CLOUDFLARE_API_TOKEN:-}}"
 CF_ZONE_ID="${CF_ZONE_ID:-${CLOUDFLARE_ZONE_ID:-}}"
 

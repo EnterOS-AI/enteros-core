@@ -408,9 +408,9 @@ func TestIsSafeURL_DevMode_AllowsRFC1918(t *testing.T) {
 
 	for _, url := range []string{
 		"http://10.1.2.3/agent",
-		"http://172.18.0.42:8000/a2a",       // the docker-compose case from the issue
+		"http://172.18.0.42:8000/a2a", // the docker-compose case from the issue
 		"http://192.168.1.100/agent",
-		"http://[fd00::1]/agent",            // IPv6 ULA fd00::/8 also relaxed
+		"http://[fd00::1]/agent", // IPv6 ULA fd00::/8 also relaxed
 	} {
 		if err := isSafeURL(url); err != nil {
 			t.Errorf("isSafeURL(%q) in dev mode: got %v, want nil", url, err)

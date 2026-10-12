@@ -6,7 +6,7 @@
 
 .monitor {
   --mono: "JetBrains Mono", ui-monospace, monospace;
-  --sans: var(--font-hanken), "Hanken Grotesk", system-ui, sans-serif;
+  --sans: var(--font-inter-tight), "Inter Tight", system-ui, sans-serif;
   /* dark (default) */
   --bg: #08080a; --panel: #0d0d11;
   --card: #16161d; --card-2: #1b1b23;

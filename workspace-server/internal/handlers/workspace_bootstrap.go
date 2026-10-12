@@ -12,10 +12,10 @@ import (
 )
 
 // BootstrapFailedRequest is the body shape the control plane POSTs when a
-// workspace EC2 crashes during user-data execution — before the agent runtime
-// ever calls /registry/register. Without this signal the workspace sits in
-// `provisioning` until the 10-minute sweeper flips it. Fast-path fail keeps
-// the canvas honest about state.
+// provider-managed workspace crashes during bootstrap, before the agent
+// runtime ever calls /registry/register. Without this signal the workspace
+// sits in `provisioning` until the timeout sweeper flips it. Fast-path failure
+// keeps the canvas honest about state.
 type BootstrapFailedRequest struct {
 	// Error is the short, single-line message surfaced in the UI banner
 	// and the WORKSPACE_PROVISION_FAILED payload.
@@ -28,8 +28,8 @@ type BootstrapFailedRequest struct {
 }
 
 // BootstrapFailed marks a workspace as failed from an out-of-band signal —
-// specifically the control plane's bootstrap watcher when it detects
-// "RUNTIME CRASHED" in the EC2 console output of a workspace that never
+// specifically the control plane's bootstrap watcher when it detects a
+// runtime crash in the provider's bootstrap logs for a workspace that never
 // self-registered. Idempotent: a workspace already flipped to online
 // (raced with a late self-registration) or to failed (double-report) is
 // left alone.
@@ -94,8 +94,8 @@ func (h *WorkspaceHandler) BootstrapFailed(c *gin.Context) {
 
 	// RFC internal#742 Part 2: this is one of the two boot-failure
 	// verdict points. We've just flipped a still-running (but
-	// unconfigured) workspace EC2 to `failed`; the control plane will
-	// reap the instance shortly. Capture a forensic rescue bundle off
+	// unconfigured) managed workspace to `failed`; the control plane will
+	// reap its compute shortly. Capture a forensic rescue bundle off
 	// the live box NOW, before it's torn down, so a wedged workspace is
 	// post-mortem-inspectable. Best-effort + non-blocking: runs in its
 	// own goroutine with its own timeout, detached from this request's
@@ -107,12 +107,12 @@ func (h *WorkspaceHandler) BootstrapFailed(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// Console proxies EC2 console output for a workspace from the control plane.
-// Only CP has `ec2:GetConsoleOutput` permission — the tenant platform can't
-// call AWS directly (no AWS creds on the tenant EC2 by design). The canvas
-// hits this endpoint; the platform proxies via the CP admin bearer it was
-// provisioned with. Admin-gated because raw console output can leak
-// user-data snippets that we treat as semi-sensitive.
+// Console proxies provider bootstrap/serial output for a workspace from the
+// control plane. The tenant platform has no direct provider credentials, so
+// the canvas reaches this capability through the CP admin bearer. The current
+// AWS backend implements this with EC2 GetConsoleOutput; other backends may
+// return unsupported. Admin-gated because raw console output can leak
+// bootstrap snippets that we treat as semi-sensitive.
 //
 // Endpoint shape:  GET /workspaces/:id/console
 // Response shape:  {"output": "<serial console text>"}

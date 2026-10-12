@@ -20,7 +20,7 @@ const AUTH_BASE = "/cp/auth";
 
 // Auth UI lives on the "app" subdomain (app.moleculesai.app), NOT on
 // tenant subdomains (hongmingwang.moleculesai.app). Tenant subdomains
-// proxy to EC2 platform which has no auth routes.
+// proxy to the tenant workspace-server, which has no CP auth routes.
 function getAuthOrigin(): string {
   if (typeof window === "undefined") return PLATFORM_URL;
   const host = window.location.hostname;

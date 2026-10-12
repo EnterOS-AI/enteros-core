@@ -24,12 +24,13 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"testing"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"github.com/google/uuid"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
 func integrationDB_PlatformAgentInstall(t *testing.T) *sql.DB {
@@ -531,8 +532,8 @@ func TestIntegration_PlatformAgentInstall_ConciergeBornWithBroadcast(t *testing.
 		t.Fatalf("installed concierge kind=%q, want 'platform'", kind)
 	}
 	if !conciergeBroadcast {
-		t.Fatalf("fresh concierge broadcast_enabled=false, want TRUE — the org's top "+
-			"orchestrator must be born able to broadcast to its team without a manual "+
+		t.Fatalf("fresh concierge broadcast_enabled=false, want TRUE — the org's top " +
+			"orchestrator must be born able to broadcast to its team without a manual " +
 			"PATCH /workspaces/:id/abilities (birth-default regression)")
 	}
 
@@ -553,7 +554,7 @@ func TestIntegration_PlatformAgentInstall_ConciergeBornWithBroadcast(t *testing.
 		t.Fatalf("read sub-agent row: %v", err)
 	}
 	if subAgentBroadcast {
-		t.Fatalf("sub-agent broadcast_enabled=true, want FALSE — only the concierge/"+
+		t.Fatalf("sub-agent broadcast_enabled=true, want FALSE — only the concierge/" +
 			"orchestrator should hold broadcast at birth; a sub-agent must not")
 	}
 
@@ -588,8 +589,184 @@ func TestIntegration_PlatformAgentInstall_ConciergeBornWithBroadcast(t *testing.
 		t.Fatalf("read concierge after re-install-post-disable: %v", err)
 	}
 	if conciergeBroadcast {
-		t.Fatalf("re-install re-enabled a deliberately-disabled concierge broadcast_enabled, "+
-			"want FALSE preserved — the ON CONFLICT upsert must not clobber the operator's "+
+		t.Fatalf("re-install re-enabled a deliberately-disabled concierge broadcast_enabled, " +
+			"want FALSE preserved — the ON CONFLICT upsert must not clobber the operator's " +
 			"PATCH /abilities choice (only the fresh-INSERT VALUES sets the birth default)")
+	}
+}
+
+// TestIntegration_PlatformAgentInstall_RefusesToDisplaceOnlinePlatformRoot is the
+// PROVE-FAIL gate for the concierge-destruction bug.
+//
+// The raw install is row-only: it upserts the caller's id and NEVER provisions
+// (that contract is frozen for the CP — see InstallPlatformAgent). Step 0 also
+// downgrades any platform root whose id differs from the caller's, so that a
+// non-canonical root cannot block uniq_workspaces_one_platform_root. Those two
+// facts compose into a destructive one: post a FOREIGN id at an org whose
+// concierge is ONLINE, and the live concierge is demoted to an ordinary
+// workspace while a container-less row takes its place — with nothing left to
+// bring it up. The canvas then resolves the new root, its status never reaches
+// 'online', and the composer is disabled forever.
+//
+// That is not a hypothetical. canvas/e2e/staging-concierge.spec.ts posted a
+// hardcoded uuid on every staging E2E run and destroyed the org's concierge for
+// every spec that ran after it (staging-slow-cold-greeting: "concierge composer
+// never enabled (agent unreachable)"), from bae6a1cdb (2026-06-11, which added
+// the step-0 downgrade and thereby replaced the unique-index COLLISION that had
+// been rejecting the foreign id loudly) until this guard.
+//
+// Case 1 (fail-before): a foreign id aimed at an ONLINE root is REFUSED, and the
+//
+//	live concierge survives untouched. Without the guard, step 0 demotes
+//	it and this fails on the kind assertion.
+//
+// Case 2 (no false-positive): the same foreign id against a NOT-online root is
+//
+//	still allowed through — the legitimate non-canonical-id repair the
+//	downgrade was written for keeps working.
+//
+// Case 3 (CP unaffected): re-installing the SAME id on an online root is a
+//
+//	normal idempotent upsert, never a conflict. This is the only path the
+//	CP ever takes, and it must stay byte-identical.
+func TestIntegration_PlatformAgentInstall_RefusesToDisplaceOnlinePlatformRoot(t *testing.T) {
+	conn := integrationDB_PlatformAgentInstall(t)
+	ctx := context.Background()
+
+	liveID := uuid.New().String()
+	foreignID := uuid.New().String()
+	liveName := "Live Concierge " + liveID[:8]
+	foreignName := "Foreign Concierge " + foreignID[:8]
+
+	cleanup := func() {
+		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE id = ANY($1)`,
+			pq.Array([]string{liveID, foreignID}))
+		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE name = ANY($1)`,
+			pq.Array([]string{liveName, foreignName}))
+	}
+	t.Cleanup(cleanup)
+	cleanup()
+
+	// Seed the org's real, ONLINE concierge as the sole platform root.
+	//
+	// uniq_workspaces_one_platform_root is a PARTIAL UNIQUE INDEX and these
+	// integration tests share one database, so a platform root left behind by an
+	// earlier test in the file (e.g. ConciergeBornWithBroadcast) collides with
+	// this seed. Downgrade whatever root is standing before planting ours —
+	// exactly what installPlatformAgent's own step 0 does to a non-live root.
+	seedOnlineRoot := func(t *testing.T) {
+		t.Helper()
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE workspaces SET kind = 'workspace'
+			WHERE kind = 'platform' AND parent_id IS NULL AND id <> $1
+		`, liveID); err != nil {
+			t.Fatalf("clear pre-existing platform root: %v", err)
+		}
+		if _, err := conn.ExecContext(ctx, `
+			INSERT INTO workspaces (id, name, kind, parent_id, status, runtime, template)
+			VALUES ($1, $2, 'platform', NULL, 'online', $3, $4)
+			ON CONFLICT (id) DO UPDATE SET kind = 'platform', parent_id = NULL, status = 'online'
+		`, liveID, liveName, defaultConciergeRuntime, conciergeTemplateForRuntime(defaultConciergeRuntime)); err != nil {
+			t.Fatalf("seed live concierge: %v", err)
+		}
+	}
+
+	readKindStatus := func(t *testing.T, id string) (kind, status string, found bool) {
+		t.Helper()
+		err := conn.QueryRowContext(ctx,
+			`SELECT COALESCE(kind::text, ''), COALESCE(status::text, '') FROM workspaces WHERE id = $1`,
+			id).Scan(&kind, &status)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", false
+		}
+		if err != nil {
+			t.Fatalf("read %s: %v", id, err)
+		}
+		return kind, status, true
+	}
+
+	// ── Case 1: foreign id vs ONLINE root → refused, live concierge intact ──
+	seedOnlineRoot(t)
+	err := installPlatformAgent(ctx, conn, foreignID, foreignName, defaultConciergeRuntime)
+	var conflict *platformRootConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("installing foreign id %s over an ONLINE platform root must return "+
+			"*platformRootConflictError (it would otherwise demote a live concierge and "+
+			"install a container-less replacement it never provisions); got err=%v", foreignID, err)
+	}
+	if conflict.ExistingID != liveID {
+		t.Fatalf("conflict names the wrong root: got %s, want the online root %s",
+			conflict.ExistingID, liveID)
+	}
+	if kind, status, found := readKindStatus(t, liveID); !found || kind != "platform" || status != "online" {
+		t.Fatalf("the LIVE concierge was damaged by a refused install: "+
+			"found=%v kind=%q status=%q (want kind=platform status=online)", found, kind, status)
+	}
+	if _, _, found := readKindStatus(t, foreignID); found {
+		t.Fatalf("the refused install still wrote the foreign row %s — the transaction "+
+			"must roll back entirely", foreignID)
+	}
+
+	// ── Case 2: foreign id vs a DEGRADED root → ALSO refused ───────────────
+	//
+	// This is the case the first version of the guard got wrong. It probed
+	// `status = 'online'` alone, so a DEGRADED root fell straight through to the
+	// destructive step-0 downgrade. A degraded concierge is NOT a dead one: it has
+	// a real, running container and is merely failing its health probe — which is
+	// why registry/cp_instance_reconciler.go:168 and :294, healthsweep, hibernation
+	// and wedged_agent all define the live set as IN ('online','degraded'). Row-only
+	// installing over it orphans the container and leaves the org with a concierge
+	// that has none: the exact destruction this guard exists to prevent, reachable
+	// through a narrower window.
+	//
+	// Negative control: this case FAILS against the `status = 'online'` predicate
+	// (install returns nil, liveID is demoted to kind='workspace') and passes only
+	// with IN ('online','degraded').
+	if _, err := conn.ExecContext(ctx,
+		`UPDATE workspaces SET status = 'degraded' WHERE id = $1`, liveID); err != nil {
+		t.Fatalf("mark root degraded: %v", err)
+	}
+	err = installPlatformAgent(ctx, conn, foreignID, foreignName, defaultConciergeRuntime)
+	if !errors.As(err, &conflict) {
+		t.Fatalf("installing foreign id %s over a DEGRADED platform root must ALSO return "+
+			"*platformRootConflictError — a degraded concierge still has a running container, "+
+			"so a row-only install orphans it; got err=%v", foreignID, err)
+	}
+	if kind, status, found := readKindStatus(t, liveID); !found || kind != "platform" || status != "degraded" {
+		t.Fatalf("the DEGRADED concierge was damaged by a refused install: "+
+			"found=%v kind=%q status=%q (want kind=platform status=degraded)", found, kind, status)
+	}
+	if _, _, found := readKindStatus(t, foreignID); found {
+		t.Fatalf("the refused install still wrote the foreign row %s — the transaction "+
+			"must roll back entirely", foreignID)
+	}
+
+	// ── Case 3: foreign id vs a NOT-live root → the repair path still works ──
+	if _, err := conn.ExecContext(ctx,
+		`UPDATE workspaces SET status = 'failed' WHERE id = $1`, liveID); err != nil {
+		t.Fatalf("mark root failed: %v", err)
+	}
+	if err := installPlatformAgent(ctx, conn, foreignID, foreignName, defaultConciergeRuntime); err != nil {
+		t.Fatalf("installing a foreign id over a NOT-online root must still be allowed "+
+			"(this is the non-canonical-id repair the step-0 downgrade exists for); got %v", err)
+	}
+	if kind, _, _ := readKindStatus(t, foreignID); kind != "platform" {
+		t.Fatalf("repair install did not make %s the platform root (kind=%q)", foreignID, kind)
+	}
+	if kind, _, _ := readKindStatus(t, liveID); kind != "workspace" {
+		t.Fatalf("repair install did not downgrade the broken root %s (kind=%q)", liveID, kind)
+	}
+
+	// ── Case 4: same id on an ONLINE root → plain idempotent upsert (the CP path) ──
+	if _, err := conn.ExecContext(ctx,
+		`UPDATE workspaces SET status = 'online' WHERE id = $1`, foreignID); err != nil {
+		t.Fatalf("mark root online: %v", err)
+	}
+	if err := installPlatformAgent(ctx, conn, foreignID, foreignName, defaultConciergeRuntime); err != nil {
+		t.Fatalf("re-installing the SAME id on an online root is the CP's own idempotent "+
+			"path and must never conflict; got %v", err)
+	}
+	if kind, status, _ := readKindStatus(t, foreignID); kind != "platform" || status != "online" {
+		t.Fatalf("idempotent re-install disturbed the root: kind=%q status=%q", kind, status)
 	}
 }

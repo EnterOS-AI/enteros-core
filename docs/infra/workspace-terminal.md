@@ -1,33 +1,22 @@
-# Workspace Terminal
+# Workspace terminal boundary
 
-> **Full runbook moved to the internal repo on 2026-04-22.**
->
-> The implementation-level content (EIC bootstrap script output,
-> per-tenant SG backfill commands, tenant-specific identifiers) now
-> lives at **`Molecule-AI/internal/runbooks/workspace-terminal.md`**
-> (private — Molecule AI org members only).
+Canvas exposes the workspace terminal through the authenticated
+`/workspaces/:id/terminal` WebSocket route. The backend implementation depends
+on the configured lifecycle provider.
 
-## What this feature is (public summary)
+- A local provider may attach to a local container/process.
+- A control-plane provider may proxy a provider-specific remote console.
+- An external workspace may not expose a managed terminal at all.
 
-The canvas Terminal tab opens an interactive shell on a workspace's
-compute — locally this is a `docker exec` into the container; in the
-SaaS tenant path it's an SSH session into the tenant EC2 (or the
-workspace container running on it) over an [EC2 Instance Connect
-Endpoint](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-connect-setup-ec2-instance-connect-endpoint.html).
-End users see a terminal; no direct public SSH ingress is required.
+Core must not describe the control-plane terminal as universally using SSH,
+EC2 Instance Connect, a particular VM, or a fixed security-group topology.
+Provider-specific implementations belong in the current control-plane code and
+their dated operational runbooks.
 
-Tracking: originally `molecule-core#1528` (resolved 2026-04-22). Future
-terminal work is tracked in `molecule-core` issues (workspace-server scope)
-and in `molecule-controlplane` issues for the EIC / per-tenant SG path.
+The terminal route remains subject to the router's authentication and workspace
+authorization. Terminal access is privileged execution, not merely an
+observability view; never expose it through a fail-open or cosmetic Canvas auth
+path.
 
-## Where things are
-
-- **Go handler:** [`workspace-server/internal/handlers/terminal.go`](../../workspace-server/internal/handlers/terminal.go)
-- **CP provisioner (EIC endpoint, per-tenant SG):** `Molecule-AI/molecule-controlplane/internal/provisioner/ec2.go` — `EICEndpointSGID` field
-- **Bootstrap script:** `Molecule-AI/molecule-controlplane/scripts/bootstrap-eic-terminal.sh`
-- **Detailed ops runbook (internal):** `Molecule-AI/internal/runbooks/workspace-terminal.md`
-
-Why the split: the bootstrap-script output + per-tenant SG ingress
-backfill commands include AWS resource IDs and tenant slugs that
-don't belong in a public repo, but the high-level design is useful
-for external readers + self-hosters.
+Verify a terminal change against the exact configured provider and an actual
+interactive command/exit flow, not only WebSocket upgrade success.

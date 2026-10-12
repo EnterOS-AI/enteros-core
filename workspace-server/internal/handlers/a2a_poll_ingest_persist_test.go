@@ -115,7 +115,7 @@ func TestProxyA2A_PollMode_PersistsUserMessageSynchronouslyBeforeQueuedResponse(
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	start := time.Now()
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 	elapsed := time.Since(start)
 
 	// Defining assertion #1: the handler must not have returned the

@@ -29,13 +29,14 @@ package staginge2e
 // / adminCreateOrg / adminDeleteTenant / tenantAdminToken / tenantCreateWorkspace
 // / waitForWorkspaceOnlineRoutable / waitForWorkspaceStatus / doTenantJSON /
 // serveProbe / jsonField). NOTHING here re-implements org provisioning or
-// teardown — t.Cleanup-driven admin DELETE guarantees no leaked tenant.
+// teardown; the shared harness schedules an exact-slug admin DELETE before it
+// waits for provisioning, retries transient lifecycle conflicts, and requires
+// exact-slug absence before the E2E can pass.
 //
 // Guarded by the staging_e2e build tag + STAGING_E2E=1 (requireStagingEnv).
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -44,16 +45,20 @@ import (
 func TestPluginInstallLifecycle_Staging(t *testing.T) {
 	cfg := requireStagingEnv(t)
 
-	slug := fmt.Sprintf("e2e-plgn-%d", time.Now().Unix()%100000000)
+	slug := e2eSlug("plgn")
 	t.Logf("plugin-lifecycle: slug=%s", slug)
 
 	// --- Step 1: provision throwaway org + tenant (reused scaffolding) ---
 	orgID := adminCreateOrg(t, cfg, slug)
-	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
 	host := slug + "." + cfg.subdomainSuffix
 	token := tenantAdminToken(t, cfg, slug)
 	waitForHTTP(t, host, http.StatusOK, 10*time.Minute, "tenant /health ready")
 	t.Logf("tenant TLS ready: %s", host)
+	// /health is allowlisted and goes green before the app's real proxied routes
+	// serve (controlplane#1012). Gate on the actual /plugins route the next
+	// subtest asserts, to a stable streak, before reading it — otherwise a
+	// transient boot-window 503 flakes registry_non_empty.
+	waitForTenantRoute(t, host, "/plugins", token, orgID, 2, 3*time.Minute, "tenant /plugins ready")
 
 	// --- Step 2: registry must be non-empty BEFORE we pick a plugin ----------
 	// This is independent of any workspace — the registry is host-local
@@ -119,6 +124,12 @@ func TestPluginInstallLifecycle_Staging(t *testing.T) {
 		// the workspace lifecycle gate instead of a one-shot probe.
 		assertServes(t, host, token, orgID, wsID, "post-plugin-install")
 		t.Logf("agent served A2A after install — stayed online through the restart")
+
+		// ...and it must STILL be up minutes later. Every assertion above is
+		// one-shot and a workspace in a restart LOOP satisfies all of them in
+		// the window between restarts — that is exactly how core#5011 reached a
+		// customer with this gate green. See assertWorkspaceStaysUp.
+		assertWorkspaceStaysUp(t, host, token, orgID, wsID, 3*time.Minute, "post-plugin-install stability")
 	})
 
 	// --- Step 5: the core#182 local-docker 502 regression guard ---------------
@@ -254,4 +265,86 @@ func pollListInstalledContains(t *testing.T, host, token, orgID, wsID, name stri
 		time.Sleep(10 * time.Second)
 	}
 	return false
+}
+
+// assertWorkspaceStaysUp fails when a workspace RESTARTS during the sample
+// window, by watching `uptime_seconds` for a DECREASE.
+//
+// WHY THIS EXISTS — core#5011, a production incident CI could not have caught.
+//
+// A customer's coordinator restarted 24-32 times an hour and its agent never
+// survived long enough to complete a turn. The control plane's install
+// classifier compared a freshly cloned staged tree against the LIVE tree and
+// counted runtime-generated files (a plugin daemon's `*.egg-info/` and
+// `__pycache__/*.pyc`) as content. Those never exist in a clone, so the trees
+// differed permanently, every reconcile classified `cold` and restarted the
+// workspace, and every restart fired fireReconcileOnline, which reconciled
+// again:
+//
+//	reconcile -> cold -> restart -> online -> reconcile -> cold -> ...
+//
+// Every existing e2e assertion PASSED against that box. They are all one-shot:
+// provision, assert online, assert a tool answers, done. A workspace in a
+// ~100-second restart loop satisfies every one of them in the window between
+// restarts. The gate was blind not because it lacked a plugin test, but because
+// nothing ever asked "is it STILL up a few minutes later".
+//
+// uptime_seconds is monotonic within one container lifetime (the heartbeat
+// writes it every cycle) and resets to 0 on restart, so a decrease is a restart
+// — no docker access or log scraping required, and it works against a remote
+// SaaS tenant.
+//
+// NOT a flake risk: a healthy workspace never decreases uptime. If this ever
+// reds, a workspace really did restart while nothing asked it to.
+func assertWorkspaceStaysUp(t *testing.T, host, token, orgID, wsID string, window time.Duration, why string) {
+	t.Helper()
+	const interval = 15 * time.Second
+	deadline := time.Now().Add(window)
+	var prev int64 = -1
+	samples, restarts := 0, 0
+	for time.Now().Before(deadline) {
+		u := "https://" + host + "/workspaces/" + wsID
+		_, body := doTenantJSON(t, "GET", u, token, orgID, "")
+		cur := topLevelInt(body, "uptime_seconds")
+		if cur < 0 {
+			t.Fatalf("[%s] workspace read has no uptime_seconds — this gate cannot "+
+				"observe restarts without it; body=%s", why, truncate(body, 300))
+		}
+		if prev >= 0 && cur < prev {
+			restarts++
+			t.Errorf("[%s] workspace RESTARTED: uptime_seconds went %d -> %d. "+
+				"Nothing asked it to restart, so something is re-provisioning it in a "+
+				"loop (core#5011: the install classifier counting runtime-generated "+
+				"files as content is one way this happens).", why, prev, cur)
+		}
+		prev = cur
+		samples++
+		time.Sleep(interval)
+	}
+	if samples < 3 {
+		t.Fatalf("[%s] only %d uptime samples in %s — the window is too short to "+
+			"prove stability, and a gate that cannot observe must not report success",
+			why, samples, window)
+	}
+	if restarts == 0 {
+		t.Logf("[%s] workspace stayed up across %d samples over %s (no uptime reset)",
+			why, samples, window)
+	}
+}
+
+// topLevelInt is topLevelString's numeric sibling; -1 when missing/not a number.
+func topLevelInt(body, key string) int64 {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &m); err != nil {
+		return -1
+	}
+	raw, ok := m[key]
+	if !ok {
+		return -1
+	}
+	var n int64
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return -1
+	}
+	return n
 }

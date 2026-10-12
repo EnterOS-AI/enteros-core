@@ -22,6 +22,7 @@ import {
   PARENT_SIDE_PADDING,
   TopologyCycleError,
 } from "./canvas-topology";
+import { mergeBootTelemetry } from "./boot-telemetry";
 
 /**
  * Walk every parent node and bump its width/height (if explicitly set)
@@ -84,6 +85,16 @@ export { WORKSPACE_KIND } from "@/lib/workspace-kind";
 export interface WorkspaceNodeData extends Record<string, unknown> {
   name: string;
   status: string;
+  /** Greeting-first UI readiness (decoupled from serving status): true once the
+   *  agent's first-boot greeting has landed in chat. While status="online" but
+   *  greeted is false, the node renders a "warming up / composing greeting"
+   *  state instead of full "ready" — the workspace IS serving, it just hasn't
+   *  spoken yet. Set live by the AGENT_MESSAGE handler and, on reload, hydrated
+   *  from the GET /workspaces `greeted` field so an already-greeted workspace
+   *  doesn't flash warming. A per-node UI timeout also clears warming so a
+   *  workspace whose greeting never lands (greeting disabled, agent error) still
+   *  settles to ready. Absent on older builds → treat as greeted (no warming). */
+  greeted?: boolean;
   tier: number;
   agentCard: Record<string, unknown> | null;
   activeTasks: number;
@@ -141,7 +152,7 @@ export interface WorkspaceNodeData extends Record<string, unknown> {
    *  builds — that fallthrough is treated as "push" to match
    *  ws-server's `lookupDeliveryMode` default. */
   deliveryMode?: string;
-  /** Desired EC2/container shape persisted in workspaces.compute. Applied
+  /** Desired workspace-host/container shape persisted in workspaces.compute. Applied
    *  at next restart/reprovision, and used to determine Display tab
    *  availability. */
   compute?: WorkspaceCompute;
@@ -150,13 +161,46 @@ export interface WorkspaceNodeData extends Record<string, unknown> {
    *  config volume. UI-only, cleared after restart. */
   applyTemplateOnRestart?: boolean;
   /** "Enter OS" boot-sequence steps, appended by the BOOT_STEP WS handler
-   *  while the workspace is `provisioning`. Drives BootSequenceScreen's
-   *  per-step keycap animation + watchdog log. Absent/empty until the
-   *  runtime emits its first BOOT_STEP — the boot screen degrades to a
-   *  generic indeterminate boot when there are none. Cleared implicitly
-   *  once the workspace leaves `provisioning` (the screen unmounts).
-   *  Latest status per `step` wins (a step goes running → ok/failed). */
+   *  while the workspace is `provisioning` and restored from the server's
+   *  `boot_steps` replay on hydrate (events/boottrace.go). Drives
+   *  BootSequenceScreen's per-step keycap animation. Absent/empty until the
+   *  first BOOT_STEP is seen — the boot screen degrades to a generic
+   *  indeterminate boot when there are none. Cleared implicitly once the
+   *  workspace leaves `provisioning` (the screen unmounts; a reprovision
+   *  starts a fresh server-side history). Latest status per `step` wins
+   *  (a step goes running → ok/failed). */
   bootSteps?: BootStep[];
+  /** Append-only watchdog log for the boot screen — one line per distinct
+   *  (step, status, message) observation, including the 20s "still
+   *  building…" heartbeats that latest-per-step `bootSteps` overwrites.
+   *  Owned by the store (not the component) so panel remounts and
+   *  rehydrates never reset the log. Capped at MAX_BOOT_LOG_LINES. */
+  bootLog?: BootLogLine[];
+  /** Server boot-generation marker (events/boottrace.go): identifies WHICH
+   *  boot the replayed history belongs to. hydrate uses it to decide
+   *  same-generation MERGE vs new-generation RESET — a call timestamps
+   *  cannot make across server/client clocks. Absent until a replay
+   *  carrying one is adopted. */
+  bootGen?: string;
+}
+
+/** One rendered watchdog-log line (see WorkspaceNodeData.bootLog). */
+export interface BootLogLine {
+  id: string;
+  /** Observation time, unix ms — server clock when replayed, client clock
+   *  when live. Used only for computing the NEXT line's delta; never
+   *  compared across arbitrary lines (the clocks differ). */
+  at: number;
+  /** Immutable display offset, ms since the boot's first line — computed at
+   *  append time from clamped same-clock deltas (boot-telemetry.ts), so it
+   *  survives remounts, cap-drops and clock skew without re-basing. */
+  t: number;
+  /** Clock domain of `at` (see BootStep.serverClock) — consulted when the
+   *  NEXT line computes its delta, so a server→client boundary can't inject
+   *  raw cross-clock skew into the offset column. */
+  serverClock?: boolean;
+  status: "running" | "ok" | "failed";
+  text: string;
 }
 
 /** One boot-sequence step, mirrored from the Go BOOT_STEP wire payload
@@ -178,6 +222,15 @@ export interface BootStep {
   status: "running" | "ok" | "failed";
   /** Optional log line; the failure reason when status === "failed". */
   message?: string;
+  /** Observation time, unix ms — server-stamped on replayed history,
+   *  client arrival time on live events. Optional: absent on steps stored
+   *  before this field existed. */
+  at?: number;
+  /** Which clock stamped `at` — true for the server (replayed history),
+   *  false/absent for this client (live events). Deltas across a clock
+   *  boundary are clamped when deriving display offsets, so skew can't
+   *  distort the watchdog timeline (boot-telemetry.ts). */
+  serverClock?: boolean;
 }
 
 export type PanelTab = "details" | "skills" | "chat" | "terminal" | "display" | "container-config" | "config" | "schedule" | "channels" | "files" | "memory" | "traces" | "events" | "activity" | "audit";
@@ -218,6 +271,13 @@ interface CanvasState {
   // palette. Set by TemplatePalette's toggle button.
   templatePaletteOpen: boolean;
   setTemplatePaletteOpen: (open: boolean) => void;
+  /** True once SelfHostSetupScene's async first-run gate has evaluated
+   *  (whatever the verdict). Until then, ConciergeShell holds a neutral
+   *  loading screen when no platform root exists — otherwise a fresh
+   *  self-host load flashes the "concierge missing/offline" shell for the
+   *  second the gate takes to resolve before the onboarding overlay mounts. */
+  selfHostGateResolved: boolean;
+  setSelfHostGateResolved: (resolved: boolean) => void;
   hydrate: (workspaces: WorkspaceData[]) => void;
   applyEvent: (msg: WSMessage) => void;
   onNodesChange: (changes: NodeChange<Node<WorkspaceNodeData>>[]) => void;
@@ -306,9 +366,24 @@ interface CanvasState {
   batchRestart: () => Promise<void>;
   batchPause: () => Promise<void>;
   batchDelete: () => Promise<void>;
-  /** Agent-pushed messages keyed by workspace ID. ChatTab consumes and clears these. */
+  /** Agent-pushed messages keyed by workspace ID — a LIVE HAND-OFF to a mounted
+   *  chat view, NOT a durable mailbox. It buffers only for workspaces that
+   *  currently have a retained consumer, and it is discarded when the last one
+   *  releases. Anything delivered while no chat view is mounted is dropped on
+   *  purpose: the platform has already persisted it, so the next mount hydrates
+   *  it from GET /chat-history. A queue that outlives its consumer gets
+   *  re-rendered on remount ON TOP of the hydrated copy and the user sees the
+   *  message twice. */
   agentMessages: Record<string, Array<{ id: string; content: string; timestamp: string; messageId?: string; attachments?: Array<{ name: string; uri: string; mimeType?: string; size?: number }> }>>;
   consumeAgentMessages: (workspaceId: string) => Array<{ id: string; content: string; timestamp: string; messageId?: string; attachments?: Array<{ name: string; uri: string; mimeType?: string; size?: number }> }>;
+  /** Number of mounted chat views currently able to render live agent messages
+   *  for a workspace. Gates whether `agentMessages` buffers at all. */
+  agentMessageConsumers: Record<string, number>;
+  /** Register a mounted chat view as a live consumer for `workspaceId`. */
+  retainAgentMessages: (workspaceId: string) => void;
+  /** Unregister a chat view. When the LAST consumer for a workspace releases,
+   *  its pending queue is discarded — see `agentMessages`. */
+  releaseAgentMessages: (workspaceId: string) => void;
   /** WebSocket connection status — drives the live indicator in the Toolbar. */
   wsStatus: "connected" | "connecting" | "disconnected";
   setWsStatus: (status: "connected" | "connecting" | "disconnected") => void;
@@ -341,6 +416,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   setSidePanelWidth: (w) => set({ sidePanelWidth: w }),
   templatePaletteOpen: false,
   setTemplatePaletteOpen: (open) => set({ templatePaletteOpen: open }),
+  selfHostGateResolved: false,
+  setSelfHostGateResolved: (resolved) => set({ selfHostGateResolved: resolved }),
   // Batch selection
   selectedNodeIds: new Set<string>(),
   toggleNodeSelection: (id) => {
@@ -459,6 +536,32 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       set({ agentMessages: rest });
     }
     return msgs;
+  },
+  agentMessageConsumers: {},
+  retainAgentMessages: (workspaceId) => {
+    const { agentMessageConsumers } = get();
+    set({
+      agentMessageConsumers: {
+        ...agentMessageConsumers,
+        [workspaceId]: (agentMessageConsumers[workspaceId] ?? 0) + 1,
+      },
+    });
+  },
+  releaseAgentMessages: (workspaceId) => {
+    const { agentMessageConsumers, agentMessages } = get();
+    const remaining = (agentMessageConsumers[workspaceId] ?? 0) - 1;
+    if (remaining > 0) {
+      set({
+        agentMessageConsumers: { ...agentMessageConsumers, [workspaceId]: remaining },
+      });
+      return;
+    }
+    // Last consumer gone: drop the counter AND any queue it never drained.
+    // The queue is a live hand-off; an undrained one is a duplicate waiting to
+    // happen, because the next mount hydrates the same message from the DB.
+    const { [workspaceId]: _c, ...restConsumers } = agentMessageConsumers;
+    const { [workspaceId]: _m, ...restMessages } = agentMessages;
+    set({ agentMessageConsumers: restConsumers, agentMessages: restMessages });
   },
   setViewport: (v) => set({ viewport: v }),
   saveViewport: async (x, y, zoom) => {
@@ -1001,6 +1104,59 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         layoutOverrides,
         currentParentSizes,
       );
+      // Boot-telemetry carry-over — decided by the server's boot-GENERATION
+      // marker, never by timestamps (replayed `at`s are server-stamped,
+      // local ones client-stamped; cross-clock math breaks under skew) and
+      // never by length heuristics (a fresh boot's replay is legitimately
+      // shorter than a stale boot's local log):
+      //   - field absent → old platform that doesn't track history: keep
+      //     what this session accumulated over WS.
+      //   - present WITHOUT a generation → this server instance holds no
+      //     trace (restarted mid-boot / other instance): it knows nothing,
+      //     keep local.
+      //   - present with the SAME generation we hold → same boot: MERGE
+      //     (the replay is a snapshot ~1 RTT old; live events consumed
+      //     meanwhile are newer — adopting verbatim would regress keycaps
+      //     and drop just-streamed lines until the next rehydrate).
+      //   - present with a DIFFERENT generation (or we hold none) → a new
+      //     boot: adopt the replay verbatim, even empty — the previous
+      //     boot's keycaps/log/failure banner must not bleed into it.
+      const liveById = new Map(live.map((w) => [w.id, w]));
+      const prevById = new Map(current.map((n) => [n.id, n]));
+      for (const n of nodes) {
+        if (n.data.status !== "provisioning") continue;
+        const w = liveById.get(n.id);
+        const hasField = Array.isArray(w?.boot_steps);
+        const gen = typeof w?.boot_generation === "string" ? w.boot_generation : undefined;
+        const prev = prevById.get(n.id);
+        const local = prev?.data.bootSteps?.length ? prev.data : undefined;
+        if (!hasField || gen === undefined) {
+          if (local) {
+            n.data = {
+              ...n.data,
+              bootSteps: local.bootSteps,
+              bootLog: local.bootLog,
+              bootGen: local.bootGen,
+            };
+          }
+          continue;
+        }
+        if (local && local.bootGen === gen) {
+          const merged = mergeBootTelemetry(
+            n.data.bootSteps ?? [],
+            n.data.bootLog ?? [],
+            local.bootSteps ?? [],
+            local.bootLog ?? [],
+          );
+          n.data = { ...n.data, ...merged, bootGen: gen };
+        }
+        // else: a different (or unproven — local streamed live before any
+        // replay stamped its generation) generation: keep the replay exactly
+        // as built. Ambiguity resolves toward the server — safe against
+        // stale-boot bleed-through at the cost of at most one RTT of live
+        // lines, once; this hydrate stamps bootGen so every later rehydrate
+        // merges.
+      }
       // Clear any stale hydration error from a previous failed load so a
       // successful rehydrate does not leave the user staring at an old
       // error banner (core#2921).

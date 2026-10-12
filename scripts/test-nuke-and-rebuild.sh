@@ -14,9 +14,6 @@
 #   4. Platform exposes the templates it sees on disk. Regression target:
 #      bind-mount drift between docker-compose.yml and the platform
 #      config (CONFIGS_HOST_DIR / CONFIGS_DIR misalignment).
-#   5. The image-auto-refresh watcher (PR #2114) starts. Regression
-#      target: someone defaults IMAGE_AUTO_REFRESH back to false in
-#      compose, breaking the runtime CD chain users now rely on.
 #
 # Usage:
 #   bash scripts/test-nuke-and-rebuild.sh
@@ -142,10 +139,6 @@ DISK_COUNT=$(find "$ROOT/workspace-configs-templates" -mindepth 1 -maxdepth 1 2>
 PLATFORM_COUNT=$(docker exec molecule-monorepo-platform-1 sh -c 'find /configs -mindepth 1 -maxdepth 1 2>/dev/null | wc -l' | tr -d ' ' || echo 0)
 check "platform sees same template count as disk ($DISK_COUNT)" \
   "[ \"$PLATFORM_COUNT\" = \"$DISK_COUNT\" ]"
-
-# IMAGE_AUTO_REFRESH watcher should log its startup line (PR #2114).
-check "image-auto-refresh watcher started" \
-  "docker logs molecule-monorepo-platform-1 2>&1 | grep -q 'image-auto-refresh: started'"
 
 echo ""
 echo "=== Result: $PASS passed, $FAIL failed ==="

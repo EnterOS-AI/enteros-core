@@ -566,8 +566,8 @@ func TestCollectCPConfigFiles_AssetsNotBoundBy256KCap(t *testing.T) {
 }
 
 // TestCollectCPConfigFiles_ConfigFilesStillCappedAt256K pins that lifting the
-// asset cap did NOT relax the SM/user-data transport limit: the SM-bound
-// ConfigFiles bundle keeps its 256 KiB cap (cpConfigFilesMaxBytes).
+// asset cap did NOT relax the compatibility transport guard: ConfigFiles
+// keeps its 256 KiB cap (cpConfigFilesMaxBytes).
 func TestCollectCPConfigFiles_ConfigFilesStillCappedAt256K(t *testing.T) {
 	big := make([]byte, (256<<10)+1)
 	for i := range big {
@@ -577,7 +577,7 @@ func TestCollectCPConfigFiles_ConfigFilesStillCappedAt256K(t *testing.T) {
 		ConfigFiles: map[string][]byte{"system-prompt.md": big},
 	}
 	if _, _, err := collectCPConfigFiles(cfg); err == nil {
-		t.Fatal("ConfigFiles over 256 KiB must still be rejected (SM/user-data transport cap unchanged)")
+		t.Fatal("ConfigFiles over 256 KiB must still be rejected (compatibility transport guard unchanged)")
 	}
 }
 

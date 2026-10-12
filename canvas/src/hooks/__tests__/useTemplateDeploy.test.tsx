@@ -35,9 +35,16 @@ const { mockApiPost, mockApiGet, mockCheckDeploySecrets, mockResolveRuntime } =
     mockResolveRuntime: vi.fn(),
   }));
 
-vi.mock("@/lib/api", () => ({
-  api: { post: mockApiPost, get: mockApiGet },
-}));
+// Spread the real module so PlatformUnavailableError (used by the create
+// path's cold-origin retry classifier, workspaceCreateRetry.ts) stays a real
+// constructor for `instanceof`; only the `api` object's methods are mocked.
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>();
+  return {
+    ...actual,
+    api: { post: mockApiPost, get: mockApiGet },
+  };
+});
 
 vi.mock("@/lib/deploy-preflight", async () => {
   // Re-export the real types; only swap the runtime functions.

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
-# FULL-JOURNEY staging E2E — the SSOT real-LLM gate that runs PER-PR (as the
-# required "E2E Staging Concierge Creates Workspace" context) AND is mirrored by
-# the deploy-pipeline staging gate that blocks the prod promote
-# (molecule-controlplane scripts/deploy/local-cp-staging-e2e-gate.sh). Every step
-# is a REAL assertion (a deterministic side effect / a real completion), never a
-# PONG. LLM = MiniMax (cheap): the org is platform-managed (the CP LLM proxy
+# FULL-JOURNEY staging E2E — the SSOT real-LLM scenario. Its workflow runs a
+# credential-free syntax self-check on pull requests and the real live journey
+# only on push-to-main / dispatch. It is an independent staging signal, not an
+# ordering dependency for staging-CD or production redeploy. The controlplane
+# pipeline has its own matching staging scenario. Every step here is a REAL
+# assertion (a deterministic side effect / a real completion), never a PONG.
+# LLM = MiniMax (cheap): the org is platform-managed (the CP LLM proxy
 # supplies the MiniMax default) so agent turns stay short + cheap.
 #
 #   STEP 1  CREATE A NEW ORG          via the CP admin API; wait running + tenant
@@ -41,8 +42,9 @@
 #                                     "Not logged in"/error/empty. This reds on the
 #                                     created-agent auth bug (no LLM token) and is
 #                                     INDEPENDENT of runtime#181.
-#   STEP 6  TEARDOWN                  the throwaway org is deleted cleanly (trap),
-#                                     leak-checked (org row + EC2).
+#   STEP 6  TEARDOWN                  the throwaway org is deleted through the
+#                                     synchronous CP purge; its exact receipt,
+#                                     audit row, and org absence are verified.
 #
 # NOTE on "team": this architecture has no separate create_team verb — a team is
 # realised as workspace(s) under the org, and the management MCP
@@ -87,10 +89,10 @@
 #
 # Env contract (same as test_staging_concierge_e2e.sh / test_staging_full_saas.sh):
 #   MOLECULE_CP_URL        default: https://staging-api.moleculesai.app
-#   MOLECULE_ADMIN_TOKEN   CP admin bearer — Railway staging CP_ADMIN_API_TOKEN
+#   MOLECULE_ADMIN_TOKEN   staging CP admin bearer from Infisical /shared/controlplane-admin
 #
 # Optional env:
-#   E2E_PROVISION_TIMEOUT_SECS    default 900 (15 min cold tenant EC2 budget)
+#   E2E_PROVISION_TIMEOUT_SECS    default 900 (15 min cold tenant budget)
 #   E2E_CONCIERGE_ONLINE_SECS     default 900 (concierge boot-to-online budget)
 #   E2E_MCP_TOOLS_SECS            default 240 (STEP 4.5 poll budget for the
 #                                 loaded_mcp_tools heartbeat to publish
@@ -99,8 +101,7 @@
 #                                 send the message — generous for nondeterminism)
 #   E2E_KEEP_ORG                  1 → skip teardown (debugging only)
 #   E2E_RUN_ID                    slug suffix; CI: ${GITHUB_RUN_ID}-${RUN_ATTEMPT}
-#   E2E_AWS_LEAK_CHECK            auto (default) | required | off
-#   E2E_AWS_TERMINATE_LEAKS      1 → terminate slug-tagged leaked EC2 on exit
+#   E2E_INFRA_BACKEND             required: local-docker (only active backend)
 #   E2E_REQUIRE_LIVE             1 → a SKIP for "no concierge on platform image"
 #                                 becomes a hard FAIL (CI sets this so a silently-
 #                                 missing platform-agent image can't false-green
@@ -111,7 +112,7 @@
 #   1  generic / assertion failure (agent didn't act, or tool failed)
 #   2  missing required env
 #   3  provisioning timed out
-#   4  teardown left orphan resources
+#   4  teardown receipt/audit/org-absence proof failed
 #   5  E2E_REQUIRE_LIVE=1 but the concierge could not be exercised (no
 #      platform-agent image / never came online) — false-green guard
 set -euo pipefail
@@ -121,10 +122,21 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck disable=SC1091
 # shellcheck source=_lib.sh
 source "$SCRIPT_DIR/_lib.sh"
-# AWS-leak-check lib — same teardown leak assertion the full-SaaS harness uses.
+# Exact synchronous CP purge receipt + exact-org absence verifier.
 # shellcheck disable=SC1091
-# shellcheck source=lib/aws_leak_check.sh
-source "$SCRIPT_DIR/lib/aws_leak_check.sh"
+# shellcheck source=lib/cp_purge_receipt.sh
+source "$SCRIPT_DIR/lib/cp_purge_receipt.sh"
+
+# shellcheck source=lib/tenant_api_ready.sh
+source "$SCRIPT_DIR/lib/tenant_api_ready.sh"
+# Shared tenant-facing routing/CORS topology deriver (the #4406 contract extracted
+# into ONE helper). Default (all MOLECULE_TENANT_* unset) reproduces exact staging
+# behaviour; the ephemeral runner sets MOLECULE_TENANT_URL/_ROUTE_DOMAIN/_ORIGIN_
+# TEMPLATE to route by slug over the loopback CP.
+# shellcheck disable=SC1091
+# shellcheck source=lib/tenant_topology.sh
+source "$SCRIPT_DIR/lib/tenant_topology.sh"
+e2e_cp_require_local_backend || exit 2
 # Real-completion error-as-text scanner — used to detect the concierge
 # surfacing its tool/LLM error AS a reply ("Agent error …") so a broken agent
 # can't read as "asked but politely declined".
@@ -152,6 +164,7 @@ source "$SCRIPT_DIR/lib/provision_tool_ssot.sh"
 source "$SCRIPT_DIR/lib/obs.sh"
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
+e2e_cp_require_staging_origin "$CP_URL" || exit 2
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:-}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 CONCIERGE_ONLINE_SECS="${E2E_CONCIERGE_ONLINE_SECS:-900}"
@@ -174,22 +187,22 @@ fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; [ -n "${OBS_RUN_ID:-}" ] && obs_
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 
 # ─── PR-mode early-exit (core#3081 / CR2 #12653) ──────────────────────────────
-# A required status context that never fires on pull_request degrades the
-# merge gate to a silent indefinite pending (the failure mode
-# lint-required-no-paths exists to prevent). The workflow sets
-# E2E_REQUIRE_LIVE=0 on pull_request runs because PRs do not have staging
-# creds wired; the real staging test would just exit 2 at the ADMIN_TOKEN
-# check below. The PR-mode gate is a self-check:
+# The workflow emits this job's status on pull_request, but the context is not
+# presence-required by the merge queue while parked in required-contexts.txt.
+# A posted red still blocks through main's branch-protection wildcard. The
+# workflow sets E2E_REQUIRE_LIVE=0 on pull_request because PRs do not have
+# staging creds wired; the real staging test would exit 2 at the ADMIN_TOKEN
+# check below. The PR-mode arm is a self-check:
 #   - bash -n on the script's own syntax (catches PR-merge regressions
 #     that break the script BEFORE it runs).
-# On push / dispatch / cron, E2E_REQUIRE_LIVE=1, the real staging test
+# On push / dispatch, E2E_REQUIRE_LIVE=1, the real staging test
 # runs against live staging, and skip_loud on missing infra exits 5
 # (HARD FAIL — the false-green guard).
 if [ "${REQUIRE_LIVE}" = "0" ] && [ -z "${ADMIN_TOKEN}" ]; then
   log "PR-mode: E2E_REQUIRE_LIVE=0 and no MOLECULE_ADMIN_TOKEN — skipping live staging test."
-  log "(the real staging test runs on push-to-main / dispatch / cron with E2E_REQUIRE_LIVE=1)"
+  log "(the real staging test runs on push-to-main / dispatch with E2E_REQUIRE_LIVE=1)"
   # Self-check: bash -n on the script's own syntax. The script IS the
-  # gate on push; on PR, the gate is 'script exists and is bash-clean'.
+  # live validation on push; on PR, the arm is 'script exists and is bash-clean'.
   if ! bash -n "$0"; then
     fail "PR-mode self-check FAILED: bash -n on $0 returned non-zero — script has a syntax error"
   fi
@@ -201,7 +214,7 @@ fi
 # dispatched local run (the original PR test path) — keep the original
 # strict check below.
 if [ -z "${ADMIN_TOKEN}" ]; then
-  fail "MOLECULE_ADMIN_TOKEN required (Railway staging CP_ADMIN_API_TOKEN) — E2E_REQUIRE_LIVE=1 needs staging creds"
+  fail "MOLECULE_ADMIN_TOKEN required (staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin) — E2E_REQUIRE_LIVE=1 needs staging creds"
 fi
 # Collision-proof slug (core#2782). The prior `head -c 32` truncation
 # dropped the run_attempt suffix and let two parallel/retry runs
@@ -415,26 +428,34 @@ poll_push_async_chat_history() {
 CURL_COMMON=(-sS --max-time 30)
 TMPDIR_E2E=$(mktemp -d -t cncrg-mk-XXXXXX)
 
-# ─── teardown trap (worker delete + org delete + leak check) ─────────────────
+# ─── teardown trap (worker delete + exact CP purge proof) ────────────────────
 CLEANUP_DONE=0
 WORKER_ID=""        # set once the concierge creates it (for targeted delete)
 TENANT_URL=""       # set after provisioning
 TENANT_TOKEN=""
 ORG_ID=""
+ORG_CREATION_VERIFIED=0
 cleanup() {
   local entry_rc=$?
   [ "$CLEANUP_DONE" = "1" ] && return 0
   CLEANUP_DONE=1
   rm -rf "$TMPDIR_E2E" 2>/dev/null || true
 
+  if [ "$ORG_CREATION_VERIFIED" != "1" ]; then
+    log "No verified creation-returned org identity for $SLUG — skipping destructive org teardown."
+    [ -n "${OBS_RUN_ID:-}" ] && obs_run_end "$( [ "$entry_rc" = "0" ] && echo skip || echo fail )"
+    case "$entry_rc" in 0|1|2|3|4|5) return 0 ;; *) exit 1 ;; esac
+  fi
+
   # Best-effort targeted delete of the worker the concierge created, so the org
   # delete below isn't the only thing reaping it (defensive — org delete cascades
   # anyway). Only attempted if we resolved its id and have tenant creds.
   if [ -n "$WORKER_ID" ] && [ -n "$TENANT_URL" ] && [ -n "$TENANT_TOKEN" ]; then
     curl "${CURL_COMMON[@]}" -X DELETE "$TENANT_URL/workspaces/$WORKER_ID?confirm=true" \
+      "${TENANT_ROUTE_HDRS[@]}" \
       -H "Authorization: Bearer $TENANT_TOKEN" \
       -H "X-Molecule-Org-Id: $ORG_ID" \
-      -H "Origin: $TENANT_URL" \
+      -H "Origin: $TENANT_ORIGIN" \
       -H "X-Confirm-Name: $WORKER_NAME" >/dev/null 2>&1 || true
   fi
 
@@ -445,47 +466,35 @@ cleanup() {
   fi
   [ -n "${OBS_RUN_ID:-}" ] && obs_step_start teardown
   log "🧹 Tearing down org $SLUG..."
-  if curl "${CURL_COMMON[@]}" --max-time 120 -X DELETE "$CP_URL/cp/admin/tenants/$SLUG" \
-    -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
-    -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1; then
-    ok "Teardown request accepted"
-  else
-    log "Teardown returned non-2xx (may already be gone)"
-  fi
-
-  # Eventual-consistency wait: org row gone / purged.
-  local leak_count=1 elapsed=0
-  while [ "$elapsed" -lt 60 ]; do
-    leak_count=$(curl "${CURL_COMMON[@]}" "$CP_URL/cp/admin/orgs" \
-      -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null \
-      | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for o in d.get('orgs', []) if o.get('slug')=='$SLUG' and o.get('status') != 'purged'))" \
-      2>/dev/null || echo 1)
-    [ "$leak_count" = "0" ] && break
-    sleep 5; elapsed=$((elapsed + 5))
-  done
-  if [ "$leak_count" != "0" ]; then
-    echo "⚠️  LEAK: org $SLUG still present post-teardown after ${elapsed}s (count=$leak_count)" >&2
+  local purge_verify_rc=0
+  e2e_cp_delete_and_verify_purge \
+    "$CP_URL" "$ADMIN_TOKEN" "$SLUG" "$ORG_ID" || purge_verify_rc=$?
+  if [ "$purge_verify_rc" != "0" ]; then
     if [ -n "${OBS_RUN_ID:-}" ]; then
-      obs_leak org "$SLUG" "executeOrgPurge:purgeDBRows (org row survived admin-list)"
-      obs_step_end zero_leftover_verify fail "org $SLUG still present post-teardown after ${elapsed}s (count=$leak_count)" "elapsed_secs=$elapsed"
+      obs_step_end teardown fail "CP purge receipt/audit or exact-tenant HTTP 404 verification failed" "purge_verify_rc=$purge_verify_rc"
+      obs_step_end zero_leftover_verify skip "direct provider enumeration was not performed" "purge_verify_rc=$purge_verify_rc"
       obs_run_end fail
     fi
-    exit 4
+    case "$purge_verify_rc" in 2) exit 2 ;; *) exit 4 ;; esac
   fi
-  local aws_leak_rc=0
-  e2e_verify_no_ec2_leaks_for_slug "$SLUG" || aws_leak_rc=$?
-  if [ "$aws_leak_rc" != "0" ]; then
-    if [ -n "${OBS_RUN_ID:-}" ]; then
-      obs_leak ec2 "$SLUG" "CascadeWorkspaceEC2s / deprovisionTenantInfra (slug-tagged EC2 survived)"
-      obs_step_end zero_leftover_verify fail "EC2/resource leak for $SLUG (aws_leak_rc=$aws_leak_rc)" "aws_leak_rc=$aws_leak_rc"
-      obs_run_end fail
-    fi
-    case "$aws_leak_rc" in 2) exit 2 ;; *) exit 4 ;; esac
-  fi
-  ok "Teardown clean — no orphan org or EC2 resources for $SLUG (${elapsed}s)"
+  local teardown_message teardown_proof
+  case "$E2E_CP_PURGE_RESULT" in
+    purged)
+      teardown_message="CP purge completed and exact org absent"
+      teardown_proof="cp_purge_receipt_audit_exact_tenant_404"
+      ;;
+    already_absent)
+      teardown_message="Exact org already absent; no DELETE or purge audit required"
+      teardown_proof="exact_tenant_404"
+      ;;
+    *)
+      [ -n "${OBS_RUN_ID:-}" ] && obs_step_end teardown fail "CP purge helper returned an unknown success result" "result=${E2E_CP_PURGE_RESULT:-unset}"
+      exit 4
+      ;;
+  esac
   if [ -n "${OBS_RUN_ID:-}" ]; then
-    obs_step_end teardown pass "" "elapsed_secs=$elapsed"
-    obs_step_end zero_leftover_verify pass "no orphan org or EC2 resources" "elapsed_secs=$elapsed"
+    obs_step_end teardown pass "$teardown_message" "proof=$teardown_proof"
+    obs_step_end zero_leftover_verify skip "direct provider enumeration is not available on this generic runner" "proof=$teardown_proof"
     obs_run_end "$( [ "$entry_rc" = "0" ] && echo pass || echo fail )"
   fi
   case "$entry_rc" in 0|1|2|3|4|5) ;; *) exit 1 ;; esac
@@ -504,9 +513,10 @@ admin_call() {  # <method> <path> [curl args…]
 tenant_call() {  # <method> <path> [curl args…]
   local method="$1" path="$2"; shift 2
   curl "${CURL_COMMON[@]}" -X "$method" "$TENANT_URL$path" \
+    "${TENANT_ROUTE_HDRS[@]}" \
     -H "Authorization: Bearer $TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
-    -H "Origin: $TENANT_URL" "$@"
+    -H "Origin: $TENANT_ORIGIN" "$@"
 }
 
 # list_workspaces_json: echo the raw GET /workspaces JSON array (tenant-scoped).
@@ -570,11 +580,28 @@ obs_step_end preflight pass "" "cp_url=$CP_URL"
 # ─── 1. Create org (CP installs + provisions the concierge as platform root) ──
 obs_step_start org_create
 log "1/6 CREATE A NEW ORG — creating org $SLUG..."
-CREATE_RESP=$(admin_call POST /cp/admin/orgs \
+CREATE_BODYFILE="$TMPDIR_E2E/create-org-response.json"
+set +e
+CREATE_HTTP_CODE=$(admin_call POST /cp/admin/orgs \
+  -o "$CREATE_BODYFILE" -w '%{http_code}' \
   -d "{\"slug\":\"$SLUG\",\"name\":\"E2E $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\"}")
+CREATE_CURL_RC=$?
+set -e
+CREATE_RESP=$(cat "$CREATE_BODYFILE" 2>/dev/null || true)
+if [ "$CREATE_CURL_RC" != "0" ]; then
+  fail "Org create request failed (curl_rc=$CREATE_CURL_RC http=${CREATE_HTTP_CODE:-000}); raw body: $CREATE_RESP"
+fi
+case "$CREATE_HTTP_CODE" in
+  2[0-9][0-9]) ;;
+  *) fail "Org create returned non-2xx (http=${CREATE_HTTP_CODE:-000}); raw body: $CREATE_RESP" ;;
+esac
 echo "$CREATE_RESP" | python3 -m json.tool >/dev/null || fail "Org create non-JSON: $CREATE_RESP"
 ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
-[ -z "$ORG_ID" ] && fail "Org create response missing 'id': $CREATE_RESP"
+e2e_cp_validate_org_id "$ORG_ID" \
+  || fail "Org create response missing a valid UUID 'id': $CREATE_RESP"
+ORG_CREATION_VERIFIED=1
+e2e_cp_publish_creation_identity "$SLUG" "$ORG_ID" \
+  || fail "Could not publish the verified org creation identity for teardown"
 export OBS_ORG_ID="$ORG_ID"
 ok "Org created (id=$ORG_ID)"
 obs_step_end org_create pass "" "org_id=$ORG_ID"
@@ -604,16 +631,19 @@ done
 ok "Tenant provisioning complete"
 obs_step_end provision pass "" "instance_status=running"
 
-# Derive tenant domain from CP hostname (prod vs staging).
-CP_HOST=$(echo "$CP_URL" | sed -E 's#^https?://##; s#/.*$##')
-case "$CP_HOST" in
-  api.*)         DERIVED_DOMAIN="${CP_HOST#api.}" ;;
-  staging-api.*) DERIVED_DOMAIN="staging.${CP_HOST#staging-api.}" ;;
-  *)             DERIVED_DOMAIN="$CP_HOST" ;;
-esac
-TENANT_DOMAIN="${MOLECULE_TENANT_DOMAIN:-$DERIVED_DOMAIN}"
-TENANT_URL="https://$SLUG.$TENANT_DOMAIN"
+# Derive the tenant-facing routing/CORS topology via the SHARED helper
+# (lib/tenant_topology.sh). Sets in THIS scope: TENANT_URL / TENANT_ROUTE_HOST /
+# TENANT_ROUTE_HDRS[] (Host + X-Molecule-Org-Slug, empty on staging) / TENANT_ORIGIN.
+# Default (all MOLECULE_TENANT_* unset) reproduces the exact staging
+# slug.<domain> subdomain + Origin=$TENANT_URL behaviour byte-for-byte; the
+# ephemeral runner passes MOLECULE_TENANT_URL=CP base + MOLECULE_TENANT_ROUTE_DOMAIN
+# + MOLECULE_TENANT_ORIGIN_TEMPLATE so the tenant is reached by slug over the CP.
+derive_tenant_topology "$SLUG" "$CP_URL" \
+  || fail "Could not derive tenant topology for $SLUG (ephemeral slug-routing needs MOLECULE_TENANT_ORIGIN_TEMPLATE for a valid CORS Origin)"
 log "    TENANT_URL=$TENANT_URL"
+if [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+  log "    tenant routing via Host=$TENANT_ROUTE_HOST + X-Molecule-Org-Slug=$SLUG; CORS Origin=$TENANT_ORIGIN (ephemeral-CP slug routing)"
+fi
 
 # ─── 3. Per-tenant admin token + TLS readiness ───────────────────────────────
 obs_step_start tenant_health
@@ -626,11 +656,55 @@ ok "Tenant admin token retrieved (len=${#TENANT_TOKEN})"
 log "    Waiting for tenant TLS / DNS propagation..."
 TLS_DEADLINE=$(( $(date +%s) + 15 * 60 ))
 while true; do
-  curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1 && break
-  [ "$(date +%s)" -gt "$TLS_DEADLINE" ] && fail "Tenant /health never 2xx within 15m"
+  # Under ephemeral slug-routing the CP answers /health for ANY Host (its own
+  # global handler), so a route-header /health probe is vacuous — it 2xx's before
+  # the tenant route is up. Probe /org/identity (a tenant-owned proxied handler)
+  # WITH the route headers + X-Molecule-Org-Id so a not-yet-routable tenant is
+  # actually caught. Staging (empty TENANT_ROUTE_HDRS) keeps the global /health
+  # check byte-for-byte. Mirrors the #4406 reference (test_staging_full_saas.sh step 4).
+  if [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+    curl -sSfk --max-time 5 "${TENANT_ROUTE_HDRS[@]}" -H "X-Molecule-Org-Id: $ORG_ID" "$TENANT_URL/org/identity" >/dev/null 2>&1 && break
+  else
+    curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1 && break
+  fi
+  [ "$(date +%s)" -gt "$TLS_DEADLINE" ] && fail "Tenant never became routable within 15m (probe: $( [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ] && echo '/org/identity via route headers' || echo '/health' ))"
   sleep 5
 done
 ok "Tenant reachable at $TENANT_URL"
+
+# /health is allowlisted past the tenant guard, so it goes green while the app's
+# real proxied routes are still coming up (controlplane#1012). The CP publishes
+# instance_status=running on a /health-only canary, so 'running' can precede
+# 'app serving' by a few seconds under load. Gate on the ACTUAL API contract the
+# canvas assertions below depend on, to a stable streak, before asserting — a
+# genuinely half-wired tenant never stabilises and this fails loudly.
+# wait_tenant_api_ready (lib/tenant_api_ready.sh) is NOT slug-routing aware —
+# it sends only Authorization/X-Molecule-Org-Id/Origin=$turl, with NO Host/X-Molecule-
+# Org-Slug. On staging that is correct (the subdomain routes). Under ephemeral
+# slug-routing it would hit the CP base URL with no route headers → the wrong/no
+# tenant → a vacuous or false readiness signal. So under ephemeral run a route-
+# aware readiness streak via tenant_call (which threads TENANT_ROUTE_HDRS +
+# TENANT_ORIGIN); staging keeps the proven shared helper byte-for-byte.
+if [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+  READY_DEADLINE=$(( $(date +%s) + 180 )); READY_STREAK=0
+  while true; do
+    READY_BODY="$TMPDIR_E2E/ready_body"; : >"$READY_BODY"
+    set +e
+    READY_CODE=$(tenant_call GET /workspaces --max-time 10 -o "$READY_BODY" -w '%{http_code}' 2>/dev/null); READY_RC=$?
+    set -e
+    READY_FIRST=$(head -c 256 "$READY_BODY" 2>/dev/null | tr -d '[:space:]' | head -c 1)
+    if [ "$READY_RC" = "0" ] && [ "$READY_CODE" = "200" ] && [ "$READY_FIRST" = "[" ]; then
+      READY_STREAK=$((READY_STREAK + 1)); [ "$READY_STREAK" -ge 2 ] && break
+    else
+      READY_STREAK=0
+    fi
+    [ "$(date +%s)" -gt "$READY_DEADLINE" ] && fail "Tenant proxied API (GET /workspaces) never became ready under slug-routing — half-wired tenant (controlplane#1012) (last http=$READY_CODE first='$READY_FIRST')"
+    sleep 3
+  done
+else
+  wait_tenant_api_ready "$TENANT_URL" /workspaces "$TENANT_TOKEN" "$ORG_ID" "concierge-creates" \
+    || fail "Tenant proxied API (GET /workspaces) never became ready — half-wired tenant (controlplane#1012)"
+fi
 obs_step_end tenant_health pass "" "tenant_url=$TENANT_URL"
 
 # ─── 2. CANVAS WORKS — the tenant canvas/app + its PROXIED API actually resolve ─
@@ -657,8 +731,14 @@ canvas_probe() {
   local label="$1" method="$2" path="$3" auth="$4" shape="$5"
   local code rc body first
   local -a args=(-sS --max-time 25 -X "$method" -o "$CANVAS_BODY_TMP" -w '%{http_code}')
+  # Thread the ephemeral slug-routing headers (Host + X-Molecule-Org-Slug) on
+  # EVERY canvas probe, incl. the open routes (/org/identity, /canvas/viewport),
+  # so the CP wildcard proxy resolves the tenant; empty on staging ⇒ the subdomain
+  # routes ⇒ byte-identical. Tenant-auth probes present the tenant's real
+  # CORS_ORIGINS ($TENANT_ORIGIN == $TENANT_URL on staging).
+  args+=("${TENANT_ROUTE_HDRS[@]}")
   if [ "$auth" = "tenant" ]; then
-    args+=(-H "Authorization: Bearer $TENANT_TOKEN" -H "X-Molecule-Org-Id: $ORG_ID" -H "Origin: $TENANT_URL")
+    args+=(-H "Authorization: Bearer $TENANT_TOKEN" -H "X-Molecule-Org-Id: $ORG_ID" -H "Origin: $TENANT_ORIGIN")
   fi
   set +e
   code=$(curl "${args[@]}" "$TENANT_URL$path" 2>/dev/null); rc=$?
@@ -730,17 +810,43 @@ obs_step_end canvas pass "" "routes=workspaces,org_identity,canvas_viewport,requ
 # host-first precedence (a0ca9507).
 obs_step_start cold_open
 log "2.5/6 COLD-OPEN — replaying the browser's X-Molecule-Org-Slug on a cold open of the fresh org..."
-CO_HOST="${TENANT_URL#https://}"; CO_HOST="${CO_HOST%%/*}"
-CO_SLUG_FIRSTLABEL="${CO_HOST%%.*}"        # canvas getTenantSlug() FIXED: leftmost DNS label
-CO_SLUG_OLD="${CO_HOST%.moleculesai.app}"  # OLD suffix-strip of the default .moleculesai.app
+# Cold-open browser-slug derivation. On staging the slug lives in the tenant
+# subdomain host ($SLUG.staging.moleculesai.app), so derive both the FIXED
+# first-label slug and the OLD suffix-strip form from it. Under ephemeral slug-
+# routing the CP base URL carries NO slug — the tenant is addressed by the ROUTE
+# host ($SLUG.$ROUTE_DOMAIN via TENANT_ROUTE_HOST) — so the browser slug IS the
+# routing slug and we send the route Host header so the wildcard proxy resolves
+# the tenant. There is only ONE routing slug (no distinct 2-level-subdomain
+# suffix-strip form), so CO_SLUG_OLD==CO_SLUG_FIRSTLABEL and the regression-lock
+# arm (b) elides: the 2-level-subdomain host-first precedence is a staging-DNS
+# property covered by the controlplane resolveOrg host-first unit
+# (internal/router/resolve_test.go) + the canvas first-label unit (#3408), not by
+# this loopback single-container CP.
+if [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+  CO_HOST="$TENANT_ROUTE_HOST"
+  CO_ROUTE_HOST_HDR=(-H "Host: $TENANT_ROUTE_HOST")
+  CO_SLUG_FIRSTLABEL="$SLUG"
+  CO_SLUG_OLD="$SLUG"
+else
+  CO_HOST="${TENANT_URL#*://}"; CO_HOST="${CO_HOST%%/*}"
+  CO_ROUTE_HOST_HDR=()
+  CO_SLUG_FIRSTLABEL="${CO_HOST%%.*}"        # canvas getTenantSlug() FIXED: leftmost DNS label
+  CO_SLUG_OLD="${CO_HOST%.moleculesai.app}"  # OLD suffix-strip of the default .moleculesai.app
+fi
 CO_BODY_TMP="$TMPDIR_E2E/cold_open_body"
 # cold_open_call <slug-header> <path> -> echoes the HTTP code; writes body to $CO_BODY_TMP.
 cold_open_call() {
   local slughdr="$1" path="$2" code
+  # CO_ROUTE_HOST_HDR carries the ephemeral route Host (=$SLUG.$ROUTE_DOMAIN) so the
+  # CP wildcard proxy resolves the tenant; empty on staging (the subdomain routes).
+  # X-Molecule-Org-Slug is the VARIABLE UNDER TEST (the browser-derived slug), kept
+  # LAST so it is what the CP sees as the client header. Origin = the tenant's real
+  # CORS_ORIGINS ($TENANT_ORIGIN == $TENANT_URL on staging).
   set +e
   code=$(curl -sS --max-time 25 -o "$CO_BODY_TMP" -w '%{http_code}' \
+    "${CO_ROUTE_HOST_HDR[@]}" \
     -H "Authorization: Bearer $TENANT_TOKEN" -H "X-Molecule-Org-Id: $ORG_ID" \
-    -H "X-Molecule-Org-Slug: $slughdr" -H "Origin: $TENANT_URL" \
+    -H "X-Molecule-Org-Slug: $slughdr" -H "Origin: $TENANT_ORIGIN" \
     "$TENANT_URL$path" 2>/dev/null)
   set -e
   printf '%s' "${code:-000}"
@@ -868,6 +974,44 @@ if not isinstance(tools, list): print(''); sys.exit(0)
 print(json.dumps(tools))"
 }
 
+# concierge_provision_diagnosis: read the DISCRIMINATING fields out of the SAME
+# workspace body the loaded_mcp_tools gate is already polling, and say what the
+# empty inventory actually means (molecule-controlplane#2854).
+#
+# The old failure text asserted "the mgmt-MCP tools failed to load at init" for
+# EVERY empty inventory. That is one of at least three distinct causes, and it
+# is the wrong one for the most common: core#5057, where CPProvisioner.Start's
+# single-shot POST to /cp/workspaces/provision hit a transient error, the box
+# was NEVER CREATED, and the row went straight to status=failed with an empty
+# instance_id. There are no MCP tools because there is no container — nothing
+# ever got as far as "init". Blaming the MCP loader sent an earlier
+# investigation down the wrong path for a long time, and the data needed to
+# tell the cases apart was sitting in the body being polled the whole time.
+concierge_provision_diagnosis() {
+  tenant_call GET "/workspaces/$CONCIERGE_ID" 2>/dev/null | python3 -c "
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: print('workspace body unreadable — cannot classify'); sys.exit(0)
+if not isinstance(d, dict): print('workspace body not an object — cannot classify'); sys.exit(0)
+status = d.get('status') or '<none>'
+inst = d.get('instance_id') or ''
+err = d.get('last_sample_error') or ''
+base = 'status=%s instance_id=%s' % (status, inst if inst else '<EMPTY>')
+if not inst and status in ('failed', 'provisioning'):
+    print(base + ' -> THE BOX WAS NEVER CREATED. This is a PROVISION failure, not an '
+          'MCP-load failure: with no instance there is no container and nothing ever '
+          'reached init. Prime suspect is core#5057 (single-shot POST to '
+          '/cp/workspaces/provision, no retry). last_sample_error=' + (err or '<none>'))
+elif status == 'failed':
+    print(base + ' -> the box was created but the workspace is FAILED; the MCP inventory '
+          'is a downstream symptom. last_sample_error=' + (err or '<none>'))
+elif status in ('online', 'degraded'):
+    print(base + ' -> the box EXISTS and is ' + status + ', so an empty inventory really '
+          'does point at the management-MCP failing to load at init.')
+else:
+    print(base + ' -> unclassified; inspect the workspace row.')"
+}
+
 # Poll until the required tool is present, or the budget is exhausted. We keep the
 # last non-empty inventory read so a HARD FAIL can report what WAS loaded.
 mcp_deadline=$(( $(date +%s) + MCP_TOOLS_SECS ))
@@ -892,10 +1036,10 @@ elif [ -n "$LOADED_TOOLS" ] && [ "$LOADED_TOOLS" != "[]" ]; then
   # concierge booted with a management-MCP that is missing provision_workspace.
   fail "loaded_mcp_tools present but $(required_provision_tool_id) not reported within ${MCP_TOOLS_SECS}s — the concierge's management MCP did not expose the provision tool. HARD GATE (never-skip): runtime#181 producer landed 2026-06-25; a healthy concierge reports ~46 tools incl. this one. Tools: $(echo "$LOADED_TOOLS" | head -c 400)"
 else
-  # Field absent/empty for the whole budget: the mgmt-MCP tools failed to load at
-  # init (broken concierge boot). runtime#181 producer landed 2026-06-25, so an
-  # empty inventory is a real failure, not a not-yet-landed producer.
-  fail "loaded_mcp_tools absent/empty after ${MCP_TOOLS_SECS}s — the concierge reported NO management-MCP tools. HARD GATE (never-skip): runtime#181 producer landed 2026-06-25 and a healthy concierge reports ~46 tools incl. $(required_provision_tool_id); an empty inventory means the mgmt-MCP failed to load at init."
+  # Field absent/empty for the whole budget. Do NOT assert a cause — read the
+  # discriminating fields out of the same body we have been polling and report
+  # what actually happened (molecule-controlplane#2854).
+  fail "loaded_mcp_tools absent/empty after ${MCP_TOOLS_SECS}s — the concierge reported NO management-MCP tools. HARD GATE (never-skip): runtime#181 producer landed 2026-06-25 and a healthy concierge reports ~46 tools incl. $(required_provision_tool_id). DIAGNOSIS: $(concierge_provision_diagnosis)"
 fi
 
 # Pre-state: the worker MUST NOT exist yet (so its later appearance is causally
@@ -1012,6 +1156,59 @@ if [ -n "$WORKER_KIND" ] && [ "$WORKER_KIND" != "workspace" ]; then
 fi
 ok "Created node is a real kind='workspace' row"
 obs_step_end create_team_verify pass "" "worker_id=$WORKER_ID" "worker_kind=${WORKER_KIND:-workspace}"
+
+# ─── 4.7. CONCIERGE MANAGES A CHILD'S SCHEDULES (org key, CROSS-workspace) ─────
+# The capability the management-mode schedule tools deliver (mcp-server#111): the
+# concierge / org API key can CREATE, LIST and DELETE schedules on ANOTHER
+# workspace. Those verbs POST/GET/DELETE /workspaces/<TARGET>/schedules under the
+# ORG key — exactly what tenant_call does here: TENANT_TOKEN is the org-scoped
+# bearer, which core's WorkspaceAuth org-token branch admits for EVERY workspace in
+# the org. We target the CHILD ($WORKER_ID), NOT the caller — so this proves the
+# cross-workspace grant end-to-end against the real tenant core, deterministically.
+# (The LLM tool-invocation + tool-registration surface is unit-gated in mcp-server's
+# management.test.ts; this gate covers the load-bearing core route + org-key auth.)
+obs_step_start concierge_manages_schedule
+log "4.7/6 CONCIERGE MANAGES SCHEDULES — org key creates a schedule on CHILD $WORKER_ID (cross-workspace)..."
+_SCHED_NAME="e2e-cncrg-sched-$(printf '%s' "$WORKER_ID" | tr -cd 'a-f0-9' | cut -c1-8)"
+_SCHED_TMP="$TMPDIR_E2E/cncrg_sched_out"
+_SCHED_BODY_JSON=$(SCHED_NAME="$_SCHED_NAME" python3 -c 'import json,os; print(json.dumps({"name":os.environ["SCHED_NAME"],"cron_expr":"0 9 * * *","prompt":"e2e cross-workspace schedule (concierge/org key)","enabled":True}))')
+# CREATE — bounded retry only on a 5xx daemon-arm race (the auth/route itself is
+# deterministic; a 401/403 is a HARD, non-retryable capability regression).
+_SCHED_CODE=000
+for _CS_ATTEMPT in $(seq 1 6); do
+  : >"$_SCHED_TMP"
+  _SCHED_CODE=$(tenant_call POST "/workspaces/$WORKER_ID/schedules" \
+    -H "Content-Type: application/json" -d "$_SCHED_BODY_JSON" \
+    -o "$_SCHED_TMP" -w '%{http_code}' 2>/dev/null || echo 000)
+  _SCHED_RESP=$(cat "$_SCHED_TMP" 2>/dev/null || echo "")
+  echo "$_SCHED_CODE" | grep -Eq '^2..$' && break
+  if echo "$_SCHED_CODE" | grep -Eq '^(401|403)$'; then
+    fail "CONCIERGE CROSS-WORKSPACE SCHEDULE DENIED: org-key POST /workspaces/$WORKER_ID/schedules → http=$_SCHED_CODE. \
+The org/tenant key is NOT admitted for another workspace's schedule route — the load-bearing dependency of the management-mode schedule tools (mcp-server#111) is broken (WorkspaceAuth org-token branch). Body: $(echo "$_SCHED_RESP" | head -c 300)"
+  fi
+  log "    create attempt $_CS_ATTEMPT/6 → http=$_SCHED_CODE (daemon-arm/forward race); retrying"; sleep 10
+done
+if ! echo "$_SCHED_CODE" | grep -Eq '^2..$'; then
+  fail "CONCIERGE SCHEDULE CREATE FAILED: org-key POST /workspaces/$WORKER_ID/schedules → http=$_SCHED_CODE (want 2xx) after retries. Body: $(echo "$_SCHED_RESP" | head -c 300)"
+fi
+_SCHED_ID=$(printf '%s' "$_SCHED_RESP" | python3 -c "import sys,json
+try: d=json.load(sys.stdin)
+except Exception: d={}
+print((d.get('id') if isinstance(d,dict) else '') or ((d.get('schedule') or {}).get('id') if isinstance(d,dict) else '') or '')" 2>/dev/null || echo "")
+ok "org key CREATED a schedule on CHILD $WORKER_ID (http=$_SCHED_CODE, id=${_SCHED_ID:-?})"
+# LIST — the created schedule must be visible to the org key on the child.
+_LIST_RESP=$(tenant_call GET "/workspaces/$WORKER_ID/schedules" 2>/dev/null || echo "")
+if ! printf '%s' "$_LIST_RESP" | grep -q "$_SCHED_NAME"; then
+  fail "CONCIERGE SCHEDULE LIST MISSING: org-key GET /workspaces/$WORKER_ID/schedules did not contain '$_SCHED_NAME'. Body: $(echo "$_LIST_RESP" | head -c 300)"
+fi
+ok "org key LISTED child $WORKER_ID schedules and saw '$_SCHED_NAME' (cross-workspace read OK)"
+# DELETE — prove the delete verb + clean up (non-fatal on cleanup miss).
+if [ -n "$_SCHED_ID" ]; then
+  _DEL_CODE=$(tenant_call DELETE "/workspaces/$WORKER_ID/schedules/$_SCHED_ID" -o /dev/null -w '%{http_code}' 2>/dev/null || echo 000)
+  echo "$_DEL_CODE" | grep -Eq '^2..$' && ok "org key DELETED the schedule on child (http=$_DEL_CODE)" || log "    delete returned $_DEL_CODE (non-fatal cleanup)"
+fi
+ok "═ STEP 4.7 PASS: concierge/org-key CROSS-workspace schedule management works end-to-end"
+obs_step_end concierge_manages_schedule pass "" "worker_id=$WORKER_ID" "sched_id=${_SCHED_ID:-none}"
 
 # ─── 4.6. CREATED-AGENT LLM AUTH PRESENCE (corroborating, observability-tolerant)
 # The concierge-created member must receive the platform LLM auth — the CP proxy

@@ -2,8 +2,9 @@ package handlers
 
 // AuditHandler implements GET /workspaces/:id/audit.
 //
-// EU AI Act Annex III compliance endpoint — queries the append-only HMAC-chained
-// audit event log for a workspace and optionally verifies the HMAC chain inline.
+// It queries stored HMAC-linked audit event rows for a workspace and optionally
+// verifies the returned rows inline. This is a read-only surface; event
+// production is owned separately.
 //
 // Route (behind WorkspaceAuth middleware):
 //
@@ -21,25 +22,30 @@ package handlers
 // Response:
 //
 //	{
-//	    "events":      [...],     // slice of audit event rows
-//	    "total":       N,         // total matching rows (ignoring limit/offset)
-//	    "chain_valid": true|false|null
-//	    // null when AUDIT_LEDGER_SALT is not configured on the platform side
+//	    "events":             [...],   // slice of audit event rows
+//	    "total":              N,       // total matching rows (ignoring limit/offset)
+//	    "chain_valid":        true|false|null,
+//	    "chain_verification": "verified"|"tampered"|
+//	                          "unavailable_partial_query"|"disabled_no_salt"
 //	}
 //
 // Chain verification
 // ------------------
 // When AUDIT_LEDGER_SALT is set, the handler re-derives the PBKDF2 key and
-// verifies every HMAC in the result set (scoped to the queried agent_id, in
-// chronological order).  Returns null when the salt is absent so operators
-// know to use the Python CLI instead:
-//
-//	python -m molecule_audit.verify --agent-id <id>
+// verifies every HMAC in the result set (scoped to each queried agent_id, in
+// chronological order). chain_valid is null when the salt is absent or when
+// pagination/session/lower-time filters omit possible chain predecessors —
+// chain_verification SPLITS those two cases so an unset salt (a
+// misconfiguration that leaves the ledger NOT tamper-evident) is never
+// indistinguishable from a benign partial view. An unset salt is additionally
+// logged loudly (once) via getAuditHMACKey; a genuine tamper is fail-closed to
+// chain_valid=false / chain_verification="tampered".
 //
 // Environment variables:
 //
-//	AUDIT_LEDGER_SALT — secret salt for PBKDF2 key derivation (optional;
-//	                    chain_valid is null when unset)
+//	AUDIT_LEDGER_SALT — secret salt for PBKDF2 key derivation. When unset,
+//	                    chain_valid is null, chain_verification is
+//	                    "disabled_no_salt", and a loud SECURITY/AUDIT log fires.
 
 import (
 	"crypto/hmac"
@@ -60,7 +66,8 @@ import (
 	"golang.org/x/crypto/pbkdf2"
 )
 
-// pbkdf2 parameters — must match molecule_audit/ledger.py exactly.
+// PBKDF2 parameters are part of the stored audit-event signing contract. Any
+// future producer must use these values and computeAuditHMAC's canonical form.
 var (
 	auditPBKDF2Salt       = []byte("molecule-audit-ledger-v1")
 	auditPBKDF2Iterations = 210_000
@@ -72,17 +79,31 @@ var (
 
 // getAuditHMACKey derives (and caches) the 32-byte HMAC key from AUDIT_LEDGER_SALT.
 // Returns nil when the env var is not set.
+//
+// A missing salt is a MISCONFIGURATION, not a benign default: with no key the
+// HMAC audit-chain cannot be verified at all, so the ledger stops being
+// tamper-evident. That must never be a SILENT no-audit. This function therefore
+// emits a loud, once-only SECURITY/AUDIT log the first time it observes an unset
+// salt, and the read handler additionally surfaces chain_verification=
+// "disabled_no_salt" on EVERY response so operators and clients both see it.
 func getAuditHMACKey() []byte {
 	auditKeyOnce.Do(func() {
-		if salt := os.Getenv("AUDIT_LEDGER_SALT"); salt != "" {
-			auditHMACKey = pbkdf2.Key(
-				[]byte(salt),
-				auditPBKDF2Salt,
-				auditPBKDF2Iterations,
-				auditPBKDF2KeyLen,
-				sha256.New,
-			)
+		salt := os.Getenv("AUDIT_LEDGER_SALT")
+		if salt == "" {
+			// Loud, not silent. Once-only (guarded by auditKeyOnce) so it cannot be
+			// used to flood logs, but unmissable in operator dashboards.
+			log.Printf("SECURITY/AUDIT: AUDIT_LEDGER_SALT is not set — HMAC audit-chain " +
+				"verification is DISABLED; the audit ledger is NOT tamper-evident. Configure " +
+				"AUDIT_LEDGER_SALT to enable append-only chain verification.")
+			return
 		}
+		auditHMACKey = pbkdf2.Key(
+			[]byte(salt),
+			auditPBKDF2Salt,
+			auditPBKDF2Iterations,
+			auditPBKDF2KeyLen,
+			sha256.New,
+		)
 	})
 	return auditHMACKey
 }
@@ -110,6 +131,11 @@ type auditEventRow struct {
 	PrevHMAC           *string   `json:"prev_hmac"`
 	HMAC               string    `json:"hmac"`
 	WorkspaceID        string    `json:"workspace_id"`
+	// Details is the compact, key-sorted JSON payload naming the event's
+	// SUBJECT (deleted workspace id, revoked token id, client ip, …). Stored
+	// as TEXT, not JSONB, precisely so the bytes read back are the bytes
+	// signed — see migration 20260730120000. NULL on rows predating it.
+	Details *string `json:"details"`
 }
 
 // Query handles GET /workspaces/:id/audit.
@@ -188,7 +214,7 @@ func (h *AuditHandler) Query(c *gin.Context) {
 	// Fetch rows ------------------------------------------------------------
 	selectQuery := `SELECT id, timestamp, agent_id, session_id, operation,
 		input_hash, output_hash, model_used,
-		human_oversight_flag, risk_flag, prev_hmac, hmac, workspace_id
+		human_oversight_flag, risk_flag, prev_hmac, hmac, workspace_id, details
 		FROM audit_events ` + where +
 		fmt.Sprintf(" ORDER BY timestamp ASC, id ASC LIMIT $%d OFFSET $%d", idx, idx+1)
 
@@ -213,24 +239,65 @@ func (h *AuditHandler) Query(c *gin.Context) {
 	}
 
 	// Chain verification (inline when AUDIT_LEDGER_SALT is set) ------------
-	// Paginated views cannot verify chain integrity — earlier events are absent
-	// from the result set so any verdict would be misleading. Return null to
-	// signal "not computed" rather than false (which would imply tampering).
+	// chain_valid stays a bool|null as before. chain_verification is an added,
+	// non-breaking field that SPLITS the two very different reasons chain_valid
+	// can be null, so a missing salt is never a silent no-audit:
+	//
+	//   "verified"                  — full chain re-verified, HMAC intact
+	//   "tampered"                  — HMAC/link mismatch in a complete prefix
+	//   "unavailable_partial_query" — salt IS set, but offset/session/from could
+	//                                 omit chain predecessors (legitimate)
+	//   "disabled_no_salt"          — AUDIT_LEDGER_SALT is unset: verification is
+	//                                 OFF and the ledger is NOT tamper-evident
+	//                                 (a misconfiguration, also logged loudly)
+	//
+	// A non-zero offset, session filter, or lower time bound can omit earlier
+	// events in an agent's chain, so those are reported as unavailable rather
+	// than a misleading verdict. agent_id selects complete per-agent chains; an
+	// upper time bound and limit retain a verifiable prefix when offset is zero.
 	var chainValid *bool
-	if offset == 0 {
+	var chainVerification string
+	switch {
+	case getAuditHMACKey() == nil:
+		// No key can be derived — the ledger is not tamper-evident. This is a
+		// configuration failure, distinct from the benign partial-view case, and
+		// must be surfaced on every response (getAuditHMACKey also logs loudly).
+		chainVerification = "disabled_no_salt"
+	case offset != 0 || sessionID != "" || fromStr != "":
+		chainVerification = "unavailable_partial_query"
+	case auditAnyUnsigned(events):
+		// Distinct from "tampered": these rows were never signed (appended
+		// while the salt was unset), so calling them tampered would send an
+		// operator hunting for an attacker who does not exist. Still
+		// fail-closed — chain_valid is false, not null.
+		f := false
+		chainValid = &f
+		chainVerification = "unsigned_events_present"
+	default:
 		chainValid = verifyAuditChain(events)
+		switch {
+		case chainValid == nil:
+			// Unreachable while the salt is set, but stay explicit rather than
+			// silently emitting a bare null.
+			chainVerification = "unavailable"
+		case *chainValid:
+			chainVerification = "verified"
+		default:
+			chainVerification = "tampered"
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"events":      events,
-		"total":       total,
-		"chain_valid": chainValid,
+		"events":             events,
+		"total":              total,
+		"chain_valid":        chainValid,
+		"chain_verification": chainVerification,
 	})
 }
 
 // scanAuditRows reads all rows from a *sql.Rows into a slice.
 func scanAuditRows(rows *sql.Rows) ([]auditEventRow, error) {
-	var result []auditEventRow
+	result := make([]auditEventRow, 0)
 	for rows.Next() {
 		var ev auditEventRow
 		if err := rows.Scan(
@@ -247,6 +314,7 @@ func scanAuditRows(rows *sql.Rows) ([]auditEventRow, error) {
 			&ev.PrevHMAC,
 			&ev.HMAC,
 			&ev.WorkspaceID,
+			&ev.Details,
 		); err != nil {
 			return nil, err
 		}
@@ -261,7 +329,7 @@ func scanAuditRows(rows *sql.Rows) ([]auditEventRow, error) {
 // verifyAuditChain verifies the HMAC chain across the supplied events.
 //
 // Returns nil when AUDIT_LEDGER_SALT is not configured (chain_valid: null in
-// the response — use the Python CLI to verify in that case).
+// the response).
 // Returns a pointer to true/false otherwise.
 func verifyAuditChain(events []auditEventRow) *bool {
 	key := getAuditHMACKey()
@@ -277,6 +345,21 @@ func verifyAuditChain(events []auditEventRow) *bool {
 
 	for i := range events {
 		ev := &events[i]
+
+		// A row stamped unsigned: was appended while AUDIT_LEDGER_SALT was
+		// unset — it is a real record but was never signed, so it can be
+		// neither verified nor honestly called tampered. Fail closed: the
+		// chain is not verifiable. Query reports this as
+		// "unsigned_events_present" so operators get the actionable reason.
+		if auditIsUnsigned(ev.HMAC) {
+			log.Printf(
+				"SECURITY/AUDIT: unsigned audit event %s (agent=%s) — written with AUDIT_LEDGER_SALT unset; chain is NOT tamper-evident",
+				ev.ID, ev.AgentID,
+			)
+			f := false
+			return &f
+		}
+
 		state, ok := chains[ev.AgentID]
 		if !ok {
 			state = &chainState{}
@@ -323,16 +406,20 @@ func verifyAuditChain(events []auditEventRow) *bool {
 	return &t
 }
 
-// computeAuditHMAC replicates Python's _compute_event_hmac() for a single row.
+// auditCanonicalPayload builds the signed byte string for one row.
 //
-// Canonical JSON rules (must match ledger.py exactly):
+// Canonical JSON rules:
 //   - All fields except "hmac", serialised as a JSON object
 //   - Keys sorted alphabetically (encoding/json.Marshal on map does this)
 //   - Compact separators (no spaces)
 //   - Timestamp as RFC-3339 seconds-precision with Z suffix
 //   - Null values as JSON null (Go *string nil → null)
-func computeAuditHMAC(key []byte, ev *auditEventRow) string {
-	// Build the canonical map — keys must sort alphabetically to match Python.
+//
+// "details" is OMITTED entirely when the column is NULL rather than emitted as
+// JSON null. That is deliberate and load-bearing: rows written before the
+// details column existed must keep hashing to exactly the same value, so
+// adding the column cannot retroactively invalidate a chain.
+func auditCanonicalPayload(ev *auditEventRow) string {
 	canonical := map[string]interface{}{
 		"agent_id":             ev.AgentID,
 		"human_oversight_flag": ev.HumanOversightFlag,
@@ -346,14 +433,26 @@ func computeAuditHMAC(key []byte, ev *auditEventRow) string {
 		"session_id":           ev.SessionID,
 		"timestamp":            ev.Timestamp.UTC().Format("2006-01-02T15:04:05Z"),
 	}
+	if ev.Details != nil {
+		canonical["details"] = *ev.Details
+	}
 
 	payload, marshalErr := json.Marshal(canonical) // compact, sorted keys
 	if marshalErr != nil {
 		log.Printf("auditChainHash: json.Marshal canonical failed: %v", marshalErr)
 		return ""
 	}
+	return string(payload)
+}
+
+// computeAuditHMAC signs one row's canonical form with the ledger key.
+func computeAuditHMAC(key []byte, ev *auditEventRow) string {
+	payload := auditCanonicalPayload(ev)
+	if payload == "" {
+		return ""
+	}
 	mac := hmac.New(sha256.New, key)
-	mac.Write(payload)
+	mac.Write([]byte(payload))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 

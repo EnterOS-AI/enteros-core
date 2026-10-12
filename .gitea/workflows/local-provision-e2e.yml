@@ -32,7 +32,7 @@ name: Local Provision Lifecycle E2E
 # operator ever moves these to a runner WITHOUT docker.sock access for the
 # platform binary, this lane will red — keep it on `docker-host`.
 #
-# Both jobs pin `runs-on: docker-host` (Linux operator-host runners with the
+# Both jobs pin `runs-on: docker-host` (self-hosted Linux runners with the
 # molecule-core-net bridge + a working docker.sock). The bare `ubuntu-latest`
 # label is also advertised by the Windows act_runner, where docker.sock-bound
 # steps fail non-deterministically — see lint-required-workflows-docker-host-
@@ -59,15 +59,40 @@ env:
 
 jobs:
   # ===========================================================================
-  # REQUIRED gate — stub runtime, fast. This IS meant to be a required merge gate
-  # (the only mandatory coverage for the LOCAL Docker provisioner), but the new
-  # context is not yet in branch_protections/main — wire it in once the operator
-  # confirms the docker-host runners reliably provision sibling containers from
-  # the host platform binary for this lane (see SUBSTRATE REQUIREMENT above), then
-  # flip the directive below to `# bp-required: yes`. Until then it runs gating
-  # locally (continue-on-error: false) but un-wired in BP, an acknowledged
-  # asymmetry tracked for follow-up. (Earlier this block read `# bp-exempt`, which
-  # contradicted "REQUIRED gate" and tripped lint-required-context-exists-in-bp.)
+  # Gating merge check — stub runtime, fast; the only mandatory coverage for
+  # the LOCAL Docker provisioner.
+  #
+  # CORRECTED 2026-08-10. This block previously claimed enforcement on "two
+  # layers" and told the reader "do not read the `pending` directive below as
+  # 'not enforced'". Layer 1 of that claim was FALSE, and the reassuring
+  # wording is what made it durable. What actually holds:
+  #
+  #   1. NOT presence-required. This context sits BELOW the `# pending-#2409`
+  #      marker in .gitea/required-contexts.txt, in the documented-but-NOT-
+  #      enforced half, so the merge queue does not require it to post. It has
+  #      been there since the entry was introduced (08f75b5e6, 2026-06-28) —
+  #      original parking, not drift.
+  #   2. TRUE: branch_protections/main uses status_check_contexts=['*'], so
+  #      every POSTED context must be success (#4363 '*' semantics). This job
+  #      is continue-on-error: false, so a red here does block.
+  #
+  # The gap between 1 and 2 is not academic: ['*'] constrains statuses that
+  # EXIST. On 2026-08-10 a duplicate mapping key in this file made Gitea
+  # refuse to schedule the whole workflow; both contexts stopped posting and
+  # the PR read 43/43 success with all 8 enforced contexts present. Nothing
+  # required this context to exist, so nothing noticed it stop. Rule 11 in
+  # lint-workflow-yaml.py now catches that specific cause.
+  #
+  # Promotion above the marker is deliberately NOT taken here. The stated
+  # precondition is an OPERATOR confirmation that docker-host runners reliably
+  # provision sibling containers (mc#2409, still open), and the measured
+  # record does not discharge it: over 2026-08-01..10, 276 runs of this lane,
+  # 274 green and 2 genuine failures, both the same signature —
+  # `FAIL: proxy reached stub (canned reply)` with the platform logging
+  # `workspace agent restarting — retry after a short backoff
+  # [workspace_settling]`. That is a ~0.7% substrate/timing race at the A2A
+  # proxy-reach step, i.e. exactly the reliability question mc#2409 parks on.
+  # Evidence posted to mc#2409; root-fix the settling race, then promote.
   # bp-required: pending #2409
   # ===========================================================================
   lifecycle-stub:
@@ -88,6 +113,29 @@ jobs:
       # hostnames (ws-<id>:8000). Force false so the proxy keeps using the
       # host-mapped 127.0.0.1:<ephemeral_port> URL, which IS reachable.
       MOLECULE_IN_DOCKER: false
+      # The platform this job starts provisions ws-<id> containers on the shared
+      # host daemon. Production keeps them unless-stopped; here one that outlives
+      # the run must exit once and stay collectable, not crash-loop on the runner
+      # host (RC09).
+      MOLECULE_WORKSPACE_RESTART_POLICY: "no"
+      # core#5031: this job tags a STUB over
+      # molecule-local/workspace-template-claude-code:<template-HEAD-sha>-<arch>
+      # (+ :latest) — a name derived entirely from the world, so every process on
+      # this shared docker.sock computes it identically. The self-host schedules
+      # e2e does the same, and on core#5030 its cleanup restored the name while
+      # THIS job was still using it: the required lifecycle gate failed asserting
+      # on LLM credentials, which is nowhere near the cause.
+      #
+      # This token gives the job a PRIVATE tag namespace. JOB level, not step
+      # level: the platform-server started below RESOLVES the tag
+      # (provisioner/local_image_isolation.go) and the e2e script WRITES it, so
+      # both halves must read one variable or they drift.
+      #
+      # Only the STUB jobs get a token. lifecycle-real builds the genuine
+      # template for the same sha, so it writes content-identical bytes under the
+      # shared name — isolating it would force a cold 2.5GB rebuild every run to
+      # fix a race that job does not have.
+      MOLECULE_LOCAL_IMAGE_ISOLATION: e2e-${{ github.run_id }}-${{ github.run_attempt }}-lifestub
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -102,21 +150,35 @@ jobs:
           cache: false
           cache-dependency-path: workspace-server/go.sum
 
-      - name: Snapshot pre-existing ws-* containers (run-scoped teardown baseline)
+      - name: Init owned-workspace manifest (run-scoped teardown identity)
         run: |
-          # #2883: this job provisions ws-<uuid> workspace containers via the
-          # platform binary's docker.sock. The e2e script's own EXIT trap deletes
-          # the workspace it created, but a CANCELLED / TIMED-OUT job (act_runner
-          # SIGKILLs the job container, so the bash trap never fires) or a
-          # platform crash mid-provision leaks the ws-<uuid> container — it then
-          # runs forever and pegs CPU on the shared docker-host runner (13 orphans
-          # found on ded-1, 11+3 on the prod robots). Record the ws-* containers
-          # that already exist BEFORE this job touches anything, so the always()
-          # teardown below removes ONLY the ones this run created and never
-          # disrupts a concurrent run's in-flight workspace on the shared host.
-          docker ps -aq --filter "name=^ws-" > /tmp/ws_baseline_${{ github.run_id }}_${{ github.run_attempt }}.txt 2>/dev/null || true
-          echo "ws-* baseline ($(wc -l < /tmp/ws_baseline_${{ github.run_id }}_${{ github.run_attempt }}.txt 2>/dev/null | tr -d ' ') pre-existing):"
-          cat /tmp/ws_baseline_${{ github.run_id }}_${{ github.run_attempt }}.txt 2>/dev/null || true
+          # #2883: this job provisions ws-<uuid> workspace containers via the platform
+          # binary's docker.sock. The e2e script's own EXIT trap deletes the workspace it
+          # created, but a CANCELLED / TIMED-OUT job (act_runner SIGKILLs the job
+          # container, so the bash trap never fires) or a platform crash mid-provision
+          # leaks the ws-<uuid> container — it then runs forever and pegs CPU on the
+          # shared docker-host runner (13 orphans found on ded-1, 11+3 on the prod
+          # robots).
+          #
+          # #4346: this used to be a BASELINE — snapshot the ws-* containers that exist
+          # before the job starts, and have the teardown delete anything NOT in that
+          # snapshot. That is inference by exclusion, and it is WRONG on a shared daemon:
+          # "not in my baseline" is not the same as "mine". The concurrency group is
+          # per-SHA, so a DIFFERENT PR's run executes concurrently on this same docker
+          # host, and any container it creates AFTER our snapshot is — by construction —
+          # absent from it. Our teardown then found that run's LIVE workspace, called it
+          # our own leak, and `docker rm -f`'d it mid-test. The victim saw its container
+          # simply cease to exist, with nothing wrong anywhere in its provisioning path
+          # (last_sample_error=<none>, container_running=<none>): indistinguishable from a
+          # platform bug, and it reads exactly like a flake.
+          #
+          # So we record POSITIVE identity instead. The e2e script knows the id the
+          # moment POST /workspaces returns it, and the container is named ws-<id>; it
+          # appends that id here (E2E_WS_MANIFEST). The teardown removes those and
+          # nothing else, which is correct no matter what any concurrent run does or when
+          # it started.
+          : > /tmp/ws_owned_${{ github.run_id }}_${{ github.run_attempt }}.txt
+          echo "owned-workspace manifest initialised (empty)."
 
       - name: Build e2e-names SSOT CLI
         working-directory: workspace-server
@@ -129,10 +191,12 @@ jobs:
           # lifecycle script also uses alpine to seed config.yaml into the
           # named config volume. Pre-pull + ensure the bridge (idempotent).
           docker pull alpine:3 >/dev/null
-          # Pre-pull the exact digest-pinned alpine image the platform server
-          # uses for token-write helper containers (workspace-server/Dockerfile
-          # and provisioner.go). Without this, the real-image advisory job can
-          # fail when the runner cache does not already contain the pinned SHA.
+          # Pre-pull the exact digest-pinned alpine image provisioner.go's
+          # alpineImageDefault uses for token-write helper containers
+          # (deliberately NOT workspace-server/Dockerfile's base digest, which
+          # is the single-arch mirror re-pin; do not "re-sync" them). Without
+          # this, the real-image advisory job can fail when the runner cache
+          # does not already contain the pinned SHA.
           docker pull alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e >/dev/null
           docker network create molecule-core-net >/dev/null 2>&1 || true
           # SEV-2499 / mc#2499: connect the act_runner job container to
@@ -150,12 +214,54 @@ jobs:
           fi
           echo "alpine:3 pre-pulled; molecule-core-net ensured."
 
+      - name: Verify digest pins are multi-arch (amd64+arm64)
+        run: |
+          # Guards the invariant documented in docker-compose.infra.yml: every
+          # fixed image pin must be a multi-arch manifest-list/index digest. A
+          # platform-specific digest reads identically in review but breaks
+          # arm64 dev hosts (redis-cli segfaults under qemu, ClickHouse
+          # aborts). FAIL-CLOSED: a runner without buildx fails the job rather
+          # than silently downgrading this gate to advisory — fix the runner,
+          # not the check (docker-host runners already run buildx imagetools
+          # in the publish workflows).
+          if ! docker buildx version >/dev/null 2>&1; then
+            echo "::error::docker buildx unavailable on this runner — multi-arch pin verification cannot run (gate is fail-closed)"
+            exit 1
+          fi
+          # Scope: the two compose files only. provisioner.go's alpine helper
+          # pin is EXCLUDED — it is knowingly single-arch until a multi-arch
+          # index is hosted on the internal mirror (see the comment on
+          # alpineImageDefault); adding it here would red this gate on a known,
+          # documented exception.
+          refs=$(grep -hoE 'image: [^ ]+@sha256:[a-f0-9]{64}' docker-compose.yml docker-compose.infra.yml | sed 's/^image: //' | sort -u)
+          rc=0
+          for ref in $refs; do
+            # Inspect failures are caught explicitly. Previously, under the
+            # runner's `set -e -o pipefail`, an image that could not be
+            # inspected (removed upstream, auth wall) killed this step inside
+            # the `plats=$(...)` assignment with NO message (core#5208).
+            if ! out=$(docker buildx imagetools inspect "$ref" 2>&1); then
+              echo "::error::CANNOT INSPECT: $ref — $(printf '%s' "$out" | tail -1)"
+              rc=1
+              continue
+            fi
+            plats=$(printf '%s\n' "$out" | grep -E '^[[:space:]]+Platform:' | awk '{print $2}' || true)
+            if ! printf '%s\n' "$plats" | grep -qx 'linux/amd64' \
+               || ! printf '%s\n' "$plats" | grep -q '^linux/arm64'; then
+              echo "::error::NOT MULTI-ARCH: $ref [$(printf '%s' "$plats" | tr '\n' ' ')]"
+              rc=1
+            else
+              echo "ok: $ref"
+            fi
+          done
+          exit $rc
+
       - name: Start Postgres (docker, ephemeral host port)
         run: |
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$PG_CONTAINER" \
+          # tmpfs PGDATA + run label + `rm -fv` pre-clean: see the script header.
+          bash .gitea/scripts/ci-service-container.sh postgres "$PG_CONTAINER" postgres:16 \
             -e POSTGRES_USER=dev -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=molecule \
-            -p 127.0.0.1::5432 postgres:16 >/dev/null
+            -p 127.0.0.1::5432 >/dev/null
           PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           [ -z "$PG_PORT" ] && PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | head -1 | awk -F: '{print $NF}')
           if [ -z "$PG_PORT" ]; then echo "::error::no host port for $PG_CONTAINER"; docker logs "$PG_CONTAINER" || true; exit 1; fi
@@ -168,8 +274,7 @@ jobs:
 
       - name: Start Redis (docker, ephemeral host port)
         run: |
-          docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$REDIS_CONTAINER" -p 127.0.0.1::6379 redis:7 >/dev/null
+          bash .gitea/scripts/ci-service-container.sh redis "$REDIS_CONTAINER" redis:7 -p 127.0.0.1::6379 >/dev/null
           REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           [ -z "$REDIS_PORT" ] && REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | head -1 | awk -F: '{print $NF}')
           if [ -z "$REDIS_PORT" ]; then echo "::error::no host port for $REDIS_CONTAINER"; docker logs "$REDIS_CONTAINER" || true; exit 1; fi
@@ -234,25 +339,21 @@ jobs:
         working-directory: workspace-server
         run: go build -o platform-server ./cmd/server
 
-      - name: Kill stale platform-server before start (issue #1046)
-        run: |
-          # Dynamic port allocation (see #2450) eliminates the fixed-port race
-          # that caused this gate to red when a prior run left a zombie process.
-          # We still sweep by process name to avoid leaking platform-server
-          # processes on the shared runner.
-          killed=0
-          for pid in $(grep -l "platform-serve" /proc/[0-9]*/comm 2>/dev/null); do
-            kpid="${pid%/comm}"; kpid="${kpid##*/}"
-            cmdline=$(cat "/proc/${kpid}/cmdline" 2>/dev/null | tr '\0' ' ')
-            if echo "$cmdline" | grep -q "platform-server"; then
-              echo "Killing stale platform-server pid ${kpid}: ${cmdline}"
-              kill "$kpid" 2>/dev/null || true
-              killed=$((killed + 1))
-            fi
-          done
-          if [ "$killed" -gt 0 ]; then echo "Killed $killed stale platform-server process(es)."; else echo "No platform-server-named process found."; fi
-          sleep 1
-
+      # The "Kill stale platform-server before start" step here is DELETED. Its
+      # own comment conceded the point: "Dynamic port allocation (see #2450)
+      # eliminates the fixed-port race... We still sweep by process name to
+      # avoid leaking platform-server processes on the shared runner." That is a
+      # SWEEPER standing in for a leak fix — and it swept processes it did not
+      # own. e2e-api, e2e-peer-visibility, e2e-chat and this lane share the
+      # `docker-host` runner and demonstrably overlap across PRs, so a host-wide
+      # kill-by-name reaches into a concurrent PR's live run and kills ITS
+      # platform-server mid-test. A required context then reds on a PR that
+      # changed nothing, and under branch protection status_check_contexts=['*']
+      # the merge queue freezes.
+      #
+      # The leak itself is now fixed where it happens: the server runs under
+      # `timeout`, so an orphan from a hard-cancelled run reaps ITSELF. Nothing
+      # signals a process it did not start.
       - name: Start platform (background)
         working-directory: workspace-server
         run: |
@@ -260,8 +361,14 @@ jobs:
           # DATABASE_URL/REDIS_URL/ADMIN_TOKEN/MOLECULE_ENV are inherited from
           # $GITHUB_ENV. PLATFORM_URL is also passed explicitly because
           # $GITHUB_ENV propagation can be flaky on act_runner (#2468 RCA).
+          #
+          # `timeout` bound == this job's own timeout-minutes (15): the clock
+          # starts here, after checkout/docker/go-build, so it can never fire
+          # during a healthy run — the job is already dead by then. It reaps only
+          # OUR child, never a foreign run's process.
           echo "starting platform with PLATFORM_URL=${PLATFORM_URL:-<fallback>} PORT=$PORT BIND_ADDR=0.0.0.0"
-          PORT=$PORT BIND_ADDR=0.0.0.0 PLATFORM_URL="${PLATFORM_URL:-http://host.docker.internal:$PORT}" ./platform-server > platform.log 2>&1 &
+          PORT=$PORT BIND_ADDR=0.0.0.0 PLATFORM_URL="${PLATFORM_URL:-http://host.docker.internal:$PORT}" \
+            timeout --signal=TERM --kill-after=30s 15m ./platform-server > platform.log 2>&1 &
           echo $! > platform.pid
 
       - name: Wait for /health (+ migrations applied)
@@ -291,6 +398,10 @@ jobs:
           docker run --rm --network molecule-core-net alpine:latest sh -c "wget -qO- http://${PLATFORM_URL#http://}/health" || echo "WARN: platform not reachable from molecule-core-net"
 
       - name: Run local-provision lifecycle E2E (stub — REQUIRED)
+        env:
+          # The script appends every workspace id it provisions here, so the teardown
+          # can delete OUR containers and only ours. See #4346.
+          E2E_WS_MANIFEST: /tmp/ws_owned_${{ github.run_id }}_${{ github.run_attempt }}.txt
         run: bash tests/e2e/test_local_provision_lifecycle_e2e.sh
 
       - name: Dump platform log on failure
@@ -300,82 +411,152 @@ jobs:
       - name: Dump workspace container logs on failure
         if: failure()
         run: |
-          WS_NAME=$(docker ps --filter "name=ws-" --format '{{.Names}}' | head -1 || true)
-          if [ -n "$WS_NAME" ]; then
-            echo "=== Workspace container logs for $WS_NAME ==="
-            docker logs "$WS_NAME" 2>&1 | tail -n 80 || true
-          fi
+          # READ FROM THE MANIFEST, NOT FROM `docker ps | head -1`.
+          #
+          # This is a shared docker host with concurrent runs on it, so the first ws-*
+          # container the daemon lists is very often NOT ours. Dumping it meant that when
+          # a run failed, the logs it printed to explain WHY could belong to a completely
+          # different PR's workspace — and someone would then debug their failure against
+          # a stranger's stack trace. A diagnostic that lies is worse than none (#4346).
+          MANIFEST="/tmp/ws_owned_${{ github.run_id }}_${{ github.run_attempt }}.txt"
+          [ -s "$MANIFEST" ] || { echo "(no workspace was provisioned by this run)"; exit 0; }
+          while read -r wsid; do
+            [ -n "$wsid" ] || continue
+            name="ws-${wsid}"
+            echo "=== Workspace container logs for $name (OURS) ==="
+            docker logs "$name" 2>&1 | tail -n 80 || echo "(container $name is gone)"
+          done < "$MANIFEST"
 
       - name: Stop platform
         if: always()
         run: |
           [ -f workspace-server/platform.pid ] && kill "$(cat workspace-server/platform.pid)" 2>/dev/null || true
 
+      - name: Remove this run's workspace containers + volumes (platform-instance scoped)
+        # Positive identity, like the manifest teardown below, but for every
+        # container THIS run's platform provisioned — including ones no manifest
+        # knows about (a provision that raced a delete, RC09). They carry
+        # molecule.platform.instance=sha256(DATABASE_URL)[:16]; the DSN holds this
+        # run's own ephemeral PG port, so a concurrent run's workspaces never
+        # match. The listing is inside the reviewed script, filtered by that
+        # label only (test_ws_orphan_reap.py); this workflow still lists nothing.
+        # Volumes are derived from the containers (the bind-created ones carry no
+        # labels), so this runs BEFORE the manifest teardown removes them.
+        if: always()
+        run: |
+          if [ -z "${DATABASE_URL:-}" ]; then
+            echo "No DATABASE_URL — the platform never started; nothing to remove."
+            exit 0
+          fi
+          # "Stop platform" only signals it. Wait (bounded) until our own server
+          # has exited, so nothing it is still doing creates a container after
+          # the listing below. Not `kill -0`: the pid is the `timeout` wrapper,
+          # reparented to the job container's PID 1 (`sleep`, which reaps
+          # nothing), so once it exits it stays a zombie that `kill -0` still
+          # finds and the loop always ran its full 30s. Read the state instead.
+          PID="$(cat workspace-server/platform.pid 2>/dev/null || true)"
+          for _ in $(seq 1 30); do
+            [ -n "$PID" ] || break
+            st="$(awk '/^State:/ {print $2}' "/proc/$PID/status" 2>/dev/null || true)"
+            case "$st" in ''|Z|X) break ;; esac
+            sleep 1
+          done
+          bash .gitea/scripts/ws-orphan-reap.sh instance "$DATABASE_URL" \
+            || echo "::warning::instance-scoped workspace teardown did not complete — see above"
+
       - name: Stop service containers
         if: always()
         run: |
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$REDIS_CONTAINER" 2>/dev/null || true
 
-      - name: Teardown leaked ws-* workspace containers (run-scoped, #2883)
+      - name: Teardown OUR ws-* workspace containers (positive identity, #2883 / #4346)
         if: always()
         run: |
-          # #2883: remove ONLY the ws-<uuid> workspace containers this run
-          # created (everything matching name ^ws- that was NOT in the
-          # pre-job baseline). The e2e script's trap usually handles its own
-          # workspace, but a cancelled/timed-out job kills the runner container
-          # before the trap fires, and a platform crash can orphan the
-          # container — both leak a forever-running ws-* that pegs CPU on the
-          # shared docker-host. Run-scoped (diff against baseline) so a
-          # concurrent run's in-flight workspace on the same host is untouched.
-          # The standing sweep-stale-ws-orphans.yml janitor is the age-guarded
-          # belt-and-braces second layer for anything this step misses
-          # (e.g. the runner container itself being SIGKILLed before this runs).
-          BASELINE="/tmp/ws_baseline_${{ github.run_id }}_${{ github.run_attempt }}.txt"
-          [ -f "$BASELINE" ] || : > "$BASELINE"
+          # Remove exactly the workspace containers THIS run provisioned — the ids the
+          # e2e script recorded in the manifest as POST /workspaces handed them back.
+          # Nothing else on this daemon is ours to delete.
+          #
+          # This deletes by NAME (ws-<id>), never by "every ^ws- container I don't
+          # recognise". A concurrent run's workspace is not in our manifest, so it cannot
+          # be touched — which is the whole of #4346. The previous baseline-exclusion
+          # version protected us only from runs that started BEFORE us, and offered zero
+          # protection against the ones that start AFTER, which is the common case
+          # because this step runs at the END of the job.
+          #
+          # Anything this step misses entirely (the runner container SIGKILLed before it
+          # runs, so nothing here executes) is the job of the standing
+          # sweep-stale-ws-orphans.yml janitor. That is the right layer for it: it is
+          # AGE-GUARDED, so unlike this step it cannot delete a container that is still
+          # in use.
+          # Delete by EXACT NAME, and NEVER enumerate the daemon here. `docker rm`
+          # takes a container name directly, so the id from the manifest is all we
+          # need — there is no `docker ps`/`docker container ls` in this step at all.
+          # That is deliberate and load-bearing: the moment a teardown step LISTS the
+          # daemon (by any idiom — `--filter name=ws-`, `--format | grep ws-`,
+          # `-a | awk /ws-/`) it can select a CONCURRENT run's container, which is the
+          # entire #4346 failure. A destructive step that never lists cannot pick the
+          # wrong victim, and the guard (test_ws_teardown_positive_identity.py) enforces
+          # exactly that property rather than blacklisting listing spellings.
+          MANIFEST="/tmp/ws_owned_${{ github.run_id }}_${{ github.run_attempt }}.txt"
+          [ -f "$MANIFEST" ] || : > "$MANIFEST"
           removed=0
-          for cid in $(docker ps -aq --filter "name=^ws-" 2>/dev/null); do
-            # Skip containers that already existed before this job started.
-            if grep -qx "$cid" "$BASELINE" 2>/dev/null; then continue; fi
-            name=$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's#^/##' || echo "$cid")
-            echo "removing leaked workspace container: $name ($cid)"
-            docker rm -f "$cid" >/dev/null 2>&1 || true
+          while read -r wsid; do
+            [ -n "$wsid" ] || continue
+            echo "removing our workspace container: ws-${wsid}"
+            docker rm -f "ws-${wsid}" >/dev/null 2>&1 || true
+            docker volume rm -f "ws-${wsid}-configs" "ws-${wsid}-claude-sessions" "ws-${wsid}-workspace" >/dev/null 2>&1 || true
             removed=$((removed + 1))
-          done
-          rm -f "$BASELINE" 2>/dev/null || true
-          echo "ws-* teardown removed $removed run-scoped orphan container(s)."
+          done < "$MANIFEST"
+          echo "ws-* teardown removed $removed of $(wc -l < "$MANIFEST" | tr -d ' ') owned container(s)."
+          rm -f "$MANIFEST" 2>/dev/null || true
 
   # ===========================================================================
-  # ADVISORY — real claude-code image, lifecycle-only. Non-blocking. It pulls/
-  # builds the 2.5GB template image, makes a real (cheap) MiniMax LLM call, and is
-  # network-dependent, so a miss must not block. It proves the REAL runtime
+  # Real claude-code image, lifecycle-only. It pulls/builds the 2.5GB template
+  # image and makes a real (cheap) MiniMax LLM call. It proves the REAL runtime
   # survives a restart AND serves a genuine LLM round-trip on the local
   # provisioner (proxy-reach asserts a real MiniMax reply, not just reachability).
+  #
+  # PROMOTED out of the advisory mask (mc#4603 close-out). mc#2408's promotion
+  # criterion was "one further full renewal cycle green on a settled runner
+  # pool". Measured over 2026-08-01 -> 2026-08-09 (9 days, 300 main commits):
+  # 279 runs of this lane, 279 job logs retrieved, of which
+  #   * 278 ended `=== Results: 18 passed, 0 failed ===`
+  #   * 1 (run 634912, PR#5127 head b27707c206) was CANCELLED on a superseded
+  #     head — its log stops mid-Step-5 with no failure output and even its
+  #     `if: always()` steps read `failure`, the act_runner SIGKILL signature.
+  #     It already posted `failure` WITH the mask on, so the mask never
+  #     protected against it.
+  #   * 0 runs took the `MINIMAX_API_KEY` skip path
+  #   * 0 runs took an `infra_skip_advisory` path
+  #   * 0 `--- FAIL` / go-test failures
+  # The evidence is from the LOGS, deliberately: a masked job rolls a failed
+  # step up to a `success` commit status (Gitea Quirk #10), so the status rows
+  # this lane produced could not distinguish "green" from "silently skipped".
+  # That is the exact trap PR#656 / mc#664 fell into.
+  #
+  # Residual coupling is stated rather than masked: this lane needs Infisical,
+  # api.minimax.io and a template build. Those still fail closed, and BP is
+  # ['*'], so a genuine outage reds this context. The shock absorbers that
+  # remain are explicit and capped — infra_skip_advisory() hard-fails on 2+
+  # distinct A2A degradation signatures — and the guard step below refuses to
+  # accept any of them as a pass now that the lane gates.
   # ===========================================================================
-  # bp-exempt: advisory lane (continue-on-error: true) — informational, never a merge gate.
+  # bp-exempt: not in .gitea/required-contexts.txt (the stub lane is the
+  # presence-required one), so this context is not demanded at merge time; it is
+  # no longer continue-on-error, so when it posts it must be green.
   lifecycle-real:
     name: Local Provision Lifecycle E2E (real image + MiniMax LLM, advisory)
     runs-on: docker-host
     # Serialise behind the gating stub job: both jobs share the same docker-host
-    # runner and provision sibling containers. `needs:` forces this advisory job
-    # to start only AFTER lifecycle-stub finishes, avoiding resource contention.
+    # runner and provision sibling containers. `needs:` forces this job to start
+    # only AFTER lifecycle-stub finishes, avoiding resource contention.
     # (Dynamic ports eliminated the fixed-port race; serialisation remains for
-    # docker-host capacity hygiene.) continue-on-error keeps a real-job miss
-    # non-blocking; `needs:` does NOT gate on the stub's success (a failed
-    # required gate still lets this advisory dependent run).
+    # docker-host capacity hygiene.) `needs:` does NOT gate on the stub's
+    # success — `if: always()` keeps this lane running even when the required
+    # stub gate reds, so the two lanes fail independently.
     needs: lifecycle-stub
     if: ${{ always() }}
-    # Tracker for lint-continue-on-error-tracking (Tier 2e / internal#350): this
-    # mask has a forced 14-day renewal cycle. mc#2408 is the decision /
-    # promotion-criteria issue. This is a GENUINELY-advisory real-MiniMax lane:
-    # it stays masked until the docker-host runner pool reliably builds the
-    # template + reaches api.minimax.io AND MOLECULE_STAGING_MINIMAX_API_KEY is
-    # stably available (per-workflow run history is API-blind on Gitea 1.22.6, so
-    # green cannot be confirmed to unmask) — re-tracked, not unmasked. Two prior
-    # renewal trackers aged past the 14d cap and were superseded (their numbers
-    # are intentionally NOT repeated within 2 lines of the directive below —
-    # lint-continue-on-error-tracking matches the FIRST tracker in that window).
-    continue-on-error: true  # mc#3617: 2026-07-09 renewal, expires 2026-07-23 — advisory MiniMax e2e; promote to gating (flip false) when the runner pool + staging MiniMax key are stable, else open a successor tracker (per mc#2408).
     timeout-minutes: 30
     env:
       PG_CONTAINER: pg-lpe2e-real-${{ github.run_id }}-${{ github.run_attempt }}
@@ -391,6 +572,11 @@ jobs:
       # host-network platform cannot resolve. Leave MOLECULE_IN_DOCKER=false so
       # the proxy uses the host-mapped port directly (same as lifecycle-stub).
       MOLECULE_IN_DOCKER: false
+      # The platform this job starts provisions ws-<id> containers on the shared
+      # host daemon. Production keeps them unless-stopped; here one that outlives
+      # the run must exit once and stay collectable, not crash-loop on the runner
+      # host (RC09).
+      MOLECULE_WORKSPACE_RESTART_POLICY: "no"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -431,20 +617,42 @@ jobs:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+          TRANSIENT_LEDGER: /tmp/lpe2e_transient_${{ github.run_id }}_${{ github.run_attempt }}.txt
         run: |
           set -uo pipefail
           BASE="https://key.moleculesai.app"
-          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+          # Capture curl's exit status SEPARATELY from the body (the
+          # lint-curl-status-capture pattern). Piping straight into python
+          # loses it: a connection failure and a 200-with-empty-value both
+          # arrive as an empty string, and those two are not the same event.
+          #   - transport failure  => Infisical is UNREACHABLE. External
+          #     outage, not our defect. Record a transient and let the guard
+          #     step adjudicate against the budget.
+          #   - 200 with an empty/missing value => MISCONFIGURATION. Ours.
+          #     Fail closed exactly as before.
+          LOGIN_BODY=$(curl -fsS --max-time 30 -X POST "$BASE/api/v1/auth/universal-auth/login" \
             -H 'Content-Type: application/json' \
-            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
-          if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
-          read_secret() {
-            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=$2" \
-              -H "Authorization: Bearer $TOK" \
-              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
-          }
-          MINIMAX_API_KEY=$(read_secret MINIMAX_API_KEY %2Fshared%2Fcontrolplane)
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}") || LOGIN_RC=$?
+          LOGIN_RC=${LOGIN_RC:-0}
+          if [ "$LOGIN_RC" -ne 0 ]; then
+            echo "::warning::Infisical login unreachable (curl rc=$LOGIN_RC) — external dependency, recording a transient."
+            echo "infisical-unreachable login_curl_rc=$LOGIN_RC" >> "$TRANSIENT_LEDGER"
+            exit 0
+          fi
+          TOK=$(printf '%s' "$LOGIN_BODY" | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          if [ -z "$TOK" ]; then
+            echo "::error::Infisical login returned success with an empty accessToken — misconfiguration, failing closed."
+            exit 1
+          fi
+          SECRET_BODY=$(curl -fsS --max-time 30 "$BASE/api/v3/secrets/raw/MINIMAX_API_KEY?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=%2Fshared%2Fcontrolplane" \
+            -H "Authorization: Bearer $TOK") || READ_RC=$?
+          READ_RC=${READ_RC:-0}
+          if [ "$READ_RC" -ne 0 ]; then
+            echo "::warning::Infisical secret read unreachable (curl rc=$READ_RC) — external dependency, recording a transient."
+            echo "infisical-unreachable read_curl_rc=$READ_RC" >> "$TRANSIENT_LEDGER"
+            exit 0
+          fi
+          MINIMAX_API_KEY=$(printf '%s' "$SECRET_BODY" | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")')
           echo "::add-mask::$MINIMAX_API_KEY"
           if [ -z "$MINIMAX_API_KEY" ]; then
             echo "::error::Infisical returned empty MINIMAX_API_KEY at staging /shared/controlplane — failing closed."
@@ -453,21 +661,35 @@ jobs:
           echo "MINIMAX_API_KEY=$MINIMAX_API_KEY" >> "$GITHUB_ENV"
           echo "MINIMAX_API_KEY loaded from Infisical staging SSOT (len=${#MINIMAX_API_KEY})"
 
-      - name: Snapshot pre-existing ws-* containers (run-scoped teardown baseline)
+      - name: Init owned-workspace manifest (run-scoped teardown identity)
         run: |
-          # #2883: this job provisions ws-<uuid> workspace containers via the
-          # platform binary's docker.sock. The e2e script's own EXIT trap deletes
-          # the workspace it created, but a CANCELLED / TIMED-OUT job (act_runner
-          # SIGKILLs the job container, so the bash trap never fires) or a
-          # platform crash mid-provision leaks the ws-<uuid> container — it then
-          # runs forever and pegs CPU on the shared docker-host runner (13 orphans
-          # found on ded-1, 11+3 on the prod robots). Record the ws-* containers
-          # that already exist BEFORE this job touches anything, so the always()
-          # teardown below removes ONLY the ones this run created and never
-          # disrupts a concurrent run's in-flight workspace on the shared host.
-          docker ps -aq --filter "name=^ws-" > /tmp/ws_baseline_${{ github.run_id }}_${{ github.run_attempt }}.txt 2>/dev/null || true
-          echo "ws-* baseline ($(wc -l < /tmp/ws_baseline_${{ github.run_id }}_${{ github.run_attempt }}.txt 2>/dev/null | tr -d ' ') pre-existing):"
-          cat /tmp/ws_baseline_${{ github.run_id }}_${{ github.run_attempt }}.txt 2>/dev/null || true
+          # #2883: this job provisions ws-<uuid> workspace containers via the platform
+          # binary's docker.sock. The e2e script's own EXIT trap deletes the workspace it
+          # created, but a CANCELLED / TIMED-OUT job (act_runner SIGKILLs the job
+          # container, so the bash trap never fires) or a platform crash mid-provision
+          # leaks the ws-<uuid> container — it then runs forever and pegs CPU on the
+          # shared docker-host runner (13 orphans found on ded-1, 11+3 on the prod
+          # robots).
+          #
+          # #4346: this used to be a BASELINE — snapshot the ws-* containers that exist
+          # before the job starts, and have the teardown delete anything NOT in that
+          # snapshot. That is inference by exclusion, and it is WRONG on a shared daemon:
+          # "not in my baseline" is not the same as "mine". The concurrency group is
+          # per-SHA, so a DIFFERENT PR's run executes concurrently on this same docker
+          # host, and any container it creates AFTER our snapshot is — by construction —
+          # absent from it. Our teardown then found that run's LIVE workspace, called it
+          # our own leak, and `docker rm -f`'d it mid-test. The victim saw its container
+          # simply cease to exist, with nothing wrong anywhere in its provisioning path
+          # (last_sample_error=<none>, container_running=<none>): indistinguishable from a
+          # platform bug, and it reads exactly like a flake.
+          #
+          # So we record POSITIVE identity instead. The e2e script knows the id the
+          # moment POST /workspaces returns it, and the container is named ws-<id>; it
+          # appends that id here (E2E_WS_MANIFEST). The teardown removes those and
+          # nothing else, which is correct no matter what any concurrent run does or when
+          # it started.
+          : > /tmp/ws_owned_${{ github.run_id }}_${{ github.run_attempt }}.txt
+          echo "owned-workspace manifest initialised (empty)."
 
       - name: Build e2e-names SSOT CLI
         working-directory: workspace-server
@@ -476,8 +698,10 @@ jobs:
       - name: Ensure provisioner network + pre-pull alpine
         run: |
           docker pull alpine:3 >/dev/null
-          # Pre-pull the exact digest-pinned alpine image the platform server
-          # uses for token-write helper containers.
+          # Pre-pull the exact digest-pinned alpine image provisioner.go's
+          # alpineImageDefault uses for token-write helper containers
+          # (deliberately differs from the Dockerfile's single-arch mirror
+          # re-pin).
           docker pull alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e >/dev/null
           docker network create molecule-core-net >/dev/null 2>&1 || true
           # Workspace containers join molecule-core-net. The act_runner job
@@ -487,10 +711,10 @@ jobs:
 
       - name: Start Postgres (docker, ephemeral host port)
         run: |
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$PG_CONTAINER" \
+          # tmpfs PGDATA + run label + `rm -fv` pre-clean: see the script header.
+          bash .gitea/scripts/ci-service-container.sh postgres "$PG_CONTAINER" postgres:16 \
             -e POSTGRES_USER=dev -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=molecule \
-            -p 127.0.0.1::5432 postgres:16 >/dev/null
+            -p 127.0.0.1::5432 >/dev/null
           PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           [ -z "$PG_PORT" ] && PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | head -1 | awk -F: '{print $NF}')
           if [ -z "$PG_PORT" ]; then echo "::error::no host port"; docker logs "$PG_CONTAINER" || true; exit 1; fi
@@ -503,8 +727,7 @@ jobs:
 
       - name: Start Redis (docker, ephemeral host port)
         run: |
-          docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$REDIS_CONTAINER" -p 127.0.0.1::6379 redis:7 >/dev/null
+          bash .gitea/scripts/ci-service-container.sh redis "$REDIS_CONTAINER" redis:7 -p 127.0.0.1::6379 >/dev/null
           REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           [ -z "$REDIS_PORT" ] && REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | head -1 | awk -F: '{print $NF}')
           if [ -z "$REDIS_PORT" ]; then echo "::error::no host port"; docker logs "$REDIS_CONTAINER" || true; exit 1; fi
@@ -563,29 +786,21 @@ jobs:
         working-directory: workspace-server
         run: go build -o platform-server ./cmd/server
 
-      - name: Kill stale platform-server before start (issue #1046)
-        run: |
-          # Dynamic port allocation (see #2450) eliminates the fixed-port race.
-          # We still sweep by process name to avoid leaking platform-server
-          # processes on the shared runner.
-          killed=0
-          for pid in $(grep -l "platform-serve" /proc/[0-9]*/comm 2>/dev/null); do
-            kpid="${pid%/comm}"; kpid="${kpid##*/}"
-            cmdline=$(cat "/proc/${kpid}/cmdline" 2>/dev/null | tr '\0' ' ')
-            if echo "$cmdline" | grep -q "platform-server"; then
-              echo "Killing stale platform-server pid ${kpid}: ${cmdline}"
-              kill "$kpid" 2>/dev/null || true
-              killed=$((killed + 1))
-            fi
-          done
-          if [ "$killed" -gt 0 ]; then echo "Killed $killed stale platform-server process(es)."; else echo "No platform-server-named process found."; fi
-          sleep 1
-
+      # Host-wide "Kill stale platform-server" sweep DELETED here too — same
+      # reasoning as the first job in this file (see the note above the other
+      # "Start platform" step): the port is already dynamic, so the sweep bought
+      # nothing, and on the shared `docker-host` runner it killed concurrent
+      # PRs' platform-servers, reddening required contexts on unrelated PRs and
+      # wedging the ['*'] merge queue.
       - name: Start platform (background)
         working-directory: workspace-server
         run: |
+          # `timeout` bound == this job's own timeout-minutes (30). Reaps only
+          # our own orphan if the job is hard-cancelled before the `always()`
+          # stop step; cannot fire during a healthy run.
           echo "starting platform with PLATFORM_URL=${PLATFORM_URL:-<fallback>} PORT=$PORT BIND_ADDR=0.0.0.0"
-          PORT=$PORT BIND_ADDR=0.0.0.0 PLATFORM_URL="${PLATFORM_URL:-http://host.docker.internal:$PORT}" ./platform-server > platform.log 2>&1 &
+          PORT=$PORT BIND_ADDR=0.0.0.0 PLATFORM_URL="${PLATFORM_URL:-http://host.docker.internal:$PORT}" \
+            timeout --signal=TERM --kill-after=30s 30m ./platform-server > platform.log 2>&1 &
           echo $! > platform.pid
 
       - name: Wait for /health (+ migrations applied)
@@ -626,11 +841,171 @@ jobs:
           # the env; we feed it from Infisical (MINIMAX_API_KEY @ staging
           # /shared/controlplane) via the "Fetch staging MiniMax key from Infisical
           # KMS" step above (exported to $GITHUB_ENV). When that fetch is gated off
-          # (untrusted-fork PR) MINIMAX_API_KEY is empty and the script SKIPS loud
-          # (exit 0) — it never reds on a missing key (serving-e2e skip-if-absent
-          # pattern). The advisory job stays green either way.
+          # (untrusted-fork PR) MINIMAX_API_KEY is empty and the script exits 0
+          # having asserted nothing. That was harmless while the job was masked;
+          # now that the lane gates, the guard step below turns any such
+          # zero-assertion exit into a loud, named red.
           LIFECYCLE_LLM: minimax
-        run: bash tests/e2e/test_local_provision_lifecycle_e2e.sh
+          # The script appends every workspace id it provisions here, so the teardown can
+          # delete OUR containers and only ours. See #4346 — this is the job whose live
+          # container a concurrent run's teardown deleted mid-restart.
+          E2E_WS_MANIFEST: /tmp/ws_owned_${{ github.run_id }}_${{ github.run_attempt }}.txt
+          E2E_REAL_LOG: /tmp/lpe2e_real_${{ github.run_id }}_${{ github.run_attempt }}.log
+        run: |
+          # Gitea runs a step as `bash --noprofile --norc -e -o pipefail {0}`, but
+          # a script cannot read its own flags off a `set` line, so state them.
+          set -eo pipefail
+          bash tests/e2e/test_local_provision_lifecycle_e2e.sh 2>&1 | tee "$E2E_REAL_LOG"
+
+      # A green exit is NOT evidence this lane exercised anything: the e2e script
+      # has three distinct `exit 0` paths — the normal pass, the
+      # MINIMAX_API_KEY-absent skip, and infra_skip_advisory(). Only the first
+      # prints a `=== Results: <N> passed, 0 failed ===` line. While the job was
+      # `continue-on-error: true` that difference was invisible; now that the
+      # lane gates, a zero-assertion run must not be able to report success
+      # identically to a full one. Assert the COUNT.
+      # PROPORTIONALITY (mc#5155). This workflow has NO `paths:` filter and BP is
+      # ['*'], so every posted context must be green on every PR. Unmasking made
+      # a real defect red the lane -- which is the point -- but it also meant a
+      # MiniMax or Infisical OUTAGE would red every open PR at once, freezing the
+      # whole merge queue. "A check that can fail" and "an external outage blocks
+      # all merges" are different bargains, and only the first was the argument
+      # for unmasking.
+      #
+      # A `paths:` filter was considered and rejected: `paths:` is workflow-level,
+      # so it would also stop the REQUIRED `lifecycle-stub` context (listed in
+      # .gitea/required-contexts.txt) from posting. That is the
+      # `path_filtered_workflow_cant_be_required` class that lint-required-no-paths
+      # exists to prevent -- it only misses it here because BP ['*'] resolves to
+      # zero enumerable contexts in that lint.
+      #
+      # Instead: a BOUNDED, ENUMERATED allowance, adjudicated in one place.
+      #   * Only the signatures in E2E_TRANSIENT_CLASSES may consume it, and each
+      #     one is an EXTERNAL dependency being unreachable -- never our code.
+      #     `a2a-gateway-error` and `a2a-queue-timeout` are deliberately NOT in
+      #     the set: those can indicate a real proxy/daemon regression.
+      #   * The budget is ONE event per run. A second consumes nothing and reds.
+      #   * A consumed budget is a loud ::warning:: naming the class, not silence.
+      # This is bounded in a way an open-ended `continue-on-error` never was: it
+      # cannot absorb an assertion failure, a thin pass, or an unknown skip.
+      #
+      # Budget sizing: the transient trigger fired 0 times in 279 runs over 9 days
+      # (2026-08-01..09), independently re-measured as 0 in 286 runs over 308 main
+      # commits. Budgeting for 1 per run against a measured rate of 0 is therefore
+      # deliberately generous; if it ever actually fires, the warning is visible in
+      # the run and mc#5155 forces the review rather than letting it normalise.
+      - name: Assert the real-image lane actually asserted something
+        env:
+          E2E_REAL_LOG: /tmp/lpe2e_real_${{ github.run_id }}_${{ github.run_attempt }}.log
+          TRANSIENT_LEDGER: /tmp/lpe2e_transient_${{ github.run_id }}_${{ github.run_attempt }}.txt
+          # Floor, not equality: adding a 19th assertion to the e2e must not red
+          # this. 18 is what every one of the 279 logs sampled 2026-08-01..09 printed.
+          E2E_MIN_ASSERTIONS: '18'
+          # Space-separated. EXTERNAL-unreachable signatures only.
+          E2E_TRANSIENT_CLASSES: 'infisical-unreachable a2a-connect-timeout'
+          E2E_TRANSIENT_BUDGET: '1'
+        run: |
+          set -uo pipefail
+
+          # Count transients recorded by earlier steps (Infisical transport).
+          ledger_n=0
+          if [ -s "$TRANSIENT_LEDGER" ]; then
+            ledger_n=$(grep -c . "$TRANSIENT_LEDGER" || true)
+            ledger_n=${ledger_n:-0}
+          fi
+
+          # `transient_ok <class>` — is this signature allowed to spend budget?
+          transient_ok() {
+            case " $E2E_TRANSIENT_CLASSES " in
+              *" $1 "*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          # `spend <class> <detail>` — consume the budget or red.
+          spend() {
+            _class="$1"; _detail="${2:-}"
+            _total=$((ledger_n + 1))
+            if ! transient_ok "$_class"; then
+              echo "::error::real-image lane stopped on '$_class'${_detail:+ ($_detail)} and asserted nothing."
+              echo "          '$_class' is NOT an allowed transient class ($E2E_TRANSIENT_CLASSES) —"
+              echo "          it can indicate a real regression, so it reds. Root-fix per no-flaky; do not re-mask."
+              exit 1
+            fi
+            if [ "$_total" -gt "$E2E_TRANSIENT_BUDGET" ]; then
+              echo "::error::real-image lane hit $_total transient event(s), over the budget of $E2E_TRANSIENT_BUDGET."
+              echo "          Repeated external failure in one run is not transient — it is an outage to fix (mc#5155)."
+              [ -s "$TRANSIENT_LEDGER" ] && sed 's/^/            ledger: /' "$TRANSIENT_LEDGER"
+              exit 1
+            fi
+            echo "::warning::real-image lane consumed its transient budget: $_class${_detail:+ ($_detail)}."
+            echo "::warning::An EXTERNAL dependency was unreachable, so this run asserted nothing and is NOT"
+            echo "::warning::evidence the lane works. Tracked by mc#5155; budget $_total/$E2E_TRANSIENT_BUDGET."
+            exit 0
+          }
+
+          if [ ! -s "$E2E_REAL_LOG" ]; then
+            # No log at all. If an earlier step recorded a transient (e.g. the
+            # Infisical fetch never exported a key), that is the explanation.
+            if [ "$ledger_n" -gt 0 ]; then
+              _first=$(head -1 "$TRANSIENT_LEDGER" | awk '{print $1}')
+              ledger_n=$((ledger_n - 1))   # `spend` re-adds this one
+              spend "$_first" "$(head -1 "$TRANSIENT_LEDGER")"
+            fi
+            echo "::error::advisory lane produced no log at $E2E_REAL_LOG — cannot confirm it ran."
+            exit 1
+          fi
+          # The tee'd file is the script's raw stdout, but the same text read back
+          # through the Actions job-log API is prefixed with an ISO-8601 stamp
+          # ("2026-08-09T02:10:05.9495407Z === Results: ..."). Strip an optional
+          # leading stamp and any trailing CR so this guard matches BOTH shapes.
+          # Anchoring at start-of-line after that strip is deliberate: it stops a
+          # line of echoed script SOURCE from counting as an emitted result — the
+          # same false-positive class that makes a naive `::error::` grep match
+          # un-executed `echo "::error::..."` lines in a step body.
+          norm() {
+            sed -e 's/\r$//' -e 's/^[0-9][0-9-]*T[0-9:.]*Z[[:space:]]*//' "$E2E_REAL_LOG"
+          }
+          if norm | grep -q '^=== Results: advisory infra-skip'; then
+            reason=$(norm | sed -n 's/^=== Results: advisory infra-skip (\(.*\)) ===$/\1/p' | tail -1)
+            # An unparseable reason must NOT be treated as an allowed class:
+            # `spend` fails closed on anything outside E2E_TRANSIENT_CLASSES,
+            # and the empty string is outside it.
+            spend "${reason:-<unparsed>}" "infra-skip"
+          fi
+          # NOTE: `n` may be empty if no Results line matched. Test emptiness
+          # FIRST — `[ "" -lt 18 ]` is a bash ERROR, not false, and an
+          # unguarded numeric test on an empty string has silently skipped an
+          # entire check in this repo before.
+          n=$(norm | sed -n 's/^=== Results: \([0-9][0-9]*\) passed, 0 failed ===$/\1/p' | tail -1)
+          if [ -z "${n:-}" ]; then
+            # No clean Results line. If an earlier step recorded an external
+            # transient, that explains it (an unreachable Infisical means no key,
+            # which makes the e2e take its missing-key exit). Otherwise this is a
+            # genuine early exit and reds.
+            if [ "$ledger_n" -gt 0 ]; then
+              _first=$(head -1 "$TRANSIENT_LEDGER" | awk '{print $1}')
+              ledger_n=$((ledger_n - 1))
+              spend "$_first" "$(head -1 "$TRANSIENT_LEDGER")"
+            fi
+            echo "::error::no clean '=== Results: <N> passed, 0 failed ===' line in the real-image lane log."
+            echo "          The script exited without completing its assertions (missing MINIMAX_API_KEY, or an early exit)."
+            tail -n 25 "$E2E_REAL_LOG" || true
+            exit 1
+          fi
+          if [ "$n" -lt "$E2E_MIN_ASSERTIONS" ]; then
+            echo "::error::real-image lane asserted only $n of an expected >=$E2E_MIN_ASSERTIONS checks — refusing a thin pass."
+            exit 1
+          fi
+          echo "real-image lane asserted $n checks, 0 failed (floor $E2E_MIN_ASSERTIONS); transient budget used 0/$E2E_TRANSIENT_BUDGET."
+          if [ "$ledger_n" -gt 0 ]; then
+            # Belt-and-braces: a clean Results line alongside a recorded transient
+            # is not an expected combination (an unreachable Infisical means no
+            # key, which makes the e2e exit before asserting). Surface it rather
+            # than let it pass unremarked.
+            echo "::warning::lane passed cleanly BUT $ledger_n transient(s) were recorded earlier this run:"
+            sed 's/^/::warning::  /' "$TRANSIENT_LEDGER"
+          fi
 
       - name: Dump platform log on failure
         if: failure()
@@ -639,47 +1014,102 @@ jobs:
       - name: Dump workspace container logs on failure
         if: failure()
         run: |
-          WS_NAME=$(docker ps --filter "name=ws-" --format '{{.Names}}' | head -1 || true)
-          if [ -n "$WS_NAME" ]; then
-            echo "=== Workspace container logs for $WS_NAME ==="
-            docker logs "$WS_NAME" 2>&1 | tail -n 80 || true
-          fi
+          # READ FROM THE MANIFEST, NOT FROM `docker ps | head -1`.
+          #
+          # This is a shared docker host with concurrent runs on it, so the first ws-*
+          # container the daemon lists is very often NOT ours. Dumping it meant that when
+          # a run failed, the logs it printed to explain WHY could belong to a completely
+          # different PR's workspace — and someone would then debug their failure against
+          # a stranger's stack trace. A diagnostic that lies is worse than none (#4346).
+          MANIFEST="/tmp/ws_owned_${{ github.run_id }}_${{ github.run_attempt }}.txt"
+          [ -s "$MANIFEST" ] || { echo "(no workspace was provisioned by this run)"; exit 0; }
+          while read -r wsid; do
+            [ -n "$wsid" ] || continue
+            name="ws-${wsid}"
+            echo "=== Workspace container logs for $name (OURS) ==="
+            docker logs "$name" 2>&1 | tail -n 80 || echo "(container $name is gone)"
+          done < "$MANIFEST"
 
       - name: Stop platform
         if: always()
         run: |
           [ -f workspace-server/platform.pid ] && kill "$(cat workspace-server/platform.pid)" 2>/dev/null || true
 
+      - name: Remove this run's workspace containers + volumes (platform-instance scoped)
+        # Positive identity, like the manifest teardown below, but for every
+        # container THIS run's platform provisioned — including ones no manifest
+        # knows about (a provision that raced a delete, RC09). They carry
+        # molecule.platform.instance=sha256(DATABASE_URL)[:16]; the DSN holds this
+        # run's own ephemeral PG port, so a concurrent run's workspaces never
+        # match. The listing is inside the reviewed script, filtered by that
+        # label only (test_ws_orphan_reap.py); this workflow still lists nothing.
+        # Volumes are derived from the containers (the bind-created ones carry no
+        # labels), so this runs BEFORE the manifest teardown removes them.
+        if: always()
+        run: |
+          if [ -z "${DATABASE_URL:-}" ]; then
+            echo "No DATABASE_URL — the platform never started; nothing to remove."
+            exit 0
+          fi
+          # "Stop platform" only signals it. Wait (bounded) until our own server
+          # has exited, so nothing it is still doing creates a container after
+          # the listing below. Not `kill -0`: the pid is the `timeout` wrapper,
+          # reparented to the job container's PID 1 (`sleep`, which reaps
+          # nothing), so once it exits it stays a zombie that `kill -0` still
+          # finds and the loop always ran its full 30s. Read the state instead.
+          PID="$(cat workspace-server/platform.pid 2>/dev/null || true)"
+          for _ in $(seq 1 30); do
+            [ -n "$PID" ] || break
+            st="$(awk '/^State:/ {print $2}' "/proc/$PID/status" 2>/dev/null || true)"
+            case "$st" in ''|Z|X) break ;; esac
+            sleep 1
+          done
+          bash .gitea/scripts/ws-orphan-reap.sh instance "$DATABASE_URL" \
+            || echo "::warning::instance-scoped workspace teardown did not complete — see above"
+
       - name: Stop service containers
         if: always()
         run: |
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$REDIS_CONTAINER" 2>/dev/null || true
 
-      - name: Teardown leaked ws-* workspace containers (run-scoped, #2883)
+      - name: Teardown OUR ws-* workspace containers (positive identity, #2883 / #4346)
         if: always()
         run: |
-          # #2883: remove ONLY the ws-<uuid> workspace containers this run
-          # created (everything matching name ^ws- that was NOT in the
-          # pre-job baseline). The e2e script's trap usually handles its own
-          # workspace, but a cancelled/timed-out job kills the runner container
-          # before the trap fires, and a platform crash can orphan the
-          # container — both leak a forever-running ws-* that pegs CPU on the
-          # shared docker-host. Run-scoped (diff against baseline) so a
-          # concurrent run's in-flight workspace on the same host is untouched.
-          # The standing sweep-stale-ws-orphans.yml janitor is the age-guarded
-          # belt-and-braces second layer for anything this step misses
-          # (e.g. the runner container itself being SIGKILLed before this runs).
-          BASELINE="/tmp/ws_baseline_${{ github.run_id }}_${{ github.run_attempt }}.txt"
-          [ -f "$BASELINE" ] || : > "$BASELINE"
+          # Remove exactly the workspace containers THIS run provisioned — the ids the
+          # e2e script recorded in the manifest as POST /workspaces handed them back.
+          # Nothing else on this daemon is ours to delete.
+          #
+          # This deletes by NAME (ws-<id>), never by "every ^ws- container I don't
+          # recognise". A concurrent run's workspace is not in our manifest, so it cannot
+          # be touched — which is the whole of #4346. The previous baseline-exclusion
+          # version protected us only from runs that started BEFORE us, and offered zero
+          # protection against the ones that start AFTER, which is the common case
+          # because this step runs at the END of the job.
+          #
+          # Anything this step misses entirely (the runner container SIGKILLed before it
+          # runs, so nothing here executes) is the job of the standing
+          # sweep-stale-ws-orphans.yml janitor. That is the right layer for it: it is
+          # AGE-GUARDED, so unlike this step it cannot delete a container that is still
+          # in use.
+          # Delete by EXACT NAME, and NEVER enumerate the daemon here. `docker rm`
+          # takes a container name directly, so the id from the manifest is all we
+          # need — there is no `docker ps`/`docker container ls` in this step at all.
+          # That is deliberate and load-bearing: the moment a teardown step LISTS the
+          # daemon (by any idiom — `--filter name=ws-`, `--format | grep ws-`,
+          # `-a | awk /ws-/`) it can select a CONCURRENT run's container, which is the
+          # entire #4346 failure. A destructive step that never lists cannot pick the
+          # wrong victim, and the guard (test_ws_teardown_positive_identity.py) enforces
+          # exactly that property rather than blacklisting listing spellings.
+          MANIFEST="/tmp/ws_owned_${{ github.run_id }}_${{ github.run_attempt }}.txt"
+          [ -f "$MANIFEST" ] || : > "$MANIFEST"
           removed=0
-          for cid in $(docker ps -aq --filter "name=^ws-" 2>/dev/null); do
-            # Skip containers that already existed before this job started.
-            if grep -qx "$cid" "$BASELINE" 2>/dev/null; then continue; fi
-            name=$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's#^/##' || echo "$cid")
-            echo "removing leaked workspace container: $name ($cid)"
-            docker rm -f "$cid" >/dev/null 2>&1 || true
+          while read -r wsid; do
+            [ -n "$wsid" ] || continue
+            echo "removing our workspace container: ws-${wsid}"
+            docker rm -f "ws-${wsid}" >/dev/null 2>&1 || true
+            docker volume rm -f "ws-${wsid}-configs" "ws-${wsid}-claude-sessions" "ws-${wsid}-workspace" >/dev/null 2>&1 || true
             removed=$((removed + 1))
-          done
-          rm -f "$BASELINE" 2>/dev/null || true
-          echo "ws-* teardown removed $removed run-scoped orphan container(s)."
+          done < "$MANIFEST"
+          echo "ws-* teardown removed $removed of $(wc -l < "$MANIFEST" | tr -d ' ') owned container(s)."
+          rm -f "$MANIFEST" 2>/dev/null || true

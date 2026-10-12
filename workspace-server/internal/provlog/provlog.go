@@ -1,6 +1,6 @@
 // Package provlog emits structured, single-line JSON log records for
-// provisioning-lifecycle boundaries (workspace create, EC2 start/stop,
-// restart, idempotency skips). Records share a stable `evt:` prefix and
+// provisioning-lifecycle boundaries (workspace create, provider compute
+// start/stop, restart, idempotency skips). Records share a stable `evt:` prefix and
 // JSON payload so a future grep|jq pipeline (or a Loki/Datadog ingest)
 // can reconstruct the per-workspace timeline without parsing the
 // human-prose log lines that already exist.
@@ -9,12 +9,14 @@
 // remain the operator-facing message. Event() emits a paired structured
 // record alongside, additive only.
 //
-// Event taxonomy (extend by appending; never rename):
+// Legacy event names are retained for compatibility; `provision.ec2_*` now
+// records generic CP-managed provider compute boundaries and must not be read
+// as proof that the selected provider is AWS. Extend by appending; never rename:
 //
-//	provision.start         — workspace row inserted, EC2 about to launch
-//	provision.skip_existing — idempotency hit, no new EC2
-//	provision.ec2_started   — RunInstances returned an instance id
-//	provision.ec2_stopped   — TerminateInstances acknowledged
+//	provision.start         — workspace row inserted, provider start about to begin
+//	provision.skip_existing — idempotency hit, no new provider start
+//	provision.ec2_started   — legacy name: CP Start returned a provider instance id
+//	provision.ec2_stopped   — legacy name: CP Stop acknowledged provider compute
 //	restart.pre_stop        — Restart handler about to call Stop
 //
 // Required fields per event are documented at each call site.

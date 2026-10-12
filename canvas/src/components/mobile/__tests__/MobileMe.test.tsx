@@ -86,7 +86,7 @@ describe("MobileMe — page structure", () => {
 
   it("renders all 5 accent color swatches", () => {
     const { container } = renderMe();
-    const swatches = container.querySelectorAll("button[aria-label]");
+    const swatches = container.querySelectorAll<HTMLButtonElement>("button[aria-label]");
     // 5 accent swatches + theme buttons + density buttons = more than 5
     // We verify the accent swatches by checking aria-labels
     const accentLabels = Array.from(swatches)
@@ -120,7 +120,7 @@ describe("MobileMe — theme selection", () => {
     const { container } = renderMe();
     // The theme buttons are rendered; System is active in our mock
     // We verify the buttons exist and are findable
-    const buttons = Array.from(container.querySelectorAll("button"));
+    const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>("button"));
     const themeButtons = buttons.filter(
       (b) => ["System", "Light", "Dark"].includes(b.textContent?.trim() ?? ""),
     );
@@ -129,7 +129,7 @@ describe("MobileMe — theme selection", () => {
 
   it("calls setTheme when a theme button is clicked", () => {
     const { container } = renderMe();
-    const darkBtn = Array.from(container.querySelectorAll("button")).find(
+    const darkBtn = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(
       (b) => b.textContent?.trim() === "Dark",
     );
     expect(darkBtn).toBeTruthy();
@@ -143,7 +143,7 @@ describe("MobileMe — theme selection", () => {
 describe("MobileMe — accent selection", () => {
   it("renders accent buttons with aria-label", () => {
     const { container } = renderMe();
-    const swatches = container.querySelectorAll("button[aria-label]");
+    const swatches = container.querySelectorAll<HTMLButtonElement>("button[aria-label]");
     const accentSwatches = Array.from(swatches).filter(
       (b) => (b.getAttribute("aria-label") ?? "").startsWith("Set accent"),
     );
@@ -152,7 +152,7 @@ describe("MobileMe — accent selection", () => {
 
   it("calls setAccent with the correct color", () => {
     const { container } = renderMe();
-    const swatch = Array.from(container.querySelectorAll("button[aria-label]")).find(
+    const swatch = Array.from(container.querySelectorAll<HTMLButtonElement>("button[aria-label]")).find(
       (b) => b.getAttribute("aria-label") === "Set accent #3b6fe0",
     );
     expect(swatch).toBeTruthy();
@@ -166,7 +166,7 @@ describe("MobileMe — accent selection", () => {
 describe("MobileMe — density selection", () => {
   it("renders density buttons", () => {
     const { container } = renderMe();
-    const buttons = Array.from(container.querySelectorAll("button"));
+    const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>("button"));
     const densityButtons = buttons.filter(
       (b) => ["Regular", "Compact"].includes(b.textContent?.trim() ?? ""),
     );
@@ -175,7 +175,7 @@ describe("MobileMe — density selection", () => {
 
   it("calls setDensity when Compact is clicked", () => {
     const { container } = renderMe({ density: "regular" });
-    const compactBtn = Array.from(container.querySelectorAll("button")).find(
+    const compactBtn = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(
       (b) => b.textContent?.trim() === "Compact",
     );
     expect(compactBtn).toBeTruthy();
@@ -185,7 +185,7 @@ describe("MobileMe — density selection", () => {
 
   it("calls setDensity when Regular is clicked", () => {
     const { container } = renderMe({ density: "compact" });
-    const regularBtn = Array.from(container.querySelectorAll("button")).find(
+    const regularBtn = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(
       (b) => b.textContent?.trim() === "Regular",
     );
     expect(regularBtn).toBeTruthy();

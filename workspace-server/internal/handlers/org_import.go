@@ -25,7 +25,6 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/scheduler"
 	"github.com/google/uuid"
 )
 
@@ -89,8 +88,8 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 	}
 	if tier == 0 {
 		// Resolved via the same DefaultTier helper Create + Templates
-		// use (#2910 PR-E). SaaS → T4 (one container per sibling EC2,
-		// no neighbour to protect from), self-hosted → T3. Pre-#2910
+		// use (#2910 PR-E). SaaS → T4 (dedicated managed compute),
+		// self-hosted → T3. Pre-#2910
 		// this path returned T2 on self-hosted, asymmetric with
 		// workspace.go's T3 — undocumented drift. Lifting to
 		// DefaultTier collapses both call sites onto one source of
@@ -224,11 +223,25 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 			"parent_id":   parentRef,
 			"tier":        tier,
 		})
+		// The workspace already exists, so create+provision is correctly
+		// skipped — but its DECLARED plugins[].config still has to reach the
+		// box. Before this, the skip returned here and the M6 config wiring
+		// below was never reached, so an existing workspace could never pick up
+		// a node's declared settings by ANY route (restart reuses stored
+		// config; tenant redeploy replaces only the control plane). That is how
+		// a live tenant ran stock template config while its org.yaml declared
+		// 11 schedules. Re-delivery makes /org/import the platform ability for
+		// this; nil deliverer = byte-identical to the old behaviour.
+		redelivered := h.redeliverDeclaredPluginSettings(ctx, existingID, ws.Name, ws.Plugins)
 		*results = append(*results, map[string]interface{}{
 			"id":      existingID,
 			"name":    ws.Name,
 			"tier":    tier,
 			"skipped": true,
+			// Reported so a caller can tell "skipped, nothing to do" apart from
+			// "skipped, but settings were refreshed" — the two were previously
+			// indistinguishable in the response.
+			"settings_redelivered": redelivered,
 		})
 		return h.recurseChildrenForImport(ws, existingID, absX, absY, defaults, orgBaseDir, results, provisionSem)
 	}
@@ -322,7 +335,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 			"name": ws.Name, "external": true,
 		})
 	} else if IsMockRuntime(runtime) {
-		// Mock-runtime workspaces have no container, no EC2, no URL —
+		// Mock-runtime workspaces have no container, provider compute, or URL —
 		// the proxyA2ARequest short-circuit synthesises every reply
 		// from a canned variant pool (see mock_runtime.go). Status
 		// goes straight to 'online' so the canvas renders the node
@@ -355,15 +368,20 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 			WorkspaceAccess: workspaceAccess,
 		}
 		templatePath := ""
+		// M6 / FIX 0: resolve cache-FIRST, then configs — mirroring
+		// TemplatesHandler.resolveTemplateDir. `template` comes from uploaded
+		// YAML and stays untrusted: resolveOrgNodeTemplateDir enforces the same
+		// resolveInsideRoot containment on BOTH roots, so an absolute path or a
+		// `../` escape is refused for each. Previously only configsDir was
+		// consulted, so on a deployment where templates are FETCHED rather than
+		// baked the node silently fell back to `<runtime>-default`.
 		if ws.Template != "" {
-			// `template` comes from the uploaded YAML — treat as untrusted.
-			// Only accept paths that stay inside h.configsDir.
-			if tp, err := resolveInsideRoot(h.configsDir, ws.Template); err == nil {
-				if _, statErr := os.Stat(tp); statErr == nil {
-					templatePath = tp
-				}
-			}
+			templatePath = resolveOrgNodeTemplateDir(h.configsDir, h.templateCacheDir, ws.Template)
 		}
+		// nodeTemplatePath is captured BEFORE files_dir overwrites templatePath
+		// below (files_dir repurposes the same variable for the asset copy), so
+		// FIX 1/2/3 read the TEMPLATE's config, never the files_dir.
+		nodeTemplatePath := templatePath
 		if templatePath == "" {
 			// #241: sanitizeRuntime() allowlists the runtime string so a
 			// crafted org.yaml cannot use it as a path-traversal oracle.
@@ -376,6 +394,37 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 
 		// Always generate default config.yaml (runtime, model, tier, etc.)
 		configFiles, cfgErr := h.workspace.ensureDefaultConfig(id, payload)
+		// M6 / FIX 1+2: a node that names a `template:` inherits that
+		// template's config as the BASE, with the generated config overlaid.
+		// Without this the template's `providers` registry, `models[]`, `env`,
+		// `skills`, `a2a` and `runtime_config` were dropped on the floor — the
+		// keys that exist ONLY in the template, which is the whole reason a
+		// node references one. Observed in production 2026-07-28: a live
+		// workspace's delivered config.yaml was the stock runtime template
+		// (`name: Hermes Agent`) with no plugins and no schedules, because the
+		// node's own config never reached it.
+		//
+		// GATED on an explicit `template:`. A node without one takes this
+		// branch not at all and keeps today's behaviour byte-for-byte, which is
+		// what makes it safe on a path that provisions whole orgs.
+		if cfgErr == nil && nodeTemplatePath != "" {
+			if generated, ok := configFiles["config.yaml"]; ok {
+				tmplCfg, readErr := os.ReadFile(filepath.Join(nodeTemplatePath, "config.yaml"))
+				if readErr == nil {
+					merged, mergeErr := mergeTemplateConfigBase(tmplCfg, generated)
+					if mergeErr != nil {
+						// Non-fatal by design: a malformed template config must
+						// not fail an org import. Keep the generated config and
+						// say so loudly rather than shipping a half-merge.
+						log.Printf("Org import: template config merge failed for %s (using generated config only): %v", ws.Name, mergeErr)
+					} else {
+						configFiles["config.yaml"] = merged
+					}
+				} else if !os.IsNotExist(readErr) {
+					log.Printf("Org import: cannot read template config.yaml for %s (using generated config only): %v", ws.Name, readErr)
+				}
+			}
+		}
 		if cfgErr != nil {
 			log.Printf("Org import: default config generation failed for %s: %v — marking workspace failed", ws.Name, cfgErr)
 			// Fail-closed: the workspace row + layout + broadcast are already
@@ -403,7 +452,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		// provisioning channel) anymore. The CTO ruling is that agent-skills
 		// are PLUGINS and must install DYNAMICALLY after the workspace boots
 		// online, via the existing plugin install pipeline — never through
-		// Secrets Manager or the template-asset relay. So instead of copying
+		// the secret-bootstrap or template-asset transport. So instead of copying
 		// the plugin tree into configFiles here, we PERSIST the declared set
 		// (workspace_declared_plugins) and let the post-online reconcile
 		// (registry heartbeat → ReconcileWorkspacePlugins) install them from
@@ -416,7 +465,25 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		// name is derived from the source so the reconcile can diff declared
 		// vs installed without fetching.
 		seenPluginNames := map[string]string{} // name → first source that claimed it
-		for _, pluginSource := range mergePlugins(defaults.Plugins, ws.Plugins) {
+		// M6 / FIX 3: three-layer precedence TEMPLATE -> org DEFAULTS -> NODE.
+		// A node that references a template gets that template's own
+		// `plugins:` too — the template is the thing that knows which plugins
+		// its agent needs. Delegates to mergePlugins so the "!"/"-" opt-out
+		// grammar is shared, meaning a node can still DECLINE an inherited
+		// plugin. Template-first ordering: the first source to claim an install
+		// name wins on collision.
+		templatePlugins := []string(nil)
+		templatePluginEntries := []templatePluginEntry(nil)
+		if nodeTemplatePath != "" {
+			if tmplCfg, readErr := os.ReadFile(filepath.Join(nodeTemplatePath, "config.yaml")); readErr == nil {
+				templatePlugins = templateDeclaredPlugins(tmplCfg)
+				// Same bytes, settings-aware view — so the template layer's
+				// `plugins[].config` reaches the box on this path too, not only
+				// on WorkspaceHandler.Create.
+				templatePluginEntries = templateConfigPluginEntriesFrom(tmplCfg, ws.Name)
+			}
+		}
+		for _, pluginSource := range mergePluginsWithTemplate(templatePlugins, pluginEntrySources(defaults.Plugins), pluginEntrySources(ws.Plugins)) {
 			pluginName, nameErr := plugins.PluginNameFromSource(pluginSource)
 			if nameErr != nil {
 				log.Printf("Org import: skipping plugin %q for %s — cannot derive install name: %v",
@@ -436,6 +503,35 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 				log.Printf("Org import: failed to record declared plugin %s (%s) for %s: %v",
 					pluginName, pluginSource, ws.Name, recErr)
 			}
+		}
+
+		// DECLARING a plugin is not the same as CONFIGURING it. The loop above
+		// projects entries down to their source strings (pluginEntrySources) —
+		// which is right for the declared set, and drops `config:` on the floor.
+		// So a node declaring
+		//
+		//	plugins:
+		//	  - source: gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.0
+		//	    config:
+		//	      schedules: [...]
+		//
+		// got the plugin but never its schedules: nothing rendered
+		// plugin-settings/<install>.json into the provisioning bundle, and the
+		// runtime's trigger seeding reads exactly that file. Confirmed in
+		// production 2026-07-30 (founder-org canary): grid `[]` after a first
+		// import, populated only after a SECOND import took the skip path and
+		// re-delivered (#4947).
+		//
+		// Rendered into configFiles so the settings ride the SAME provisioning
+		// channel as config.yaml and land in the config volume the container
+		// actually mounts — as opposed to the live-write path, which is a
+		// best-effort optimisation for already-running workspaces.
+		if rendered := renderPluginSettingsFromEntries(
+			ws.Name, templatePluginEntries, defaults.Plugins, ws.Plugins,
+		); len(rendered) > 0 {
+			var added int
+			configFiles, added = mergePluginSettingsIntoConfigFiles(configFiles, rendered)
+			log.Printf("Org import: rendered %d plugin-settings file(s) for %s", added, ws.Name)
 		}
 
 		// Render category_routing into config.yaml so the agent can read its routing
@@ -490,7 +586,8 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		// Resolve idle_prompt — same precedence (ws inline → ws file → defaults).
 		// Inject into config.yaml alongside idle_interval_seconds so the
 		// workspace's heartbeat loop picks up the idle-reflection cadence on
-		// boot (see workspace/heartbeat.py + config.py).
+		// boot (see molecule-ai-workspace-runtime/molecule_runtime/
+		// heartbeat.py and config.py).
 		idlePrompt, err := resolvePromptRef(ws.IdlePrompt, ws.IdlePromptFile, orgBaseDir, ws.FilesDir)
 		if err != nil {
 			log.Printf("Org import: failed to resolve idle_prompt for %s: %v", ws.Name, err)
@@ -520,11 +617,57 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 			// means the idle loop never fires regardless of interval, so we
 			// only emit interval when there's a body to go with it.
 			if idleInterval <= 0 {
-				idleInterval = 600 // same default as workspace/config.py
+				idleInterval = 600 // same default as molecule_runtime/config.py
 			}
 			block := fmt.Sprintf("idle_interval_seconds: %d\nidle_prompt: |\n  %s\n", idleInterval, indented)
 			configFiles["config.yaml"] = appendYAMLBlock(configFiles["config.yaml"], block)
 			log.Printf("Org import: injected idle_prompt (%d chars, interval=%ds) into config.yaml for %s", len(trimmed), idleInterval, ws.Name)
+		}
+
+		// Scheduler-as-trigger-plugin RFC §8A P3 (template-seeding seam, core
+		// leg — mechanism decided on issue #4411, 2026-07-17): render the
+		// workspace's RESOLVED schedules into the DELIVERED config.yaml so the
+		// runtime's boot/reload seeding (molecule-ai-workspace-runtime#318,
+		// seed_schedules_from_workspace_config) reconciles them onto the
+		// volume-authoritative grid. The config/asset channel lands the file
+		// on the volume BEFORE boot, so there is no core→runtime API race on
+		// first provision. This is now the ONLY schedule delivery path — the
+		// legacy core-DB seed was retired in P4b. Must run BEFORE the provision
+		// dispatch below, which captures configFiles for the provision goroutine.
+		if len(ws.Schedules) > 0 {
+			schedBlock, schedRendered, schedSkipped := renderTemplateSchedulesYAML(ws.Schedules, orgBaseDir, ws.FilesDir, ws.Name)
+			if schedBlock != "" {
+				if configFiles == nil {
+					configFiles = map[string][]byte{}
+				}
+				// Checked append (belt+braces over the per-entry round-trip
+				// guard): the ASSEMBLED config.yaml is re-parsed; if the combined
+				// document fails to load, the block is dropped — an unparseable
+				// config.yaml would brick workspace boot (runtime config.py
+				// loads it with no try/except).
+				combined, appended := appendYAMLBlockChecked(configFiles["config.yaml"], schedBlock, "schedules", ws.Name)
+				configFiles["config.yaml"] = combined
+				if appended {
+					log.Printf("Org import: injected %d schedule(s) into config.yaml for %s (skipped=%d of %d)", schedRendered, ws.Name, schedSkipped, len(ws.Schedules))
+				} else {
+					schedRendered = 0
+				}
+			}
+			// C2 ordering (RFC P5 per-workspace delivery): a workspace that
+			// ships schedules needs the molecule-scheduler trigger plugin to
+			// fire them (post-#4399 the plugin is the ONLY fire path), and the
+			// declaration must land in workspace_declared_plugins BEFORE the
+			// provision goroutine below assembles MOLECULE_DECLARED_PLUGINS
+			// (buildProvisionerConfig → desiredPluginSources), so first boot
+			// installs the daemon instead of waiting for the next online
+			// reconcile. Pre-fix the org-import path never declared it at all
+			// (only schedules.go Create and template_schedules.go did).
+			// Non-fatal: a declare hiccup must not fail the import.
+			if schedRendered > 0 {
+				if declErr := ensureSchedulerPluginDeclared(ctx, id); declErr != nil {
+					log.Printf("Org import: declare scheduler plugin for %s (non-fatal): %v", ws.Name, declErr)
+				}
+			}
 		}
 
 		// Inline system_prompt (only if no files_dir provides one)
@@ -538,7 +681,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		// Inject secrets from persona env + .env files as workspace secrets.
 		// Resolution (later overrides earlier):
 		//   0. Persona env (per-role bootstrap creds; only when ws.Role is set
-		//      and the operator-host bootstrap dir ships a matching file)
+		//      and the configured persona directory has a matching file)
 		//   1. Org root .env (shared defaults)
 		//   2. Workspace-specific .env (per-workspace overrides)
 		// Each line: KEY=VALUE → stored as encrypted workspace secret.
@@ -601,7 +744,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 
 		// #1084: limit concurrent provisioning via semaphore.
 		// Use provisionWorkspaceAuto so SaaS deployments route through
-		// the CP (EC2) path — calling provisionWorkspace directly was
+		// the control-plane provider path — calling provisionWorkspace directly was
 		// the same silent-drop bug that bit TeamHandler.Expand on
 		// 2026-05-04 (see workspace.go:121-125 comment + #2486). Symptom:
 		// every claude-code workspace from org-import on SaaS sat in
@@ -623,53 +766,10 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 	}
 
 skipProvision:
-	// internal#2006: migrate runtime-created schedules from a removed
-	// predecessor of the same agent (role+parent) onto this freshly-created
-	// workspace. Reconcile re-derives template-sourced state below, but
-	// schedules a user added at runtime (source='runtime', via the canvas/API)
-	// bind to the ephemeral workspace_id and would otherwise be abandoned on
-	// the removed row when an agent is recreated with a new id. Runs before the
-	// template upsert loop so a same-named template schedule still wins.
-	// Best-effort: never fails the import.
-	h.migrateRuntimeSchedulesFromRemovedPredecessor(ctx, id, role, ws.Name, parentID)
-
-	// Insert schedules if defined. Resolve each schedule's prompt body from
-	// either inline `prompt:` or `prompt_file:` (file ref relative to the
-	// workspace's files_dir). Inline wins; empty prompt after resolution is
-	// a configuration error (cron with no body would never do anything).
-	for _, sched := range ws.Schedules {
-		tz := sched.Timezone
-		if tz == "" {
-			tz = "UTC"
-		}
-		enabled := true
-		if sched.Enabled != nil {
-			enabled = *sched.Enabled
-		}
-		prompt, promptErr := resolvePromptRef(sched.Prompt, sched.PromptFile, orgBaseDir, ws.FilesDir)
-		if promptErr != nil {
-			log.Printf("Org import: failed to resolve prompt for schedule '%s' on %s: %v — skipping insert", sched.Name, ws.Name, promptErr)
-			continue
-		}
-		if prompt == "" {
-			log.Printf("Org import: schedule '%s' on %s has empty prompt (neither prompt nor prompt_file set) — skipping insert", sched.Name, ws.Name)
-			continue
-		}
-		// #722: surface the error rather than silently using time.Time{} (zero)
-		// which lib/pq stores as 0001-01-01 and may confuse the fire query.
-		nextRun, nextRunErr := scheduler.ComputeNextRun(sched.CronExpr, tz, time.Now())
-		if nextRunErr != nil {
-			log.Printf("Org import: invalid cron expression for schedule '%s' on %s: %v — skipping insert",
-				sched.Name, ws.Name, nextRunErr)
-			continue
-		}
-		if _, err := db.DB.ExecContext(context.Background(), orgImportScheduleSQL,
-			id, sched.Name, sched.CronExpr, tz, prompt, enabled, nextRun); err != nil {
-			log.Printf("Org import: failed to upsert schedule '%s' for %s: %v", sched.Name, ws.Name, err)
-		} else {
-			log.Printf("Org import: schedule '%s' (%s, %d chars) upserted for %s (source=template)", sched.Name, sched.CronExpr, len(prompt), ws.Name)
-		}
-	}
+	// Schedules declared in the template were rendered into the delivered
+	// config.yaml above (renderTemplateSchedulesYAML); the runtime seeds them
+	// onto the volume-authoritative grid at boot/reload. Core no longer writes
+	// a schedule DB table (retired in P4b).
 
 	// Insert channels if defined (Telegram, Slack, etc.). Config values
 	// support ${VAR} expansion from .env files. The manager is reloaded
@@ -719,6 +819,18 @@ skipProvision:
 		if err := adapter.ValidateConfig(expandedConfig); err != nil {
 			skipChannel(ch.Type, err.Error())
 			log.Printf("Org import: skipping %s channel for %s — invalid config: %v", ch.Type, ws.Name, err)
+			continue
+		}
+
+		// Match ChannelHandler.Create/Update: production channel credentials
+		// must be encrypted before channel_config reaches Postgres. Validate
+		// first because adapters need the plaintext shape, then encrypt the
+		// known secret fields in place while leaving routing identifiers usable.
+		if err := channels.EncryptSensitiveFields(expandedConfig); err != nil {
+			skipChannel(ch.Type, "channel config encryption failed")
+			// Do not log expandedConfig: it still contains the imported secrets
+			// when encryption fails.
+			log.Printf("Org import: skipping %s channel for %s — config encryption failed: %v", ch.Type, ws.Name, err)
 			continue
 		}
 
@@ -919,74 +1031,11 @@ func scanPlatformAnchor(ctx context.Context, query string, args ...interface{}) 
 	return id, x, y, true
 }
 
-// migrateRuntimeSchedulesFromRemovedPredecessor re-points runtime-created
-// schedules (source='runtime') from the most-recent removed predecessor of the
-// same agent onto newID. Recreating an agent mints a NEW workspace id (the
-// ON CONFLICT in createWorkspaceTree only matches non-removed rows), so a
-// schedule a user added at runtime would otherwise be abandoned on the removed
-// row. Template-sourced schedules are NOT migrated — reconcile re-derives those
-// from the org template (the upsert loop). The predecessor is matched by the
-// stable `role` when present (survives the name auto-suffixing that yields
-// "Agent (2)"), falling back to name+parent. Idempotent (skips names already on
-// newID) and best-effort (logs, never errors the import). See internal#2006.
-func (h *OrgHandler) migrateRuntimeSchedulesFromRemovedPredecessor(ctx context.Context, newID string, role interface{}, name string, parentID *string) {
-	var predID string
-	var err error
-	if role != nil {
-		err = db.DB.QueryRowContext(ctx, `
-			SELECT id FROM workspaces
-			WHERE status = 'removed' AND role = $1
-			  AND parent_id IS NOT DISTINCT FROM $2
-			  AND id <> $3
-			ORDER BY updated_at DESC NULLS LAST
-			LIMIT 1
-		`, role, parentID, newID).Scan(&predID)
-	} else {
-		err = db.DB.QueryRowContext(ctx, `
-			SELECT id FROM workspaces
-			WHERE status = 'removed' AND name = $1
-			  AND parent_id IS NOT DISTINCT FROM $2
-			  AND id <> $3
-			ORDER BY updated_at DESC NULLS LAST
-			LIMIT 1
-		`, name, parentID, newID).Scan(&predID)
-	}
-	if errors.Is(err, sql.ErrNoRows) {
-		return // first-time create — no predecessor to migrate from
-	}
-	if err != nil {
-		log.Printf("Org import: predecessor lookup for %q (new=%s) failed: %v — skipping schedule migration", name, newID, err)
-		return
-	}
-	res, err := db.DB.ExecContext(ctx, `
-		UPDATE workspace_schedules s
-		SET workspace_id = $1, updated_at = now()
-		WHERE s.workspace_id = $2
-		  AND s.source = 'runtime'
-		  AND NOT EXISTS (
-		      SELECT 1 FROM workspace_schedules t
-		      WHERE t.workspace_id = $1 AND t.name = s.name
-		  )
-	`, newID, predID)
-	if err != nil {
-		log.Printf("Org import: schedule migration %s -> %s (%q) failed: %v", predID, newID, name, err)
-		return
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		log.Printf("Org import: schedule migration rows affected %s -> %s: %v", predID, newID, err)
-		return
-	}
-	if n > 0 {
-		log.Printf("Org import: migrated %d runtime schedule(s) from removed predecessor %s to new workspace %s (%q)", n, predID, newID, name)
-	}
-}
-
 // lookupExistingChild returns the id of an existing workspace under
 // (parent_id, name) if any, with idempotency-friendly semantics:
 //   - parent_id IS NOT DISTINCT FROM matches NULL too (root workspaces)
-//   - status='removed' rows are ignored — collapsed teams or deleted
-//     workspaces shouldn't block a re-import
+//   - status='removed' rows are ignored — workspaces removed by deletion or
+//     import reconciliation shouldn't block a re-import
 //
 // On sql.ErrNoRows: returns ("", false, nil) — caller should INSERT.
 // On a real DB error: returns ("", false, err) — caller propagates.
@@ -1019,7 +1068,7 @@ func (h *OrgHandler) lookupExistingChild(ctx context.Context, name string, paren
 // grid (so nested-parent children don't clip into leaf siblings) and
 // dispatching createWorkspaceTree for each. Pacing prevents Docker
 // container-spam thundering on the self-hosted backend; SaaS dispatches
-// the EC2 provision in a goroutine so the main loop is not blocked.
+// managed provisioning in a goroutine so the main loop is not blocked.
 func (h *OrgHandler) recurseChildrenForImport(ws OrgWorkspace, parentID string, absX, absY float64, defaults OrgDefaults, orgBaseDir string, results *[]map[string]interface{}, provisionSem chan struct{}) error {
 	if len(ws.Children) == 0 {
 		return nil

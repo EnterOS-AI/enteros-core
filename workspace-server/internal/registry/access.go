@@ -62,7 +62,7 @@ func isAncestorOf(ancestorID, childID string) bool {
 // the org hierarchy. The rules:
 //
 //   - self → self
-//   - siblings (same parent, including both root-level)
+//   - siblings with the same non-root parent
 //   - any ancestor → any descendant (e.g. PM → Backend Engineer)
 //   - any descendant → any ancestor (e.g. Security Auditor → PM)
 //
@@ -73,11 +73,11 @@ func isAncestorOf(ancestorID, childID string) bool {
 // audit_summary, so it fell back to delegating to Dev Lead — bypassing
 // PM's category_routing entirely.
 //
-// The relaxation preserves the hierarchy intent (no horizontal cross-team
-// chatter — Frontend Engineer cannot directly message Backend Engineer
-// unless they share a parent, which they do under Dev Lead) while
-// unblocking the leadership-chain pattern that is fundamental to how
-// audit summaries fan out across the org.
+// The relaxation preserves hierarchy isolation: unrelated roots and
+// workspaces in disjoint subtrees remain unable to communicate, while
+// same non-root-parent siblings and ancestor/descendant pairs may. This
+// unblocks the leadership-chain pattern that is fundamental to how audit
+// summaries fan out across the org.
 func CanCommunicate(callerID, targetID string) bool {
 	if callerID == targetID {
 		return true
@@ -94,7 +94,8 @@ func CanCommunicate(callerID, targetID string) bool {
 		return false
 	}
 
-	// Siblings — same parent (including root-level where both have no parent)
+	// Siblings — same non-root parent. Unrelated roots are denied because a
+	// nil parent does not establish a shared hierarchy.
 	if caller.ParentID != nil && target.ParentID != nil &&
 		*caller.ParentID == *target.ParentID {
 		return true

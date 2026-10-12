@@ -1,13 +1,17 @@
 # Social Channels
 
-Connect AI agent workspaces to social platforms (Telegram, Slack, Discord) so users can talk to agents from anywhere. Built on a pluggable adapter pattern — one channel per workspace, multiple chats per channel.
+Connect AI agent workspaces to Telegram, Slack, Discord, and Lark/Feishu.
+Each workspace can have one channel row per platform type; Telegram rows can
+serve multiple comma-separated chat IDs.
 
 ## Architecture
 
 ```
-Telegram/Slack/Discord
+Telegram/Slack/Discord/Lark
     ↓ webhook or long-polling
-Platform: ChannelAdapter.ParseWebhook() / StartPolling()
+Public receiver: authenticate request against the candidate channel row
+    ↓ authenticated payload only
+ChannelAdapter.ParseWebhook() / StartPolling()
     ↓ allowlist check + Redis history lookup
 ProxyA2ARequest(ctx, workspaceID, body, "channel:<type>", true)
     ↓ agent processes (existing A2A flow)
@@ -22,12 +26,16 @@ The `channel:<type>` caller prefix bypasses workspace hierarchy access checks (s
 
 | Type | Status | Library |
 |------|--------|---------|
-| `telegram` | ✅ Implemented | `go-telegram-bot-api/v5` |
-| `slack` | Planned | — |
-| `discord` | ✅ Implemented (PR #656) | native `net/http` |
-| `whatsapp` | Planned | — |
+| `telegram` | Implemented: long polling or authenticated webhook | `go-telegram-bot-api/v5` |
+| `slack` | Implemented: Events API/slash-command input and two outbound modes | native `net/http` |
+| `discord` | Implemented: signed Interactions input and Incoming Webhook output | native `net/http`, `crypto/ed25519` |
+| `lark` | Implemented: Event Subscription input and Custom Bot output | native `net/http` |
 
-To add a new adapter: implement `ChannelAdapter` in `workspace-server/internal/channels/`, register in `registry.go`. Everything else (CRUD API, Canvas UI, MCP tools) works automatically.
+To add an adapter, implement `ChannelAdapter` in
+`workspace-server/internal/channels/` and register it in `registry.go`. The
+CRUD API and Canvas form consume the adapter schema. A new public-webhook
+provider must also add an explicit fail-closed authentication case in
+`handlers/channels.go`; registration alone does not make inbound requests safe.
 
 ## Telegram Setup
 
@@ -52,7 +60,8 @@ The Discover endpoint reports `can_read_all_group_messages` and surfaces a warni
 
 ### 4. Or connect via API
 ```bash
-curl -X POST http://localhost:8080/workspaces/:id/channels \
+curl -X POST "${PLATFORM_URL}/workspaces/${WORKSPACE_ID}/channels" \
+  -H "Authorization: Bearer ${TOKEN}" \
   -H 'Content-Type: application/json' \
   -d '{
     "channel_type": "telegram",
@@ -101,12 +110,17 @@ Last 10 messages per chat stored in Redis at `channel:telegram:{chat_id}:history
 
 ## Webhook Mode
 
-Currently, channels run in long-polling mode by default. Webhook mode is implemented but requires:
+Telegram rows use long polling by default. Adding `webhook_secret` selects
+webhook mode and prevents the poller from deleting the configured webhook.
+Webhook mode requires:
+
 1. Public URL pointing to `POST /webhooks/telegram` on your platform
 2. Manual `setWebhook` call to Telegram with the URL + a `secret_token`
 3. Storing the same `secret_token` in `channel_config.webhook_secret`
 
-The platform verifies the `X-Telegram-Bot-Api-Secret-Token` header on every webhook request.
+The receiver requires an exact, constant-time match of
+`X-Telegram-Bot-Api-Secret-Token` against that row's non-empty secret. Rows
+without `webhook_secret` cannot receive public webhook requests.
 
 ## Org Template Auto-Link
 
@@ -129,6 +143,49 @@ The vars are resolved from (in order): `pm/.env` → org root `.env` → platfor
 
 The platform calls `adapter.ValidateConfig()` upfront so unknown channel types or invalid configs fail fast. Insert is idempotent (`ON CONFLICT DO UPDATE`) so re-importing the same org refreshes the channel config.
 
+## Slack Setup
+
+Slack supports two outbound configurations:
+
+- Bot API: `bot_token` plus `channel_id`
+- Incoming Webhook: `webhook_url`
+
+To receive Events API callbacks or slash commands, also set the Slack App's
+`signing_secret`. Point the Slack request URL at `POST /webhooks/slack`.
+The receiver computes Slack's `v0:{timestamp}:{raw_body}` HMAC-SHA256 signature,
+uses a constant-time comparison, and rejects timestamps more than five minutes
+from server time. The signature must authenticate the same row whose
+`channel_id` matches the parsed event.
+
+```json
+{
+  "channel_type": "slack",
+  "config": {
+    "bot_token": "xoxb-...",
+    "channel_id": "C01234ABCDE",
+    "signing_secret": "..."
+  }
+}
+```
+
+Slack URL-verification challenges are echoed only after signature verification.
+Molecule AI parses registered slash commands, but it does not create or
+register commands in your Slack App.
+
+## Lark / Feishu Setup
+
+Outbound delivery uses a Lark or Feishu Custom Bot `webhook_url`. Inbound
+delivery is a separate Lark App Event Subscription pointed at
+`POST /webhooks/lark`. An inbound-capable row also needs:
+
+- `chat_id`: the chat to bind to this workspace row
+- `verify_token`: the Event Subscription Verification Token
+
+The receiver requires the token for URL-verification and
+`im.message.receive_v1` callbacks, compares it in constant time, and only
+routes events whose chat ID matches the authenticated row. See
+[Connecting an AI Agent to Lark / Feishu](../tutorials/lark-feishu-channel.md).
+
 ## Discord Setup
 
 ### 1. Create a Discord Webhook
@@ -143,28 +200,57 @@ The platform calls `adapter.ValidateConfig()` upfront so unknown channel types o
 
 ### 3. Or connect via API
 ```bash
-curl -X POST http://localhost:8080/workspaces/:id/channels \
+curl -X POST "${PLATFORM_URL}/workspaces/${WORKSPACE_ID}/channels" \
+  -H "Authorization: Bearer ${TOKEN}" \
   -H 'Content-Type: application/json' \
   -d '{
     "channel_type": "discord",
     "config": {
-      "webhook_url": "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+      "webhook_url": "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN",
+      "chat_id": "YOUR_DISCORD_CHANNEL_ID",
+      "public_key": "YOUR_APPLICATION_ED25519_PUBLIC_KEY_HEX"
     }
   }'
 ```
 
-### 4. Register slash commands (for inbound)
-Discord uses Application Commands (slash commands) for inbound messages. Register them in your Discord server's **Integration** page, or use Discord's developer portal to create global commands. The adapter parses `/<command> <options>` and passes them to the workspace agent.
+### 4. Register application commands (for inbound)
+
+Discord inbound requires a Discord Application. Copy its Ed25519 Public Key
+into `public_key`, copy the target channel ID into `chat_id`, and point the
+Application's Interactions Endpoint URL at `POST /webhooks/discord`. Register
+the commands you want in Discord; Molecule AI parses the received command name
+and options but does not register commands for you.
+
+Every request is verified against the candidate row's `public_key` before its
+untrusted `channel_id` can select a destination. The legacy
+`app_public_key` config name is accepted only for existing rows. A self-hosted
+deployment can use `DISCORD_APP_PUBLIC_KEY` for rows with no per-row key.
 
 ### Inbound / Outbound
 | Direction | Mechanism |
 |---|---|
-| **Inbound** | Discord Interactions endpoint (slash commands, message components) → `ParseWebhook()` |
+| **Inbound** | Signed Discord Interactions endpoint → `ParseWebhook()` |
 | **Outbound** | Discord Incoming Webhooks → `SendMessage()` (2000-char chunking built in) |
 
-**Note:** No Discord bot token is required for outbound-only use — the webhook URL encodes channel + token. For inbound slash commands, you need a Discord Application with an Interactions endpoint URL pointed at `POST /webhooks/discord` on your platform.
+Discord endpoint PINGs receive the required type-1 PONG. Accepted application
+commands receive an immediate ephemeral type-4 interaction response while the
+agent runs asynchronously; the agent's reply is sent through the configured
+Incoming Webhook. No Discord bot token is required for outbound-only use.
 
 See `workspace-server/internal/channels/discord.go` for the full adapter implementation.
+
+## Credential Storage and Public Receiver Rules
+
+In production, `bot_token`, `webhook_secret`, `webhook_url`, `verify_token`,
+and `signing_secret` are field-encrypted with AES-256-GCM in
+`channel_config`. Read APIs redact these values. Routing identifiers and
+Discord public keys remain plaintext because they are not secrets. Legacy
+plaintext rows are read for compatibility and are upgraded when re-saved.
+
+The public receiver caps bodies at 1 MiB and rejects a request unless at least
+one enabled row of that provider authenticates it. Chat matching happens only
+inside that authenticated row subset, preventing one app or bot credential
+from selecting another row by supplying its chat ID.
 
 ## Hot Reload
 
@@ -195,25 +281,13 @@ CREATE TABLE workspace_channels (
 |--------|------|-------------|
 | GET | `/channels/adapters` | List available platforms |
 | POST | `/channels/discover` | Detect chats for a bot token |
-| GET | `/workspaces/:id/channels` | List channels (bot_token masked) |
+| GET | `/workspaces/:id/channels` | List channels (sensitive config redacted) |
 | POST | `/workspaces/:id/channels` | Create channel (validates config) |
 | PATCH | `/workspaces/:id/channels/:channelId` | Update config/enabled/allowlist |
 | DELETE | `/workspaces/:id/channels/:channelId` | Remove channel |
 | POST | `/workspaces/:id/channels/:channelId/send` | Outbound message |
 | POST | `/workspaces/:id/channels/:channelId/test` | Send test message |
 | POST | `/webhooks/:type` | Incoming webhook receiver |
-
-## MCP Tools
-
-```typescript
-list_channel_adapters()                                              // list platforms
-list_channels({ workspace_id })                                      // list channels
-add_channel({ workspace_id, channel_type, config, allowed_users })   // hot reload
-update_channel({ workspace_id, channel_id, config, enabled, allowed_users })
-remove_channel({ workspace_id, channel_id })
-send_channel_message({ workspace_id, channel_id, text })             // outbound
-test_channel({ workspace_id, channel_id })                           // test connection
-```
 
 ## Telegram-Specific Implementation Notes
 
@@ -232,8 +306,11 @@ test_channel({ workspace_id, channel_id })                           // test con
 | `workspace-server/internal/channels/adapter.go` | `ChannelAdapter` interface |
 | `workspace-server/internal/channels/registry.go` | Adapter registry |
 | `workspace-server/internal/channels/telegram.go` | Telegram implementation |
+| `workspace-server/internal/channels/slack.go` | Slack implementation + v0 HMAC verification |
+| `workspace-server/internal/channels/lark.go` | Lark/Feishu implementation + token verification |
+| `workspace-server/internal/channels/discord.go` | Discord adapter and interaction parsing |
+| `workspace-server/internal/channels/secret.go` | Sensitive-field encryption and redaction |
 | `workspace-server/internal/channels/manager.go` | Orchestrator with hot reload |
 | `workspace-server/internal/handlers/channels.go` | REST API + webhook |
 | `workspace-server/migrations/016_workspace_channels.sql` | DB schema |
 | `canvas/src/components/tabs/ChannelsTab.tsx` | Canvas UI |
-| `mcp-server/src/index.ts` | 7 MCP tools |

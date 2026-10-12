@@ -1,86 +1,68 @@
-# RE-ENABLED (group A — molecules-server cutover): the AWS account is closed, so this
-# minimal cell now provisions on the molecules-server (local-docker) compute backend via
-# E2E_PROVIDER=molecules-server (canonical wire id; CP persists it as organizations.provider
-# 'local'). push/pull_request on main+staging are restored so it GATES again. Advisory-RED is
-# expected until the local-docker gate + CP health + browser-registration fixes land — then
-# promote its context into .gitea/required-contexts.txt.
+# Current staging smoke for the default platform runtime on molecules-server.
+# The live branch-protection wildcard makes a posted red status blocking even
+# though this path-scoped context is not presence-required in
+# .gitea/required-contexts.txt. A red result is therefore a release blocker, not
+# an advisory or an expected state.
 name: boot-to-registration-e2e
 
-# cp#455 — Minimal-cell boot-to-registration e2e.
-# CTO directive 14eb4f07: "build the minimal claude-code+kimi cell,
-# it should now go GREEN since the fix is live."
+# Minimal molecules-server cell reduced to four externally observable checks:
 #
-# Stage 1 of 5-stage rollout. Reuses the dispatch-only EC2
-# provisioning path from test_staging_full_saas.sh but reduced to
-# the minimum boot-to-registration surface:
+#   1. The current strict admin API provisions a fresh tenant to running.
+#   2. The platform root is online, routable, and heartbeat-registered through
+#      the current tenant workspace API.
+#   3. POST /workspaces/:id/a2a produces a real known-answer completion, with
+#      durable queue polling when the runtime returns an asynchronous result.
+#   4. The EXIT trap confirms teardown and verifies the org is absent.
 #
-#   1. Provision request accepted; workspace transitions to booting/running
-#   2. Controlplane receives /registry/register for that workspace_id
-#   3. JSON-RPC/completion route returns successful minimal response
-#   4. Teardown terminates workspace even on failure (trap)
-#
-# Advisory (non-blocking) per Researcher Stage 2 design — RED on
-# current main is expected pre-cp#469-cluster. After cp#477 deploy
-# (888efceb) + PR #2167 merge, cell should turn GREEN. THAT green
-# is the cluster-proof signal.
-#
-# Cost controls (mandatory):
-#   - SPOT instances (tagged run_id/workspace_id for cost attribution)
-#   - Fast teardown (~3-5 min wall-clock) even on assertion failure
-#   - Structured per-cell results JSON (runtime/provider/model/
-#     billing_mode/workspace_id/register_status/completion_status/
+# Isolation controls:
+#   - A run-scoped local-docker org/workspace identity
+#   - Bounded teardown even on assertion failure
+#   - Structured per-cell results JSON (runtime/provider/workspace_id/
+#     register_status/completion_status/
 #     teardown_status/elapsed_seconds)
 #
-# Inputs:
-#   runtime        : default claude-code
-#   billing_mode   : default platform_managed (the cp#469-cluster path)
-#   provider       : molecules-server (local-docker compute backend; was 'platform')
-#   model          : default moonshot/kimi-k2.6 (CTO-specified)
-#
-# PR target: molecule-core (this file). Companion harness extension
-# (test_minimal_boot_cell.sh) lives in tests/e2e/ alongside
-# test_staging_full_saas.sh — same repo, same branch.
-#
-# Note: cp#455 was originally spec'd to live in molecule-controlplane
-# (`.gitea/workflows/` path), but molecule-core's CI is the home for
-# tenant-boot e2e tests in this stage. Stage 2 may move the path.
+# Runtime is read from the staging Infisical SSOT on trusted refs. The
+# checked-in value is a fail-safe local/untrusted-ref fallback only.
 
 on:
-  # RE-ENABLED (group A): molecules-server (local-docker) replaces the closed AWS EC2 path,
-  # so the minimal cell provisions at ~zero cloud spend and can gate again. Path-scoped to the
-  # harness + this workflow so unrelated PRs don't spin a real tenant (mirrors the sibling e2e
-  # lanes). schedule/workflow_run stay OFF (no-nightly-e2e rule).
+  # Path-scoped to the harness and its direct dependencies so unrelated PRs do
+  # not provision a real staging tenant. schedule/workflow_run stay disabled.
   push:
     branches: [main, staging]
     paths:
       - 'tests/e2e/test_minimal_boot_cell.sh'
       - 'tests/e2e/lib/collision-proof-slug.sh'
+      - 'tests/e2e/lib/completion_assert.sh'
+      - 'tests/e2e/lib/a2a_text_extract.py'
+      - 'tests/e2e/lib/redact_secrets.py'
+      - 'tests/test_minimal_boot_cell_contract.py'
       - '.gitea/workflows/boot-to-registration-e2e.yml'
   pull_request:
     branches: [main, staging]
     paths:
       - 'tests/e2e/test_minimal_boot_cell.sh'
       - 'tests/e2e/lib/collision-proof-slug.sh'
+      - 'tests/e2e/lib/completion_assert.sh'
+      - 'tests/e2e/lib/a2a_text_extract.py'
+      - 'tests/e2e/lib/redact_secrets.py'
+      - 'tests/test_minimal_boot_cell_contract.py'
       - '.gitea/workflows/boot-to-registration-e2e.yml'
   workflow_dispatch:
-  # Note: Gitea 1.22.6 does not support workflow_dispatch.inputs
-  # (feedback_gitea_workflow_dispatch_inputs_unsupported). Defaults
-  # are hardcoded in the job env below. Stage 2 can add matrix/
-  # param support once the Gitea version supports it.
+  # Repository policy keeps dispatch flat. Defaults are hardcoded in the job
+  # env below; parameterization needs a deliberate caller/fixture migration.
 
 # No cron schedule. Runs on push/pull_request (main+staging) + manual dispatch.
-# Branch protection doesn't require this yet (not in .gitea/required-contexts.txt) —
-# advisory-RED is expected until the molecules-server local-docker path is green; GREEN
-# then signals the local-docker minimal cell boots + registers.
+# This context is not presence-required in .gitea/required-contexts.txt, but the
+# live wildcard blocks a red status whenever the path filter causes it to run.
 permissions:
   contents: read
   # No issue-write; failures surface as red runs in workflow history.
 
 # Per-SHA grouping (mirrors e2e-api.yml). Each run provisions its OWN isolated
 # cell (slug `cp455-<run_id>`), so two commits' runs never corrupt each other.
-# A STATIC group would make a newer main push cancel the older commit's run, and
-# on Gitea 1.22.6 a superseded same-group run is CANCELLED (not queued) even
-# with cancel-in-progress:false (status-reaper.yml 69-72), stamping a cancel-red
+# A STATIC group would make a newer main push cancel the older commit's run. A
+# legacy runner incident showed a superseded same-group run could be CANCELLED
+# (not queued) even with cancel-in-progress:false, stamping a cancel-red
 # that wedges the `[*]` queue. cancel-in-progress:false so a teardown is never
 # aborted mid-flight.
 concurrency:
@@ -88,65 +70,48 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # bp-exempt: runs on push/PR (main+staging) so it GATES, but is NOT yet in
-  # .gitea/required-contexts.txt — advisory-red until the molecules-server local-docker
-  # path + CP health + browser-registration fixes land, then promote it into the required
-  # SSOT (cp#455 Stage 1).
+  # bp-exempt: not presence-required in .gitea/required-contexts.txt. The live
+  # wildcard still makes any posted failure blocking; see core#4392.
   minimal-cell:
-    name: Minimal cell (claude-code + molecules-server + SSOT default model)
+    name: Minimal cell (SSOT runtime + molecules-server)
     runs-on: ubuntu-latest
-    # Bounded at 12 min. Wall-clock budget breakdown:
-    #   - cold EC2 provision: ~3-4 min (SPOT)
-    #   - /registry/register wait: ~30s
-    #   - completion call: ~10s
-    #   - teardown: ~30-60s
-    #   - tail headroom: ~6-7 min
-    timeout-minutes: 12
+    # Covers bounded provision (5m), tenant edge readiness (5m), registration
+    # (5m), A2A retries/durable polling, teardown verification, and runner
+    # headroom. Keep this above every nested bound so the EXIT trap can run.
+    timeout-minutes: 35
     env:
-      # Hardcoded defaults — Gitea 1.22.6 does not support workflow_dispatch.inputs
-      # (feedback_gitea_workflow_dispatch_inputs_unsupported). Stage 2 can add
-      # matrix/param support once the Gitea version supports it.
+      # Hardcoded defaults under the repository's flat-dispatch policy.
       #
-      # E2E_RUNTIME / E2E_MODEL: these literals are now only the FALLBACK. On a
-      # trusted event the "Fetch platform defaults from KMS SSOT" step below
-      # overrides them with the authoritative Infisical values
-      # (MOLECULE_DEFAULT_RUNTIME / MOLECULE_LLM_DEFAULT_MODEL). The fallback model
-      # is the CURRENT SSOT value (minimax/MiniMax-M2.7), NOT a moonshot vendor
-      # const — so an untrusted-ref/local run still tracks the SSOT default.
+      # E2E_RUNTIME is only the fallback. On a trusted event the KMS step below
+      # overrides it with the authoritative MOLECULE_DEFAULT_RUNTIME value.
       E2E_RUNTIME: claude-code
-      E2E_BILLING_MODE: platform_managed
       # Compute backend: molecules-server (local-docker). This is the canonical cloudprovider
       # SSOT wire id the CP org-create validates via IsValidRequest and persists as the DB-legal
       # organizations.provider 'local' (PersistKey). Was 'platform' (never a valid compute
-      # provider — the closed AWS DefaultProvider path). Orthogonal to E2E_BILLING_MODE, which
-      # stays platform_managed (the LLM proxy/metering arm).
+      # provider — the closed AWS DefaultProvider path).
       E2E_PROVIDER: molecules-server
-      E2E_MODEL: minimax/MiniMax-M2.7
       E2E_RUN_ID: cp455-${{ github.run_id }}
-      E2E_PROVISION_TIMEOUT_SECS: '300' # 5 min — fast teardown budget
+      E2E_PROVISION_TIMEOUT_SECS: '300'
+      E2E_TENANT_READY_TIMEOUT_SECS: '300'
+      E2E_REGISTER_TIMEOUT_SECS: '300'
+      E2E_A2A_TIMEOUT_SECS: '120'
       MOLECULE_CP_URL: ${{ vars.STAGING_CP_URL || 'https://staging-api.moleculesai.app' }}
       # MOLECULE_ADMIN_TOKEN now arrives via $GITHUB_ENV from the "Fetch platform
-      # defaults (model+runtime) from KMS SSOT" step below (wave-B staging
+      # runtime + admin token from KMS SSOT" step below (wave-B staging
       # consumers migration extends that same fetch). It is sourced from Infisical
-      # CP_ADMIN_API_TOKEN at staging /shared/controlplane-admin. The old
-      # CP_STAGING_ADMIN_API_TOKEN Gitea Actions secret is left in place until a
-      # green run validates this path (validate-before-delete). The Verify-
-      # required-secrets gate still validates MOLECULE_ADMIN_TOKEN is non-empty.
+      # CP_ADMIN_API_TOKEN at staging /shared/controlplane-admin. The
+      # Verify-required-secrets gate validates that export before provisioning.
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      # KMS SSOT for the platform default model+runtime (de-hardcode) AND the
-      # staging CP admin bearer (wave-B staging consumers migration): the env
-      # block above embeds "moonshot/kimi-k2.6" / "claude-code" as fallback
-      # literals. Read the authoritative values from Infisical (staging
-      # /shared/controlplane/llm: MOLECULE_LLM_DEFAULT_MODEL /
-      # MOLECULE_DEFAULT_RUNTIME) and export them as E2E_MODEL / E2E_RUNTIME so
+      # KMS SSOT for the platform default runtime and the staging CP admin bearer
+      # (wave-B staging consumers migration): read MOLECULE_DEFAULT_RUNTIME
+      # from staging /shared/controlplane/llm and export it as E2E_RUNTIME so
       # this gate tracks the platform default. This same step also sources
       # MOLECULE_ADMIN_TOKEN from CP_ADMIN_API_TOKEN @ staging
       # /shared/controlplane-admin, replacing the duplicated
-      # CP_STAGING_ADMIN_API_TOKEN Gitea Actions secret. BEHAVIOR-NEUTRAL today
-      # (the staging KMS values equal the old literals); a later staging-model
-      # flip is a separate, deliberate KMS edit. FAIL CLOSED on empty.
+      # CP_STAGING_ADMIN_API_TOKEN Gitea Actions secret. SSOT changes are picked
+      # up without editing this workflow. FAIL CLOSED on empty.
       #
       # TRUSTED-REF GATING: molecule-core is a PUBLIC repo. This step consumes
       # the CI machine-identity secrets, so it must only run on a TRUSTED event —
@@ -155,7 +120,7 @@ jobs:
       # (which could exfiltrate the KMS token) — a fork PR skips this step, leaving
       # MOLECULE_ADMIN_TOKEN empty so the "Verify required secrets present" gate below
       # fails closed (the real provision e2e cannot run from a fork).
-      - name: Fetch platform defaults (model+runtime) from KMS SSOT
+      - name: Fetch platform runtime + admin token from KMS SSOT
         id: defaults
         if: >-
           github.event_name == 'workflow_dispatch' ||
@@ -178,12 +143,7 @@ jobs:
               -H "Authorization: Bearer $TOK" \
               | python3 -c 'import sys,json; v=json.load(sys.stdin).get("secret",{}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) else "")'
           }
-          E2E_MODEL=$(read_secret MOLECULE_LLM_DEFAULT_MODEL %2Fshared%2Fcontrolplane%2Fllm)
           E2E_RUNTIME=$(read_secret MOLECULE_DEFAULT_RUNTIME %2Fshared%2Fcontrolplane%2Fllm)
-          if [ -z "$E2E_MODEL" ]; then
-            echo "::error::Infisical returned empty for MOLECULE_LLM_DEFAULT_MODEL at staging /shared/controlplane/llm - a required boot gate must not run with an empty platform default model."
-            exit 1
-          fi
           if [ -z "$E2E_RUNTIME" ]; then
             echo "::error::Infisical returned empty for MOLECULE_DEFAULT_RUNTIME at staging /shared/controlplane/llm - a required boot gate must not run with an empty platform default runtime."
             exit 1
@@ -197,32 +157,32 @@ jobs:
             echo "::error::Infisical returned empty CP_ADMIN_API_TOKEN at staging /shared/controlplane-admin — failing closed."
             exit 1
           fi
-          # model + runtime ids are not secrets, but mask defensively before export.
-          echo "::add-mask::$E2E_MODEL"
+          # The runtime id is not a secret, but mask defensively before export.
           echo "::add-mask::$E2E_RUNTIME"
           {
-            echo "E2E_MODEL=$E2E_MODEL"
             echo "E2E_RUNTIME=$E2E_RUNTIME"
             echo "MOLECULE_ADMIN_TOKEN=$MOLECULE_ADMIN_TOKEN"
           } >> "$GITHUB_ENV"
-          echo "platform defaults + admin token loaded from Infisical (model len=${#E2E_MODEL}, runtime len=${#E2E_RUNTIME}, admin len=${#MOLECULE_ADMIN_TOKEN})"
+          echo "platform runtime + admin token loaded from Infisical (runtime len=${#E2E_RUNTIME}, admin len=${#MOLECULE_ADMIN_TOKEN})"
 
       - name: Verify required secrets present
         run: |
           if [ -z "${MOLECULE_ADMIN_TOKEN:-}" ]; then
-            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret missing — minimal-cell e2e cannot run"
-            echo "::error::Set it at Settings → Secrets and Variables → Actions; pull from staging-CP's CP_ADMIN_API_TOKEN env in Railway."
+            echo "::error::MOLECULE_ADMIN_TOKEN missing — minimal-cell e2e cannot run"
+            echo "::error::Read CP_ADMIN_API_TOKEN from Infisical staging /shared/controlplane-admin through the CI identity."
             exit 1
           fi
 
       - name: Install required tools
         run: |
-          for cmd in jq curl python3; do
+          set -euo pipefail
+          for cmd in bash curl python3; do
             command -v "$cmd" >/dev/null 2>&1 || {
               echo "::error::required tool '$cmd' not on PATH — runner image regression?"
               exit 1
             }
           done
+          python3 tests/test_minimal_boot_cell_contract.py
 
       - name: Run minimal-cell boot-to-registration harness
         # The harness script handles its own teardown via EXIT trap;
@@ -258,31 +218,26 @@ jobs:
         if: failure()
         run: |
           {
-            echo "## cp#455 minimal-cell FAILED"
+            echo "## Minimal boot-to-registration cell FAILED"
             echo ""
             echo "**Run ID:** ${{ github.run_id }}"
             echo "**Runtime:** ${E2E_RUNTIME}"
-            echo "**Billing mode:** ${E2E_BILLING_MODE}"
             echo "**Provider:** ${E2E_PROVIDER}"
-            echo "**Model:** ${E2E_MODEL}"
             echo "**Slug:** ${E2E_RUN_ID}"
             echo ""
             echo "### What this means"
             echo ""
-            echo "The minimal claude-code+kimi cell did not pass all 4 assertions:"
-            echo "1. Provision request accepted; workspace transitions to booting/running"
-            echo "2. Controlplane receives /registry/register for that workspace_id"
-            echo "3. JSON-RPC/completion route returns successful minimal response"
-            echo "4. Teardown terminates workspace even on failure (trap)"
-            echo ""
-            echo "RED is expected pre-cp#469-cluster. After cp#477 deploy (888efceb) + PR #2167 merge,"
-            echo "this should turn GREEN. Persistent RED after both merge = cluster bug, not e2e bug."
+            echo "The default-runtime molecules-server cell did not pass all 4 assertions:"
+            echo "1. Current admin org-create contract provisions the tenant to running"
+            echo "2. Tenant workspace API shows an online, routable, heartbeat-registered platform root"
+            echo "3. Current A2A route returns a real PINEAPPLE known-answer completion"
+            echo "4. Confirmed teardown leaves no org behind"
             echo ""
             echo "### Next steps"
             echo ""
             echo "1. Check the harness output above for the assertion that failed"
-            echo "2. If assertion 1 fails: provision path broken — check CP admin API + EC2 quota"
-            echo "3. If assertion 2 fails: /registry/register path broken — check workspace-server boot"
-            echo "4. If assertion 3 fails: LLM proxy / completion path broken — check cp#469 cluster"
+            echo "2. If assertion 1 fails: check the CP admin API and molecules-server capacity"
+            echo "3. If assertion 2 fails: check platform-root boot, registration, routing, and heartbeat"
+            echo "4. If assertion 3 fails: check the A2A proxy, runtime, and platform LLM route"
             echo "5. If assertion 4 fails: teardown trap broken — leak risk, fix immediately"
           } >> "$GITHUB_STEP_SUMMARY"

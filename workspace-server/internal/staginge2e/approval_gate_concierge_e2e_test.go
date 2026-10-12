@@ -5,20 +5,21 @@ package staginge2e
 // approval_gate_concierge_e2e_test.go — live staging end-to-end coverage for
 // core#2574: the Phase-4 approval gate on the admin-token path.
 //
-// What it proves that unit + integration tests cannot: that against a REAL
-// SaaS tenant, the concierge's ADMIN_TOKEN (Tier 2b) is gated when minting
+// What it proves that unit + integration tests cannot: that against a real
+// staging tenant, the concierge's ADMIN_TOKEN (Tier 2b) is gated when minting
 // org API tokens and writing workspace secrets — not just that the Go code
 // returns 202, but that the REAL Postgres row is created and the retry-after-
 // approval flow works through the actual HTTP surface.
 //
 // Run with:
 //
-//	STAGING_E2E=1 CP_BASE_URL=https://cp.staging.moleculesai.app \
+//	STAGING_E2E=1 CP_BASE_URL=https://staging-api.moleculesai.app \
 //	  CP_ADMIN_API_TOKEN=... go test -tags=staging_e2e ./internal/staginge2e/ \
 //	  -run TestConciergeApprovalGate_Staging -v
 //
-// Guarded by the staging_e2e build tag + STAGING_E2E=1 env gate.
-// Teardown is t.Cleanup-driven (admin DELETE /cp/admin/tenants).
+// Guarded by the staging_e2e build tag + STAGING_E2E=1 env gate. Exact-slug
+// admin DELETE teardown is scheduled after org-create succeeds; transient
+// lifecycle conflicts are retried and exact absence is required for success.
 //
 // ISOLATION NOTE (fix/staging-e2e-approval-gate-subtest-isolation):
 // Previously, the test declared `var secretApprovalID string` at parent
@@ -128,12 +129,11 @@ func secretWriteApprovalFlow(t *testing.T, host, token, orgID, ordinaryWS, key, 
 func TestConciergeApprovalGate_Staging(t *testing.T) {
 	cfg := requireStagingEnv(t)
 
-	slug := fmt.Sprintf("e2e-gate-%d", time.Now().Unix()%100000000)
+	slug := e2eSlug("gate")
 	t.Logf("approval-gate: slug=%s", slug)
 
 	// --- Step 1: provision throwaway org + tenant ---
 	orgID := adminCreateOrg(t, cfg, slug)
-	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
 	t.Logf("org created: org_id=%s", orgID)
 
 	token := tenantAdminToken(t, cfg, slug)
@@ -288,11 +288,10 @@ func TestConciergeApprovalGate_Staging(t *testing.T) {
 func TestConciergeApprovalGate_Staging_OrderIndependent(t *testing.T) {
 	cfg := requireStagingEnv(t)
 
-	slug := fmt.Sprintf("e2e-isolation-%d", time.Now().Unix()%100000000)
+	slug := e2eSlug("isolation")
 	t.Logf("isolation: slug=%s", slug)
 
 	orgID := adminCreateOrg(t, cfg, slug)
-	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
 	t.Logf("org created: org_id=%s", orgID)
 
 	token := tenantAdminToken(t, cfg, slug)

@@ -42,7 +42,7 @@ SYNTHESIS_DEPTH="${SYNTHESIS_DEPTH:-3}"
 A2A_TIMEOUT="${A2A_TIMEOUT:-600}"
 KEEP_WORKSPACES="${KEEP_WORKSPACES:-0}"
 
-# SaaS-mode auth chain: workspace-server (per-tenant Go binary on EC2)
+# Hosted-mode auth chain: the tenant workspace-server
 # requires BOTH headers:
 #   Authorization: Bearer <tenant-admin-token>      (per-tenant secret)
 #   X-Molecule-Org-Id:  <org-uuid>                  (TenantGuard middleware)
@@ -225,16 +225,16 @@ ACTIVITY=$(api "$PLATFORM/workspaces/$PM_ID/activity?since_secs=$A2A_TIMEOUT" 2>
 emit "activity_trace" "{\"raw\":$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$ACTIVITY")}"
 
 # ---- rfc2251_phase log lines from the workspace container ----
-# Local Docker provisioner: workspace container name is workspace-<id>.
-# SaaS: container is on EC2 — skip log capture, fall back to heartbeat only.
+# Local Docker provisioner: workspace container name is ws-<full-id>.
+# Hosted mode may not expose its container engine to this workstation, so log
+# capture is local-only and the hosted path falls back to platform activity.
 if [ "$MODE" = "local" ] && command -v docker >/dev/null 2>&1; then
-  for id in "$PM_ID"; do
-    container=$(docker ps --filter "name=workspace-$id" --format '{{.Names}}' | head -1)
-    if [ -n "$container" ]; then
-      phase_log=$(docker logs --since "${A2A_TIMEOUT}s" "$container" 2>&1 | grep 'rfc2251_phase=' || echo "<no rfc2251_phase log lines — container running stale image without #2255 instrumentation>")
-      emit "phase_log" "{\"workspace_id\":\"$id\",\"container\":\"$container\",\"raw\":$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$phase_log")}"
-    fi
-  done
+  id="$PM_ID"
+  container=$(docker ps --filter "name=ws-$id" --format '{{.Names}}' | head -1)
+  if [ -n "$container" ]; then
+    phase_log=$(docker logs --since "${A2A_TIMEOUT}s" "$container" 2>&1 | grep 'rfc2251_phase=' || echo "<no rfc2251_phase log lines — container running stale image without #2255 instrumentation>")
+    emit "phase_log" "{\"workspace_id\":\"$id\",\"container\":\"$container\",\"raw\":$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$phase_log")}"
+  fi
 fi
 
 emit "run_completed" "{\"elapsed_secs\":$ELAPSED_SECS,\"pm_id\":\"$PM_ID\",\"child_id\":\"$CHILD_ID\"}"

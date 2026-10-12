@@ -34,8 +34,6 @@ func TestAllEventTypes_IsSnapshot(t *testing.T) {
 		"APPROVAL_REQUESTED",
 		"BOOT_STEP",
 		"CHANNEL_MESSAGE",
-		"CRON_EXECUTED",
-		"CRON_SKIPPED",
 		"DELEGATION_COMPLETE",
 		"DELEGATION_FAILED",
 		"DELEGATION_SENT",
@@ -59,6 +57,8 @@ func TestAllEventTypes_IsSnapshot(t *testing.T) {
 		"WORKSPACE_PROVISIONING",
 		"WORKSPACE_PROVISION_FAILED",
 		"WORKSPACE_REMOVED",
+		"WORKSPACE_RESTART_DECLINED",
+		"WORKSPACE_UPDATED",
 	}
 	sort.Strings(expected)
 

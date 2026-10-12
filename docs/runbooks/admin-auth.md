@@ -1,56 +1,77 @@
-# Admin Authentication Runbook
+# Admin authentication runbook
 
-## Auth is fail-CLOSED in every environment — `ADMIN_TOKEN` is the bootstrap credential
+Authentication fails closed in every environment. There is no development,
+empty-database, or datastore-outage path that grants access.
 
-Per the CTO "nothing should be fail-open" directive, **every** auth path on the
-workspace-server fails closed — there is no dev-mode / zero-token / DB-outage
-hatch that grants access. This includes:
+## Credential classes
 
-- `AdminAuth` and `WorkspaceAuth` (admin + per-workspace routes),
-- `CanvasOrBearer` (the cosmetic `PUT /canvas/viewport` route), and
-- `validateDiscoveryCaller` (`/registry/:id/peers`, `/registry/discover/:id`).
+The current middleware recognizes four credential classes:
 
-Consequence for **bootstrap**: a brand-new self-hosted / dev install has **no
-DB-backed tokens yet**, and there is no longer a fail-open that lets the first
-request through. The **only** way to reach admin routes (and to mint the first
-workspace token via `POST /admin/workspaces/:id/tokens`) is to set `ADMIN_TOKEN`
-in the platform environment and present it as the bearer. This is the "local
-mimics production" principle: there is no zero-config bootstrap.
+| Credential | Intended use | Scope |
+|---|---|---|
+| Verified control-plane session cookie | SaaS Canvas | Tenant membership verified upstream; accepted by admin and workspace middleware |
+| Organization API token | Human/automation access | Named, revocable, audited access across the organization |
+| `ADMIN_TOKEN` | Bootstrap and break-glass | Full admin and workspace access; required configuration for local and deployed servers |
+| Workspace bearer token | Agent access | Bound to one workspace under `WorkspaceAuth` |
 
-- **Local dev:** `scripts/dev-start.sh` provisions a deterministic
-  `ADMIN_TOKEN` into `.env` (and exports the matching `NEXT_PUBLIC_ADMIN_TOKEN`
-  so the canvas authenticates with it). See `docs/quickstart.md`.
-- **Self-hosted / SaaS:** set `ADMIN_TOKEN` to a strong random secret
-  (`openssl rand -base64 32`) in the platform env and bake the matching
-  `NEXT_PUBLIC_ADMIN_TOKEN` into the canvas bundle.
+`AdminAuth` also retains a deprecated compatibility fallback: if
+`ADMIN_TOKEN` is completely unset, any live workspace token can authenticate an
+admin route. Do not rely on this mode. Configuring `ADMIN_TOKEN` disables that
+fallback and causes workspace tokens to be rejected by `AdminAuth`.
 
-## Required: set `MOLECULE_ENV` in all non-dev environments
+Some update handlers are stricter than their route middleware. Infrastructure
+fields (`tier`, `parent_id`, `runtime`, `workspace_dir`, and `compute`) require
+the configured admin token or a verified control-plane session; organization
+and workspace tokens are rejected for those fields.
+
+## Bootstrap
+
+Set `ADMIN_TOKEN` before the workspace server starts. For a standalone
+installation, generate a strong random value and inject it through the normal
+environment secret path:
 
 ```bash
-# In your tenant / EC2 / Railway environment variables:
-MOLECULE_ENV=production
+openssl rand -base64 32
 ```
 
-This matches the production tenant default. NOTE: `MOLECULE_ENV` no longer gates
-any auth decision — it only drives NON-security local-dev conveniences (loopback
-bind, relaxed rate limit). Setting it to `dev`/`development` does **not** relax
-authentication. Staging and production smoke tests should use the real user/API
-workflow: create a workspace, then mint a one-time displayed workspace bearer
-with `POST /admin/workspaces/:id/tokens`.
+Do not commit the value or paste it into documentation. Local development uses
+`scripts/dev-start.sh`, which provisions matching server and Canvas
+configuration. The normal local entry point is documented in
+[`docs/quickstart.md`](../quickstart.md).
 
-## Admin bearer token (`ADMIN_TOKEN`)
+After bootstrap, create named organization API tokens through Canvas when a
+revocable human or automation credential is preferable. Plaintext tokens are
+shown once.
 
-The platform uses `ADMIN_TOKEN` as the bearer credential for admin-gated endpoints:
+## Request behavior
 
-| Endpoint | Auth method |
-|----------|-------------|
-| `GET/POST/PATCH/DELETE /workspaces` | `Authorization: Bearer <ADMIN_TOKEN>` |
-| `GET /admin/liveness` | `Authorization: Bearer <ADMIN_TOKEN>` |
-| `POST /org/import` | `Authorization: Bearer <ADMIN_TOKEN>` |
-| `POST /admin/workspaces/:id/tokens` | `Authorization: Bearer <ADMIN_TOKEN>`; plaintext token returned once |
-| `PATCH /workspaces/:id` infrastructure fields (`tier`, `parent_id`, `runtime`, `workspace_dir`, `compute`) | `Authorization: Bearer <ADMIN_TOKEN>` or a verified control-plane session; workspace and org tokens are rejected |
+Use `Authorization: Bearer <token>` for bearer credentials. A valid verified
+SaaS session cookie can authenticate browser requests without a bearer.
 
-Missing or invalid bearer → **401 in every environment** (fail-closed; no
-dev-mode fail-open). If the auth datastore is unreachable, auth-gated routes
-return **503** (`platform_unavailable`) — an availability tradeoff that grants no
-access — rather than allowing the request through.
+Examples of `AdminAuth` routes include:
+
+- workspace collection/lifecycle management;
+- `/settings/secrets` and legacy `/admin/secrets` aliases;
+- `/org/import` and `/org/templates`;
+- bundle import/export and global event surfaces; and
+- admin liveness and scheduler-health endpoints.
+
+Workspace subroutes protected by `WorkspaceAuth` accept a token bound to the
+`:id`, an organization token, the configured admin token, or a verified
+control-plane session.
+
+## Failure behavior
+
+- Missing or invalid credentials return `401`.
+- A failed auth-datastore lookup returns `503` with code
+  `platform_unavailable` and does not expose the underlying database error.
+- `MOLECULE_ENV=dev` or `development` does not relax authentication.
+- `Origin`, `Referer`, and same-origin appearance are not authentication for
+  admin or workspace-data routes.
+
+Set `MOLECULE_ENV=production` (or `prod`) in production so security-sensitive
+production guards, including strict secret-key initialization, are active.
+
+The middleware and handler-level authorization checks are the authoritative
+contract. See [ADR-001](../adr/ADR-001-admin-token-scope.md) for the deprecated
+workspace-token fallback and its residual risk.

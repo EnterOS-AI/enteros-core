@@ -68,8 +68,8 @@ func (m testEnvMutator) MutateEnv(_ context.Context, _ string, env map[string]st
 // Behavior-based — drift-resistant. A future provision function with
 // any name still trips this gate as long as it calls one of the
 // provisioner Start methods. This replaces an earlier name-list
-// version (PR #2366) that missed TeamHandler.Expand (issue #2367) —
-// the bug that motivated the upgrade.
+// version (PR #2366) that missed the then-present TeamHandler.Expand
+// (issue #2367) — a historical bug in a handler that has since been retired.
 //
 // Same shape as the audit-coverage gate from #335 (#2343 PR-5).
 //
@@ -245,14 +245,12 @@ func TestMintWorkspaceSecrets_PersistsInboundSecretInSaaSMode(t *testing.T) {
 	}
 }
 
-// TestPrepareProvisionContext_ParentIDInjection pins the PARENT_ID env
-// contract added in #2367: when payload.ParentID is set (currently only
-// TeamHandler.Expand populates it), prepareProvisionContext MUST
-// surface it as envVars["PARENT_ID"] so workspace/coordinator.py can
-// read it on startup. Pre-fix #2367 the env was set inline in
-// TeamHandler.Expand on cfg.EnvVars; the refactor moved it into the
-// shared prepare so any future provision path with a parent_id
-// inherits it automatically.
+// TestPrepareProvisionContext_ParentIDInjection pins legacy PARENT_ID
+// compatibility: when payload.ParentID is set, prepareProvisionContext
+// surfaces it as envVars["PARENT_ID"] for older external images. No current
+// checked-in runtime consumes this variable; workspaces.parent_id and the
+// platform APIs are authoritative. The shared prepare path preserves the
+// legacy field consistently for any provision request carrying a parent ID.
 func TestPrepareProvisionContext_ParentIDInjection(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -931,6 +929,20 @@ func TestApplyRuntimeModelEnv_SetsUniversalMODELForAllRuntimes(t *testing.T) {
 			model:             "minimax/MiniMax-M2.7",
 			wantMODEL:         "minimax/MiniMax-M2.7",
 			wantHermesDefault: "minimax/MiniMax-M2.7",
+		},
+		{
+			name:              "hermes: BYOK selection projects to native syntax without changing canonical model",
+			runtime:           "hermes",
+			model:             "minimax:MiniMax-M2.7-highspeed",
+			wantMODEL:         "minimax:MiniMax-M2.7-highspeed",
+			wantHermesDefault: "minimax/MiniMax-M2.7-highspeed",
+		},
+		{
+			name:              "hermes: restart projects persisted BYOK model to native syntax",
+			runtime:           "hermes",
+			moleculeModelEnv:  "minimax:MiniMax-M2.7-highspeed",
+			wantMODEL:         "minimax:MiniMax-M2.7-highspeed",
+			wantHermesDefault: "minimax/MiniMax-M2.7-highspeed",
 		},
 		{
 			name:      "claude-code: picked model populates MODEL + MOLECULE_MODEL (no vendor-specific name)",
@@ -1791,5 +1803,52 @@ func TestPrepareProvisionContext_LatePrivilegedAdminEnvFailsClosed(t *testing.T)
 	keys, _ := abort.Extra["forbidden_env_keys"].([]string)
 	if len(keys) != 1 || keys[0] != "ADMIN_TOKEN" {
 		t.Fatalf("forbidden keys = %#v, want [ADMIN_TOKEN]", abort.Extra["forbidden_env_keys"])
+	}
+}
+
+// TestPrepareProvisionContext_DeclaresSchedulerUnconditionally — the scheduler is
+// a BASE per-workspace ability (the firing daemon AND the self-audience
+// self-schedule MCP tool ship in the one molecule-scheduler plugin), so it must be
+// declared on EVERY workspace at provision REGARDLESS of the
+// MOLECULE_DECLARE_DEFAULT_NATIVE_PLUGINS flag (which stays the lever for the
+// digest providers). With the flag OFF, prepareProvisionContext must still record
+// molecule-scheduler in workspace_declared_plugins.
+func TestPrepareProvisionContext_DeclaresSchedulerUnconditionally(t *testing.T) {
+	// Flag OFF — the digest-provider default set is a no-op, but the scheduler is not.
+	t.Setenv(declareDefaultNativePluginsEnv, "")
+	os.Unsetenv(declareDefaultNativePluginsEnv)
+	// Platform-managed model (CP proxy base URL + usage token present) so the
+	// provision reaches the declare hook rather than aborting on the BYOK gate.
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets`).
+		WithArgs("ws-sched-base").
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+	// The unconditional scheduler declare — the behavior under test. molecule-
+	// scheduler is not the concierge MCP, so recordDeclaredPlugin is a single INSERT
+	// (no entitlement SELECT).
+	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	handler := NewWorkspaceHandler(&captureBroadcaster{}, nil, "http://localhost:8080", t.TempDir())
+	payload := models.CreateWorkspacePayload{
+		Name:  "Sched-Base",
+		Role:  "agent-sched",
+		Tier:  1,
+		Model: "anthropic:claude-opus-4-7",
+	}
+	_, abort := handler.prepareProvisionContext(
+		context.Background(), "ws-sched-base", "/nonexistent", nil, payload, false)
+	if abort != nil {
+		t.Fatalf("unexpected abort: %s", abort.Msg)
+	}
+	// The scheduler INSERT expectation being MET proves it was declared with the
+	// flag off (a flag-gated-only declare would leave it unmet).
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("scheduler must be declared at provision even with the default-native flag OFF: %v", err)
 	}
 }

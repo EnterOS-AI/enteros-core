@@ -21,6 +21,7 @@ WORKFLOWS_DIR="$ROOT/.gitea/workflows"
 SETUP="$ROOT/infra/scripts/setup.sh"
 RESET_LIB="$ROOT/scripts/lib/docker-reset.sh"
 NUKE="$ROOT/scripts/nuke-and-rebuild.sh"
+POST_REBUILD="$ROOT/scripts/post-rebuild-setup.sh"
 
 fail() {
   echo "FAIL: $1" >&2
@@ -65,7 +66,8 @@ token_file_line=$(line_of '\$HOME/\.molecule-ai/gitea-token')
 # shellcheck disable=SC2016
 template_token_line=$(line_of 'export MOLECULE_TEMPLATE_REPO_TOKEN="\$MOLECULE_GITEA_TOKEN"')
 wait_ch_line=$(line_of '^wait_for_langfuse_clickhouse_native$')
-docker_run_line=$(line_of '^(if )?docker run -d --name molecule-core-langfuse-1')
+# shellcheck disable=SC2016
+langfuse_up_line=$(line_of '^(if )?docker compose -f "\$ROOT/docker-compose\.yml" up -d langfuse')
 wait_http_line=$(line_of '^wait_for_langfuse_http$')
 banner_line=$(line_of 'Molecule AI dev environment ready')
 
@@ -79,8 +81,8 @@ banner_line=$(line_of 'Molecule AI dev environment ready')
 [ "$object_backend_line" -lt "$setup_line" ] || fail "local object-store backend must default to minio before platform/infra startup"
 [ "$workspace_endpoint_line" -lt "$setup_line" ] || fail "workspace-data endpoint must point at the dynamic local MinIO port before setup.sh"
 [ "$setup_line" -lt "$wait_ch_line" ] || fail "ClickHouse native wait must happen after setup.sh"
-[ "$wait_ch_line" -lt "$docker_run_line" ] || fail "ClickHouse native wait must happen before docker run starts Langfuse"
-[ "$docker_run_line" -lt "$wait_http_line" ] || fail "Langfuse HTTP wait must happen after docker run"
+[ "$wait_ch_line" -lt "$langfuse_up_line" ] || fail "ClickHouse native wait must happen before compose starts Langfuse"
+[ "$langfuse_up_line" -lt "$wait_http_line" ] || fail "Langfuse HTTP wait must happen after compose up"
 [ "$wait_http_line" -lt "$banner_line" ] || fail "Langfuse HTTP wait must happen before the ready banner"
 
 # shellcheck disable=SC2016
@@ -98,8 +100,9 @@ printf '%s\n' "$cleanup_body" | grep -Fq 'docker-compose.yml" down --remove-orph
   || fail "cleanup must tear down the full compose stack, including platform fallback containers"
 printf '%s\n' "$cleanup_body" | grep -Fq 'docker-compose.infra.yml" down --remove-orphans' \
   || fail "cleanup must tear down the infra-only compose stack"
-printf '%s\n' "$cleanup_body" | grep -Fq 'docker rm -f molecule-core-langfuse-1' \
-  || fail "cleanup must remove the manually-run Langfuse container"
+# shellcheck disable=SC2016
+printf '%s\n' "$cleanup_body" | grep -Fq 'docker rm -f "$LANGFUSE_CONTAINER"' \
+  || fail "cleanup must remove the stale Langfuse container via \$LANGFUSE_CONTAINER"
 if printf '%s\n' "$cleanup_body" | grep -Eq -- '--volumes|-v( |$)'; then
   fail "cleanup must not delete named volumes by default"
 fi
@@ -127,15 +130,74 @@ printf '%s\n' "$ch_body" | grep -q 'clickhouse-client' \
 printf '%s\n' "$ch_body" | grep -q 'langfuse-clickhouse' \
   || fail "ClickHouse native wait must target the Langfuse ClickHouse service"
 
+# Compose derives the container name from COMPOSE_PROJECT_NAME. Every by-name
+# docker reference must go through $LANGFUSE_CONTAINER — a hardcoded
+# molecule-core-langfuse-1 false-negatives when the user exports a different
+# project name (compose creates <project>-langfuse-1).
+# shellcheck disable=SC2016
+line_of '^LANGFUSE_CONTAINER="\$\{COMPOSE_PROJECT_NAME\}-langfuse-1"' >/dev/null
+if grep -Eq '^[^#]*molecule-core-langfuse-1' "$DEV_START"; then
+  fail "dev-start.sh must reference the Langfuse container via \$LANGFUSE_CONTAINER, not a hardcoded name"
+fi
+
 http_body=$(function_body wait_for_langfuse_http)
 printf '%s\n' "$http_body" | grep -q 'docker inspect' \
   || fail "Langfuse HTTP wait must detect a container that exits before readiness"
 # shellcheck disable=SC2016
+printf '%s\n' "$http_body" | grep -Fq '"$LANGFUSE_CONTAINER"' \
+  || fail "Langfuse HTTP wait must inspect the project-derived container name"
+# shellcheck disable=SC2016
 printf '%s\n' "$http_body" | grep -q '\$LANGFUSE_HOST' \
   || fail "Langfuse HTTP wait must probe the announced Langfuse host URL"
+# The compose service is the single Langfuse definition — dev-start must not
+# reintroduce a parallel `docker run` path that can drift from it.
+if grep -Eq '^[^#]*docker run .*langfuse/langfuse' "$DEV_START"; then
+  fail "dev-start.sh must start Langfuse via compose, not a parallel docker run"
+fi
+# Drift guards for the settings that diverged historically: the migration URL
+# must embed the langfuse user + the SAME password default as
+# docker-compose.infra.yml's clickhouse, and agents resolve langfuse-web.
 # shellcheck disable=SC2016
-grep -Fq -- '-p "127.0.0.1:${MOLECULE_LANGFUSE_HOST_PORT}:3000"' "$DEV_START" \
-  || fail "direct Langfuse docker run must be loopback-bound"
+grep -Fq 'clickhouse://langfuse:${CLICKHOUSE_PASSWORD:-langfuse-dev}@langfuse-clickhouse:9000' "$COMPOSE_MAIN" \
+  || fail "compose Langfuse CLICKHOUSE_MIGRATION_URL must embed credentials with the infra password default"
+# shellcheck disable=SC2016
+grep -Fq 'CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-langfuse-dev}' "$COMPOSE_MAIN" \
+  || fail "compose Langfuse CLICKHOUSE_PASSWORD default must match docker-compose.infra.yml"
+# shellcheck disable=SC2016
+grep -Fq 'CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-langfuse-dev}' "$COMPOSE" \
+  || fail "infra clickhouse CLICKHOUSE_PASSWORD default must stay langfuse-dev (lockstep with main compose)"
+grep -Fq -- '- langfuse-web' "$COMPOSE_MAIN" \
+  || fail "compose Langfuse must carry the langfuse-web network alias for workspace agents"
+# ...and compose must SAY SO to the platform. The provisioner has no compiled-in
+# default host any more (it injected a name that resolves only here, and every
+# k8s workspace retried an export against it forever), so this file is the only
+# thing that tells the compose platform where the trace sink is. Drop this line
+# and compose-topology tracing goes silently off.
+# shellcheck disable=SC2016
+grep -Fq 'MOLECULE_WORKSPACE_LANGFUSE_HOST: "${MOLECULE_WORKSPACE_LANGFUSE_HOST:-http://langfuse-web:3000}"' "$COMPOSE_MAIN" \
+  || fail "compose platform must pass MOLECULE_WORKSPACE_LANGFUSE_HOST — the provisioner has no default"
+
+# Hermetic Go bootstrap: must exist, be attempted before the go-run/container
+# branch, verify a pinned sha256, and stage inside the toolchains dir (atomic
+# same-fs rename — no half-install a later run would trust).
+bootstrap_fn_line=$(line_of '^bootstrap_go_toolchain\(\) \{')
+# shellcheck disable=SC2016
+go_branch_line=$(line_of '^if \[ "\$PLATFORM_MODE" = host \] && ! go_is_usable; then$')
+[ "$bootstrap_fn_line" -lt "$go_branch_line" ] \
+  || fail "Go bootstrap must be defined before the platform go-run branch"
+grep -Eq '^GO_SHA256_(DARWIN|LINUX)_(ARM64|AMD64)="[a-f0-9]{64}"' "$DEV_START" \
+  || fail "Go bootstrap must pin per-platform sha256 checksums"
+grep -Fq 'CHECKSUM MISMATCH' "$DEV_START" \
+  || fail "Go bootstrap must refuse a toolchain that fails checksum verification"
+grep -Fq 'refusing unverified toolchain' "$DEV_START" \
+  || fail "Go bootstrap must refuse to install without a sha256 tool"
+# shellcheck disable=SC2016
+grep -Fq 'mktemp -d "$(dirname "$go_dest")/.stage.XXXXXX"' "$DEV_START" \
+  || fail "Go bootstrap must stage inside the toolchains dir for an atomic install"
+bootstrap_body=$(function_body bootstrap_go_toolchain)
+if printf '%s\n' "$bootstrap_body" | grep -Eq 'sudo|brew |apt-get|apt |dnf |pacman'; then
+  fail "Go bootstrap must stay hermetic — no sudo/package-manager installs"
+fi
 
 echo "PASS: dev-start.sh gates the ready banner on Langfuse readiness"
 echo "PASS: dev-start.sh wires local private-repo tokens without persisting them"
@@ -145,10 +207,19 @@ grep -Eq '^  minio:' "$COMPOSE" \
   || fail "docker-compose.infra.yml must declare the MinIO service"
 grep -Eq '^  minio-init:' "$COMPOSE" \
   || fail "docker-compose.infra.yml must declare the MinIO bucket bootstrap service"
-grep -Fq 'minio/minio@sha256:' "$COMPOSE" \
+grep -Eq 'image: [^ ]*/minio:[^@ ]+@sha256:[a-f0-9]{64}' "$COMPOSE" \
   || fail "MinIO image must be digest-pinned"
-grep -Fq 'minio/mc@sha256:' "$COMPOSE" \
+grep -Eq 'image: [^ ]*/minio-client:[^@ ]+@sha256:[a-f0-9]{64}' "$COMPOSE" \
   || fail "MinIO client image must be digest-pinned"
+# Every fixed image in both compose files must be digest-pinned. Variable
+# images (canvas/platform, resolved from the internal registry at runtime) are
+# exempt. Pins must be MULTI-ARCH manifest-list digests — see the refresh note
+# in docker-compose.infra.yml; a platform-specific digest breaks arm64 hosts.
+for _cf in "$COMPOSE" "$COMPOSE_MAIN"; do
+  if grep -E '^[[:space:]]+image: ' "$_cf" | grep -Fv '${' | grep -Fv '@sha256:'; then
+    fail "$(basename "$_cf") has a fixed image reference without a digest pin (printed above)"
+  fi
+done
 # shellcheck disable=SC2016
 grep -Fq '127.0.0.1:${MOLECULE_MINIO_HOST_PORT:-9000}:9000' "$COMPOSE" \
   || fail "MinIO S3 API must be loopback-bound in local dev"
@@ -316,6 +387,21 @@ grep -Fq 'docker-reset.sh' "$NUKE" \
   || fail "nuke-and-rebuild.sh must source the shared scripts/lib/docker-reset.sh"
 grep -Fq 'mol_purge_ws_objects' "$NUKE" \
   || fail "nuke-and-rebuild.sh must purge ws-* via mol_purge_ws_objects (UUID-scoped)"
+
+# A local reset must not seed tenant credentials by writing global_secrets rows
+# directly.  The retired helper required a GitHub PAT and bypassed the
+# authenticated secret API/encryption path.  First-run credentials belong in
+# Canvas Settings (or PUT /settings/secrets with ADMIN_TOKEN) after the stack is
+# healthy.
+[ ! -e "$POST_REBUILD" ] \
+  || fail "post-rebuild-setup.sh must stay retired (it bypassed authenticated secret storage)"
+if grep -Fq 'post-rebuild-setup.sh' "$NUKE"; then
+  fail "nuke-and-rebuild.sh must not call the retired raw-DB secret seeder"
+fi
+grep -Fq 'Canvas Settings' "$NUKE" \
+  || fail "nuke-and-rebuild.sh must direct first-run secrets through Canvas Settings"
+grep -Fq '/settings/secrets' "$NUKE" \
+  || fail "nuke-and-rebuild.sh must name the authenticated API alternative"
 
 # The destructive wipe must NEVER fire on Ctrl-C: the exit-trap handler cleanup()
 # must invoke cleanup_dev_stack (volume-preserving), never fresh_reset.

@@ -3,10 +3,17 @@
 package staginge2e
 
 import (
+	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,9 +24,9 @@ import (
 // / hibernate) coverage.
 //
 // What it proves that the handler unit tests (httptest in
-// internal/handlers/*_test.go) cannot: that against a REAL EC2-backed tenant
-// workspace, the lifecycle endpoints actually transition the CONTAINER state
-// and recover — not just flip a DB flag or return HTTP 200.
+// internal/handlers/*_test.go) cannot: that against a real staging tenant on
+// the configured compute provider, the lifecycle endpoints actually transition
+// the container state and recover — not just flip a DB flag or return HTTP 200.
 //
 // Pipeline:
 //
@@ -41,7 +48,7 @@ import (
 //     pause (POST /pause):
 //     → paused, AND the container is genuinely stopped — observed via the
 //     tenant API as: url cleared + the workspace no longer serves A2A
-//     (a stopped EC2/container is unreachable; a mere flag would still serve).
+//     (a stopped container is unreachable; a mere flag would still serve).
 //     resume (POST /resume):
 //     paused → provisioning → online + serveable again.
 //
@@ -58,12 +65,11 @@ import (
 func TestWorkspaceLifecycle_Staging(t *testing.T) {
 	cfg := requireStagingEnv(t)
 
-	slug := fmt.Sprintf("e2e-life-%d", time.Now().Unix()%100000000)
+	slug := e2eSlug("life")
 	t.Logf("workspace-lifecycle: slug=%s", slug)
 
 	// --- Step 1: provision org via admin API ---
 	orgID := adminCreateOrg(t, cfg, slug)
-	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
 	t.Logf("org created: org_id=%s", orgID)
 
 	// --- Step 1b: acquire tenant admin token + wait for tenant TLS ready ---
@@ -79,6 +85,13 @@ func TestWorkspaceLifecycle_Staging(t *testing.T) {
 
 	// Baseline: the freshly-online workspace must actually serve A2A.
 	assertServes(t, tenantHost, token, orgID, wsID, "baseline (post-boot)")
+
+	// core#5026 baseline: the first boot must have produced a boot-install report.
+	// This is also the `before` snapshot the restart subtest advances from — the
+	// restart rule needs a server-clock baseline, and this is the only place that
+	// can honestly claim one (the workspace was created seconds ago by this run).
+	installReportBeforeRestart := assertBootInstallReportLanded(
+		t, tenantHost, token, orgID, wsID, "workspace (initial boot)")
 
 	// ── soft restart ────────────────────────────────────────────────────────
 	// online → provisioning → online; container must come back serveable.
@@ -101,7 +114,28 @@ func TestWorkspaceLifecycle_Staging(t *testing.T) {
 		// Post-restart liveness/serve probe — proves the container is actually
 		// back, not just that the status row says online.
 		assertServes(t, tenantHost, token, orgID, wsID, "post-restart")
-		t.Logf("restart VERIFIED: online → provisioning → online + serveable")
+
+		// core#5026 — THE assertion this issue is about. issueAndInjectToken
+		// revokes the workspace's live instance tokens BEFORE minting the
+		// replacement, so the credential the previous boot held is dead the moment
+		// this restart begins. A runtime that posts its boot-install report before
+		// /registry/register (runtime 0.4.72 posted it as boot step 1 of 8) is
+		// therefore 401'd by construction on every restart, swallows it fail-soft,
+		// and leaves the stored row describing a boot that no longer exists.
+		// Measured on prod: the row read 2026-07-31T19:04 through many later boots,
+		// so /admin/plugin-install-reports and the
+		// molecule_plugin_install_degraded_workspaces gauge could neither clear
+		// when the box recovered nor fire when it broke.
+		//
+		// Presence alone cannot see that — the row IS there. Only ADVANCEMENT can,
+		// and only a restart produces it, which is why the assertion lives in this
+		// subtest and not next to the initial boot. Both timestamps come from the
+		// same tenant database through the same endpoint, so the comparison is
+		// immune to runner clock skew.
+		assertBootInstallReportAdvanced(t, tenantHost, token, orgID, wsID,
+			"workspace (across restart)", installReportBeforeRestart)
+
+		t.Logf("restart VERIFIED: online → provisioning → online + serveable + boot-install report re-sent")
 	})
 
 	// ── pause → resume ──────────────────────────────────────────────────────
@@ -256,24 +290,41 @@ func waitForWorkspaceStatus(t *testing.T, host, token, orgID, wsID, want string,
 
 // waitForWorkspaceOnlineRoutable polls until status=online AND url is non-empty.
 // A routable url is the real "the agent is reachable" signal the SDK uses — an
-// online row without a url is not yet serveable.
+// online row without a url is not yet serveable. It ends the moment the control
+// plane publishes a terminal verdict instead of polling out the whole budget
+// (readiness_terminal_signal.go).
+//
+// This loop is where the defect was FIRST visible: because it logs every status
+// transition it recorded, nine times in retention, the exact shape the Guard B
+// loop hid — `provisioning` at t+0, `failed` at ~t+93s, then thirteen and a half
+// more minutes of polling a row that had already been written off. Now the same
+// observation ends the wait and the row's own last_sample_error is quoted.
 func waitForWorkspaceOnlineRoutable(t *testing.T, host, token, orgID, wsID string, timeout time.Duration, why string) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	var lastStatus, lastURL string
-	for time.Now().Before(deadline) {
-		_, st, url := workspaceStatusAndURL(t, host, token, orgID, wsID)
-		if st != lastStatus || (url != "") != (lastURL != "") {
-			t.Logf("    [%s] status=%q routable=%v", why, st, url != "")
-			lastStatus, lastURL = st, url
+	watch := DeployWorkspaceOnlineRoutableWatch(why, timeout)
+	for {
+		hs, body := doTenantJSON(t, "GET", "https://"+host+"/workspaces/"+wsID, token, orgID, "")
+		st := topLevelString(body, "status")
+		url := topLevelString(body, "url")
+		step := watch.Observe(time.Now(), Obs{
+			ReadOK:     hs == http.StatusOK,
+			Status:     st,
+			Detail:     topLevelString(body, "last_sample_error"),
+			Extra:      url != "",
+			ExtraLabel: fmt.Sprintf("routable=%v", url != ""),
+		})
+		if step.Transitioned && step.Message != "" {
+			t.Logf("    %s", step.Message)
 		}
-		if st == "online" && url != "" {
+		switch step.Decision {
+		case WaitReady:
+			return
+		case WaitFailTerminal, WaitFailBudget, WaitFailMisconfigured:
+			t.Fatalf("%s: workspace %s — %s", why, wsID, step.Message)
 			return
 		}
 		time.Sleep(10 * time.Second)
 	}
-	t.Fatalf("%s: workspace %s never reached online+routable within %s (last status=%q, url-set=%v)",
-		why, wsID, timeout, lastStatus, lastURL != "")
 }
 
 // assertURLCleared asserts the canvas GET reports an empty url within timeout.
@@ -300,7 +351,11 @@ func assertURLCleared(t *testing.T, host, token, orgID, wsID string, timeout tim
 // connection error / 5xx / 4xx means it did not serve.
 func serveProbe(t *testing.T, host, token, orgID, wsID string) (served bool, code int) {
 	t.Helper()
-	url := "https://" + host + "/workspaces/" + wsID + "/a2a"
+	top, err := tenantTopoFromHost(host)
+	if err != nil {
+		t.Fatalf("serve probe: tenant topology for %s: %v", host, err)
+	}
+	url := top.baseURL + "/workspaces/" + wsID + "/a2a"
 	body := fmt.Sprintf(`{"jsonrpc":"2.0","method":"message/send","id":"e2e-probe","params":{"message":{"role":"user","messageId":%q,"parts":[{"kind":"text","text":"platform lifecycle e2e serve probe — reply with the single token: PONG"}]}}}`,
 		fmt.Sprintf("e2e-probe-%d", time.Now().UnixNano()))
 	req, err := http.NewRequest("POST", url, strings.NewReader(body))
@@ -309,7 +364,7 @@ func serveProbe(t *testing.T, host, token, orgID, wsID string) (served bool, cod
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-Molecule-Org-Id", orgID)
-	req.Header.Set("Origin", "https://"+host)
+	applyTenantRouting(req, top)
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 90 * time.Second}
 	resp, err := client.Do(req)
@@ -341,8 +396,8 @@ func assertServes(t *testing.T, host, token, orgID, wsID, why string) {
 }
 
 // assertNotServing requires the workspace to STOP serving A2A within timeout —
-// the observable proxy (via the tenant API, no AWS/SSM access in core) that the
-// container is genuinely stopped, not merely flagged paused/hibernated.
+// the observable proxy available through the tenant API that the container is
+// genuinely stopped, not merely flagged paused/hibernated.
 //
 // NOTE: a hibernated workspace auto-wakes on the NEXT A2A message — so a single
 // probe could itself trigger a wake. We therefore look for the workspace to be
@@ -350,12 +405,11 @@ func assertServes(t *testing.T, host, token, orgID, wsID, why string) {
 // stopped; we do not retry-poll the probe (that would wake it). A live-and-
 // serving container returns 2xx immediately, which is the regression we catch.
 //
-// TODO(core#2332): the strongest "container stopped" signal is the EC2/Docker
-// state itself (instance stopped), which is only observable from the CP side
-// (AWS/SSM) — not reachable from the core ws-server module without importing the
-// CP client surface. This asserts the strongest signal available here (url
-// cleared + immediate non-serve). If/when a CP-side admin endpoint surfaces the
-// instance power-state to the tenant API, tighten this to assert it directly.
+// TODO(core#2332): the strongest "container stopped" signal is the provider's
+// actual container/process state, which is owned by the CP/provisioner and is
+// not exposed to this tenant ws-server test. This asserts the strongest signal
+// available here (url cleared + immediate non-serve). If a CP-side admin
+// endpoint surfaces provider state to the tenant API, tighten this assertion.
 func assertNotServing(t *testing.T, host, token, orgID, wsID string, why string) {
 	t.Helper()
 	// The status/url already settled to stopped before this is called. One
@@ -444,6 +498,9 @@ func requireStagingEnv(t *testing.T) stagingCfg {
 	if len(missing) > 0 {
 		t.Skipf("STAGING_E2E=1 but missing required env: %s — skipping LOUD (not a silent pass)", strings.Join(missing, ", "))
 	}
+	if err := validateStagingCPBase(cfg.cpBase); err != nil {
+		t.Fatalf("unsafe CP_BASE_URL for staging E2E: %v", err)
+	}
 	return cfg
 }
 
@@ -454,8 +511,41 @@ func envOr(k, def string) string {
 	return def
 }
 
-// adminCreateOrg provisions a throwaway org via the CP admin API and waits for
-// its instance to reach running (provisioning is async).
+// e2eSlug builds the slug for an ephemeral e2e org.
+//
+// It keeps the `e2e-<tag>` prefix so CP's IsEphemeral classifier still tags the
+// org throwaway, and — crucially — embeds the CI run-id (GITHUB_RUN_ID) so the
+// workflow-level `if: always()` teardown net can sweep a leaked org by run-id
+// even when Go's t.Cleanup never fires. `go test -timeout` firing and a
+// SIGKILL'd runner both SKIP t.Cleanup, so the old run-id-less slug form
+// (`e2e-<tag>-<unixtime>`) could not be matched by the always()-net and leaked
+// until the age-guarded reaper eventually caught it. Embedding the run-id closes
+// that gap: belt (t.Cleanup on the happy/failure path) and braces (the
+// run-id-scoped always()-net on timeout/kill).
+//
+// On local runs GITHUB_RUN_ID is empty, so it falls back to the legacy
+// unix-timestamp form. A short 24-bit random suffix keeps parallel/rerun slugs
+// collision-resistant while staying well under the DNS-label / CP slug limit.
+func e2eSlug(tag string) string {
+	if runID := strings.TrimSpace(os.Getenv("GITHUB_RUN_ID")); runID != "" {
+		var entropy [3]byte
+		if _, err := cryptorand.Read(entropy[:]); err == nil {
+			return fmt.Sprintf("e2e-%s-%s-%s", tag, runID, hex.EncodeToString(entropy[:]))
+		}
+		// A crypto/rand outage should not turn slug construction into a silent
+		// empty value. Preserve the exact six-hex contract with a clock fallback;
+		// the create endpoint still rejects any real collision.
+		fallback := uint64(time.Now().UnixNano()) & 0xffffff
+		return fmt.Sprintf("e2e-%s-%s-%06x", tag, runID, fallback)
+	}
+	return fmt.Sprintf("e2e-%s-%d", tag, time.Now().Unix()%100000000)
+}
+
+// adminCreateOrg provisions a throwaway org via the CP admin API, immediately
+// registers exact-slug cleanup, and then waits for its instance to reach
+// running (provisioning is async). Cleanup must be registered here rather than
+// by callers: a provisioning timeout calls t.Fatalf before this function
+// returns, so caller-owned cleanup would never be installed.
 func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string) (orgID string) {
 	t.Helper()
 	// Compute backend for the throwaway tenant. Defaults to molecules-server (the local-docker
@@ -469,32 +559,302 @@ func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string) (orgID string) {
 	if status != http.StatusCreated && status != http.StatusOK {
 		t.Fatalf("AdminCreate org: HTTP %d: %s", status, resp)
 	}
+	// A 200/201 means the server accepted the exact slug. Schedule targeted
+	// cleanup before parsing the response so a malformed success body still
+	// triggers a teardown attempt.
+	registerTenantCleanup(t, cfg, slug)
 	id := jsonField(resp, "id")
 	if id == "" {
 		t.Fatalf("AdminCreate org: no id in response: %s", resp)
 	}
-	deadline := time.Now().Add(7 * time.Minute)
-	for time.Now().Before(deadline) {
+	// TERMINAL-SIGNAL WAIT (see readiness_terminal_signal.go). The admin list
+	// already carries org_instances.last_error alongside instance_status, so a
+	// provision the control plane has already declared dead is answered in
+	// seconds with ITS reason instead of 7 minutes of polling and a stopwatch.
+	// A terminal status must persist past the CP's own self-heal window before
+	// it is believed, so this can never out-run a retry the CP is running.
+	watch := DeployOrgInstanceRunningWatch(slug)
+	var lastListStatus int
+	lastInstance := "<never observed>"
+	for {
 		st, list := doJSON(t, "GET", cfg.cpBase+"/cp/admin/orgs", cfg.adminToken, "")
-		if st == http.StatusOK && strings.Contains(list, `"slug":"`+slug+`"`) &&
-			orgInstanceStatus(list, slug) == "running" {
-			return id
+		lastListStatus = st
+		obs := Obs{}
+		if st == http.StatusOK {
+			seen, lastErr, present := orgInstanceRow(list, slug)
+			switch {
+			case !present:
+				lastInstance = "<org row absent from admin list>"
+				obs = Obs{ReadOK: true, Status: "<org row absent from admin list>"}
+			case seen == "":
+				lastInstance = "<row present, instance_status omitted>"
+				obs = Obs{ReadOK: true, Status: "<instance_status omitted>"}
+			default:
+				lastInstance = seen
+				obs = Obs{ReadOK: true, Status: seen, Detail: lastErr}
+			}
 		}
-		time.Sleep(15 * time.Second)
+		step := watch.Observe(time.Now(), obs)
+		if step.Transitioned && step.Message != "" {
+			t.Logf("    %s", step.Message)
+		}
+		switch step.Decision {
+		case WaitReady:
+			return id
+		case WaitFailTerminal, WaitFailMisconfigured:
+			// The control plane published a verdict (or this wait is unsound).
+			// Either way, waiting out the rest of the budget adds nothing.
+			t.Fatalf("%s\n"+
+				"  CP tenant diagnostics: %s\n"+
+				"  CP boot-events:        %s",
+				step.Message,
+				bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/diagnostics"),
+				bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/boot-events?limit=20"))
+			return ""
+		case WaitFailBudget:
+			// Nothing was ever published — fall through to the (unchanged)
+			// self-diagnosing timeout below, which is the right report for a
+			// genuinely STUCK provision.
+		default:
+			time.Sleep(15 * time.Second)
+			continue
+		}
+		break
 	}
-	t.Fatalf("org %s did not reach instance_status=running within timeout", slug)
+	// SELF-DIAGNOSING TIMEOUT (Guard B operability).
+	//
+	// This message used to be exactly "org %s did not reach instance_status=
+	// running within timeout" and NOTHING else. That single line is what the
+	// staging-tenant-cd HARD GATE printed on runs 616479 / 617016, and it named
+	// neither the last status the CP reported nor the reason provisioning stalled.
+	// The actual cause was a CP-side check-constraint rejection
+	// (organizations_provider_check, migration 071 vs a literal 'local' write) —
+	// a fact the control plane already knew and this gate simply never asked for.
+	// Two separate investigations of a red Guard B were spent re-deriving it by
+	// hand from a live reproduction, because the gate deleted its own evidence:
+	// the t.Cleanup teardown purges the org moments later, so by the time anyone
+	// reads the log the tenant it is asking about no longer exists.
+	//
+	// So: before failing, pull the two admin surfaces the CP already exposes for
+	// exactly this question and put them IN the failure. Both are best-effort —
+	// a diagnostics fetch that itself fails must never replace the real verdict,
+	// only annotate it.
+	t.Fatalf("org %s did not reach instance_status=running within %s AND the control plane never "+
+		"published a terminal verdict about it (it is STUCK, not FAILED) "+
+		"(last admin-list HTTP %d, last instance_status=%q).\n"+
+		"  CP tenant diagnostics: %s\n"+
+		"  CP boot-events:        %s",
+		slug, orgProvisionBudget, lastListStatus, lastInstance,
+		bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/diagnostics"),
+		bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/boot-events?limit=20"))
 	return ""
+}
+
+func registerTenantCleanup(t *testing.T, cfg stagingCfg, slug string) {
+	t.Helper()
+	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
 }
 
 func adminDeleteTenant(t *testing.T, cfg stagingCfg, slug string) {
 	t.Helper()
-	body := fmt.Sprintf(`{"confirm":%q}`, slug)
-	status, resp := doJSON(t, "DELETE", cfg.cpBase+"/cp/admin/tenants/"+slug, cfg.adminToken, body)
-	if status != http.StatusOK && status != http.StatusAccepted && status != http.StatusNotFound {
-		t.Logf("WARNING: teardown DELETE tenant %s returned HTTP %d: %s (manual cleanup may be needed)", slug, status, resp)
+	if err := deleteTenantAndVerify(cfg, slug, 3*time.Minute, 5*time.Second); err != nil {
+		// Cleanup is part of the live contract. A green functional assertion
+		// with a leaked tenant is not a passing E2E, so fail the test closed.
+		t.Errorf("teardown failed for exact tenant %s: %v", slug, err)
 		return
 	}
-	t.Logf("teardown: deleted tenant %s (HTTP %d)", slug, status)
+	t.Logf("teardown: deleted exact tenant %s and verified it absent", slug)
+}
+
+// deleteTenantAndVerify retries the one transient response the CP emits while
+// an asynchronous lifecycle operation is still settling (HTTP 409), then
+// proves the exact slug is absent through the CP's identity-bound tenant
+// endpoint (404). It is deliberately bounded and exact-slug-only: no fleet
+// sweep and no false-green warning path.
+func deleteTenantAndVerify(cfg stagingCfg, slug string, timeout, pollInterval time.Duration) error {
+	if cfg.cpBase == "" || cfg.adminToken == "" {
+		return fmt.Errorf("control-plane base URL and admin token are required")
+	}
+	if err := validateStagingCPBase(cfg.cpBase); err != nil {
+		return err
+	}
+	if !validE2ESlug(slug) {
+		return fmt.Errorf("refusing cleanup for non-E2E slug %q", slug)
+	}
+	if timeout <= 0 || pollInterval <= 0 {
+		return fmt.Errorf("cleanup timeout and poll interval must be positive")
+	}
+
+	requestTimeout := 30 * time.Second
+	if timeout < requestTimeout {
+		requestTimeout = timeout
+	}
+	client := &http.Client{
+		Timeout: requestTimeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	deadline := time.Now().Add(timeout)
+	body := fmt.Sprintf(`{"confirm":%q}`, slug)
+	var lastStatus int
+	var lastDetail string
+
+	for {
+		status, respBody, err := cleanupJSONRequest(
+			client,
+			http.MethodDelete,
+			strings.TrimRight(cfg.cpBase, "/")+"/cp/admin/tenants/"+slug,
+			cfg.adminToken,
+			body,
+		)
+		lastStatus = status
+		if err != nil {
+			lastDetail = err.Error()
+		} else {
+			lastDetail = cleanupResponseDetail(respBody)
+			switch {
+			case status == http.StatusOK || status == http.StatusAccepted || status == http.StatusNotFound:
+				absent, verifyErr := exactTenantAbsent(client, cfg, slug)
+				if verifyErr == nil && absent {
+					return nil
+				}
+				if verifyErr != nil {
+					lastDetail = "absence verification: " + verifyErr.Error()
+				} else {
+					lastDetail = "DELETE accepted but exact tenant identity still exists"
+				}
+			case status == http.StatusConflict || status == http.StatusRequestTimeout ||
+				status == http.StatusTooManyRequests || status >= http.StatusInternalServerError:
+				// Retry below. A 409 is expected while a just-completed test still
+				// has an active lifecycle operation; transport/5xx/429 failures are
+				// also bounded rather than converted into a false green.
+			default:
+				return fmt.Errorf("DELETE returned non-retryable HTTP %d: %s", status, lastDetail)
+			}
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("cleanup deadline exhausted after HTTP %d: %s", lastStatus, lastDetail)
+		}
+		sleepFor := pollInterval
+		if remaining < sleepFor {
+			sleepFor = remaining
+		}
+		time.Sleep(sleepFor)
+	}
+}
+
+func exactTenantAbsent(client *http.Client, cfg stagingCfg, slug string) (bool, error) {
+	status, body, err := cleanupJSONRequest(
+		client,
+		http.MethodGet,
+		fmt.Sprintf("%s/cp/admin/tenants/%s/boot-events?limit=1", strings.TrimRight(cfg.cpBase, "/"), slug),
+		cfg.adminToken,
+		"",
+	)
+	if err != nil {
+		return false, err
+	}
+	if status == http.StatusNotFound {
+		return true, nil
+	}
+	if status != http.StatusOK {
+		return false, fmt.Errorf("exact tenant identity returned HTTP %d: %s", status, cleanupResponseDetail(body))
+	}
+	var identity struct {
+		Slug string `json:"slug"`
+	}
+	if err := json.Unmarshal([]byte(body), &identity); err != nil {
+		return false, fmt.Errorf("decode exact tenant identity: %w", err)
+	}
+	if identity.Slug != slug {
+		return false, fmt.Errorf("exact tenant identity mismatch: got %q", identity.Slug)
+	}
+	return false, nil
+}
+
+func validateStagingCPBase(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Hostname() == "" || parsed.User != nil ||
+		(parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("invalid control-plane URL")
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if parsed.Scheme == "https" && host == "staging-api.moleculesai.app" {
+		return nil
+	}
+	if parsed.Scheme == "http" && (host == "127.0.0.1" || host == "::1" || host == "localhost") {
+		return nil
+	}
+	// Ephemeral per-PR loopback CP: the throwaway control-plane is reached over a
+	// loopback alias (lvh.me / *.lvh.me / *.localhost) or a single-label docker DNS
+	// name (e.g. "controlplane") on the gate's private compose network. Accepted
+	// ONLY under an explicit opt-in so a normal staging run can never send its
+	// admin bearer to a loopback host. Default-unset ⇒ this arm is never taken ⇒
+	// byte-identical to the historical validation.
+	if os.Getenv("E2E_CP_ALLOW_EPHEMERAL_LOOPBACK") == "1" &&
+		parsed.Scheme == "http" && isEphemeralLoopbackHost(host) {
+		return nil
+	}
+	return fmt.Errorf("refusing to send staging admin bearer to %s://%s", parsed.Scheme, host)
+}
+
+// isEphemeralLoopbackHost reports whether host is a loopback-resolving alias the
+// ephemeral per-PR CP is reached by. It is gated behind E2E_CP_ALLOW_EPHEMERAL_LOOPBACK
+// in validateStagingCPBase, so it only ever loosens the check under explicit opt-in.
+func isEphemeralLoopbackHost(host string) bool {
+	switch {
+	case host == "lvh.me" || strings.HasSuffix(host, ".lvh.me"):
+		return true
+	case host == "localhost" || strings.HasSuffix(host, ".localhost"):
+		return true
+	case host == "127.0.0.1" || host == "::1":
+		return true
+	case !strings.Contains(host, "."):
+		// A single-label container DNS name on the ephemeral docker network
+		// (e.g. "controlplane") — only resolvable inside the gate's compose net.
+		return true
+	default:
+		return false
+	}
+}
+
+func validE2ESlug(slug string) bool {
+	if len(slug) == 0 || len(slug) > 63 ||
+		(!strings.HasPrefix(slug, "e2e-") && !strings.HasPrefix(slug, "rt-e2e-")) {
+		return false
+	}
+	for _, r := range slug {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func cleanupJSONRequest(client *http.Client, method, url, token, body string) (int, string, error) {
+	req, err := http.NewRequest(method, url, strings.NewReader(body))
+	if err != nil {
+		return 0, "", fmt.Errorf("build %s request: %w", method, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, "", fmt.Errorf("%s request: %w", method, err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, readBody(resp), nil
+}
+
+func cleanupResponseDetail(body string) string {
+	detail := strings.Join(strings.Fields(body), " ")
+	if len(detail) > 300 {
+		return detail[:300] + "..."
+	}
+	return detail
 }
 
 // tenantAdminToken fetches the per-tenant admin token from the CP admin surface.
@@ -517,7 +877,8 @@ func tenantAdminToken(t *testing.T, cfg stagingCfg, slug string) string {
 }
 
 // tenantCreateWorkspace creates a default-runtime workspace via the tenant
-// ws-server, exercising the full tenant → CP provisioner → EC2 path.
+// ws-server, exercising the full tenant → CP provisioner → configured-provider
+// path (currently molecules-server/local Docker in staging).
 //
 // De-hardcode: the runtime + model FOLLOW the same KMS-injection pattern the
 // de-hardcode lanes use — E2E_RUNTIME / E2E_MODEL are exported by the e2e
@@ -545,27 +906,184 @@ func tenantCreateWorkspaceWithRuntime(t *testing.T, cfg stagingCfg, host, token,
 		`{"name":%q,"runtime":%q,"tier":%d,"model":%q,"provider":%q}`,
 		name, runtime, 1, model, "platform",
 	)
-	status, resp := doTenantJSON(t, "POST", url, token, orgID, body)
-	if status != http.StatusCreated && status != http.StatusOK {
-		t.Fatalf("tenant workspace create (runtime=%s model=%s): HTTP %d: %s", runtime, model, status, resp)
+	// Cold-origin 503 retry (#91, RCA run 527280): the create POST intermittently
+	// returns an EMPTY-body 503 in the ~1-2s Cloudflare cold-origin window right
+	// after /health went green — the request never reached the ws-server handler.
+	// Retry ONLY that "never reached a handler" signature (empty-body 503 or a
+	// transport error surfaced as status 0), honoring the origin's Retry-After.
+	// A non-empty body, or a 502/504 (a non-idempotent POST that may already have
+	// been processed), is surfaced on the first try — never re-POSTed. This
+	// mirrors the shell (tests/e2e/lib/workspace_create_retry.sh) and TS
+	// (canvas workspaceCreateRetry.ts) classifiers so all three create seams
+	// share ONE non-masking rule.
+	const maxAttempts = 4
+	var status int
+	var resp string
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		var retryAfter string
+		status, resp, retryAfter = doTenantCreateOnce(t, url, token, orgID, body)
+		if status == http.StatusCreated || status == http.StatusOK {
+			id := jsonField(resp, "id")
+			if id == "" {
+				t.Fatalf("tenant workspace create: no id in response: %s", resp)
+			}
+			return id
+		}
+		if coldCreateShouldRetry(status, resp) && attempt < maxAttempts {
+			delay := parseColdRetryAfter(retryAfter)
+			t.Logf("tenant workspace create (runtime=%s model=%s): cold-origin retryable HTTP %d (empty body), attempt %d/%d — sleeping %ds (Retry-After=%q) [#91]",
+				runtime, model, status, attempt, maxAttempts, delay, retryAfter)
+			time.Sleep(time.Duration(delay) * time.Second)
+			continue
+		}
+		break
 	}
-	id := jsonField(resp, "id")
-	if id == "" {
-		t.Fatalf("tenant workspace create: no id in response: %s", resp)
+	t.Fatalf("tenant workspace create (runtime=%s model=%s): HTTP %d: %s", runtime, model, status, resp)
+	return ""
+}
+
+// doTenantCreateOnce issues the SAME tenant create request as doTenantJSON (the
+// three SaaS-auth headers + Content-Type, the same 90s client) but RETURNS the
+// Retry-After header and, on a transport error, status=0 with empty body so the
+// caller's retry loop — not this helper — decides. It deliberately does NOT
+// t.Fatalf on a transport error: a connection reset / never-established socket
+// in the cold-origin window is exactly the retryable "never reached a handler"
+// signal, and t.Fatalf here would kill the test before the loop could retry.
+func doTenantCreateOnce(t *testing.T, url, token, orgID, body string) (int, string, string) {
+	t.Helper()
+	rewritten, top, err := tenantTopoFromURL(url)
+	if err != nil {
+		t.Fatalf("tenant topology for %s: %v", url, err)
 	}
-	return id
+	req, err := http.NewRequest("POST", rewritten, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build POST %s: %v", rewritten, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-Molecule-Org-Id", orgID)
+	applyTenantRouting(req, top)
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		if coldCreateTransportRetryable(err) {
+			// Connection reset / refused / never-established in the cold window:
+			// no handler was reached, so model as status 0 (no status line) and
+			// let coldCreateShouldRetry retry — the transport twin of curl `000`.
+			return 0, "", ""
+		}
+		// Client-side timeout (http.Client.Timeout / context deadline) or abort:
+		// the origin may already have PROCESSED this non-idempotent POST before
+		// the client stopped waiting, so a re-POST would DOUBLE-CREATE. Surface a
+		// non-retryable sentinel — status -1 AND a non-empty body each
+		// independently force coldCreateShouldRetry to false — so the loop stops.
+		return -1, "transport error (maybe-processed, not retried): " + err.Error(), ""
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, readBody(resp), resp.Header.Get("Retry-After")
+}
+
+// coldCreateTransportRetryable classifies a client.Do transport error (an error
+// return with NO HTTP response). It is the Go twin of the shell's curl-exit
+// gate and the TS classifier's TypeError-vs-TimeoutError split:
+//
+//   - A CLIENT-side timeout — http.Client.Timeout, a request-context deadline,
+//     or any net.Error whose Timeout() is true — is maybe-processed: the origin
+//     may already have handled the non-idempotent POST /workspaces before the
+//     client gave up, so re-POSTing risks a DOUBLE-CREATE. NOT retryable.
+//     (Mirrors the TS classifier refusing TimeoutError/AbortError and the shell
+//     refusing curl exit 28.)
+//   - Everything else at the transport layer — connection refused / reset by
+//     peer / never-established socket / EOF — never reached a handler, so it is
+//     the safe cold-origin transient to retry (the twin of curl `000`).
+func coldCreateTransportRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	// http.Client.Timeout cancels the request context, surfacing (possibly
+	// wrapped in *url.Error) as context.DeadlineExceeded.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// Dial/read/write deadlines and other timeouts surface as a net.Error with
+	// Timeout()==true; *url.Error forwards Timeout() from the error it wraps.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return false
+	}
+	// Non-timeout transport failure (reset/refused/never-established) → retry.
+	return true
+}
+
+// coldCreateShouldRetry is the pure, non-masking classifier for the create POST.
+// It mirrors create_should_retry_cold (shell) / shouldRetryColdCreate (TS)
+// byte-for-byte: retry ONLY a "never reached a handler" signature.
+//
+//   - A NON-EMPTY body is a real response from the ws-server handler (which
+//     always emits a body — e.g. a 422/400 JSON error). Emptiness IS the
+//     "not the handler" signal, so a non-empty body is NEVER retried; it is
+//     surfaced so a genuine regression cannot be masked by a retry.
+//   - status 503 with an empty body → the edge/ingress "Service Unavailable"
+//     synthesised before a handler is up (the RCA'd cold-origin signature).
+//   - status 0 (transport error / connection reset) → the same cold window at
+//     the transport layer.
+//   - 502 / 504 (and everything else) → NOT retried: a bad-gateway /
+//     gateway-timeout on a non-idempotent POST may already have been processed,
+//     so re-POSTing risks a double-create.
+func coldCreateShouldRetry(status int, body string) bool {
+	if strings.TrimSpace(body) != "" {
+		return false
+	}
+	switch status {
+	case 503, 0:
+		return true
+	default:
+		return false
+	}
+}
+
+// parseColdRetryAfter honors ONLY a bare integer delta-seconds Retry-After
+// (RFC 7231 also allows an HTTP-date; we do not follow a date). Anything that is
+// not all-digits after stripping whitespace — an HTTP-date, empty, or junk —
+// falls back to the default rather than being mangled into a huge value.
+// Default 2, capped at 10 so a hostile/large value can't stall the whole gate.
+func parseColdRetryAfter(raw string) int {
+	s := strings.Join(strings.Fields(raw), "") // strip all whitespace (mirror shell tr -d)
+	if s == "" {
+		return 2
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 2
+		}
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 2
+	}
+	if n > 10 {
+		n = 10
+	}
+	return n
 }
 
 // --- reachability ----------------------------------------------------------
 
 func waitForHTTP(t *testing.T, host string, want int, timeout time.Duration, why string) {
 	t.Helper()
-	url := "https://" + host + "/health"
+	top, err := tenantTopoFromHost(host)
+	if err != nil {
+		t.Fatalf("%s: tenant topology for %s: %v", why, host, err)
+	}
+	url := top.baseURL + "/health"
 	client := &http.Client{Timeout: 15 * time.Second}
 	deadline := time.Now().Add(timeout)
 	var last int
 	for time.Now().Before(deadline) {
 		req, _ := http.NewRequest("GET", url, nil)
+		// /health carries no CORS Origin today; add only the slug-routing Host
+		// header under ephemeral routing (a no-op on staging → byte-identical).
+		applyTenantHostOnly(req, top)
 		resp, err := client.Do(req)
 		if err == nil {
 			last = resp.StatusCode
@@ -577,6 +1095,65 @@ func waitForHTTP(t *testing.T, host string, want int, timeout time.Duration, why
 		time.Sleep(10 * time.Second)
 	}
 	t.Fatalf("%s: %s never returned HTTP %d within %s (last=%d)", why, url, want, timeout, last)
+}
+
+// waitForTenantRoute gates on a REAL proxied tenant route (not the allowlisted
+// /health) serving a STABLE consecutive-200 streak before the caller asserts
+// against it. The CP publishes instance_status=running on a /health-only canary
+// (controlplane#1012 — internal/provisioner/canary.go probes only /health), so
+// the first proxied API call (e.g. GET /plugins, GET /workspaces) can transiently
+// 502/503 while the app finishes wiring under load. This is a readiness gate, not
+// a retry-until-green mask: a genuinely half-wired tenant never reaches the streak
+// and this fails loudly; the caller's content assertions still run afterwards.
+func waitForTenantRoute(t *testing.T, host, path, token, orgID string, wantStreak int, timeout time.Duration, why string) {
+	t.Helper()
+	top, err := tenantTopoFromHost(host)
+	if err != nil {
+		t.Fatalf("%s: tenant topology for %s: %v", why, host, err)
+	}
+	url := top.baseURL + path
+	client := &http.Client{Timeout: 15 * time.Second}
+	deadline := time.Now().Add(timeout)
+	streak, last := 0, 0
+	for time.Now().Before(deadline) {
+		req, _ := http.NewRequest("GET", url, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("X-Molecule-Org-Id", orgID)
+		applyTenantRouting(req, top)
+		resp, err := client.Do(req)
+		if err == nil {
+			last = resp.StatusCode
+			// 401/403 are definitive auth failures, not a boot-window condition —
+			// fail fast instead of burning the whole deadline and mis-blaming the
+			// provisioner.
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				resp.Body.Close()
+				t.Fatalf("%s: %s returned HTTP %d — an AUTH failure (bad tenant token/org-id), not a readiness/half-wired issue", why, url, resp.StatusCode)
+			}
+			if resp.StatusCode == http.StatusOK {
+				// Reject a 200 whose body is the canvas SPA HTML fallback (route
+				// not registered yet): the assertion this gates needs JSON.
+				body := readBody(resp)
+				resp.Body.Close()
+				trimmed := strings.TrimSpace(body)
+				if len(trimmed) > 0 && trimmed[0] != '<' {
+					streak++
+					if streak >= wantStreak {
+						return
+					}
+					time.Sleep(3 * time.Second)
+					continue
+				}
+				streak = 0
+				time.Sleep(3 * time.Second)
+				continue
+			}
+			resp.Body.Close()
+		}
+		streak = 0
+		time.Sleep(3 * time.Second)
+	}
+	t.Fatalf("%s: %s never served a stable %dx200 JSON within %s (last=%d) — persistent half-wired tenant (controlplane#1012), not a transient boot window", why, url, wantStreak, timeout, last)
 }
 
 // --- HTTP helpers ----------------------------------------------------------
@@ -605,13 +1182,17 @@ func doJSON(t *testing.T, method, url, token, body string) (int, string) {
 // mismatched/absent Origin with 404).
 func doTenantJSON(t *testing.T, method, url, token, orgID, body string) (int, string) {
 	t.Helper()
-	req, err := http.NewRequest(method, url, strings.NewReader(body))
+	rewritten, top, err := tenantTopoFromURL(url)
 	if err != nil {
-		t.Fatalf("build %s %s: %v", method, url, err)
+		t.Fatalf("tenant topology for %s: %v", url, err)
+	}
+	req, err := http.NewRequest(method, rewritten, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build %s %s: %v", method, rewritten, err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-Molecule-Org-Id", orgID)
-	req.Header.Set("Origin", "https://"+strings.SplitN(strings.TrimPrefix(url, "https://"), "/", 2)[0])
+	applyTenantRouting(req, top)
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 90 * time.Second}
 	resp, err := client.Do(req)
@@ -622,18 +1203,9 @@ func doTenantJSON(t *testing.T, method, url, token, orgID, body string) (int, st
 	return resp.StatusCode, readBody(resp)
 }
 
-func readBody(resp *http.Response) string {
-	buf := make([]byte, 0, 4096)
-	tmp := make([]byte, 4096)
-	for {
-		n, e := resp.Body.Read(tmp)
-		buf = append(buf, tmp[:n]...)
-		if e != nil || len(buf) > 1<<20 {
-			break
-		}
-	}
-	return string(buf)
-}
+// (readBody moved to admin_diagnostics.go — the untagged file — so the normal
+// `go test ./...` gate type-checks it and the untagged diagnostic path can
+// share the ONE body reader rather than growing a second copy.)
 
 // jsonField does a flat, dependency-free extraction of a top-level string field
 // value ("key":"value") — sufficient for the id/status/url fields we read.

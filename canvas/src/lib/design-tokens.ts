@@ -5,6 +5,12 @@ export const STATUS_CONFIG: Record<string, { dot: string; glow: string; label: s
   degraded: { dot: "bg-amber-400", glow: "shadow-amber-400/50", label: "Degraded", bar: "from-amber-500/20 to-transparent" },
   failed: { dot: "bg-red-400", glow: "shadow-red-400/50", label: "Failed", bar: "from-red-500/20 to-transparent" },
   provisioning: { dot: "bg-sky-400 motion-safe:animate-pulse", glow: "shadow-sky-400/50", label: "Starting", bar: "from-sky-500/20 to-transparent" },
+  // warming: derived state — the workspace is online and SERVING (status=online),
+  // but its first-boot agent greeting has not landed in chat yet. Distinct from
+  // provisioning (sky, not yet serving): a pulsing emerald says "up and running,
+  // just composing its opening message." Cleared the moment an AGENT_MESSAGE
+  // arrives (greeted) or a short UI timeout elapses (greeting-first UI decouple).
+  warming: { dot: "bg-emerald-400 motion-safe:animate-pulse", glow: "shadow-emerald-400/50", label: "Warming up", bar: "from-emerald-500/20 to-transparent" },
   // not_configured: derived state from agent_card.configuration_status (PR #2756 chain).
   // Workspace is reachable (heartbeating, /agent-card serves) but adapter.setup()
   // failed — typically a missing/rotated LLM credential. Amber to differentiate from

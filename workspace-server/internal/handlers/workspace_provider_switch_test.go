@@ -147,11 +147,11 @@ func TestWorkspaceUpdate_NoProviderSwitch_DoesNotDeprovision(t *testing.T) {
 	}
 }
 
-// 4. Provider READ errors (transient DB fault) → fail-CLOSED: abort 502, no
-//    deprovision, no compute overwrite. A fail-open read (the old `err == nil`
-//    gate) would skip switch detection and overwrite compute → orphan the old
-//    cloud box. sqlmock has NO UPDATE/Stop expectations, so either an overwrite
-//    or a stray deprovision trips it.
+//  4. Provider READ errors (transient DB fault) → fail-CLOSED: abort 502, no
+//     deprovision, no compute overwrite. A fail-open read (the old `err == nil`
+//     gate) would skip switch detection and overwrite compute → orphan the old
+//     cloud box. sqlmock has NO UPDATE/Stop expectations, so either an overwrite
+//     or a stray deprovision trips it.
 func TestWorkspaceUpdate_ProviderSwitch_AbortsOnProviderReadError(t *testing.T) {
 	mock := setupTestDB(t)
 	cp := &scriptedCPStop{}

@@ -35,6 +35,12 @@ import (
 // Same fix as setupTestDB (handlers_test.go); same root cause as mc#975.
 func setupTestDBForQueueTests(t *testing.T) sqlmock.Sqlmock {
 	t.Helper()
+	// Drain stragglers from PRIOR tests before swapping the global db.DB:
+	// a globalGoAsync goroutine still running (e.g. ensureAndArmSchedulerPlugin)
+	// reads db.DB concurrently with this write — the CI -race failure in
+	// TestScheduleHandler_Create_CRLFStripped. Draining first means every
+	// leaked goroutine finishes against the OLD handle.
+	waitGlobalAsyncForTest()
 	mockDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
@@ -220,6 +226,36 @@ func expectQueueBudgetCheck(mock sqlmock.Sqlmock, workspaceID string) {
 		WillReturnRows(sqlmock.NewRows([]string{"budget_limits"}).AddRow([]byte("{}")))
 }
 
+// expectAgentURLResolve mocks the FRESH per-attempt DB URL read that
+// DrainQueueForWorkspace performs after ClearCachedURL evicts the cache
+// (core#124): resolveAgentURL's cache-miss branch runs
+// `SELECT url, status FROM workspaces WHERE id = $1`. Returning a non-empty
+// url + status='online' makes it resolve `url` and reseed the cache, so the
+// proxyA2ARequest that follows dispatches to `url` (the woken workspace's
+// CURRENT container), not a stale cached one. Must be registered right after
+// expectDequeueNextOk and before expectQueueBudgetCheck to match the call
+// order under QueryMatcherEqual.
+func expectAgentURLResolve(mock sqlmock.Sqlmock, wsID, url string) {
+	mock.ExpectQuery(
+		"SELECT url, status FROM workspaces WHERE id = $1").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"url", "status"}).AddRow(url, "online"))
+}
+
+// expectAgentURLResolveSettling mocks the same fresh per-attempt DB URL read, but
+// for a workspace that has NOT reached online yet: url is NULL and status is a
+// recoverable-settling state (provisioning / awaiting_agent). resolveAgentURL then
+// returns a classWorkspaceSettling proxyA2AError (no URL), which
+// DrainQueueForWorkspace must route onto the BOUNDED settling path — NOT through
+// proxyA2ARequest (which would enqueueBusyA2A a fresh unbounded row: the #4531
+// regression). status='provisioning' is one of isRecoverableSettlingStatus's set.
+func expectAgentURLResolveSettling(mock sqlmock.Sqlmock, wsID string) {
+	mock.ExpectQuery(
+		"SELECT url, status FROM workspaces WHERE id = $1").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"url", "status"}).AddRow(nil, "provisioning"))
+}
+
 // seedRedisURL puts the agent server URL into the Redis cache so resolveAgentURL
 // returns it without needing a DB lookup.
 func seedRedisURL(t *testing.T, mr *miniredis.Miniredis, wsID, url string) {
@@ -241,6 +277,10 @@ func drainItem(wsID string) *QueuedItem {
 		Body:        []byte(`{"method":"message/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"hi"}]}}}`),
 		Method:      sql.NullString{String: "message/send", Valid: true},
 		Attempts:    1,
+		// Just-enqueued: well WITHIN a2aSettlingRetryCeiling, so the transient
+		// gateway-origin path stays eligible (the ceiling drop is exercised by
+		// TestDrainQueueForWorkspace_SettlingCeilingExceeded_Drops with an aged item).
+		EnqueuedAt: time.Now(),
 	}
 }
 
@@ -255,13 +295,13 @@ func drainItem(wsID string) *QueuedItem {
 func expectDequeueNextOk(mock sqlmock.Sqlmock, item *QueuedItem) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(
-		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
+		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts, enqueued_at, settling_since FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
 		WithArgs(item.WorkspaceID).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "workspace_id", "caller_id", "priority", "body", "method", "attempts",
+			"id", "workspace_id", "caller_id", "priority", "body", "method", "attempts", "enqueued_at", "settling_since",
 		}).AddRow(
 			item.ID, item.WorkspaceID, item.CallerID, item.Priority,
-			string(item.Body), item.Method, item.Attempts,
+			string(item.Body), item.Method, item.Attempts, item.EnqueuedAt, item.SettlingSince,
 		))
 	mock.ExpectExec(
 		"UPDATE a2a_queue SET status = 'dispatched', dispatched_at = now(), attempts = attempts + 1 WHERE id = $1").
@@ -275,7 +315,7 @@ func expectDequeueNextOk(mock sqlmock.Sqlmock, item *QueuedItem) {
 func expectDequeueNextEmpty(mock sqlmock.Sqlmock, wsID string) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(
-		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
+		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts, enqueued_at, settling_since FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
 		WithArgs(wsID).
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectRollback()
@@ -289,12 +329,17 @@ func expectCompleted(mock sqlmock.Sqlmock, id string, respBody interface{}) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
-// expectFailed sets up mock for MarkQueueItemFailed with a specific error message.
+// expectFailed sets up mock for MarkQueueItemFailed with a specific error
+// message. MarkQueueItemFailed now reads the resulting status back (RETURNING
+// status) so the drain can fire the never-silent first-boot fallback only on the
+// genuinely-terminal 'failed' transition — hence ExpectQuery, not ExpectExec.
+// Returns 'queued' (the non-terminal re-queue) so the drain's fallback branch
+// does NOT fire for the non-greet items these existing tests exercise.
 func expectFailed(mock sqlmock.Sqlmock, id string, errMsg string) {
-	mock.ExpectExec(
-		"UPDATE a2a_queue SET status = CASE WHEN attempts >= $2 THEN 'failed' ELSE 'queued' END, last_error = $3, dispatched_at = NULL WHERE id = $1").
+	mock.ExpectQuery(
+		"UPDATE a2a_queue SET status = CASE WHEN attempts >= $2 THEN 'failed' ELSE 'queued' END, last_error = $3, dispatched_at = NULL WHERE id = $1 RETURNING status").
 		WithArgs(id, 5, errMsg).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("queued"))
 }
 
 // expectTransientRetry sets up mock for MarkQueueItemTransientRetry. The
@@ -310,8 +355,17 @@ func expectFailed(mock sqlmock.Sqlmock, id string, errMsg string) {
 // flagged the literal form as having an unused sibling const.
 func expectTransientRetry(mock sqlmock.Sqlmock, id string, errMsg sqlmock.Argument) {
 	mock.ExpectExec(
-		"UPDATE a2a_queue SET status = 'queued', attempts = GREATEST(attempts - 1, 0), last_error = $2, dispatched_at = NULL, next_attempt_at = now() + make_interval(secs => $3) WHERE id = $1").
+		"UPDATE a2a_queue SET status = 'queued', attempts = GREATEST(attempts - 1, 0), last_error = $2, dispatched_at = NULL, next_attempt_at = now() + make_interval(secs => $3), settling_since = COALESCE(settling_since, now()) WHERE id = $1").
 		WithArgs(id, errMsg, transientRetryBackoffSecs).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+// expectSettlingCeilingDrop mocks DropQueueItemTerminal — the terminal drop taken
+// when a transient gateway-origin failure has persisted past a2aSettlingRetryCeiling.
+func expectSettlingCeilingDrop(mock sqlmock.Sqlmock, id string, reason sqlmock.Argument) {
+	mock.ExpectExec(
+		"UPDATE a2a_queue SET status = 'dropped', last_error = $2, dispatched_at = NULL, completed_at = now() WHERE id = $1 AND status = 'dispatched'").
+		WithArgs(id, reason).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
@@ -366,11 +420,12 @@ func agentServer(body string, status int) *httptest.Server {
 func TestDrainQueueForWorkspace_Success_Completes(t *testing.T) {
 	item := drainItem("ws-ok")
 	mock, handler, mr := drainSetup(t, item.WorkspaceID)
-	expectDequeueNextOk(mock, item)
-	expectQueueBudgetCheck(mock, item.WorkspaceID)
-
 	srv := agentServer(`{"result":{"status":"ok"}}`, http.StatusOK)
 	defer srv.Close()
+	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
+	expectQueueBudgetCheck(mock, item.WorkspaceID)
+
 	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
 
 	expectCompleted(mock, item.ID, `{"result":{"status":"ok"}}`)
@@ -392,15 +447,19 @@ func TestDrainQueueForWorkspace_BatchCapacity_DrainsMultiple(t *testing.T) {
 	item2.ID = "qid-batch-2"
 
 	mock, handler, mr := drainSetup(t, wsID)
+	srv := agentServer(`{"result":{"status":"ok"}}`, http.StatusOK)
+	defer srv.Close()
 	expectDequeueNextOk(mock, item1)
+	// #4531/finding [8]: the agent URL is resolved ONCE per drain call (lazily, on
+	// the first dequeued item), not per-iteration — so only ONE expectAgentURLResolve
+	// is registered even though two items are dispatched.
+	expectAgentURLResolve(mock, wsID, srv.URL)
 	expectQueueBudgetCheck(mock, wsID)
 	expectCompleted(mock, item1.ID, `{"result":{"status":"ok"}}`)
 	expectDequeueNextOk(mock, item2)
 	expectQueueBudgetCheck(mock, wsID)
 	expectCompleted(mock, item2.ID, `{"result":{"status":"ok"}}`)
 
-	srv := agentServer(`{"result":{"status":"ok"}}`, http.StatusOK)
-	defer srv.Close()
 	seedRedisURL(t, mr, wsID, srv.URL)
 
 	handler.DrainQueueForWorkspace(context.Background(), wsID, 2)
@@ -416,11 +475,12 @@ func TestDrainQueueForWorkspace_BatchCapacity_DrainsMultiple(t *testing.T) {
 func TestDrainQueueForWorkspace_202Accepted_CompletesNotFailed(t *testing.T) {
 	item := drainItem("ws-202")
 	mock, handler, mr := drainSetup(t, item.WorkspaceID)
-	expectDequeueNextOk(mock, item)
-	expectQueueBudgetCheck(mock, item.WorkspaceID)
-
 	srv := agentServer(`{"status":"queued"}`, http.StatusAccepted)
 	defer srv.Close()
+	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
+	expectQueueBudgetCheck(mock, item.WorkspaceID)
+
 	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
 
 	expectCompleted(mock, item.ID, nil)
@@ -437,13 +497,14 @@ func TestDrainQueueForWorkspace_202Accepted_CompletesNotFailed(t *testing.T) {
 func TestDrainQueueForWorkspace_ProxyErrResponseNil_NoPanic(t *testing.T) {
 	item := drainItem("ws-nilresp")
 	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	srv := agentServer("", http.StatusBadGateway)
+	defer srv.Close()
 	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
 	expectQueueBudgetCheck(mock, item.WorkspaceID)
 	expectRuntimeLookup(mock, item.WorkspaceID)
 	expectRecentHeartbeatAbsent(mock, item.WorkspaceID)
 
-	srv := agentServer("", http.StatusBadGateway)
-	defer srv.Close()
 	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
 
 	expectFailed(mock, item.ID, "Bad Gateway")
@@ -460,7 +521,10 @@ func TestDrainQueueForWorkspace_ProxyErrResponseNil_NoPanic(t *testing.T) {
 func TestDrainQueueForWorkspace_ProxyErrMissingErrorKey_UsesStatusText(t *testing.T) {
 	item := drainItem("ws-missingkey")
 	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	srv := agentServer(`{"code":500,"detail":"internal server error"}`, http.StatusInternalServerError)
+	defer srv.Close()
 	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
 	expectQueueBudgetCheck(mock, item.WorkspaceID)
 	expectRuntimeLookup(mock, item.WorkspaceID)
 	// 500 is NOT in isUpstreamDeadStatus so isGatewayOriginFailure returns
@@ -468,8 +532,6 @@ func TestDrainQueueForWorkspace_ProxyErrMissingErrorKey_UsesStatusText(t *testin
 	// for the transient-retry path. Falls through to MarkQueueItemFailed
 	// (the pre-fix behaviour for non-gateway failures).
 
-	srv := agentServer(`{"code":500,"detail":"internal server error"}`, http.StatusInternalServerError)
-	defer srv.Close()
 	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
 
 	expectFailed(mock, item.ID, "Internal Server Error")
@@ -486,13 +548,14 @@ func TestDrainQueueForWorkspace_ProxyErrMissingErrorKey_UsesStatusText(t *testin
 func TestDrainQueueForWorkspace_ProxyErrNonStringError_NoPanic(t *testing.T) {
 	item := drainItem("ws-nonstr")
 	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	srv := agentServer(`{"error": 429}`, http.StatusServiceUnavailable)
+	defer srv.Close()
 	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
 	expectQueueBudgetCheck(mock, item.WorkspaceID)
 	expectRuntimeLookup(mock, item.WorkspaceID)
 	expectRecentHeartbeatAbsent(mock, item.WorkspaceID)
 
-	srv := agentServer(`{"error": 429}`, http.StatusServiceUnavailable)
-	defer srv.Close()
 	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
 
 	expectFailed(mock, item.ID, "Service Unavailable")
@@ -509,14 +572,15 @@ func TestDrainQueueForWorkspace_ProxyErrNonStringError_NoPanic(t *testing.T) {
 func TestDrainQueueForWorkspace_ProxyErrWithStringError_UsesErrorMessage(t *testing.T) {
 	item := drainItem("ws-str-err")
 	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	wantErrMsg := "upstream agent crashed with signal: killed"
+	srv := agentServer(fmt.Sprintf(`{"error":%q}`, wantErrMsg), http.StatusBadGateway)
+	defer srv.Close()
 	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
 	expectQueueBudgetCheck(mock, item.WorkspaceID)
 	expectRuntimeLookup(mock, item.WorkspaceID)
 	expectRecentHeartbeatAbsent(mock, item.WorkspaceID)
 
-	wantErrMsg := "upstream agent crashed with signal: killed"
-	srv := agentServer(fmt.Sprintf(`{"error":%q}`, wantErrMsg), http.StatusBadGateway)
-	defer srv.Close()
 	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
 
 	expectFailed(mock, item.ID, wantErrMsg)
@@ -549,7 +613,7 @@ func TestDrainQueueForWorkspace_DequeueError_LogsAndReturns(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(
-		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
+		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts, enqueued_at, settling_since FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
 		WithArgs("ws-dequeue-err").
 		WillReturnError(sql.ErrConnDone)
 	mock.ExpectRollback()
@@ -574,7 +638,10 @@ func TestDrainQueueForWorkspace_MaxAttempts_FailsRatherThanRetries(t *testing.T)
 		Attempts:    5, // already at max
 	}
 	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	srv := agentServer(`{"error":"agent unreachable"}`, http.StatusBadGateway)
+	defer srv.Close()
 	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
 	expectQueueBudgetCheck(mock, item.WorkspaceID)
 	expectRuntimeLookup(mock, item.WorkspaceID)
 	// No recent heartbeat → falls through to MarkQueueItemFailed (not the
@@ -582,8 +649,6 @@ func TestDrainQueueForWorkspace_MaxAttempts_FailsRatherThanRetries(t *testing.T)
 	// unreachable workspaces: the 5-attempt cap still fires after 5 retries.
 	expectRecentHeartbeatAbsent(mock, item.WorkspaceID)
 
-	srv := agentServer(`{"error":"agent unreachable"}`, http.StatusBadGateway)
-	defer srv.Close()
 	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
 
 	expectFailed(mock, item.ID, "agent unreachable")
@@ -606,11 +671,12 @@ func TestDrainQueueForWorkspace_ClaimGuarding_SecondDrainGetsEmpty(t *testing.T)
 	mock, handler, mr := drainSetup(t, wsID)
 
 	// Drain 1: claims item, proxies successfully, marks completed.
-	expectDequeueNextOk(mock, item)
-	expectQueueBudgetCheck(mock, wsID)
-
 	srv := agentServer(`{"result":{}}`, http.StatusOK)
 	defer srv.Close()
+	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, wsID, srv.URL)
+	expectQueueBudgetCheck(mock, wsID)
+
 	seedRedisURL(t, mr, wsID, srv.URL)
 	expectCompleted(mock, item.ID, `{"result":{}}`)
 
@@ -653,18 +719,19 @@ func TestDrainQueueForWorkspace_ClaimGuarding_SecondDrainGetsEmpty(t *testing.T)
 func TestDrainQueueForWorkspace_TransientGatewayFailure_StaysQueued(t *testing.T) {
 	item := drainItem("ws-gateway-blip")
 	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	// Cloudflare 502 error page — empty body, no JSON. This is the
+	// shape that triggered the RCA: a healthy workspace's A2A forward
+	// hits a CDN tunnel blip and returns 502 with an HTML body.
+	srv := agentServer(`<html>cloudflare error</html>`, http.StatusBadGateway)
+	defer srv.Close()
 	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
 	expectQueueBudgetCheck(mock, item.WorkspaceID)
 	expectRuntimeLookup(mock, item.WorkspaceID)
 	// Recent heartbeat: the workspace is alive; the failure is in the
 	// path between us and the agent, not the agent itself.
 	expectRecentHeartbeatPresent(mock, item.WorkspaceID)
 
-	// Cloudflare 502 error page — empty body, no JSON. This is the
-	// shape that triggered the RCA: a healthy workspace's A2A forward
-	// hits a CDN tunnel blip and returns 502 with an HTML body.
-	srv := agentServer(`<html>cloudflare error</html>`, http.StatusBadGateway)
-	defer srv.Close()
 	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
 
 	// Expect MarkQueueItemTransientRetry (NOT MarkQueueItemFailed). The
@@ -691,14 +758,15 @@ func TestDrainQueueForWorkspace_TransientGatewayFailure_StaysQueued(t *testing.T
 func TestDrainQueueForWorkspace_TransientGatewayFailure_InvalidatesCachedURL(t *testing.T) {
 	item := drainItem("ws-invalidate")
 	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	srv := agentServer("", http.StatusBadGateway)
+	defer srv.Close()
 	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
 	expectQueueBudgetCheck(mock, item.WorkspaceID)
 	expectRuntimeLookup(mock, item.WorkspaceID)
 	expectRecentHeartbeatPresent(mock, item.WorkspaceID)
 	expectTransientRetry(mock, item.ID, sqlmock.AnyArg())
 
-	srv := agentServer("", http.StatusBadGateway)
-	defer srv.Close()
 	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
 
 	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
@@ -714,6 +782,89 @@ func TestDrainQueueForWorkspace_TransientGatewayFailure_InvalidatesCachedURL(t *
 	}
 }
 
+// TestDrainQueueForWorkspace_SettlingCeilingExceeded_Drops is the negative
+// control to TestDrainQueueForWorkspace_TransientGatewayFailure_StaysQueued:
+// SAME inputs (online workspace, recent heartbeat, transient 502 gateway-origin
+// failure) EXCEPT the item was enqueued longer ago than a2aSettlingRetryCeiling.
+// The transient path is NON-cap-burning and would otherwise re-queue forever,
+// poking the runtime on every attempt and starving idle-gated work (the RCA of
+// the flaky ephemeral happy-path gate — task #124/#94). Past the ceiling the
+// drain must TERMINALLY DROP the item (DropQueueItemTerminal), NOT re-queue it,
+// AND invalidate the (stale/dead) cached URL so the remaining queued items of
+// this workspace in the same drain re-resolve instead of hammering it (#4459
+// re-review [3]).
+func TestDrainQueueForWorkspace_SettlingCeilingExceeded_Drops(t *testing.T) {
+	item := drainItem("ws-settling-zombie")
+	// SETTLING (not merely enqueued) well past the ceiling: the item's first
+	// gateway-origin failure was long ago, so it has been actively settling-retrying
+	// far longer than any real blip explains. (enqueued_at alone must NOT trigger the
+	// drop — see TestDrainQueueForWorkspace_LongQueuedNotDroppedOnFirstBlip.)
+	item.SettlingSince = sql.NullTime{Time: time.Now().Add(-(a2aSettlingRetryCeiling + time.Minute)), Valid: true}
+	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	// Same 502 gateway-origin shape as the transient-retry test.
+	srv := agentServer(`<html>cloudflare error</html>`, http.StatusBadGateway)
+	defer srv.Close()
+	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
+	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	expectRecentHeartbeatPresent(mock, item.WorkspaceID)
+
+	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
+
+	// Expect the TERMINAL drop, NOT a transient re-queue. If the ceiling check
+	// were absent the drain would call MarkQueueItemTransientRetry instead and
+	// this expectation would go unmet (proving the branch).
+	expectSettlingCeilingDrop(mock, item.ID, sqlmock.AnyArg())
+
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+
+	// The cached URL must be INVALIDATED on the drop path (#4459 re-review [3]):
+	// the stale/dead URL is what caused the drop, so the remaining queued items of
+	// this workspace must re-resolve rather than all hitting it again.
+	if got, err := mr.Get(fmt.Sprintf("ws:%s:url", item.WorkspaceID)); err == nil && got != "" {
+		t.Errorf("cached URL survived the ceiling-drop path; want it invalidated (got=%q)", got)
+	}
+}
+
+// TestDrainQueueForWorkspace_LongQueuedNotDroppedOnFirstBlip is the negative
+// control for the #4459 re-review data-loss fix [0]: an item that merely sat
+// QUEUED a long time (enqueued_at old — e.g. its target was offline) but whose
+// settling_since is still NULL (this is its FIRST gateway-origin failure) must NOT
+// be dropped on that first blip. It must go to the transient-retry path (which
+// STAMPS settling_since), so the target — now alive and about to accept — is given
+// the full settling window. Dropping here is the silent data-loss the fix closes.
+func TestDrainQueueForWorkspace_LongQueuedNotDroppedOnFirstBlip(t *testing.T) {
+	item := drainItem("ws-long-queued")
+	item.EnqueuedAt = time.Now().Add(-(a2aSettlingRetryCeiling + 10*time.Minute)) // ancient
+	item.SettlingSince = sql.NullTime{Valid: false}                               // but never settled yet
+	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	srv := agentServer(`<html>cloudflare error</html>`, http.StatusBadGateway)
+	defer srv.Close()
+	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
+	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	expectRecentHeartbeatPresent(mock, item.WorkspaceID)
+
+	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
+
+	// MUST transient-retry (which stamps settling_since), NOT drop. If the ceiling
+	// still measured from enqueued_at, this would be a DropQueueItemTerminal and this
+	// expectation would go unmet — the exact data-loss regression.
+	expectTransientRetry(mock, item.ID, sqlmock.AnyArg())
+
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations (long-queued item was dropped on first blip instead of retried): %v", err)
+	}
+}
+
 // TestDrainQueueForWorkspace_GatewayFailure_NoRecentHeartbeat_StillFails:
 // the heartbeat gate is the load-bearing part of the new path. If the
 // workspace is NOT heartbeating, a 502 stays a dead-agent failure —
@@ -723,14 +874,15 @@ func TestDrainQueueForWorkspace_TransientGatewayFailure_InvalidatesCachedURL(t *
 func TestDrainQueueForWorkspace_GatewayFailure_NoRecentHeartbeat_StillFails(t *testing.T) {
 	item := drainItem("ws-no-hb")
 	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	srv := agentServer("", http.StatusBadGateway)
+	defer srv.Close()
 	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
 	expectQueueBudgetCheck(mock, item.WorkspaceID)
 	expectRuntimeLookup(mock, item.WorkspaceID)
 	expectRecentHeartbeatAbsent(mock, item.WorkspaceID)
 	expectFailed(mock, item.ID, "Bad Gateway")
 
-	srv := agentServer("", http.StatusBadGateway)
-	defer srv.Close()
 	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
 
 	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
@@ -803,17 +955,18 @@ func TestDrainQueueForWorkspace_UpstreamDead_BypassesTransientPath(t *testing.T)
 func TestDrainQueueForWorkspace_TransientRetry_BackoffBreaksCapacityLoop(t *testing.T) {
 	item := drainItem("ws-capacity-loop")
 	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	srv := agentServer("", http.StatusBadGateway)
+	defer srv.Close()
 
 	// Iteration 1 of the for-loop (capacity=2): the only queued row is
 	// claimed, dispatched, and hits a transient 502. Recent heartbeat
 	// keeps the transient-retry path eligible.
 	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
 	expectQueueBudgetCheck(mock, item.WorkspaceID)
 	expectRuntimeLookup(mock, item.WorkspaceID)
 	expectRecentHeartbeatPresent(mock, item.WorkspaceID)
 
-	srv := agentServer("", http.StatusBadGateway)
-	defer srv.Close()
 	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
 
 	expectTransientRetry(mock, item.ID, sqlmock.AnyArg())
@@ -831,6 +984,161 @@ func TestDrainQueueForWorkspace_TransientRetry_BackoffBreaksCapacityLoop(t *test
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestDrainQueueForWorkspace_FreshResolve_UsesNewURLNotStaleCache is the
+// regression test for core#124 (ephemeral-gate run 815192): after a
+// force-hibernate→wake re-provisions a NEW container, a QUEUED A2A turn must be
+// dispatched to the woken workspace's CURRENT container URL, resolved FRESH from
+// the DB at drain time — NOT the stale pre-hibernate URL that lingers in the
+// Redis cache for up to its 5-minute TTL. Before the fix, the drain trusted the
+// cache and dialled the dead pre-hibernate host ("dial tcp: lookup <old>: no
+// such host"), stranding the turn forever.
+//
+// Two agent servers stand in for the two containers: `stale` is the dead
+// pre-hibernate box whose URL is (wrongly) still cached; `fresh` is the woken
+// box whose NEW URL the DB now reports. The negative control is load-bearing:
+// we FIRST assert the cache-first resolve (the pre-fix code path) returns the
+// STALE URL, then prove the drain dispatches to `fresh` and NEVER touches
+// `stale`. A regression that reinstated cache-first dispatch would hit `stale`
+// (staleHits==1) and leave the completed body mismatched — this test fails on
+// all three of: staleHits, freshHits, and the expectCompleted body match.
+func TestDrainQueueForWorkspace_FreshResolve_UsesNewURLNotStaleCache(t *testing.T) {
+	item := drainItem("ws-woke-newurl")
+	wsID := item.WorkspaceID
+	mock, handler, mr := drainSetup(t, wsID)
+
+	var staleHits, freshHits int32
+	stale := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&staleHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"result":{"from":"STALE-dead-container"}}`)
+	}))
+	defer stale.Close()
+	fresh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&freshHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"result":{"from":"FRESH-woken-container"}}`)
+	}))
+	defer fresh.Close()
+
+	// The stale pre-hibernate URL is still cached in Redis (survived the 5-min
+	// TTL after the force-hibernate→wake replaced the container).
+	seedRedisURL(t, mr, wsID, stale.URL)
+
+	// NEGATIVE CONTROL: the cache-first resolve — exactly what the drain used to
+	// do — returns the STALE url. This proves the cache is genuinely poisoned, so
+	// "fresh dispatches to `fresh`" below is a real behavioural difference and not
+	// an artefact of an empty cache.
+	if got, perr := handler.resolveAgentURL(context.Background(), wsID); perr != nil || got != stale.URL {
+		t.Fatalf("negative-control precondition: cache-first resolveAgentURL = (%q, %v), want (%q, nil) — "+
+			"the stale URL must be cached so the drain's fresh-resolve has something to override", got, perr, stale.URL)
+	}
+
+	// The woken container registered its NEW url in the DB; the fresh per-attempt
+	// DB read the drain now performs returns it.
+	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, wsID, fresh.URL)
+	expectQueueBudgetCheck(mock, wsID)
+	expectCompleted(mock, item.ID, `{"result":{"from":"FRESH-woken-container"}}`)
+
+	handler.DrainQueueForWorkspace(context.Background(), wsID, 1)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+	if got := atomic.LoadInt32(&freshHits); got != 1 {
+		t.Errorf("drain must dispatch to the FRESH (woken) container: fresh got %d request(s), want 1", got)
+	}
+	if got := atomic.LoadInt32(&staleHits); got != 0 {
+		t.Errorf("drain dialled the STALE (dead pre-hibernate) cached URL: stale got %d request(s), want 0 — "+
+			"the fresh per-attempt DB resolve must override the poisoned cache (core#124)", got)
+	}
+	// The fresh resolve reseeded the cache with the DB truth, so subsequent
+	// resolves (and the proxyA2ARequest that just ran) use the NEW url.
+	if got, err := mr.Get(fmt.Sprintf("ws:%s:url", wsID)); err != nil || got != fresh.URL {
+		t.Errorf("cache was not corrected to the fresh URL after drain: got=(%q, %v), want %q", got, err, fresh.URL)
+	}
+}
+
+// TestDrainQueueForWorkspace_SettlingWorkspace_BoundedRetryNotFreshEnqueue is the
+// regression test for the #4531 unbounded-requeue bug. A workspace stuck
+// provisioning/awaiting_agent (URL-less → resolveAgentURL returns
+// classWorkspaceSettling) had its queued turn routed through proxyA2ARequest, whose
+// classWorkspaceSettling branch enqueueBusyA2A's a FRESH a2a_queue row every drain
+// (attempts=0, settling_since=NULL, enqueued_at=now()) and then MarkQueueItemCompleted's
+// the original — so the #4459 settling ceiling AND DropStaleQueueItems could never
+// fire and the turn zombie-requeued forever.
+//
+// The fix keeps the SAME row on the bounded settling path: MarkQueueItemTransientRetry,
+// which COALESCE-stamps settling_since and preserves attempts (idempotent requeue, no
+// fresh INSERT). This test pins that: a settling workspace's dequeued item is
+// transient-retried and NO proxyA2ARequest / EnqueueA2A INSERT happens.
+//
+// NEGATIVE CONTROL (proven against the pre-fix unconditional-clear code): the ONLY
+// mocks registered after the settling resolve are for MarkQueueItemTransientRetry.
+// The pre-fix code instead calls proxyA2ARequest, whose first DB touch
+// (checkWorkspaceBudget's `SELECT COALESCE(budget_limits ...)`) is unmocked and
+// whose enqueue path issues a fresh EnqueueA2A INSERT — none of which match the
+// registered transient-retry UPDATE, so ExpectationsWereMet reports the
+// transient-retry expectation as UNMET and the test fails. Only the conditional-
+// settling fix makes it pass.
+func TestDrainQueueForWorkspace_SettlingWorkspace_BoundedRetryNotFreshEnqueue(t *testing.T) {
+	item := drainItem("ws-provisioning-settle")
+	// First settling observation: settling_since is still NULL (well within the
+	// ceiling), so the bounded path transient-retries (which STAMPS settling_since)
+	// rather than dropping.
+	item.SettlingSince = sql.NullTime{Valid: false}
+	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+
+	expectDequeueNextOk(mock, item)
+	expectAgentURLResolveSettling(mock, item.WorkspaceID)
+	// The bounded path calls MarkQueueItemTransientRetry directly — no proxyA2ARequest,
+	// no budget check, no fresh EnqueueA2A INSERT. The transient-retry SQL COALESCEs
+	// settling_since and undoes DequeueNext's attempts++ (attempts preserved).
+	expectTransientRetry(mock, item.ID, sqlmock.AnyArg())
+
+	// No cached URL: a provisioning workspace has none. ClearCachedURL over an empty
+	// key is a no-op; the DB resolve returns NULL url → classWorkspaceSettling.
+	_ = mr
+
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations (settling workspace was NOT kept on the bounded "+
+			"transient-retry path — likely dispatched through proxyA2ARequest and fresh-enqueued, "+
+			"re-opening #4531): %v", err)
+	}
+}
+
+// TestDrainQueueForWorkspace_SettlingWorkspace_CeilingExceeded_Drops is the twin of
+// the online settling-ceiling drop, on the URL-less/provisioning path. Same inputs
+// as the bounded-retry test EXCEPT settling_since is older than a2aSettlingRetryCeiling:
+// the target has stayed URL-less far past any normal wake/provision window. The bounded
+// path must TERMINALLY DROP the item (DropQueueItemTerminal), NOT transient-retry it,
+// so a provisioning box that never comes online cannot zombie-requeue the turn forever.
+//
+// NEGATIVE CONTROL: only DropQueueItemTerminal is registered after the resolve. If the
+// ceiling branch were absent, the code would MarkQueueItemTransientRetry instead (unmet
+// drop expectation → fail); the pre-#4531-fix code would call proxyA2ARequest (unmet
+// drop expectation → fail).
+func TestDrainQueueForWorkspace_SettlingWorkspace_CeilingExceeded_Drops(t *testing.T) {
+	item := drainItem("ws-provisioning-zombie")
+	item.SettlingSince = sql.NullTime{Time: time.Now().Add(-(a2aSettlingRetryCeiling + time.Minute)), Valid: true}
+	mock, handler, _ := drainSetup(t, item.WorkspaceID)
+
+	expectDequeueNextOk(mock, item)
+	expectAgentURLResolveSettling(mock, item.WorkspaceID)
+	expectSettlingCeilingDrop(mock, item.ID, sqlmock.AnyArg())
+
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations (settling item past the ceiling was NOT terminally "+
+			"dropped on the URL-less path): %v", err)
 	}
 }
 
@@ -986,6 +1294,7 @@ func TestDrainQueueForWorkspace_RestartContextInFlight_DefersDrain(t *testing.T)
 	// it exists to catch. A drainable queue is what makes "0 hits" mean the GUARD
 	// stopped it, not an incidental DB error.
 	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
 	expectQueueBudgetCheck(mock, item.WorkspaceID)
 	expectCompleted(mock, item.ID, `{"result":{"status":"ok"}}`)
 
@@ -1042,5 +1351,163 @@ func TestSendRestartContext_ClearsPendingGate(t *testing.T) {
 	if restartContextInFlight(wsID) {
 		t.Error("restart-context gate LEAKED after sendRestartContext returned — this workspace's " +
 			"A2A queue would never drain again")
+	}
+}
+
+// ==================== rule-1 finding #1: never-silent terminal drop, driven END-TO-END through DrainQueueForWorkspace ====================
+//
+// The direct-call tests (first_boot_greeting_test.go) pin
+// deliverFirstBootFallbackOnTerminalDrop in isolation. These drive the SAME
+// guarantee through the real drain loop: a busy-queued self-first-boot-greet
+// item whose dispatch terminally fails/drops must land the static fallback via
+// the claim-on-delivery seam exactly once, while a NON-terminal re-queue must
+// deliver nothing (the fresh chat only gets the fallback when the real reply is
+// genuinely gone).
+
+// greetQueueItem builds a QueuedItem whose Body is a real self-first-boot-greet
+// payload (source_type=self-first-boot-greet, toolCount stamped) — the shape
+// DrainQueueForWorkspace hands to deliverFirstBootFallbackOnTerminalDrop.
+func greetQueueItem(t *testing.T, wsID string, toolCount int) *QueuedItem {
+	t.Helper()
+	body, err := buildFirstBootGreetPayload(wsID, toolCount)
+	if err != nil {
+		t.Fatalf("buildFirstBootGreetPayload: %v", err)
+	}
+	return &QueuedItem{
+		ID:          "qid-greet-001",
+		WorkspaceID: wsID,
+		CallerID:    sql.NullString{Valid: false}, // canvas/system path — no CanCommunicate check
+		Priority:    PriorityTask,
+		Body:        body,
+		Method:      sql.NullString{String: "message/send", Valid: true},
+		Attempts:    5, // at the cap — the realistic shape for the terminal 'failed' transition
+		EnqueuedAt:  time.Now(),
+	}
+}
+
+// expectMarkFailedStatus pins MarkQueueItemFailed's RETURNING-status read to a
+// specific resulting status ('failed' = terminal, 'queued' = non-terminal
+// re-queue). QueryMatcherEqual → exact SQL.
+func expectMarkFailedStatus(mock sqlmock.Sqlmock, id, errMsg, status string) {
+	mock.ExpectQuery(
+		"UPDATE a2a_queue SET status = CASE WHEN attempts >= $2 THEN 'failed' ELSE 'queued' END, last_error = $3, dispatched_at = NULL WHERE id = $1 RETURNING status").
+		WithArgs(id, 5, errMsg).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow(status))
+}
+
+// expectGreetClaimWonEq / expectGreetWriterSendEq pin the claim-on-delivery seam
+// the never-silent fallback drives (exact-SQL twins of the regex helpers in
+// first_boot_greeting_test.go, for the QueryMatcherEqual drain mock). A claim that
+// flips one row + a writer lookup(true) + INSERT proves the fallback was delivered
+// exactly once.
+func expectGreetClaimWonEq(mock sqlmock.Sqlmock, wsID string) {
+	mock.ExpectExec("UPDATE workspaces SET has_greeted = true WHERE id = $1 AND has_greeted = false").
+		WithArgs(wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+func expectGreetWriterSendEq(mock sqlmock.Sqlmock, wsID string) {
+	mock.ExpectQuery("SELECT name, talk_to_user_enabled FROM workspaces WHERE id = $1 AND status != 'removed'").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "talk_to_user_enabled"}).AddRow("Concierge", true))
+	mock.ExpectExec("INSERT INTO activity_logs (workspace_id, activity_type, method, summary, response_body, status) VALUES ($1, 'a2a_receive', 'notify', $2, $3::jsonb, 'ok')").
+		WithArgs(wsID, sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+}
+
+// TestDrainQueueForWorkspace_FirstBootGreet_TerminalFailDeliversFallback: a
+// self-first-boot-greet item whose dispatch fails and hits the 5-attempt cap
+// (MarkQueueItemFailed RETURNING 'failed') must deliver the static fallback via
+// the claim seam — the real greeting reply is gone and the sync greet path already
+// returned, so without this the fresh chat opens silent.
+func TestDrainQueueForWorkspace_FirstBootGreet_TerminalFailDeliversFallback(t *testing.T) {
+	item := greetQueueItem(t, "ws-greet-terminal", 45)
+	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	srv := agentServer(`{"error":"agent unreachable"}`, http.StatusBadGateway)
+	defer srv.Close()
+
+	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
+	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	// No recent heartbeat → 502 is treated as a dead-agent failure and routes
+	// through MarkQueueItemFailed (not the non-cap-burning transient retry).
+	expectRecentHeartbeatAbsent(mock, item.WorkspaceID)
+	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
+
+	// The cap is hit → 'failed' (terminal) → the never-silent fallback fires.
+	expectMarkFailedStatus(mock, item.ID, "agent unreachable", "failed")
+	expectGreetClaimWonEq(mock, item.WorkspaceID)
+	expectGreetWriterSendEq(mock, item.WorkspaceID)
+
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+	handler.asyncWG.Wait() // the fallback delivery runs on goAsync
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("terminal-fail fallback not delivered via the claim seam exactly once: %v", err)
+	}
+}
+
+// TestDrainQueueForWorkspace_FirstBootGreet_RequeueDoesNotDeliver is the negative
+// control: a self-first-boot-greet dispatch that fails but is RE-QUEUED
+// (MarkQueueItemFailed RETURNING 'queued', terminal=false) must NOT deliver the
+// fallback — the real greeting reply is still coming on the next drain, so firing
+// the static fallback now would double-greet. No claim, no writer, no delivery.
+func TestDrainQueueForWorkspace_FirstBootGreet_RequeueDoesNotDeliver(t *testing.T) {
+	item := greetQueueItem(t, "ws-greet-requeue", 45)
+	item.Attempts = 1 // below the cap
+	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	srv := agentServer(`{"error":"agent unreachable"}`, http.StatusBadGateway)
+	defer srv.Close()
+
+	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
+	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	expectRecentHeartbeatAbsent(mock, item.WorkspaceID)
+	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
+
+	// Non-terminal re-queue → the drain must NOT invoke the fallback seam. If it
+	// did, the unexpected claim/writer queries would fail ExpectationsWereMet.
+	expectMarkFailedStatus(mock, item.ID, "agent unreachable", "queued")
+
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+	handler.asyncWG.Wait()
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("re-queue must not deliver a fallback (no extra claim/writer queries expected): %v", err)
+	}
+}
+
+// TestDrainQueueForWorkspace_FirstBootGreet_SettlingCeilingDropDeliversFallback:
+// the OTHER terminal path — a self-first-boot-greet item that has been settling
+// past a2aSettlingRetryCeiling is DropQueueItemTerminal'd (not re-queued), and the
+// never-silent fallback must fire there too.
+func TestDrainQueueForWorkspace_FirstBootGreet_SettlingCeilingDropDeliversFallback(t *testing.T) {
+	item := greetQueueItem(t, "ws-greet-ceiling", 45)
+	// Settling far past the ceiling: the ceiling-drop branch (not transient retry).
+	item.SettlingSince = sql.NullTime{Time: time.Now().Add(-(a2aSettlingRetryCeiling + time.Minute)), Valid: true}
+	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	srv := agentServer(`<html>cloudflare error</html>`, http.StatusBadGateway)
+	defer srv.Close()
+
+	expectDequeueNextOk(mock, item)
+	expectAgentURLResolve(mock, item.WorkspaceID, srv.URL)
+	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	// Recent heartbeat → transient-gateway path is eligible, but the aged
+	// settling_since forces the TERMINAL ceiling drop instead of a retry.
+	expectRecentHeartbeatPresent(mock, item.WorkspaceID)
+	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
+
+	expectSettlingCeilingDrop(mock, item.ID, sqlmock.AnyArg())
+	expectGreetClaimWonEq(mock, item.WorkspaceID)
+	expectGreetWriterSendEq(mock, item.WorkspaceID)
+
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+	handler.asyncWG.Wait()
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("settling-ceiling drop fallback not delivered via the claim seam exactly once: %v", err)
 	}
 }

@@ -1,14 +1,26 @@
 ---
-title: "Phase 33: From Cloudflare Tunnel to Direct Connect — How Molecule AI Agent Workspaces Get Their Own IP"
+title: "[Historical] Phase 33: Cloudflare Tunnel to Public-IP Workspaces"
 date: 2026-04-22
 slug: cloudflare-tunnel-migration
-description: "Phase 33 replaces Cloudflare Tunnel with direct-connect agent workspaces that get their own public IPs. Here's what changed, why, and what it means for your deployment."
+description: "Historical record of the retired Phase 33 AWS direct-connect design. This is not current deployment guidance."
 tags: [platform, infrastructure, cloud, deployment]
 ---
 
-# Phase 33: From Cloudflare Tunnel to Direct Connect — How Molecule AI Agent Workspaces Get Their Own IP
+# [Historical] Phase 33: From Cloudflare Tunnel to Public-IP Workspaces
 
-In Phase 33, Molecule AI changes how cloud-hosted agent workspaces connect to the platform. Previously, every workspace connected outbound through a Cloudflare Tunnel — a lightweight daemon that maintained a persistent connection to Cloudflare's edge, routing traffic through their network. Starting today, workspaces provisioned in your cloud account get their own public IP addresses and connect directly, with no tunnel in the path.
+> **Historical architecture only — do not follow these deployment
+> instructions.** This April 2026 article records an intermediate AWS design
+> that was later retired. The current platform uses domain-only access,
+> CI-on-merge deployments, and the active control-plane provisioning backends;
+> operators must not infer a public-IP, VPC, security-group, or operator-host
+> workflow from this post. See the current
+> [provisioner](../../architecture/provisioner.md) and
+> [workspace placement](../../architecture/workspace-placement.md)
+> documentation.
+
+In Phase 33, Molecule AI changed how the then-current cloud-hosted agent
+workspaces connected to the platform. The design moved from outbound
+Cloudflare Tunnels to public IP addresses in the operator's AWS account.
 
 This post covers what changed architecturally, why we made the change, and what operators and developers need to know.
 
@@ -51,9 +63,9 @@ Your browser / API client
 
 The platform still handles auth and routing. But the data path no longer goes through Cloudflare's tunnel network — it's a direct TCP connection from client to workspace.
 
-What changes for you:
+What changed in that retired design:
 
-| | Cloudflare Tunnel (before) | Direct Connect (now) |
+| | Cloudflare Tunnel (pre-Phase 33) | AWS direct connect (Phase 33 snapshot) |
 |---|---|---|
 | Workspace gets | Cloudflare-assigned hostname | Public IP from your VPC |
 | Inbound connection | Outbound tunnel WebSocket only | Direct WebSocket on :443 |
@@ -62,42 +74,58 @@ What changes for you:
 | Platform dependency | Cloudflare required for connectivity | Platform API still required for auth/routing; workspace IP works for direct curl |
 | Debugging | Must go through tunnel | `curl https://<workspace-ip>` works directly |
 
-## What operators need to do
+## What operators needed to do (historical)
 
-If you already have a CP-managed workspace in your AWS account (provisioned via the `controlplane` backend with `MOLECULE_ORG_ID` set), Phase 33 transitions automatically. The platform manages the security group rules, so no manual changes are required.
+At the time, existing CP-managed workspaces in an operator's AWS account were
+expected to transition automatically, with the platform managing the security
+group rules.
 
-**New provisioners:** when you create a CP-managed workspace, the platform now assigns a public IP from the workspace subnet. This is automatic — the provisioning flow is the same, just with a different network configuration on the backend.
+**New provisioners:** the Phase 33 design assigned a public IP from the
+workspace subnet while preserving the existing provisioning API.
 
-**Existing self-hosted or Fly.io workspaces:** no change. Those backends don't use the CP provisioner path and were never on Cloudflare Tunnel in the same way.
+**Existing self-hosted or Fly.io workspaces:** these were outside the Phase 33
+control-plane provisioner path.
 
-**If you have a custom VPC configuration:** the platform expects a workspace subnet with outbound internet access (for `pip install`, model API calls, etc.) and a security group that the platform can manage. If you've locked down your security groups to deny all inbound from the platform's IP ranges, you may need to allow port 443 from the platform CIDR. Check `docs.molecule.ai/infra/network-requirements` for the current allowlist.
+**If you have a custom VPC configuration:** the Phase 33 design expected a
+workspace subnet with outbound internet access and a platform-managed security
+group. This paragraph is retained as historical context, not as a current
+network allowlist or operator procedure.
 
-## What developers need to know
+## What developers needed to know (historical)
 
-From an agent runtime perspective — nothing changes. Your code talks to the platform API, registers workspaces, receives task dispatch, and runs tools. The transport layer is different but the API contract is identical.
+From the agent runtime's perspective, the design intended to preserve the
+platform API contract while changing the transport layer.
 
-Specific things that do change:
+Changes described by that snapshot included:
 
-- **Direct workspace access**: if your code or tooling needs to reach a running workspace directly (for monitoring, log scraping, port-forwarding), you can now use its public IP instead of going through the platform proxy
-- **WebSocket path**: the workspace still opens a WebSocket to the platform on boot. That connection is now outbound from the workspace's public IP to the platform — same direction as before, different path
-- **CI/CD and health checks**: scripts that hit workspace health endpoints can use the public IP directly; no tunnel hostname required
+- **Direct workspace access**: tools were expected to reach a workspace's
+  public IP instead of the platform proxy.
+- **WebSocket path**: the design retained an outbound workspace-to-platform
+  WebSocket over the new network path.
+- **CI/CD and health checks**: scripts were expected to address the public IP
+  instead of a tunnel hostname.
 
-## Security model
+## Security model at the time
 
-The security group rules are managed by the platform, not operator-configured. This is intentional — it means the platform can enforce:
+The design assigned workspace security-group management to the platform and
+intended to enforce:
 
 - Port 443 only (no other inbound ports)
 - TLS required on all connections
 - JWT validation before any workspace data is served
 
-What it doesn't do: the platform doesn't manage your VPC-level security groups beyond the workspace-specific one. If your VPC has overly restrictive route tables or NAT-only egress for the workspace subnet, model API calls from the agent may fail. Ensure your workspace subnet has both inbound 443 from the platform and outbound 443/443 to model provider endpoints.
+The design did not manage VPC-level security groups beyond the
+workspace-specific one. It expected inbound TCP 443 from the platform and
+outbound TCP 443 to model-provider endpoints.
 
-## When this ships
+## Original rollout timing
 
-Phase 33 is rolling out to all new CP-managed workspace provisions starting 2026-04-22. Existing workspaces will migrate on their next restart cycle — the platform handles this automatically during normal workspace rotation.
+The original plan called for new CP-managed provisions to use this topology
+starting 2026-04-22 and for existing workspaces to migrate on restart.
 
-If you have questions or hit issues during migration, the runbook is at `docs.molecule.ai/infra/cloudflare-tunnel-migration`.
+That migration window and its runbook are closed. Use the current architecture
+documents linked in the banner above.
 
 ---
 
-*Phase 33 is part of the Molecule AI infrastructure hardening track. For the full roadmap, see `docs.molecule.ai/roadmap`.*
+*Archived Phase 33 design record; superseded and not current operator guidance.*

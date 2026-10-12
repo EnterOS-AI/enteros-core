@@ -80,7 +80,7 @@ Workspace context menu actions include:
 - restart
 - duplicate
 - export bundle
-- expand to team / collapse team
+- show or hide the existing team view (`Expand Team View` / `Collapse Team View`)
 - extract from team
 - delete
 
@@ -114,20 +114,25 @@ Chat is now **WebSocket-first**, with polling kept as a recovery fallback instea
 
 ## Side Panel
 
-Selecting a workspace opens the right-side panel. The panel is resizable and currently includes **10 tabs**:
+Selecting a workspace opens the right-side panel. The panel is resizable and currently includes **15 tabs**:
 
 | Tab | Current role |
 |---|---|
 | `Chat` | Two sub-tabs: **My Chat** (user↔agent, `source=canvas`) and **Agent Comms** (agent↔agent A2A traffic, `source=agent`). WebSocket response delivery, activity-based history |
 | `Activity` | Rich activity feed for A2A send/receive, task updates, logs, skill promotion, and full-trace entry points |
 | `Details` | Basic metadata, runtime/skill summary, restart, peer list, delete |
-| `Skills` | Read-only skill and capability display from the Agent Card |
-| `Terminal` | WebSocket shell into the running workspace container |
+| `Plugins` | Installed plugins plus skill and capability information exposed for the workspace |
+| `Terminal` | Backend-aware shell access when the workspace's compute supports it |
+| `Display` | Remote display availability, session, and control state |
+| `Container` | Compute/provider options and container-level configuration |
 | `Config` | Structured editor for `config.yaml`, runtime, skills, A2A, delegation, sandbox, secrets, and raw YAML |
+| `Schedule` | Workspace schedules and execution state |
+| `Channels` | Channel connections and discovery |
 | `Files` | Workspace file browser/editor for `/configs`, `/workspace`, `/home`, and `/plugins` |
 | `Memory` | Key/value workspace memory view with TTL-capable entries |
 | `Traces` | Langfuse traces |
 | `Events` | Workspace-scoped structure events |
+| `Audit` | Workspace-scoped audit trail |
 
 ### Panel banners
 
@@ -173,7 +178,9 @@ The file tree uses **lazy loading** to avoid fetching the entire filesystem at o
 
 ## Team Visualization
 
-Expanded teams render as embedded child cards inside the parent node:
+When a parent's team view is visible, existing `parent_id` descendants render
+as embedded child cards inside the parent node. Hiding the team view is
+presentational and does not stop or delete those workspaces:
 
 - children are hidden as top-level React Flow nodes
 - nested cards show status, tier, skill summary, and descendant counts

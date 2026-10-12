@@ -284,7 +284,7 @@ interface RuntimeOption {
 // haven't migrated to the explicit `providers:` field yet, AND
 // continues to be a useful fallback for any future runtime whose
 // derive-provider semantics happen to match the slug prefix.
-export function deriveProvidersFromModels(models: ModelSpec[]): string[] {
+export function deriveProvidersFromModels(models: ReadonlyArray<Partial<Pick<ModelSpec, "id">>>): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const m of models) {

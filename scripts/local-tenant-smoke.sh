@@ -14,7 +14,8 @@
 # Usage:
 #   scripts/local-tenant-smoke.sh             # build image, then smoke
 #   scripts/local-tenant-smoke.sh --no-build  # smoke an already-built IMAGE
-#   IMAGE=ghcr.io/.../molecule-tenant:sha-x scripts/local-tenant-smoke.sh --no-build
+#   IMAGE=registry.moleculesai.app/molecule-ai/molecule-tenant:sha-x \
+#     scripts/local-tenant-smoke.sh --no-build
 #
 # Requires: docker (+ buildx). Mirrors the CI build args + smoke env exactly.
 

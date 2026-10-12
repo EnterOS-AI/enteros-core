@@ -2,21 +2,20 @@ package handlers
 
 // Pins the backend-dispatcher invariant added 2026-05-04.
 //
-// Before the fix, TeamHandler.Expand hardcoded the Docker provisioner
-// (provisionWorkspace), so on a SaaS tenant where the workspace-server
-// has no docker socket, child workspaces were created as DB rows but
-// never got an EC2 instance. The 600s sweeper then logged the misleading
-// "container started but never called /registry/register".
+// Historical motivation: before the dispatcher fix, the then-present
+// TeamHandler.Expand hardcoded the Docker provisioner (provisionWorkspace),
+// so on a SaaS tenant where the workspace-server had no Docker socket, child
+// workspaces were created as DB rows but never got an EC2 instance. That
+// destructive expand handler has since been retired.
 //
 // The fix centralizes backend selection in
-// WorkspaceHandler.provisionWorkspaceAuto and routes both Create and
-// TeamHandler.Expand through it. These tests pin:
+// WorkspaceHandler.provisionWorkspaceAuto. These tests now pin the dispatcher
+// itself and all remaining call sites rather than a team-expansion route:
 //
 //  1. Auto returns false when neither backend is wired (caller must
 //     persist + mark-failed itself).
 //  2. Auto picks CP when cpProv is set.
-//  3. team.go uses provisionWorkspaceAuto, not provisionWorkspace
-//     directly (source-level guard against the original drift).
+//  3. No handler calls the per-backend provision functions directly.
 
 import (
 	"bytes"
@@ -69,6 +68,16 @@ func (r *trackingCPProv) StopAndPrune(_ context.Context, workspaceID string) err
 	r.mu.Unlock()
 	return r.stopErr
 }
+
+// EnsureImage satisfies the core#5019 pull-before-stop seam. These stubs
+// predate it; answering "ready" keeps their pre-#5019 behaviour EXACTLY
+// (the guard allows, the restart proceeds) so this stub carries no opinion
+// about the new branch. Tests that exercise the DECLINE path use
+// prewarmCPProv in workspace_restart_pull_before_stop_test.go.
+func (r *trackingCPProv) EnsureImage(_ context.Context, _ provisioner.EnsureImageRequest) (provisioner.EnsureImageResult, error) {
+	return provisioner.EnsureImageResult{Status: "ready"}, nil
+}
+
 func (r *trackingCPProv) GetConsoleOutput(_ context.Context, _ string) (string, error) {
 	return "", nil
 }
@@ -99,10 +108,10 @@ func (r *trackingCPProv) startedSnapshot() []string {
 //     still doesn't sit stuck in 'provisioning' for 10 min until the
 //     sweeper fires).
 //
-// Pre-2026-05-05 the false return was silent and TeamHandler /
-// OrgHandler.createWorkspaceTree dropped workspaces on the floor when
-// they ignored it. This test pins the new contract that Auto owns the
-// failed-mark on no-backend.
+// Before 2026-05-05 the false return was silent; the retired TeamHandler and
+// the then-current OrgHandler.createWorkspaceTree both historically dropped
+// workspaces when they ignored it. This test pins the current contract that
+// Auto owns the failed mark on no-backend.
 func TestProvisionWorkspaceAuto_NoBackendMarksFailed(t *testing.T) {
 	mock := setupTestDB(t)
 	mock.MatchExpectationsInOrder(false)
@@ -184,15 +193,15 @@ func TestProvisionWorkspaceAuto_RoutesToCPWhenSet(t *testing.T) {
 }
 
 // TestNoCallSiteCallsDirectProvisionerExceptAuto — generic source-level
-// gate covering ANY future caller, not just team.go and org_import.go.
+// gate covering every current and future handler call site.
 //
 // The architectural intent is: provisionWorkspaceAuto is the single
 // source of truth for "how to start a workspace"; the per-backend
 // helpers (provisionWorkspace = Docker, provisionWorkspaceCP = CP) are
 // implementation details Auto routes between based on which backend is
 // wired. Pre-2026-05-04 we had this abstraction but enforced only by
-// convention — TeamHandler.Expand violated it (silent SaaS bug), then
-// org_import.go violated it the same way. The fixes were identical:
+// convention — the then-present TeamHandler.Expand violated it (silent SaaS
+// bug), then org_import.go violated it the same way. The fixes were identical:
 // route through Auto. This gate prevents the *next* call site from
 // repeating the pattern.
 //
@@ -270,7 +279,8 @@ func TestNoCallSiteCallsDirectProvisionerExceptAuto(t *testing.T) {
 }
 
 // TestOrgImport_UsesAutoNotDirectDockerPath — source-level guard for
-// the org_import.go call site. Same bug pattern as team.go above:
+// the org_import.go call site. It preserves the same dispatcher invariant as
+// the historical, now-retired team handler fix:
 // pre-2026-05-04 #2 (this PR), org_import called h.workspace.provisionWorkspace
 // directly, sending every imported workspace down the Docker path on
 // SaaS. User reproduced 2026-05-04 ~22:30Z importing a 7-workspace
@@ -282,11 +292,11 @@ func TestNoCallSiteCallsDirectProvisionerExceptAuto(t *testing.T) {
 // provisionWorkspaceCP because that function was never invoked).
 //
 // The repro pattern was identical to issue #2486. The fix is identical
-// to the team.go fix above: route through provisionWorkspaceAuto.
+// to that historical fix: route through provisionWorkspaceAuto.
 //
 // This test pins the call site so a future refactor can't re-introduce
-// the bug. Substring match on the source — same rationale as the team.go
-// gate above.
+// the bug. Substring match on the source because this is a source-level
+// architecture gate.
 func TestOrgImport_UsesAutoNotDirectDockerPath(t *testing.T) {
 	wd, err := os.Getwd()
 	if err != nil {
@@ -408,8 +418,7 @@ func TestNoBareBothNilCheck(t *testing.T) {
 // backends count.
 //
 // Substring match because the failure shape is "wrong field" — a plain
-// text gate suffices, same rationale as TestTeamExpand_UsesAutoNotDirectDockerPath
-// above.
+// text gate suffices, matching the generic dispatcher source gate above.
 func TestOrgImportGate_UsesHasProvisionerNotBareField(t *testing.T) {
 	wd, err := os.Getwd()
 	if err != nil {
@@ -529,9 +538,10 @@ func (s *stoppingLocalProv) WriteAuthTokenToVolume(_ context.Context, _, _ strin
 // pattern that motivated this PR. Any non-test handler that wants to
 // "stop the workload" must go through h.X.StopWorkspaceAuto, not bare
 // h.X.provisioner.Stop / h.X.cpProv.Stop / h.X.Stop. Pre-2026-05-05
-// team.go and workspace_crud.go both called h.provisioner.Stop directly
-// inside `if h.provisioner != nil { ... }` gates — silent no-op on
-// SaaS, EC2 leak (#2813, #2814).
+// the former team.go path and workspace_crud.go both called
+// h.provisioner.Stop directly inside `if h.provisioner != nil { ... }`
+// gates — a silent no-op on SaaS and an EC2 leak (#2813, #2814). The
+// destructive team handler was later retired.
 //
 // Allowed exceptions:
 //   - workspace.go: defines StopWorkspaceAuto (the dispatcher itself).
@@ -905,6 +915,14 @@ func TestRunRestartCycle_UsesProvisionWorkspaceAutoSyncLocked(t *testing.T) {
 // stays in the Pause handler — only the "stop the running workload"
 // step delegates to the dispatcher. This pin asserts the dispatcher
 // is called from the Pause loop with `ws.id`.
+//
+// The needle carries `opCtx`, not `ctx`, and the second half of this test
+// forbids `ctx`. Pause's side effects were moved off the request-scoped
+// context (see the detach note in Pause): passing the raw request `ctx` here
+// is the exact regression that let an aborted client connection cancel the
+// stop while the handler still answered 200 {"status":"paused"}. Pinning the
+// argument keeps the two invariants — right dispatcher, right context —
+// from drifting apart.
 func TestPauseHandler_UsesStopWorkspaceAuto(t *testing.T) {
 	wd, err := os.Getwd()
 	if err != nil {
@@ -915,9 +933,14 @@ func TestPauseHandler_UsesStopWorkspaceAuto(t *testing.T) {
 		t.Fatalf("read workspace_restart.go: %v", err)
 	}
 	stripped := stripGoComments(src)
-	if !bytes.Contains(stripped, []byte("h.StopWorkspaceAuto(ctx, ws.id)")) {
-		t.Errorf("workspace_restart.go must call StopWorkspaceAuto from the Pause loop with `ws.id` — current code does not. " +
+	if !bytes.Contains(stripped, []byte("h.StopWorkspaceAuto(opCtx, ws.id)")) {
+		t.Errorf("workspace_restart.go must call StopWorkspaceAuto from the Pause loop with `ws.id` on the DETACHED opCtx — current code does not. " +
 			"Phase 3 of #2799 migrated this site; do not regress to the inline `if h.provisioner != nil { Stop }` dispatch.")
+	}
+	if bytes.Contains(stripped, []byte("h.StopWorkspaceAuto(ctx, ws.id)")) {
+		t.Errorf("Pause's stop is back on the request-scoped `ctx`. An aborted client connection then cancels the stop " +
+			"mid-flight — the defect where Pause reported 200 {\"status\":\"paused\"} having stopped nothing. Use the " +
+			"detached, budget-bounded opCtx.")
 	}
 }
 

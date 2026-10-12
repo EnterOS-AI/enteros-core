@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """gitea-merge-queue — conservative serialized merge bot for Gitea.
 
-Gitea 1.22.6+ has auto-merge (`pull_auto_merge`) but no GitHub-style merge
-queue. This script provides the missing serialized policy in user space:
+Gitea's `pull_auto_merge` does not implement this repository's exact-head,
+one-at-a-time validation policy. This script enforces that policy in user space:
 
 1. Scan open same-repo PRs that are NOT opted out (auto-discovery, see below),
    oldest-first, skipping drafts, until an ACTIONABLE one is found. A non-ready
@@ -14,21 +14,14 @@ queue. This script provides the missing serialized policy in user space:
    main re-runs push CI and this gate PAUSES the queue if main goes red, so no
    merge piles onto an unverified/red main (issue #2358).
 3. Refuse fork PRs; the queue may only mutate same-repo branches.
-4. DIRECT-MERGE when conflict-free (issue #2358). When Gitea reports the PR
-   conflict-free (mergeable is True) and the merge bar below is met, MERGE IT
-   DIRECTLY — even if its head does not contain current main. We do NOT call
-   /pulls/{n}/update first: branch protection does not require strict
-   up-to-date, so behind-main conflict-free PRs merge cleanly, and calling
-   /update would trigger Gitea dismiss_stale_approvals (dismissing the genuine
-   approvals and forcing a re-review every tick — the rebase-churn bottleneck).
-   The /update path is used ONLY when the PR is DEFINITIVELY not mergeable
-   (mergeable is literal False) AND its head lacks current main — refreshing the
-   branch may resolve a behind-main non-conflict; a real conflict returns HTTP
-   409 and the PR is HELD per #2352. mergeable=None/missing (Gitea STILL
-   COMPUTING conflict state) is a distinct fail-closed WAIT: never merged AND
-   never /update'd — calling /update during the compute window would dismiss the
-   PR's genuine approvals (dismiss_stale_approvals) and re-introduce the exact
-   rebase-churn this queue eliminates. None is re-checked next tick.
+4. Honor branch protection's `block_on_outdated_branch` field. When enabled,
+   a behind-main PR is updated first and must earn fresh CI/review before merge;
+   this avoids Gitea's expected HTTP 405 for a stale head. When disabled, the
+   queue retains the #2358 throughput path and directly merges a conflict-free
+   (`mergeable is True`) behind-main PR after the full merge bar passes. For a
+   current-base PR, `mergeable=None/missing` is a fail-closed WAIT and literal
+   False is a conflict WAIT. A real /update conflict returns HTTP 409 and the PR
+   is best-effort HELD per #2352.
 5. Merge ONLY when, on the PR's CURRENT head sha:
      - >= REQUIRED_APPROVALS distinct GENUINE official APPROVED reviews from
        the recognised reviewer set (not stale, not dismissed, commit_id ==
@@ -39,15 +32,15 @@ queue. This script provides the missing serialized policy in user space:
 
 Authoritative gates (fail-closed):
   - The REQUIRED status contexts come from BRANCH PROTECTION
-    (`status_check_contexts`) PLUS the hardcoded governance checks
-    (qa-review, security-review, sop-checklist). If branch protection
-    cannot be enumerated, the queue HOLDS (does not merge blindly).
+    (`status_check_contexts`). If branch protection cannot be enumerated,
+    the queue HOLDS (does not merge blindly). (The old uniform SOP gate —
+    qa-review/security-review/sop-checklist — was removed 2026-07-14; see
+    GOVERNANCE_REQUIRED_CONTEXTS below.)
   - NON-required reds (E2E Chat, Staging SaaS, ci-arm64-advisory, any
     continue-on-error job) MUST NOT block. They are reported, never gating.
-  - `force_merge=true` is used ONLY when the merge is blocked *solely* by
-    missing-but-non-required advisory contexts (required are green + genuine
-    approvals present). It is NEVER used to bypass a failing REQUIRED context
-    or missing approvals.
+  - Every merge uses Gitea's normal protected endpoint with the reviewed head
+    SHA pinned. The queue never requests Gitea's administrator force override;
+    Gitea re-checks branch protection and approvals at write time.
 
 Auto-discovery (opt-OUT, label-optional):
   The queue is SELF-SUSTAINING — a ready PR does NOT need a human (or an agent)
@@ -80,11 +73,13 @@ Head-of-line (HOL) safety has two complementary layers:
   (b) For the candidate the scan acts on, two permanent failure modes HOLD the
       PR (apply HOLD_LABEL) and let the scan CONTINUE to the next candidate
       rather than re-selecting the same wedged PR every tick:
-        - a permanent permission/4xx merge error (403/404/405), and
+        - a normal protected-merge refusal (403/404/405), and
         - a persistent branch-update conflict (the /update endpoint returns
           HTTP 409 because the PR branch cannot be merged with main without a
           manual rebase). A conflict will not self-resolve, so retrying it
           every tick would HOL-block every ready PR behind it (issue #2352).
+      If the scoped queue token cannot persist HOLD_LABEL, the tick FAILS RED
+      instead of claiming success without a durable hold (internal#1082).
 
 Status-fetch is fail-closed: if the combined status for a sha cannot be
 fetched, the PR is skipped this tick (never treated as green).
@@ -101,16 +96,19 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
 
-# SSOT fail-closed approval predicate (SEV-1 internal#812). review-check.sh
-# consumes the same module via _review_check_filter.py — do NOT duplicate
-# the predicate here. See _approval_validator.py for the fail-closed contract.
+# SSOT fail-closed approval predicate (SEV-1 internal#812). This is now the
+# sole consumer of the module (the review-check.sh chain was removed with the
+# SOP review gate 2026-07-14) — do NOT duplicate the predicate here. See
+# _approval_validator.py for the fail-closed contract.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _approval_validator import classify_reviews as _classify_reviews_ssot  # noqa: E402
+from _review_policy import recognized_reviewers, required_approvals  # noqa: E402
 
 
 def _env(key: str, *, default: str = "") -> str:
@@ -168,51 +166,69 @@ OPT_OUT_LABELS = {
 # Verified against the lint-bp-context-emit-match test which already
 # asserts (pull_request_target) for these names. No requirement
 # dropped; just a name correction.
-GOVERNANCE_REQUIRED_CONTEXTS = [
-    "qa-review / approved (pull_request_target)",
-    "security-review / approved (pull_request_target)",
-    "sop-checklist / all-items-acked (pull_request_target)",
-]
+# SOP review-gate contexts (qa-review / security-review / sop-checklist) were
+# fully removed 2026-07-14 (CTO directive): the producing workflows are deleted
+# and no PR emits these contexts anymore, so keeping them here would make every
+# merge wait forever on phantom-required checks. reserved-path-review was
+# likewise RETIRED 2026-07-17 (CTO directive; workflow + script deleted), so the
+# peer-approval floor (REVIEWER_SET + REQUIRED_APPROVALS, see below) plus the
+# DETECTIVE audit-force-merge backstop are now the review gates. Kept as an
+# (empty) list so the concat sites below are a harmless no-op and re-adding a
+# uniform governance context is a one-line change.
+GOVERNANCE_REQUIRED_CONTEXTS: list[str] = []
 
 # --------------------------------------------------------------------------
 # CRITICAL fail-closed contexts (RCA: core PR #1676 merged 2026-06-24 with
 # `CI / Platform (Go) = failure` AND `CI / all-required = skipped`, turning
 # main RED. Same class as #3181.)
 # --------------------------------------------------------------------------
-# These two contexts MUST be green before ANY merge, INCLUDING a force_merge.
-# They are checked here UNCONDITIONALLY and INDEPENDENTLY of whatever branch
-# protection happens to enumerate in status_check_contexts — the #1676 gap was
-# precisely that when BP did NOT list these (or listed a different suffix),
-# Platform(Go)=failure + all-required=skipped fell through the required-set
-# check and were then swept up as "non-required reds" and FORCE-MERGED past.
+# The repo's `<workflow> / all-required` AGGREGATOR SENTINEL MUST be green
+# before ANY merge. It is checked UNCONDITIONALLY and INDEPENDENTLY of whatever
+# branch protection happens to enumerate in status_check_contexts — the #1676
+# gap was precisely that when BP did NOT list it (or listed a different suffix),
+# a skipped/failed aggregator fell through the required-set check and was then
+# swept up as a "non-required red" and FORCE-MERGED past.
 #
 # Rules (all fail-closed — unverifiable == BLOCK):
-#   * `CI / Platform (Go)`  : must be `success`. failure/error/skipped/missing
-#                              all BLOCK. (skipped/missing = the gate did not
-#                              actually run → cannot prove green.)
-#   * `CI / all-required`   : the aggregator sentinel. `skipped` is FATAL —
-#                              a skipped all-required means the required jobs
-#                              it gates did NOT actually run, so nothing
+#   * `<workflow> / all-required` : the aggregator sentinel. `skipped` is FATAL
+#                              — a skipped all-required means the required jobs
+#                              it `needs:` did NOT actually run, so nothing
 #                              gated the merge. failure/error/missing also
-#                              BLOCK; only `success` passes.
+#                              BLOCK; only `success` passes. Because the
+#                              sentinel `needs:` every required job (enforced by
+#                              lint-required-no-paths + all-required-check), its
+#                              green transitively proves each sub-job (e.g.
+#                              `Platform (Go)`) ran and passed, so #1676 is fully
+#                              covered by requiring THIS one context green.
 # The context names are matched by their base prefix (the part before the
 # trailing " (pull_request*)" event suffix) so the guard catches the context
 # regardless of which event variant Gitea emitted it under.
+#
+# ZERO-DRIFT / PER-REPO (root-cause fix): the critical set is NOT a hardcoded
+# constant — it is DERIVED PER-REPO from that repo's own checked-in SSOT
+# (`.gitea/required-contexts.txt` → enforced_file_contexts) by
+# `critical_context_prefixes()`. The former hardcoded default
+# ("CI / Platform (Go),CI / all-required") was molecule-core-specific and, when
+# this shared script ran for other repos (e.g. molecule-controlplane, which
+# emits LOWERCASE `ci / all-required` and has NO `Platform (Go)` job), demanded
+# contexts that were legitimately ABSENT on that repo — phantom-blocking EVERY
+# PR ("CRITICAL required context(s) not green"). A context that legitimately
+# does not exist on a repo is not a missing required check.
+# `CRITICAL_REQUIRED_CONTEXT_PREFIXES` remains an OPTIONAL explicit override (a
+# repo may still pin extra critical contexts by name); left empty (the default)
+# the set is SSOT-derived.
 CRITICAL_REQUIRED_CONTEXT_PREFIXES = [
     name.strip()
     for name in _env(
         "CRITICAL_REQUIRED_CONTEXT_PREFIXES",
-        default="CI / Platform (Go),CI / all-required",
+        default="",
     ).split(",")
     if name.strip()
 ]
 
 REQUIRED_CONTEXTS_RAW = _env(
     "REQUIRED_CONTEXTS",
-    default=(
-        "CI / all-required (pull_request),"
-        "sop-checklist / all-items-acked (pull_request)"
-    ),
+    default="CI / all-required (pull_request)",
 )
 # --------------------------------------------------------------------------
 # Enforced-contexts SSOT file (internal#3181 — close the BP↔allowlist gap)
@@ -222,7 +238,7 @@ REQUIRED_CONTEXTS_RAW = _env(
 # lint_no_coe_on_required.py, and the merge gate derived its required set
 # ONLY from branch-protection `status_check_contexts`. So a context listed
 # in the file but ABSENT from BP was NOT merge-blocking — it was classified
-# as a non-required advisory red and force_merge=true bypassed it. That is
+# as a non-required advisory red and the former force-merge path bypassed it. That is
 # exactly how PR#3181 merged with `E2E Staging SaaS (full lifecycle) /
 # E2E Staging Concierge Creates Workspace` RED (in the file, not in BP).
 #
@@ -250,11 +266,160 @@ _PENDING_MARKER_RE = re.compile(r"^\s*#\s*pending-#\d+\b", re.IGNORECASE)
 _EVENT_SUFFIX_RE = re.compile(
     r"\s*\((?:pull_request|push|pull_request_target)\)\s*$"
 )
+
+# The queue's OWN commit-status context. The `gitea-merge-queue` workflow's
+# `queue` job posts `gitea-merge-queue / queue` on the PR head, and that status
+# is `pending` for the whole duration of THIS run. A wildcard branch-protection
+# set ("*") therefore matches the queue's own in-flight status and — because it
+# is pending, never success, during self-evaluation — makes the queue decide
+# `wait` on the very PR whose approval fired the run. That is a self-referential
+# deadlock (core#4420): a PR cannot merge on the event of its OWN approval; it only
+# merges when some UNRELATED trigger evaluates it (that run's pending self-status
+# lands on the other PR's head). required_contexts_green() drops this context
+# from the user-space GLOB evaluation; reassert_queue_runner_status() reconciles
+# the same gate-runner context immediately before Gitea's protected merge write.
+#
+# This is NOT the advisory-skip the module forbids elsewhere (skipping a real
+# test that carries a red/pending status): the queue job is the gate-RUNNER, not
+# a gate, and requiring its own in-flight status to be green is a logical
+# impossibility, not a soft-fail. Only wildcard patterns are affected; a LITERAL
+# requirement naming this context is left untouched. Event-suffix-insensitive
+# (fires on pull_request_review, so the live suffix is not in _EVENT_SUFFIX_RE).
+SELF_STATUS_CONTEXT = "gitea-merge-queue / queue"
+_SELF_STATUS_RE = re.compile(
+    r"\A" + re.escape(SELF_STATUS_CONTEXT) + r"(?:\s*\([^)]*\))?\s*\Z"
+)
+# Gitea's commit-status write response can precede visibility in the combined
+# status view used by wildcard branch protection. Keep both waits short and
+# bounded: failure to observe the write is a hard stop, never permission to
+# bypass the protected endpoint.
+
+# --------------------------------------------------------------------------
+# Gitea's NATIVE cancellation stamp (core#5156)
+# --------------------------------------------------------------------------
+# When an Actions run is cancelled, Gitea's own Actions engine — not any step,
+# script or `if: always()` reporter — writes a commit status with
+# `state=failure` and `description="Has been cancelled"`. Measured on
+# molecule-core PR #5156, head 626d2049da, run 644628 / job 949071:
+#
+#   id=148  pending   05:59:31Z  "Blocked by required conditions"
+#   id=149  failure   05:59:53Z  "Has been cancelled"
+#   job 949071: status=completed conclusion=cancelled
+#               started_at=1970-01-01T00:00:00Z  run_attempt=0
+#
+# `started_at=1970` and `run_attempt=0` prove the job NEVER STARTED, so no
+# workflow-side code could have posted either row; and every one of the 149
+# rows on that SHA except a single status-reaper POST carries `creator: null`,
+# the signature of a server-side write with no API user behind it. There is
+# therefore NO workflow-side way to stop the `failure` being written.
+#
+# Why THIS run was cancelled even though `cancel-in-progress: false`:
+#   644627  head 1165a63f64 (PR #5167)  job created 05:59:06Z -> RUNNING
+#   644628  head 626d2049da (PR #5156)  job created 05:59:31Z -> BLOCKED
+#   644629  head 67e1299253 (PR #5166)  job created 05:59:53Z -> evicts 644628
+# 644628 is cancelled at exactly 05:59:53Z, the second 644629 arrives.
+#
+# NOTE the mechanism, because the obvious reading is wrong: this is NOT
+# `cancel-in-progress` (this workflow sets it to `false`). That setting protects
+# the RUNNING member of a concurrency group; at most one run may sit QUEUED per
+# group, so a newer arrival evicts the older queued run regardless. And the
+# three runs are three DIFFERENT PRs, one approval each inside 48 seconds — not
+# a burst on one PR. Because this workflow's group is repo-global
+# (`gitea-merge-queue-${{ github.repository }}`), approving ANY PR can kill the
+# queued run of ANY OTHER PR. Nothing will ever post to the evicted SHA's
+# timeline again, so the `failure` latches permanently under
+# `status_check_contexts=["*"]`.
+#
+# The operational corollary — and the reason it is a consequence, not folklore:
+# space approvals ACROSS THE REPO until the prior queue run reaches a terminal
+# state. Re-approving a latched PR does clear it (a fresh run re-posts the
+# context), but only if that approval is not itself part of a burst; a clustered
+# approval re-creates the latch it was meant to clear. This code change removes
+# the dependence on that discipline for the queue's own context.
+#
+# A cancelled gate-runner job carries ZERO information about the PR it was
+# evaluating: it never executed a single check. Requiring it green is the exact
+# same self-referential impossibility as requiring the `pending` row green
+# (core#4420), so the strip below covers both. It is NOT a blanket
+# cancelled-is-green rule: it applies ONLY to `SELF_STATUS_CONTEXT`, only under
+# a GLOB pattern, and a genuine queue-job `failure` (any other description)
+# still blocks. See `_is_native_cancellation_artifact`.
+#
+# Description-string coupling is a SOFT contract with Gitea, deliberately the
+# same one `.gitea/scripts/main-red-watchdog.py` already relies on. If a future
+# Gitea release renames the string, cancelled self-statuses simply start
+# blocking again — visible, not silent — and this constant gets re-pinned.
+NATIVE_CANCELLED_DESCRIPTION = "Has been cancelled"
+# Second, independent predicate: the row must point at an Actions run/job, i.e.
+# it was written by the Actions engine rather than POSTed by a bot that happened
+# to choose the same description text.
+_ACTIONS_TARGET_URL_RE = re.compile(
+    r"\A(?:https?://[^/]+)?/[^/\s]+/[^/\s]+/actions/runs/[0-9]+/jobs/[0-9]+\Z"
+)
+
+# --------------------------------------------------------------------------
+# Gitea 1.27 FILTERED-WORKFLOW PLACEHOLDERS are not results
+# --------------------------------------------------------------------------
+# Gitea 1.27 posts a `skipped` commit status for every job of a workflow that
+# MATCHED the event but was excluded by its own `branches:` / `paths:` filter,
+# whenever the job's context matches a branch-protection pattern
+# (services/actions/commit_status.go, CreateSkippedCommitStatusForFilteredWorkflow).
+# No run is created, so the row is written with
+#
+#     state="skipped"  description="Skipped"  target_url=""  (Actions user)
+#
+# With status_check_contexts=["*"] every filtered job qualifies, so EVERY PR
+# head carries one per push-only job -- including `CI / all-required (push)`,
+# because ci.yml's push trigger is `branches: [main]`. One live head shows both
+# kinds of `skipped` side by side (PR #5212, head 0c75646966):
+#
+#   CI / Platform (Go) (pull_request)  failure  /actions/runs/763155/jobs/1076636
+#   CI / all-required (pull_request)   skipped  /actions/runs/763155/jobs/1076641  REAL skip
+#   CI / all-required (push)           skipped  ""                                 placeholder
+#
+# On PR #5135 (head e99eb1e6aa: 41 success + 102 placeholders, zero failures)
+# the queue logged `CRITICAL required context(s) not green (fail-closed):
+# CI / all-required=skipped` and the PR was merged by hand 29 s later. The
+# step-0 critical guard needs EVERY event flavour of the aggregator to be
+# success and the ["*"] sweep needs every posted context to be success, so on
+# Gitea 1.27 the queue could merge no PR at all.
+#
+# A placeholder records that NO run happened; it is not a verdict. It is
+# dropped BEFORE the newest-wins reduction -- what Gitea <= 1.26 did by never
+# writing it. Consequences, all deliberate:
+#   * a context that also has real rows is judged on its newest REAL row, so a
+#     placeholder written later (the same commit pushed to a filtered branch)
+#     can never mask an earlier real failure;
+#   * a context with ONLY placeholders is absent: a literal requirement reports
+#     `missing` and the step-0 guard reports `missing` -- both still block, so
+#     "did not run" is never "passed";
+#   * a REAL job-level skip (all-required skipped because a `needs:` failed --
+#     the core#1676 shape) carries its Actions job URL, is not a placeholder,
+#     and still blocks.
+# Recognition needs ALL of: state `skipped`, description exactly "Skipped",
+# a `target_url` field that is present and empty, and no creator (a row an API
+# user POSTed is never treated as one). Rows missing those fields -- the
+# conductor snapshot carries only context+status -- are never dropped, so a
+# change in Gitea's shape makes placeholders block again: visible, not silent.
+FILTERED_WORKFLOW_PLACEHOLDER_DESCRIPTION = "Skipped"
+
+SELF_STATUS_CONFIRM_ATTEMPTS = 5
+SELF_STATUS_CONFIRM_DELAY_SECONDS = 0.25
+MERGE_STATUS_RETRY_ATTEMPTS = 3
+MERGE_STATUS_RETRY_DELAY_SECONDS = 0.5
+
 # Required contexts for push (main/staging) runs. The push CI uses the same
 # aggregator names with " (push)" suffix. Checking these explicitly instead of
-# the combined state avoids false-pause when non-blocking jobs (e.g. Platform
-# Go with continue-on-error: true due to mc#774) have failed — their failures
-# pollute the combined state but do not block merges.
+# the combined state avoids false-pause when a genuinely non-blocking job has
+# failed — such a failure pollutes the combined state but does not block merges.
+#
+# The example this comment used to cite ("Platform Go with continue-on-error:
+# true due to mc#774") is STALE and was actively misleading: mc#774 was closed
+# 2026-07-08 as CLOSE_STALE by org triage — not because the mask was retired —
+# and `platform-build` has carried `continue-on-error: false` since the RFC #219
+# Phase 4 flip. Platform (Go) IS blocking: it is a `needs:` of the `all-required`
+# sentinel, which is a branch-protection required context. Do not treat a red
+# Platform (Go) as ignorable on the strength of this comment.
 PUSH_REQUIRED_CONTEXTS_RAW = _env(
     "PUSH_REQUIRED_CONTEXTS",
     default="CI / all-required (push)",
@@ -262,21 +427,27 @@ PUSH_REQUIRED_CONTEXTS_RAW = _env(
 
 # Recognised official-reviewer set. A merge requires this many DISTINCT genuine
 # approvals (not stale/dismissed, on the current head sha) from accounts in
-# this set. The set is the real agents-team reviewer roster; founder/CTO-agent
-# accounts are intentionally excluded so the queue cannot be satisfied by a
-# human/owner approval alone — it must be a genuine peer review.
-REVIEWER_SET = {
-    name.strip()
-    for name in _env(
-        "REVIEWER_SET",
-        default="agent-reviewer,agent-researcher,agent-reviewer-cr2",
-    ).split(",")
-    if name.strip()
-}
-# Default mirrors molecule-core branch protection (required_approvals: 2). The
-# authoritative value is read from branch protection at runtime; this is only
-# the fallback when BP does not specify one.
-REQUIRED_APPROVALS_DEFAULT = int(_env("REQUIRED_APPROVALS", default="2") or "2")
+# this set. Checked-in defaults live only in _review_policy.py, which is shared
+# with audit-force-merge.sh; optional environment overrides remain fail-closed.
+#
+# CTO 2026-07-14: the peer roster is the union of the review, management, and
+# owner teams — reviewers, managers, and owners may all satisfy the floor.
+# The prior default {agent-reviewer,agent-researcher,agent-reviewer-cr2} was
+# a login list of three accounts that no automation drives; they produced 0
+# genuine approvals across 29 merges, so the floor was unsatisfiable and EVERY
+# merge fell through to a manual owner/admin path (the queue was dead). This
+# roster is the current membership of teams code-reviewers/qa/security/
+# managers/Owners. It is still a LOGIN list (not team-resolved) so the queue
+# needs no org-team read scope to run; the trade-off is that team membership
+# changes require updating the one shared policy module.
+REVIEWER_SET = recognized_reviewers(os.environ.get("REVIEWER_SET"))
+# CTO 2026-07-14: the genuine-peer floor is ONE approval. The previous default
+# of 2 was drift and, combined with the dead REVIEWER_SET above and the actual
+# review practice (<=1 general review per PR, 0/14 recent merges had 2 distinct
+# peer approvals), made the queue unable to merge anything.
+# Branch protection's value still wins when it is a valid int >= this floor
+# (see the fail-closed clamp in branch-protection parsing).
+REQUIRED_APPROVALS_DEFAULT = required_approvals(os.environ.get("REQUIRED_APPROVALS"))
 
 # --------------------------------------------------------------------------
 # Runtime-bump auto-merge exemption (RFC internal#131 PR-A, dispatch 9c2e9c88)
@@ -423,8 +594,11 @@ class ApiError(RuntimeError):
 
 
 class MergePermissionError(ApiError):
-    """Merge failed with a permanent permission error (403/404/405).
-    The queue should HOLD this PR and move to the next one."""
+    """The normal merge endpoint refused the request (403/404/405).
+
+    This can be permission or branch-protection policy. The queue never
+    bypasses it; it best-effort HOLDS the PR and scans the next candidate.
+    """
 
 
 class BranchUpdateConflictError(ApiError):
@@ -484,11 +658,6 @@ class MergeDecision:
     ready: bool
     action: str
     reason: str
-    # When ready is True, force indicates the merge is blocked SOLELY by
-    # missing-but-non-required governance contexts (required are green +
-    # genuine approvals present), so force_merge=true is justified to bypass
-    # ONLY those non-required contexts. Defaults False.
-    force: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -498,6 +667,18 @@ class BranchProtection:
     required_contexts: list[str]
     required_approvals: int
     block_on_rejected_reviews: bool
+    block_on_outdated_branch: bool = False
+    # True when this record was NOT read from the authoritative
+    # `/branch_protections` endpoint but SYNTHESIZED from the env-configured
+    # fallback because that endpoint was FORBIDDEN (HTTP 403) to the queue's
+    # merge actor. In this mode the queue does NOT trust its own client-side
+    # required-context/approval set as the authority — it relies on Gitea's
+    # server-side branch-protection enforcement AT MERGE TIME (the protected
+    # `/pulls/{n}/merge` endpoint re-checks BP itself and returns 405 for an
+    # under-approved / red / stale-head PR, which merge_pull maps to
+    # MergePermissionError -> HOLD). See get_branch_protection() for why a 403
+    # is a DETERMINISTIC permission state that must NOT fail-closed forever.
+    fallback: bool = False
 
 
 def _require_runtime_env() -> None:
@@ -614,28 +795,327 @@ def status_state(status: dict) -> str:
     return str(status.get("status") or status.get("state") or "").lower()
 
 
+def _is_native_cancellation_artifact(status: dict) -> bool:
+    """True when this row is Gitea's server-side `cancelled -> failure` stamp.
+
+    Requires BOTH predicates to hold, so a real red can never be mistaken for
+    one (see NATIVE_CANCELLED_DESCRIPTION for the measured evidence):
+
+      1. state is `failure` AND the description is EXACTLY the engine's
+         cancellation text. Exact match after strip — a substring test would
+         swallow a genuine failure whose description merely quotes the phrase
+         (e.g. a test named "Has been cancelled by the user unexpectedly"),
+         which is the same trap `main-red-watchdog._is_cancel_cascade` avoids.
+      2. `target_url` is an Actions run/job link, proving the Actions engine
+         wrote it rather than a bot POSTing the same text.
+
+    A run that genuinely FAILED carries "Failing after Ns" and is unaffected.
+    """
+    if status_state(status) != "failure":
+        return False
+    description = status.get("description")
+    if not isinstance(description, str):
+        return False
+    if description.strip() != NATIVE_CANCELLED_DESCRIPTION:
+        return False
+    target_url = status.get("target_url")
+    if not isinstance(target_url, str):
+        return False
+    return bool(_ACTIONS_TARGET_URL_RE.fullmatch(target_url.strip()))
+
+
+def is_filtered_workflow_placeholder(status: dict) -> bool:
+    """True only for Gitea 1.27's no-run `skipped` row for a filtered workflow.
+
+    See FILTERED_WORKFLOW_PLACEHOLDER_DESCRIPTION for the measured shapes. Every
+    predicate must hold; anything else -- including a real job-level skip,
+    which carries its Actions job URL -- is a status and is evaluated normally.
+    """
+    if not isinstance(status, dict) or status_state(status) != "skipped":
+        return False
+    if "target_url" not in status:
+        return False
+    target_url = status.get("target_url")
+    if not isinstance(target_url, str) or target_url.strip():
+        return False
+    description = status.get("description")
+    if not isinstance(description, str):
+        return False
+    if description.strip() != FILTERED_WORKFLOW_PLACEHOLDER_DESCRIPTION:
+        return False
+    return not status.get("creator")
+
+
+def self_status_is_uninformative(status: dict) -> bool:
+    """True when the queue's OWN gate-runner status carries no verdict.
+
+    Two shapes, one meaning — "this queue job never reached a conclusion about
+    the PR", so requiring it green under a wildcard is self-referential:
+
+      * `pending`   — the status of the very run doing this evaluation
+                      (core#4420).
+      * cancelled   — the run was evicted from the repo-global concurrency
+                      group and never executed a single step (core#5156).
+
+    Every other state (`success`, a real `failure`, `error`) IS a verdict and
+    is left to the ordinary evaluation.
+    """
+    return status_state(status) == "pending" or _is_native_cancellation_artifact(status)
+
+
+def status_numeric_id(status: dict) -> int:
+    """Return a sortable Gitea commit-status id, or -1 when unavailable."""
+    value = status.get("id")
+    if isinstance(value, bool):
+        return -1
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
 def latest_statuses_by_context(statuses: list[dict]) -> dict[str, dict]:
     # Gitea /statuses endpoint returns entries in ascending id order (oldest
     # first). We need the LAST occurrence of each context, so iterate in
     # reverse to prefer newer entries.
+    #
+    # Gitea 1.27 filtered-workflow placeholders are dropped before the
+    # reduction (FILTERED_WORKFLOW_PLACEHOLDER_DESCRIPTION): they record that no
+    # run happened, so they can neither pass nor fail a context.
     latest: dict[str, dict] = {}
     for status in reversed(statuses):
+        if is_filtered_workflow_placeholder(status):
+            continue
         context = status.get("context")
         if isinstance(context, str):
             latest[context] = status  # overwrite: reverse order → newest wins
     return latest
 
 
+class GiteaGlobCompileError(ValueError):
+    """A branch-protection glob cannot be compiled with Gitea semantics."""
+
+
+_GITEA_GLOB_SPECIAL = frozenset("*?\\[]{}")
+
+
+def _is_glob(pattern: str) -> bool:
+    """Mirror Gitea modules/glob.IsSpecialByte.
+
+    Branch-protection entries are always compiled as Gitea globs. This helper
+    is only used to keep the diagnostic distinction between a missing plain
+    literal and a special pattern that matched nothing.
+    """
+    return any(c in _GITEA_GLOB_SPECIAL for c in pattern)
+
+
+def _compile_gitea_glob(pattern: str) -> re.Pattern[str]:
+    """Compile the status-context glob exactly along Gitea's modules/glob
+    grammar (with no separators, as services/pull/commit_status.go invokes it).
+
+    Supported server syntax is broader than Python ``fnmatch``: ``*``, ``**``,
+    ``?``, character classes and ``[!x]`` negation, brace alternatives, and
+    backslash escapes. Invalid classes/escapes fail closed at the caller.
+    """
+    pos = 0
+
+    # Gitea hands glob escapes to Go's regexp compiler. Python's regexp
+    # escape language is not the same: for example, Python accepts ``\u0061``
+    # where Go rejects it, Python may parse ``\1`` as a backreference, and
+    # Python's Unicode ``\w`` is wider than Go/RE2's ASCII class. Translate a
+    # deliberately conservative common subset and reject every other
+    # alphanumeric escape. An unsupported policy must block merging rather
+    # than be interpreted differently from branch protection.
+    regexp_classes = {
+        "d": "[0-9]",
+        "D": "[^0-9]",
+        "s": r"[\t\n\f\r ]",
+        "S": r"[^\t\n\f\r ]",
+        "w": "[0-9A-Za-z_]",
+        "W": "[^0-9A-Za-z_]",
+    }
+    class_fragments = {
+        "d": "0-9",
+        "s": r"\t\n\f\r ",
+        "w": "0-9A-Za-z_",
+    }
+    control_escapes = frozenset("aftnrv")
+
+    def compile_escape(*, in_character_class: bool) -> str:
+        nonlocal pos
+        if pos >= len(pattern):
+            raise GiteaGlobCompileError("no character to escape")
+
+        escaped = pattern[pos]
+        pos += 1
+        if escaped in control_escapes:
+            return "\\" + escaped
+        if in_character_class and escaped in class_fragments:
+            return class_fragments[escaped]
+        if not in_character_class and escaped in regexp_classes:
+            return regexp_classes[escaped]
+
+        # Go/RE2 accepts an escaped ASCII punctuation character as that
+        # literal character. Re-escape it for Python instead of passing the
+        # raw sequence through (whose meaning may differ).
+        if (
+            escaped.isascii()
+            and 0x20 <= ord(escaped) <= 0x7E
+            and not escaped.isalnum()
+        ):
+            return re.escape(escaped)
+
+        raise GiteaGlobCompileError(f"unsupported regexp escape \\{escaped}")
+
+    def compile_chars() -> str:
+        nonlocal pos
+        result = ""
+        if pos < len(pattern) and pattern[pos] == "!":
+            pos += 1
+            result += "^"
+        while pos < len(pattern):
+            c = pattern[pos]
+            pos += 1
+            if c == "]":
+                return "[" + result + "]"
+            if c == "[":
+                # Go/RE2 accepts POSIX named classes such as ``[[:alpha:]]``;
+                # Python's regexp parser gives the same bytes nested-set
+                # semantics. This conservative port does not translate that
+                # syntax, so reject it instead of widening/narrowing the
+                # branch-protection policy. A literal '[' remains available
+                # as ``\[`` below.
+                raise GiteaGlobCompileError(
+                    "nested/POSIX character classes are unsupported"
+                )
+            if c == "\\":
+                if pos >= len(pattern):
+                    raise GiteaGlobCompileError("unterminated character class escape")
+                result += compile_escape(in_character_class=True)
+            else:
+                result += c
+        raise GiteaGlobCompileError("unterminated character class")
+
+    def compile_part(subpattern: bool) -> str:
+        nonlocal pos
+        result = ""
+        while pos < len(pattern):
+            c = pattern[pos]
+            pos += 1
+            if subpattern and c == "}":
+                return "(?:" + result + ")"
+            if c == "*":
+                if pos < len(pattern) and pattern[pos] == "*":
+                    pos += 1
+                # Gitea calls glob.Compile(ctx) without separators, so single
+                # and double star both match any sequence of characters.
+                result += ".*"
+            elif c == "?":
+                result += "."
+            elif c == "[":
+                result += compile_chars()
+            elif c == "{":
+                result += compile_part(True)
+            elif c == "," and subpattern:
+                result += "|"
+            elif c == "\\":
+                result += compile_escape(in_character_class=False)
+            else:
+                result += re.escape(c)
+        # This intentionally mirrors Gitea's compiler: an opening brace that
+        # reaches EOF returns the compiled subexpression rather than raising.
+        return result
+
+    try:
+        return re.compile(r"\A" + compile_part(False) + r"\Z", re.ASCII)
+    except re.error as exc:
+        raise GiteaGlobCompileError(str(exc)) from exc
+
+
 def required_contexts_green(
     latest_statuses: dict[str, dict],
     contexts: list[str],
 ) -> tuple[bool, list[str]]:
+    # Gitea branch protection uses GLOB patterns in status_check_contexts —
+    # most importantly the bare "*" ("every POSTED commit status must be
+    # success"), but also narrower forms like "CI /*". Reading a glob
+    # literally (`latest_statuses.get("*")` -> None -> "missing") made this
+    # return (False, ["*=missing"]) for EVERY PR, including a fully green one —
+    # so the queue decided `wait` on all of them and step 4b (the
+    # `.gitea/required-contexts.txt` presence check) was never reached. The
+    # queue thus merged nothing, and every merge on main was performed by a
+    # human (core#4363).
+    #
+    # Each entry is matched with Gitea's real semantics:
+    #   * a GLOB pattern is a SUPERSET check — it matches every posted context
+    #     via the same grammar as modules/glob and requires all matches to be
+    #     `success`.
+    #     A glob that matches ZERO posted contexts is fail-closed: we cannot
+    #     prove any required gate ran, so it WAITs (`<pattern>=no-match`). This
+    #     closes the pre-#4363-followup vacuous-green hole where "*" over an
+    #     empty status set returned green (safety then rested entirely on the
+    #     step-0 critical backstop + step-4b presence check; now this layer
+    #     itself refuses to bless an empty board).
+    #   * a LITERAL entry (no wildcard) is a PRESENCE check — that exact named
+    #     context must be posted AND `success`.
+    # Results are de-duped so a context flagged by more than one pattern is
+    # reported once. (core#4363 + follow-up: glob-generalized, fail-closed on
+    # empty match.)
     missing_or_bad: list[str] = []
-    for context in contexts:
-        status = latest_statuses.get(context)
-        state = status_state(status or {})
-        if state != "success":
-            missing_or_bad.append(f"{context}={state or 'missing'}")
+    seen: set[str] = set()
+
+    def _flag(ctx: str, state: str) -> None:
+        if ctx in seen:
+            return
+        seen.add(ctx)
+        missing_or_bad.append(f"{ctx}={state or 'missing'}")
+
+    for pattern in contexts:
+        try:
+            matcher = _compile_gitea_glob(pattern)
+        except GiteaGlobCompileError:
+            # Gitea drops an uncompileable required pattern from its matcher;
+            # the queue is stricter and makes that policy defect explicit.
+            _flag(pattern, "invalid-glob")
+            continue
+        matches = [c for c in latest_statuses if matcher.fullmatch(c)]
+        if _is_glob(pattern):
+            # Drop the queue's OWN status from wildcard matches ONLY while it
+            # carries no verdict about the PR — see self_status_is_uninformative:
+            #   * `pending`: it stays pending throughout this very run, so
+            #     requiring it green under a glob like "*" is a self-referential
+            #     deadlock (core#4420, see SELF_STATUS_CONTEXT).
+            #   * Gitea's native cancellation stamp: the run was evicted while
+            #     QUEUED in the repo-global concurrency group and never executed
+            #     a step (core#5156). The pre-#5156 code stripped only `pending`
+            #     and justified it with "it self-heals on the next clean tick" —
+            #     that assumption is FALSE for a repo-global group, because the
+            #     evicting run belongs to a different head SHA and no future run
+            #     ever posts to this one again. The red latched forever.
+            # The strip stays fail-closed for everything else: a self-status that
+            # genuinely FAILED/errored is a real red and MUST still block the
+            # merge. A LITERAL requirement is left untouched: a narrow glob
+            # ("CI /*") never matches it anyway, and if a policy deliberately
+            # names it exactly, honor that.
+            matches = [
+                c
+                for c in matches
+                if not (
+                    _SELF_STATUS_RE.fullmatch(c)
+                    and self_status_is_uninformative(latest_statuses.get(c) or {})
+                )
+            ]
+        if not matches:
+            # Fail-closed: a required pattern that matches nothing cannot be
+            # shown green. Preserve the old `missing` wording for plain exact
+            # names; special Gitea patterns report `no-match`.
+            _flag(pattern, "no-match" if _is_glob(pattern) else "missing")
+            continue
+        for ctx in matches:
+            state = status_state(latest_statuses.get(ctx) or {})
+            if state != "success":
+                _flag(ctx, state)
+
     return not missing_or_bad, missing_or_bad
 
 
@@ -798,14 +1278,110 @@ def parse_branch_protection(body: Any) -> BranchProtection:
         required_contexts=contexts,
         required_approvals=required_approvals,
         block_on_rejected_reviews=bool(body.get("block_on_rejected_reviews")),
+        block_on_outdated_branch=bool(body.get("block_on_outdated_branch")),
+    )
+
+
+# Match the `-> HTTP <code>` fragment that api() embeds in every ApiError it
+# raises (`f"{method} {path} -> HTTP {status}: {snippet}"`). Used to tell a
+# DETERMINISTIC permission denial (403) apart from a transient/unknown failure.
+_HTTP_STATUS_RE = re.compile(r"-> HTTP (\d{3})\b")
+
+
+def _apierror_http_status(exc: ApiError) -> int | None:
+    """Best-effort extract of the HTTP status embedded in an ApiError message,
+    or None when the error carries no `-> HTTP <code>` marker (e.g. a non-JSON
+    body error or a locally-raised ApiError)."""
+    m = _HTTP_STATUS_RE.search(str(exc))
+    return int(m.group(1)) if m else None
+
+
+def _fallback_branch_protection(reason: str) -> BranchProtection:
+    """Synthesize a SAFE branch-protection record for the merge-time-authoritative
+    fallback path (see get_branch_protection).
+
+      * required_contexts  -> [] (EMPTY). In fallback mode the client MUST NOT
+        gate on a hard-coded context NAME: the wildcard BP set is `*` (match
+        every posted status), whose case/naming is repo-specific (e.g. this org
+        posts `ci / all-required`, lowercase), and the env REQUIRED_CONTEXTS
+        default is a differently-cased placeholder. A literal client-side name
+        that does not match the repo's actual context would FALSE-WAIT a green
+        PR forever — the exact opposite of unjamming. Deferring the named-context
+        gate to Gitea's server-side `*` check (always case-correct) is both
+        correct and strictly safe: the queue never uses the admin force-override,
+        so Gitea re-checks the full `*` set at write time and 405s any PR with
+        ANY posted context red, which merge_pull HOLDs. The client still keeps
+        its CASE-CORRECT, SSOT-sourced CI backstops that do NOT depend on this
+        field: the step-0 CRITICAL guard (critical_context_prefixes(), derived
+        from the repo's own `.gitea/required-contexts.txt`) and the step-4b
+        ENFORCED-file set (load_enforced_file_contexts, event-suffix-insensitive)
+        — so a PR whose aggregator is red is still refused client-side before any
+        futile merge POST.
+      * required_approvals -> REQUIRED_APPROVALS_DEFAULT, the env approval
+        FLOOR (never 0). This matters because a repo whose BP records
+        required_approvals=0 gets NO server-side approval enforcement from
+        Gitea at merge time, so this client floor is the ONLY approval gate in
+        fallback mode — it must never drop below the SSOT floor.
+      * block_on_outdated_branch -> False: take the #2358 direct-merge path; a
+        stale head Gitea still 405s server-side and merge_pull HOLDs it.
+
+    fallback=True flags every consumer that the authority is Gitea's merge-time
+    check, not this record.
+    """
+    print(
+        "::warning::branch protection unreadable to the queue merge actor "
+        f"({reason}); entering GITEA-AUTHORITATIVE FALLBACK: the protected "
+        "merge endpoint re-checks the wildcard branch protection server-side and "
+        "rejects (405) any under-approved / red / stale-head PR. Client keeps its "
+        "SSOT-sourced backstops (critical-context + enforced-file CI gates + the "
+        f"approval floor REQUIRED_APPROVALS={REQUIRED_APPROVALS_DEFAULT}) and defers "
+        "the named required-context set to Gitea. This grants the queue NO new "
+        "privilege — it merges strictly less than Gitea itself allows."
+    )
+    return BranchProtection(
+        required_contexts=[],
+        required_approvals=REQUIRED_APPROVALS_DEFAULT,
+        block_on_rejected_reviews=True,
+        block_on_outdated_branch=False,
+        fallback=True,
     )
 
 
 def get_branch_protection(branch: str) -> BranchProtection:
-    """Fetch branch protection for `branch`; fail-closed if unavailable."""
+    """Fetch branch protection for `branch`.
+
+    The `/branch_protections/{branch}` READ endpoint is ADMIN-only in Gitea
+    ("user should be an owner or a collaborator with admin write"). The queue's
+    non-bypass merge actor is deliberately a WRITE collaborator (least
+    privilege — write is all it needs to MERGE), so this read can legitimately
+    return 403 while the actor still has full authority to merge. Fail-closing
+    on that 403 would red-stamp `gitea-merge-queue / queue` on EVERY PR under a
+    `['*']` BP and jam the whole repo (the exact regression this fixes: the CP
+    merge actor was reset admin->write and the queue died).
+
+    A 403 is a DETERMINISTIC permission state — re-reading will never succeed,
+    so holding forever is wrong. Instead FALL BACK to Gitea's own
+    merge-time enforcement: build a safe env-derived BranchProtection
+    (fallback=True) and let the protected merge endpoint be the authoritative
+    gate. It remains IMPOSSIBLE for the queue to merge anything Gitea would
+    reject: the queue never uses the admin force-override, so Gitea re-checks
+    required approvals + required contexts server-side at write time and 405s an
+    unready PR, which merge_pull converts to a HOLD.
+
+    A NON-403 failure (transient 5xx, network, malformed body) is NOT
+    deterministic and could self-resolve, so it stays FAIL-CLOSED
+    (BranchProtectionUnavailable -> HOLD the tick, retry next tick) rather than
+    dropping to the fallback on a possible Gitea blip.
+    """
     try:
         _, body = api("GET", f"/repos/{OWNER}/{NAME}/branch_protections/{branch}")
     except ApiError as exc:
+        status = _apierror_http_status(exc)
+        if status == 403:
+            return _fallback_branch_protection(
+                f"HTTP 403 reading branch_protections/{branch} "
+                "(merge actor lacks admin read; write is sufficient to merge)"
+            )
         raise BranchProtectionUnavailable(
             f"could not fetch branch protection for {branch}: {exc}"
         ) from exc
@@ -907,6 +1483,7 @@ def is_runtime_bump_exempt(
     required_contexts: list[str],
     latest_runtime_v_tag: str | None,
     rc_active: bool,
+    posted_contexts: list[str] | None = None,
 ) -> tuple[bool, str]:
     """Decide whether a PR is a qualifying runtime-bump eligible for the
     auto-merge exemption. Returns (exempt, reason).
@@ -1022,21 +1599,40 @@ def is_runtime_bump_exempt(
             f"!= latest runtime-v tag={latest_runtime_v_tag!r}",
         )
 
-    # CONDITION 2a: GATE-ADEQUACY (CI side). At least one of the
-    # required contexts (case-insensitive substring match against
-    # RUNTIME_PROVISION_SMOKE_CONTEXTS) must be in the loaded
-    # required_contexts set. Empty required_contexts → fail-closed.
-    if not required_contexts:
-        return False, "required_contexts is empty (no CI gate to verify against)"
-    required_contexts_lower = [c.lower() for c in required_contexts]
+    # CONDITION 2a: GATE-ADEQUACY (CI side). At least one runtime-provision/
+    # compat smoke context (a job that provisions + runs a workspace on the
+    # new runtime — NOT static build/lint) must be REQUIRED, so that "all
+    # required green" (GUARD 4) actually proves the bump safe.
+    #
+    # Under a wildcard BP set ("*"), the BP literals name no contexts, so the
+    # adequacy check must consult the contexts ACTUALLY posted on the PR head:
+    # under "*" every posted context is required-to-be-green, so a smoke
+    # context that ran (is posted) is genuinely a required gate. A smoke job
+    # that never ran is simply absent from the posted set → adequacy fails →
+    # fall back to the 2-genuine path (fail-closed). Without this, ["*"] can
+    # NEVER satisfy adequacy (`'runtime-provision-smoke' in '*'` is False), so
+    # the exemption is dead and every bump PR waits forever for human approvals
+    # (core#4363 made this reachable; before it the queue never got here).
+    if "*" in required_contexts:
+        adequacy_contexts = list(posted_contexts or [])
+        adequacy_src = "posted contexts (wildcard BP)"
+    else:
+        adequacy_contexts = list(required_contexts)
+        adequacy_src = "required_contexts"
+    if not adequacy_contexts:
+        return (
+            False,
+            f"no CI gate to verify adequacy against ({adequacy_src} is empty)",
+        )
+    adequacy_lower = [c.lower() for c in adequacy_contexts]
     has_runtime_smoke = any(
         any(smoke in ctx for smoke in RUNTIME_PROVISION_SMOKE_CONTEXTS)
-        for ctx in required_contexts_lower
+        for ctx in adequacy_lower
     )
     if not has_runtime_smoke:
         return (
             False,
-            f"required_contexts has no runtime-provision/compat smoke "
+            f"{adequacy_src} has no runtime-provision/compat smoke "
             f"(looked for any of: {sorted(RUNTIME_PROVISION_SMOKE_CONTEXTS)})",
         )
 
@@ -1347,27 +1943,6 @@ def pr_has_current_base(pr: dict, commits: list[dict], main_sha: str) -> bool:
     return pr_contains_base_sha(commits, main_sha)
 
 
-def _non_required_red_present(
-    latest: dict[str, dict],
-    required_contexts: list[str],
-) -> bool:
-    """True if any NON-required context is non-success.
-
-    Such reds are the governance/SOP/advisory checks Gitea may still treat as
-    "missing required context" at merge time even though branch protection does
-    not require them. Their presence is what justifies force_merge=true (we
-    have already verified every REQUIRED context is green and approvals are
-    genuine, so force only bypasses these non-required reds).
-    """
-    required = set(required_contexts)
-    for context, status in latest.items():
-        if context in required:
-            continue
-        if status_state(status) != "success":
-            return True
-    return False
-
-
 def _context_base_name(context: str) -> str:
     """Strip the trailing ` (pull_request*)` / ` (push)` event suffix from a
     Gitea status context, returning the stable base name.
@@ -1386,14 +1961,69 @@ def _context_base_name(context: str) -> str:
     return stripped
 
 
-def critical_contexts_block(latest: dict[str, dict]) -> list[str]:
-    """FAIL-CLOSED guard for the CRITICAL_REQUIRED_CONTEXT_PREFIXES.
+def _is_aggregator_sentinel(base_context: str) -> bool:
+    """True for a `<workflow> / all-required` aggregator sentinel (job key ==
+    `all-required`).
 
-    Returns a list of human-readable block reasons; an EMPTY list means every
-    critical context is provably green. A NON-empty list means the merge MUST
-    be refused (this gates the normal AND the force_merge path — see
-    evaluate_merge_readiness, which calls this BEFORE any merge decision incl.
-    force).
+    The job key (the segment after the final ` / `) is compared
+    case-INSENSITIVELY so a repo whose workflow is named `ci` (molecule-
+    controlplane) is matched identically to one named `CI` (molecule-core).
+    The workflow-name segment is preserved verbatim in the returned prefix, so
+    the emitted-context match downstream stays exact.
+    """
+    parts = base_context.rsplit(" / ", 1)
+    if len(parts) != 2:
+        return False
+    workflow, job = parts
+    return bool(workflow.strip()) and job.strip().lower() == "all-required"
+
+
+def critical_context_prefixes(
+    enforced_file_contexts: list[str] | None,
+) -> list[str]:
+    """The per-repo CRITICAL fail-closed context set (zero-drift).
+
+    Priority:
+      1. An explicit `CRITICAL_REQUIRED_CONTEXT_PREFIXES` env override — a repo
+         may still pin critical contexts by name. Used verbatim when non-empty.
+      2. Otherwise DERIVED from this repo's own checked-in SSOT
+         (`.gitea/required-contexts.txt` → ``enforced_file_contexts``): every
+         ENFORCED `<workflow> / all-required` aggregator sentinel.
+
+    This replaces the former hardcoded, molecule-core-specific default
+    (`CI / Platform (Go), CI / all-required`) which phantom-blocked every PR on
+    any repo whose emitted context names differ (molecule-controlplane emits
+    LOWERCASE `ci / all-required` and has no `Platform (Go)` job). The
+    aggregator sentinel is (by lint-required-no-paths + all-required-check)
+    guaranteed non-path-filtered and `needs:` every required job, so requiring
+    IT green — sourced from the SSOT, correctly-cased per repo — is the correct
+    fail-closed backstop for ANY repo.
+
+    Returns [] only when neither source yields a context (a genuine
+    misconfiguration — no override AND an SSOT with no all-required sentinel);
+    the caller (critical_contexts_block) fail-closes on empty.
+    """
+    if CRITICAL_REQUIRED_CONTEXT_PREFIXES:
+        return list(CRITICAL_REQUIRED_CONTEXT_PREFIXES)
+    derived: list[str] = []
+    for ctx in enforced_file_contexts or []:
+        base = _context_base_name(ctx)
+        if _is_aggregator_sentinel(base) and base not in derived:
+            derived.append(base)
+    return derived
+
+
+def critical_contexts_block(
+    latest: dict[str, dict], critical_prefixes: list[str]
+) -> list[str]:
+    """FAIL-CLOSED guard for the per-repo CRITICAL context set.
+
+    ``critical_prefixes`` is the repo-correct critical set from
+    :func:`critical_context_prefixes` (SSOT-derived aggregator sentinel(s), or an
+    explicit env override). Returns a list of human-readable block reasons; an
+    EMPTY list means every critical context is provably green. A NON-empty list
+    means the merge MUST be refused (evaluate_merge_readiness calls this before
+    any merge decision).
 
     Fail-closed semantics (RCA core#1676):
       * A critical context that is failure/error/skipped/missing → BLOCK.
@@ -1402,12 +2032,33 @@ def critical_contexts_block(latest: dict[str, dict]) -> list[str]:
         canonical case — a skipped aggregator sentinel means nothing gated
         the required jobs.)
       * Only `success` clears a critical context.
+      * Gitea 1.27 filtered-workflow placeholders never reach this function
+        (latest_statuses_by_context drops them): the PR head's
+        `CI / all-required (push)` placeholder is not a flavour of the
+        aggregator that ran. A REAL skip keeps its Actions URL and blocks here.
 
     Each critical PREFIX must be matched by at least one observed context whose
     base name equals it AND that context must be `success`. If the prefix is
     not present at all in the statuses, that is ALSO a block (missing == not
     proven green).
     """
+    # Fail-closed empty-guard (core#4363 follow-up). This step-0 backstop is
+    # the last line of defense against a vacuous merge. If the per-repo critical
+    # set is empty (no env override AND the repo's SSOT carries no
+    # `<workflow> / all-required` aggregator sentinel), the loop below would
+    # iterate nothing and return [] — a fail-OPEN that lets a PR with no posted
+    # CI sail through step 0. `push_required_contexts()` raises on its empty
+    # parse for exactly this reason; the critical set must be just as
+    # unforgiving. BLOCK rather than pass vacuously.
+    if not critical_prefixes:
+        return [
+            "critical context set is empty — no CRITICAL_REQUIRED_CONTEXT_"
+            "PREFIXES override AND the repo's .gitea/required-contexts.txt SSOT "
+            "carries no '<workflow> / all-required' aggregator sentinel to derive "
+            "from. The step-0 critical backstop would pass vacuously for ANY PR "
+            "(incl. one with no posted CI). Merge gate HOLDS (fail-closed)."
+        ]
+
     # Map base-name -> set of observed states for that base name.
     observed: dict[str, list[str]] = {}
     for context, status in latest.items():
@@ -1417,7 +2068,7 @@ def critical_contexts_block(latest: dict[str, dict]) -> list[str]:
         observed.setdefault(base, []).append(status_state(status))
 
     reasons: list[str] = []
-    for prefix in CRITICAL_REQUIRED_CONTEXT_PREFIXES:
+    for prefix in critical_prefixes:
         states = observed.get(prefix)
         if not states:
             reasons.append(f"{prefix}=missing (critical context not reported — cannot prove green)")
@@ -1445,24 +2096,25 @@ def evaluate_merge_readiness(
     pr_labels: set[str] | None = None,
     runtime_bump_exempt: bool = False,
     enforced_file_contexts: list[str] | None = None,
+    block_on_outdated_branch: bool = False,
 ) -> MergeDecision:
-    # 0) CRITICAL fail-closed guard (RCA core#1676). Before ANY other gate —
-    #    and BEFORE step 5 computes the force_merge flag — the PR head's
-    #    critical contexts (CI / Platform (Go), CI / all-required) MUST be
-    #    green. This is checked UNCONDITIONALLY, independent of branch
-    #    protection's status_check_contexts, so a force_merge can NEVER bypass
-    #    a red/skipped Platform(Go) or a skipped all-required. #1676 merged red
-    #    because these fell out of the BP-required set and were then swept up
-    #    as "non-required reds" and force-merged. There is no exemption from
-    #    this gate — runtime-bump exemption only bypasses the APPROVALS bar,
-    #    never a red required CI status.
+    # 0) CRITICAL fail-closed guard (RCA core#1676). Before ANY other gate, the
+    #    PR head's per-repo critical context — the repo's own
+    #    `<workflow> / all-required` aggregator sentinel, SSOT-derived from
+    #    enforced_file_contexts (see critical_context_prefixes) — MUST be green.
+    #    This is checked UNCONDITIONALLY, independent of branch protection's
+    #    status_check_contexts. #1676 merged red because the aggregator fell out
+    #    of the BP-required set and the former force path bypassed it. There is
+    #    no exemption from this gate — runtime-bump exemption only bypasses the
+    #    APPROVALS bar, never a red required CI status.
+    critical_prefixes = critical_context_prefixes(enforced_file_contexts)
     pr_latest_critical = latest_statuses_by_context(pr_status.get("statuses") or [])
-    critical_block = critical_contexts_block(pr_latest_critical)
+    critical_block = critical_contexts_block(pr_latest_critical, critical_prefixes)
     if critical_block:
         return MergeDecision(
             False, "wait",
-            "CRITICAL required context(s) not green (fail-closed, force_merge "
-            "cannot bypass): " + "; ".join(critical_block),
+            "CRITICAL required context(s) not green (fail-closed): "
+            + "; ".join(critical_block),
         )
 
     # 1) Main's push-required contexts must be green. Combined state can be
@@ -1520,11 +2172,17 @@ def evaluate_merge_readiness(
             f"need {effective_required_approvals}",
         )
 
-    # 4) Every REQUIRED status context must be green. This includes both
-    #    branch-protection-required contexts AND the hardcoded governance checks
-    #    (qa-review, security-review, sop-checklist). NON-required reds (E2E
-    #    Chat, Staging SaaS, ci-arm64-advisory, continue-on-error jobs) are NOT
-    #    consulted here and must not block.
+    # 4) Every REQUIRED status context must be green (the branch-protection
+    #    status_check_contexts set; the old uniform SOP governance checks were
+    #    removed 2026-07-14). Under the production wildcard BP set ("*"),
+    #    "required" means EVERY POSTED context — so there is NO "non-required
+    #    red" exemption here: a red E2E Chat / Staging SaaS / ci-arm64-advisory /
+    #    continue-on-error job all block, exactly like any other posted red
+    #    (core#4363). Do NOT re-add an advisory-skip branch to
+    #    required_contexts_green — that recreates the PR#3181 fail-open class.
+    #    A genuinely advisory
+    #    check must carry NO commit status (or be excluded from BP), not be
+    #    skipped here.
     latest = latest_statuses_by_context(pr_status.get("statuses") or [])
     ok, missing_or_bad = required_contexts_green(latest, required_contexts)
     if not ok:
@@ -1534,7 +2192,7 @@ def evaluate_merge_readiness(
     #     (internal#3181). This is the SSOT-as-ENFORCED fix: the file is the
     #     documented "required to merge" set, but historically the gate read
     #     ONLY branch protection, so a file entry absent from BP was treated
-    #     as a non-required advisory red and force_merge=true bypassed it —
+    #     as a non-required advisory red and the former force path bypassed it —
     #     exactly how PR#3181 merged with `E2E Staging SaaS (full lifecycle) /
     #     E2E Staging Concierge Creates Workspace` RED.
     #
@@ -1544,8 +2202,7 @@ def evaluate_merge_readiness(
     #     loader excludes the tail) and are therefore NOT enforced — the
     #     sequencing escape hatch that keeps a known-red, tracked check from
     #     freezing the whole queue. Fail-closed: a red/missing enforced context
-    #     returns `wait`, so the flow NEVER reaches the force_merge path below
-    #     for it. This runs AFTER step 4 so a BP-required red is reported first.
+    #     returns `wait`. This runs AFTER step 4 so a BP-required red is reported first.
     # `enforced_file_contexts` here is ALWAYS a real (possibly empty) list:
     # a read FAILURE was converted to an EnforcedContextsUnavailable hold at
     # the call site BEFORE this function runs (RC 13618), so reaching here
@@ -1562,27 +2219,36 @@ def evaluate_merge_readiness(
                 + ", ".join(efbad),
             )
 
-    # 5) DIRECT-MERGE when conflict-free (issue #2358 — throughput fix).
+    # 5) Honor Gitea's live up-to-date branch-protection policy. Core currently
+    #    sets block_on_outdated_branch=true, so a behind-main head must be
+    #    updated and then receive fresh CI/review before any merge attempt.
+    #    Ignoring this field sends an otherwise-ready PR to an inevitable HTTP
+    #    405 and can wedge the queue when its token cannot write hold labels.
+    if block_on_outdated_branch and not pr_has_current_base:
+        return MergeDecision(
+            False,
+            "update",
+            "branch protection requires an up-to-date head; updating with current main",
+        )
+
+    # 5b) DIRECT-MERGE when conflict-free only when branch protection permits
+    #     behind-main heads (issue #2358 — throughput fix).
     #    If Gitea reports the PR conflict-free (mergeable is True), MERGE IT
     #    DIRECTLY even if its head does not yet contain current main. Branch
-    #    protection does NOT require strict up-to-date, so a behind-main but
-    #    conflict-free PR merges cleanly. We deliberately do NOT call
-    #    /pulls/{n}/update first: update triggers Gitea dismiss_stale_approvals,
-    #    which would dismiss the PR's genuine approvals and force a full
-    #    re-review every tick — the rebase-churn bottleneck that collapsed
-    #    throughput to ~0/hr with dozens of mergeable PRs open.
+    #    protection may permit that path. We do not call /update in that policy
+    #    mode because it triggers Gitea dismiss_stale_approvals and forces a
+    #    full re-review every tick — the rebase-churn bottleneck that collapsed
+    #    throughput to ~0/hr.
     #
     #    The merge bar is UNCHANGED: we only reach here with main green +
     #    >= required genuine approvals on the current head + no open
     #    REQUEST_CHANGES + every BP-required context green. The trade-off is
     #    that the PR's CI ran on a possibly-behind base, so a SEMANTIC main-break
     #    is caught by POST-merge main CI (step 1's pause backstop) rather than
-    #    pre-merge. force_merge is used ONLY for missing-but-non-required
-    #    governance reds (required are green + approvals genuine), never to
-    #    bypass a failing required context or an approval shortfall.
+    #    pre-merge.
+    #
     if mergeable is True:
-        force = _non_required_red_present(latest, required_contexts)
-        return MergeDecision(True, "merge", "ready", force=force)
+        return MergeDecision(True, "merge", "ready")
 
     # 6) NOT (yet) mergeable. TRI-STATE, fail-closed — never merge on an unknown.
     #    We MUST distinguish "still computing" (None/missing) from a "definitive
@@ -1669,14 +2335,28 @@ def get_combined_status(sha: str, *, prefer_live: bool = False) -> dict:
         "GET",
         f"/repos/{OWNER}/{NAME}/commits/{sha}/statuses",
     )
-    # Build latest per context: process combined (ascending→reverse=newest
-    # first), then fill gaps from all_statuses (already newest-first).
+    # Build latest per context: process combined first because it is Gitea's
+    # authoritative latest view, then fill its capped/missing contexts from the
+    # complete history.  Do not trust the paginated history's response order:
+    # concurrent status writes can move page boundaries and surface an older
+    # pending row before its newer success row.  Status ids are monotonic, so
+    # sorting by id makes enrichment deterministic across page-order races.
+    #
+    # Gitea 1.27 filtered-workflow placeholders are skipped in BOTH passes, so
+    # a context whose server-reduced latest row is a placeholder falls through
+    # to its newest REAL row from the history (a placeholder must never mask
+    # an earlier real failure), and a placeholder-only context is absent. See
+    # FILTERED_WORKFLOW_PLACEHOLDER_DESCRIPTION.
     latest: dict[str, dict] = {}
-    for status in reversed(sorted(combined_statuses, key=lambda s: s.get("id") or 0)):
+    for status in sorted(combined_statuses, key=status_numeric_id, reverse=True):
+        if is_filtered_workflow_placeholder(status):
+            continue
         ctx = status.get("context")
         if isinstance(ctx, str) and ctx not in latest:
             latest[ctx] = status
-    for status in all_statuses:
+    for status in sorted(all_statuses, key=status_numeric_id, reverse=True):
+        if is_filtered_workflow_placeholder(status):
+            continue
         ctx = status.get("context")
         if isinstance(ctx, str) and ctx not in latest:
             latest[ctx] = status
@@ -1762,6 +2442,50 @@ def post_comment(pr_number: int, body: str, *, dry_run: bool) -> None:
     api("POST", f"/repos/{OWNER}/{NAME}/issues/{pr_number}/comments", body={"body": body})
 
 
+def post_branch_update_comment_best_effort(
+    pr_number: int, body: str, *, dry_run: bool
+) -> None:
+    """Report a successful branch refresh without making it a queue gate.
+
+    AUTO_SYNC_TOKEN intentionally has repository-write but not issue-write
+    scope. Updating a branch is the state transition; the comment is only
+    observability. A 403 here must therefore stay visible while allowing the
+    successful queue tick to finish green.
+    """
+    try:
+        post_comment(pr_number, body, dry_run=dry_run)
+    except (ApiError, urllib.error.URLError, TimeoutError) as exc:
+        sys.stderr.write(
+            f"::warning::could not post branch-update comment to PR "
+            f"#{pr_number}: {exc}; branch update remains successful\n"
+        )
+
+
+def post_skip_comment_best_effort(
+    pr_number: int, body: str, *, dry_run: bool
+) -> None:
+    """Post an early-skip explanation without letting it gate the queue.
+
+    Observable-skip classes (today: fork PRs) get an explanatory PR comment.
+    But the merge-actor token (AUTO_SYNC_TOKEN) intentionally has
+    repository-write without issue-write scope, so this POST 403s. The skip
+    decision is ALREADY made (``reason`` is set) — the comment is pure
+    observability. A failed comment must therefore stay visible (``::warning::``)
+    while allowing the queue tick to CONTINUE to every candidate behind this
+    one: one un-commentable fork PR must never wedge the whole tick and
+    head-of-line-block every ready PR (the serialized queue does not support
+    fork PRs anyway — the PR is skipped whether or not the comment lands). Same
+    graceful-degrade philosophy as the #4505 BP-read fallback.
+    """
+    try:
+        post_comment(pr_number, body, dry_run=dry_run)
+    except (ApiError, urllib.error.URLError, TimeoutError) as exc:
+        sys.stderr.write(
+            f"::warning::could not post skip comment to PR #{pr_number}: "
+            f"{exc}; PR is skipped regardless, continuing queue scan\n"
+        )
+
+
 def update_pull(pr_number: int, *, dry_run: bool) -> None:
     print(f"::notice::updating PR #{pr_number} with base branch via style={UPDATE_STYLE}")
     if dry_run:
@@ -1833,53 +2557,162 @@ def hold_pr(pr_number: int, hold_note: str, *, dry_run: bool) -> None:
     """Apply HOLD_LABEL to a wedged PR so the queue advances past it.
 
     choose_next_queued_issue skips HOLD_LABEL-bearing PRs, so this is the HOL
-    guard: a PR the queue cannot make progress on (permanent permission error
-    or unresolvable branch-update conflict) is held and a human/agent fixes it,
-    rather than the queue re-selecting it every tick forever. If the label
-    cannot be applied we still post the explanatory comment so the wedge is at
-    least visible — but we never loop on the PR.
+    guard when issue writes are available. The comment is observability-only,
+    but the label is the durable opt-out state. If the label cannot be written,
+    raise after attempting the diagnostic comment so main() makes this queue
+    run red. A merge refusal must never be reported as a successful queue tick
+    when no durable hold was recorded (internal#1082).
     """
+    label_exc: ApiError | None = None
     try:
         add_label_by_name(pr_number, HOLD_LABEL, dry_run=dry_run)
-    except ApiError as label_exc:
+    except ApiError as exc:
+        label_exc = exc
         sys.stderr.write(
-            f"::error::could not apply HOLD_LABEL to PR #{pr_number}: {label_exc}\n"
+            f"::error::could not apply HOLD_LABEL to PR #{pr_number}: {exc}\n"
         )
         hold_note += (
             f"\n\n(NOTE: could not apply the hold label automatically: "
-            f"{label_exc}. Please add `{HOLD_LABEL}` manually.)"
+            f"{exc}. Please add `{HOLD_LABEL}` manually.)"
         )
-    post_comment(pr_number, hold_note, dry_run=dry_run)
+    try:
+        post_comment(pr_number, hold_note, dry_run=dry_run)
+    except ApiError as comment_exc:
+        sys.stderr.write(
+            f"::error::could not post hold comment to PR #{pr_number}: "
+            f"{comment_exc}\n"
+        )
+    if label_exc is not None:
+        raise ApiError(
+            f"could not durably hold PR #{pr_number} with `{HOLD_LABEL}` "
+            f"after a permanent queue refusal: {label_exc}"
+        ) from label_exc
 
 
-def merge_pull(pr_number: int, *, dry_run: bool, force: bool = False) -> None:
+def reassert_queue_runner_status(head_sha: str, *, dry_run: bool) -> None:
+    """Replace only non-success queue-runner statuses before protected merge.
+
+    Under wildcard branch protection, Gitea itself still matches the Actions
+    job's in-flight ``gitea-merge-queue / queue`` status even though the
+    user-space readiness gate correctly excludes that gate-runner context.
+    Once every real merge gate and the final live regression check have passed,
+    publish success for the exact runner context so Gitea's ordinary protected
+    endpoint observes the same decision.  Product/test contexts are never
+    written here.  A failed or malformed status write raises and prevents the
+    merge (core#4420; observed in queue run 519372).
+    """
+    live_status = get_combined_status(head_sha, prefer_live=True)
+    latest = latest_statuses_by_context(live_status.get("statuses") or [])
+    for context in sorted(latest):
+        current = latest[context]
+        if not _SELF_STATUS_RE.fullmatch(context):
+            continue
+        if status_state(current) == "success":
+            continue
+
+        print(
+            f"::notice::reasserting queue-runner status '{context}' as success "
+            "before the ordinary protected merge write"
+        )
+        if dry_run:
+            continue
+
+        body: dict[str, Any] = {
+            "state": "success",
+            "context": context,
+            "description": "Merge queue gates passed; protected merge write in progress",
+        }
+        target_url = current.get("target_url")
+        safe_target_re = re.compile(
+            rf"\A/{re.escape(OWNER)}/{re.escape(NAME)}/actions/runs/"
+            r"[0-9]+/jobs/[0-9]+\Z"
+        )
+        if isinstance(target_url, str) and safe_target_re.fullmatch(target_url):
+            body["target_url"] = target_url
+        _, confirmation = api(
+            "POST",
+            f"/repos/{OWNER}/{NAME}/statuses/{head_sha}",
+            body=body,
+        )
+        if (
+            not isinstance(confirmation, dict)
+            or confirmation.get("context") != context
+            or status_state(confirmation) != "success"
+        ):
+            raise ApiError(
+                "queue-runner status write did not confirm success for "
+                f"{context!r} on {head_sha}"
+            )
+
+        # The POST response only proves that Gitea accepted the new row. The
+        # protected merge path reads the separately materialized combined
+        # commit-status view, which can lag briefly. Confirm through that same
+        # live read surface before attempting the ordinary merge endpoint.
+        for attempt in range(1, SELF_STATUS_CONFIRM_ATTEMPTS + 1):
+            visible = get_combined_status(head_sha, prefer_live=True)
+            visible_latest = latest_statuses_by_context(
+                visible.get("statuses") or []
+            )
+            if status_state(visible_latest.get(context, {})) == "success":
+                break
+            if attempt < SELF_STATUS_CONFIRM_ATTEMPTS:
+                time.sleep(SELF_STATUS_CONFIRM_DELAY_SECONDS)
+        else:
+            raise ApiError(
+                "queue-runner status write was accepted but not visible as "
+                f"success for {context!r} on {head_sha} after "
+                f"{SELF_STATUS_CONFIRM_ATTEMPTS} live reads"
+            )
+
+
+def merge_pull(
+    pr_number: int,
+    *,
+    dry_run: bool,
+    head_commit_id: str,
+) -> None:
     payload: dict[str, Any] = {
-        "Do": "merge",
-        "MergeTitleField": f"Merge PR #{pr_number} via Gitea merge queue",
-        "MergeMessageField": (
+        "do": "merge",
+        "merge_title_field": f"Merge PR #{pr_number} via Gitea merge queue",
+        "merge_message_field": (
             "Serialized merge by gitea-merge-queue after current-main, "
             "genuine approvals, and required CI checks were green."
         ),
+        "head_commit_id": head_commit_id,
     }
-    if force:
-        # force_merge bypasses ONLY missing-but-non-required governance
-        # contexts. The caller has already verified required contexts are green
-        # and genuine approvals are present, so this never bypasses a failing
-        # required context or an approval shortfall.
-        payload["force_merge"] = True
-    print(f"::notice::merging PR #{pr_number}{' (force_merge: non-required reds)' if force else ''}")
+    print(f"::notice::merging PR #{pr_number} through the normal protected endpoint")
     if dry_run:
         return
-    try:
-        api("POST", f"/repos/{OWNER}/{NAME}/pulls/{pr_number}/merge", body=payload, expect_json=False)
-    except ApiError as exc:
-        # Re-raise permission-like errors so process_once can HOLD this PR.
-        # 403 = no push access, 404 = repo/pr not found, 405 = not allowed.
-        msg = str(exc)
-        for code in ("403", "404", "405"):
-            if code in msg:
+    # The final live product/required-context re-check is performed by the
+    # caller immediately before this function. Reconcile only the queue's own
+    # gate-runner status with that decision; failure here propagates and no
+    # merge request is sent. This is a normal status write, never an admin or
+    # branch-protection override (core#4420).
+    merge_path = f"/repos/{OWNER}/{NAME}/pulls/{pr_number}/merge"
+    for attempt in range(1, MERGE_STATUS_RETRY_ATTEMPTS + 1):
+        reassert_queue_runner_status(head_commit_id, dry_run=False)
+        try:
+            api("POST", merge_path, body=payload, expect_json=False)
+            return
+        except ApiError as exc:
+            msg = str(exc)
+            status_visibility_race = (
+                re.search(r"-> HTTP 405(?:\D|$)", msg) is not None
+                and "Not all required status checks successful" in msg
+            )
+            if status_visibility_race and attempt < MERGE_STATUS_RETRY_ATTEMPTS:
+                print(
+                    "::warning::protected merge has not observed the confirmed "
+                    "queue-runner success yet; retrying the same ordinary "
+                    f"endpoint ({attempt}/{MERGE_STATUS_RETRY_ATTEMPTS})"
+                )
+                time.sleep(MERGE_STATUS_RETRY_DELAY_SECONDS)
+                continue
+            # Re-raise permission-like errors so process_once can HOLD this PR.
+            # 403 = no push access, 404 = repo/pr not found, 405 = not allowed.
+            if re.search(r"-> HTTP (?:403|404|405)(?:\D|$)", msg):
                 raise MergePermissionError(msg) from exc
-        raise  # re-raise other ApiErrors unchanged
+            raise  # re-raise other ApiErrors unchanged
 
 
 def live_premerge_status_regressions(
@@ -1921,7 +2754,9 @@ def live_premerge_status_regressions(
     regressions: list[str] = []
     # Same order evaluate_merge_readiness checks: critical first (force cannot
     # bypass), then BP+governance required, then the enforced-file SSOT set.
-    critical_block = critical_contexts_block(live_latest)
+    critical_block = critical_contexts_block(
+        live_latest, critical_context_prefixes(enforced_file_contexts)
+    )
     if critical_block:
         regressions.extend(critical_block)
     ok, bad = required_contexts_green(live_latest, required_contexts)
@@ -1936,16 +2771,21 @@ def live_premerge_status_regressions(
 
 def process_once(*, dry_run: bool = False) -> int:
     # Required status contexts come from BRANCH PROTECTION, not a hand-kept env
-    # list. Fail-closed: if BP cannot be enumerated, HOLD the whole tick rather
-    # than merge against an unverified required set.
+    # list. Fail-closed: if BP cannot be enumerated, FAIL the whole tick rather
+    # than merge against an unverified required set or publish a false green.
     try:
         bp = get_branch_protection(WATCH_BRANCH)
     except BranchProtectionUnavailable as exc:
         sys.stderr.write(
-            f"::error::queue held: branch protection for {WATCH_BRANCH} "
-            f"unavailable (fail-closed): {exc}\n"
+            f"::error::queue failed closed: branch protection for {WATCH_BRANCH} "
+            f"unavailable; no merge attempted: {exc}\n"
         )
-        return 0
+        # The hold is safe only if it is also honest. Returning success here
+        # made an approval-triggered consumer publish a green queue context even
+        # though the conductor could not read policy and made no merge attempt
+        # (internal#1084). A transient API failure may retry on the next event or
+        # manual dispatch, but this run must remain non-success.
+        return 1
     # Uniform gate: governance checks are ALWAYS required, even if branch
     # protection does not enumerate them. Deduplicate against BP list.
     contexts = list(dict.fromkeys(bp.required_contexts + GOVERNANCE_REQUIRED_CONTEXTS))
@@ -1959,12 +2799,13 @@ def process_once(*, dry_run: bool = False) -> int:
     # ApiError) BEFORE the candidate loop. We deliberately do NOT catch it:
     # it propagates to main()'s ApiError handler → rc 1 (no merge + operators
     # paged). A vanished merge-gate SSOT is an incident, not a transient to be
-    # held silently — unlike BranchProtectionUnavailable, which can be a Gitea
-    # blip and is held quietly with rc 0.
+    # held silently. BranchProtectionUnavailable is equally non-success: even a
+    # transient Gitea blip cannot produce an honest green queue context.
     enforced_file_contexts = load_enforced_file_contexts(ENFORCED_CONTEXTS_FILE)
     print(
         f"::notice::queue policy from branch protection: "
         f"required_approvals={required_approvals} "
+        f"block_on_outdated_branch={bp.block_on_outdated_branch} "
         f"required_contexts={contexts or '[none]'} "
         f"enforced_file_contexts={enforced_file_contexts or '[none]'}"
     )
@@ -2042,6 +2883,7 @@ def process_once(*, dry_run: bool = False) -> int:
             required_approvals=required_approvals,
             dry_run=dry_run,
             enforced_file_contexts=enforced_file_contexts,
+            block_on_outdated_branch=bp.block_on_outdated_branch,
         )
         if decision is None:
             continue  # not merge-eligible (not-open / opted-out / fork / wrong base)
@@ -2075,7 +2917,7 @@ def process_once(*, dry_run: bool = False) -> int:
                 )
                 hold_pr(pr_number, hold_note, dry_run=dry_run)
                 continue  # held — keep scanning for a mergeable candidate
-            post_comment(
+            post_branch_update_comment_best_effort(
                 pr_number,
                 (
                     f"merge-queue: updated this branch with `{WATCH_BRANCH}` at "
@@ -2103,47 +2945,45 @@ def process_once(*, dry_run: bool = False) -> int:
             # so a genuinely-ready PR behind it can still merge this tick. One
             # extra GET, only for the single candidate about to merge.
             head_sha = ctx.get("head_sha")
-            if isinstance(head_sha, str) and head_sha:
-                regressions = live_premerge_status_regressions(
-                    head_sha,
-                    required_contexts=contexts,
-                    enforced_file_contexts=enforced_file_contexts,
+            if not isinstance(head_sha, str) or not head_sha:
+                print(
+                    f"::notice::PR #{pr_number} SKIPPED: exact head SHA is "
+                    "missing; refusing an unpinned merge request"
                 )
-                if regressions:
-                    print(
-                        f"::notice::PR #{pr_number} SKIPPED: live pre-merge "
-                        f"re-check found {', '.join(regressions)} "
-                        "(snapshot was stale)"
-                    )
-                    continue  # skip — keep scanning for a still-ready candidate
+                continue
+            regressions = live_premerge_status_regressions(
+                head_sha,
+                required_contexts=contexts,
+                enforced_file_contexts=enforced_file_contexts,
+            )
+            if regressions:
+                print(
+                    f"::notice::PR #{pr_number} SKIPPED: live pre-merge "
+                    f"re-check found {', '.join(regressions)} "
+                    "(snapshot was stale)"
+                )
+                continue  # skip — keep scanning for a still-ready candidate
             try:
-                merge_pull(pr_number, dry_run=dry_run, force=decision.force)
+                merge_pull(
+                    pr_number,
+                    dry_run=dry_run,
+                    head_commit_id=head_sha,
+                )
             except MergePermissionError as exc:
-                # Permanent merge failure (HTTP 403/404/405). HOLD this PR by
-                # applying HOLD_LABEL (it becomes an opt-out label, so subsequent
-                # ticks skip it) and CONTINUE scanning so the queue still advances
-                # to the next ready PR this tick rather than stalling.
+                # Normal merge refusal (HTTP 403/404/405). Never bypass it.
+                # HOLD this PR and CONTINUE scanning only when the durable
+                # HOLD_LABEL write succeeds. If the scoped token lacks
+                # write:issue, hold_pr raises so main() returns non-success;
+                # a refused merge with no durable hold must not look green.
                 sys.stderr.write(f"::error::merge permission error for PR #{pr_number}: {exc}\n")
                 hold_note = (
-                    "merge-queue: merge failed with a permanent permission error "
-                    f"({exc}). No available token has Can-merge permission for this "
-                    f"PR. Applied `{HOLD_LABEL}` to unblock the queue (HOL guard). "
-                    f"Fix: grant Can-merge to the queue token, then remove "
-                    f"`{HOLD_LABEL}` to requeue."
+                    "merge-queue: the normal protected merge was refused "
+                    f"({exc}). No force/admin bypass was attempted. Attempted "
+                    f"to apply `{HOLD_LABEL}` so the queue can advance. Re-check "
+                    "branch freshness, required checks, approvals, and token "
+                    f"permissions; then remove `{HOLD_LABEL}` to requeue."
                 )
-                try:
-                    add_label_by_name(pr_number, HOLD_LABEL, dry_run=dry_run)
-                except ApiError as label_exc:
-                    # If we cannot even apply the hold label, fall back to a comment
-                    # so the wedge is at least visible; do NOT loop on this PR.
-                    sys.stderr.write(
-                        f"::error::could not apply HOLD_LABEL to PR #{pr_number}: {label_exc}\n"
-                    )
-                    hold_note += (
-                        f"\n\n(NOTE: could not apply the hold label automatically: "
-                        f"{label_exc}. Please add `{HOLD_LABEL}` manually.)"
-                    )
-                post_comment(pr_number, hold_note, dry_run=dry_run)
+                hold_pr(pr_number, hold_note, dry_run=dry_run)
                 continue  # held — keep scanning for a mergeable candidate
             return 0
     return 0
@@ -2322,6 +3162,7 @@ def _evaluate_candidate(
     required_approvals: int,
     dry_run: bool,
     enforced_file_contexts: list[str] | None = None,
+    block_on_outdated_branch: bool = False,
 ) -> tuple[MergeDecision | None, dict]:
     """Evaluate a single auto-discovered candidate against the full merge bar.
 
@@ -2344,7 +3185,12 @@ def _evaluate_candidate(
         # but avoid PR-comment noise for the high-volume skip classes.
         print(f"::notice::PR #{pr_number} {reason}; skipping")
         if pr_comment is not None:
-            post_comment(pr_number, pr_comment, dry_run=dry_run)
+            # Best-effort ONLY: never let an un-postable skip comment (the
+            # merge-actor token lacks write:issue -> 403 on fork PRs) raise out
+            # of _evaluate_candidate and crash the whole tick. Both callers
+            # (the process_once scan loop and enumerate_readiness) then continue
+            # to the remaining candidates. See post_skip_comment_best_effort.
+            post_skip_comment_best_effort(pr_number, pr_comment, dry_run=dry_run)
         return None, ctx
 
     head_sha = pr.get("head", {}).get("sha")
@@ -2414,12 +3260,21 @@ def _evaluate_candidate(
             )
             rc_prs = []
         rc_active = _is_active_release_candidate(prs=rc_prs, pr_number=pr_number)
+        # Under a wildcard BP set the CI-side gate-adequacy check reads the
+        # contexts ACTUALLY posted on the head (base names, event-suffix
+        # stripped), since "*" itself names none. Harmless for a literal BP
+        # set (adequacy then reads required_contexts and ignores this).
+        posted_ctx_base_names = [
+            _context_base_name(c)
+            for c in latest_statuses_by_context(pr_status.get("statuses") or [])
+        ]
         runtime_bump_exempt, exempt_reason = is_runtime_bump_exempt(
             pr=pr,
             pr_files=pr_files,
             required_contexts=required_contexts,
             latest_runtime_v_tag=latest_tag,
             rc_active=rc_active,
+            posted_contexts=posted_ctx_base_names,
         )
     except (ApiError, ValueError, TypeError) as exc:
         # API error fetching diff / tag / RC status → fail-closed:
@@ -2450,6 +3305,7 @@ def _evaluate_candidate(
         pr_labels=pr_labels,
         runtime_bump_exempt=runtime_bump_exempt,
         enforced_file_contexts=enforced_file_contexts,
+        block_on_outdated_branch=block_on_outdated_branch,
     )
     return decision, ctx
 
@@ -2507,6 +3363,7 @@ def enumerate_readiness(*, dry_run: bool = False) -> list[ReadinessEntry]:
                 required_approvals=required_approvals,
                 dry_run=dry_run,
                 enforced_file_contexts=enforced_file_contexts,
+                block_on_outdated_branch=bp.block_on_outdated_branch,
             )
         except ApiError as exc:
             # Fail-closed per candidate: an unreadable PR is recorded as

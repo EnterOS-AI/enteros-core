@@ -25,9 +25,8 @@ package handlers
 // for a provider the workspace never uses.
 //
 // MINIMAX_BASE_URL is set to api.minimax.io (NOT api.minimaxi.com) —
-// the global endpoint matches the keys all operator-host secrets are
-// issued against. See RFC internal#417 §Phase 1 for the regional
-// ambiguity table.
+// the global endpoint matches the platform's default credential region.
+// Deployments using the China endpoint must set MINIMAX_BASE_URL explicitly.
 //
 // Every entry MUST carry the provider's OpenAI-compatible version segment
 // (/v1, /openai/v1, /v2). The in-workspace adapters build the request URL

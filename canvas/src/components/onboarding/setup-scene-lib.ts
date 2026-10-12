@@ -314,7 +314,7 @@ export function humanizeSetupError(
       };
     case WORKSPACE_ERROR_CODES.MissingPlatformProxy:
       return {
-        copy: "That model needs Molecule's hosted proxy (not available self-hosted) — pick a bring-your-own-key model.",
+        copy: "That model needs the Enter OS hosted proxy (not available self-hosted) — pick a bring-your-own-key model.",
         returnToKeyStep: false,
       };
     case WORKSPACE_ERROR_CODES.RuntimeUnsupported:

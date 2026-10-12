@@ -29,10 +29,21 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
 )
+
+// atomicInstallLocks serializes installs per (container, plugin). Boot-install
+// and the post-online reconcile can deliver the same plugin concurrently;
+// without this lock, one delivery's SWAP can move the live dir between the
+// other's `test -d` SNAPSHOT check and its `mv`, failing the whole install
+// with "mv: cannot stat ... No such file or directory" (loud since the
+// 2026-07-19 exec exit-code fix; before that the same race was silently
+// corrupting). Package-level so every PluginsHandler instance in the process
+// shares one lock table.
+var atomicInstallLocks sync.Map // "container\x00plugin" → *sync.Mutex
 
 const (
 	pluginsRoot       = "/configs/plugins"
@@ -91,6 +102,11 @@ func (v installVersion) markerPath() string {
 func (h *PluginsHandler) atomicCopyToContainer(
 	ctx context.Context, containerName, hostDir, pluginName string,
 ) error {
+	lockKey := containerName + "\x00" + pluginName
+	mu, _ := atomicInstallLocks.LoadOrStore(lockKey, &sync.Mutex{})
+	mu.(*sync.Mutex).Lock()
+	defer mu.(*sync.Mutex).Unlock()
+
 	v := newInstallVersion(pluginName)
 
 	// Step 0a: ensure staging + previous root dirs exist (idempotent).

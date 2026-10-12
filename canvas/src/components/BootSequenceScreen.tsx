@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import type { Node } from "@xyflow/react";
-import type { WorkspaceNodeData, BootStep } from "@/store/canvas";
+import type { WorkspaceNodeData, BootStep, BootLogLine } from "@/store/canvas";
 import { WORKSPACE_STATUS } from "@/lib/workspace-status";
 
 /**
@@ -24,9 +25,15 @@ import { WORKSPACE_STATUS } from "@/lib/workspace-status";
  * so a runtime that doesn't yet emit boot events still shows a coherent
  * boot screen rather than a blank panel.
  *
- * The tactile keycap physics (press/pop/glow box-shadow stacks + keyframes)
- * live in styles/boot-sequence.css; this component owns layout + state and
- * uses the canvas semantic Tailwind tokens for everything else.
+ * The tactile keycap physics (press/pop/glow keyframes) live in
+ * styles/boot-sequence.css; this component owns layout + state.
+ * VISUAL LANGUAGE: mirrors the approved "Enter OS — Workspace Boot
+ * Sequence" mockup (artifact bbc372b1, the design SSOT): a CENTERED card
+ * on a near-black page — never full-bleed — all-mono type, a 7+spacebar
+ * keycap grid (the final "go online" step spans the row), violet accent /
+ * amber running / green ok, and a grammar-highlighted watchdog log. All
+ * colors come from the --eos-* tokens pinned under `.mol-boot`, NOT the
+ * canvas app theme, so the screen is identical in light and dark themes.
  */
 
 /** Default ordered boot plan — the sensible fallback keycap set when the
@@ -52,16 +59,6 @@ const DEFAULT_BOOT_PLAN: { key: string; label: string }[] = [
   { key: "ONLINE", label: "Go online" },
 ];
 
-/** A single log line rendered in the watchdog terminal. */
-interface WatchLine {
-  id: string;
-  /** monotonic seconds since the boot screen mounted, e.g. "2.4s". */
-  t: string;
-  /** running | ok | failed — drives the line color. */
-  status: "running" | "ok" | "failed" | "info";
-  text: string;
-}
-
 /** Per-keycap view model derived from the received steps (or the default
  *  plan when none have arrived). */
 interface KeyView {
@@ -83,6 +80,30 @@ interface Props {
    * rendered non-interactive (never clickable) so it never looks clickable
    * with nothing behind it. */
   onEnter?: () => void;
+}
+
+/** Grammar-highlight one watchdog line, mockup-style: state words render
+ *  green-bold (ready / OK / connected / ONLINE / up / done), references
+ *  render violet (`:8642` ports, `@pkg@1.2.3` specs). Pure text-in,
+ *  spans-out — the line's textContent is unchanged, so tests and e2e
+ *  substring matches keep working. */
+function renderBootLogText(text: string): ReactNode[] {
+  const parts = text.split(/(\bready\b|\bconnected\b|\bONLINE\b|\bOK\b|\bok\b|\bdone\b|\bup\b|:\d{2,5}\b|@[\w./@^~-]+)/);
+  return parts.map((p, i) => {
+    if (i % 2 === 0) return p;
+    if (/^[:@]/.test(p)) {
+      return (
+        <span key={i} className="mol-boot-log-ref">
+          {p}
+        </span>
+      );
+    }
+    return (
+      <span key={i} className="mol-boot-log-kw">
+        {p}
+      </span>
+    );
+  });
 }
 
 export function BootSequenceScreen({ node, onEnter }: Props) {
@@ -108,6 +129,13 @@ export function BootSequenceScreen({ node, onEnter }: Props) {
     const total = Math.max(...sorted.map((s) => s.total), sorted.length);
     const byIndex = new Map<number, BootStep>();
     for (const s of sorted) byIndex.set(s.step, s);
+    // Highest step that has reported anything. ONLY step 1 (the
+    // provisioner's PWR, which deliberately never flips itself to ok — see
+    // provisioner.go startWorkspace) is displayed as implicitly complete
+    // once the runtime's own steps take over; runtime steps report their
+    // own ok/failed, and force-completing them would misreport which step a
+    // hung boot is actually stuck on (out-of-order/concurrent runtimes).
+    const maxReported = sorted[sorted.length - 1]?.step ?? 0;
     const out: KeyView[] = [];
     for (let i = 1; i <= total; i++) {
       const s = byIndex.get(i);
@@ -115,7 +143,14 @@ export function BootSequenceScreen({ node, onEnter }: Props) {
         out.push({
           key: s.key,
           label: s.label,
-          state: s.status === "ok" ? "done" : s.status === "failed" ? "failed" : "running",
+          state:
+            s.status === "ok"
+              ? "done"
+              : s.status === "failed"
+                ? "failed"
+                : s.step === 1 && maxReported > 1
+                  ? "done"
+                  : "running",
         });
       } else {
         // A step index we haven't heard about yet — render a dim placeholder
@@ -140,42 +175,18 @@ export function BootSequenceScreen({ node, onEnter }: Props) {
   const failed = data.status === WORKSPACE_STATUS.Failed || failedStep !== null;
 
   // ── Watchdog log ───────────────────────────────────────────────────────
-  // Derived append-only from the boot steps' messages. Each step's latest
-  // message becomes one log line; we keep our own list keyed by step so the
-  // running→ok transition replaces the running line rather than stacking a
-  // duplicate. Falls back to a single "watchdog attached" line when there
-  // are no events yet.
-  const mountedAt = useRef<number>(Date.now());
-  const seenRef = useRef<Map<number, string>>(new Map());
-  const [log, setLog] = useState<WatchLine[]>([]);
+  // Owned by the store (node.data.bootLog — appended by the BOOT_STEP WS
+  // handler and rebuilt from the server's boot_steps replay on hydrate), so
+  // remounts, reconnects and periodic rehydrates never reset it. Each line
+  // carries its own immutable `t` offset (boot-telemetry.ts) — stable under
+  // remounts, log-cap head drops, and server/client clock skew, unlike the
+  // previous mount-relative clock that showed "11.5s" on a boot already
+  // 3m40s in.
+  const log = useMemo<BootLogLine[]>(
+    () => (Array.isArray(data.bootLog) ? data.bootLog : []),
+    [data.bootLog],
+  );
   const logEndRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    if (!haveEvents) return;
-    const seen = seenRef.current;
-    const additions: WatchLine[] = [];
-    for (const s of [...bootSteps].sort((a, b) => a.step - b.step)) {
-      // Dedup key: step index + status so running and ok both log once.
-      const sig = `${s.step}:${s.status}`;
-      if (seen.get(s.step) === sig) continue;
-      seen.set(s.step, sig);
-      const secs = ((Date.now() - mountedAt.current) / 1000).toFixed(1) + "s";
-      const text =
-        s.message ??
-        (s.status === "ok"
-          ? `${s.label} — done`
-          : s.status === "failed"
-            ? `${s.label} — FAILED`
-            : `${s.label}…`);
-      additions.push({
-        id: `${s.step}-${s.status}-${additions.length}`,
-        t: secs,
-        status: s.status,
-        text,
-      });
-    }
-    if (additions.length > 0) setLog((prev) => [...prev, ...additions]);
-  }, [haveEvents, bootSteps]);
 
   // Auto-scroll the log to the newest line. `scrollIntoView` is optional-called
   // because it is not implemented in every environment (jsdom, some embedded
@@ -214,9 +225,14 @@ export function BootSequenceScreen({ node, onEnter }: Props) {
       ? "Ready"
       : "Booting";
 
+  // Indeterminate boot — no telemetry yet, but the machine IS working.
+  // Animate anyway (staggered keycap shimmer + a sweeping progress bar) so
+  // the pre-telemetry screen never reads as frozen.
+  const indeterminate = !haveEvents && !failed && !online;
+
   return (
     <div
-      className={`flex flex-col h-full min-h-0 overflow-y-auto bg-surface p-4 transition-opacity duration-500 ${
+      className={`mol-boot flex h-full min-h-0 overflow-y-auto p-4 sm:p-6 transition-opacity duration-500 ${
         hit ? "opacity-0" : "opacity-100"
       }`}
       role="status"
@@ -224,163 +240,203 @@ export function BootSequenceScreen({ node, onEnter }: Props) {
       aria-label={`Workspace boot sequence — ${statusLabel}`}
       data-testid="boot-sequence-screen"
     >
-      {/* Header */}
-      <div className="flex items-center justify-between gap-3 mb-4">
-        <div className="min-w-0">
-          <div className="text-[10px] tracking-[0.2em] uppercase text-ink-soft">
-            Provisioning workspace
-          </div>
-          <div className="text-[13px] text-ink truncate font-mono" title={node.id}>
-            {data.name || node.id}
-          </div>
-        </div>
-        <div className="flex items-center gap-2 text-[11px] text-ink-mid border border-line-soft rounded-full px-2.5 py-1 shrink-0">
-          <span
-            aria-hidden="true"
-            className={`w-1.5 h-1.5 rounded-full ${
-              failed ? "bg-bad" : online ? "bg-good" : "bg-warm motion-safe:animate-pulse"
-            }`}
-          />
-          <span>{statusLabel}</span>
-          <span className="text-ink-soft">
-            · <span className="text-ink">{runtime}</span>
-          </span>
-        </div>
-      </div>
-
-      {/* Keycap deck */}
-      <div className="grid grid-cols-4 gap-2.5 rounded-2xl p-3.5 mb-4 bg-surface-sunken border border-line-soft [box-shadow:inset_0_2px_14px_rgba(0,0,0,0.4)]">
-        {keys.map((k, i) => {
-          const fillWidth =
-            k.state === "done" || k.state === "failed" ? "100%" : k.state === "running" ? "72%" : "0%";
-          const fillColor =
-            k.state === "done" ? "var(--color-good)" : k.state === "failed" ? "var(--color-bad)" : "var(--color-warm)";
-          const codeColor =
-            k.state === "done" ? "text-good" : k.state === "failed" ? "text-bad" : k.state === "running" ? "text-warm" : "text-ink-soft";
-          const codeLabel =
-            k.state === "done" ? "ok" : k.state === "failed" ? "error" : k.state === "running" ? "run" : "idle";
-          return (
-            <div
-              key={`${k.key}-${i}`}
-              className={`mol-boot-key px-2.5 pt-3.5 pb-7 text-center ${
-                k.state === "running" ? "is-active" : k.state === "done" ? "is-done" : k.state === "failed" ? "is-failed" : ""
-              }`}
-              aria-label={`${k.label}: ${codeLabel}`}
+      {/* Centered card — the mockup never stretches full-bleed. */}
+      <div className="mol-boot-card m-auto p-5 sm:p-7">
+        {/* Header — return-key tile, eyebrow + workspace name, status pill */}
+        <div className="flex items-center justify-between gap-3 mb-5">
+          <div className="flex items-center gap-3.5 min-w-0">
+            <span
+              aria-hidden="true"
+              className="mol-boot-icon flex items-center justify-center w-9 h-9 shrink-0 text-white text-[17px]"
             >
-              <span className="block text-[15px] font-extrabold tracking-wide text-ink leading-none mb-1.5">
-                {k.key}
-              </span>
-              <span className={`absolute top-2 right-2.5 text-[8px] tracking-widest uppercase ${codeColor}`}>
-                {codeLabel}
-              </span>
-              <span className="block text-[9px] leading-tight text-ink-mid min-h-[24px]">
-                {k.label}
-              </span>
-              <span className="absolute left-3 right-3 bottom-2.5 h-[3px] rounded bg-white/[0.06] overflow-hidden">
-                <span
-                  className="mol-boot-key-fill block h-full rounded"
-                  style={{ width: fillWidth, background: fillColor, boxShadow: `0 0 8px ${fillColor}` }}
-                />
-              </span>
+              ⏎
+            </span>
+            <div className="min-w-0">
+              <div className="text-[10px] font-medium tracking-[0.22em] uppercase text-[var(--eos-fg-dim)]">
+                Provisioning workspace
+              </div>
+              <div className="text-[13px] text-[var(--eos-fg)] truncate mt-0.5" title={node.id}>
+                {data.name || node.id}
+              </div>
             </div>
-          );
-        })}
-      </div>
-
-      {/* Overall progress */}
-      <div className="flex items-center gap-3 mb-4">
-        <div className="flex-1 h-1.5 rounded bg-white/5 border border-line-soft overflow-hidden">
-          <span
-            className="block h-full transition-[width] duration-500 ease-out"
-            style={{
-              width: `${pct}%`,
-              background: failed
-                ? "linear-gradient(90deg, var(--color-bad), var(--color-bad))"
-                : "linear-gradient(90deg, var(--color-accent-strong), var(--color-accent))",
-              boxShadow: failed
-                ? "0 0 14px color-mix(in srgb, var(--color-bad) 60%, transparent)"
-                : "0 0 14px var(--color-accent)",
-            }}
-          />
+          </div>
+          <div className="flex items-center gap-2 text-[11px] text-[var(--eos-fg-muted)] border border-[var(--eos-border)] rounded-full px-3 py-1.5 shrink-0 bg-black/20">
+            <span
+              aria-hidden="true"
+              className={`w-1.5 h-1.5 rounded-full ${failed || online ? "" : "motion-safe:animate-pulse"}`}
+              style={{
+                background: failed
+                  ? "var(--eos-bad)"
+                  : online
+                    ? "var(--eos-good)"
+                    : "var(--eos-warm)",
+              }}
+            />
+            <span>{statusLabel}</span>
+            <span className="text-[var(--eos-fg-dim)]">
+              · runtime <span className="text-[var(--eos-fg)] font-semibold">{runtime}</span>
+            </span>
+          </div>
         </div>
-        <div className="text-[11px] text-ink-mid tabular-nums min-w-[64px] text-right">
-          <span className="text-ink">{pct}</span>% · {doneCount}/{total}
-        </div>
-      </div>
 
-      {/* Watchdog log */}
-      <div className="rounded-xl border border-line-soft overflow-hidden mb-4 bg-surface-sunken">
-        <div className="flex items-center gap-2 px-3 py-2 border-b border-line-soft text-[10px] tracking-[0.16em] uppercase text-ink-mid">
+        {/* Keycap deck — auto-fit columns; the final "go online" step spans
+            the row like the mockup's wide NET spacebar. */}
+        <div
+          className="grid gap-2.5 rounded-xl p-3.5 mb-4 bg-[var(--eos-deck)] border border-[var(--eos-border)] [box-shadow:inset_0_2px_14px_rgba(0,0,0,0.45)]"
+          style={{ gridTemplateColumns: "repeat(auto-fit, minmax(96px, 1fr))" }}
+        >
+          {keys.map((k, i) => {
+            const isWide = i === keys.length - 1 && keys.length >= 4;
+            const fillWidth = k.state === "idle" ? "0%" : "100%";
+            const codeColor =
+              k.state === "done"
+                ? "text-[var(--eos-good)]"
+                : k.state === "failed"
+                  ? "text-[var(--eos-bad)]"
+                  : k.state === "running"
+                    ? "text-[var(--eos-warm)]"
+                    : "text-[var(--eos-fg-dim)]";
+            const codeLabel =
+              k.state === "done" ? "ok" : k.state === "failed" ? "error" : k.state === "running" ? "run" : "idle";
+            return (
+              <div
+                key={`${k.key}-${i}`}
+                className={`mol-boot-key px-2.5 ${isWide ? "pt-5 pb-8" : "pt-4 pb-7"} text-center ${
+                  k.state === "running" ? "is-active" : k.state === "done" ? "is-done" : k.state === "failed" ? "is-failed" : indeterminate ? "is-waiting" : ""
+                }`}
+                style={{
+                  ...(indeterminate ? ({ "--mol-boot-i": i } as CSSProperties) : {}),
+                  ...(isWide ? { gridColumn: "1 / -1" } : {}),
+                }}
+                aria-label={`${k.label}: ${codeLabel}`}
+              >
+                <span className="block text-[15px] font-bold tracking-[0.08em] text-[var(--eos-fg)] leading-none mb-1.5">
+                  {k.key}
+                </span>
+                <span className={`absolute top-2 right-2.5 text-[8px] tracking-widest uppercase ${codeColor}`}>
+                  {codeLabel}
+                </span>
+                <span className={`block text-[9.5px] leading-tight text-[var(--eos-fg-muted)] ${isWide ? "" : "min-h-[24px]"}`}>
+                  {k.label}
+                </span>
+                {/* Fill color/glow are owned by the keycap state classes in
+                    boot-sequence.css; only the width is per-key state here. */}
+                <span className="absolute left-3 right-3 bottom-2.5 h-[3px] rounded-[2px] bg-white/[0.06] overflow-hidden">
+                  <span className="mol-boot-key-fill block h-full rounded-[2px]" style={{ width: fillWidth }} />
+                </span>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Overall progress */}
+        <div className="flex items-center gap-3 mb-4">
+          <div className="flex-1 h-1 rounded-full bg-white/5 overflow-hidden">
+            <span
+              className={`block h-full rounded-full transition-[width] duration-500 ease-out ${
+                indeterminate ? "mol-boot-bar-indeterminate" : ""
+              }`}
+              style={{
+                width: indeterminate ? "100%" : `${pct}%`,
+                background: indeterminate
+                  ? undefined
+                  : failed
+                    ? "var(--eos-bad)"
+                    : "linear-gradient(90deg, var(--eos-accent-strong), var(--eos-accent))",
+                boxShadow: failed
+                  ? "0 0 12px color-mix(in srgb, var(--eos-bad) 60%, transparent)"
+                  : "0 0 12px color-mix(in srgb, var(--eos-accent) 60%, transparent)",
+              }}
+            />
+          </div>
+          <div className="text-[11px] text-[var(--eos-fg-dim)] tabular-nums min-w-[64px] text-right">
+            <span className="text-[var(--eos-fg)]">{pct}</span>% · {doneCount}/{total}
+          </div>
+        </div>
+
+        {/* Watchdog log */}
+        <div className="rounded-xl border border-[var(--eos-border)] overflow-hidden mb-4 bg-[var(--eos-deck)]">
+          <div className="flex items-center gap-2 px-3.5 py-2 border-b border-[var(--eos-border)] text-[10px] font-medium tracking-[0.18em] uppercase text-[var(--eos-fg-dim)]">
+            <span
+              aria-hidden="true"
+              className="w-1.5 h-1.5 rounded-full bg-[var(--eos-accent)] motion-safe:animate-pulse"
+            />
+            Watchdog · live boot telemetry
+          </div>
+          <ul className="mol-boot-log m-0 px-3.5 py-2.5 h-[150px] overflow-y-auto text-[12px] leading-[1.85]">
+            {log.length === 0 ? (
+              <li className="flex gap-3 text-[var(--eos-fg-muted)] mol-boot-logline">
+                <span className="text-[var(--eos-fg-dim)] tabular-nums shrink-0">0.0s</span>
+                <span>
+                  watchdog attached · waiting for boot telemetry
+                  <span className="motion-safe:animate-pulse"> …</span>
+                </span>
+              </li>
+            ) : (
+              log.map((l) => (
+                <li
+                  key={l.id}
+                  className={`flex gap-3 mol-boot-logline ${
+                    l.status === "ok"
+                      ? "text-[var(--eos-fg-muted)]"
+                      : l.status === "failed"
+                        ? "text-[var(--eos-bad)]"
+                        : "text-[var(--eos-warm)]"
+                  }`}
+                >
+                  <span className="text-[var(--eos-fg-dim)] tabular-nums shrink-0">
+                    {(l.t / 1000).toFixed(1)}s
+                  </span>
+                  <span className="whitespace-pre-wrap">
+                    {l.status === "running" && <span aria-hidden="true">› </span>}
+                    {renderBootLogText(l.text)}
+                  </span>
+                </li>
+              ))
+            )}
+            <div ref={logEndRef} />
+          </ul>
+        </div>
+
+        {/* Failure banner — a stuck boot fails loud, with the reason inline. */}
+        {failedStep && (
+          <div
+            role="alert"
+            className="rounded-xl border border-[color-mix(in_srgb,var(--eos-bad)_40%,transparent)] bg-[color-mix(in_srgb,var(--eos-bad)_12%,transparent)] px-3.5 py-2.5 mb-4 text-[11.5px] text-[var(--eos-bad)] leading-relaxed"
+          >
+            <span className="font-semibold">Boot failed at {failedStep.label}.</span>{" "}
+            {bootSteps.find((s) => s.label === failedStep.label && s.status === "failed")?.message ??
+              "The runtime reported this step could not complete."}
+          </div>
+        )}
+
+        {/* ENTER OS bar — armed/hit treatments live in boot-sequence.css. */}
+        <button
+          type="button"
+          disabled={!interactive}
+          onClick={interactive ? onEnter : undefined}
+          aria-label={armed ? "Enter OS — workspace ready" : failed ? "Boot failed" : "Enter OS — locked, boot in progress"}
+          className={`mol-boot-enter relative w-full flex items-center justify-center gap-3.5 px-5 py-5 text-[16px] font-bold tracking-[0.22em] ${
+            armed
+              ? `is-armed ${interactive ? "cursor-pointer" : "cursor-default"}`
+              : hit
+                ? "is-hit"
+                : "cursor-not-allowed"
+          }`}
+        >
           <span
             aria-hidden="true"
-            className="w-1.5 h-1.5 rounded-full bg-accent motion-safe:animate-pulse"
-          />
-          Watchdog · live boot telemetry
-        </div>
-        <ul className="m-0 px-3 py-2.5 h-[140px] overflow-y-auto text-[11.5px] leading-relaxed font-mono">
-          {!haveEvents ? (
-            <li className="flex gap-2 text-ink-mid mol-boot-logline">
-              <span className="text-ink-soft tabular-nums shrink-0">0.0s</span>
-              <span>
-                watchdog attached · waiting for boot telemetry
-                <span className="motion-safe:animate-pulse"> …</span>
-              </span>
-            </li>
-          ) : (
-            log.map((l) => (
-              <li
-                key={l.id}
-                className={`flex gap-2 mol-boot-logline ${
-                  l.status === "ok"
-                    ? "text-ink"
-                    : l.status === "failed"
-                      ? "text-bad"
-                      : l.status === "running"
-                        ? "text-warm"
-                        : "text-ink-mid"
-                }`}
-              >
-                <span className="text-ink-soft tabular-nums shrink-0">{l.t}</span>
-                <span className="whitespace-pre-wrap">{l.text}</span>
-              </li>
-            ))
-          )}
-          <div ref={logEndRef} />
-        </ul>
+            className="absolute left-3.5 bottom-2 text-[9px] font-normal tracking-[0.08em] text-[var(--eos-fg-dim)]"
+          >
+            enter
+          </span>
+          <span className="text-[17px] opacity-70" aria-hidden="true">⏎</span>
+          <span>{failed ? "BOOT FAILED" : "ENTER OS"}</span>
+          <span className="mol-boot-enter-sub text-[10.5px] font-medium tracking-[0.12em] uppercase opacity-75">
+            {failed ? `halted at step ${(failedStep && keys.indexOf(failedStep) + 1) || "?"}/${total}` : armed ? "ready · entering…" : "locked · boot in progress"}
+          </span>
+        </button>
       </div>
-
-      {/* Failure banner — a stuck boot fails loud, with the reason inline. */}
-      {failedStep && (
-        <div
-          role="alert"
-          className="rounded-xl border border-bad/40 bg-bad/10 px-3.5 py-2.5 mb-4 text-[11.5px] text-bad leading-relaxed"
-        >
-          <span className="font-semibold">Boot failed at {failedStep.label}.</span>{" "}
-          {bootSteps.find((s) => s.label === failedStep.label && s.status === "failed")?.message ??
-            "The runtime reported this step could not complete."}
-        </div>
-      )}
-
-      {/* ENTER OS key */}
-      <button
-        type="button"
-        disabled={!interactive}
-        onClick={interactive ? onEnter : undefined}
-        aria-label={armed ? "Enter OS — workspace ready" : failed ? "Boot failed" : "Enter OS — locked, boot in progress"}
-        className={`mol-boot-enter w-full flex items-center justify-center gap-3.5 px-5 py-4 rounded-[14px] font-mono text-[16px] font-extrabold tracking-[0.14em] border ${
-          armed
-            ? `is-armed text-ink border-accent/60 ${interactive ? "cursor-pointer" : "cursor-default"}`
-            : hit
-              ? "is-hit text-ink border-accent/60"
-              : "text-ink-soft border-line cursor-not-allowed"
-        }`}
-      >
-        <span className="text-[18px] opacity-70" aria-hidden="true">⏎</span>
-        <span>{failed ? "BOOT FAILED" : "ENTER OS"}</span>
-        <span className="text-[11px] font-semibold tracking-[0.1em] uppercase text-ink-soft">
-          {failed ? `halted at step ${(failedStep && keys.indexOf(failedStep) + 1) || "?"}/${total}` : armed ? "ready · entering…" : "locked · boot in progress"}
-        </span>
-      </button>
     </div>
   );
 }

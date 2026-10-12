@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
@@ -61,17 +63,12 @@ var ErrUnresolvableRuntime = errors.New("provisioner: requested runtime has no r
 // pre-build step on the tenant host.
 //
 // The registry prefix is determined by RegistryPrefix() in registry.go;
-// defaults to ghcr.io/molecule-ai (upstream OSS) and is overridden via the
-// MOLECULE_IMAGE_REGISTRY env var in production tenants that mirror to
-// AWS ECR or another registry. The map is computed at package init and
-// captures whatever prefix was active then.
+// it defaults to registry.moleculesai.app/molecule-ai and can be overridden
+// with MOLECULE_IMAGE_REGISTRY for self-hosted/private registries. The map is
+// computed at package init and captures whatever prefix was active then.
 //
-// Legacy local-build path (`docker build -t workspace-template:<runtime>`
-// via scripts/build-images.sh) is still supported for development:
-// when a bare `workspace-template:<runtime>` image is present locally,
-// Docker's image resolver matches it before any pull is attempted. Set
-// the env var WORKSPACE_IMAGE_LOCAL_OVERRIDE=1 (enforced by callers) to
-// short-circuit pulls entirely if needed.
+// Local development uses registry_mode.go's manifest-backed source-build path;
+// there is no in-core workspace-template tree or build-images helper.
 var RuntimeImages = computeRuntimeImages()
 
 // DefaultImage is the fallback workspace Docker image. Computed via RegistryPrefix() so the prefix
@@ -90,12 +87,38 @@ const (
 	// DefaultPort is the port the A2A server listens on inside the container.
 	DefaultPort = "8000"
 
-	// ProvisionTimeout bounds the SaaS/CP provision context (cpProv.Start —
-	// the EC2-launch API call, which returns quickly; the long cold-boot is
-	// owned by the CP bootstrap-watcher + the registry provision-timeout
-	// sweep, not this ctx) and the short DB-lookup nudge at
-	// buildProvisionerConfig. It is deliberately NO LONGER the cap on the
-	// LOCAL docker-build path: a cold `docker build` can legitimately run
+	// ProvisionTimeout BOUNDS NOTHING. As of the CP-mode migration below it has
+	// no remaining call site in this module (the package is internal/, so there
+	// are none outside it either). It is kept as the named record of a value
+	// that must not come back, and because a fresh 3-minute constant is exactly
+	// what someone would otherwise reinvent.
+	//
+	// DO NOT reintroduce it as a provision-context bound. Both times a fixed
+	// 3-minute deadline was applied to "provisioning", it cost a workspace.
+	//
+	// (1) THE CP PROVISION CONTEXT. The claim that this constant could safely
+	// bound it — "cpProv.Start … the provider provision API call, which
+	// returns quickly" — was false, and is the origin of a production defect.
+	// cpProv.Start does NOT return quickly: the control plane resolves the
+	// workspace's image from runtime_image_pins at PROVISION time, so a
+	// workspace created shortly after a runtime-image promote is the one host
+	// that must obtain a freshly promoted multi-GB image (workspace-template-
+	// hermes is 6.89GB) before the call can answer at all. Everything
+	// downstream was sized for that — core#5019 raised provisionHTTPClient to
+	// 20 min, the control plane raised its own pull cap to 30 min with a 2-min
+	// stall window — and this 3-minute ceiling beat all of them, cancelling the
+	// request so the CP's `docker pull` died with it. The signature is
+	// `pull failed: context canceled` in CP stdout, and the workspace is marked
+	// terminally failed. CP-mode callers now derive their deadline from
+	// provisioner.CPProvisionCeiling (see handlers.cpProvisionTimeout), which
+	// is the provision client's own budget and therefore cannot invert.
+	//
+	// The long cold-boot after the box exists is still owned by the CP
+	// bootstrap-watcher + the registry provision-timeout sweep, not by any
+	// context here.
+	//
+	// (2) THE LOCAL DOCKER-BUILD PATH, which it likewise no longer caps:
+	// a cold `docker build` can legitimately run
 	// past 3 min, so the Docker-mode + bundle-import call sites now derive
 	// their deadline from the per-runtime provision timeout (floored at 12m,
 	// see handlers.dockerProvisionTimeout / provisioner.DefaultProvisionCeiling)
@@ -113,9 +136,20 @@ const (
 	WorkspaceKindPlatform = "platform"
 
 	// alpineImage is the digest-pinned alpine image used for throwaway
-	// containers that read/write volumes or migrate data.  Pinning prevents
+	// containers that read/write volumes or migrate data. Pinning prevents
 	// supply-chain drift / compromised-tag attacks (core#2545).
-	// Matches workspace-server/Dockerfile FROM alpine:3.20@sha256:...
+	//
+	// KNOWN SINGLE-ARCH (amd64; runs under Rosetta/QEMU on arm64 hosts). Do
+	// not re-pin to Hub's multi-arch index (tried, reverted in PR #4455): a
+	// new digest exists in no runner cache, and the ephemeral-CP lane's fresh
+	// dind must not pull from Hub anonymously — nor can it be pre-seeded,
+	// because `docker save | docker load` drops RepoDigests. Durable fix:
+	// host a multi-arch index on registry.moleculesai.app (buildx imagetools
+	// create) and re-pin to that.
+	//
+	// Deliberately differs from workspace-server/Dockerfile's base digest
+	// (single-arch mirror re-pin). The CI pre-pull in
+	// .gitea/workflows/local-provision-e2e.yml must match this constant.
 	alpineImageDefault = "alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e"
 )
 
@@ -130,7 +164,7 @@ type WorkspaceConfig struct {
 	WorkspacePath    string            // Host path to bind-mount as /workspace (if empty, uses Docker named volume)
 	Tier             int
 	Runtime          string // "hermes" (default), "claude-code", "codex", "openclaw", etc.
-	InstanceType     string // Optional CP EC2 instance type override (SaaS only)
+	InstanceType     string // Optional provider machine/instance type override (SaaS only)
 	DiskGB           int32  // Optional CP root volume size override in GiB (SaaS only)
 	DataPersistence  string // internal#734: "persist"|"ephemeral"|"" — durable-data choice forwarded to CP (SaaS only)
 	Provider         string // multi-provider RFC: ""/"aws"|"hetzner"|"gcp" compute backend for the workspace box (per-workspace; distinct from LLM/model provider). Forwarded to CP.
@@ -156,11 +190,9 @@ type WorkspaceConfig struct {
 	// and returns the asset file map. nil = no provider wired
 	// (self-host default; falls through to the local TemplatePath
 	// path for the config bundle). For SaaS workspaces, main.go
-	// wires a real impl (Gitea shallow clone). When the fetcher
-	// is set, it MERGES with cfg.ConfigFiles (caller wins on
-	// conflict, like the prior PersistedBundleProvider pattern
-	// in #2831 PIECE 1) so the existing TemplatePath+ConfigFiles
-	// path keeps working for callers that don't opt in.
+	// wires a real implementation backed by the Gitea archive API. Fetched
+	// files remain separate from cfg.ConfigFiles on the CP request wire; the
+	// control plane consumes both fields and materializes their union.
 	TemplateAssetFetcher TemplateAssetFetcher
 
 	// Kind is the workspace kind: "" / "workspace" (ordinary) or "platform"
@@ -278,6 +310,7 @@ type dockerClient interface {
 	ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error)
 	ContainerExecAttach(ctx context.Context, execID string, config container.ExecAttachOptions) (types.HijackedResponse, error)
 	ContainerExecCreate(ctx context.Context, container string, config container.ExecOptions) (container.ExecCreateResponse, error)
+	ContainerExecInspect(ctx context.Context, execID string) (container.ExecInspect, error)
 	ContainerInspect(ctx context.Context, container string) (container.InspectResponse, error)
 	ContainerList(ctx context.Context, options container.ListOptions) ([]container.Summary, error)
 	ContainerLogs(ctx context.Context, container string, options container.LogsOptions) (io.ReadCloser, error)
@@ -304,6 +337,82 @@ type Provisioner struct {
 	// paths — and on a registry-unreachable host would turn each call into a
 	// per-call pull-timeout instead of a single one.
 	alpineEnsureOnce sync.Once
+	// bootStep, when set (SetBootStepEmitter), streams provisioning-phase
+	// boot telemetry (status ∈ running|ok|failed + a human message) for a
+	// workspace. The wiring in cmd/server turns these into BOOT_STEP
+	// broadcasts (step 1, "Provision compute" — the one step of the boot
+	// family the runtime can never emit because it is not running yet).
+	// Without this the canvas watchdog shows "waiting for boot telemetry"
+	// for the entire provisioning phase — on a first local-build boot that
+	// is 5+ silent minutes that read as a hang. nil = no-op.
+	bootStep func(workspaceID, status, message string)
+	// removedCheck (SetWorkspaceRemovedCheck) and the in-flight Start registry
+	// (CancelInflightStart) close the delete-vs-provision race — see
+	// start_delete_guard.go.
+	removedCheck func(ctx context.Context, workspaceID string) bool
+	inflightMu   sync.Mutex
+	inflight     map[string]map[*inflightStart]struct{}
+}
+
+// SetBootStepEmitter wires provisioning-phase boot telemetry (see the
+// bootStep field). Call before the first Start; not synchronized.
+func (p *Provisioner) SetBootStepEmitter(fn func(workspaceID, status, message string)) {
+	p.bootStep = fn
+}
+
+func (p *Provisioner) emitBootStep(workspaceID, status, message string) {
+	if p != nil && p.bootStep != nil {
+		p.bootStep(workspaceID, status, message)
+	}
+}
+
+// buildHeartbeatInterval paces the "still building" telemetry during a
+// local image build. Package-level so the unit test can shrink it.
+var buildHeartbeatInterval = 20 * time.Second
+
+// buildLocalImageWithTelemetry wraps the local-build seam with boot
+// telemetry: an immediate "building" line, a heartbeat while the docker
+// build runs (first boot builds take minutes with no other signal), and a
+// completion line. Cache hits (fast returns) report reuse instead.
+func (p *Provisioner) buildLocalImageWithTelemetry(ctx context.Context, workspaceID, runtime string) (string, error) {
+	p.emitBootStep(workspaceID, "running",
+		fmt.Sprintf("building %s runtime image from template — a first boot can take several minutes", runtime))
+	start := time.Now()
+	done := make(chan struct{})
+	hbStopped := make(chan struct{})
+	go func() {
+		defer close(hbStopped)
+		t := time.NewTicker(buildHeartbeatInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				p.emitBootStep(workspaceID, "running",
+					fmt.Sprintf("still building %s runtime image — %s elapsed", runtime, time.Since(start).Round(time.Second)))
+			}
+		}
+	}()
+	tag, err := ensureLocalImageHook(ctx, runtime)
+	close(done)
+	// JOIN the heartbeat before emitting the completion line: close(done)
+	// only signals it, and an already-in-flight tick could land AFTER the
+	// completion, leaving "still building — Ns elapsed" as the log's last
+	// line (canvas watchdog reads that as an unfinished build; also the
+	// TestBuildTelemetrySlowBuild CI flake). The completion line must be
+	// terminal.
+	<-hbStopped
+	if err != nil {
+		return "", err
+	}
+	if elapsed := time.Since(start); elapsed < 3*time.Second {
+		p.emitBootStep(workspaceID, "running", fmt.Sprintf("runtime image already built — reusing %s", tag))
+	} else {
+		p.emitBootStep(workspaceID, "running",
+			fmt.Sprintf("runtime image ready in %s", time.Since(start).Round(time.Second)))
+	}
+	return tag, nil
 }
 
 // New creates a new Provisioner connected to the local Docker daemon.
@@ -325,14 +434,16 @@ func New() (*Provisioner, error) {
 // per-org tenant's workspace-server does NOT construct a Provisioner (main.go
 // takes the control-plane branch), yet the mol-ws-* workspace containers run on
 // a docker daemon the tenant CAN reach. Without a docker client the plugins /
-// templates / terminal handlers fall back to the retired AWS EIC SSH path and
-// 90-120s-timeout → 502 (core#182 tie-in). Wiring a real client lets plugin
-// delivery use docker CopyToContainer against the mol-ws-* container instead.
+// templates / terminal handlers can fall into the retained legacy AWS EIC SSH
+// compatibility path and 90-120s-timeout → 502 (core#182 tie-in). Wiring a real
+// client lets plugin delivery use docker CopyToContainer against the mol-ws-*
+// container instead.
 //
 // Why a live Ping rather than a hardcoded backend flag: it "waits on the real
-// signal" (no-hardcoding-all-dynamic). A genuine cloud tenant (EC2-per-
-// workspace SaaS) has no local daemon → Ping fails → (nil, false) → the AWS
-// EIC path stays unchanged for real "i-<hex>" instance ids. client.FromEnv
+// signal" (no-hardcoding-all-dynamic). A legacy remote instance has no local
+// daemon → Ping fails → (nil, false), preserving compatibility for existing
+// "i-<hex>" instance ids. Managed local-Docker tenants expose the local daemon.
+// client.FromEnv
 // constructs a client struct even when the daemon is down (errors surface only
 // on first API call), so the Ping is mandatory to distinguish the two backends.
 func NewDockerClientIfReachable(ctx context.Context) (*client.Client, bool) {
@@ -364,10 +475,21 @@ func legacyContainerName(workspaceID string) string {
 	return fmt.Sprintf("ws-%s", id)
 }
 
-// containerNamePrefix is the shared prefix every workspace container
-// name carries (`ws-`). Used by ListWorkspaceContainerIDPrefixes for
-// the Docker name-filter, and by the orphan sweeper to recognise our
-// own containers vs. anything else on the host.
+// containerNamePrefix is the prefix every workspace container THIS
+// package mints carries (`ws-`, see ContainerName). It is a generic
+// workspace descriptor, NOT a brand token, so it survives a rebrand
+// untouched.
+//
+// It is also the Docker name-FILTER used by the list methods below.
+// That filter is a SUBSTRING match, so it also returns the
+// control-plane-minted `<brand>-ws-…` containers that share the daemon
+// — which is exactly what we want, because those are workspace
+// containers too. The precise classification is NOT done here: it is
+// done by parseWorkspaceContainerID in brand_seam.go, which accepts the
+// full union WorkspaceContainerNamePrefixes() returns. Matching on this
+// single token alone would go blind to every brand-prefixed container
+// and false-orphan live workspaces — see brand_seam.go for the failure
+// mode and brand_seam_test.go for its negative control.
 const containerNamePrefix = "ws-"
 
 // LabelManaged is stamped on every workspace container + volume the
@@ -404,9 +526,8 @@ const LabelInstance = "molecule.platform.instance"
 // every workspace template creates and drops to via `gosu agent` before
 // exec'ing the runtime (the a2a_mcp_server runs under this uid). The value is
 // fixed at 1000:1000 across all templates — see:
-//   - workspace-configs-templates/claude-code-default/Dockerfile (`useradd -u 1000 ... agent`)
-//   - workspace-configs-templates/hermes/Dockerfile               (`useradd -u 1000 ... agent`)
-//   - workspace/entrypoint.sh                                     (`exec gosu agent` — "uid 1000")
+//   - standalone workspace-template Dockerfiles (`useradd -u 1000 ... agent`)
+//   - their entrypoint/start scripts             (`exec gosu agent` — "uid 1000")
 //
 // Files the platform injects into /configs AFTER the entrypoint's
 // `chown -R agent:agent /configs` (the post-start #418 re-injection and the
@@ -475,12 +596,18 @@ func PlatformInstanceID() string {
 	return platformInstanceID
 }
 
-// ListWorkspaceContainerIDPrefixes returns the 12-char workspace ID
-// prefixes of every running ws-* container the Docker daemon knows
-// about. The 12-char form matches ContainerName's truncation, so the
-// orphan sweeper can intersect this set against `SELECT
-// substring(id::text, 1, 12) FROM workspaces WHERE status = 'removed'`
-// without an extra round-trip per row.
+// ListWorkspaceContainerIDPrefixes returns the workspace ID prefixes of
+// every workspace container the Docker daemon knows about — every name
+// shape in WorkspaceContainerNamePrefixes(): the `ws-<id>` form this
+// package mints AND the `<brand>-ws-<tenant>-<short>` form the control
+// plane's local-docker backend mints on the same daemon, for the current
+// brand and every legacy brand. A `ws-`-only match here false-orphans
+// live brand-prefixed workspaces (see brand_seam.go).
+//
+// Every returned value is a LEADING SUBSTRING of `workspaces.id::text`,
+// so the orphan sweeper can intersect this set against the workspaces
+// table with a single `id::text LIKE ANY(...)` round-trip instead of one
+// query per row.
 //
 // Returns an empty slice on any Docker error (sweeper treats that as
 // "skip this round" — better than a partial scan that misses leaks).
@@ -501,21 +628,20 @@ func (p *Provisioner) ListWorkspaceContainerIDPrefixes(ctx context.Context) ([]s
 	prefixes := make([]string, 0, len(containers))
 	for _, c := range containers {
 		// Container names from the API include a leading slash:
-		// "/ws-abc123def456". Strip both the slash and our prefix
-		// to recover the 12-char workspace ID.
+		// "/ws-abc123def456". parseWorkspaceContainerID strips the
+		// slash and whichever of the union prefixes
+		// (WorkspaceContainerNamePrefixes) the name carries, returning
+		// the workspace-id prefix in `workspaces.id::text` space.
 		//
 		// The Docker name filter is a SUBSTRING match (not a prefix
 		// match), so something like "my-ws-thing" would also be
-		// returned. The HasPrefix check below is load-bearing:
-		// without it those false positives would flow into the
-		// orphan sweeper's DB query as bogus LIKE patterns.
+		// returned. The anchored prefix check inside
+		// parseWorkspaceContainerID is load-bearing: without it those
+		// false positives would flow into the orphan sweeper's DB
+		// query as bogus LIKE patterns.
 		for _, name := range c.Names {
-			n := strings.TrimPrefix(name, "/")
-			if !strings.HasPrefix(n, containerNamePrefix) {
-				continue
-			}
-			id := strings.TrimPrefix(n, containerNamePrefix)
-			if id == "" {
+			id, ok := parseWorkspaceContainerID(name)
+			if !ok {
 				continue
 			}
 			prefixes = append(prefixes, id)
@@ -567,17 +693,17 @@ func (p *Provisioner) ListManagedContainerIDPrefixes(ctx context.Context) ([]str
 	}
 	prefixes := make([]string, 0, len(containers))
 	for _, c := range containers {
-		// Same name-strip dance as ListWorkspaceContainerIDPrefixes —
-		// label filter is exact (not substring), so any false-positive
-		// must be a non-ws-* container we accidentally labeled. Defence
-		// against a future bug that stamps the label on something else.
+		// Same name parse as ListWorkspaceContainerIDPrefixes — label
+		// filter is exact (not substring), so any false-positive must
+		// be a container outside every workspace name shape that we
+		// accidentally labeled. Defence against a future bug that
+		// stamps the label on something else. Going through the shared
+		// seam also means a labeled container minted under a brand
+		// prefix stays visible to the wiped-DB pass instead of leaking
+		// forever behind a `ws-`-only check.
 		for _, name := range c.Names {
-			n := strings.TrimPrefix(name, "/")
-			if !strings.HasPrefix(n, containerNamePrefix) {
-				continue
-			}
-			id := strings.TrimPrefix(n, containerNamePrefix)
-			if id == "" {
+			id, ok := parseWorkspaceContainerID(name)
+			if !ok {
 				continue
 			}
 			prefixes = append(prefixes, id)
@@ -672,10 +798,34 @@ func resolveStartWorkspaceHostURL(hostPort, boundPort string) string {
 }
 
 // Start provisions and starts a workspace container.
+//
+// The run is registered per workspace so a delete can cancel it and wait for it
+// (CancelInflightStart); a Start abandoned for that reason — or because its
+// removed-check fired — returns ErrWorkspaceRemoved with nothing left behind.
 func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, error) {
 	if p == nil || p.cli == nil {
 		return "", ErrNoBackend
 	}
+	callerCtx := ctx
+	ctx, done := p.trackStart(ctx, cfg.WorkspaceID)
+	defer done()
+	url, err := p.start(ctx, callerCtx, cfg)
+	if err != nil && !errors.Is(err, errRemovedAndDiscarded) && errors.Is(context.Cause(ctx), ErrWorkspaceRemoved) {
+		// Cancelled by a delete mid-flight: whatever step failed on the cancelled
+		// ctx may have left a volume (or a created-not-started container) behind.
+		// Only start's own discard counts as done: a Docker call the cancel cut
+		// off returns an error that itself wraps ErrWorkspaceRemoved.
+		p.discardRemovedWorkspace(ctx, cfg.WorkspaceID)
+		return "", fmt.Errorf("%w: %s (start cancelled: %v)", ErrWorkspaceRemoved, cfg.WorkspaceID, err)
+	}
+	return url, err
+}
+
+// start does the work of Start. ctx is cancelled by a delete
+// (CancelInflightStart); callerCtx is the ctx Start was called with, which only
+// the local image build runs under (buildLocalImageUnlessRemoved).
+func (p *Provisioner) start(ctx, callerCtx context.Context, cfg WorkspaceConfig) (string, error) {
+	p.emitBootStep(cfg.WorkspaceID, "running", "provisioning compute (docker)")
 	name := ContainerName(cfg.WorkspaceID)
 	// KI-013 deploy safety: prefer legacy truncated config volume if it
 	// already exists, so pre-deploy workspace data is not orphaned.
@@ -730,11 +880,11 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	// the SHA-pinned tag of the freshly-built image before ContainerCreate.
 	//
 	// Pinned overrides (cfg.Image set, e.g. via CP's runtime_image_pins for
-	// production thin-AMI launches) bypass this path — they pin a digest
+	// managed launches) bypass this path — they pin a digest
 	// the operator chose explicitly.
 	if cfg.Image == "" && cfg.Runtime != "" {
 		if src := Resolve(); src.Mode == RegistryModeLocal {
-			builtTag, buildErr := ensureLocalImageHook(ctx, cfg.Runtime)
+			builtTag, buildErr := p.buildLocalImageUnlessRemoved(ctx, callerCtx, cfg.WorkspaceID, cfg.Runtime)
 			if buildErr != nil {
 				return "", fmt.Errorf("local-build mode: ensure image for runtime %q: %w", cfg.Runtime, buildErr)
 			}
@@ -799,10 +949,24 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 
 	hostCfg := &container.HostConfig{
 		Binds:         binds,
-		RestartPolicy: container.RestartPolicy{Name: "unless-stopped"},
+		RestartPolicy: workspaceRestartPolicy(),
 		PortBindings: nat.PortMap{
 			nat.Port(DefaultPort + "/tcp"): []nat.PortBinding{
 				{HostIP: "127.0.0.1", HostPort: hostPort}, // Pre-allocated stable host port (#2851)
+			},
+		},
+		// Explicit json-file log driver + rotation for every ws-<id> runtime
+		// container. Dozzle reads container stdout through the json-file driver,
+		// so pinning it here (instead of inheriting a daemon default that may be
+		// a non-readable driver like local/journald/none) guarantees these
+		// containers' logs are captured AND visible in Dozzle, while max-size/
+		// max-file cap on-disk growth at 3 × 10m per workspace. Mirrors the
+		// x-logging anchor the compose services use.
+		LogConfig: container.LogConfig{
+			Type: "json-file",
+			Config: map[string]string{
+				"max-size": "10m",
+				"max-file": "3",
 			},
 		},
 	}
@@ -824,7 +988,7 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 
 	// Resolve the target image platform once so the pull and the
 	// container-create use the same value. On an Apple Silicon dev
-	// laptop the GHCR workspace-template-* images only ship a
+	// laptop the published workspace-template-* images only ship a
 	// linux/amd64 manifest today; without an explicit platform the
 	// daemon asks for linux/arm64/v8 and ImagePull returns
 	// "no matching manifest for linux/arm64/v8 in the manifest list
@@ -835,14 +999,14 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	if IsLocalBuildImage(image) {
 		// Locally-built images were built for localBuildImagePlatform() —
 		// the create MUST match it, not the registry-pull default (which
-		// pins amd64 on Apple Silicon for GHCR-manifest reasons that do
+		// pins amd64 on Apple Silicon for registry-manifest reasons that do
 		// not apply to a local build). core#3502.
 		imgPlatformStr = localBuildImagePlatform()
 	}
 	imgPlatform := parseOCIPlatform(imgPlatformStr)
 
 	// Log image resolution for debugging stale-image issues, and pull from
-	// GHCR so tenant hosts don't need a pre-build step anymore. Two cases
+	// the configured registry so hosts do not need a pre-build step. Two cases
 	// trigger a pull:
 	//   1. Image not present locally — historical behavior (pull-on-miss).
 	//   2. Image present locally AND tag is moving (`:latest`, no tag,
@@ -862,6 +1026,30 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 			name, image, clip(imgInspect.ID, 19), clip(imgInspect.Created, 19))
 	}
 
+	// RC09: the image step above can take minutes (a cold local build), and a
+	// DELETE may have landed meanwhile. Creating ws-<id> now would resurrect a
+	// removed workspace as a crash-looping orphan. Check, and discard instead.
+	if p.workspaceRemoved(ctx, cfg.WorkspaceID) {
+		p.discardRemovedWorkspace(ctx, cfg.WorkspaceID)
+		return "", fmt.Errorf("%w: %s (before container create)", errRemovedAndDiscarded, cfg.WorkspaceID)
+	}
+	// Create the /workspace volume LABELLED too when the tier keeps that bind
+	// (ApplyTierConfig drops it for tier 1; a host-path bind is no volume).
+	// Left to the bind, Docker creates it without labels, and a delete keeps
+	// it by design — so once its container is gone nothing could tell which
+	// platform instance it belongs to. Idempotent for an existing volume.
+	if wsVolume := WorkspaceVolumeName(cfg.WorkspaceID); bindsNamedVolume(hostCfg.Binds, wsVolume) {
+		if _, err := p.cli.VolumeCreate(ctx, volume.CreateOptions{Name: wsVolume, Labels: managedLabels()}); err != nil {
+			return "", fmt.Errorf("failed to ensure workspace volume %s: %w", wsVolume, err)
+		}
+	}
+	// Re-assert the LABELLED config volume right before the create (idempotent).
+	// The bind below auto-creates a missing named volume WITHOUT labels, which
+	// leaves an instance-scoped janitor nothing to recognise it by.
+	if _, err := p.cli.VolumeCreate(ctx, volume.CreateOptions{Name: configVolume, Labels: managedLabels()}); err != nil {
+		return "", fmt.Errorf("failed to ensure config volume %s: %w", configVolume, err)
+	}
+
 	// Create and start container. If the image still isn't available,
 	// Docker returns a generic "No such image" error that's opaque to
 	// operators — wrap it with the resolved tag and the exact pull
@@ -870,7 +1058,7 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	if err != nil {
 		if isImageNotFoundErr(err) {
 			return "", fmt.Errorf(
-				"docker image %q not found after pull attempt — verify GHCR visibility for %s and that the tenant has internet access (underlying error: %w)",
+				"docker image %q not found after pull attempt — verify registry access for %s and that the host can reach the configured registry (underlying error: %w)",
 				image, runtimeTagFromImage(image), err,
 			)
 		}
@@ -897,6 +1085,14 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 		// Clean up created container on start failure
 		_ = p.cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
 		return "", fmt.Errorf("failed to start container: %w", err)
+	}
+
+	// RC09 backstop for the window between the check above and this point: a
+	// delete that marked the row while we created/started must not be outlived
+	// by the container it could not see yet.
+	if p.workspaceRemoved(ctx, cfg.WorkspaceID) {
+		p.discardRemovedWorkspace(ctx, cfg.WorkspaceID)
+		return "", fmt.Errorf("%w: %s (after container start)", errRemovedAndDiscarded, cfg.WorkspaceID)
 	}
 
 	// Verify the started container uses the expected image
@@ -939,6 +1135,10 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	}
 
 	log.Printf("Provisioner: started container %s for workspace %s at %s (advertise: %s, internal: %s)", name, cfg.WorkspaceID, hostURL, advertiseURL, InternalURL(cfg.WorkspaceID))
+	// status stays "running", not "ok": the runtime's own boot steps take the
+	// family over from here, and a green tile before the runtime is actually
+	// online would overstate progress if the container dies on entrypoint.
+	p.emitBootStep(cfg.WorkspaceID, "running", "compute ready — runtime starting")
 	return hostURL, nil
 }
 
@@ -1015,10 +1215,11 @@ func isSCMWriteTokenKey(key string) bool {
 }
 
 var privilegedWorkspaceEnvKeys = map[string]struct{}{
-	"ADMIN_TOKEN":          {},
-	"MOLECULE_ADMIN_TOKEN": {},
-	"CP_ADMIN_API_TOKEN":   {},
-	"CP_ADMIN_TOKEN":       {},
+	"ADMIN_TOKEN":               {},
+	"MOLECULE_ADMIN_TOKEN":      {},
+	"CP_ADMIN_API_TOKEN":        {},
+	"CP_ADMIN_TOKEN":            {},
+	"CP_PROMOTE_PROD_API_TOKEN": {},
 }
 
 func isPrivilegedWorkspaceEnvKey(key string) bool {
@@ -1081,8 +1282,8 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 		// agent that forges an approval has no token to act on it. A
 		// latent path exists (loadPersonaEnvFile merges a per-role
 		// persona `GITEA_TOKEN` into cfg.EnvVars when MOLECULE_PERSONA_ROOT
-		// is set on a tenant host); it is inert today (persona dirs are
-		// operator-host-only) but unguarded. Strip SCM-write tokens here
+		// is mounted); it must remain safe regardless of where that persona
+		// directory is sourced. Strip SCM-write tokens here
 		// by construction so the invariant holds regardless of whether
 		// that path ever becomes reachable.
 		if isSCMWriteTokenKey(k) {
@@ -1118,37 +1319,80 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 		}
 	}
 	// Langfuse tracing (SSOT reproducibility): when the platform has Langfuse
-	// keys in its env, inject them into EVERY workspace container so the shared
-	// runtime's tracing producer emits — no per-workspace secret needed. The
-	// agent reaches Langfuse over the Docker network, so its HOST is the
-	// container-network URL (MOLECULE_WORKSPACE_LANGFUSE_HOST, default
-	// http://langfuse-web:3000), NOT the platform's host-published one. A
-	// workspace_secrets override still wins (assembled above from cfg.EnvVars).
-	if pk, sk := os.Getenv("LANGFUSE_PUBLIC_KEY"), os.Getenv("LANGFUSE_SECRET_KEY"); pk != "" && sk != "" {
-		host := os.Getenv("MOLECULE_WORKSPACE_LANGFUSE_HOST")
-		if host == "" {
-			host = "http://langfuse-web:3000"
-		}
-		// A workspace/global-secret LANGFUSE_HOST that points at the platform
-		// HOST's loopback (127.0.0.1 / localhost / ::1 — the host-published
-		// Langfuse UI port) is UNREACHABLE from inside the workspace container,
-		// so the tracing producer silently fails ("Unexpected error … contact
-		// support"). Rewrite such a value to the container-network URL. A
-		// non-loopback override (a real cloud.langfuse.com or internal DNS) is
-		// a deliberate external target and is left untouched. Duplicate env
-		// keys resolve last-wins in the container runtime, so appending here
-		// overrides earlier cfg.EnvVars only when the earlier value is absent
-		// or unusable.
-		existing, set := cfg.EnvVars["LANGFUSE_HOST"]
-		if v, ok := cfg.EnvVars["LANGFUSE_PUBLIC_KEY"]; !ok || strings.TrimSpace(v) == "" {
-			env = append(env, fmt.Sprintf("LANGFUSE_PUBLIC_KEY=%s", pk))
-		}
-		if v, ok := cfg.EnvVars["LANGFUSE_SECRET_KEY"]; !ok || strings.TrimSpace(v) == "" {
-			env = append(env, fmt.Sprintf("LANGFUSE_SECRET_KEY=%s", sk))
-		}
-		if !set || isLoopbackHostURL(existing) {
-			env = append(env, fmt.Sprintf("LANGFUSE_HOST=%s", host))
-		}
+	// keys in its env AND a reachable trace endpoint is known, inject them into
+	// EVERY workspace container so the shared runtime's tracing producer emits —
+	// no per-workspace secret needed. See appendWorkspaceLangfuseEnv.
+	env = appendWorkspaceLangfuseEnv(env, cfg.EnvVars)
+	return env
+}
+
+// workspaceLangfuseHostEnv names the platform env var that carries the trace
+// endpoint a WORKSPACE CONTAINER can reach. It is deliberately distinct from
+// LANGFUSE_HOST (which is the PLATFORM's own reader URL — on compose the
+// host-published 127.0.0.1:3001 port) because the two are different addresses
+// of the same service seen from different network namespaces.
+const workspaceLangfuseHostEnv = "MOLECULE_WORKSPACE_LANGFUSE_HOST"
+
+// appendWorkspaceLangfuseEnv appends the LANGFUSE_* tracing entries for one
+// workspace container — or appends NOTHING, which is the ordinary case on any
+// deployment that has not stood Langfuse up.
+//
+// THERE IS NO DEFAULT HOST, AND ITS ABSENCE IS THE POINT.
+//
+// This used to fall back to the literal "http://langfuse-web:3000" — the
+// docker-compose service alias defined in this repo's own docker-compose.yml.
+// It resolves inside the compose topology and NOWHERE ELSE. On the k8s fleet no
+// langfuse-web Service exists in any namespace, so every workspace agent in
+// every tenant retried an OTLP export against a name that cannot resolve,
+// forever. MEASURED over 24h to 2026-09-01: 22,224 error lines in
+// ns/enteros-dinecall-ai and 9,011 in ns/enteros-minori — roughly 90% of all
+// error lines those tenants produced, which is how a real error stops being
+// findable. A value that is correct in exactly one deployment topology is not a
+// default; it is a guess that only that one topology can honour, and it belongs
+// in that topology's config (docker-compose.yml sets this var; dev-start.sh
+// exports it) rather than compiled in as everyone's fallback.
+//
+// THE KEYS ARE GATED ON THE HOST, not merely for tidiness. The Langfuse SDK's
+// own default endpoint is https://cloud.langfuse.com, a public host that DOES
+// resolve — so injecting a key pair with no host would convert a silent local
+// failure into silent egress of tenant trace data to a third party. Gating the
+// whole set on a known-reachable endpoint keeps the FAIL-OPEN contract this
+// block already honours for the keys: nothing configured → nothing injected →
+// the runtime boots untraced.
+func appendWorkspaceLangfuseEnv(env []string, envVars map[string]string) []string {
+	pk, sk := os.Getenv("LANGFUSE_PUBLIC_KEY"), os.Getenv("LANGFUSE_SECRET_KEY")
+	if pk == "" || sk == "" {
+		return env
+	}
+	// A workspace/global-secret LANGFUSE_HOST that points at the platform HOST's
+	// loopback (127.0.0.1 / localhost / ::1 — the host-published Langfuse UI
+	// port) is UNREACHABLE from inside the workspace container, so the tracing
+	// producer silently fails ("Unexpected error … contact support"). Such a
+	// value is rewritten to the container-network URL when one is configured. A
+	// non-loopback override (a real cloud.langfuse.com or internal DNS) is a
+	// deliberate external target and is left untouched. Duplicate env keys
+	// resolve last-wins in the container runtime, so appending here overrides
+	// the earlier cfg.EnvVars entry only when that value is absent or unusable.
+	existing, set := envVars["LANGFUSE_HOST"]
+	existingUsable := set && strings.TrimSpace(existing) != "" && !isLoopbackHostURL(existing)
+	host := strings.TrimSpace(os.Getenv(workspaceLangfuseHostEnv))
+	switch {
+	case existingUsable:
+		// The workspace named its own reachable endpoint; it is already in env
+		// from the cfg.EnvVars pass above and must not be overridden.
+	case host != "":
+		env = append(env, fmt.Sprintf("LANGFUSE_HOST=%s", host))
+	default:
+		// No reachable endpoint is known — not from the platform, not from the
+		// workspace's own secrets (an unset or loopback value is not one). Emit
+		// nothing rather than a hostname that only one topology can resolve.
+		return env
+	}
+	if v, ok := envVars["LANGFUSE_PUBLIC_KEY"]; !ok || strings.TrimSpace(v) == "" {
+		env = append(env, fmt.Sprintf("LANGFUSE_PUBLIC_KEY=%s", pk))
+	}
+	if v, ok := envVars["LANGFUSE_SECRET_KEY"]; !ok || strings.TrimSpace(v) == "" {
+		env = append(env, fmt.Sprintf("LANGFUSE_SECRET_KEY=%s", sk))
 	}
 	return env
 }
@@ -1363,30 +1607,43 @@ func buildTemplateTar(templatePath string) (*bytes.Buffer, error) {
 		if err != nil {
 			return err
 		}
-		header.Name = rel
+		// Tar entry names MUST use forward slashes: filepath.Rel returns
+		// `scripts\boot.sh` on a Windows host, and the Linux docker daemon
+		// would extract that as a flat FILE literally named "scripts\boot.sh"
+		// at /configs root instead of a scripts/ directory — the workspace
+		// boots without its nested config layout.
+		header.Name = wirepath.Normalize(rel)
 
+		if info.IsDir() {
+			return tw.WriteHeader(header)
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		// Strip CRLF from shell scripts and Python files. Windows
+		// git checkout introduces \r\n even with .gitattributes eol=lf;
+		// Linux containers choke on \r in shebangs and Python path args.
+		// This is the single fix point — every file that enters a
+		// container passes through CopyTemplateToContainer. Extension is
+		// case-folded: NTFS is case-insensitive, so SETUP.SH is a normal
+		// occurrence that must strip identically to setup.sh.
+		ext := strings.ToLower(filepath.Ext(path))
+		if ext == ".sh" || ext == ".py" || ext == ".md" {
+			data = bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
+		}
+		// Size MUST be set before WriteHeader: the strip above shrinks the
+		// data below the on-disk size FileInfoHeader recorded, and mutating
+		// the header after writing it does nothing — the tar would declare
+		// more bytes than follow and fail with "missed writing N bytes"
+		// (every Windows-host provision died at copy-template this way).
+		header.Size = int64(len(data))
 		if err := tw.WriteHeader(header); err != nil {
 			return err
 		}
-
-		if !info.IsDir() {
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			// Strip CRLF from shell scripts and Python files. Windows
-			// git checkout introduces \r\n even with .gitattributes eol=lf;
-			// Linux containers choke on \r in shebangs and Python path args.
-			// This is the single fix point — every file that enters a
-			// container passes through CopyTemplateToContainer.
-			ext := filepath.Ext(path)
-			if ext == ".sh" || ext == ".py" || ext == ".md" {
-				data = bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
-			}
-			header.Size = int64(len(data))
-			if _, err := tw.Write(data); err != nil {
-				return err
-			}
+		if _, err := tw.Write(data); err != nil {
+			return err
 		}
 		return nil
 	})
@@ -1416,10 +1673,15 @@ func buildConfigFilesTar(files map[string][]byte) (*bytes.Buffer, error) {
 	tw := tar.NewWriter(&buf)
 
 	createdDirs := map[string]bool{}
-	for name, data := range files {
+	for rawName, data := range files {
+		// Tar entry names are container (Linux) paths: normalize to forward
+		// slashes and use path.Dir, never filepath.* — on a Windows host
+		// filepath.Dir("a/b/c") returns `a\b`, and a backslash dir header
+		// extracts on the Linux daemon as a flat literal-backslash file.
+		name := wirepath.Normalize(rawName)
 		// Create parent directories in tar (deduplicated)
-		dir := filepath.Dir(name)
-		if dir != "." && !createdDirs[dir] {
+		dir := path.Dir(name)
+		if dir != "." && dir != "/" && !createdDirs[dir] {
 			if err := tw.WriteHeader(&tar.Header{
 				Typeflag: tar.TypeDir,
 				Name:     dir + "/",
@@ -1440,10 +1702,10 @@ func buildConfigFilesTar(files map[string][]byte) (*bytes.Buffer, error) {
 			Gid:  AgentGID,
 		}
 		if err := tw.WriteHeader(header); err != nil {
-			return nil, fmt.Errorf("failed to write tar header for %s: %w", name, err)
+			return nil, fmt.Errorf("failed to write tar header for %s: %w", rawName, err)
 		}
 		if _, err := tw.Write(data); err != nil {
-			return nil, fmt.Errorf("failed to write tar data for %s: %w", name, err)
+			return nil, fmt.Errorf("failed to write tar data for %s: %w", rawName, err)
 		}
 	}
 	if err := tw.Close(); err != nil {
@@ -1498,6 +1760,16 @@ func (p *Provisioner) ExecRead(ctx context.Context, containerName, filePath stri
 		}
 		clean = append(clean, data[8:8+size]...)
 		data = data[8+size:]
+	}
+	// Surface the exit code: without this, `cat` on a missing file returned
+	// (nil bytes, nil error) — indistinguishable from an empty file — and
+	// callers persisted the empty read instead of using their volume fallback.
+	inspect, ierr := p.cli.ContainerExecInspect(ctx, exec.ID)
+	if ierr != nil {
+		return clean, fmt.Errorf("exec inspect (cat %s): %w", filePath, ierr)
+	}
+	if inspect.ExitCode != 0 {
+		return clean, fmt.Errorf("exec cat %s: exit %d", filePath, inspect.ExitCode)
 	}
 	return clean, nil
 }
@@ -1683,7 +1955,14 @@ func (p *Provisioner) migrateVolumeIfNeeded(ctx context.Context, newName, legacy
 	if err != nil {
 		return fmt.Errorf("create migration container: %w", err)
 	}
-	defer p.cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+	defer func() {
+		// Detached from ctx: a delete cancels the Start's ctx (RC09), possibly
+		// mid-copy, and a remove on a cancelled ctx never reaches the daemon —
+		// the copy container would outlive the Start, holding both volumes.
+		rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		_ = p.cli.ContainerRemove(rmCtx, resp.ID, container.RemoveOptions{Force: true})
+	}()
 
 	if err := p.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		return fmt.Errorf("start migration container: %w", err)
@@ -2048,8 +2327,8 @@ func (p *Provisioner) VolumeHasFile(ctx context.Context, workspaceID, relPath st
 // available locally." The daemon wraps this message in a generic
 // SystemError type without exposing a typed sentinel, so we fall back
 // to substring match on the known messages emitted by moby. Used by
-// Start() to rewrite opaque ContainerCreate failures into actionable
-// "run build-all.sh" hints. Issue #117.
+// Start() to rewrite opaque ContainerCreate failures into actionable registry
+// or local-image diagnostics. Issue #117.
 func isImageNotFoundErr(err error) bool {
 	if err == nil {
 		return false
@@ -2110,15 +2389,15 @@ func imageTagIsMoving(image string) bool {
 
 // runtimeTagFromImage extracts the runtime name from a workspace-template
 // image reference for use in user-facing error hints. Handles both the
-// legacy local tag (`workspace-template:<runtime>`) and the current GHCR
-// form (`ghcr.io/molecule-ai/workspace-template-<runtime>:<tag>`). Falls
-// back to the full image string if the shape is unrecognised.
+// legacy local tag (`workspace-template:<runtime>`) and the current registry
+// form (`<registry>/workspace-template-<runtime>:<tag>`). Falls back to the
+// full image string if the shape is unrecognised.
 func runtimeTagFromImage(image string) string {
 	const legacyPrefix = "workspace-template:"
 	if strings.HasPrefix(image, legacyPrefix) {
 		return image[len(legacyPrefix):]
 	}
-	// GHCR form: strip everything before and including "workspace-template-",
+	// Registry form: strip everything before and including "workspace-template-",
 	// then drop the :<tag> suffix.
 	const ghcrInfix = "workspace-template-"
 	if i := strings.Index(image, ghcrInfix); i >= 0 {
@@ -2229,8 +2508,8 @@ func clip(s string, n int) string {
 // `ImagePull` + `ContainerCreate` on the workspace-template-* images.
 //
 // Empty result means "use the daemon default" — the common case on
-// linux/amd64 hosts (CI, SaaS EC2, Linux dev machines). On Apple Silicon
-// the GHCR workspace-template-* images ship a single linux/amd64
+// linux/amd64 hosts (CI, hosted Linux, Linux dev machines). On Apple Silicon
+// the published workspace-template-* images ship a single linux/amd64
 // manifest today, so the daemon's native linux/arm64/v8 request misses
 // with "no matching manifest". Forcing linux/amd64 pulls the amd64
 // manifest and lets Docker Desktop run it under QEMU emulation. Slow

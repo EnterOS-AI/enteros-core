@@ -1,8 +1,14 @@
 # RFC: Decouple workspace config + skill delivery from Secrets Manager
 
-**Status:** Draft
+**Status:** Historical draft (superseded; not an implementation plan)
 **Author:** CEO Assistant (on CTO direction)
 **Related:** RCA #2831 (SaaS agents lose config/skills/memory), #2832 (credentials in auto-memory), #2838 (provisioner reconciliation — partial), merged runtime fix #125/#134 (memory re-inject on auto-heal + persistence discipline), seo-template #16 (slash-command format), [`rfc-platform-mcp-as-plugin.md`](rfc-platform-mcp-as-plugin.md) (the concierge **management MCP** moves to the plugin channel — companion to the §10a concierge-identity-as-template fix below)
+
+> This document captures an April/May 2026 proposal against the retired AWS
+> Secrets Manager, EC2, GHCR, and operator-account topology. It remains useful
+> as design history only. Do not use its inventory, migration steps, or secret
+> transport as current instructions; use the checked provisioner/runtime code
+> and current architecture references instead.
 
 ## 1. Summary
 

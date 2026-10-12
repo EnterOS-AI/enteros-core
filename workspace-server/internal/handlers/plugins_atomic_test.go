@@ -62,9 +62,9 @@ func TestTarHostDirWithPrefix_HappyPath(t *testing.T) {
 
 	// Plant: <host>/plugin.yaml + <host>/skills/foo/SKILL.md + <host>/.complete
 	files := map[string]string{
-		"plugin.yaml":             "name: foo\nversion: 1.0.0\n",
-		"skills/foo/SKILL.md":     "# Foo skill\n",
-		".complete":                "", // upstream may already have a marker
+		"plugin.yaml":         "name: foo\nversion: 1.0.0\n",
+		"skills/foo/SKILL.md": "# Foo skill\n",
+		".complete":           "", // upstream may already have a marker
 	}
 	for rel, body := range files {
 		full := filepath.Join(hostDir, rel)
@@ -96,6 +96,13 @@ func TestTarHostDirWithPrefix_HappyPath(t *testing.T) {
 		// Every entry must start with the prefix
 		if !strings.HasPrefix(hdr.Name, prefix) {
 			t.Errorf("entry %q does not start with prefix %q", hdr.Name, prefix)
+		}
+		// Tar names are slash-only by spec: a backslash entry (what
+		// filepath.Join produced on Windows hosts pre-fix) extracts on the
+		// Linux daemon as ONE flat literal-backslash filename in `/` — the
+		// 2026-07-19 concierge-without-management-MCP incident.
+		if strings.Contains(hdr.Name, `\`) {
+			t.Errorf("entry %q contains a backslash — Windows-host path separator leaked into the tar", hdr.Name)
 		}
 		if hdr.Typeflag == tar.TypeReg {
 			body, err := io.ReadAll(tr)
@@ -248,7 +255,7 @@ func TestTarWalk_DirEntryHasTrailingSlash(t *testing.T) {
 func TestTarWalk_FileContentsPreserved(t *testing.T) {
 	hostDir := t.TempDir()
 	contents := map[string]string{
-		"plugin.yaml":           "name: test\nversion: 1.0.0\n",
+		"plugin.yaml":         "name: test\nversion: 1.0.0\n",
 		"skills/foo/SKILL.md": "# Foo\n",
 	}
 	for rel, body := range contents {

@@ -57,7 +57,7 @@ this keeps the harness lean per the CTO directive.
 
 ```bash
 # from molecule-core repo root:
-export TEMPLATE_IMAGE=ghcr.io/molecule-ai/workspace-template-hermes:latest
+export TEMPLATE_IMAGE=registry.moleculesai.app/molecule-ai/workspace-template-hermes:latest
 ./local-e2e/scripts/run-canary.sh
 ```
 
@@ -78,8 +78,8 @@ we bake before we cascade):
 1. `molecule-ai-workspace-template-hermes` — highest-traffic + most
    recent RFC#600-class fixes — REQUIRED gate
 2. Bake for 5 business days
-3. Cascade to claude-code, langgraph, autogen, openclaw, smolagents,
-   google-adk (one PR per template — see `scripts/onboard-template.sh`)
+3. Cascade to the other maintained templates: claude-code, codex, and
+   openclaw (one PR per template — see `scripts/onboard-template.sh`)
 
 ## Future extensions (out of scope for the initial PR)
 

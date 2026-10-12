@@ -641,10 +641,11 @@ def current_branch_head(env: dict[str, str]) -> str | None:
 def superseded_by(env: dict[str, str]) -> str | None:
     """Return the newer head SHA if THIS deploy job has been superseded, else None.
 
-    This workflow runs with no `concurrency:` (intentional — Gitea 1.22.6 cancels
-    queued runs, which is unacceptable for a prod deploy). When two main pushes
-    land close together, BOTH deploy-production jobs run. The newer push rolls the
-    fleet forward first; the OLDER job's strict /buildinfo verify then sees tenants
+    This workflow runs with no `concurrency:`. That is intentional: a legacy
+    runner incident cancelled queued runs despite cancel-in-progress:false,
+    which is unacceptable for a prod deploy. When two main pushes land close
+    together, BOTH deploy-production jobs run. The newer push rolls the fleet
+    forward first; the OLDER job's strict /buildinfo verify then sees tenants
     on the NEWER SHA and false-reds with "$slug is stale" — even though the fleet
     is AHEAD, not behind. Git SHAs aren't ordered, so the verify can't tell ahead
     from behind on its own (and /buildinfo exposes only git_sha, no build time).

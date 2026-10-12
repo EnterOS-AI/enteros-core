@@ -23,7 +23,7 @@
 // registry before each workspace container starts.
 //
 // Plugins live in their own Go modules + repos (e.g.
-// github.com/Molecule-AI/molecule-ai-plugin-github-app-auth). Each
+// git.moleculesai.app/molecule-ai/molecule-ai-plugin-github-app-auth). Each
 // plugin ships its own cmd/server/main.go that imports core's startup
 // function + registers the plugin's mutator. Operators deploy the
 // plugin binary instead of core's vanilla cmd/server when they want

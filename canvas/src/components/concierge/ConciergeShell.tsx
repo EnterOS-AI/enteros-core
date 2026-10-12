@@ -22,8 +22,9 @@ import { RequestsInbox } from "./RequestsInbox";
 import { MonitorPanel } from "@/components/monitor/MonitorPanel";
 import {
   IcHome, IcOrgMap, IcSettings, IcSearch, IcBell, IcSun, IcMoon, IcChevDown,
-  IcQueue, IcCaret, IcMolecule, IcCheck, IcChat,
+  IcQueue, IcCaret, IcMolecule, IcCheck, IcChat, IcLogs,
 } from "./icons";
+import { DOZZLE_URL } from "@/lib/dozzle";
 
 /* ── status → concept palette ─────────────────────────────────────────── */
 function statusInfo(status: string): { color: string; label: string } {
@@ -97,6 +98,7 @@ export function resolveHomeChatTarget<N extends { id: string }>(
 
 export function ConciergeShell() {
   const nodes = useCanvasStore((st) => st.nodes);
+  const selfHostGateResolved = useCanvasStore((st) => st.selfHostGateResolved);
   const topView = useCanvasStore((st) => st.topView);
   const setTopView = useCanvasStore((st) => st.setTopView);
   const selectNode = useCanvasStore((st) => st.selectNode);
@@ -110,10 +112,10 @@ export function ConciergeShell() {
 
   // Dynamic org name for the topbar. Sourced from GET /org/identity
   // ({name} ← MOLECULE_ORG_NAME, added by a parallel backend change).
-  // Falls back to "Molecule AI" when the endpoint 404s / errors or
+  // Falls back to "Enter OS" when the endpoint 404s / errors or
   // returns an empty name, so the topbar never breaks before the backend
   // lands.
-  const [orgName, setOrgName] = useState("Molecule AI");
+  const [orgName, setOrgName] = useState("Enter OS");
   // Current org slug (from GET /org/identity) — used to highlight the active
   // org in the switcher and to derive the apex domain for cross-org navigation.
   const [orgSlug, setOrgSlug] = useState("");
@@ -128,7 +130,7 @@ export function ConciergeShell() {
         if (!cancelled && slug) setOrgSlug(slug);
       })
       .catch(() => {
-        // No endpoint / not reachable — keep the "Molecule AI" fallback.
+        // No endpoint / not reachable — keep the "Enter OS" fallback.
       });
     return () => {
       cancelled = true;
@@ -338,11 +340,51 @@ export function ConciergeShell() {
   // so it needs its own hook here. Falls through to the normal shell the
   // moment the root reports online — the runtime POSTs one BOOT_STEP per phase
   // to /workspaces/:id/boot-event, which the screen animates as keycaps.
+  // Deliberately BEFORE the pre-gate hold: a mid-boot page reload must show
+  // the restored boot screen immediately, not a generic spinner for however
+  // long the setup gate's API round-trips take on a build-saturated host.
   if (
     platformRoot &&
     platformRoot.data.status === WORKSPACE_STATUS.Provisioning
   ) {
-    return <BootSequenceScreen node={platformRoot} />;
+    // Full-viewport wrapper: BootSequenceScreen sizes itself with `h-full`,
+    // which resolves to CONTENT height unless an ancestor has a resolved
+    // height. This shell renders straight into the page body (page.tsx), so
+    // without this the boot screen painted as a short top-anchored block with
+    // a dead black band under it instead of the fullscreen boot the design
+    // calls for. Same `fixed inset-0` treatment the pre-gate hold below and
+    // the SelfHostSetupScene mount already use.
+    return (
+      <div className="fixed inset-0" data-testid="concierge-boot-screen">
+        <BootSequenceScreen node={platformRoot} />
+      </div>
+    );
+  }
+
+  // Pre-gate hold: on a fresh self-host load the always-seeded platform root
+  // is present but NOT online (unconfigured/offline), and the
+  // SelfHostSetupScene's async gate hasn't yet decided whether to mount the
+  // onboarding overlay. Rendering the shell in that window flashed a
+  // misleading "concierge offline" view for the second the gate takes —
+  // hold a neutral loading screen until the gate has a verdict. An ONLINE
+  // root skips the hold entirely (returning users never see a spinner), and
+  // after the verdict the shell renders normally (the overlay covers it on
+  // self-host; SaaS no-concierge orgs get the legacy create-agent view).
+  if (
+    !selfHostGateResolved &&
+    (!platformRoot || platformRoot.data.status !== WORKSPACE_STATUS.Online)
+  ) {
+    return (
+      <div
+        role="status"
+        aria-live="polite"
+        data-testid="concierge-pregate-loading"
+        className="fixed inset-0 flex flex-col items-center justify-center gap-3 bg-surface"
+      >
+        <span className="w-8 h-8 rounded-full border-2 border-line border-t-accent motion-safe:animate-spin" aria-hidden="true" />
+        <span className="text-xs text-ink-mid">Connecting to your organization…</span>
+      </div>
+    );
   }
 
   return (
@@ -356,7 +398,7 @@ export function ConciergeShell() {
             <div className={s.logo} title="Toggle sidebar" onClick={() => setRailOpen((o) => !o)}>
               <IcMolecule />
             </div>
-            <span className={s.railWordmark}>Molecule</span>
+            <span className={s.railWordmark}>Enter OS</span>
             <button className={s.railToggle} title="Collapse sidebar" onClick={() => setRailOpen((o) => !o)}>
               <IcOrgMap />
             </button>
@@ -371,6 +413,19 @@ export function ConciergeShell() {
             <span className={s.ico}><IcQueue /></span><span className={s.lbl}>Monitor</span>
           </button>
           <div className={s.spacer} />
+          {/* Dev-only escape hatch to raw container logs (Dozzle). External
+              link, not a TopView — it opens in a new tab rather than taking
+              over the rail's own view state. */}
+          <a
+            data-testid="nav-logs"
+            className={s.navbtn}
+            title="Logs — open Dozzle in a new tab"
+            href={DOZZLE_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <span className={s.ico}><IcLogs /></span><span className={s.lbl}>Logs</span>
+          </a>
           <button data-testid="nav-settings" className={`${s.navbtn} ${topView === "settings" ? s.active : ""}`} title="Settings" onClick={() => nav("settings")}>
             <span className={s.ico}><IcSettings /></span><span className={s.lbl}>Settings</span>
           </button>
@@ -531,8 +586,37 @@ export function ConciergeShell() {
                   </div>
                   <div className={s.embedChat}>
                     {/* key=chatId remounts ChatTab on selection change so the
-                        history/composer state never bleeds between agents. */}
-                    <ChatTab key={chatId} workspaceId={chatId} data={chatNode.data} />
+                        history/composer state never bleeds between agents.
+
+                        MOUNT-GATED on the Home view being active — the same
+                        `{topView === "..." && ...}` gate the Org-map view
+                        already uses for <Canvas/> below. `.view` is a bare
+                        display:none swap, so WITHOUT this gate the Home
+                        ChatTab stays mounted and live while the user is on
+                        the Org map. Because resolveHomeChatTarget follows
+                        `selectedNodeId`, selecting a workspace node on the
+                        map re-points this hidden ChatTab at the SAME
+                        workspace as the visible SidePanel ChatTab — two live
+                        subscribers for one workspace.
+
+                        useChatSocket delivers a live AGENT_MESSAGE via
+                        useCanvasStore.consumeAgentMessages(), which DELETES
+                        the queue on read. Whichever of the two effects ran
+                        first won; when the hidden one won, the visible panel
+                        never saw the message at all and it only surfaced
+                        ~10s later via useChatHistory's RECONCILE_INTERVAL_MS
+                        poll. That is the E2E Chat
+                        "agent /notify delivery reaches the canvas chat"
+                        flake (assertion budget 10s vs ~9.9s delivery), and
+                        for a real user it is a self-initiated agent message
+                        (digest reply, send_message_to_user, proactive
+                        update) taking up to 10 seconds to appear.
+
+                        A display:none panel must not consume live state on
+                        behalf of the panel the user is actually looking at. */}
+                    {topView === "home" && (
+                      <ChatTab key={chatId} workspaceId={chatId} data={chatNode.data} />
+                    )}
                   </div>
                 </section>
               ) : (

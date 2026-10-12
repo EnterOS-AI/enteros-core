@@ -1,16 +1,21 @@
 # Event Log
 
-Every structural change appends an immutable row to `structure_events`. The table is **append-only** — rows are never updated or deleted. This is the event sourcing pattern.
+Selected workspace lifecycle and agent operations append immutable rows to
+`structure_events`. The table is **append-only** — rows are never updated or
+deleted — but it is an audit/history surface, not a complete event source for
+reconstructing platform state.
 
 ## How It Works
 
-The `workspaces` table is a **projection** of these events — it represents current state. If you replay all events from the beginning, you get the same `workspaces` table.
+The `workspaces` table is authoritative for current workspace state. Related
+tables such as `canvas_layouts`, `activity_logs`, and `workspace_schedules`
+own their respective current or operational data. `structure_events` records
+only operations that explicitly call `RecordAndBroadcast`.
 
 ## Event Types
 
-**The rule: structural changes are persisted, presentational changes are ephemeral.**
-
-The test: "If I replayed all `structure_events` from scratch, would I reconstruct a fully working system?" If yes, the event log is complete. Canvas positions don't affect system behavior — they belong in `canvas_layouts`, not `structure_events`.
+Canvas layout changes and several high-volume operational events are stored in
+their owning tables instead of `structure_events`.
 
 ### Persisted to structure_events (AND broadcast via WebSocket)
 
@@ -21,9 +26,6 @@ WORKSPACE_ONLINE             availability change
 WORKSPACE_OFFLINE            availability change
 WORKSPACE_DEGRADED           health change
 WORKSPACE_REMOVED            permanent change
-WORKSPACE_MOVED              hierarchy change (different parent, NOT canvas drag)
-WORKSPACE_EXPANDED           hierarchy change
-WORKSPACE_COLLAPSED          hierarchy change
 AGENT_ASSIGNED               agent change
 AGENT_REMOVED                agent change
 AGENT_REPLACED               agent change
@@ -31,30 +33,35 @@ AGENT_MOVED                  agent moved between workspaces
 AGENT_CARD_UPDATED           capabilities changed
 ```
 
-### WebSocket only, NOT persisted to structure_events
+### Not persisted to structure_events
 
 ```
 TASK_UPDATED                 current task changed — saved to workspaces.current_task
 ACTIVITY_LOGGED              activity log created — saved to activity_logs table
-Canvas node dragged          presentational — saved to canvas_layouts
-Canvas viewport changed      presentational — saved to canvas_viewport
-Node collapsed/expanded      presentational UI toggle — saved to canvas_layouts
-  (different from WORKSPACE_EXPANDED which is a structural team expansion)
+Canvas node dragged          presentational — saved to canvas_layouts; no dedicated event
+Canvas viewport changed      presentational — saved to canvas_viewport; no dedicated event
+Node hidden/shown            presentational team-view toggle — saved to canvas_layouts; no dedicated event
+Hierarchy reparented         current parent_id updated on workspaces; no dedicated event
 ```
 
-`TASK_UPDATED` and `ACTIVITY_LOGGED` use `BroadcastOnly()` — they are sent over WebSocket but not recorded in `structure_events`. They have their own storage: `workspaces.current_task` column and `activity_logs` table respectively. This separation keeps `structure_events` focused on structural changes that define the org chart, while operational activity (A2A communications, task updates, agent logs) lives in `activity_logs` with its own retention policy.
+`TASK_UPDATED` and `ACTIVITY_LOGGED` use `BroadcastOnly()` — they are sent over WebSocket but not recorded in `structure_events`. They have their own storage: `workspaces.current_task` column and `activity_logs` table respectively. This keeps high-volume operational data out of the selected lifecycle history while activity data retains its own storage and retention policy.
 
-`WORKSPACE_MOVED` is the nuanced case: a workspace moved to a different parent (hierarchy change) is structural and persisted. A node dragged to a new canvas position is presentational and saved to `canvas_layouts` only.
+Canvas layout and hierarchy writes use their HTTP/current-state surfaces and
+do not emit a dedicated WebSocket event from the canonical taxonomy.
+
+There are no dedicated `WORKSPACE_MOVED`, `WORKSPACE_EXPANDED`, or
+`WORKSPACE_COLLAPSED` event types. Hierarchy is current state on
+`workspaces.parent_id`; clients rehydrate it from the workspace API. Visual
+hide/show state is the separate `canvas_layouts.collapsed` field.
 
 See [WebSocket Events](../api-protocol/websocket-events.md) for the full JSON payload of each event type.
 
 ## Why This Matters
 
-1. **Complete audit trail** — you always know exactly what happened and when
+1. **Selected lifecycle history** — recorded operations remain queryable
 2. **Meaningful responses for removed workspaces** — other workspaces can get context when querying a workspace that no longer exists
 3. **Canvas timeline** — the canvas can show a timeline of changes for any workspace
 4. **Easier debugging** — debugging distributed agent systems becomes much easier with a full history
-5. **Future: time travel** — replay to any point in time ("what did our org chart look like last Tuesday?")
 
 ## Schema
 
@@ -70,13 +77,15 @@ CREATE TABLE structure_events (
 );
 ```
 
-The `payload` JSONB field contains event-specific data (e.g. the old and new URL for a workspace move, the reason for a deletion).
+The `payload` JSONB field contains event-specific data such as a provisioning
+failure reason or cascade-delete count.
 
 ## Rules
 
 - **Never UPDATE or DELETE rows** in `structure_events`. It is append-only.
-- The `workspaces` table is the mutable projection — update that instead.
-- Every state change must produce an event before updating the projection.
+- The `workspaces` table is the authoritative mutable workspace state.
+- Add a `structure_events` row only through an event-producing code path; do
+  not infer that every state update has a matching event.
 
 ## Related Docs
 

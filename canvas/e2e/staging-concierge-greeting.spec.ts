@@ -41,9 +41,11 @@
  */
 
 import { test, expect, type Page, type BrowserContext, type APIRequestContext } from "@playwright/test";
+import { gotoWithNetworkChangeRetry } from "../test-utils/stagingNavigation";
+import { installStagingWebSocketAuth } from "./support/stagingWebSocketAuth";
 import {
   checkConciergeInvariants,
-  isPureGreeting,
+  isOpeningGreeting,
   unexpectedGreetings,
   findDuplicates,
   type SimpleMessage,
@@ -177,10 +179,12 @@ test.describe("concierge greeting — stored session (server contextId belt)", (
       .post(`${tenantURL}/workspaces/${conciergeId}/chat-session/new`, { headers })
       .catch(() => undefined);
 
-    // Turn 1: the opening 'hi' — expect a greeting.
+    // Turn 1: the opening 'hi' — expect a greeting-shaped introduction. The
+    // concierge may include a longer prose capability summary here; that is a
+    // valid opening, not the bare later-turn greeting isPureGreeting detects.
     const greeting = await sendCanvasTurnNoContext(request, tenantURL, headers, conciergeId, "hi");
     expect(
-      isPureGreeting(greeting),
+      isOpeningGreeting(greeting),
       `the concierge's opening reply was not a greeting: "${greeting.slice(0, 120)}"`,
     ).toBeTruthy();
 
@@ -201,8 +205,16 @@ test.describe("concierge greeting — stored session (server contextId belt)", (
 });
 
 /* ─────────── B. RENDERED UI — client render/persistence doubling ──────────── */
-async function authenticate(context: BrowserContext, tenantToken: string) {
+async function authenticate(
+  context: BrowserContext,
+  tenantURL: string,
+  tenantToken: string,
+) {
   await context.setExtraHTTPHeaders({ Authorization: `Bearer ${tenantToken}` });
+  await installStagingWebSocketAuth(context, {
+    token: tenantToken,
+    tenantURL,
+  });
   await context.addInitScript(() => {
     window.localStorage.setItem(
       "molecule_cookie_consent",
@@ -259,12 +271,14 @@ test.describe("concierge greeting — rendered My Chat (UI)", () => {
   }) => {
     test.setTimeout(8 * 60 * 1000);
     const { tenantURL, tenantToken } = tenantEnv();
-    await authenticate(context, tenantToken);
+    await authenticate(context, tenantURL, tenantToken);
 
     page.on("console", (m) => {
       if (m.type() === "error") console.log(`[e2e/console-error] ${m.text()}`);
     });
-    await page.goto(tenantURL, { waitUntil: "domcontentloaded" });
+    await gotoWithNetworkChangeRetry(page, tenantURL, {
+      waitUntil: "domcontentloaded",
+    });
     await page.waitForSelector('[data-testid="nav-home"], [data-testid="hydration-error"]', {
       timeout: 45_000,
     });
@@ -309,7 +323,7 @@ test.describe("concierge greeting — rendered My Chat (UI)", () => {
     let sawGreeting = false;
     while (Date.now() < replyDeadline) {
       const bubbles = await readRenderedBubbles(page);
-      if (bubbles.some((m) => m.role === "agent" && isPureGreeting(m.content))) {
+      if (bubbles.some((m) => m.role === "agent" && isOpeningGreeting(m.content))) {
         sawGreeting = true;
         break;
       }

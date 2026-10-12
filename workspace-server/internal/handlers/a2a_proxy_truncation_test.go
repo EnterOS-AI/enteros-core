@@ -85,7 +85,7 @@ func TestProxyA2A_RequestBodyTooLarge(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-oversize-req/a2a", strings.NewReader(oversize))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected status 413, got %d: %s", w.Code, w.Body.String())
@@ -157,7 +157,7 @@ func TestProxyA2A_LargeRequestWithinLimit(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-large-ok/a2a", strings.NewReader(largeBody))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	time.Sleep(50 * time.Millisecond)
 

@@ -14,7 +14,7 @@ import (
 )
 
 // external_rotate.go — operator-facing endpoints for credential lifecycle
-// on runtime=external workspaces.
+// on external-like runtimes (external, kimi, and kimi-cli).
 //
 //   POST /workspaces/:id/external/rotate
 //     Mints a fresh workspace_auth_token, revokes any prior live tokens
@@ -26,14 +26,13 @@ import (
 //     Returns the connection payload WITHOUT minting (auth_token = "").
 //     For the operator who lost their copy of the snippet but still has
 //     the token elsewhere — they want the rest of the connect block
-//     (PLATFORM_URL, WORKSPACE_ID, registry endpoints, all 7 snippets)
+//     (PLATFORM_URL, WORKSPACE_ID, registry endpoints, all 8 snippets)
 //     without invalidating the live agent.
 //
-// Both endpoints reject runtime ≠ external with 400 — the "external
-// connection" payload only makes sense for awaiting-agent / online-
-// external workspaces. A user clicking Rotate on a hermes / claude-code
-// workspace would silently break ssh-EIC tunnel auth, which is worse
-// than refusing the action.
+// Both endpoints reject runtimes outside isExternalLikeRuntime with 400. A
+// user rotating a container-backed hermes / claude-code workspace would leave
+// its in-container heartbeat on a stale credential; restart is the supported
+// rotation path for those runtimes.
 
 // RotateExternalCredentials handles POST /workspaces/:id/external/rotate.
 //
@@ -119,8 +118,8 @@ func (h *WorkspaceHandler) RotateExternalCredentials(c *gin.Context) {
 // the snippets (their note app got wiped, they switched machines, etc.)
 // but doesn't want to invalidate the live external agent.
 //
-// The canvas modal masks the auth_token field in this mode and labels
-// it "(rotate to reveal a new token — current token is unrecoverable)".
+// The canvas modal explains this tokenless mode; its Fields tab renders the
+// deliberately omitted auth_token as "(missing)".
 func (h *WorkspaceHandler) GetExternalConnection(c *gin.Context) {
 	id := c.Param("id")
 	if id == "" {

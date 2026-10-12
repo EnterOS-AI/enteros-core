@@ -137,6 +137,83 @@ func TestBuildTemplateTar_SkipsSymlinks(t *testing.T) {
 	}
 }
 
+func TestBuildTemplateTar_CRLFTemplatesSurviveStrip(t *testing.T) {
+	// Regression: on a Windows checkout the .sh/.py/.md templates carry
+	// CRLF on disk. buildTemplateTar strips CRLF from those files but used
+	// to set header.Size AFTER the header had already been written, so the
+	// tar declared the on-disk size while fewer stripped bytes followed —
+	// "archive/tar: missed writing N bytes" and every provision on a
+	// Windows host failed at the copy-template step (2026-07-18 local
+	// onboarding failure: README.md with exactly 53 CRLFs → "missed
+	// writing 53 bytes").
+	dir := t.TempDir()
+	crlfDoc := "# Title\r\nline one\r\nline two\r\n"
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte(crlfDoc), 0644); err != nil {
+		t.Fatalf("write README.md: %v", err)
+	}
+	// NESTED + UPPERCASE: the entry name must use forward slashes even when
+	// built on Windows (filepath.Rel yields `scripts\BOOT.SH` there — a
+	// literal-backslash FILE name to the Linux daemon), and the CRLF strip
+	// must be extension-case-insensitive (NTFS is case-insensitive).
+	if err := os.MkdirAll(filepath.Join(dir, "scripts"), 0755); err != nil {
+		t.Fatalf("mkdir scripts: %v", err)
+	}
+	crlfScript := "#!/bin/sh\r\necho hi\r\n"
+	if err := os.WriteFile(filepath.Join(dir, "scripts", "BOOT.SH"), []byte(crlfScript), 0644); err != nil {
+		t.Fatalf("write scripts/BOOT.SH: %v", err)
+	}
+	// A non-stripped extension keeps its bytes verbatim, CRLF and all.
+	crlfYAML := "name: keep\r\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(crlfYAML), 0644); err != nil {
+		t.Fatalf("write config.yaml: %v", err)
+	}
+
+	buf, err := buildTemplateTar(dir)
+	if err != nil {
+		t.Fatalf("buildTemplateTar with CRLF templates: %v", err)
+	}
+
+	bodies := map[string]string{}
+	sizes := map[string]int64{}
+	tr := tar.NewReader(buf)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read tar: %v", err)
+		}
+		body, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatalf("read body for %s: %v", hdr.Name, err)
+		}
+		bodies[hdr.Name] = string(body)
+		sizes[hdr.Name] = hdr.Size
+	}
+
+	wantDoc := strings.ReplaceAll(crlfDoc, "\r\n", "\n")
+	if bodies["README.md"] != wantDoc {
+		t.Errorf("README.md body = %q, want CRLF-stripped %q", bodies["README.md"], wantDoc)
+	}
+	if sizes["README.md"] != int64(len(wantDoc)) {
+		t.Errorf("README.md header size = %d, want stripped length %d", sizes["README.md"], len(wantDoc))
+	}
+	// Forward-slash entry name (never `scripts\BOOT.SH`), CRLF stripped
+	// despite the uppercase extension.
+	wantScript := strings.ReplaceAll(crlfScript, "\r\n", "\n")
+	if bodies["scripts/BOOT.SH"] != wantScript {
+		names := make([]string, 0, len(bodies))
+		for n := range bodies {
+			names = append(names, n)
+		}
+		t.Errorf("scripts/BOOT.SH body = %q, want CRLF-stripped %q (entries: %v)", bodies["scripts/BOOT.SH"], wantScript, names)
+	}
+	if bodies["config.yaml"] != crlfYAML {
+		t.Errorf("config.yaml body = %q, want verbatim %q", bodies["config.yaml"], crlfYAML)
+	}
+}
+
 // baseHostConfig returns a fresh HostConfig with typical pre-tier binds,
 // mimicking what Start() builds before calling ApplyTierConfig.
 func baseHostConfig(pluginsPath string) *container.HostConfig {
@@ -228,9 +305,14 @@ func TestBuildContainerEnv_LangfusePassthrough(t *testing.T) {
 		return false
 	}
 
-	t.Run("injects langfuse into the agent with the docker-network host", func(t *testing.T) {
+	// The COMPOSE topology, which is the one where `langfuse-web` is a real
+	// name: the platform is handed the container-network endpoint explicitly
+	// (docker-compose.yml sets MOLECULE_WORKSPACE_LANGFUSE_HOST; dev-start.sh
+	// exports it) and the agent gets it verbatim.
+	t.Run("injects langfuse into the agent with the configured container host", func(t *testing.T) {
 		t.Setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
 		t.Setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+		t.Setenv("MOLECULE_WORKSPACE_LANGFUSE_HOST", "http://langfuse-web:3000")
 		env := buildContainerEnv(WorkspaceConfig{WorkspaceID: "x", Runtime: "claude-code"})
 		if !has(env, "LANGFUSE_PUBLIC_KEY=pk-lf-test") || !has(env, "LANGFUSE_SECRET_KEY=sk-lf-test") {
 			t.Errorf("langfuse keys not injected: %v", env)
@@ -241,9 +323,28 @@ func TestBuildContainerEnv_LangfusePassthrough(t *testing.T) {
 		}
 	})
 
+	// THE REGRESSION THIS BLOCK EXISTS FOR. With keys but no configured
+	// container endpoint the provisioner used to inject the literal
+	// `http://langfuse-web:3000` — a docker-compose service alias that resolves
+	// in exactly one topology. On k8s it resolves nowhere, and every agent
+	// retried an OTLP export against it forever (22,224 error lines in one
+	// tenant in 24h). Nothing may be injected: not the host, and not the keys
+	// either, because a key pair with no host sends the Langfuse SDK to its own
+	// default endpoint, the PUBLIC cloud.langfuse.com.
+	t.Run("injects nothing when no workspace langfuse host is configured", func(t *testing.T) {
+		t.Setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
+		t.Setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+		t.Setenv("MOLECULE_WORKSPACE_LANGFUSE_HOST", "")
+		env := buildContainerEnv(WorkspaceConfig{WorkspaceID: "x", Runtime: "claude-code"})
+		if hasKey(env, "LANGFUSE_") {
+			t.Errorf("no reachable trace endpoint is configured — nothing LANGFUSE_* may be injected, got %v", env)
+		}
+	})
+
 	t.Run("no-op when platform has no langfuse keys", func(t *testing.T) {
 		t.Setenv("LANGFUSE_PUBLIC_KEY", "")
 		t.Setenv("LANGFUSE_SECRET_KEY", "")
+		t.Setenv("MOLECULE_WORKSPACE_LANGFUSE_HOST", "http://langfuse-web:3000")
 		env := buildContainerEnv(WorkspaceConfig{WorkspaceID: "x", Runtime: "claude-code"})
 		if hasKey(env, "LANGFUSE_") {
 			t.Errorf("expected no LANGFUSE_* when keys unset, got %v", env)
@@ -253,6 +354,7 @@ func TestBuildContainerEnv_LangfusePassthrough(t *testing.T) {
 	t.Run("workspace-secret LANGFUSE_HOST override wins", func(t *testing.T) {
 		t.Setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
 		t.Setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+		t.Setenv("MOLECULE_WORKSPACE_LANGFUSE_HOST", "http://langfuse-web:3000")
 		env := buildContainerEnv(WorkspaceConfig{
 			WorkspaceID: "x", Runtime: "claude-code",
 			EnvVars: map[string]string{"LANGFUSE_HOST": "http://custom:3000"},
@@ -268,9 +370,62 @@ func TestBuildContainerEnv_LangfusePassthrough(t *testing.T) {
 		}
 	})
 
+	// A workspace that names its OWN reachable endpoint is traced even with no
+	// platform-side container host configured — the workspace supplied the fact
+	// the platform was missing, so there is nothing to guess.
+	t.Run("workspace LANGFUSE_HOST alone is enough to enable tracing", func(t *testing.T) {
+		t.Setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
+		t.Setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+		t.Setenv("MOLECULE_WORKSPACE_LANGFUSE_HOST", "")
+		env := buildContainerEnv(WorkspaceConfig{
+			WorkspaceID: "x", Runtime: "claude-code",
+			EnvVars: map[string]string{"LANGFUSE_HOST": "https://cloud.langfuse.com"},
+		})
+		if !has(env, "LANGFUSE_HOST=https://cloud.langfuse.com") {
+			t.Errorf("the workspace's own endpoint must survive: %v", env)
+		}
+		if !has(env, "LANGFUSE_PUBLIC_KEY=pk-lf-test") || !has(env, "LANGFUSE_SECRET_KEY=sk-lf-test") {
+			t.Errorf("platform keys should ride along with a workspace-supplied host: %v", env)
+		}
+	})
+
+	// The loopback rewrite, unchanged: a host-published 127.0.0.1 URL is
+	// unreachable from inside the container and is replaced by the configured
+	// container endpoint...
+	t.Run("loopback workspace host is rewritten to the configured container host", func(t *testing.T) {
+		t.Setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
+		t.Setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+		t.Setenv("MOLECULE_WORKSPACE_LANGFUSE_HOST", "http://langfuse-web:3000")
+		env := buildContainerEnv(WorkspaceConfig{
+			WorkspaceID: "x", Runtime: "claude-code",
+			EnvVars: map[string]string{"LANGFUSE_HOST": "http://127.0.0.1:3001"},
+		})
+		if !has(env, "LANGFUSE_HOST=http://langfuse-web:3000") {
+			t.Errorf("a loopback host must be rewritten to the container endpoint: %v", env)
+		}
+	})
+
+	// ...and when there IS no configured container endpoint, a loopback value is
+	// still not a reachable one, so nothing is injected on top of it. The
+	// unusable value the workspace itself carries is left exactly as the
+	// workspace set it — the platform has no better answer to substitute.
+	t.Run("loopback workspace host with no configured container host injects nothing", func(t *testing.T) {
+		t.Setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-platform")
+		t.Setenv("LANGFUSE_SECRET_KEY", "sk-lf-platform")
+		t.Setenv("MOLECULE_WORKSPACE_LANGFUSE_HOST", "")
+		env := buildContainerEnv(WorkspaceConfig{
+			WorkspaceID: "x", Runtime: "claude-code",
+			EnvVars: map[string]string{"LANGFUSE_HOST": "http://127.0.0.1:3001"},
+		})
+		if has(env, "LANGFUSE_PUBLIC_KEY=pk-lf-platform") || has(env, "LANGFUSE_SECRET_KEY=sk-lf-platform") {
+			t.Errorf("platform keys must not be injected without a reachable endpoint: %v", env)
+		}
+	})
+
 	t.Run("workspace-secret langfuse keys win over platform keys", func(t *testing.T) {
 		t.Setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-platform")
 		t.Setenv("LANGFUSE_SECRET_KEY", "sk-lf-platform")
+		t.Setenv("MOLECULE_WORKSPACE_LANGFUSE_HOST", "http://langfuse-web:3000")
 		env := buildContainerEnv(WorkspaceConfig{
 			WorkspaceID: "x", Runtime: "claude-code",
 			EnvVars: map[string]string{
@@ -654,7 +809,7 @@ func TestWorkspaceConfig_ResetClaudeSessionFieldPresent(t *testing.T) {
 // ever silently reverts to :latest, we lose the "one bad publish doesn't
 // break every workspace" guarantee.
 func TestSelectImage_PrefersExplicitImage(t *testing.T) {
-	pinned := "ghcr.io/molecule-ai/workspace-template-claude-code@sha256:3d6761a97ed07d7d33cfc19a8fbab81175d9d9179618d493dbc00c5f7ef076a3"
+	pinned := "registry.moleculesai.app/molecule-ai/workspace-template-claude-code@sha256:3d6761a97ed07d7d33cfc19a8fbab81175d9d9179618d493dbc00c5f7ef076a3"
 	got, err := selectImage(WorkspaceConfig{Runtime: "claude-code", Image: pinned})
 	if err != nil {
 		t.Fatalf("selectImage with cfg.Image=pinned: unexpected error %v", err)
@@ -984,11 +1139,14 @@ func TestBuildContainerEnv_AdminTokenGatedToPlatformKind(t *testing.T) {
 	t.Setenv("ADMIN_TOKEN", "tenant-admin-secret")
 	cfgFor := func(kind string) WorkspaceConfig {
 		return WorkspaceConfig{
-			WorkspaceID:  "ws-local",
-			PlatformURL:  "http://platform:8080",
-			Runtime:      "claude-code",
-			Kind:         kind,
-			EnvVars:      map[string]string{"ADMIN_TOKEN": "caller-admin", "MOLECULE_ADMIN_TOKEN": "caller-admin-2", "CUSTOM": "ok"},
+			WorkspaceID: "ws-local",
+			PlatformURL: "http://platform:8080",
+			Runtime:     "claude-code",
+			Kind:        kind,
+			EnvVars: map[string]string{
+				"ADMIN_TOKEN": "caller-admin", "MOLECULE_ADMIN_TOKEN": "caller-admin-2",
+				"CP_PROMOTE_PROD_API_TOKEN": "caller-promote", "CUSTOM": "ok",
+			},
 			TemplatePath: t.TempDir(),
 		}
 	}
@@ -1015,6 +1173,9 @@ func TestBuildContainerEnv_AdminTokenGatedToPlatformKind(t *testing.T) {
 		}
 		if envContainsPrefix(got, "MOLECULE_ADMIN_TOKEN=") {
 			t.Fatalf("caller-supplied MOLECULE_ADMIN_TOKEN must be stripped, got %v", got)
+		}
+		if envContainsPrefix(got, "CP_PROMOTE_PROD_API_TOKEN=") {
+			t.Fatalf("production promote capability must never reach a tenant box, got %v", got)
 		}
 	}
 }
@@ -1129,10 +1290,11 @@ func TestBuildCPTenantEnv_NeverForwardsAdminToken(t *testing.T) {
 	cfg := WorkspaceConfig{
 		WorkspaceID: "ws-tenant",
 		EnvVars: map[string]string{
-			"ADMIN_TOKEN":          "caller-admin",
-			"MOLECULE_ADMIN_TOKEN": "caller-admin-2",
-			"GITEA_TOKEN":          "stripme",
-			"CUSTOM":               "ok",
+			"ADMIN_TOKEN":               "caller-admin",
+			"MOLECULE_ADMIN_TOKEN":      "caller-admin-2",
+			"CP_PROMOTE_PROD_API_TOKEN": "caller-promote",
+			"GITEA_TOKEN":               "stripme",
+			"CUSTOM":                    "ok",
 		},
 	}
 	got := buildCPTenantEnv(cfg)
@@ -1141,6 +1303,9 @@ func TestBuildCPTenantEnv_NeverForwardsAdminToken(t *testing.T) {
 	}
 	if _, ok := got["MOLECULE_ADMIN_TOKEN"]; ok {
 		t.Errorf("caller-supplied MOLECULE_ADMIN_TOKEN must be stripped: %v", got)
+	}
+	if _, ok := got["CP_PROMOTE_PROD_API_TOKEN"]; ok {
+		t.Errorf("production promote capability must never be forwarded to a tenant box: %v", got)
 	}
 	if _, ok := got["GITEA_TOKEN"]; ok {
 		t.Errorf("GITEA_TOKEN must still be stripped")
@@ -1391,11 +1556,11 @@ func TestRuntimeTagFromImage(t *testing.T) {
 		"workspace-template:openclaw":    "openclaw",
 		"workspace-template:claude-code": "claude-code",
 		"workspace-template:base":        "base",
-		// Current GHCR form produced by molecule-ci's publish-template-image
-		// workflow and consumed by RuntimeImages.
-		"ghcr.io/molecule-ai/workspace-template-hermes:latest":           "hermes",
-		"ghcr.io/molecule-ai/workspace-template-claude-code:latest":      "claude-code",
-		"ghcr.io/molecule-ai/workspace-template-claude-code:sha-abc1234": "claude-code",
+		// Current registry form produced by the template publish workflow and
+		// consumed by RuntimeImages.
+		"registry.moleculesai.app/molecule-ai/workspace-template-hermes:latest":           "hermes",
+		"registry.moleculesai.app/molecule-ai/workspace-template-claude-code:latest":      "claude-code",
+		"registry.moleculesai.app/molecule-ai/workspace-template-claude-code:sha-abc1234": "claude-code",
 		// Fallbacks for non-standard shapes
 		"myregistry.io/foo:v1.2": "v1.2",
 		"no-colon-at-all":        "no-colon-at-all",
@@ -1425,29 +1590,29 @@ func TestImageTagIsMoving(t *testing.T) {
 		want  bool
 	}{
 		// Bare references default to :latest at the registry level.
-		{"bare repo no tag", "ghcr.io/molecule-ai/workspace-template-hermes", true},
+		{"bare repo no tag", "registry.moleculesai.app/molecule-ai/workspace-template-hermes", true},
 		{"bare local image no tag", "workspace-template", true},
 
 		// Explicit moving tags.
-		{"explicit latest", "ghcr.io/molecule-ai/workspace-template-hermes:latest", true},
-		{"explicit staging", "ghcr.io/molecule-ai/workspace-template-hermes:staging", true},
-		{"explicit main", "ghcr.io/molecule-ai/workspace-template-hermes:main", true},
-		{"explicit dev", "ghcr.io/molecule-ai/workspace-template-hermes:dev", true},
-		{"explicit edge", "ghcr.io/molecule-ai/workspace-template-hermes:edge", true},
-		{"explicit nightly", "ghcr.io/molecule-ai/workspace-template-hermes:nightly", true},
-		{"explicit rolling", "ghcr.io/molecule-ai/workspace-template-hermes:rolling", true},
+		{"explicit latest", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:latest", true},
+		{"explicit staging", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:staging", true},
+		{"explicit main", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:main", true},
+		{"explicit dev", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:dev", true},
+		{"explicit edge", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:edge", true},
+		{"explicit nightly", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:nightly", true},
+		{"explicit rolling", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:rolling", true},
 
 		// Pinned tags — must NOT be classified as moving.
-		{"semver tag", "ghcr.io/molecule-ai/workspace-template-hermes:0.8.2", false},
-		{"semver with v prefix", "ghcr.io/molecule-ai/workspace-template-hermes:v1.2.3", false},
-		{"sha-prefixed commit tag", "ghcr.io/molecule-ai/workspace-template-claude-code:sha-abc1234", false},
-		{"date-stamped tag", "ghcr.io/molecule-ai/workspace-template-hermes:2026-04-30", false},
-		{"build-id tag", "ghcr.io/molecule-ai/workspace-template-hermes:build-12345", false},
+		{"semver tag", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:0.8.2", false},
+		{"semver with v prefix", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:v1.2.3", false},
+		{"sha-prefixed commit tag", "registry.moleculesai.app/molecule-ai/workspace-template-claude-code:sha-abc1234", false},
+		{"date-stamped tag", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:2026-04-30", false},
+		{"build-id tag", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:build-12345", false},
 
 		// Digest pinning — strongest immutability signal, never moving
 		// even if a moving-looking tag is also present.
-		{"digest only", "ghcr.io/molecule-ai/workspace-template-hermes@sha256:abc123def456", false},
-		{"tag plus digest", "ghcr.io/molecule-ai/workspace-template-hermes:latest@sha256:abc123def456", false},
+		{"digest only", "registry.moleculesai.app/molecule-ai/workspace-template-hermes@sha256:abc123def456", false},
+		{"tag plus digest", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:latest@sha256:abc123def456", false},
 
 		// Registry hostname with port — the `:` in `:5000` must NOT be
 		// mistaken for a tag separator. Without this guard, a private
@@ -1480,22 +1645,22 @@ func TestImageTagIsMoving(t *testing.T) {
 // (via %w) for errors.Is chains.
 
 func TestImageNotFoundErrorIncludesPullHint(t *testing.T) {
-	underlying := testErr(`Error response from daemon: No such image: ghcr.io/molecule-ai/workspace-template-openclaw:latest`)
+	underlying := testErr(`Error response from daemon: No such image: registry.moleculesai.app/molecule-ai/workspace-template-openclaw:latest`)
 	if !isImageNotFoundErr(underlying) {
 		t.Fatalf("precondition failed: classifier didn't recognise moby's message")
 	}
 
-	image := "ghcr.io/molecule-ai/workspace-template-openclaw:latest"
+	image := "registry.moleculesai.app/molecule-ai/workspace-template-openclaw:latest"
 	tag := runtimeTagFromImage(image)
 	wrapped := testErr(
-		`docker image "` + image + `" not found after pull attempt — verify GHCR visibility for ` + tag +
-			` and that the tenant has internet access (underlying error: ` + underlying.Error() + `)`,
+		`docker image "` + image + `" not found after pull attempt — verify registry access for ` + tag +
+			` and that the host can reach the configured registry (underlying error: ` + underlying.Error() + `)`,
 	)
 	s := wrapped.Error()
 
 	for _, want := range []string{
-		`"ghcr.io/molecule-ai/workspace-template-openclaw:latest"`,
-		`verify GHCR visibility for openclaw`,
+		`"registry.moleculesai.app/molecule-ai/workspace-template-openclaw:latest"`,
+		`verify registry access for openclaw`,
 		`No such image`,
 	} {
 		if !strings.Contains(s, want) {

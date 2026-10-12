@@ -69,6 +69,21 @@ const HAS_BULLET_LIST = /(^|\n)\s*(?:[-*•]|\d+\.)\s/;
 const GREETING_MAX_LEN = 240;
 
 /**
+ * True when a message has the semantic shape of a conversation opener.
+ *
+ * This is intentionally broader than isPureGreeting: a live concierge may
+ * answer the first literal "hi" with a greeting plus a longer capability
+ * introduction. Callers must use this only when they already know the message
+ * is the opening reply. Later-turn re-greet detection stays on the stricter,
+ * length/list-bounded predicate below.
+ */
+export function isOpeningGreeting(text: string): boolean {
+  const t = (text || "").trim();
+  if (!t) return false;
+  return GREETING_OPENER.test(t) || CONCIERGE_INTRO.test(t);
+}
+
+/**
  * True when a message is a bare concierge GREETING (an opener / self-intro with
  * no substantive body), as opposed to a real answer. Robust to LLM wording:
  * keys on an anchored opener OR an explicit concierge self-introduction, and
@@ -224,7 +239,15 @@ export function checkConciergeInvariants(
   const agentMsgs = messages.filter(
     (m) => m.role === "agent" && m.content.trim().length > 0,
   );
+  const firstAgent = agentMsgs[0] ?? null;
+  const openingGreeting =
+    requireGreeting && firstAgent && isOpeningGreeting(firstAgent.content)
+      ? firstAgent
+      : null;
   const greetings = agentMsgs.filter((m) => isPureGreeting(m.content));
+  if (openingGreeting && !greetings.includes(openingGreeting)) {
+    greetings.unshift(openingGreeting);
+  }
   const greetingCount = greetings.length;
 
   // Invariant 1: exactly one greeting on a fresh chat.
@@ -240,7 +263,17 @@ export function checkConciergeInvariants(
   // requireGreeting=false means "an arbitrary window", i.e. the real opening
   // greeting may lie OUTSIDE it — so no greeting in the window gets the
   // expected-opening free pass, or a re-greet would be swallowed as the opening.
-  const reGreets = unexpectedGreetings(messages, { openingIsExpected: requireGreeting });
+  // Only a narrow/bare opening greeting consumes unexpectedGreetings' free
+  // pass. A longer opening introduction is counted above, but remains outside
+  // the later-turn bare-greeting classifier; the first later bare greeting is
+  // therefore evaluated against its preceding user turn instead of being
+  // mistaken for the opening.
+  const openingIsExpected = Boolean(
+    requireGreeting &&
+      openingGreeting &&
+      isPureGreeting(openingGreeting.content),
+  );
+  const reGreets = unexpectedGreetings(messages, { openingIsExpected });
   if (reGreets.length > 0) {
     const shown = reGreets.map((g) => `"${g.content.slice(0, 60)}"`).join("; ");
     violations.push(
@@ -275,4 +308,74 @@ export function checkConciergeInvariants(
 export function isReGreet(greeting: string, followupReply: string, threshold = 0.7): boolean {
   if (isPureGreeting(followupReply)) return true;
   return contentSimilarity(greeting, followupReply) >= threshold;
+}
+
+/** Result of attributing rendered agent bubbles to a single chat turn. */
+export interface TurnAttribution {
+  /** Agent bubbles that appeared AFTER the baseline — i.e. produced by the turn. */
+  replies: SimpleMessage[];
+  /** True when every baseline bubble is still intact, in order, at the front. */
+  prefixIntact: boolean;
+  /** Baseline positions that changed or vanished (empty when prefixIntact). */
+  prefixDrift: { index: number; before: string; after: string }[];
+}
+
+/**
+ * Attribute agent bubbles to ONE turn, by diffing the transcript against a
+ * baseline captured immediately BEFORE that turn was sent.
+ *
+ * Why this exists — the two failure modes it replaces, both proven on run
+ * 499907:
+ *
+ *  1. COUNTING THE WHOLE TRANSCRIPT IS WRONG. The staging specs share ONE org
+ *     and ONE long-lived concierge "My Chat" (see staging-setup.ts globalSetup +
+ *     workers:1), so by the time a late-sorting spec runs, the transcript already
+ *     carries the earlier specs' turns. An `agents.length === 1` model therefore
+ *     asserts something false about the world it runs in and false-REDs on
+ *     perfectly correct behaviour. Attribution is relative to a baseline, so
+ *     pre-existing history is simply not this turn's business.
+ *
+ *  2. DEDUPING BY EXACT CONTENT CANNOT SEE A SEMANTIC DOUBLE-REPLY. If the agent
+ *     answers ONE "hi" TWICE with differently-worded replies ("Hey again! What
+ *     can I help you with?" / "Hey! What can I do for you?"), an exact-content
+ *     dedupe returns [] and the guard passes — while the user plainly sees the
+ *     concierge answer twice. Counting the replies ATTRIBUTABLE TO THE TURN
+ *     catches it regardless of wording: one turn must yield exactly one reply.
+ *
+ * The chat transcript is append-only, so the baseline must survive as a PREFIX.
+ * A copy of an OLD bubble re-inserted mid-transcript (the render-dup symptom
+ * applied to history rather than the live turn) breaks that prefix, so it is
+ * reported via `prefixDrift` instead of being silently absorbed into `replies`.
+ *
+ * Comparison is on NORMALIZED content, so cosmetic markdown/whitespace re-render
+ * cannot masquerade as drift. Non-agent bubbles are ignored on both sides.
+ *
+ * @param before  transcript captured BEFORE the turn was sent (any roles)
+ * @param after   transcript captured AFTER the turn settled (any roles)
+ */
+export function agentRepliesForTurn(before: SimpleMessage[], after: SimpleMessage[]): TurnAttribution {
+  const beforeAgents = before.filter((m) => m.role === "agent");
+  const afterAgents = after.filter((m) => m.role === "agent");
+
+  const prefixDrift: { index: number; before: string; after: string }[] = [];
+  for (let i = 0; i < beforeAgents.length; i++) {
+    const b = normalizeContent(beforeAgents[i].content);
+    const a = i < afterAgents.length ? normalizeContent(afterAgents[i].content) : "";
+    if (a !== b) {
+      prefixDrift.push({
+        index: i,
+        before: beforeAgents[i].content,
+        after: i < afterAgents.length ? afterAgents[i].content : "<missing>",
+      });
+    }
+  }
+
+  return {
+    // Everything past the baseline length is new. When the prefix has drifted the
+    // slice is not trustworthy on its own — hence prefixIntact, which callers
+    // must assert BEFORE reading a meaning into `replies`.
+    replies: afterAgents.slice(beforeAgents.length),
+    prefixIntact: prefixDrift.length === 0,
+    prefixDrift,
+  };
 }

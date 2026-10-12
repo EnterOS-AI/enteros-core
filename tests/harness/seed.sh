@@ -41,9 +41,9 @@ create_workspace() {
     #     (CTO 2026-05-22 SSOT directive forbids silent DefaultModel fallback)
     local body
     if [ -n "$parent" ]; then
-        body="{\"name\":\"$name\",\"tier\":$tier,\"parent_id\":\"$parent\",\"runtime\":\"hermes\",\"model\":\"moonshot/kimi-k2.6\"}"
+        body="{\"name\":\"$name\",\"tier\":$tier,\"parent_id\":\"$parent\",\"runtime\":\"hermes\",\"model\":\"minimax/MiniMax-M2.7\"}"
     else
-        body="{\"name\":\"$name\",\"tier\":$tier,\"runtime\":\"hermes\",\"model\":\"moonshot/kimi-k2.6\"}"
+        body="{\"name\":\"$name\",\"tier\":$tier,\"runtime\":\"hermes\",\"model\":\"minimax/MiniMax-M2.7\"}"
     fi
     local id
     if [ "$tenant" = "alpha" ]; then

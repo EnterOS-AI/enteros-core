@@ -10,7 +10,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/scheduler"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/cronspec"
 )
 
 func TestOrgDefaults_InitialPrompt_YAMLParsing(t *testing.T) {
@@ -624,7 +624,7 @@ func TestOrgImport_ScheduleComputeError(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := scheduler.ComputeNextRun(tc.cronExpr, tc.tz, now)
+			_, err := cronspec.ComputeNextRun(tc.cronExpr, tc.tz, now)
 			if err == nil {
 				t.Errorf("ComputeNextRun(%q, %q) returned nil error — "+
 					"org importer would silently insert zero next_run_at; #722 fix requires non-nil",

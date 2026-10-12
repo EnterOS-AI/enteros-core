@@ -130,7 +130,7 @@ cd canvas && npm test
 # Runtime code is SSOT in molecule-ai-workspace-runtime, not molecule-core/workspace.
 cd ../molecule-ai-workspace-runtime
 python -m venv .venv && source .venv/bin/activate
-pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ -e . pytest pytest-asyncio
+python -m pip install -e '.[test]'
 pytest -q
 
 # E2E API tests (requires running platform)
@@ -183,7 +183,6 @@ stages 3–4) are merge-blocking and partly live in CP's deploy pipeline.
 | python-lint | pytest with coverage |
 | e2e-api | Full API test suite (62 tests) |
 | shellcheck | Shell script linting |
-| review-check-tests | `review-check.sh` evaluator regression suite (13 scenarios) |
 | ops-scripts | Python unittest suite for `scripts/*.py` |
 
 ### Workspace runtime SSOT
@@ -194,18 +193,27 @@ Do not reintroduce `molecule-core/workspace/` or vendored `molecule_runtime/`
 copies in consumers. Core and templates consume the published runtime package
 from the Gitea package registry.
 
-For local external MCP agents, multi-workspace config is
-`MOLECULE_WORKSPACES=[{"id":"...","token":"...","platform_url":"..."}]`.
+For local external MCP agents, the multi-workspace config key depends on the
+bridge: the maintained Python runtime/MCP CLI uses `MOLECULE_WORKSPACES`, while
+`parseWorkspaceTargets` in `@molecule-ai/mcp-server` uses
+`MOLECULE_WORKSPACES_JSON`. The shared entry shape and the bridge-specific keys
+are documented once, canonically, in
+[Multiple workspaces and tenants](docs/guides/external-agent-registration.md#multiple-workspaces-and-tenants);
+the operator-facing snippets are generated from
+`workspace-server/internal/handlers/external_connection.go`. Do not restate the
+shape in a new place — a second copy is how the key names drift, and a snippet
+built against the wrong key fails silently.
 `platform_url` selects the tenant; `org_id` is not part of this config.
 Workspace IDs can differ across orgs.
 
 ## Local Testing
 
-### review-check.sh
+### CI ops-script suite
 ```bash
-bash .gitea/scripts/tests/test_review_check.sh
+python3 -m pytest .gitea/scripts/tests/ -q
+bash .gitea/scripts/tests/test_ci_status.sh
 ```
-Runs the full regression suite against a fixture HTTP server. No network access required.
+Runs the governance/merge-queue script regression suites. No network access required.
 
 ## Code Style
 
@@ -230,7 +238,7 @@ Runs the full regression suite against a fixture HTTP server. No network access 
 Code in this repo lands in molecule-core. Some related runtime artifacts
 live in their own repos:
 
-- [`molecule-ai/molecule-ai-workspace-runtime`](https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-runtime) — Python adapter SDK (`molecule_runtime`) that runs inside containerized Molecule workspaces. Bridges Claude Code SDK / hermes / langgraph / etc. → A2A queue.
+- [`molecule-ai/molecule-ai-workspace-runtime`](https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-runtime) — Python runtime (`molecule_runtime`) that runs inside containerized Molecule workspaces. Its runtime-owned adapter registry, rather than a copied list here, defines the maintained adapters bridged to the A2A queue.
 - [`molecule-ai/molecule-ai-sdk`](https://git.moleculesai.app/molecule-ai/molecule-ai-sdk) — `A2AServer` + `RemoteAgentClient` for external agents that register over the public `/registry/register` flow.
 - [`molecule-ai/molecule-mcp-claude-channel`](https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel) — Claude Code channel plugin. Bridges A2A traffic into a running Claude Code session via MCP `notifications/claude/channel`. Polling-based (no tunnel required); install inside Claude Code via `/plugin marketplace add https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel.git` → `/plugin install molecule@molecule-channel`, then launch with `claude --dangerously-load-development-channels=plugin:molecule@molecule-channel`.
 

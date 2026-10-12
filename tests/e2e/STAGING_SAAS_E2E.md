@@ -1,117 +1,99 @@
-# Staging SaaS E2E — runbook
+# Staging SaaS E2E runbook
 
-Four workflows + a shared bash harness that together cover the SaaS stack end to end against live staging. Every workflow provisions a fresh org per run and tears it down; leaks are CI failures.
+The staging E2E workflows provision disposable resources through
+`https://staging-api.moleculesai.app` on the current local-Docker backend,
+exercise the deployed tenant stack, and tear everything down through the
+control plane. The workflow YAML files are authoritative for triggers, cadence,
+runner labels, and timeout budgets.
 
-## Coverage
+## Main coverage
 
-| Workflow | Cadence | Wall time | Scope |
-|---|---|---|---|
-| `e2e-staging-saas.yml` | push + nightly 07:00 UTC | ~20 min | Full API: org → tenant → 2 workspaces → A2A → HMA → delegation → leak check |
-| `staging-smoke.yml` | every 30 min | ~8 min | Minimum smoke + self-managed alert issue |
-| `e2e-staging-canvas.yml` | push + weekly Sunday 08:00 | ~25 min | All 13 canvas workspace-panel tabs via Playwright |
-| `e2e-staging-sanity.yml` | weekly Monday 06:00 | ~10 min | Intentional-failure: teardown safety-net self-check |
+- `.gitea/workflows/e2e-staging-saas.yml`: control-plane/tenant API, workspace
+  creation, registration, A2A, memory, delegation, and cleanup.
+- `.gitea/workflows/e2e-staging-canvas.yml`: current Canvas workspace-panel
+  interactions against a real staging org.
+- `.gitea/workflows/e2e-staging-external.yml`: external-runtime registration,
+  heartbeat, and delivery.
+- backend reconciliation and recovery: the standalone
+  `e2e-staging-reconciler.yml` post-push lane was RETIRED (it was push-only,
+  narrowly paths-filtered, and dormant — 0 runs across the recent Actions
+  window — and red-when-run because its `docker info` preflight needs a
+  molecules-server `DOCKER_HOST` that the generic `ubuntu-latest` runner does
+  not have). Its coverage now runs advisory per-PR on the ephemeral gate as the
+  `reconciler_heals_terminated` scenario
+  (`.gitea/workflows/e2e-ephemeral-happy-path.yml`), driven by the same
+  `tests/e2e/test_reconciler_heals_terminated_instance.sh` harness.
+- `.gitea/workflows/e2e-workspace-lifecycle-staging.yml`: restart,
+  pause/resume, hibernate/wake, and A2A survival.
+- `.gitea/workflows/staging-tenant-cd.yml`: exact-image staging rollout plus a
+  guarded exact-digest runtime-image readiness sibling, followed by the hard
+  provision/management-MCP/A2A/lifecycle gate and rollback chain. The E2E cannot
+  start until the tenant roll and local-deploy daemon readiness are both green.
 
-`tests/e2e/test_staging_full_saas.sh` is the shared harness all workflows invoke (with `E2E_MODE={full|smoke}` and `E2E_INTENTIONAL_FAILURE={0|1}` toggles).
+The shared shell harness is `tests/e2e/test_staging_full_saas.sh`; individual
+workflows select the required mode. The active local-Docker lanes in
+`e2e-staging-saas.yml` that use these shell harnesses keep EXIT/INT/TERM cleanup
+traps. Destructive teardown is enabled only after a successful create returns a
+valid creation-returned org ID. Cleanup requires that ID to match the exact slug
+before DELETE, then normally validates the DELETE response's purge and org
+identities, the exact completed purge audit, and that
+`/cp/admin/tenants/<slug>/boot-events?limit=1` returns HTTP 404. That endpoint
+resolves the exact tenant identity before listing events; the admin roster is
+used only to rediscover the exact slug/ID pair already published by a successful
+create and is not absence proof. A missing run ID or verified creation identity
+makes the safety net visibly inconclusive and authorizes no roster request or
+DELETE. If the synchronous delete response is lost during local-Docker network
+detach, cleanup can recover only from a completed purge audit for the same
+creation-returned slug/org ID recorded no earlier than that DELETE attempt, plus
+the same exact structured HTTP 404 absence proof; a missing, stale, or malformed
+audit remains a hard failure. A generic Actions runner does not directly
+enumerate provider resources, so its logs must never
+describe that unperformed scan as a pass. Other staging workflow families retain
+separate teardown contracts; `molecule-ai/internal#639` tracks the remaining
+convergence.
 
-### Full-SaaS checklist (sections)
+The Go staging suites use `e2eSlug(<tag>)`, which embeds `GITHUB_RUN_ID` and a
+five-digit uniqueness suffix in CI. Their primary path remains the test's
+fail-closed `t.Cleanup` exact delete. A process timeout or runner SIGKILL cannot
+run `t.Cleanup`, so every credential-bearing Go job invokes the shared
+`tests/e2e/lib/go_e2e_run_teardown.sh` safety net with only the exact tags that
+job creates. The helper accepts only a full
+`e2e-<tag>-<run-id>-<six-hex>` match, obtains the matching org ID from the
+staging roster, and delegates deletion and proof to `cp_purge_receipt.sh`.
+Cleanup failure remains visible; the automatic main-push janitor is only a
+delayed final backstop after its conservative 90-minute age floor.
 
-| # | What |
-|---|---|
-| 0 | CP preflight |
-| 1 | `POST /cp/admin/orgs` — org create without WorkOS session |
-| 2 | Wait for tenant status = running |
-| 3 | `GET /cp/admin/orgs/:slug/admin-token` — fetch per-tenant bearer |
-| 4 | Tenant TLS readiness on `/health` |
-| 5 | Provision parent workspace |
-| 6 | Provision child workspace (full mode) |
-| 7 | Wait both online |
-| 8 | A2A round-trip on parent — expect agent response |
-| 9 | HMA memory write + read, peers smoke, activity log (full mode) |
-| 10 | Delegation mechanics: parent → child via proxy + activity assertion (full mode) |
-| 11 | EXIT trap — teardown + leak detection |
+The full-SaaS scheduler checks are volume-authoritative. Step 10f resolves the
+workspace under test, accepts daemon-readiness evidence only from that exact
+container's `schedule-health.json`, and requires both explicit-ID and omitted-ID
+self-mode creates to appear on its own `schedules.yaml` grid. A UUID response is
+the only signal that permits a bounded create retry because it proves the
+request reached the retired database path while capability propagation was
+stale; name-keyed volume responses and visible grid entries switch to poll-only
+to avoid duplicate creates. On failure, the harness prints the target's bounded
+grid, health, armed-state, and history snapshots before the wider container
+context. A sibling workspace heartbeat is never target readiness evidence.
 
-### Canvas tabs
+## Credential
 
-Opens all 13 workspace-panel tabs against the freshly-provisioned org:
+Load staging `CP_ADMIN_API_TOKEN` from Infisical environment `staging`, path
+`/shared/controlplane-admin`, and expose it to a local harness as
+`MOLECULE_ADMIN_TOKEN` only for that process. Do not copy the value into this
+runbook, a committed env file, or a persistent credential bundle.
 
+```bash
+source ~/.molecule-ai/ops.sh
+E2E_INFRA_BACKEND=local-docker \
+  MOLECULE_ADMIN_TOKEN="$(mol_secret CP_ADMIN_API_TOKEN /shared/controlplane-admin staging)" \
+  bash tests/e2e/test_staging_full_saas.sh
 ```
-chat, activity, details, skills, terminal, config, schedule,
-channels, files, memory, traces, events, audit
-```
 
-Per tab: visible, panel renders, no "Failed to load" toast, screenshot captured. Known SaaS-mode gaps (Files empty, Terminal disconnect, Peers 401) are whitelisted — see issue #1369.
+`E2E_KEEP_ORG=1` is a local debugging escape hatch. Never set it in CI.
 
-### Sanity self-check
+## Completion criteria
 
-Runs the harness with `E2E_INTENTIONAL_FAILURE=1`, which poisons the tenant admin token after the org is provisioned. The workspace-provision step then fails and the script exits non-zero; the EXIT trap + teardown + leak assertion must still run clean. If they don't, the sanity workflow files a `priority-high` issue with label `e2e-safety-net`.
-
-## Required secret (exactly one)
-
-Set in **Settings → Secrets and variables → Actions → Repository secrets**:
-
-### `CP_STAGING_ADMIN_API_TOKEN`
-
-> **Historical-rename note (2026-05-11):** previously named
-> `MOLECULE_STAGING_ADMIN_TOKEN`. Canonicalised to
-> `CP_STAGING_ADMIN_API_TOKEN` per internal#322 (the Railway staging
-> service exposes it as `CP_ADMIN_API_TOKEN`; the `CP_*` repo-secret
-> prefix matches the upstream env name + makes the service it talks
-> to obvious in workflow YAMLs). See the original PR for the
-> cross-workflow sweep.
-
-The `CP_ADMIN_API_TOKEN` env currently set on the Railway staging molecule-platform → controlplane service.
-
-```
-railway variables --environment staging --service controlplane --kv | grep CP_ADMIN_API_TOKEN
-```
-
-This **one** secret drives everything:
-
-- `POST /cp/admin/orgs` — provision org (no WorkOS session needed)
-- `GET /cp/admin/orgs/:slug/admin-token` — fetch per-tenant bearer
-- `DELETE /cp/admin/tenants/:slug` — teardown
-- `GET /cp/admin/orgs` — leak detection post-teardown
-
-The per-tenant admin token (short-lived, per-org) drives every tenant-side call (`POST /workspaces`, `/memories`, `/a2a`, etc.).
-
-**No WorkOS session cookie needed** — admin endpoints bypass session auth via `AdminGate` (bearer + rate-limit only). CI provision + teardown collapse to one credential.
-
-## Running locally
-
-```
-export MOLECULE_ADMIN_TOKEN="…"
-# Optional: keep the org for post-mortem inspection
-export E2E_KEEP_ORG=1
-bash tests/e2e/test_staging_full_saas.sh
-```
-
-`E2E_KEEP_ORG=1` skips teardown so you can poke at the provisioned tenant yourself. **Never set this in CI** — staging will fill with orphans.
-
-## Cost
-
-- Full run: ~20 min, ~$0.007
-- Smoke (48/day): ~$0.06/day
-- Canvas (few/week): ~$0.01/day
-- Sanity (weekly): ~$0.002/week
-- **Total staging burn: < $0.15/day** at expected CI load
-
-Hard per-workflow timeouts (15–40 min) cap runaway cost. Three teardown layers:
-
-1. Bash `trap cleanup_org EXIT INT TERM` in the harness
-2. Playwright `globalTeardown` for the canvas workflow
-3. `if: always()` step in every workflow that greps today's `e2e-*` orgs and force-deletes them
-
-## Exit codes
-
-| Code | Meaning |
-|---|---|
-| 0 | Happy path |
-| 1 | Generic failure (agent didn't respond, provisioning hung, etc.) |
-| 2 | Missing required env |
-| 3 | Provisioning timed out |
-| 4 | Teardown left orphan resources (**leak detected — sanity workflow catches this**) |
-
-## Known gaps (tracked elsewhere)
-
-- [#1369](https://git.moleculesai.app/molecule-ai/molecule-core/issues/1369): SaaS canvas Files / Terminal / Peers tabs — architecturally broken; whitelisted in the spec
-- LLM-driven delegation (autonomous `delegate_task` tool use) — probabilistic, not in v1; proxy mechanics covered
+A run is complete only when the throwaway tenant/workspaces reach the asserted
+states, a real A2A response is observed, and cleanup proves the exact completed
+purge audit plus an HTTP 404 from the exact-tenant boot-events endpoint. This is
+control-plane purge evidence, not a direct provider-resource scan. A successful
+API create, image push, or pin update by itself is not an end-to-end pass.

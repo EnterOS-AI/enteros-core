@@ -222,3 +222,54 @@ func TestRunStreamingCommand_ZeroGraceDisablesStallGate(t *testing.T) {
 		t.Errorf("command cut short; got %q", out)
 	}
 }
+
+// A silence that the caller's exemption recognizes (e.g. BuildKit's final
+// "unpacking to image" phase, which legitimately emits nothing for minutes on
+// a large image) must NOT trip the stall gate — the command runs to
+// completion. The absolute ceiling still applies (last sub-test). This is the
+// 2026-07-18 first-boot regression: the ~7GB hermes image's silent unpack
+// exceeded the 4m grace and EVERY fresh self-host onboarding died at
+// "no output within stall grace".
+func TestRunStreamingCommandExempt_QuietPhaseSurvivesStallGate(t *testing.T) {
+	requireSh(t)
+	// Emits the unpack marker, goes silent well past the grace, then finishes.
+	script := `echo "#26 unpacking to docker.io/molecule-local/workspace-template-hermes:x-amd64"; sleep 1; echo "#26 DONE 0.6s"`
+	cmd := exec.CommandContext(context.Background(), "sh", "-c", script)
+
+	out, err := runStreamingCommandExempt(
+		context.Background(), cmd, 300*time.Millisecond, 30*time.Second, buildkitQuietPhaseExempt)
+	if err != nil {
+		t.Fatalf("silent exempt phase was killed: %v (out=%q)", err, out)
+	}
+	if !strings.Contains(string(out), "#26 DONE") {
+		t.Errorf("command cut short; got %q", out)
+	}
+
+	// Same silence WITHOUT an exempt marker in the tail must still be killed.
+	cmd2 := exec.CommandContext(context.Background(), "sh", "-c", `echo "#24 RUN pip install"; sleep 10`)
+	_, err = runStreamingCommandExempt(
+		context.Background(), cmd2, 300*time.Millisecond, 30*time.Second, buildkitQuietPhaseExempt)
+	if !errors.Is(err, errBuildStalled) {
+		t.Fatalf("non-exempt silence must still stall-kill, got %v", err)
+	}
+
+	// An exempt phase that NEVER ends is still stall-killed — at the
+	// extended (stallExemptFactor×) grace, not deferred all the way to the
+	// absolute ceiling — so a daemon wedged mid-unpack keeps the diagnostic
+	// stall error and dies promptly.
+	cmd3 := exec.CommandContext(context.Background(), "sh", "-c", `echo "#26 unpacking to docker.io/x"; sleep 30`)
+	grace := 300 * time.Millisecond
+	start := time.Now()
+	_, err = runStreamingCommandExempt(
+		context.Background(), cmd3, grace, 30*time.Second, buildkitQuietPhaseExempt)
+	elapsed := time.Since(start)
+	if !errors.Is(err, errBuildStalled) {
+		t.Fatalf("endless exempt phase must be stall-killed at the extended grace, got %v", err)
+	}
+	if elapsed < grace*stallExemptFactor {
+		t.Errorf("exempt kill after %s — before the extended grace %s", elapsed, grace*stallExemptFactor)
+	}
+	if elapsed > grace*stallExemptFactor+2*stallPollInterval+2*time.Second {
+		t.Errorf("exempt kill took %s — far past extended grace %s + slack", elapsed, grace*stallExemptFactor)
+	}
+}

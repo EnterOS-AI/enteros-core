@@ -406,10 +406,11 @@ echo "--- (1) channel SEND → mock upstream receives serialized payload ---"
 
 # Create a slack channel whose webhook_url points at our mock. If the
 # platform wasn't started with the webhook test-base, ValidateConfig
-# rejects this URL → loud_skip / RED. chat_id is required by SendOutbound.
+# rejects this URL → loud_skip / RED. Incoming Webhook mode intentionally has
+# no channel_id: the URL encodes its destination, and this E2E proves the live
+# manager honors that adapter contract.
 SLACK_CFG=$(python3 -c "import json,sys; print(json.dumps({
-  'webhook_url': sys.argv[1] + 'services/T000/B000/e2e',
-  'chat_id': 'mock-chat'}))" "$WEBHOOK_BASE")
+  'webhook_url': sys.argv[1] + 'services/T000/B000/e2e'}))" "$WEBHOOK_BASE")
 CREATE=$(curl -s -X POST "$BASE/workspaces/$WS_TARGET/channels" "${WS_AUTH[@]}" \
   -H "Content-Type: application/json" \
   -d "{\"channel_type\":\"slack\",\"config\":$SLACK_CFG,\"enabled\":true}")
@@ -505,8 +506,7 @@ seed_secret() {
 seed_secret "$WS_TARGET" "${WS_AUTH[@]}"
 # Sibling gets its OWN channel so we can prove its rows survive the target purge.
 SIB_SLACK_CFG=$(python3 -c "import json,sys; print(json.dumps({
-  'webhook_url': sys.argv[1] + 'services/T111/B111/sib',
-  'chat_id': 'sib-chat'}))" "$WEBHOOK_BASE")
+  'webhook_url': sys.argv[1] + 'services/T111/B111/sib'}))" "$WEBHOOK_BASE")
 SIB_CH=$(curl -s -X POST "$BASE/workspaces/$WS_SIBLING/channels" "${SIB_AUTH[@]}" \
   -H "Content-Type: application/json" \
   -d "{\"channel_type\":\"slack\",\"config\":$SIB_SLACK_CFG,\"enabled\":true}")

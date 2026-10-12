@@ -23,6 +23,7 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/messagestore"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/textutil"
 )
 
@@ -77,6 +78,38 @@ func extractExpiresInSeconds(body []byte) int {
 	return seconds
 }
 
+// QueuedA2AResponse reports whether resp is one of the proxy's "accepted but
+// NOT answered — deferred" acknowledgements and, when present, extracts the
+// queue row id. TWO shapes exist and every caller must recognize BOTH:
+//
+//   - busy-target enqueue (a2a_proxy_helpers.go): 202 + {"queued":true,
+//     "queue_id":...,"queue_depth":...} — the target was busy, so the turn was
+//     persisted to a2a_queue and will be dispatched on the next drain.
+//   - poll-mode / push-async short-circuit (a2a_proxy.go): {"status":"queued",
+//     "delivery_mode":...} — the turn was accepted but the agent answers later
+//     out-of-band.
+//
+// In neither case is resp the agent's real reply, so callers must NOT relay it
+// as agent output. This unifies the two former local predicates
+// (delegation.isQueuedProxyResponse + first-boot.isQueuedA2AResponse) so a new
+// queued shape is handled in exactly one place. A non-bool `queued` value
+// (e.g. the string "true") makes the whole decode fail and returns false —
+// defensive parity with the old map[string]interface{} type-assertion check.
+func QueuedA2AResponse(resp []byte) (queued bool, queueID string) {
+	var body struct {
+		Status  string `json:"status"`
+		Queued  *bool  `json:"queued"`
+		QueueID string `json:"queue_id"`
+	}
+	if err := json.Unmarshal(resp, &body); err != nil {
+		return false, ""
+	}
+	if body.Status != "queued" && (body.Queued == nil || !*body.Queued) {
+		return false, ""
+	}
+	return true, body.QueueID
+}
+
 const (
 	PriorityCritical = 100
 	PriorityTask     = 50
@@ -106,6 +139,157 @@ const (
 // the next heartbeat is not perceptibly delayed.
 const transientRetryBackoffSecs = 5
 
+// attachQueuedTurnCompletion attaches a drained USER turn's reply
+// (response_body + tool_trace) onto its message-keyed activity row — the
+// async half of the hermes tool-trace feature. Deliberately NARROW instead
+// of dispatching the drain with logActivity=true: the queue NULL-normalizes
+// system callers, so the full logging path would treat platform boot turns
+// as canvas turns (broadcast internal replies into chat, trip the greet-once
+// gate, duplicate busy re-queues — review wf_b8f98be3). Skips:
+//   - peer/delegation turns (caller_id present) — stitched via delegation rows
+//   - self-source platform turns (restart-context wake, harvester nudges) —
+//     internal self-messages the user must never see
+//   - unkeyed messages (an insert would duplicate, never collapse)
+//
+// EXCEPTION (RFC concierge rule 1): the first-boot greeting
+// (source_type=self-first-boot-greet) is self-source but IS the user-facing
+// message. When its greet turn was busy-queued, THIS drain carries the agent's
+// only real reply — the synchronous greet path already returned without
+// sending anything (first_boot_greeting.go), so route the drained reply to the
+// AgentMessageWriter SSOT here instead of skipping it, otherwise the fresh chat
+// opens silent or on the static fallback. Every OTHER self-source turn keeps
+// the skip. This is the single delivery on that path (dedup-safe).
+//
+// The upsert lands on the row the original ingest wrote (ON CONFLICT
+// workspace_id,message_id), so no new bubble is ever created here.
+func (h *WorkspaceHandler) attachQueuedTurnCompletion(ctx context.Context, workspaceID string, hasCaller bool, reqBody, respBody []byte) {
+	if len(respBody) == 0 {
+		return
+	}
+	// Peer/delegation turns (caller_id present) have their own stitching
+	// (delegation rows) and must never render in this workspace's chat.
+	if hasCaller {
+		return
+	}
+	if st := messagestore.RequestSourceType(reqBody); st != "" && messagestore.IsSelfSourceType(st) {
+		// First-boot greeting exception — see the doc comment. Its busy-queued
+		// greet turn sent nothing; this drain carries the real reply, so deliver
+		// it rather than swallowing it as an internal self-message.
+		if st == firstBootGreetSourceType {
+			h.deliverDrainedFirstBootGreeting(ctx, workspaceID, reqBody, respBody)
+		}
+		return
+	}
+	messageID := extractIdempotencyKey(reqBody)
+	if messageID == "" {
+		return
+	}
+	// Async (review wf_8b04761b #7): the DB write must not stall the drain
+	// loop; and UPDATE-ONLY (#5): if no ingest row exists for this
+	// messageId, an upsert would INSERT a fresh source_id-NULL row that
+	// hydrates as a surprise user bubble — skip instead (the reply still
+	// reached the user live via the runtime's own delivery).
+	h.goAsync(func() {
+		logCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+		var exists bool
+		if err := db.DB.QueryRowContext(logCtx,
+			`SELECT EXISTS(SELECT 1 FROM activity_logs WHERE workspace_id = $1 AND message_id = $2)`,
+			workspaceID, messageID,
+		).Scan(&exists); err != nil || !exists {
+			return
+		}
+		method := "message/send"
+		summary := "message/send (queued turn reply)"
+		LogActivity(logCtx, h.broadcaster, ActivityParams{
+			WorkspaceID:  workspaceID,
+			ActivityType: "a2a_receive",
+			TargetID:     &workspaceID,
+			Method:       &method,
+			Summary:      &summary,
+			RequestBody:  json.RawMessage(reqBody),
+			ResponseBody: json.RawMessage(respBody),
+			ToolTrace:    extractToolTrace(respBody),
+			Status:       "ok",
+			MessageId:    messageID,
+		})
+	})
+}
+
+// deliverDrainedFirstBootGreeting delivers the agent's REAL first-boot greeting
+// after its greet turn was busy-queued and is only now draining (RFC concierge
+// rule 1). The synchronous greet path (first_boot_greeting.go) returned on the
+// queued ack WITHOUT sending anything, so THIS is the single delivery — routed
+// through the AgentMessageWriter SSOT exactly like a normal greeting (the same
+// writer shape router.go wires), which is dedup-safe because it is the only
+// writer on this path. Mirrors the writer construction the production greeter
+// uses (broadcaster only; no push notifier).
+//
+// Runs async (goAsync) so the workspace-lookup + broadcast + persist never
+// stalls the drain loop, matching attachQueuedTurnCompletion's own async write.
+//
+// Claim-on-delivery (RFC concierge rule 2): routed through the shared
+// deliverFirstBootGreeting seam, so has_greeted is atomically claimed BEFORE
+// Send and rolled back on Send failure — a fresh box greets exactly once across
+// the sync-return-then-drain handoff, even against a second distinct wake, and
+// a failed delivery re-arms for a retry.
+//
+// Last-resort fallback: if the drained reply yields no usable prose (LLM error
+// / unknown shape), send the static greeting so a fresh onboarding never opens
+// on a silent chat. The tool count is recovered from the greet payload metadata
+// (firstBootToolCount) so a concierge (toolCount>0) keeps its tool-count
+// fallback text rather than degrading to the role-agnostic zero-tool greeting
+// (rule-1 finding #3).
+func (h *WorkspaceHandler) deliverDrainedFirstBootGreeting(ctx context.Context, workspaceID string, reqBody, respBody []byte) {
+	text := greetingTextFromReply(respBody)
+	if text == "" {
+		text = firstBootFallbackText(firstBootToolCount(reqBody))
+	}
+	h.goAsync(func() {
+		sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), greetSendTimeout)
+		defer cancel()
+		writer := NewAgentMessageWriter(db.DB, h.broadcaster)
+		if err := deliverFirstBootGreeting(sendCtx, writer, workspaceID, text); err != nil {
+			log.Printf("first-boot greeting: drained real-reply delivery failed for %s: %v", workspaceID, err)
+			return
+		}
+		log.Printf("first-boot greeting: delivered drained real reply to %s", workspaceID)
+	})
+}
+
+// deliverFirstBootFallbackOnTerminalDrop is the never-silent guarantee for the
+// busy-queued first-boot greeting (rule-1 finding #1). When a self-first-boot-
+// greet queue item is TERMINALLY dropped/failed in the drain loop (attempt cap,
+// settling ceiling, or URL-less settling drop), the agent's real greeting reply
+// is gone AND the synchronous greet path already returned without sending — so
+// without this the fresh chat opens silent while the user stares at an online
+// agent. Deliver the static fallback (with the concierge tool-count recovered
+// from the payload metadata) through the SAME claim-on-delivery seam: it dedups
+// against a wake that already greeted (claim lost → skip) and rolls back on Send
+// failure. No-op for any non-greet queue item.
+//
+// (The stale-sweep DropStaleQueueItems path is deliberately NOT covered here —
+// see its doc comment: a swept queued greet leaves has_greeted false, so the
+// workspace's next provisioning→online transition re-greets, which is the
+// correct healing for an item dropped precisely because the box was NOT
+// draining.)
+func (h *WorkspaceHandler) deliverFirstBootFallbackOnTerminalDrop(ctx context.Context, workspaceID string, reqBody []byte) {
+	if messagestore.RequestSourceType(reqBody) != firstBootGreetSourceType {
+		return
+	}
+	text := firstBootFallbackText(firstBootToolCount(reqBody))
+	h.goAsync(func() {
+		sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), greetSendTimeout)
+		defer cancel()
+		writer := NewAgentMessageWriter(db.DB, h.broadcaster)
+		if err := deliverFirstBootGreeting(sendCtx, writer, workspaceID, text); err != nil {
+			log.Printf("first-boot greeting: terminal-drop fallback delivery failed for %s: %v", workspaceID, err)
+			return
+		}
+		log.Printf("first-boot greeting: delivered static fallback for %s after terminal drain drop (never-silent)", workspaceID)
+	})
+}
+
 // QueuedItem is what the heartbeat drain path pulls off the queue.
 type QueuedItem struct {
 	ID          string
@@ -115,7 +299,30 @@ type QueuedItem struct {
 	Body        []byte
 	Method      sql.NullString
 	Attempts    int
+	EnqueuedAt  time.Time
+	// SettlingSince is when this item first entered the transient gateway-origin
+	// retry path (NULL until then). The settling ceiling is measured from here,
+	// not EnqueuedAt — see a2aSettlingRetryCeiling.
+	SettlingSince sql.NullTime
 }
+
+// a2aSettlingRetryCeiling bounds the total wall-clock a single queued A2A turn
+// may spend in the NON-cap-burning transient-retry path (a gateway-origin
+// failure while the target is still heartbeating — see DrainQueueForWorkspace).
+// That path deliberately does NOT burn the 5-attempt terminal cap so a brief
+// blip can't strand a legitimate turn. But with NO other ceiling, a PERSISTENTLY
+// settling target re-queues FOREVER: a force-hibernated box that was woken onto a
+// fresh container while the in-flight turn still targets the dead one, or any
+// workspace whose forward path stays broken while it keeps heartbeating. Each
+// re-delivery attempt pokes the runtime and resets its idle clock, so the
+// idle-digest (and every other idle-gated behaviour) is starved indefinitely —
+// the RCA of the nondeterministic ephemeral happy-path gate (run 533322:
+// digest armed=3, fired=0; task #124/#94). Past this ceiling we stop treating the
+// failure as transient and DROP the turn (terminally, with a caller-visible
+// reason) so it can never zombie-requeue. Sized generously (well beyond a normal
+// hibernate wake, which settles in ~15-30s) so a merely-slow-but-recovering
+// target is not dropped. Env override: A2A_SETTLING_RETRY_CEILING_S.
+var a2aSettlingRetryCeiling = envDuration("A2A_SETTLING_RETRY_CEILING_S", 180*time.Second)
 
 // EnqueueA2A inserts a busy-retry-eligible A2A request into a2a_queue and
 // returns the new row ID + current queue depth. Caller MUST have already
@@ -197,6 +404,13 @@ func EnqueueA2A(
 	// ON CONFLICT — only true CONSTRAINTs work for that). On conflict we
 	// then look up the existing row's id so the caller always receives a
 	// valid queue entry reference.
+	//ssot:allow-status-set a2a_queue is a DIFFERENT table with its own, smaller status
+	// vocabulary — CHECK (status IN ('queued','dispatched','completed','dropped','failed')).
+	// It has no in_progress and no stuck. This is that table's "still active" set, not a
+	// copy of the delegations vocabulary, and it must NOT be derived from
+	// DelegationInFlightStates: doing so would silently widen a2a_queue's idempotency
+	// predicate to states its own CHECK constraint forbids. Conflating these two
+	// vocabularies is what produced #4314 in the first place.
 	err = db.DB.QueryRowContext(ctx, `
 		INSERT INTO a2a_queue (workspace_id, caller_id, priority, body, method, idempotency_key, expires_at)
 		VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)
@@ -208,6 +422,7 @@ func EnqueueA2A(
 
 	if errors.Is(err, sql.ErrNoRows) && idempotencyKey != "" {
 		// Conflict — look up the existing active row and use its id.
+		//ssot:allow-status-set a2a_queue's own active-row set — see the INSERT above.
 		err = db.DB.QueryRowContext(ctx, `
 			SELECT id FROM a2a_queue
 			WHERE workspace_id = $1 AND idempotency_key = $2
@@ -259,7 +474,7 @@ func DequeueNext(ctx context.Context, workspaceID string) (*QueuedItem, error) {
 	var item QueuedItem
 	var body string
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, workspace_id, caller_id, priority, body::text, method, attempts
+		SELECT id, workspace_id, caller_id, priority, body::text, method, attempts, enqueued_at, settling_since
 		FROM a2a_queue
 		WHERE workspace_id = $1 AND status = 'queued'
 		  AND (expires_at IS NULL OR expires_at > now())
@@ -269,7 +484,7 @@ func DequeueNext(ctx context.Context, workspaceID string) (*QueuedItem, error) {
 		LIMIT 1
 	`, workspaceID).Scan(
 		&item.ID, &item.WorkspaceID, &item.CallerID, &item.Priority,
-		&body, &item.Method, &item.Attempts,
+		&body, &item.Method, &item.Attempts, &item.EnqueuedAt, &item.SettlingSince,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -318,17 +533,27 @@ func MarkQueueItemCompleted(ctx context.Context, id string, responseBody []byte)
 // incremented attempts counter so the next drain tick picks it up. Hits
 // an upper bound (5 attempts) to avoid wedging a stuck item in the queue
 // forever.
-func MarkQueueItemFailed(ctx context.Context, id, errMsg string) {
+//
+// Returns terminal=true iff this call flipped the row to 'failed' (the cap was
+// hit) — the caller uses it to fire the never-silent first-boot fallback only
+// on the genuinely terminal transition, not on a re-queue that will retry. The
+// status is read back via RETURNING so the signal is exact regardless of the
+// attempts arithmetic.
+func MarkQueueItemFailed(ctx context.Context, id, errMsg string) (terminal bool) {
 	const maxAttempts = 5
-	if _, err := db.DB.ExecContext(ctx, `
+	var status string
+	if err := db.DB.QueryRowContext(ctx, `
 		UPDATE a2a_queue
 		SET status = CASE WHEN attempts >= $2 THEN 'failed' ELSE 'queued' END,
 		    last_error = $3,
 		    dispatched_at = NULL
 		WHERE id = $1
-	`, id, maxAttempts, errMsg); err != nil {
+		RETURNING status
+	`, id, maxAttempts, errMsg).Scan(&status); err != nil {
 		log.Printf("A2AQueue: failed to mark %s failed: %v", id, err)
+		return false
 	}
+	return status == "failed"
 }
 
 // MarkQueueItemTransientRetry returns a dispatched item to 'queued' WITHOUT
@@ -371,10 +596,31 @@ func MarkQueueItemTransientRetry(ctx context.Context, id, errMsg string) {
 		    attempts = GREATEST(attempts - 1, 0),
 		    last_error = $2,
 		    dispatched_at = NULL,
-		    next_attempt_at = now() + make_interval(secs => $3)
+		    next_attempt_at = now() + make_interval(secs => $3),
+		    settling_since = COALESCE(settling_since, now())
 		WHERE id = $1
 	`, id, errMsg, transientRetryBackoffSecs); err != nil {
 		log.Printf("A2AQueue: failed to mark %s for transient retry: %v", id, err)
+	}
+}
+
+// DropQueueItemTerminal terminally drops a currently-dispatched item to
+// 'dropped' with a caller-visible reason. Unlike MarkQueueItemFailed (whose
+// 'failed' transition only fires once attempts>=cap — and the transient-retry
+// path deliberately keeps attempts at 0), this ends the item unconditionally so
+// a persistently-settling target cannot zombie-requeue it forever. The status
+// guard pins the write to the row THIS drain dispatched, so a racing enqueue/
+// completion is not clobbered.
+func DropQueueItemTerminal(ctx context.Context, id, reason string) {
+	if _, err := db.DB.ExecContext(ctx, `
+		UPDATE a2a_queue
+		SET status = 'dropped',
+		    last_error = $2,
+		    dispatched_at = NULL,
+		    completed_at = now()
+		WHERE id = $1 AND status = 'dispatched'
+	`, id, reason); err != nil {
+		log.Printf("A2AQueue: failed to terminally drop %s: %v", id, err)
 	}
 }
 
@@ -384,6 +630,17 @@ func MarkQueueItemTransientRetry(ctx context.Context, id, errMsg string) {
 // all workspaces.
 //
 // Returns the number of items dropped for visibility/audit logging.
+//
+// First-boot greeting (rule-1 finding #1): a swept self-first-boot-greet item is
+// NOT the silent-chat bug and needs no fallback here. This sweep only drops items
+// still 'queued' (never drained) — meaning the workspace was NOT draining. Because
+// has_greeted is committed only ON delivery (claim-on-delivery), a never-delivered
+// greet leaves the marker false, so the workspace's next provisioning→online
+// transition re-greets fresh. Delivering a fallback at sweep time (which would also
+// require a broadcaster this package function does not carry) would instead RACE
+// that re-greet. The in-drain-loop terminal branches DO deliver a fallback because
+// there the box is online-but-stuck with no re-greet coming — see
+// deliverFirstBootFallbackOnTerminalDrop.
 func DropStaleQueueItems(ctx context.Context, workspaceID string, maxAgeMinutes int) (int, error) {
 	var rows int64
 	var err error
@@ -468,6 +725,17 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 		log.Printf("A2AQueue drain: workspace %s has a restart-context boot turn in flight — deferring drain to the next heartbeat", workspaceID)
 		return
 	}
+	// The agent URL is CONSTANT for this workspace across the whole drain call, so
+	// evict+resolve it exactly ONCE (finding [8]) — lazily, on the first dequeued
+	// item, so an empty queue does no DB read and the resolve keeps its original
+	// position after the first DequeueNext. `resolved` guards the once-only block;
+	// `workspaceSettling` records whether the target is URL-less/provisioning.
+	var (
+		resolved           bool
+		resolvedURL        string
+		settlingResolveErr *proxyA2AError
+		workspaceSettling  bool
+	)
 	for i := 0; i < capacity; i++ {
 		item, err := DequeueNext(ctx, workspaceID)
 		if err != nil {
@@ -482,17 +750,58 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 		if item.CallerID.Valid {
 			callerID = item.CallerID.String
 		}
-		// Resolve the agent URL up front so every drain log line carries it.
-		// resolveAgentURL swallows its own errors into a proxyA2AError, so a
-		// resolution failure here is rare — usually a workspace with no URL
-		// row. Empty string is fine for the log; the dispatch below will
-		// produce the structured error and we already log it.
-		resolvedURL, _ := h.resolveAgentURL(ctx, workspaceID)
+		// Resolve the agent URL FRESH from the DB (source of truth) — never trust
+		// the Redis URL cache. A force-hibernate→wake re-provisions a NEW container
+		// with a NEW host/URL; Hibernate and WakeWorkspace blank workspaces.url in
+		// the DB, but the 5-minute Redis URL cache (and a late re-register from the
+		// dying pre-hibernate container) can still hold the DEAD container's URL. If
+		// the drain trusted that stale cache it would dial a host that no longer
+		// exists ("dial tcp: lookup <old-host>: no such host"), the forward would
+		// fail as upstream_dead, and — with no recent heartbeat on a just-woken box
+		// — burn the 5-attempt cap on a doomed dial, stranding the turn forever
+		// (core#124, ephemeral-gate run 815192).
+		//
+		// ClearCachedURL evicts ONLY the url key (not the liveness key), so
+		// resolveAgentURL re-reads the DB and RESEEDS the cache with the truth: the
+		// woken workspace's fresh container URL (→ dispatched to the NEW box), or a
+		// URL-less settling/provisioning row (→ classified workspace_settling). The
+		// proxyA2ARequest below then resolves the SAME reseeded cache value.
+		if !resolved {
+			db.ClearCachedURL(ctx, workspaceID)
+			resolvedURL, settlingResolveErr = h.resolveAgentURL(ctx, workspaceID)
+			workspaceSettling = settlingResolveErr != nil &&
+				settlingResolveErr.Classification == classWorkspaceSettling
+			resolved = true
+		}
+
+		// #4531 regression fix. A workspace that has NOT resolved to a reachable
+		// online URL — still provisioning / awaiting_agent (URL-less,
+		// classWorkspaceSettling; e.g. a wake that never reached online in the
+		// task#127 outage) — must NOT be dispatched through proxyA2ARequest. That
+		// path re-classifies classWorkspaceSettling and enqueueBusyA2A INSERTS a
+		// FRESH a2a_queue row every drain (attempts=0, settling_since=NULL,
+		// enqueued_at=now()), so the #4459 settling ceiling AND DropStaleQueueItems
+		// can NEVER fire and the turn zombie-requeues forever, re-poking provisioner
+		// discovery each sweep — re-opening exactly what #4459 fixed. Keep THIS row
+		// on the BOUNDED settling path instead: MarkQueueItemTransientRetry preserves
+		// settling_since (COALESCE) + attempts (idempotent requeue of the SAME row,
+		// no fresh insert), so the ceiling advances and DropQueueItemTerminal ends it.
+		if workspaceSettling {
+			h.settleQueuedItemBounded(ctx, workspaceID, callerID, item, settlingResolveErr)
+			continue
+		}
 		log.Printf("A2AQueue drain: dispatching queue_id=%s workspace_id=%s url=%s attempt=%d",
 			item.ID, workspaceID, resolvedURL, item.Attempts)
 
-		// logActivity=false: the original EnqueueA2A callsite already logged
-		// the dispatch attempt; re-logging here would double-count events.
+		// logActivity=false STANDS: EnqueueA2A NULL-normalizes system callers
+		// (caller_id is a UUID column), so a drained boot turn re-dispatches
+		// with callerID=="" and the full logging path would treat it as a
+		// CANVAS turn — broadcasting internal restart/greet replies into the
+		// user's chat, tripping the greet-once gate, and re-persisting busy
+		// re-queues as duplicate bubbles (review wf_b8f98be3, 5 confirmed
+		// regressions). The async tool-trace completion is attached instead
+		// by the NARROW helper below, which skips self-source turns and
+		// only upserts onto the message-keyed row.
 		status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, item.Body, callerID, false, false)
 
 		// 202 Accepted = the dispatch was itself queued again (target still busy).
@@ -529,17 +838,65 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 			// hand off to MarkQueueItemTransientRetry which undoes the
 			// DequeueNext attempts-increment.
 			if isGatewayOriginFailure(proxyErr) && h.hasRecentHeartbeat(ctx, workspaceID) {
+				// The transient path deliberately does NOT burn the 5-attempt cap.
+				// But a target that has been settling far past the point a blip can
+				// explain (a woken box on a fresh container while this turn targets
+				// the dead one, or any persistently-broken forward path) would
+				// re-queue FOREVER, poking the runtime on every attempt and starving
+				// idle-gated work (task #124/#94). Bound it: past
+				// a2aSettlingRetryCeiling, stop treating it as transient and DROP it.
+				// Measure the settling window from settling_since (the FIRST
+				// gateway-origin failure), NOT enqueued_at. A turn that merely sat
+				// queued a long time (target offline) whose settling_since is still
+				// NULL falls through to the transient retry below — which STAMPS
+				// settling_since — so it is never dropped on its first blip; only a
+				// SUSTAINED settling past the ceiling drops (core#4459 re-review [0]).
+				if item.SettlingSince.Valid && time.Since(item.SettlingSince.Time) >= a2aSettlingRetryCeiling {
+					settlingFor := time.Since(item.SettlingSince.Time)
+					dropMsg := fmt.Sprintf("target failed to settle within %s of the first gateway-origin failure (persistent, last status=%d classification=%s: %s); dropped to stop a zombie re-queue that starves the workspace (core#124)",
+						a2aSettlingRetryCeiling, proxyErr.Status, classificationOrUnknown(classification), errMsg)
+					DropQueueItemTerminal(ctx, item.ID, dropMsg)
+					// Never-silent (rule-1 finding #1): a self-first-boot-greet item
+					// terminally dropped here would leave the fresh chat blank —
+					// deliver the static fallback (no-op for any other item).
+					h.deliverFirstBootFallbackOnTerminalDrop(ctx, workspaceID, item.Body)
+					// The stale/dead cached URL is what caused the drop — invalidate it
+					// so the REMAINING queued items of this workspace in this same drain
+					// re-resolve instead of all hammering the same dead URL (re-review [3]).
+					h.invalidateCachedURLForDrain(ctx, workspaceID)
+					// If this was a DELEGATION, terminalize its delegate_result to
+					// 'failed' NOW so the caller's check_task_status is unblocked
+					// immediately, instead of hanging until the 6h delegation-sweeper
+					// deadline (re-review [1]).
+					if delegationID := extractDelegationIDFromBody(item.Body); delegationID != "" {
+						h.stitchDroppedDelegationFailure(ctx, callerID, item.WorkspaceID, delegationID, dropMsg)
+					}
+					log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s url=%s SETTLING CEILING EXCEEDED "+
+						"(settling_for=%s ceiling=%s status=%d classification=%s) — dropped to stop zombie re-queue",
+						item.ID, workspaceID, resolvedURL, settlingFor.Truncate(time.Second), a2aSettlingRetryCeiling,
+						proxyErr.Status, classificationOrUnknown(classification))
+					continue
+				}
 				h.invalidateCachedURLForDrain(ctx, workspaceID)
 				MarkQueueItemTransientRetry(ctx, item.ID,
 					fmt.Sprintf("transient gateway origin (%s, status=%d): %s",
 						classificationOrUnknown(classification), proxyErr.Status, errMsg))
+				settledFor := time.Duration(0)
+				if item.SettlingSince.Valid {
+					settledFor = time.Since(item.SettlingSince.Time)
+				}
 				log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s url=%s transient gateway failure "+
-					"(status=%d classification=%s) — re-queued without burning attempt cap (attempts preserved at %d)",
-					item.ID, workspaceID, resolvedURL, proxyErr.Status, classificationOrUnknown(classification), item.Attempts)
+					"(status=%d classification=%s) — re-queued without burning attempt cap (attempts preserved at %d, settling_for=%s/%s)",
+					item.ID, workspaceID, resolvedURL, proxyErr.Status, classificationOrUnknown(classification), item.Attempts,
+					settledFor.Truncate(time.Second), a2aSettlingRetryCeiling)
 				continue
 			}
 
-			MarkQueueItemFailed(ctx, item.ID, errMsg)
+			if MarkQueueItemFailed(ctx, item.ID, errMsg) {
+				// Terminal (attempt cap hit): never-silent fallback for a
+				// self-first-boot-greet item (rule-1 finding #1). No-op otherwise.
+				h.deliverFirstBootFallbackOnTerminalDrop(ctx, workspaceID, item.Body)
+			}
 			log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s url=%s dispatch failed "+
 				"(attempt=%d status=%d classification=%s): %s",
 				item.ID, workspaceID, resolvedURL, item.Attempts, proxyErr.Status,
@@ -547,6 +904,12 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 			continue
 		}
 		MarkQueueItemCompleted(ctx, item.ID, respBody)
+		// Async tool-trace completion (2026-07-21, corrected by review
+		// wf_8b04761b: the first wiring landed on the 202-requeue branch and
+		// stamped the busy-ack as the durable reply). ONLY here — the 200
+		// branch with the agent's REAL reply — attach response_body +
+		// tool_trace onto the canvas turn's message-keyed activity row.
+		h.attachQueuedTurnCompletion(ctx, workspaceID, item.CallerID.Valid, item.Body, respBody)
 		log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s url=%s dispatched (attempt=%d)",
 			item.ID, workspaceID, resolvedURL, item.Attempts)
 
@@ -561,6 +924,63 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 			h.stitchDrainResponseToDelegation(ctx, callerID, item.WorkspaceID, delegationID, respBody)
 		}
 	}
+}
+
+// settleQueuedItemBounded handles a dequeued item whose target workspace has NOT
+// yet resolved to a reachable online URL — it is still provisioning /
+// awaiting_agent (classWorkspaceSettling, URL-less). It keeps the item on the same
+// BOUNDED settling path the #4459 ceiling governs, instead of dispatching it
+// through proxyA2ARequest (whose classWorkspaceSettling branch enqueueBusyA2A's a
+// FRESH unbounded a2a_queue row every drain — the #4531 regression). Two outcomes,
+// mirroring the online transient-gateway path:
+//
+//   - settling_since is set AND older than a2aSettlingRetryCeiling → the target has
+//     stayed URL-less far past any normal wake/provision window →
+//     DropQueueItemTerminal (+ delegation drop-stitch) so the turn can never
+//     zombie-requeue and starve idle-gated work (task #124/#94).
+//   - otherwise → MarkQueueItemTransientRetry, which COALESCEs settling_since
+//     (stamps it on the FIRST settling observation, preserves it thereafter) and
+//     undoes DequeueNext's attempts++ so attempts are PRESERVED across requeues.
+//     The row is the SAME durable row every drain (idempotent), so the ceiling
+//     genuinely advances toward the drop — unlike the fresh-row regression.
+func (h *WorkspaceHandler) settleQueuedItemBounded(ctx context.Context, workspaceID, callerID string, item *QueuedItem, resolveErr *proxyA2AError) {
+	status := 0
+	if resolveErr != nil {
+		status = resolveErr.Status
+	}
+
+	if item.SettlingSince.Valid && time.Since(item.SettlingSince.Time) >= a2aSettlingRetryCeiling {
+		settlingFor := time.Since(item.SettlingSince.Time)
+		dropMsg := fmt.Sprintf("target workspace never reached online within %s of the first settling observation "+
+			"(still URL-less/provisioning, last resolve status=%d); dropped to stop a zombie re-queue that starves the workspace (core#124/#4531)",
+			a2aSettlingRetryCeiling, status)
+		DropQueueItemTerminal(ctx, item.ID, dropMsg)
+		// Never-silent (rule-1 finding #1): a self-first-boot-greet item dropped
+		// on the URL-less settling ceiling would leave the fresh chat blank —
+		// deliver the static fallback (no-op for any other item).
+		h.deliverFirstBootFallbackOnTerminalDrop(ctx, workspaceID, item.Body)
+		// If this was a DELEGATION, terminalize its delegate_result to 'failed' NOW
+		// so the caller's check_task_status is unblocked immediately instead of
+		// hanging until the 6h delegation-sweeper deadline (mirrors the online
+		// ceiling-drop, core#4459 re-review [1]).
+		if delegationID := extractDelegationIDFromBody(item.Body); delegationID != "" {
+			h.stitchDroppedDelegationFailure(ctx, callerID, item.WorkspaceID, delegationID, dropMsg)
+		}
+		log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s SETTLING CEILING EXCEEDED (URL-less: "+
+			"settling_for=%s ceiling=%s resolve_status=%d) — dropped to stop zombie re-queue",
+			item.ID, workspaceID, settlingFor.Truncate(time.Second), a2aSettlingRetryCeiling, status)
+		return
+	}
+
+	MarkQueueItemTransientRetry(ctx, item.ID,
+		fmt.Sprintf("workspace settling (URL-less/provisioning, resolve status=%d): awaiting online for drain", status))
+	settledFor := time.Duration(0)
+	if item.SettlingSince.Valid {
+		settledFor = time.Since(item.SettlingSince.Time)
+	}
+	log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s URL-less settling — re-queued on the bounded settling "+
+		"path (attempts preserved at %d, settling_for=%s/%s)",
+		item.ID, workspaceID, item.Attempts, settledFor.Truncate(time.Second), a2aSettlingRetryCeiling)
 }
 
 // classificationOrUnknown renders an empty proxyA2AError.Classification as
@@ -618,15 +1038,26 @@ func (h *WorkspaceHandler) stitchDrainResponseToDelegation(ctx context.Context, 
 		log.Printf("a2aQueue stitch %s: json.Marshal respJSON failed: %v", delegationID, marshalErr)
 		return
 	}
+	// AND status = 'queued' pins this to the PLACEHOLDER row that executeDelegation
+	// wrote. Without it the UPDATE also matches the sweeper's own terminal
+	// delegate_result row (same workspace/type/method/target/delegation_id), so a
+	// late drain would silently rewrite a "Delegation failed" notice into
+	// "completed" — leaving activity_logs saying completed while `delegations` says
+	// failed, permanently disagreeing, with the caller having been told both.
+	//
+	// It also makes the stitch idempotent: a replayed drain matches zero rows and
+	// skips the ledger terminalization below instead of double-applying it.
 	res, err := db.DB.ExecContext(ctx, `
 		UPDATE activity_logs
 		   SET status        = 'completed',
 		       summary       = $1,
 		       response_body = $2::jsonb
 		 WHERE workspace_id   = $3
+		   AND activity_type  = 'delegation'
 		   AND method         = 'delegate_result'
 		   AND target_id      = $4
 		   AND response_body->>'delegation_id' = $5
+		   AND status         = 'queued'
 	`, "Delegation completed ("+textutil.TruncateBytes(responseText, 80)+")", string(respJSON),
 		sourceID, targetID, delegationID)
 	if err != nil {
@@ -642,7 +1073,45 @@ func (h *WorkspaceHandler) stitchDrainResponseToDelegation(ctx context.Context, 
 		log.Printf("A2AQueue drain stitch: no delegate_result row for delegation %s (queued-row may not exist yet)", delegationID)
 		return
 	}
+	// TERMINALIZE THE LEDGER TOO — not just the activity_logs row.
+	//
+	// The drain path used to flip only activity_logs, leaving the `delegations`
+	// row at 'queued' FOREVER. The sweeper selects
+	// status IN ('queued','dispatched','in_progress'), so a delegation that
+	// SUCCEEDED here stayed in the sweeper's candidate set until its 6h deadline
+	// and was then marked 'failed' — and, once the sweeper notifies (#4316), the
+	// caller's agent would be told a delegation that completed six hours ago had
+	// failed. The forward-only terminal guard in delegation_ledger.go does not
+	// help: it only protects rows the normal path terminalized, and this path
+	// never did, so the guard was vacuous exactly where it was needed.
+	//
+	// It is also the direct cause of the digest counting a drained-completed
+	// delegation as "awaiting a reply" for six hours (#4314).
+	authority := recordLedgerStatus(ctx, delegationID, "completed", "", responseText)
 	log.Printf("A2AQueue drain stitch: delegation %s queued → completed (%d chars)", delegationID, len(responseText))
+
+	// AND TELL THE CALLER. This is the queued-drain path — the delegation whose
+	// target was settling/restarting when the message was sent, so the platform HELD
+	// it in a2a_queue and is only now delivering the answer. It is the scenario the
+	// caller is most likely to have been left hanging on.
+	//
+	// Every other terminal transition emits exactly one delegate_result into the
+	// caller's inbox (the single-reply-authority contract). This one did not — the
+	// drained answer landed in the ledger and in the canvas feed, but never in the
+	// caller's inbox. On main that was merely wrong-but-VISIBLE: the row stayed
+	// 'queued', so the digest still listed the delegation as awaiting a reply.
+	// Terminalizing it correctly without also replying would have made it INVISIBLE
+	// — the row leaves the in-flight set and nothing ever tells the caller. Fixing
+	// the ledger alone would have converted a visible bug into a silent one.
+	//
+	// Gate: mayReply() is true when WE terminalized this row (we own the single
+	// reply) OR when the ledger cannot arbitrate at all — dark, or no row — in which
+	// case nobody else will speak and we must. See ReplyAuthority. It preserves
+	// behaviour — with no ledger there is no CAS to arbitrate on, and the drain is
+	// the only writer on this path anyway.
+	if mayReply(authority) {
+		pushDelegationResultToInbox(ctx, sourceID, targetID, delegationID, "completed", responseText, "")
+	}
 
 	// Broadcast DELEGATION_COMPLETE so the canvas chat feed flips the
 	// "⏸ queued" line to "✓ completed" in real time. Without this the
@@ -653,6 +1122,75 @@ func (h *WorkspaceHandler) stitchDrainResponseToDelegation(ctx context.Context, 
 			"target_id":        targetID,
 			"response_preview": textutil.TruncateBytes(responseText, 200),
 			"via":              "queue_drain",
+		})
+	}
+}
+
+// stitchDroppedDelegationFailure is the FAILURE twin of
+// stitchDrainResponseToDelegation, for the settling-ceiling drop path. When the
+// drain terminally drops a queued item that was a DELEGATION, the caller's
+// delegate_result placeholder (status='queued', written by executeDelegation)
+// would otherwise sit until the 6h delegation-sweeper deadline — the caller's
+// check_task_status reports the work still in-flight for hours after the platform
+// abandoned it (core#4459 re-review [1]). This closes "queued → failed" the same
+// way the success path closes "queued → completed": it flips the placeholder,
+// terminalizes the ledger, and (single-reply-authority) notifies the caller.
+//
+// Best-effort / idempotent by the same rules as the success stitch: the
+// AND status='queued' guard pins the write to the placeholder (so a race with the
+// sweeper's own terminal row is not clobbered) and makes a replayed drop a no-op.
+func (h *WorkspaceHandler) stitchDroppedDelegationFailure(ctx context.Context, sourceID, targetID, delegationID, reason string) {
+	if sourceID == "" || delegationID == "" {
+		return
+	}
+	errJSON, marshalErr := json.Marshal(map[string]interface{}{
+		"text":          reason,
+		"delegation_id": delegationID,
+	})
+	if marshalErr != nil {
+		log.Printf("a2aQueue drop-stitch %s: json.Marshal failed: %v", delegationID, marshalErr)
+		return
+	}
+	res, err := db.DB.ExecContext(ctx, `
+		UPDATE activity_logs
+		   SET status        = 'failed',
+		       summary       = $1,
+		       error_detail  = $2,
+		       response_body = $3::jsonb
+		 WHERE workspace_id   = $4
+		   AND activity_type  = 'delegation'
+		   AND method         = 'delegate_result'
+		   AND target_id      = $5
+		   AND response_body->>'delegation_id' = $6
+		   AND status         = 'queued'
+	`, "Delegation failed ("+textutil.TruncateBytes(reason, 80)+")", reason, string(errJSON),
+		sourceID, targetID, delegationID)
+	if err != nil {
+		log.Printf("A2AQueue drain drop-stitch: update failed for delegation %s: %v", delegationID, err)
+		return
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		log.Printf("A2AQueue drain drop-stitch: RowsAffected error for delegation %s: %v", delegationID, err)
+		return
+	}
+	if rows == 0 {
+		// Not a delegation with a live placeholder (or already terminalized) —
+		// nothing to fail. No ledger/inbox side effects.
+		log.Printf("A2AQueue drain drop-stitch: no queued delegate_result row for delegation %s", delegationID)
+		return
+	}
+	authority := recordLedgerStatus(ctx, delegationID, "failed", reason, "")
+	log.Printf("A2AQueue drain drop-stitch: delegation %s queued → failed (settling-ceiling drop)", delegationID)
+	if mayReply(authority) {
+		pushDelegationResultToInbox(ctx, sourceID, targetID, delegationID, "failed", "", reason)
+	}
+	if h.broadcaster != nil {
+		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventDelegationFailed), sourceID, map[string]interface{}{
+			"delegation_id": delegationID,
+			"target_id":     targetID,
+			"error":         textutil.TruncateBytes(reason, 200),
+			"via":           "queue_drain_drop",
 		})
 	}
 }

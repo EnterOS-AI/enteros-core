@@ -1,89 +1,12 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { uploadChatFiles, FileTooLargeError } from "../uploads";
 import { createMessage, type ChatMessage, type ChatAttachment } from "../types";
-import { extractFilesFromTask } from "../message-parser";
+import { parseA2AResponse, type A2APart, type A2AResponse } from "../a2a-response";
+export { extractReplyText } from "../a2a-response";
 import { getConversationId } from "./chatContext";
-
-interface A2APart {
-  kind?: string;
-  /** A2A v0.2 used `type` as the Part discriminator; v0.3 uses `kind`.
-   *  Real runtimes and third-party agents still emit both, so accept
-   *  either when `kind` is absent. */
-  type?: string;
-  text?: string;
-  file?: {
-    name?: string;
-    mimeType?: string;
-    uri?: string;
-    size?: number;
-  };
-}
-
-interface A2AResponse {
-  result?: {
-    parts?: A2APart[];
-    artifacts?: Array<{ parts: A2APart[] }>;
-    /** Standard A2A Task status; real runtimes place the agent's final
-     *  reply inside status.message.parts. */
-    status?: { message?: { parts?: A2APart[] } };
-  };
-  /** Set by ws-server's poll-mode short-circuit in `proxyA2ARequest`
-   *  (a2a_proxy.go:416-431) when the target workspace is registered as
-   *  `delivery_mode=poll` — e.g. an operator's laptop running
-   *  `molecule-mcp-claude-channel`, a hermes/codex MCP bridge, or a
-   *  Cursor MCP client. The HTTP 200 carries the synthetic envelope
-   *  `{status:"queued", delivery_mode:"poll", method:"message/send"}`
-   *  immediately (~50ms), BEFORE the agent has produced a reply.
-   *
-   *  Task #227 routing: when this field is "queued" the caller must NOT
-   *  treat the 200 as "agent done" — there are no `result.parts` yet
-   *  (the reply will arrive separately via the AGENT_MESSAGE WS event
-   *  after the agent's next poll). Keep the spinner up; the eventual
-   *  AGENT_MESSAGE flips `sending` off via the existing useChatSocket
-   *  `onSendComplete` path. Without this distinction the spinner
-   *  disappeared immediately and external/MCP workspaces had no progress
-   *  UX between send and reply. */
-  status?: string;
-  /** Companion to `status` — "poll" when the queued short-circuit fired.
-   *  Defensive: we key the poll-mode-skip decision on status==="queued"
-   *  (the canonical signal) rather than on this field, but it's surfaced
-   *  here so future debugging / tests can assert on the full envelope. */
-  delivery_mode?: string;
-}
-
-export function extractReplyText(resp: A2AResponse): string {
-  const collect = (parts: A2APart[] | undefined): string => {
-    if (!parts) return "";
-    return parts
-      .filter((p) => p.kind === "text" || p.type === "text")
-      .map((p) => p.text ?? "")
-      .filter(Boolean)
-      .join("\n");
-  };
-  const result = resp?.result;
-  const collected: string[] = [];
-
-  // Standard A2A JSON-RPC: {result: {parts: [{kind: "text", text: "..."}]}}
-  const fromParts = collect(result?.parts);
-  if (fromParts) collected.push(fromParts);
-
-  // Standard A2A Task shape: the agent's reply can live in
-  // result.status.message.parts rather than directly on result.parts.
-  // Real runtimes (Claude Code, Hermes, etc.) commonly return this shape.
-  const fromStatusMessage = collect(result?.status?.message?.parts);
-  if (fromStatusMessage) collected.push(fromStatusMessage);
-
-  if (result?.artifacts) {
-    for (const a of result.artifacts) {
-      const t = collect(a.parts);
-      if (t) collected.push(t);
-    }
-  }
-  return collected.join("\n");
-}
 
 /** Map a thrown error from `uploadChatFiles` to the user-facing reason
  *  shown in the chat error banner.
@@ -195,6 +118,18 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
   const setupGuardRef = useRef(false);
   const optionsRef = useRef(options);
   optionsRef.current = options;
+  // Pending warming-retry timers (core#3082 auto-retry). Tracked so unmount
+  // clears them — a retry firing after the panel is gone would re-POST into
+  // a dead UI (and leak the timer). Note the message itself is still lost
+  // on unmount mid-retry, same as any in-flight send when the page closes.
+  const warmingRetryTimersRef = useRef<Set<number>>(new Set());
+  useEffect(
+    () => () => {
+      for (const id of warmingRetryTimersRef.current) window.clearTimeout(id);
+      warmingRetryTimersRef.current.clear();
+    },
+    [],
+  );
 
   const syncSendingState = useCallback(() => {
     const pending =
@@ -278,6 +213,15 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
     syncSendingState();
   }, [syncSendingState, finishSendToken]);
 
+  const failSend = useCallback((reason: string, messageId?: string) => {
+    const token = messageId ? messageIdToTokenRef.current.get(messageId)
+      : inFlightTokensRef.current.size + pendingWSTokensRef.current.size === 1
+        ? [...inFlightTokensRef.current, ...pendingWSTokensRef.current][0] : undefined;
+    if (token === undefined || wsCompletedTokensRef.current.has(token)) return;
+    setError(reason);
+    finishSendToken(token);
+  }, [finishSendToken]);
+
   const clearError = useCallback(() => setError(null), []);
 
   const sendMessage = useCallback(
@@ -340,7 +284,18 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
         });
       }
 
-      api
+      // Warming auto-retry budget (core#3082): while the concierge is still
+      // verifying its management tools, the A2A proxy DEFERS the turn with a
+      // structured 503 {"warming":true} + Retry-After instead of delivering
+      // it. That is "not ready yet", not "unreachable" — so the send retries
+      // itself on the server's cadence while the boot finishes, keeping the
+      // thinking indicator up. ~24 × 5s covers a 2-minute warm-up tail; a
+      // boot slower than that exhausts the budget and surfaces a calm
+      // "still booting" error rather than the scary unreachable banner.
+      let warmingRetriesLeft = 24;
+
+      const postTurn = (): void => {
+        api
         .post<A2AResponse>(
           `/workspaces/${workspaceId}/a2a`,
           {
@@ -385,10 +340,24 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
           { timeoutMs: 30 * 60 * 1000 },
         )
         .then((resp) => {
+          const awaitingReply = () =>
+            !wsCompletedTokensRef.current.has(myToken) &&
+            (inFlightTokensRef.current.has(myToken) || pendingWSTokensRef.current.has(myToken));
+          const { pending, error: replyError, text: replyText, attachments: replyFiles } = parseA2AResponse(resp);
+          // HTTP 200 is also used for JSON-RPC errors and failed A2A tasks.
+          // Surface these as failures, unless this turn already completed via
+          // the socket; a late HTTP response must not undo that completion.
+          if (replyError) {
+            if (awaitingReply()) {
+              setError(replyError);
+            }
+            finishSendToken(myToken);
+            return;
+          }
           // Poll-mode queued short-circuit (external/MCP workspace): the
           // server returns `{status:"queued"}` immediately and the real reply
           // arrives later via the AGENT_MESSAGE WebSocket event.
-          if (resp?.status === "queued") {
+          if (pending) {
             if (
               !inFlightTokensRef.current.has(myToken) &&
               !pendingWSTokensRef.current.has(myToken)
@@ -412,10 +381,6 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
           // (core#2786 / #2759). Token cleanup is idempotent; ChatTab's
           // message dedup handles the rare case where both paths carry the
           // same content.
-          const replyText = extractReplyText(resp);
-          const replyFiles = extractFilesFromTask(
-            (resp?.result ?? {}) as Record<string, unknown>,
-          );
           if (replyText || replyFiles.length > 0) {
             // Stamp a stable, deterministic id derived from THIS turn's
             // messageId (task #187) so the reply bubble carries a real identity
@@ -425,6 +390,7 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
             optionsRef.current.onAgentMessage?.(
               createMessage("agent", replyText, replyFiles, undefined, stableAgentReplyId(messageId)),
             );
+
           }
           finishSendToken(myToken);
         })
@@ -469,9 +435,54 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
             return; // delivered; reply (and guard release) arrives via WS
           }
 
+          // WARMING 503 (core#3082): the proxy DEFERRED the turn — the
+          // concierge is booting, not unreachable. Retry on the server's
+          // Retry-After cadence with the token kept in flight so the
+          // thinking indicator stays up and the message delivers itself
+          // the moment the agent comes online.
+          const apiErr = e as {
+            status?: number;
+            bodyText?: string;
+            retryAfter?: string | null;
+          } | null;
+          let isWarming = false;
+          if (apiErr?.status === 503 && typeof apiErr.bodyText === "string") {
+            try {
+              isWarming = (JSON.parse(apiErr.bodyText) as { warming?: boolean }).warming === true;
+            } catch {
+              // Non-JSON 503 body — not the warming shape.
+            }
+          }
+          if (isWarming && warmingRetriesLeft > 0) {
+            warmingRetriesLeft--;
+            const hinted = parseInt(apiErr?.retryAfter ?? "", 10);
+            const delayMs =
+              (Number.isFinite(hinted) && hinted > 0 ? Math.min(hinted, 30) : 5) * 1000;
+            const timerId = window.setTimeout(() => {
+              warmingRetryTimersRef.current.delete(timerId);
+              // The turn may have been finished elsewhere meanwhile (WS
+              // completion, session reset) — don't re-send a settled token.
+              if (
+                !inFlightTokensRef.current.has(myToken) &&
+                !pendingWSTokensRef.current.has(myToken)
+              ) {
+                return;
+              }
+              postTurn();
+            }, delayMs);
+            warmingRetryTimersRef.current.add(timerId);
+            return; // token stays in flight — still "thinking"
+          }
+
           finishSendToken(myToken);
-          setError("Failed to send message — agent may be unreachable");
+          setError(
+            isWarming
+              ? "Agent is still booting — the message wasn't delivered. Try again in a moment."
+              : "Failed to send message — agent may be unreachable",
+          );
         });
+      };
+      postTurn();
 
       // The POST is now in flight (the .then/.catch above run later, off the
       // microtask queue). Release the setup guard on the next microtask so
@@ -492,6 +503,7 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
     clearError,
     releaseSendGuards,
     finishSendByMessageId,
+    failSend,
     sendingFromAPIRef,
   };
 }

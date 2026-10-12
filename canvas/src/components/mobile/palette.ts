@@ -1,13 +1,14 @@
 // Mobile design system tokens.
 //
 // SSOT (core#mobile-design-parity): the CORE palette — bg/surface/surface2/
-// border/divider/text/text2/text3 + the PURPLE brand accent — is kept in
+// border/divider/text/text2/text3 + the Enter OS brand accent — is kept in
 // sync with the canonical canvas @theme in
 // `molecule-core/canvas/src/app/globals.css` (the same app this mobile UI
 // ships inside). Earlier this palette shipped a divergent set built from a
 // Claude Design handoff (GREEN accent #2f9e6a + lighter warm-paper) — it now
-// adopts the canvas warm-paper + near-black-dark surfaces and the purple
-// accent so the mobile version has the SAME design as the desktop canvas.
+// adopts the canvas Enter OS surfaces (white light / deep-navy dark) and the
+// periwinkle accent so the mobile version has the SAME design as the desktop
+// canvas.
 // `palette.ssot.test.ts` asserts these core values equal the canvas tokens;
 // `green`/`online` map to the canvas `good`, status/tier badges stay
 // mobile-specific. Don't hand-edit the core values to differ from canvas —
@@ -49,18 +50,18 @@ export interface MobilePalette {
 export const MOL_LIGHT: MobilePalette = {
   // Core — canvas @theme light SSOT (surface / surface-elevated /
   // surface-card / line / line-soft / ink / ink-mid / ink-soft).
-  bg: "#f1efe8",
+  bg: "#ffffff",
   surface: "#ffffff",
-  surface2: "#faf9f4",
-  border: "#ddd9cf",
-  divider: "#ebe8df",
-  text: "#21201b",
-  text2: "#5c5a52",
-  text3: "#656871",
+  surface2: "#fafafc",
+  border: "#d6d6d6",
+  divider: "#e8e8e8",
+  text: "#000000",
+  text2: "#4d4d4d",
+  text3: "#6e6e78",
 
-  // green/online map to the canvas `good` (#2a6e44, AA-hardened — core#2742);
+  // green/online map to the canvas `good` (#25794a, AA-gated — core#2742);
   // soft/ink tints derived.
-  green: "#2a6e44",
+  green: "#25794a",
   greenSoft: "#d9ebe0",
   greenInk: "#1f6a47",
 
@@ -71,7 +72,7 @@ export const MOL_LIGHT: MobilePalette = {
 
   t4SoftCard: "#f9ece0",
 
-  online: "#2a6e44",
+  online: "#25794a",
   starting: "#e9b53b",
   degraded: "#d28a2a",
   failed: "#c8472a",
@@ -80,22 +81,22 @@ export const MOL_LIGHT: MobilePalette = {
 
   remote: "#7a4dd1",
   remoteBg: "#ede2ff",
-  accent: "#7c3aed", // canvas purple brand (was green #2f9e6a)
+  accent: "#6663d6", // canvas Enter OS accent (was green #2f9e6a)
 };
 
 export const MOL_DARK: MobilePalette = {
-  // Core — canvas @theme dark SSOT (near-black surfaces + bright ink).
-  bg: "#08080a",
-  surface: "#16161d",
-  surface2: "#1b1b23",
-  border: "#26262e",
-  divider: "#1b1b22",
-  text: "#ececf1",
-  text2: "#9b9baa",
-  text3: "#65656f",
+  // Core — canvas @theme dark SSOT (deep-navy surfaces + bright ink).
+  bg: "#010120",
+  surface: "#0b0b38",
+  surface2: "#101042",
+  border: "#232350",
+  divider: "#19193f",
+  text: "#f4f4ff",
+  text2: "#a3a3c8",
+  text3: "#8888b0",
 
-  // green/online map to the canvas dark `good` (#34d399).
-  green: "#34d399",
+  // green/online map to the canvas dark `good` (#3fd69a).
+  green: "#3fd69a",
   greenSoft: "#1f3a2c",
   greenInk: "#7fd3a8",
 
@@ -106,7 +107,7 @@ export const MOL_DARK: MobilePalette = {
 
   t4SoftCard: "#2a1f17",
 
-  online: "#34d399",
+  online: "#3fd69a",
   starting: "#e9b53b",
   degraded: "#d28a2a",
   failed: "#d65a3e",
@@ -115,7 +116,7 @@ export const MOL_DARK: MobilePalette = {
 
   remote: "#a38aff",
   remoteBg: "#2a1f44",
-  accent: "#a78bfa", // canvas dark purple brand (was green #3eb37c)
+  accent: "#bdbbff", // canvas Enter OS dark accent (was green #3eb37c)
 };
 
 /**
@@ -133,10 +134,10 @@ export const getPalette = (dark: boolean): MobilePalette => (dark ? MOL_DARK : M
 // `usePalette` from this file we can drop this line.
 export { usePalette } from "./palette-context";
 
-// References the CSS variables that next/font/google emits in
+// References the CSS variables that next/font/local emits in
 // app/layout.tsx. Falls through to system fonts if the variable is
 // undefined (e.g. in unit tests with no <body> font class).
-export const MOBILE_FONT_SANS = "var(--font-hanken), 'Hanken Grotesk', ui-sans-serif, system-ui, sans-serif";
+export const MOBILE_FONT_SANS = "var(--font-inter-tight), 'Inter Tight', ui-sans-serif, system-ui, sans-serif";
 export const MOBILE_FONT_MONO = "var(--font-jetbrains), 'JetBrains Mono', ui-monospace, monospace";
 
 // Status keys we surface in the mobile UI. Anything else from the

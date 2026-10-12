@@ -201,3 +201,361 @@ func TestObservedRuntime(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Gate 1.5 REQUIRE-LIVE posture (GUARD_B_REQUIRE_CALLABLE)
+// ---------------------------------------------------------------------------
+//
+// The k8s design doc discharges Gate 1.5 by an OPERATOR running Guard B by hand
+// against the controlplane-test CP, and its acceptance bar is "a fresh org
+// provisions onto k8s AND its concierge answers a real provision_workspace call
+// — NOT a PONG". Nothing on that hand path sets E2E_ASSERT_MGMT_MCP_CALLABLE
+// (only the staging-tenant-cd deploy job does), so before this guard the verdict
+// returned ok=true on the presence-only branch: a GREEN that never made the tool
+// call. These cases lock that hole shut and prove the guard is not inert.
+
+func TestEvaluateMgmtMCPCallable_RequireCallableRefusesPresenceOnly(t *testing.T) {
+	const defaultRuntime = "hermes"
+	tools := []string{requiredVerb()}
+
+	// The exact probe an operator would produce on the Gate-1.5 hand path with
+	// GUARD_B_REQUIRE_CALLABLE unset: a perfectly healthy fresh concierge that was
+	// never asked to run the tool. Every observation-based check passes.
+	presenceOnly := MgmtMCPProbe{
+		ExpectedRuntime:          defaultRuntime,
+		ObservedRuntime:          defaultRuntime,
+		Status:                   "online",
+		MCPServerPresent:         true,
+		MCPServerPresentReported: true,
+		LoadedTools:              tools,
+		RequiredTool:             requiredVerb(),
+		AssertCallable:           false,
+		WorkerProvisioned:        false,
+	}
+
+	// FAIL-BEFORE (the historical behaviour this guard changes): without the
+	// require-live posture the SAME probe is a green. Asserting it here documents
+	// that the new RED below is caused by RequireCallable and nothing else.
+	if ok, reason := EvaluateMgmtMCPCallable(presenceOnly); !ok {
+		t.Fatalf("baseline: presence-only probe should still be OK when RequireCallable is unset (got RED: %s)", reason)
+	} else if !strings.Contains(reason, "presence-only") {
+		t.Fatalf("baseline reason %q should name the presence-only posture", reason)
+	}
+
+	// RED: same probe, require-live armed.
+	req := presenceOnly
+	req.RequireCallable = true
+	ok, reason := EvaluateMgmtMCPCallable(req)
+	if ok {
+		t.Fatalf("RequireCallable=true with AssertCallable=false must be RED — a presence-only run cannot discharge Gate 1.5 (got GREEN: %s)", reason)
+	}
+	for _, want := range []string{"GUARD_B_REQUIRE_CALLABLE", "NOT a PONG", "misconfiguration"} {
+		if !strings.Contains(reason, want) {
+			t.Fatalf("RED reason must NAME the cause; %q missing from %q", want, reason)
+		}
+	}
+
+	// GREEN: require-live armed AND the real A2A turn genuinely created the
+	// workspace. This is the only shape that discharges Gate 1.5.
+	green := req
+	green.AssertCallable = true
+	green.WorkerProvisioned = true
+	ok, reason = EvaluateMgmtMCPCallable(green)
+	if !ok {
+		t.Fatalf("require-live + a genuine callable turn must be GREEN (got RED: %s)", reason)
+	}
+	if !strings.Contains(reason, "genuinely CALLABLE") {
+		t.Fatalf("GREEN reason %q must state the callable proof ran", reason)
+	}
+
+	// RED: require-live armed, the turn WAS armed, but the workspace never
+	// appeared — the present-but-not-runnable class. Must still name callability,
+	// not the require-live misconfiguration (check 0 must not shadow check 5).
+	notRunnable := green
+	notRunnable.WorkerProvisioned = false
+	ok, reason = EvaluateMgmtMCPCallable(notRunnable)
+	if ok {
+		t.Fatalf("armed callable turn that produced no workspace must be RED (got GREEN: %s)", reason)
+	}
+	if !strings.Contains(reason, "not genuinely CALLABLE") {
+		t.Fatalf("RED reason %q must name present-but-not-callable, not the require-live misconfiguration", reason)
+	}
+}
+
+// TestGuardBMode locks the posture resolution: GUARD_B_REQUIRE_CALLABLE IMPLIES
+// the callable turn, so an operator who sets the one Gate-1.5 variable cannot
+// then receive a presence-only green; and setting only the deploy gate's
+// existing variable is unchanged (add-only).
+func TestGuardBMode(t *testing.T) {
+	cases := []struct {
+		name                    string
+		assertVal, requireVal   string
+		wantAssert, wantRequire bool
+	}{
+		{"both_unset__historical_local_default", "", "", false, false},
+		{"deploy_gate_only__unchanged", "1", "", true, false},
+		{"require_live_implies_assert", "", "1", true, true},
+		{"both_set", "1", "1", true, true},
+		{"permissive_truthy", "yes", "on", true, true},
+		{"explicit_false_is_off", "0", "false", false, false},
+		{"whitespace_and_case", " TRUE ", " Yes ", true, true},
+		{"garbage_is_off", "maybe", "later", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, r := GuardBMode(tc.assertVal, tc.requireVal)
+			if a != tc.wantAssert || r != tc.wantRequire {
+				t.Fatalf("GuardBMode(%q,%q) = (assert=%v require=%v), want (assert=%v require=%v)",
+					tc.assertVal, tc.requireVal, a, r, tc.wantAssert, tc.wantRequire)
+			}
+			if r && !a {
+				t.Fatalf("invariant violated: requireCallable must imply assertCallable")
+			}
+		})
+	}
+}
+
+// TestClassifyProvisionedWorkspace is the FAIL-BEFORE proof for core#5052.
+//
+// Before the fix, findWorkspaceByName returned (id, kind) and the live test
+// scored ANY row whose name matched — including one that had already FAILED —
+// as "CALLABLE CONFIRMED". The `failed` and `removed` cases below are exactly
+// the rows the old logic green-lit; they MUST now be refused.
+func TestClassifyProvisionedWorkspace(t *testing.T) {
+	cases := []struct {
+		name    string
+		kind    string
+		status  string
+		wantOK  bool
+		wantSub string
+	}{
+		// The genuine pass: a real workspace that provisioned.
+		{"online workspace is callable proof", "workspace", "online", true, "genuinely ran"},
+		// Async provision is NOT a failure — the verb ran; booting is separate.
+		{"still provisioning is not a failure", "workspace", "provisioning", true, "genuinely ran"},
+		// Fields the API may omit must not false-fail (matches the rest of Guard B).
+		{"unobserved status tolerated", "workspace", "", true, "not surfaced"},
+		{"unobserved kind tolerated", "", "online", true, "genuinely ran"},
+
+		// ── THE VACUITY THIS FIX CLOSES ──
+		{"failed workspace is NOT callable proof", "workspace", "failed", false, "TERMINAL status=\"failed\""},
+		{"removed workspace is NOT callable proof", "workspace", "removed", false, "TERMINAL status=\"removed\""},
+
+		// Pre-existing kind guard, now co-located with the status guard.
+		{"non-workspace kind refused", "platform", "online", false, "not a real team-member create"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, reason := ClassifyProvisionedWorkspace(tc.kind, tc.status)
+			if ok != tc.wantOK {
+				t.Fatalf("ClassifyProvisionedWorkspace(%q,%q) ok=%v want %v (reason=%s)",
+					tc.kind, tc.status, ok, tc.wantOK, reason)
+			}
+			if !strings.Contains(reason, tc.wantSub) {
+				t.Errorf("ClassifyProvisionedWorkspace(%q,%q) reason=%q does not contain %q",
+					tc.kind, tc.status, reason, tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestClassifyProvisionedWorkspaceRefusesEveryTerminalBadStatus pins the refusal
+// list itself, so adding a terminal-bad status to the enum without teaching this
+// gate about it is visible rather than silent.
+func TestClassifyProvisionedWorkspaceRefusesEveryTerminalBadStatus(t *testing.T) {
+	for _, st := range terminalBadWorkspaceStatuses {
+		if ok, _ := ClassifyProvisionedWorkspace("workspace", st); ok {
+			t.Errorf("terminal-bad status %q was accepted as callable proof", st)
+		}
+	}
+}
+
+// TestA2ATurnLogCapSurvivesTheRuntimeFailureText pins the log cap against the
+// exact shape that defeated it (core#5052).
+//
+// The old cap was 200. The runtime answers a failed tool-use turn with
+// `Model generated invalid tool call: <tool-id>` wrapped in a JSON-RPC message
+// envelope; the envelope alone is ~145 chars, so 200 sliced the tool id — the
+// one field naming WHY the turn failed — apart mid-word. This test fails if the
+// cap ever regresses below a real sample of that response.
+func TestA2ATurnLogCapSurvivesTheRuntimeFailureText(t *testing.T) {
+	// A real red-run body, verbatim except for the id/messageId values.
+	sample := `{"id":"e2e-mcp-52efb491","jsonrpc":"2.0","result":{"kind":"message",` +
+		`"messageId":"aa7d2518-287b-45c5-82e2-9a2da30b9ca5","parts":[{"kind":"text",` +
+		`"text":"Model generated invalid tool call: mcp__molecule_platform__provision_workspace"}],` +
+		`"role":"agent"}}`
+
+	if got := truncate(sample, a2aTurnLogCap); got != sample {
+		t.Fatalf("a2aTurnLogCap=%d truncates a real failure body (len=%d) — the diagnostic would be lost again:\n%s",
+			a2aTurnLogCap, len(sample), got)
+	}
+	// Guard the regression directly: the OLD cap must be demonstrably too small,
+	// so this test is a fail-before proof and not a tautology.
+	if truncate(sample, 200) == sample {
+		t.Fatalf("sample is not long enough to prove the 200-char cap was lossy (len=%d)", len(sample))
+	}
+	if strings.Contains(truncate(sample, 200), "provision_workspace") {
+		t.Errorf("the 200-char cap unexpectedly preserved the tool id; sample no longer reproduces the blindness")
+	}
+}
+
+// TestEvaluateMgmtMCPCallable_RefusesZeroEvidence pins the vacuous-pass guard
+// (check 4b): a probe in which the tenant surfaced NEITHER mcp_server_present
+// NOR a loaded_mcp_tools inventory, on a run that did not arm the callable
+// turn, verified NOTHING about the management MCP beyond status=online — so it
+// must not be reported green.
+//
+// This is not hypothetical tolerance. The staging fleet does not surface
+// mcp_server_present at all today: every green Guard B run logs
+// `present=false(reported=false)`, so check 3 is already a confirmed no-op and
+// loaded_mcp_tools is the ONLY positive presence signal being read. If the
+// heartbeat producer stops surfacing that one too — the exact failure shape the
+// runtime#181 producer regression would take — the presence half degrades to
+// "online, and nothing else was asked" and, before this guard, returned OK.
+func TestEvaluateMgmtMCPCallable_RefusesZeroEvidence(t *testing.T) {
+	const defaultRuntime = "hermes"
+
+	// Everything the tenant COULD have surfaced is absent. Note both absent
+	// fields are individually tolerated by checks 3 and 4 by design.
+	zeroEvidence := MgmtMCPProbe{
+		ExpectedRuntime:          defaultRuntime,
+		ObservedRuntime:          defaultRuntime,
+		Status:                   "online",
+		MCPServerPresentReported: false,
+		LoadedTools:              nil,
+		RequiredTool:             requiredVerb(),
+		AssertCallable:           false,
+		WorkerProvisioned:        false,
+	}
+
+	ok, reason := EvaluateMgmtMCPCallable(zeroEvidence)
+	if ok {
+		t.Fatalf("a presence-only probe with NO surfaced mgmt-MCP evidence must be RED — "+
+			"it is a pass:0/fail:0 verdict (got GREEN: %s)", reason)
+	}
+	for _, want := range []string{"ZERO positive evidence", "vacuous"} {
+		if !strings.Contains(reason, want) {
+			t.Fatalf("RED reason must NAME the vacuity; %q missing from %q", want, reason)
+		}
+	}
+
+	// The guard must be NARROW: a single positive signal is enough to clear it,
+	// otherwise it would false-fail the tolerated-absent-field contract the rest
+	// of this gate is built on. Each of the three below must restore GREEN on
+	// its own.
+	t.Run("inventory_alone_clears_it", func(t *testing.T) {
+		p := zeroEvidence
+		p.LoadedTools = []string{requiredVerb()}
+		if ok, reason := EvaluateMgmtMCPCallable(p); !ok {
+			t.Fatalf("a surfaced inventory carrying the verb is positive evidence (got RED: %s)", reason)
+		}
+	})
+	t.Run("mcp_server_present_alone_clears_it", func(t *testing.T) {
+		p := zeroEvidence
+		p.MCPServerPresentReported = true
+		p.MCPServerPresent = true
+		if ok, reason := EvaluateMgmtMCPCallable(p); !ok {
+			t.Fatalf("a reported mcp_server_present=true is positive evidence (got RED: %s)", reason)
+		}
+	})
+	t.Run("callable_turn_alone_clears_it", func(t *testing.T) {
+		p := zeroEvidence
+		p.AssertCallable = true
+		p.WorkerProvisioned = true
+		if ok, reason := EvaluateMgmtMCPCallable(p); !ok {
+			t.Fatalf("a genuine callable turn is the strongest positive evidence (got RED: %s)", reason)
+		}
+	})
+
+	// The DEPLOY PATH must be untouched: staging-tenant-cd arms the callable
+	// turn, so check 4b can never fire there even on a fleet that surfaces
+	// nothing — an armed-but-unproven turn must still fail as NOT CALLABLE
+	// (check 5), never as the zero-evidence misconfiguration.
+	t.Run("deploy_path_still_fails_as_not_callable", func(t *testing.T) {
+		p := zeroEvidence
+		p.AssertCallable = true
+		p.RequireCallable = true
+		p.WorkerProvisioned = false
+		ok, reason := EvaluateMgmtMCPCallable(p)
+		if ok {
+			t.Fatalf("armed turn with no workspace must be RED (got GREEN: %s)", reason)
+		}
+		if !strings.Contains(reason, "not genuinely CALLABLE") {
+			t.Fatalf("the deploy path must name present-but-not-callable, not the zero-evidence guard; got %q", reason)
+		}
+	})
+}
+
+// TestRequiredVerbIsTheINVENTORYSpellingNotTheHermesModelFacingOne locks a
+// correction that has now been mis-derived twice, in both directions, by people
+// reading a red Guard B log.
+//
+// There are TWO distinct, both-correct spellings of the same verb, and they
+// differ by exactly one character class:
+//
+//	mcp__molecule-platform__provision_workspace   (HYPHEN)
+//	    the MCP SERVER-side tool id. This is what the tenant heartbeat reports
+//	    in loaded_mcp_tools — verified live against a fresh staging concierge on
+//	    2026-08-05, whose inventory carried this exact string among 60 tools.
+//	    It is what checks 3/4 of this gate assert, and what the server-side
+//	    heartbeat matcher (handlers.conciergePlatformMCPProvisionWorkspaceTool)
+//	    matches. It is composed from the SDK contract, never hand-spelled.
+//
+//	mcp__molecule_platform__provision_workspace   (UNDERSCORE)
+//	    the MODEL-FACING name INSIDE hermes, which sanitises every tool id with
+//	    re.sub(r"[^A-Za-z0-9_]", "_", ...). This is the spelling that appears in
+//	    hermes' own `Model generated invalid tool call: ...` text — see
+//	    TestA2ATurnLogCapSurvivesTheRuntimeFailureText, whose sample is a real
+//	    red-run body.
+//
+// Neither is wrong; they are different layers. The failure mode is an agent who
+// sees the underscore form in a runtime error and "fixes" the gate to match it,
+// which would make checks 3/4 assert a string loaded_mcp_tools never contains —
+// turning the presence half from self-consistent into permanently RED (or, if
+// paired with a matching edit to the probe, into a new self-consistent pair
+// that still proves nothing). This test makes that edit fail here first.
+//
+// What this test does NOT claim: that either spelling proves the model can
+// DISPATCH the verb. It cannot — both are manifest-derived. Only the real A2A
+// turn in check 5 proves dispatchability, which is why the deploy path arms it.
+func TestRequiredVerbIsTheINVENTORYSpellingNotTheHermesModelFacingOne(t *testing.T) {
+	const (
+		inventorySpelling   = "mcp__molecule-platform__provision_workspace"
+		hermesModelSpelling = "mcp__molecule_platform__provision_workspace"
+	)
+
+	if got := requiredVerb(); got != inventorySpelling {
+		t.Fatalf("the SSOT-composed verb must be the MCP server-side (hyphen) spelling that "+
+			"loaded_mcp_tools actually carries: got %q, want %q", got, inventorySpelling)
+	}
+
+	// Prove the two spellings really are distinct, so this test is a discriminator
+	// and not a tautology over one string.
+	if inventorySpelling == hermesModelSpelling {
+		t.Fatal("the two spellings must differ, otherwise this guard proves nothing")
+	}
+
+	// And prove the relationship between them is exactly hermes' sanitisation, so
+	// a future change to MCPServerName that introduces another non-[A-Za-z0-9_]
+	// character is still described by this comment.
+	if got := hermesSanitiseToolID(requiredVerb()); got != hermesModelSpelling {
+		t.Fatalf("hermes sanitisation of the SSOT verb should yield the model-facing spelling: got %q, want %q",
+			got, hermesModelSpelling)
+	}
+}
+
+// hermesSanitiseToolID mirrors hermes' own tool-id sanitisation,
+// re.sub(r"[^A-Za-z0-9_]", "_", name). It exists ONLY to document and pin the
+// relationship between the two spellings above; nothing in the gate dispatches
+// on it.
+func hermesSanitiseToolID(id string) string {
+	out := []rune(id)
+	for i, r := range out {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
+		default:
+			out[i] = '_'
+		}
+	}
+	return string(out)
+}

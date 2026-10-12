@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
-# edge-429-probe.sh — capture 429 origin (workspace-server vs CF/Vercel edge)
+# edge-429-probe.sh — capture 429 origin (workspace-server vs edge proxy)
 # during a simulated canvas-burst against a tenant subdomain.
 #
 # Issue molecule-core#62. The post-#60 verification step asks an
-# operator with CF/Vercel dashboard access to confirm whether the
+# operator with Cloudflare dashboard access to confirm whether the
 # layout-chunk 429s observed in DevTools were:
 #   (a) workspace-server bucket overflow (closes once #60 deploys), or
-#   (b) actual edge-layer rate-limiting (CF or Vercel).
+#   (b) actual Cloudflare edge-layer rate-limiting.
 #
 # This script doesn't need dashboard access. It reproduces the burst
 # pattern locally and dumps every 429's response shape so the operator
 # can distinguish (a) from (b) by inspection: workspace-server emits a
-# JSON body, CF emits HTML, Vercel emits a different HTML. Headers tell
-# the same story (cf-ray vs x-vercel-*).
+# JSON body while Cloudflare normally emits HTML and a cf-ray header.
 #
 # Usage:
 #   ./scripts/edge-429-probe.sh <tenant-host> [--burst N] [--waves N] [--pause SECS] [--out file]
@@ -86,7 +85,7 @@ run_burst() {
   for i in $(seq 1 "$BURST"); do
     {
       out=$(curl -sS --max-time 10 -o /dev/null \
-        -w 'status=%{http_code} size=%{size_download} time=%{time_total} server=%{header.server} cf_ray=%{header.cf-ray} x_vercel=%{header.x-vercel-id} retry_after=%{header.retry-after} content_type=%{header.content-type} x_ratelimit_limit=%{header.x-ratelimit-limit} x_ratelimit_remaining=%{header.x-ratelimit-remaining} x_ratelimit_reset=%{header.x-ratelimit-reset}\n' \
+        -w 'status=%{http_code} size=%{size_download} time=%{time_total} server=%{header.server} cf_ray=%{header.cf-ray} retry_after=%{header.retry-after} content_type=%{header.content-type} x_ratelimit_limit=%{header.x-ratelimit-limit} x_ratelimit_remaining=%{header.x-ratelimit-remaining} x_ratelimit_reset=%{header.x-ratelimit-reset}\n' \
         "https://${HOST}${path}" 2>/dev/null) || out="status=curl_err"
       printf 'label=%s-%s-%s %s\n' "$label" "$wave" "$i" "$out" >> "$TMP_RESULTS"
     } &
@@ -130,9 +129,7 @@ emit "#   status=429 + content_type starts with application/json + x_ratelimit_l
 emit "#     => workspace-server bucket overflow. Closes when #60 deploys."
 emit "#   status=429 + cf_ray set + content_type=text/html"
 emit "#     => Cloudflare WAF / rate-limit. Audit dashboard rules per #62."
-emit "#   status=429 + x_vercel set + content_type=text/html"
-emit "#     => Vercel edge / Bot Fight Mode. Audit Vercel project per #62."
-emit "#   status=429 with no server/cf_ray/x_vercel"
+emit "#   status=429 with no server/cf_ray"
 emit "#     => corporate proxy or VPN. Not actionable in this repo."
 
 if [ -n "$OUT" ]; then

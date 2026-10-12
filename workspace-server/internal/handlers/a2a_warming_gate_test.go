@@ -123,11 +123,13 @@ func TestProxyA2A_CanvasUser_WarmingConcierge_Deferred(t *testing.T) {
 	}
 }
 
-// TestProxyA2A_SystemWarmupCaller_NotDeferred proves the call-site exemption: the
-// platform-fired warmup (system:concierge-warmup) MUST reach the runtime DURING
-// warming (it produces the capture that drives the verified flip), so it is NOT
-// deferred — and, being a system caller, it is NOT persisted as a user bubble.
-// Here the target is poll-mode: the warmup reaches the poll-queue (200 queued),
+// TestProxyA2A_SystemWarmupCaller_NotDeferred proves the call-site exemption: a
+// system-prefixed self-turn (callerID "system:…") MUST reach the runtime DURING
+// warming, so it is NOT deferred by the warming gate — and, being a system caller,
+// it is NOT persisted as a user bubble. (EV2 retired the fireConciergeWarmup
+// readiness turn that used to be the canonical such caller; the generic
+// system-caller exemption remains, keyed on isSystemCaller, not on the warmup.)
+// Here the target is poll-mode: the call reaches the poll-queue (200 queued),
 // proving neither the warming gate (SELECT kind,status) nor the ingest persist
 // (SELECT name / INSERT activity_logs) fired — the only reads are budget +
 // delivery-mode.
@@ -143,7 +145,7 @@ func TestProxyA2A_SystemWarmupCaller_NotDeferred(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode"}).AddRow(string(models.DeliveryModePoll)))
 
 	body := []byte(`{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"role":"user","messageId":"warmup-1","parts":[{"kind":"text","text":"Platform readiness check"}]}}}`)
-	status, resp, proxyErr := h.proxyA2ARequest(context.Background(), "ws-warming-target", body, conciergeWarmupCaller, false, false)
+	status, resp, proxyErr := h.proxyA2ARequest(context.Background(), "ws-warming-target", body, "system:concierge-warmup", false, false)
 
 	if proxyErr != nil {
 		t.Fatalf("warmup system caller must NOT be deferred, got status %d", proxyErr.Status)

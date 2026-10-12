@@ -12,8 +12,8 @@
  *   - Namespace dropdown driven by GET /v2/namespaces (workspace /
  *     team / org / custom — labels rendered server-side).
  *   - Per-row badges for kind (fact|summary|checkpoint), source
- *     (agent|runtime|user), pin (📌), TTL countdown, and propagation
- *     source-workspace if the memory came from a peer.
+ *     (agent|runtime|user), pin (📌), and TTL countdown. The current
+ *     propagation contract does not populate a peer-attribution badge.
  *   - No Edit affordance — v2's plugin contract has no PATCH; the
  *     model is forget + recommit. Delete (Forget) stays.
  *

@@ -64,6 +64,17 @@ func GetCachedURL(ctx context.Context, workspaceID string) (string, error) {
 	return RDB.Get(ctx, key).Result()
 }
 
+// ClearCachedURL evicts ONLY the workspace's URL-cache key, leaving the
+// liveness key (ws:%s) and the internal-URL key untouched. Unlike
+// ClearWorkspaceKeys (which also drops liveness and would flip IsOnline),
+// this is a surgical invalidation for callers that must re-resolve the URL
+// from the DB source-of-truth without disturbing liveness accounting — e.g.
+// the A2A queue drain re-resolving a woken workspace's NEW container URL
+// after a force-hibernate→wake replaced the container (core#124).
+func ClearCachedURL(ctx context.Context, workspaceID string) {
+	RDB.Del(ctx, fmt.Sprintf("ws:%s:url", workspaceID))
+}
+
 // CacheInternalURL caches the Docker-internal URL for workspace-to-workspace discovery.
 func CacheInternalURL(ctx context.Context, workspaceID, url string) error {
 	key := fmt.Sprintf("ws:%s:internal_url", workspaceID)

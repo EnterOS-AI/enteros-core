@@ -7,7 +7,7 @@
 #
 # Required env:
 #   MOLECULE_CP_URL        default: https://staging-api.moleculesai.app
-#   MOLECULE_ADMIN_TOKEN   CP admin bearer (Railway CP_ADMIN_API_TOKEN)
+#   MOLECULE_ADMIN_TOKEN   staging CP admin bearer from Infisical
 #
 # Optional env:
 #   E2E_KEEP_ORG           1 → skip teardown (debugging only)
@@ -16,7 +16,7 @@
 set -euo pipefail
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
-ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLEC…OKEN required — Railway staging CP_ADMIN_API_TOKEN}"
+ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
 # RUN_ID_SUFFIX removed (core#2782 follow-up shellcheck): the slug now comes
 # from make_collision_proof_slug below; the old suffix var is dead.
 
@@ -62,7 +62,11 @@ cleanup_org() {
     && ok "Teardown request accepted" \
     || log "Teardown returned non-2xx (may already be gone)"
 }
-trap cleanup_org EXIT
+# INT/TERM as well as EXIT: a graceful CI cancellation delivers SIGTERM/SIGINT;
+# without trapping those, bash dies before the EXIT trap runs and the tenant
+# leaks (the staging-provisioning-outage leak class). A SIGKILL still bypasses
+# this — the sweep-stale-e2e-orgs janitor is the backstop for that case.
+trap cleanup_org EXIT INT TERM
 
 # ─── provision tenant ───────────────────────────────────────────────────
 log "Provisioning tenant $SLUG..."
@@ -118,7 +122,7 @@ ok "Container ID: $CONTAINER_ID"
 log "Testing MCP stdio transport with regular-file stdout..."
 
 OUTPUT=$(mktemp)
-trap 'rm -f "$OUTPUT"; cleanup_org' EXIT
+trap 'rm -f "$OUTPUT"; cleanup_org' EXIT INT TERM
 
 # Send initialize + tools/list via stdin, capture stdout to regular file
 {

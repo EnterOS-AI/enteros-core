@@ -32,7 +32,7 @@ package provisioner
 // CLAUDE.md, .claude/sessions/*) — those would either be rejected by
 // the allowlist (provision aborts) or, if they somehow slipped
 // through, would land in the SEPARATE TemplateAssets field rather
-// than the SM-bound ConfigFiles field. The transport split
+// than the compatibility ConfigFiles field. The transport split
 // (TemplateAssets vs ConfigFiles) is the second line of defense
 // against clobbering agent-owned state.
 //
@@ -59,7 +59,7 @@ package provisioner
 //
 // NO SIZE CAP: the existing #2845 acbc0da9 added a 16MiB bound
 // for TemplateAssets in collectCPConfigFiles (separate from the
-// 256KiB SM cap on ConfigFiles). The fetcher itself does NOT cap
+// 256 KiB ConfigFiles compatibility budget). The fetcher itself does NOT cap
 // the response — the consumer-side bound is the cap. This matches
 // the dispatch's "NO size cap" on the fetcher.
 

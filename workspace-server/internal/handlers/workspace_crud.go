@@ -13,14 +13,17 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
+	"unicode"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/approvals"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -142,6 +145,13 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		})
 		return
 	}
+	if rawName, renaming := body["name"]; renaming {
+		name, ok := rawName.(string)
+		if !ok || strings.TrimSpace(name) == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "name must be a non-empty string"})
+			return
+		}
+	}
 
 	// #685/#688: validate string fields for length and injection safety.
 	strField := func(key string) string {
@@ -157,6 +167,9 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	if name, renaming := body["name"].(string); renaming {
+		body["name"] = strings.TrimSpace(name)
 	}
 	if wsDir, ok := body["workspace_dir"]; ok && wsDir != nil {
 		if dirStr, isStr := wsDir.(string); isStr && dirStr != "" {
@@ -222,14 +235,91 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	var exists bool
 	if err := db.DB.QueryRowContext(ctx,
 		`SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)`, id,
-	).Scan(&exists); err != nil || !exists {
+	).Scan(&exists); err != nil {
+		log.Printf("Update workspace lookup error for %s: %v", id, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to look up workspace"})
+		return
+	}
+	if !exists {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
 		return
 	}
 
+	// parent_id is applied FIRST and as a guarded, single-transaction
+	// operation (workspace_reparent.go). See that file's header for the
+	// privilege analysis; the short version is that `workspaces` has no
+	// org_id column, so parent_id IS the org boundary that memory ACLs,
+	// sameOrg() delegation routing, peer discovery and org-token auth all
+	// derive from. It ran here for years as an unvalidated
+	// `UPDATE workspaces SET parent_id = $2` whose error was swallowed by a
+	// log.Printf, so a rejected write still answered 200 "updated".
+	//
+	// Applied BEFORE the name/role/tier writes below so a rejected move
+	// leaves NOTHING written — those are independent non-transactional
+	// statements, and returning after them would half-apply the request.
+	rawParent, patchingParent := body["parent_id"]
+	var reparent *reparentOutcome
+	if patchingParent {
+		// A combined rename+move is ambiguous against
+		// workspaces_parent_name_uniq — the collision check would run
+		// against the OLD name while the caller expects the new one — and
+		// cannot be made atomic with the untransacted name write below.
+		// Reject rather than pick an order and be silently wrong.
+		if _, alsoRenaming := body["name"]; alsoRenaming {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "parent_id and name cannot be changed in the same request; issue them as two PATCHes",
+				"code":  reparentCodeAmbiguous,
+			})
+			return
+		}
+		out, err := applyReparent(ctx, db.DB, id, rawParent)
+		if err != nil {
+			var rej *reparentError
+			if errors.As(err, &rej) {
+				resp := gin.H{"error": rej.Message, "code": rej.Code}
+				for k, v := range rej.Details {
+					resp[k] = v
+				}
+				log.Printf("Update: PATCH parent_id on %s REJECTED (%s): %s", id, rej.Code, rej.Message)
+				c.JSON(rej.Status, resp)
+				return
+			}
+			// A real DB failure. Must NOT fall through to 200 the way the
+			// pre-fix log.Printf did.
+			log.Printf("Update parent_id error for %s: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to re-parent workspace"})
+			return
+		}
+		reparent = out
+	}
+
 	if name, ok := body["name"]; ok {
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET name = $2, updated_at = now() WHERE id = $1`, id, name); err != nil {
+		result, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET name = $2, updated_at = now() WHERE id = $1 AND status != 'removed'`, id, name)
+		if err != nil {
+			if isParentNameUniqueViolation(err) {
+				c.JSON(http.StatusConflict, gin.H{"error": "a workspace with this name already exists under the same parent", "code": "WORKSPACE_NAME_CONFLICT"})
+				return
+			}
 			log.Printf("Update name error for %s: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rename workspace"})
+			return
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			log.Printf("Update name result error for %s: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to confirm workspace rename"})
+			return
+		}
+		if rows == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
+			return
+		}
+		// All rename clients share this path. Publish after persistence so
+		// other open pages update without reloading or restarting the agent.
+		payload := gin.H{"name": name}
+		if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceUpdated), id, payload); err != nil {
+			log.Printf("Update name event error for %s: %v", id, err)
+			h.broadcaster.BroadcastOnly(id, string(events.EventWorkspaceUpdated), payload)
 		}
 	}
 	if role, ok := body["role"]; ok {
@@ -240,11 +330,6 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	if tier, ok := body["tier"]; ok {
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET tier = $2, updated_at = now() WHERE id = $1`, id, tier); err != nil {
 			log.Printf("Update tier error for %s: %v", id, err)
-		}
-	}
-	if parentID, ok := body["parent_id"]; ok {
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET parent_id = $2, updated_at = now() WHERE id = $1`, id, parentID); err != nil {
-			log.Printf("Update parent_id error for %s: %v", id, err)
 		}
 	}
 	if collapsed, ok := body["collapsed"]; ok {
@@ -500,6 +585,58 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	}
 
 	resp := gin.H{"status": "updated"}
+	if name, renaming := body["name"]; renaming {
+		resp["workspace_id"] = id
+		resp["name"] = name
+	}
+	if reparent != nil && reparent.Changed {
+		// The move is a PRIVILEGE change, not a cosmetic one: the workspace
+		// drops read+write on the old team namespace and gains read+write on
+		// the new one — including RETROACTIVE read of everything the
+		// destination team ever wrote, because memory_records.namespace is a
+		// string frozen at write time in a datastore this process reaches
+		// only over HTTP (see workspace_reparent.go). Nothing can migrate
+		// those rows without dragging the OLD siblings' shared memories along
+		// with them, so the honest handling is to state the delta at the call
+		// site rather than let it be discovered later.
+		//
+		// For an ordinary move org:<root> is absent from both lists because
+		// the same-org invariant means it cannot change. An ADOPTION is the
+		// one exception and DOES list it — the workspace trades a writable
+		// org:<self> for a read-only org:<newRoot> — which is why the lists
+		// are built in applyReparent rather than assumed here.
+		resp["reparented"] = gin.H{
+			"old_parent_id":     reparent.OldParent,
+			"new_parent_id":     reparent.NewParent,
+			"org_root_id":       reparent.OrgRoot,
+			"adopted_into_org":  reparent.Adopted,
+			"namespaces_lost":   reparent.Lost,
+			"namespaces_gained": reparent.Gained,
+			"memories_migrated": false,
+			"memories_migrated_note": "memories written under the old team namespace stay there and remain " +
+				"readable by the former siblings; they are NOT moved",
+		}
+		// The container was provisioned with a PARENT_ID env var
+		// (workspace_provision_shared.go) that is now stale and is only
+		// rebuilt on the next provision/restart. No in-repo runtime reads it,
+		// but a restart is the only thing that refreshes it, so say so rather
+		// than leave the drift unreported.
+		needsRestart = true
+
+		// adopted_into_org is carried here as well as in the response: an
+		// adoption is the only case where a workspace CHANGES ORG, so it is
+		// the single most security-relevant bit of the event. An auditor
+		// reading the ledger must not have to infer it by comparing
+		// old_parent_id against org_root_id.
+		RecordAuditEvent(ctx, db.DB, auditEntryFromGin(c, id, "workspace.reparent", true, map[string]any{
+			"old_parent_id":     reparent.OldParent,
+			"new_parent_id":     reparent.NewParent,
+			"org_root_id":       reparent.OrgRoot,
+			"adopted_into_org":  reparent.Adopted,
+			"namespaces_lost":   reparent.Lost,
+			"namespaces_gained": reparent.Gained,
+		}))
+	}
 	if needsRestart {
 		resp["needs_restart"] = true
 	}
@@ -562,9 +699,13 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 
 	var workspaceName, workspaceStatus string
 	var activeTasks int
+	// parent_id is read here, before anything is destroyed, because it is the
+	// ANCHOR the audit event is filed under (auditDeleteAnchor). Reading it
+	// after the purge would be too late — the row is gone.
+	var workspaceParent sql.NullString
 	if err := db.DB.QueryRowContext(ctx,
-		`SELECT name, COALESCE(active_tasks, 0), status FROM workspaces WHERE id = $1`, id,
-	).Scan(&workspaceName, &activeTasks, &workspaceStatus); err != nil {
+		`SELECT name, COALESCE(active_tasks, 0), status, parent_id FROM workspaces WHERE id = $1`, id,
+	).Scan(&workspaceName, &activeTasks, &workspaceStatus, &workspaceParent); err != nil {
 		if err == sql.ErrNoRows {
 			c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
 			return
@@ -579,14 +720,13 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 	}
 
 	if c.GetHeader("X-Confirm-Name") != workspaceName {
-		childCount, scheduleCount := destructiveDeleteCounts(ctx, id)
+		childCount := destructiveDeleteCounts(ctx, id)
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":          "destructive_action_requires_confirmation",
 			"hint":           "Re-send the same request with header X-Confirm-Name: " + workspaceName,
 			"workspace_name": workspaceName,
 			"active_tasks":   activeTasks,
 			"child_count":    childCount,
-			"schedule_count": scheduleCount,
 		})
 		return
 	}
@@ -640,8 +780,8 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 
 	// Delegate the cascade to CascadeDelete so the HTTP path and the
 	// OrgImport reconcile path share one teardown sequence (#73 race
-	// guard, container stop, volume removal, token revocation, schedule
-	// disable, broadcast). The HTTP-specific bits — direct-children 409
+	// guard, container stop, volume removal, token revocation,
+	// broadcast). The HTTP-specific bits — direct-children 409
 	// gate above, ?purge=true hard-delete below, response shaping —
 	// stay in this handler.
 	// internal#734: the user can ask to erase saved data (browser profile /
@@ -663,6 +803,26 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 		return
 	}
 	allIDs := append([]string{id}, descendantIDs...)
+
+	// Tamper-evident audit append. CascadeDelete has already marked the
+	// workspace (and descendants) removed, so the event is true from here on
+	// and is recorded even if a later Stop call 500s or the purge fails.
+	//
+	// Filed under the PARENT, not the target: the hard-purge branch below
+	// deletes audit_events for every purged workspace and the FK cascades on
+	// the workspaces row — so a row filed under the target would be erased by
+	// the very act it records.
+	deleteAnchor := auditDeleteAnchor(workspaceParent.String, id)
+	RecordAuditEvent(ctx, db.DB, auditEntryFromGin(c, deleteAnchor, AuditOpWorkspaceDelete, true, map[string]any{
+		"workspace_id":     id,
+		"workspace_name":   workspaceName,
+		"parent_id":        workspaceParent.String,
+		"erase_data":       erase,
+		"cascade_deleted":  len(descendantIDs),
+		"descendant_ids":   descendantIDs,
+		"active_tasks":     activeTasks,
+		"anchored_on_self": deleteAnchor == id,
+	}))
 
 	// If any Stop call failed, surface 500 so the client retries. The DB
 	// row is already 'removed' (idempotent), and Stop's instance_id
@@ -692,7 +852,9 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 			"workspace_channels", "workspace_config", "workspace_memory",
 			"workspace_token_usage", "approval_requests", "audit_events",
 			"workspace_artifacts", "agents",
-			"workspace_auth_tokens", "workspace_schedules", "canvas_layouts",
+			// schedule rows are covered by their FK ON DELETE CASCADE when the
+			// workspaces row is hard-deleted below.
+			"workspace_auth_tokens", "canvas_layouts",
 		} {
 			if _, err := db.DB.ExecContext(ctx,
 				fmt.Sprintf("DELETE FROM %s WHERE workspace_id = ANY($1::uuid[])", table),
@@ -729,6 +891,19 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 			}
 		}
 
+		// A hard purge is strictly more destructive than the soft delete
+		// already recorded above, and it is the operation that erased the
+		// purged workspaces' own audit rows — so it gets its own event, filed
+		// under the surviving anchor.
+		RecordAuditEvent(ctx, db.DB, auditEntryFromGin(c, deleteAnchor, AuditOpWorkspacePurge, true, map[string]any{
+			"workspace_id":     id,
+			"workspace_name":   workspaceName,
+			"parent_id":        workspaceParent.String,
+			"purged_ids":       allIDs,
+			"cascade_deleted":  len(descendantIDs),
+			"anchored_on_self": deleteAnchor == id,
+		}))
+
 		c.JSON(http.StatusOK, gin.H{"status": "purged", "cascade_deleted": len(descendantIDs)})
 		return
 	}
@@ -736,26 +911,103 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "removed", "cascade_deleted": len(descendantIDs)})
 }
 
-func destructiveDeleteCounts(ctx context.Context, id string) (childCount int, scheduleCount int) {
+func destructiveDeleteCounts(ctx context.Context, id string) (childCount int) {
 	if err := db.DB.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM workspaces WHERE parent_id = $1 AND status != 'removed'`, id,
 	).Scan(&childCount); err != nil {
 		log.Printf("Delete: child count failed for %s: %v", id, err)
 		childCount = 0
 	}
-	if err := db.DB.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM workspace_schedules WHERE workspace_id = $1 AND enabled = true`, id,
-	).Scan(&scheduleCount); err != nil {
-		log.Printf("Delete: schedule count failed for %s: %v", id, err)
-		scheduleCount = 0
+	return childCount
+}
+
+// clearWorkspaceInstanceIDAfterStop NULLs a workspace's instance_id once its
+// compute is confirmed stopped, so a cleanly-deleted workspace never enters the
+// CP orphan sweeper's queue in the first place.
+//
+// The statement intentionally mirrors the sweeper's own clearing UPDATE in
+// internal/registry/cp_orphan_sweeper.go — the sweeper's SELECT predicate and
+// both writers of this field must stay in sync. The sweeper remains the
+// backstop for the case this cannot cover: a stop that FAILED, whose row keeps
+// instance_id populated on purpose.
+//
+// Best-effort by contract. Teardown has already succeeded by the time we get
+// here, so a DB error must not fail the delete; it is logged and left to the
+// sweeper. Defensive against a nil global handle, matching cpSweepOnce.
+func (h *WorkspaceHandler) clearWorkspaceInstanceIDAfterStop(ctx context.Context, wsID string) {
+	if db.DB == nil {
+		return
 	}
-	return childCount, scheduleCount
+	if _, err := db.DB.ExecContext(ctx,
+		`UPDATE workspaces SET instance_id = NULL, updated_at = now() WHERE id = $1`,
+		wsID,
+	); err != nil {
+		log.Printf("CascadeDelete %s clear instance_id failed: %v — leaving row for orphan sweeper", wsID, err)
+	}
+}
+
+// inflightProvisionWait bounds how long a delete waits, in total, for cancelled
+// in-flight provisions to unwind. Past it the teardown proceeds; the start's own
+// removed-check (provisioner.SetWorkspaceRemovedCheck) discards anything it
+// still creates.
+const inflightProvisionWait = 15 * time.Second
+
+// inflightStartCanceller is the optional provisioner capability
+// cancelInflightProvisions uses. The Docker provisioner must keep implementing
+// it — a rename would make the type assertion fail silently and deletes would
+// stop waiting for in-flight provisions — hence the compile-time pin.
+type inflightStartCanceller interface {
+	CancelInflightStart(workspaceID string, wait time.Duration) bool
+}
+
+var _ inflightStartCanceller = (*provisioner.Provisioner)(nil)
+
+// cancelInflightProvisions cancels the provisioner.Start calls still running
+// for ids and waits (bounded) for them to return — cancel all first, then wait,
+// so they unwind concurrently. Docker backend only: the CP backend has no local
+// start to cancel, and test stubs without the method are skipped.
+func (h *WorkspaceHandler) cancelInflightProvisions(ids []string) {
+	c, ok := h.provisioner.(inflightStartCanceller)
+	if !ok {
+		return
+	}
+	for _, id := range ids {
+		c.CancelInflightStart(id, 0)
+	}
+	deadline := time.Now().Add(inflightProvisionWait)
+	for _, id := range ids {
+		if !c.CancelInflightStart(id, time.Until(deadline)) {
+			log.Printf("CascadeDelete %s: an in-flight provision is still unwinding after %s — its removed-check will discard what it creates", id, inflightProvisionWait)
+		}
+	}
+}
+
+// WorkspaceIsRemoved reports whether a workspace has been deleted: its row is
+// status='removed', or gone entirely (a ?purge=true delete). It is the probe the
+// Docker provisioner runs right before ContainerCreate and right after
+// ContainerStart (provisioner.SetWorkspaceRemovedCheck), so a provision that
+// was in flight when its workspace was deleted cannot leave a container behind.
+// A query error answers false: a DB blip must not kill a legitimate provision.
+func WorkspaceIsRemoved(ctx context.Context, workspaceID string) bool {
+	if db.DB == nil {
+		return false
+	}
+	var status string
+	err := db.DB.QueryRowContext(ctx, `SELECT status FROM workspaces WHERE id = $1`, workspaceID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true
+	}
+	if err != nil {
+		log.Printf("WorkspaceIsRemoved(%s): status lookup failed: %v — treating as not removed", workspaceID, err)
+		return false
+	}
+	return status == string(models.StatusRemoved)
 }
 
 // CascadeDelete performs the cascade-removal sequence used by the HTTP
 // DELETE handler and by OrgImport's reconcile mode: walk descendants, mark
 // self+descendants 'removed' first (#73 race guard), stop containers / EC2s,
-// remove volumes, revoke tokens, disable schedules, broadcast events.
+// remove volumes, revoke tokens, broadcast events.
 //
 // Idempotent against already-removed rows (the descendant CTE and all UPDATE
 // guards skip status='removed'). Returns the descendant id list so the HTTP
@@ -767,7 +1019,7 @@ func destructiveDeleteCounts(ctx context.Context, id string) (childCount int, sc
 // returns 409 when children exist + ?confirm=true is missing); this helper
 // always cascades.
 // CascadeDelete tears down a workspace and its descendants (stop compute,
-// remove volumes, revoke tokens, disable schedules, broadcast). erase=true
+// remove volumes, revoke tokens, broadcast). erase=true
 // (internal#734) means the user asked to erase saved data, so the CP compute
 // teardown prunes each workspace's durable data volume; the HTTP delete passes
 // the user's choice, the org-import reconcile passes false (a reconcile is not
@@ -818,16 +1070,44 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 		pq.Array(allIDs)); err != nil {
 		log.Printf("CascadeDelete token revocation for %s: %v", id, err)
 	}
-	if _, err := db.DB.ExecContext(ctx,
-		`UPDATE workspace_schedules SET enabled = false, updated_at = now()
-		 WHERE workspace_id = ANY($1::uuid[]) AND enabled = true`,
-		pq.Array(allIDs)); err != nil {
-		log.Printf("CascadeDelete schedule disable for %s: %v", id, err)
-	}
-
+	// RC09: a provision for any of these workspaces may still be in flight —
+	// create, restart and bundle import each run provisioner.Start in their own
+	// goroutine, and a cold local build keeps it there for minutes. The rows are
+	// 'removed' as of the UPDATE above, so cancel those starts and wait for them
+	// to unwind BEFORE tearing down. Otherwise the start finishes after this
+	// teardown and creates ws-<id> anyway, which then crash-looped on an empty
+	// config volume with nothing left to stop it.
+	h.cancelInflightProvisions(allIDs)
+	// cleanupCtx is the non-cancelable, time-bounded teardown context: detached
+	// from the request ctx via context.WithoutCancel so a canceled / timed-out
+	// DELETE still runs the stop → remove-volume → broadcast sequence to
+	// completion instead of leaking compute. Created HERE — before the schedule
+	// capture below — so capture runs on it too (F4).
 	cleanupCtx, cleanupCancel := context.WithTimeout(
 		context.WithoutCancel(ctx), 30*time.Second)
 	defer cleanupCancel()
+
+	// P4b (core#4435): CAPTURE each volume-native workspace's user-created
+	// (source='runtime') schedule grid into workspaces.carryover_runtime_schedules
+	// NOW — BEFORE stopAndRemove tears the container down. This MUST run while the
+	// container is still up: for a volume-native workspace the grid lives on the
+	// runtime's persisted volume behind its /internal/schedules API, which dies the
+	// instant the container stops (stopWorkspaceForDelete below). The volume itself
+	// survives (erase=false), but a fresh-volume org re-import mints a NEW id +
+	// volume and would abandon it — so RestoreInheritedRuntimeSchedules can only
+	// replay what we buffer here. Best-effort by contract: any resolve/fetch/persist
+	// failure is logged and skipped, never blocking teardown. Non-volume (legacy
+	// DB-backed) ids are skipped — their schedules already persist in the table.
+	//
+	// F4: runs on cleanupCtx (NOT the cancelable request ctx) so a canceled DELETE
+	// still buffers the grid rather than silently skipping it; and is HARD-BOUNDED
+	// to captureCarryoverBudget TOTAL across all ids via captureCtx, so a
+	// black-holed descendant can never add N×scheduleForwardTimeout to the DELETE
+	// — once the budget is spent the remaining forwards fast-fail on the expired
+	// context and teardown proceeds. Best-effort throughout (never blocks).
+	captureCtx, captureCancel := context.WithTimeout(cleanupCtx, captureCarryoverBudget)
+	captureRuntimeSchedulesForCarryover(captureCtx, allIDs)
+	captureCancel()
 
 	var stopErrs []error
 	stopAndRemove := func(wsID string) {
@@ -841,9 +1121,39 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 			stopErrs = append(stopErrs, fmt.Errorf("stop %s: %w", wsID, err))
 			return
 		}
+		// Compute is confirmed stopped, so no live instance is attached any
+		// more — clear instance_id. Without this, a fully successful delete
+		// still left the row matching the CP orphan sweeper's queue predicate
+		// (status='removed' AND instance_id IS NOT NULL), so every deleted
+		// workspace entered the sweeper and needed a second, redundant CP
+		// round-trip to leave it again. When that round-trip returned non-2xx
+		// the row never left, and the sweeper retried it every 60s forever
+		// (prod, 2026-07-30 → 2026-08-03: four reno-stars workspaces).
+		//
+		// NOTE the ordering: this runs ONLY after a successful stop. The
+		// failure branch above deliberately returns with instance_id intact —
+		// that is the durable "possible leak, go re-drive it" signal the
+		// sweeper exists to consume, and it must stay.
+		h.clearWorkspaceInstanceIDAfterStop(cleanupCtx, wsID)
 		if h.provisioner != nil {
 			if err := h.provisioner.RemoveVolume(cleanupCtx, wsID); err != nil {
 				log.Printf("CascadeDelete %s volume removal warning: %v", wsID, err)
+			}
+		}
+		// Desktop sidecar (if the computer-use feature provisioned one): tear it
+		// down AND wipe its profile volume. The workspace is being deleted, so the
+		// live-login profile (cookies / authenticated sessions) MUST NOT survive —
+		// otherwise the credential volume orphans forever (§11 revoke/wipe; the
+		// reviewer's B4, "highest integration risk"). Best-effort: a desktop
+		// teardown failure must never block the workspace delete — the orphan
+		// sweeper is the backstop. Gated on sidecarProv so it's a no-op unless the
+		// desktop feature is enabled.
+		if h.sidecarProv != nil {
+			if err := h.sidecarProv.StopDesktop(cleanupCtx, wsID); err != nil {
+				log.Printf("CascadeDelete %s desktop sidecar stop warning: %v", wsID, err)
+			}
+			if err := h.sidecarProv.WipeProfile(cleanupCtx, wsID); err != nil {
+				log.Printf("CascadeDelete %s desktop profile wipe warning: %v", wsID, err)
 			}
 		}
 	}
@@ -862,6 +1172,118 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 	})
 
 	return descendantIDs, stopErrs, nil
+}
+
+// captureCarryoverBudget hard-bounds the TOTAL wall-clock the teardown-time
+// schedule capture may spend across ALL torn-down ids. Capture is best-effort and
+// must never block a delete, so instead of paying scheduleForwardTimeout (15s)
+// per black-holed descendant — N×15s on the DELETE — the whole loop shares this
+// one budget; once it is exhausted the remaining forwards fast-fail on the
+// already-expired context. A live local container answers /internal/schedules in
+// milliseconds, so 10s is generous for the reachable case and only ever caps the
+// pathological unreachable one.
+const captureCarryoverBudget = 10 * time.Second
+
+// captureRuntimeSchedulesForCarryover buffers each volume-native workspace's
+// user-created (source='runtime') schedule grid into
+// workspaces.carryover_runtime_schedules ahead of teardown, so a fresh-volume
+// org re-import can restore them onto the successor (RestoreInheritedRuntimeSchedules).
+// See core#4435 / the P4b staged-retirement doc (#4450).
+//
+// DECISIVE TIMING CONSTRAINT: a volume-native workspace's schedule grid lives on
+// its persisted volume, served ONLY by the runtime's /internal/schedules API,
+// which stops answering the moment the container stops. CascadeDelete deletes on
+// an erase=false teardown (the volume persists) but the re-import path allocates a
+// fresh id + volume, abandoning the old grid. So capture MUST happen here, before
+// the container is stopped — the successor cannot read the predecessor grid later.
+//
+// Best-effort by contract: unreachable / timeout / non-200 / malformed → log and
+// continue (NEVER block a delete). Each forward is bounded by fetchScheduleAPI's
+// own deadline, and the WHOLE loop is additionally hard-capped by the caller's
+// captureCarryoverBudget ctx (see CascadeDelete) so N black-holed descendants
+// cannot add N×scheduleForwardTimeout to the DELETE. Ids without a native
+// scheduler (ProvidesNativeScheduler==false) are skipped — there is no volume
+// grid to capture for them.
+//
+// F3 — STRUCTURAL "never block a delete": this runs SYNCHRONOUSLY inside
+// CascadeDelete, so the whole body is panic-isolated below (recover-and-don't-
+// re-raise, mirroring logProvisionPanic / coalesceRestart). A panic in a helper,
+// a bad grid decode, or a driver bug must never abort the teardown before
+// stopAndRemove — it logs with a stack trace and returns so CascadeDelete
+// proceeds. A missed capture only costs the successor that grid, never a delete.
+//
+// CAUTION — real-DB-unexercised-in-CI: the carryover_runtime_schedules JSONB
+// write below (and the read/clear in RestoreInheritedRuntimeSchedules) reuses the
+// proven registry.go loaded_mcp_tools ::jsonb idiom, and is now exercised against
+// real Postgres by TestIntegration_CarryoverSchedules_* (runtime stubbed at the
+// HTTP layer). A full LIVE volume-native delete→re-import soak is still required
+// before P4b retires the DB-world path — see the PR #4453 soak plan.
+//
+// The captured JSON is exactly the filtered array of source='runtime' grid
+// entries. Template-source entries are intentionally NOT captured — the org
+// template reconcile re-seeds those on the successor's volume, so carrying them
+// would duplicate (and, on a name collision, template wins — the successor's
+// existing grid entry is preserved).
+func captureRuntimeSchedulesForCarryover(ctx context.Context, ids []string) {
+	// F3: panic-isolate the entire capture so a panic can NEVER abort the
+	// synchronous CascadeDelete teardown (recover-and-don't-re-raise, matching
+	// logProvisionPanic / coalesceRestart). Log with a stack trace and return —
+	// CascadeDelete then proceeds to stopAndRemove.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("carryover-capture: PANIC — recovered, teardown continues: %v\n%s", r, debug.Stack())
+		}
+	}()
+	if db.DB == nil {
+		return
+	}
+	for _, id := range ids {
+		if !ProvidesNativeScheduler(id) {
+			continue // no native scheduler — nothing to capture from its volume
+		}
+		wsURL, secret, err := resolveScheduleFanoutTarget(ctx, id)
+		if err != nil {
+			log.Printf("carryover-capture: resolve %s failed (skipping, teardown continues): %v", id, err)
+			continue
+		}
+		status, body, err := fetchScheduleAPI(ctx, wsURL, secret, http.MethodGet, "", nil)
+		if err != nil {
+			log.Printf("carryover-capture: grid fetch %s failed (skipping, teardown continues): %v", id, err)
+			continue
+		}
+		if status != http.StatusOK {
+			log.Printf("carryover-capture: grid fetch %s returned %d (skipping, teardown continues)", id, status)
+			continue
+		}
+		var grid struct {
+			Schedules []volumeEntry `json:"schedules"`
+		}
+		if err := json.Unmarshal(body, &grid); err != nil {
+			log.Printf("carryover-capture: malformed grid from %s (skipping): %v", id, err)
+			continue
+		}
+		runtimeEntries := make([]volumeEntry, 0, len(grid.Schedules))
+		for _, e := range grid.Schedules {
+			if e.Source == "runtime" {
+				runtimeEntries = append(runtimeEntries, e)
+			}
+		}
+		if len(runtimeEntries) == 0 {
+			continue // nothing user-authored to carry
+		}
+		raw, err := json.Marshal(runtimeEntries)
+		if err != nil {
+			log.Printf("carryover-capture: marshal %s failed (skipping): %v", id, err)
+			continue
+		}
+		if _, err := db.DB.ExecContext(ctx,
+			`UPDATE workspaces SET carryover_runtime_schedules = $1::jsonb, updated_at = now() WHERE id = $2`,
+			raw, id); err != nil {
+			log.Printf("carryover-capture: persist %s failed (skipping): %v", id, err)
+			continue
+		}
+		log.Printf("carryover-capture: buffered %d runtime schedule(s) for %s ahead of teardown", len(runtimeEntries), id)
+	}
 }
 
 // PatchTemplate handles PATCH /workspaces/:id/template.
@@ -952,6 +1374,9 @@ func validateWorkspaceFields(name, role, model, runtime string) error {
 		if strings.ContainsAny(f.val, "\n\r") {
 			return fmt.Errorf("%s must not contain newline characters", f.label)
 		}
+	}
+	if strings.IndexFunc(name, unicode.IsControl) >= 0 {
+		return fmt.Errorf("name must not contain control characters")
 	}
 	// name and role only: reject YAML-special characters (#685).
 	for _, f := range []struct{ label, val string }{

@@ -1,12 +1,13 @@
-# Platform-only image (no canvas). Used by publish-workspace-server-image
-# workflow for ECR. Tenant image uses Dockerfile.tenant instead.
+# Platform-only image (no canvas). Used by the image-publish workflow;
+# Dockerfile.tenant builds the combined tenant image instead.
 #
-# Templates + plugins are pre-cloned by scripts/clone-manifest.sh (in CI
-# or on the operator host) into .tenant-bundle-deps/ — same pattern as
+# Templates + plugins are pre-cloned by scripts/clone-manifest.sh in the
+# trusted build context into .tenant-bundle-deps/ — same pattern as
 # Dockerfile.tenant. See that file's header for the full rationale; the
-# short version is that post-2026-05-06 every workspace-template-* and
-# org-template-* repo on Gitea is private, so an in-image `git clone`
-# has no auth path that doesn't leak the Gitea token into a layer.
+# short version is that the manifest can include private template, plugin, or
+# org dependencies, so an in-image `git clone` has no general auth path that
+# does not risk leaking the Gitea token into a layer. Public template repos use
+# the same pre-clone path for one deterministic build contract.
 #
 # Build context: repo root, with `.tenant-bundle-deps/` populated by the
 # workflow's "Pre-clone manifest deps" step (Task #173).
@@ -30,14 +31,56 @@
 # Override (e.g. to refresh the mirror from upstream):
 #   --build-arg BASE_IMAGE_REGISTRY=docker.io/library
 ARG BASE_IMAGE_REGISTRY=registry.moleculesai.app/molecule-ai
-FROM ${BASE_IMAGE_REGISTRY}/golang:1.25-alpine@sha256:c4ea15b4a7912716eb362a022e2b12317762eca387423760bc59c0f9ae69423c AS builder
+# Full base references, overridable as a UNIT.
+#
+# The digests below are MIRROR-SPECIFIC index digests — they do not exist on
+# Docker Hub, so overriding BASE_IMAGE_REGISTRY alone cannot work: the digest
+# would fail to resolve against the new registry. These args let a developer
+# swap registry AND digest together.
+#
+# WHY THIS EXISTS: the mirrored alpine:3.20 index carries ONLY linux/amd64,
+# while upstream alpine:3.20 is multi-arch. On an arm64 host the build dies at
+# the runtime stage with
+#
+#   no match for platform in manifest: not found
+#
+# so molecule-core could not be built on Apple Silicon at all. The mirrored
+# amd64 image is alpine 3.20.10 — byte-for-byte the same release as upstream —
+# so pointing at upstream is a same-content, more-architectures swap, not a
+# version bump.
+#
+# Apple Silicon / any arm64 host:
+#   make build-upstream-base        (or)
+#   docker build \
+#     --build-arg GOLANG_BASE=golang:1.25-alpine \
+#     --build-arg ALPINE_BASE=alpine:3.20 \
+#     --build-arg BASE_IMAGE_REGISTRY=docker.io/library ...
+#
+# The DURABLE fix is to mirror the arm64 variant so CI and local builds share
+# one pinned reference again; that needs registry write access. Until then this
+# arg is the escape hatch, and CI keeps using the pinned mirror defaults.
+ARG GOLANG_BASE=golang:1.25-alpine@sha256:c4ea15b4a7912716eb362a022e2b12317762eca387423760bc59c0f9ae69423c
+ARG ALPINE_BASE=alpine:3.20@sha256:91bed4737195a1a9657c53334c35b0cd1cef217402d3d128a3de5aaee4bb25aa
+FROM ${BASE_IMAGE_REGISTRY}/${GOLANG_BASE} AS builder
 WORKDIR /app
 COPY workspace-server/go.mod workspace-server/go.sum ./
 # github-app-auth plugin removed 2026-05-07 (#157): per-agent Gitea
 # identities replaced the GitHub-App-installation token flow after the
 # 2026-05-06 suspension. Pre-removal this stage COPY'd the sibling
 # plugin repo + injected a `replace` directive; both are gone.
-RUN go mod download
+# Bounded retry (#4968) — mirror of Dockerfile.tenant's go-builder; see that
+# file for the full rationale (proxy.golang.org drops HTTP/2 streams; the
+# image's default GOPROXY comma-list does not fall through on a stream error).
+# The `exit 1` keeps a genuinely-down proxy FAILING the build.
+RUN for i in 1 2 3; do \
+        go mod download && break; \
+        if [ "$i" -ge 3 ]; then \
+            echo "go mod download: FAILED after 3 attempts" >&2; \
+            exit 1; \
+        fi; \
+        echo "go mod download: attempt $i failed, retrying in $((i * 5))s" >&2; \
+        sleep $((i * 5)); \
+    done
 COPY workspace-server/ .
 # GIT_SHA mirror of Dockerfile.tenant — see that file for the rationale.
 ARG GIT_SHA=dev
@@ -66,14 +109,13 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o /memory-plugin ./cmd/memory-plugin-postgres
 
 ARG BASE_IMAGE_REGISTRY
-FROM ${BASE_IMAGE_REGISTRY}/alpine:3.20@sha256:91bed4737195a1a9657c53334c35b0cd1cef217402d3d128a3de5aaee4bb25aa
+ARG ALPINE_BASE
+FROM ${BASE_IMAGE_REGISTRY}/${ALPINE_BASE}
 # docker-cli + docker-cli-buildx are required by internal/provisioner/
 # localbuild.go which shells out via exec.Command("docker", "image",
 # "inspect"/"build"/"tag", ...) whenever Resolve().Mode ==
-# RegistryModeLocal — which is the permanent mode post-2026-05-06
-# (Molecule-AI GitHub org suspended → GHCR unreachable →
-# MOLECULE_IMAGE_REGISTRY unset → registry_mode.go falls through to
-# RegistryModeLocal). The CLI binary alone is not enough: modern
+# RegistryModeLocal (selected whenever MOLECULE_IMAGE_REGISTRY is unset).
+# The CLI binary alone is not enough: modern
 # Docker (26.x in this image) defaults BuildKit=on, and `docker build`
 # without the buildx plugin fails with `ERROR: BuildKit is enabled but
 # the buildx component is missing or broken`, leaving the workspace at
@@ -85,27 +127,38 @@ FROM ${BASE_IMAGE_REGISTRY}/alpine:3.20@sha256:91bed4737195a1a9657c53334c35b0cd1
 # recovery POST /restart calls (logs: `local-build: pre-flight OK
 # (docker=/usr/bin/docker)` followed by the BuildKit/buildx error from
 # the same dockerBuildProd path).
-# Related: mc#765 (parent fix), Task #194 / Issue #63 (local-build path
-# added); `feedback_workspace_image_ghcr_dead`.
+# Related: mc#765 (parent fix), Task #194 / Issue #63 (local-build path).
 RUN apk add --no-cache ca-certificates docker-cli docker-cli-buildx git tzdata wget
 COPY --from=builder /platform /platform
 COPY --from=builder /memory-plugin /memory-plugin
 COPY workspace-server/migrations /migrations
 COPY manifest.json /app/manifest.json
 # Templates + plugins (pre-cloned by scripts/clone-manifest.sh in the
-# trusted CI / operator-host context, .git already stripped). The Gitea
+# trusted build context, .git already stripped). The Gitea
 # token used to clone them never enters this image — same shape as
 # Dockerfile.tenant.
-COPY .tenant-bundle-deps/workspace-configs-templates /workspace-configs-templates
-COPY .tenant-bundle-deps/org-templates /org-templates
-COPY .tenant-bundle-deps/plugins /plugins
 # Non-root runtime with Docker socket access for workspace provisioning.
+# MOVED ABOVE the COPYs so they can --chown to it (see the org-templates note).
 RUN addgroup -g 1000 platform && adduser -u 1000 -G platform -s /bin/sh -D platform
+COPY .tenant-bundle-deps/workspace-configs-templates /workspace-configs-templates
+# org-templates MUST be writable by the runtime user. An org template carrying an
+# `!external` ref makes the importer materialise a content-addressable cache at
+# <template-dir>/.external-cache/ (org_external.go, gitFetcher.Fetch -> MkdirAll).
+# Without --chown this tree lands root:root 0755 while the server runs as uid 1000
+# `platform`, so that MkdirAll returns EACCES and the template becomes
+# UNIMPORTABLE:
+#   POST /org/import {"dir":"molecule-dev"} -> {"error":"org template expansion failed"}
+#   log: !external at line 155: ... mkdir /org-templates/molecule-dev/.external-cache:
+#        permission denied
+# molecule-dev is the org template the dev team actually uses, and it was broken on
+# every image built from this file. Reproduced and fixed against a local stack.
+COPY --chown=platform:platform .tenant-bundle-deps/org-templates /org-templates
+COPY .tenant-bundle-deps/plugins /plugins
 EXPOSE 8080
 # HEALTHCHECK: probe the /health endpoint so orchestrators and docker's
 # health monitoring can detect a crashed or wedged server.
-# mc#1158: workspace/Dockerfile has a HEALTHCHECK; workspace-server/Dockerfile
-# was missing one, so docker ps never shows (healthy) for this container.
+# mc#1158: runtime images already had a HEALTHCHECK; workspace-server lacked
+# one, so docker ps never showed (healthy) for this container.
 # Interval 30s, timeout 5s, 3 retries, 30s start period (server boot).
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=30s \
   CMD wget -qO- --timeout=5 http://localhost:8080/health || exit 1

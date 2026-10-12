@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # ephemeral-cp-happy-path.sh — LOCAL wrapper for the RFC "one pre-merge ephemeral
-# gate" (§04). Runs the EXACT same happy-path gate the CI workflow runs
+# gate" (§04). Runs the same happy-path scenario runner as the CI workflow
 # (tests/e2e/ephemeral_cp_happy_path.sh) — on your own machine, against a
 # THROWAWAY CP it spins up, with your working-tree tenant image. No shared
 # staging, no CI wait: validate the full happy path before you push.
 #
 # Design tenet: ONE entry point (tests/e2e/ephemeral_cp_happy_path.sh). CI is a
-# thin wrapper that supplies images + creds; THIS is the thin local wrapper. Same
-# runner → local result == CI result.
+# thin wrapper that supplies images + creds; THIS is the thin local wrapper. The
+# scenario contract is shared, but the launch environments intentionally differ:
+# CI fetches the workflow's pinned CP_EPHEMERAL_REF and uses per-job dind, while
+# this wrapper defaults to the current sibling CP checkout and direct local
+# Docker. Use the pinned checkout plus dind mode when exact CI-launch parity is
+# required.
 #
 # ── MODULAR PHASES (pinpoint a failing step without the full rebuild+boot) ────
 #   make e2e-ephemeral-happy-path            # all: build → boot → scenario → down

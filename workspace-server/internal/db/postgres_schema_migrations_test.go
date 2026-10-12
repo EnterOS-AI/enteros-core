@@ -32,6 +32,10 @@ func TestRunMigrations_FirstBoot_AppliesAndRecords(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 
 	// Expect: apply migration
+	// The migration body and its ledger row now commit TOGETHER — see
+	// migration_transaction.go. The Begin/Commit pair IS the fix, so the mock
+	// asserts it rather than tolerating it.
+	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta("CREATE TABLE foo();")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
@@ -39,6 +43,7 @@ func TestRunMigrations_FirstBoot_AppliesAndRecords(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO schema_migrations (filename) VALUES ($1)")).
 		WithArgs("001_init.up.sql").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	if err := RunMigrations(tmp); err != nil {
 		t.Fatalf("RunMigrations: %v", err)
@@ -112,6 +117,10 @@ func TestRunMigrations_MixedState_AppliesOnlyNew(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 
 	// Apply 002
+	// The migration body and its ledger row now commit TOGETHER — see
+	// migration_transaction.go. The Begin/Commit pair IS the fix, so the mock
+	// asserts it rather than tolerating it.
+	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta("SELECT 2;")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
@@ -119,6 +128,7 @@ func TestRunMigrations_MixedState_AppliesOnlyNew(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO schema_migrations (filename) VALUES ($1)")).
 		WithArgs("002_new.up.sql").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	if err := RunMigrations(tmp); err != nil {
 		t.Fatalf("RunMigrations: %v", err)
@@ -149,12 +159,17 @@ func TestRunMigrations_SkipsDownSqlFilesEvenInTracking(t *testing.T) {
 		WithArgs("001_init.up.sql").
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 
+	// The migration body and its ledger row now commit TOGETHER — see
+	// migration_transaction.go. The Begin/Commit pair IS the fix, so the mock
+	// asserts it rather than tolerating it.
+	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta("CREATE TABLE foo();")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO schema_migrations (filename) VALUES ($1)")).
 		WithArgs("001_init.up.sql").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	if err := RunMigrations(tmp); err != nil {
 		t.Fatalf("RunMigrations: %v", err)

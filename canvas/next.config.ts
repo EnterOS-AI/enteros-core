@@ -17,23 +17,22 @@ import { dirname, join } from "node:path";
 // update one heuristic. Production is unaffected: `output: "standalone"`
 // bakes resolved env into the build, and the marker file isn't shipped.
 loadMonorepoEnv();
-// Boot-time matched-pair guard for ADMIN_TOKEN / NEXT_PUBLIC_ADMIN_TOKEN.
-// When ADMIN_TOKEN is set on the workspace-server (server-side bearer
-// gate, wsauth_middleware.go ~L245), the canvas MUST send the matching
-// NEXT_PUBLIC_ADMIN_TOKEN as `Authorization: Bearer ...` on every API
-// call. If only one is set, every workspace API call 401s silently —
-// the canvas hydrates with empty data and the user sees a broken page
-// with no console hint about the auth-config mismatch.
+// Build-time matched-pair guard for the local-development and ephemeral-E2E
+// ADMIN_TOKEN / NEXT_PUBLIC_ADMIN_TOKEN compatibility path. When local Canvas
+// and workspace-server run as separate processes, the public client value must
+// match the server bearer gate or every workspace API call 401s silently.
+// Production SaaS builds must leave NEXT_PUBLIC_ADMIN_TOKEN empty and use the
+// verified control-plane session; a tenant admin secret must never be baked
+// into public JavaScript.
 //
 // Pre-fix the matched-pair contract was descriptive only (a comment in
 // .env): future devs/agents could re-misconfigure with one of the two
 // unset and silently 401. Closes the post-PR-#174 self-review gap.
 //
-// Warn-only (not exit) — production canvas Docker images bake these
-// vars into the build at image-build time, and a missed pair there
-// would still emit the warning at runtime via the standalone server's
-// startup. Killing the process on misconfiguration would turn a
-// recoverable auth issue into a hard crashloop.
+// Warn-only (not exit): local dev remains easy to diagnose, while an
+// accidentally inherited server secret does not break a production image
+// build. The diagnostic explicitly tells production builders to remove the
+// values instead of publishing the server secret.
 checkAdminTokenPair();
 
 const nextConfig: NextConfig = {
@@ -99,15 +98,15 @@ export function checkAdminTokenPair(): void {
     // eslint-disable-next-line no-console
     console.error(
       "[next.config] ADMIN_TOKEN is set but NEXT_PUBLIC_ADMIN_TOKEN is not — " +
-        "canvas will 401 against workspace-server because the bearer header " +
-        "is never attached. Set both to the same value, or unset both.",
+        "for local dev, set the matching public value; for production, remove " +
+        "ADMIN_TOKEN from the Canvas build environment (never publish it).",
     );
   } else {
     // eslint-disable-next-line no-console
     console.error(
       "[next.config] NEXT_PUBLIC_ADMIN_TOKEN is set but ADMIN_TOKEN is not — " +
-        "workspace-server will reject the bearer because no AdminAuth gate " +
-        "is configured. Set both to the same value, or unset both.",
+        "for local dev, set the matching server value; for production, remove " +
+        "NEXT_PUBLIC_ADMIN_TOKEN from the public Canvas bundle.",
     );
   }
 }

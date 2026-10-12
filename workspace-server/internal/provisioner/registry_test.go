@@ -5,27 +5,24 @@ import (
 	"testing"
 )
 
-// TestRegistryPrefix_DefaultsToGHCR pins the OSS-default behavior. If a future
-// refactor accidentally drops the default, OSS users self-hosting Molecule
-// would silently lose image pulls — this test should fail loudly instead.
-func TestRegistryPrefix_DefaultsToGHCR(t *testing.T) {
+// TestRegistryPrefix_DefaultsToGitea pins the current registry fallback used
+// by legacy callers that do not go through Resolve().
+func TestRegistryPrefix_DefaultsToGitea(t *testing.T) {
 	t.Setenv("MOLECULE_IMAGE_REGISTRY", "")
 	got := RegistryPrefix()
-	want := "ghcr.io/molecule-ai"
+	want := "registry.moleculesai.app/molecule-ai"
 	if got != want {
-		t.Fatalf("RegistryPrefix() = %q, want %q (default must remain GHCR for OSS users)", got, want)
+		t.Fatalf("RegistryPrefix() = %q, want current Gitea registry %q", got, want)
 	}
 }
 
-// TestRegistryPrefix_RespectsEnv verifies the override path used in
-// production tenants where MOLECULE_IMAGE_REGISTRY points at a private
-// mirror (AWS ECR, self-hosted Harbor, etc.).
+// TestRegistryPrefix_RespectsEnv verifies an operator-controlled mirror.
 func TestRegistryPrefix_RespectsEnv(t *testing.T) {
-	t.Setenv("MOLECULE_IMAGE_REGISTRY", "123456789012.dkr.ecr.us-east-2.amazonaws.com/molecule-ai")
+	t.Setenv("MOLECULE_IMAGE_REGISTRY", "registry.example.com/molecule-ai")
 	got := RegistryPrefix()
-	want := "123456789012.dkr.ecr.us-east-2.amazonaws.com/molecule-ai"
+	want := "registry.example.com/molecule-ai"
 	if got != want {
-		t.Fatalf("RegistryPrefix() = %q, want %q (env override path is the production cutover mechanism)", got, want)
+		t.Fatalf("RegistryPrefix() = %q, want operator override %q", got, want)
 	}
 }
 
@@ -47,7 +44,7 @@ func TestRuntimeImage_AllKnownRuntimes(t *testing.T) {
 	t.Setenv("MOLECULE_IMAGE_REGISTRY", "")
 	for _, r := range knownRuntimes {
 		got := RuntimeImage(r)
-		want := "ghcr.io/molecule-ai/workspace-template-" + r + ":latest"
+		want := "registry.moleculesai.app/molecule-ai/workspace-template-" + r + ":latest"
 		if got != want {
 			t.Errorf("RuntimeImage(%q) = %q, want %q", r, got, want)
 		}
@@ -74,13 +71,13 @@ func TestRuntimeImage_UnknownRuntime(t *testing.T) {
 // the prefix in some runtimes but not others (the failure mode that
 // triggered this whole rollout), this test catches it.
 func TestRuntimeImage_RegistryOverrideAppliesToAllRuntimes(t *testing.T) {
-	const ecr = "999999999999.dkr.ecr.us-east-2.amazonaws.com/molecule-ai"
-	t.Setenv("MOLECULE_IMAGE_REGISTRY", ecr)
+	const registry = "registry.example.com/molecule-ai"
+	t.Setenv("MOLECULE_IMAGE_REGISTRY", registry)
 
 	for _, r := range knownRuntimes {
 		got := RuntimeImage(r)
-		if !strings.HasPrefix(got, ecr+"/workspace-template-") {
-			t.Errorf("RuntimeImage(%q) = %q, must start with override prefix %q", r, got, ecr)
+		if !strings.HasPrefix(got, registry+"/workspace-template-") {
+			t.Errorf("RuntimeImage(%q) = %q, must start with override prefix %q", r, got, registry)
 		}
 		if !strings.HasSuffix(got, ":latest") {
 			t.Errorf("RuntimeImage(%q) = %q, must keep :latest tag suffix", r, got)
@@ -115,8 +112,8 @@ func TestComputeRuntimeImages_AllRuntimesPresent(t *testing.T) {
 func TestComputeRuntimeImages_ReflectsCurrentEnv(t *testing.T) {
 	t.Setenv("MOLECULE_IMAGE_REGISTRY", "")
 	defaultMap := computeRuntimeImages()
-	if !strings.HasPrefix(defaultMap["claude-code"], "ghcr.io/molecule-ai/") {
-		t.Fatalf("default map should be GHCR-prefixed, got %q", defaultMap["claude-code"])
+	if !strings.HasPrefix(defaultMap["claude-code"], "registry.moleculesai.app/molecule-ai/") {
+		t.Fatalf("default map should use the current Gitea registry, got %q", defaultMap["claude-code"])
 	}
 
 	const mirror = "registry.example.com/molecule-ai"
@@ -130,17 +127,16 @@ func TestComputeRuntimeImages_ReflectsCurrentEnv(t *testing.T) {
 // TestRegistryHost_SplitsHostFromOrgPath pins the contract that callers
 // (Docker auth payloads, registry V2 HTTP base URLs) need: the host portion
 // must be free of the "/molecule-ai" org suffix that appears in the
-// pull-prefix form. Pre-RFC #229, ghcr.io was hardcoded in two places
-// (imagewatch + admin_workspace_images auth payload); this helper is the
-// single source they should resolve from.
+// pull-prefix form. The admin image-maintenance auth payload uses this helper
+// so it cannot accidentally include the repository path.
 func TestRegistryHost_SplitsHostFromOrgPath(t *testing.T) {
 	cases := []struct {
 		name string
 		env  string
 		want string
 	}{
-		{"default GHCR", "", "ghcr.io"},
-		{"AWS ECR mirror", "004947743811.dkr.ecr.us-east-2.amazonaws.com/molecule-ai", "004947743811.dkr.ecr.us-east-2.amazonaws.com"},
+		{"default Gitea registry", "", "registry.moleculesai.app"},
+		{"operator mirror", "registry.example.com/molecule-ai", "registry.example.com"},
 		{"self-hosted Gitea", "git.moleculesai.app/molecule-ai", "git.moleculesai.app"},
 		// Bare host (no /org) — defensive: return as-is rather than empty.
 		{"bare host no org-path", "registry.example.com", "registry.example.com"},
@@ -163,7 +159,7 @@ func TestRegistryHost_SplitsHostFromOrgPath(t *testing.T) {
 // Docker engine auth payload, or an empty host in `https:///v2/...`, would
 // silently break image operations.
 func TestRegistryHost_NeverEmpty(t *testing.T) {
-	for _, env := range []string{"", "ghcr.io/molecule-ai", "/leading-slash", "host-only", "host/with/path"} {
+	for _, env := range []string{"", "registry.example.com/molecule-ai", "/leading-slash", "host-only", "host/with/path"} {
 		t.Setenv("MOLECULE_IMAGE_REGISTRY", env)
 		if got := RegistryHost(); got == "" {
 			t.Errorf("RegistryHost() with env=%q returned empty (would break Docker auth + V2 HTTP)", env)

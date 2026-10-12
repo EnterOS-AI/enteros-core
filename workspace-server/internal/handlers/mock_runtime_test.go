@@ -79,7 +79,7 @@ func TestProxyA2A_MockRuntime_ReturnsCannedReply(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	// logA2ASuccess fires async — give it a moment to settle so
 	// ExpectationsWereMet doesn't flake.
@@ -179,7 +179,7 @@ func TestProxyA2A_NonMockRuntime_NoShortCircuit(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	time.Sleep(50 * time.Millisecond)
 
@@ -224,12 +224,12 @@ func TestPickMockReply_Deterministic(t *testing.T) {
 // runtime: " Mock " entry doesn't silently get dispatched.
 func TestIsMockRuntime_TrimsAndCaseInsensitive(t *testing.T) {
 	cases := map[string]bool{
-		"mock":      true,
-		"MOCK":      true,
-		"  Mock  ":  true,
-		"mocky":     false,
-		"":          false,
-		"external":  false,
+		"mock":        true,
+		"MOCK":        true,
+		"  Mock  ":    true,
+		"mocky":       false,
+		"":            false,
+		"external":    false,
 		"claude-code": false,
 	}
 	for in, want := range cases {

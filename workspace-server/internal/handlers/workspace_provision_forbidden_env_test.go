@@ -41,6 +41,7 @@ func TestIsForbiddenTenantEnvKey_ExactMatches(t *testing.T) {
 
 		// Control-plane admin tokens.
 		{"CP_ADMIN_API_TOKEN", true},
+		{"CP_PROMOTE_PROD_API_TOKEN", true},
 		{"CP_ADMIN_TOKEN", true},
 		{"ADMIN_TOKEN", true},
 		{"MOLECULE_ADMIN_TOKEN", true},
@@ -105,7 +106,7 @@ func TestIsForbiddenTenantEnvKey_PrefixMatches(t *testing.T) {
 		// Adjacent but NOT in prefix family.
 		{"MOLECULE_AGENT_ROLE", false},
 		{"MOLECULE_URL", false},
-		{"MOLECULE_PERSONA_ROOT", false}, // path on operator host, not tenant
+		{"MOLECULE_PERSONA_ROOT", false}, // local mount selector, not a credential
 		{"MOLECULE_GITEA_TOKEN", false},  // localbuild-time only; not a tenant env
 	}
 	for _, c := range cases {

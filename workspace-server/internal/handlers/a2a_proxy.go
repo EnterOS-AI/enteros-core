@@ -29,6 +29,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/sessionid"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -127,12 +128,15 @@ func readBodyWithLimit(r io.Reader, limit int, kind string) ([]byte, error) {
 //     tokens for minutes). Total-request budget is enforced per-request
 //     via context deadline (canvas = idle-only, agent-to-agent = 30 min ceiling).
 //
-//  2. Transport.DialContext — 10s connect timeout. When a workspace's EC2
-//     black-holes TCP connects (instance terminated mid-flight, security group
-//     flipped, NACL bug), the OS default is 75s on Linux / 21s on macOS — long
-//     enough that Cloudflare's ~100s edge timeout can fire first and surface
-//     a generic 502 page to canvas. 10s is well above realistic intra-region
-//     latencies and well below CF's edge timeout.
+//  2. Transport.DialContext — the shared safeDialer applies the same SSRF
+//     policy after DNS resolution and before connect, closing the rebinding
+//     window between resolveAgentURL's preflight and the actual TCP dial. Its
+//     10s connect timeout also bounds black-holed workspace targets. When a
+//     workspace provider endpoint black-holes TCP connects (compute terminated
+//     mid-flight or its network policy changed), the OS default is 75s on Linux / 21s
+//     on macOS — long enough that Cloudflare's ~100s edge timeout can fire first
+//     and surface a generic 502 page to canvas. 10s is well above realistic
+//     intra-region latencies and well below CF's edge timeout.
 //
 //  3. Transport.ResponseHeaderTimeout — 30min default. From request-body-end
 //     to response-headers-start. Configurable via
@@ -149,17 +153,46 @@ func readBodyWithLimit(r io.Reader, limit int, kind string) ([]byte, error) {
 //     a working turn short. Body streaming after headers is governed by the
 //     per-request context deadline, NOT this timeout.
 //
+// Redirects are disabled because workspace endpoints are mutable and a safe
+// origin can redirect to metadata or an internal service with the
+// platform-inbound bearer attached. A 3xx is surfaced as the upstream response.
+//
 // The point of (2) and (3) is to surface a *structured* 503 from
 // handleA2ADispatchError when the workspace agent is unreachable, so canvas
 // gets `{"error":"workspace agent unreachable","restarting":true}` instead
 // of Cloudflare's opaque 502 error page. Without these, dead workspaces hang
 // long enough that CF gives up first and shows its own page.
+// a2aAlwaysAuthEnv turns on "attach the platform_inbound_secret to EVERY
+// outbound A2A dispatch", not just to URLs the SSRF classifier calls
+// external. Default OFF.
+//
+// Observable behavior change (a new Authorization header on container-local
+// dispatches), so it is flagged for staging burn-in before the default
+// flips — same posture as DELEGATION_RESULT_INBOX_PUSH.
+//
+// Rollout ordering matters and is one-way: this must be ON, and the fleet
+// verified, BEFORE any workspace sets MOLECULE_A2A_REQUIRE_AUTH. Enforcing
+// first 503s every live agent. Readiness is measured per workspace via
+// GET /internal/a2a-auth-status on the workspace runtime; a 200 there proves
+// the tenant's copy of the secret matches the workspace's, which is exactly
+// what enforcement will check.
+//
+// Rollback: unset the var and restart the tenant. Nothing persists.
+const a2aAlwaysAuthEnv = "MOLECULE_A2A_ALWAYS_AUTH"
+
+// a2aAlwaysAuthEnabled reports whether outbound A2A dispatches attach the
+// bearer regardless of URL shape. envx.Bool: an unparseable value falls
+// through to the safe default (off) rather than silently enabling.
+func a2aAlwaysAuthEnabled() bool {
+	return envx.Bool(a2aAlwaysAuthEnv, false)
+}
+
 var a2aClient = &http.Client{
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
 	Transport: &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		DialContext:           safeDialer().DialContext,
 		ResponseHeaderTimeout: envx.Duration("A2A_PROXY_RESPONSE_HEADER_TIMEOUT", 30*time.Minute),
 		TLSHandshakeTimeout:   10 * time.Second,
 		// MaxIdleConns / IdleConnTimeout: stdlib defaults are fine; agent
@@ -318,8 +351,8 @@ func isAgentRestartingError(err error) bool {
 //
 //   - 502 Bad Gateway, 503 Service Unavailable, 504 Gateway Timeout: standard
 //     proxy-layer "upstream is broken" codes (Cloudflare, ELB, agent tunnel).
-//   - 521 Web Server Is Down: Cloudflare can't open TCP to origin (most
-//     direct dead-EC2 signal).
+//   - 521 Web Server Is Down: Cloudflare cannot open TCP to the workspace
+//     origin (the most direct dead-provider-endpoint signal).
 //   - 522 Connection Timed Out: Cloudflare opened TCP but no response within
 //     ~15s — typical of SG/NACL flap or agent process hung.
 //   - 523 Origin Is Unreachable: Cloudflare can't route to origin (DNS or
@@ -397,11 +430,12 @@ func (e *proxyA2AError) Error() string {
 }
 
 // EnqueueA2A is a method wrapper around the package-level EnqueueA2A function so
-// that *WorkspaceHandler satisfies the scheduler's A2AProxy interface. The
-// scheduler cannot call the package function directly (it would have to import
-// internal/handlers, but handlers already imports internal/scheduler → import
-// cycle), so it goes through this method on the proxy it already holds. Used by
-// the cron scheduler to durably buffer a tick when the target workspace is busy.
+// that *WorkspaceHandler satisfies an A2AProxy interface held by a collaborator
+// in another package (e.g. channels), which cannot call the package function
+// directly without an import cycle. It durably buffers an A2A message when the
+// target workspace is busy. (Originally introduced for the core cron scheduler,
+// retired in the scheduler-as-trigger-plugin RFC P4; the wrapper stays as the
+// general durable-enqueue seam.)
 func (h *WorkspaceHandler) EnqueueA2A(ctx context.Context, workspaceID, callerID string, priority int, body []byte, method, idempotencyKey string, expiresAt *time.Time) (string, int, error) {
 	return EnqueueA2A(ctx, workspaceID, callerID, priority, body, method, idempotencyKey, expiresAt)
 }
@@ -452,28 +486,7 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 		return
 	}
 
-	callerID := c.GetHeader("X-Workspace-ID")
-
-	// #2306: when X-Workspace-ID isn't set, derive callerID from the bearer
-	// token's owning workspace. External callers (third-party SDKs, the
-	// channel plugin, etc.) authenticate purely via bearer and frequently
-	// don't set the header — without this, activity_logs.source_id ends up
-	// NULL and downstream consumers (notification peer_id, "Agent Comms by
-	// peer" tab, analytics) can't identify the sender. The bearer is the
-	// authoritative caller identity per the wsauth contract; the header is
-	// just a display/routing hint that must agree with it.
-	//
-	// Skip when an org-level token is in play (canvas/admin path) — those
-	// tokens grant org-wide access and don't bind to a single workspace.
-	if callerID == "" {
-		if _, isOrg := c.Get("org_token_id"); !isOrg {
-			if tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization")); tok != "" {
-				if wsID, err := wsauth.WorkspaceFromToken(ctx, db.DB, tok); err == nil {
-					callerID = wsID
-				}
-			}
-		}
-	}
+	claimedCallerID := c.GetHeader("X-Workspace-ID")
 
 	// #761 SECURITY: reject requests where the client-supplied X-Workspace-ID
 	// contains a system-caller prefix. isSystemCaller() bypasses both token
@@ -482,35 +495,21 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 	// (ProxyA2ARequest), never to HTTP header values. Legitimate system callers
 	// (webhooks, scheduler, restart_context) call proxyA2ARequest directly and
 	// never go through this HTTP handler.
-	if isSystemCaller(callerID) {
+	if isSystemCaller(claimedCallerID) {
 		log.Printf("security: system-caller prefix forge attempt — remote=%q header=%q",
-			c.ClientIP(), callerID)
+			c.ClientIP(), claimedCallerID)
 		c.JSON(http.StatusForbidden, gin.H{"error": "invalid caller ID"})
 		return
 	}
 
-	// Phase 30.5 — validate the caller's auth token when the caller IS
-	// a workspace (not canvas or a system caller). Canvas requests have
-	// no X-Workspace-ID so they bypass this check (the existing
-	// access-control layer already trusts them). System callers
-	// (webhook:* / system:* / test:*) only reach proxyA2ARequest via
-	// the server-side ProxyA2ARequest wrapper, never via this HTTP path.
-	//
-	// The bind is strict: the token must match `callerID`, not
-	// `workspaceID` (the target). A compromised token from workspace A
-	// must never authenticate calls from A pretending to be B.
-	//
-	// Post-RFC#637: canvas users now send X-Workspace-ID (their identity
-	// workspace). validateCallerToken detects canvas/admin auth on a
-	// tokenless workspace and returns isCanvasUser=true so the proxy can
-	// bypass CanCommunicate (human users sit outside the hierarchy).
-	isCanvasUser := false
-	if callerID != "" && callerID != workspaceID && !isSystemCaller(callerID) {
-		var err error
-		isCanvasUser, err = validateCallerToken(ctx, c, callerID)
-		if err != nil {
-			return // response already written with 401
-		}
+	// Authenticate before treating the request as canvas or workspace traffic.
+	// X-Workspace-ID is only a claim; a workspace bearer must resolve to the
+	// same source identity. Verified human and inbound credentials are the only
+	// non-workspace paths. Missing, revoked, tokenless-legacy, and DB-error
+	// cases all fail closed.
+	callerID, isCanvasUser, err := authenticateA2AHTTPCaller(ctx, c, claimedCallerID)
+	if err != nil {
+		return // response already written
 	}
 
 	// core#2691: attach the authenticated human sender's identity to canvas_user
@@ -653,6 +652,7 @@ func (h *WorkspaceHandler) ReceiveA2AInbound(c *gin.Context) {
 	// not forwarded to the target workspace.
 	c.Request.Header.Del("X-Workspace-ID")
 	c.Request.Header.Del("Authorization")
+	c.Set(a2aInboundAuthenticatedContextKey, true)
 	h.ProxyA2A(c)
 }
 
@@ -709,14 +709,11 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 			}
 		}
 
-		// #1953 cross-tenant isolation. CanCommunicate alone does NOT enforce
-		// org boundaries: its "root-level siblings — both have no parent" rule
-		// treats every tenant's org root as a sibling, so a caller that is an
-		// org root could resolve and route a2a to another tenant's org root
-		// (and resolveAgentURL accepts ANY workspace id with no org check).
-		// Gate on the SAME parent_id-chain org scoping the OFFSEC-015 broadcast
-		// fix uses: reject before resolveAgentURL when caller and target are in
-		// different orgs. Fail-closed — a DB error denies cross-org routing.
+		// #1953 cross-tenant isolation. CanCommunicate currently rejects unrelated
+		// roots and disjoint subtrees, but sameOrg remains a defense-in-depth tenant
+		// boundary independent of hierarchy policy. Gate before resolveAgentURL
+		// (which accepts any workspace ID) using the same parent-chain org scoping
+		// as the OFFSEC-015 broadcast fix. Fail closed on lookup errors.
 		ok, err := sameOrg(ctx, db.DB, callerID, workspaceID)
 		if err != nil {
 			log.Printf("ProxyA2A: org-scope check failed %s → %s: %v — denying", callerID, workspaceID, err)
@@ -805,9 +802,11 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	// Dispatching now falls to poll-mode 'queued' and hangs with no reply (the
 	// 675s dead-air the principal hit in test1). Defer a real caller with 503 +
 	// Retry-After (the canvas renders a warming state and auto-retries post-flip,
-	// mirroring the existing hibernation-wake contract). EXEMPT system callers —
-	// system:concierge-warmup MUST reach the runtime DURING warming, it produces
-	// the loaded_mcp_tools capture that drives the verified flip — and self-calls.
+	// mirroring the existing hibernation-wake contract). EXEMPT system callers and
+	// self-calls — a platform/system self-turn (callerID "system:…") must reach the
+	// runtime during warming. (EV2 retired the fireConciergeWarmup readiness turn;
+	// the provisioning->online flip is now driven by the runtime's mcp_tools_ready
+	// heartbeat event, not a synthetic warmup turn.)
 	// Placed AFTER access-control + budget + can_delegate so an unauthorized /
 	// over-budget caller still gets 403/429 first (denial hierarchy preserved),
 	// and BEFORE persist so a deferred call leaves no half-persisted bubble.
@@ -885,6 +884,35 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		return http.StatusOK, respBody, nil
 	}
 
+	// PLATFORM-OWNED BOOT TURN IN FLIGHT (first-boot greeting or
+	// restart-context): dispatching a caller's turn NOW interleaves it into
+	// the agent's single session mid-boot-turn — hermes INTERRUPTS the
+	// running turn and acks "⚡ Interrupting current task…", which the caller
+	// receives as their answer (the staging e2e's "opening reply was not a
+	// greeting"). The queue DRAIN already respects this gate
+	// (a2a_queue.go restartContextInFlight check); this closes the DIRECT
+	// dispatch path the same way: durably queue and return the standard
+	// queued envelope (the canvas already waits for the WS-delivered reply
+	// on that shape). System callers pass through — the gate holder itself
+	// dispatches through this proxy.
+	if a2aMethod == "message/send" && restartContextInFlight(workspaceID) && !isSystemCaller(callerID) {
+		if qid, depth, qErr := EnqueueA2A(ctx, workspaceID, callerID, PriorityTask, body, a2aMethod, "", nil); qErr == nil {
+			log.Printf("ProxyA2A: platform boot turn in flight for %s — queued caller turn instead of interleaving", workspaceID)
+			respBody, marshalErr := json.Marshal(gin.H{
+				"status":      "queued",
+				"method":      a2aMethod,
+				"queued":      true,
+				"queue_id":    qid,
+				"queue_depth": depth,
+			})
+			if marshalErr == nil {
+				return http.StatusOK, respBody, nil
+			}
+		}
+		// Enqueue/marshal failure: fall through to normal dispatch — an
+		// interleaved turn beats a dropped one.
+	}
+
 	// Mock-runtime short-circuit. Workspaces with runtime='mock' have
 	// no container, no EC2, no URL — every reply is synthesised here
 	// from a small canned-variant pool. Built for the "200-workspace
@@ -948,34 +976,14 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		}
 	}
 
-	// core#3319: external agents (public /a2a/inbound endpoints) must receive
-	// the workspace's platform_inbound_secret in the Authorization header.
-	// Internal container addresses are unchanged. Reuses the same per-workspace
-	// bearer that already gates /internal/* forwards (chat_files.go).
-	inboundSecret := ""
-	if isExternalAgentURL(workspaceID, agentURL) {
-		secret, healed, secretErr := readOrLazyHealInboundSecret(ctx, workspaceID, "ProxyA2A")
-		if secretErr != nil {
-			log.Printf("ProxyA2A: no platform_inbound_secret for external workspace %s: %v", workspaceID, secretErr)
-			return 0, nil, &proxyA2AError{
-				Status: http.StatusServiceUnavailable,
-				Response: gin.H{
-					"error":  "workspace not yet enrolled in inbound auth (RFC #2312)",
-					"detail": "Failed to read platform_inbound_secret. Reprovision the workspace if this persists.",
-				},
-			}
-		}
-		if healed {
-			return 0, nil, &proxyA2AError{
-				Status: http.StatusServiceUnavailable,
-				Response: gin.H{
-					"error":               "workspace re-registering — please retry in 30 seconds",
-					"detail":              "Inbound auth secret was just minted. Workspace will pick it up on its next heartbeat.",
-					"retry_after_seconds": 30,
-				},
-			}
-		}
-		inboundSecret = secret
+	// Inbound-auth credential for this dispatch. The full rationale for
+	// why this is no longer keyed on URL shape lives on
+	// resolveA2AInboundSecret in a2a_inbound_auth.go.
+	inboundSecret, secretProxyErr := resolveA2AInboundSecret(
+		ctx, workspaceID, agentURL, readOrLazyHealInboundSecret, a2aAlwaysAuthEnabled(),
+	)
+	if secretProxyErr != nil {
+		return 0, nil, secretProxyErr
 	}
 
 	startTime := time.Now()
@@ -1163,30 +1171,6 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	return resp.StatusCode, respBody, nil
 }
 
-// SendConciergeWarmupA2A adapts proxyA2ARequest to the RegistryHandler's
-// WarmupSendFunc signature for the concierge warmup (core#3082 keystone). The
-// router wires it via rh.SetWarmupSendFunc(wh.SendConciergeWarmupA2A) — the
-// same exported-method late-wiring pattern as rh.SetQueueDrainFunc(
-// wh.DrainQueueForWorkspace). It REUSES the exact internal A2A dispatch +
-// auth + URL-resolution mechanism that delegations use (proxyA2ARequest →
-// resolveAgentURL → dispatchA2A); no new auth path is invented.
-//
-// logActivity=false: the warmup is an internal readiness probe, not a
-// user/agent turn worth recording in activity_logs. isCanvasUser=false: the
-// system caller (callerID "system:…") is trusted via isSystemCaller and is
-// NOT treated as a delegation (so can_delegate is irrelevant) and NOT a
-// canvas user.
-//
-// The typed *proxyA2AError is converted to a plain error explicitly: a nil
-// pointer assigned to an error interface would otherwise be a non-nil error.
-func (h *WorkspaceHandler) SendConciergeWarmupA2A(ctx context.Context, workspaceID string, body []byte, callerID string) (int, []byte, error) {
-	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, false, false)
-	if proxyErr != nil {
-		return status, respBody, proxyErr
-	}
-	return status, respBody, nil
-}
-
 // conciergeWarmingGate returns a 503 + Retry-After deferral when the target is a
 // kind=platform concierge still HELD in 'provisioning' (warming) — i.e. it is UP
 // but has not yet proven provision_workspace is callable (core#3082). Dispatching
@@ -1318,27 +1302,98 @@ func (h *WorkspaceHandler) resolveAgentURL(ctx context.Context, workspaceID stri
 	// rewritten to the workspace container's Docker-bridge hostname.
 	// External runtimes are not managed containers; their local test/runtime
 	// URL is the target and must not be synthesized into ws-<id>:8000.
-	if strings.HasPrefix(agentURL, "http://127.0.0.1:") && h.provisioner != nil && platformInDocker {
-		var wsRuntime string
-		if err := db.DB.QueryRowContext(ctx,
-			`SELECT COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`,
-			workspaceID,
-		).Scan(&wsRuntime); err != nil {
-			log.Printf("ProxyA2A: runtime lookup before Docker URL rewrite failed for %s: %v", workspaceID, err)
-		}
-		if !isExternalLikeRuntime(wsRuntime) {
-			agentURL = provisioner.InternalURL(workspaceID)
+	agentURL, err = h.rewriteForDocker(ctx, agentURL, workspaceID)
+	if err != nil {
+		log.Printf("ProxyA2A: route lookup failed for %s: %v", workspaceID, err)
+		return "", &proxyA2AError{
+			Status:   http.StatusInternalServerError,
+			Response: gin.H{"error": "failed to resolve workspace route"},
 		}
 	}
 	// SSRF defence: reject private/metadata URLs before making outbound call.
 	if err := isSafeURL(agentURL); err != nil {
-		log.Printf("ProxyA2A: unsafe URL for workspace %s: %v", workspaceID, err)
-		return "", &proxyA2AError{
-			Status:   http.StatusBadGateway,
-			Response: gin.H{"error": "workspace URL is not publicly routable"},
+		// Docker-internal restart-flap residual (core#4548): on the local-
+		// docker topology the workspace URL was rewritten above to the
+		// synthesized container hostname (ws-<id>:8000). During a config-PUT
+		// restart flap the container's DNS name can transiently fail to
+		// resolve while docker-DNS races to (re)register it — isSafeURL then
+		// returns a *net.DNSError-wrapped "DNS resolution blocked" error and
+		// the turn is dropped with a spurious 502.
+		//
+		// settleDockerInternalDNS re-runs isSafeURL a bounded number of times
+		// to let docker-DNS settle. It is NOT a routability relaxation: the
+		// classification of what counts as routable is byte-for-byte
+		// unchanged, and it only retries while the failure remains a DNS-
+		// *resolution* error — a genuine routability rejection (private/
+		// metadata/link-local classification) is a plain error, does not
+		// match, and fails closed on the first attempt.
+		//
+		// Prod-safety: this branch is gated on devModeAllowsLoopback()
+		// (MOLECULE_ENV=development|dev) AND platformInDocker AND the URL
+		// being the container-hostname rewrite. SaaS/prod tenants run
+		// MOLECULE_ENV=production (crypto strict-init) and register by VPC-
+		// private IP (never the 127.0.0.1→ws-<id> rewrite), so prod never
+		// enters here and calls isSafeURL exactly once — the production
+		// SSRF/routability guard is unchanged.
+		if devModeAllowsLoopback() && platformInDocker &&
+			agentURL == provisioner.InternalURL(workspaceID) &&
+			isDNSResolutionError(err) {
+			err = settleDockerInternalDNS(agentURL)
+		}
+		if err != nil {
+			log.Printf("ProxyA2A: unsafe URL for workspace %s: %v", workspaceID, err)
+			return "", &proxyA2AError{
+				Status:   http.StatusBadGateway,
+				Response: gin.H{"error": "workspace URL is not publicly routable"},
+			}
 		}
 	}
 	return agentURL, nil
+}
+
+// dockerDNSSettleAttempts / dockerDNSSettleDelay bound how long the A2A
+// proxy waits for docker-DNS to (re)register a workspace container's
+// hostname during a restart flap before giving up. Ceiling ~1.5s
+// (5 × 300ms), well under the A2A client timeout. Package vars so tests
+// can shorten the delay; production never reaches settleDockerInternalDNS
+// (see resolveAgentURL gate).
+var (
+	dockerDNSSettleAttempts = 5
+	dockerDNSSettleDelay    = 300 * time.Millisecond
+)
+
+// isDNSResolutionError reports whether err (as produced by isSafeURL) is a
+// transient DNS *resolution* failure rather than a routability rejection.
+// isSafeURL wraps net.LookupHost's *net.DNSError with %w on the resolution-
+// blocked path; classification rejections are plain fmt.Errorf values that
+// do not unwrap to a *net.DNSError. This is what keeps the settle retry from
+// ever re-attempting — and thus never masking — a real SSRF rejection.
+func isDNSResolutionError(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr)
+}
+
+// settleDockerInternalDNS re-runs the SSRF/routability check (isSafeURL) up
+// to dockerDNSSettleAttempts times, sleeping dockerDNSSettleDelay between
+// attempts, but ONLY while the failure remains a DNS-resolution error. The
+// first time isSafeURL returns nil the URL is accepted; the first time it
+// returns a NON-DNS error (an actual routability rejection) that rejection
+// is returned immediately. It therefore never broadens what counts as
+// routable — it only waits for the container name to resolve. Returns nil
+// on success or the last error on timeout.
+func settleDockerInternalDNS(agentURL string) error {
+	var err error
+	for i := 0; i < dockerDNSSettleAttempts; i++ {
+		time.Sleep(dockerDNSSettleDelay)
+		err = isSafeURL(agentURL)
+		if err == nil {
+			return nil
+		}
+		if !isDNSResolutionError(err) {
+			return err // real routability rejection — fail closed, do not retry
+		}
+	}
+	return err
 }
 
 // normalizeA2APayload parses the incoming body, wraps it in a JSON-RPC 2.0
@@ -1470,8 +1525,32 @@ func normalizeA2APayload(body []byte) ([]byte, string, *proxyA2AError) {
 // across process restarts — exactly the property runtime session resumption
 // needs. The workspace id is a UUID (dash-delimited, no colons), so the
 // resulting id survives any runtime session-id sanitisation unchanged.
+//
+// Delegates to sessionid.DefaultContextID — the platform-side authority for this
+// convention. It governs the id stamped as message.contextId on canvas /
+// restart-context / first-boot turns (those genuinely run in the user's
+// session). Runtime-internal self-wakes keep their OWN routing context_id and
+// converge only their Langfuse session_id runtime-side (tracing.TracingExecutor),
+// mirroring this same "canvas-<ws>" literal — there is deliberately NO
+// cross-container env handshake (an earlier MOLECULE_DEFAULT_SESSION_CONTEXT_ID
+// injection was removed; it let the runtime's id diverge from this one). Keep
+// the runtime's tracing literal in sync with sessionid if this ever moves.
 func canvasSessionContextID(workspaceID string) string {
-	return "canvas-" + workspaceID
+	return sessionid.DefaultContextID(workspaceID)
+}
+
+// platformTurnContextID is the contextId platform-originated turns (first-boot
+// greeting, restart-context wake) stamp on their synthetic messages: the SAME
+// deterministic default session the canvas uses and the server belt fills —
+// so boots and restarts land in the user's conversation instead of a fresh
+// runtime-minted session (Langfuse 3-session fragmentation, 2026-07-21).
+// KNOWN TRADEOFF: after an explicit "New session" rotation (a client-local
+// sess-* id the server cannot see), platform turns still land in the DEFAULT
+// session. That is deliberate — system notices belong to the workspace's
+// default thread, and chat-history hydration is activity-log based so nothing
+// is lost; the alternative (runtime-minted UUID per boot) fragments tracing.
+func platformTurnContextID(workspaceID string) string {
+	return canvasSessionContextID(workspaceID)
 }
 
 // ensureCanvasSessionContextID injects a stable, deterministic contextId into a
@@ -1631,7 +1710,8 @@ func (h *WorkspaceHandler) dispatchA2A(ctx context.Context, workspaceID, agentUR
 		b = concrete
 	}
 	// Per-workspace idle-timeout override (capability primitive #2 —
-	// see workspace/adapter_base.py:idle_timeout_override). The
+	// see molecule-ai-workspace-runtime/molecule_runtime/adapter_base.py:
+	// idle_timeout_override). The
 	// adapter declares a longer/shorter window than the platform
 	// default in its heartbeat; the heartbeat handler stashes it in
 	// runtimeOverrides; we honor it here. Falls through to the global

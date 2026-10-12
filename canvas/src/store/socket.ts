@@ -7,6 +7,25 @@ import { FALLBACK_POLL_MS } from "./socket-constants";
 // Otherwise derive base + append /ws.
 export const WS_URL = process.env.NEXT_PUBLIC_WS_URL || (deriveWsBaseUrl() + "/ws");
 
+const WS_AUTH_PROTOCOL_PREFIX = "molecule-auth.";
+const WS_PROTOCOL_SENTINEL = "molecule-ws";
+
+/** Browsers cannot set Authorization on a WebSocket handshake. When local dev
+ * or an ephemeral E2E build supplies the optional Canvas admin bearer, carry
+ * it as hex in Sec-WebSocket-Protocol instead of a URL query parameter, where
+ * reverse proxies and access logs commonly record it. Production SaaS uses
+ * its verified session and leaves this public build value empty. The
+ * non-secret sentinel lets the server complete browser subprotocol
+ * negotiation without echoing the credential-bearing protocol. */
+function websocketAuthProtocols(): string[] | undefined {
+  const token = process.env.NEXT_PUBLIC_ADMIN_TOKEN;
+  if (!token) return undefined;
+  const encoded = Array.from(new TextEncoder().encode(token), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  return [`${WS_AUTH_PROTOCOL_PREFIX}${encoded}`, WS_PROTOCOL_SENTINEL];
+}
+
 export interface WSMessage {
   event: string;
   workspace_id: string;
@@ -117,7 +136,10 @@ class ReconnectingSocket {
     // Idempotent — startFallbackPoll early-returns if a timer is
     // already running, so calling it from both places is cheap.
     this.startFallbackPoll();
-    const ws = new WebSocket(this.url);
+    const protocols = websocketAuthProtocols();
+    const ws = protocols
+      ? new WebSocket(this.url, protocols)
+      : new WebSocket(this.url);
     this.ws = ws;
     this.startConnectTimeout(ws);
 
@@ -373,6 +395,18 @@ export interface WorkspaceData {
   budget_limit: number | null;
   /** Cumulative USD spend for this workspace. Present when the platform tracks spend. */
   budget_used?: number | null;
+  /** "Enter OS" boot-telemetry replay (server events/boottrace.go): the
+   *  BOOT_STEP history observed so far, attached only while status is
+   *  `provisioning`. Lets hydrate restore the boot screen (keycaps +
+   *  watchdog log) after a reload/reconnect instead of resetting it to
+   *  "waiting for boot telemetry". Absent on older platform builds. */
+  boot_steps?: import("./boot-telemetry").BootStepWire[];
+  /** Boot-generation marker paired with boot_steps (events/boottrace.go):
+   *  identifies WHICH boot the replay belongs to, so the client can merge a
+   *  same-generation replay with live-streamed state but reset on a new
+   *  generation. Absent when the server holds no trace entry (instance
+   *  restarted mid-boot) — the client keeps its local state then. */
+  boot_generation?: string;
   /** Server-declared provisioning-timeout override in milliseconds (#2054).
    *  Sourced from the workspace's template manifest at provision time —
    *  lets a slow runtime declare its cold-boot expectation without a
@@ -393,6 +427,14 @@ export interface WorkspaceData {
    *  collapsing the spinner the moment the synchronous queued-200 returns
    *  (task #227 — external/MCP workspaces had no progress UX). */
   delivery_mode?: string;
+  /** Greeting-first UI readiness (decoupled from serving status): true once the
+   *  agent's first-boot greeting has landed in chat (server evaluates the same
+   *  a2a_receive / source_id IS NULL predicate the greeter's greet-once gate
+   *  uses). Lets the canvas render "warming / composing greeting" for an online
+   *  workspace that has not spoken yet, and settle it to "ready" on reload
+   *  without flashing warming. Absent on older ws-server builds → treated as
+   *  greeted (no warming). */
+  greeted?: boolean;
   compute?: WorkspaceCompute;
 }
 
@@ -410,9 +452,11 @@ export interface WorkspaceCompute {
   // internal#734: per-workspace durable-data choice. "persist" | "ephemeral" |
   // undefined (auto). Controls whether the data volume survives recreate.
   data_persistence?: string;
-  // Cloud/compute backend for this workspace box (multi-provider, per-workspace):
-  // "aws" (default EC2) | "gcp" | "hetzner". Distinct from the LLM/model provider.
-  // Set at create time; routed by CP to the matching WorkspaceProvisioner. A
+  // Cloud/compute backend for this workspace box (multi-provider, per-workspace).
+  // Recognized values currently include "aws", "gcp", and "hetzner"; the
+  // deployment's control-plane configuration selects the default. This is
+  // distinct from the LLM/model provider. Set at create time and routed by CP
+  // to the matching WorkspaceProvisioner. A
   // workspace whose provider differs from its tenant's cloud is reached over a
   // per-workspace Cloudflare tunnel (runtime#95).
   provider?: string;

@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Full-lifecycle SaaS E2E against staging.
 #
-# Creates a fresh org per run (unique slug), waits for tenant EC2 +
-# cloudflared provisioning, exercises every major workspace-level API
+# Creates a fresh org per run (unique slug), waits for tenant provisioning,
+# exercises every major workspace-level API
 # (register, heartbeat, A2A, delegation, HMA memory, activity, peers),
-# then tears the whole org down and asserts that every cloud artefact
-# (EC2, SG, Cloudflare tunnel, DNS record, DB rows) is gone. A leaked
-# resource at teardown is a CI failure.
+# then tears the whole org down through the synchronous control-plane purge,
+# validates its exact audit receipt, and proves the exact org is absent. The
+# generic runner does not directly enumerate provider resources; current staging
+# uses the molecules-server/local-Docker backend.
 #
 # Auth model:
-#   Single MOLECULE_ADMIN_TOKEN (= CP_ADMIN_API_TOKEN on Railway staging)
+#   Single MOLECULE_ADMIN_TOKEN (= staging CP_ADMIN_API_TOKEN from Infisical)
 #   drives everything:
 #     - POST /cp/admin/orgs to provision (no WorkOS session scraping)
 #     - GET  /cp/admin/orgs/:slug/admin-token to retrieve the per-tenant
@@ -20,18 +21,18 @@
 #
 # Required env:
 #   MOLECULE_CP_URL        default: https://staging-api.moleculesai.app
-#   MOLECULE_ADMIN_TOKEN   CP admin bearer — Railway CP_ADMIN_API_TOKEN
+#   MOLECULE_ADMIN_TOKEN   staging CP admin bearer from Infisical
 #
 # Optional env:
 #   E2E_RUNTIME                  hermes (default) | claude-code | codex | openclaw
 #                                | seo-agent
-#                                  - seo-agent: a claude-code-adapter template
-#                                    VARIANT (not a distinct registry runtime).
-#                                    Selected via the `template` field (config.yaml
-#                                    resolves runtime=claude-code); reuses the
-#                                    same MiniMax/claude-code key path. See the
-#                                    TEMPLATE derivation + SECRETS_JSON block.
-#   E2E_PROVISION_TIMEOUT_SECS   default 900 (15 min cold EC2 budget)
+#                                  - seo-agent: a hermes template VARIANT (not a
+#                                    distinct registry runtime). Selected via the
+#                                    `template` field (config.yaml resolves
+#                                    runtime=hermes); platform-proxy MiniMax only,
+#                                    and HERMES_CRON_APPROVAL_MODE is seeded. See
+#                                    the TEMPLATE derivation + SECRETS_JSON block.
+#   E2E_PROVISION_TIMEOUT_SECS   default 900 (15 min cold-provision budget)
 #   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS  default 3600 (60 min — hermes
 #                                cold-boot worst-case + slack). Raised from
 #                                1800 (#1646) because flaky tenant-provisioning
@@ -44,18 +45,9 @@
 #                                 mapped to `smoke` for back-compat with
 #                                 any in-flight runner picking up an older
 #                                 workflow checkout)
-#   E2E_AWS_LEAK_CHECK           auto (default) | required | off
-#                                required in CI so teardown cannot report
-#                                clean while slug-tagged EC2 remains alive.
-#                                Backend classification (see is_ec2_backend):
-#                                ONLY an explicit 'off' is treated as the
-#                                non-EC2 (local-docker) backend and earns the
-#                                EIC hard-check skips. 'required', the default
-#                                'auto', and an unset value all fail SAFE to
-#                                the EC2 backend so the EIC hard checks stay on
-#                                — never silently dropped on a real EC2 run.
-#   E2E_AWS_TERMINATE_LEAKS      1 → terminate slug-tagged leaked EC2 before
-#                                exiting 4
+#   E2E_INFRA_BACKEND            required: local-docker (only active staging
+#                                backend). Any other or unset value fails before
+#                                an admin bearer is sent.
 #   E2E_INTENTIONAL_FAILURE      1 → poison tenant token mid-run so the
 #                                script fails; the EXIT trap MUST still
 #                                tear down cleanly (and exit 4 on leak).
@@ -82,43 +74,87 @@
 #                                swallows the lifecycle) exits 5 rather than
 #                                reporting a false green. Mirrors CP
 #                                serving-e2e's SERVING_E2E_REQUIRE_LIVE.
+#   E2E_IDLE_DIGEST_TIMEOUT_SECS default 360. When the ephemeral lane enables
+#                                the idle-digest assertion, poll durable fire
+#                                evidence for this long. This must cover both
+#                                the idle threshold and the runtime's real A2A/
+#                                LLM completion latency; it is not a cadence.
+#   E2E_SCHEDULER_TIMEOUT_SECS   the scheduler BACKSTOP for 10d.4 fire, 10g fire
+#                                and 10g DELIVER, default 3x the delivery
+#                                watchdog below. It is a never-hit safety net,
+#                                NOT the thing that decides a broken scheduler:
+#                                the wait passes the instant fire evidence
+#                                appears and fails FAST when the daemon's
+#                                last_tick goes stale. It must stay STRICTLY
+#                                LARGER than the watchdog, or the wait expires
+#                                while a wedged fire is still being re-queued for
+#                                retry. That is ENFORCED, not advisory: a value
+#                                at or below the watchdog is REFUSED at the call
+#                                site (trigger_daemon_backstop_resolve rc=3) and
+#                                hard-fails the run. Per-leg overrides
+#                                E2E_SCHEDULE_DELIVER_FIRE_TIMEOUT_SECS and
+#                                E2E_SCHEDULE_DELIVER_TIMEOUT_SECS take
+#                                precedence for 10g and are held to the same bar.
+#   E2E_DELEG_A2A_TIMEOUT_SECS   per-attempt curl budget for the DELEGATION
+#                                A2A POST (section 10), default 90 — matching
+#                                a2a_send_or_poll_queue's budget for the PARENT
+#                                leg. `message/send` is SYNCHRONOUS, so that
+#                                POST waits out a full cold agent turn on a
+#                                just-created child workspace. It overrides
+#                                CURL_COMMON's generic --max-time 30, which is
+#                                not enough: cold-call latency routinely exceeds
+#                                30s on the first request after workspace boot,
+#                                and inheriting it took the REQUIRED ephemeral
+#                                lane red twice on 2026-07-30 with
+#                                curl_rc=28 / http=000.
+#   E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS
+#                                default 600, floored at 60. The delivery
+#                                ABSOLUTE CANCEL BOUND. This is not a value
+#                                mirrored from the daemon: scheduler v0.2.2
+#                                retired MOLECULE_TRIGGER_DELIVERY_WATCHDOG
+#                                _SECONDS and there is nothing by that name to
+#                                retune, so the harness CONFIGURES the bound
+#                                instead. Step 10's provision injects this same
+#                                number onto the workspace as BOTH
+#                                MOLECULE_TRIGGER_DELIVERY_ABSOLUTE_CAP_SECONDS
+#                                (the daemon's ceiling) and
+#                                MOLECULE_MAX_TURN_SECONDS (the runtime's
+#                                per-turn cap, which the daemon PREFERS over its
+#                                own ceiling whenever the turn-lease snapshot
+#                                reports one — so setting only the first leaves
+#                                the ordinary branch at its 3600s default). The
+#                                backstops above are then derived as 3x it and
+#                                strictly exceed the bound the daemon actually
+#                                enforces. Raise it if a real delivery ever
+#                                needs longer than 600s; both the injected caps
+#                                and the derived backstops follow.
 #
 # Exit codes:
 #   0  happy path
 #   1  generic failure
 #   2  missing required env
 #   3  provisioning timed out
-#   4  teardown left orphan resources
+#   4  teardown receipt/audit/org-absence proof failed
 #   5  E2E_REQUIRE_LIVE set but the run validated no real lifecycle (no
 #      false-green-on-skip)
 #
 # ─────────────────────────────────────────────────────────────────────────
-# PROMOTION-READINESS (harden/e2e-staging-saas-failclosed):
-#   This harness is being hardened so `E2E Staging SaaS` + `E2E Staging
-#   Platform Boot` can become HARD merge-gates. continue-on-error is NOT
-#   flipped here — that promotion is the CTO's irreversible branch-protection
-#   call. What this branch makes fail-closed (was false-green / un-named
-#   flake before):
-#     • Provision/online waits are bounded readiness-POLLS, not fixed sleeps;
-#       each hard-fails with a named mechanism + last-seen signal on deadline,
-#       never a silent timeout (cp#245 boot-timeout class).
-#     • Peer-discovery (9b) asserts a real 2xx, not just "not 404" — a 5xx /
-#       000 / empty no longer reads as "reachable".
-#     • Activity-log (9b) is ASSERTED reachable (2xx + parseable), not
-#       logged-and-ignored behind `|| echo '[]'`.
-#     • Child activity provenance (10) is asserted (was soft-logged).
-#     • E2E_REQUIRE_LIVE=1 (CI) makes the run exit 5 if it reached the end
-#       without proving a real provision→online→A2A round-trip — no
-#       false-green-on-skip.
-#   STILL BLOCKS making it REQUIRED (must clear before the CTO flips
-#   continue-on-error→false in .gitea/workflows/e2e-staging-saas.yml):
-#     • De-flake window: N consecutive green runs on main for BOTH jobs
-#       (platform-boot shares the cp#245 boot surface — #2187 tracks its
-#       flip). This harness removes the harness-side flake mechanisms; the
-#       remaining surface is real-infra (EC2 cold boot, CF DNS) latency,
-#       already bounded by the readiness polls above.
-#     • Branch-protection required-context wiring is a repo-settings change,
-#       not a code change in this PR.
+# CURRENT EXECUTION / ENFORCEMENT:
+#   • e2e-staging-saas.yml runs this harness live on protected main pushes and
+#     workflow dispatches; pull requests run a credential-free syntax arm.
+#   • The shared-staging contexts are parked below required-contexts.txt's
+#     pending marker, so they are not presence-required by the merge queue. An
+#     emitted red can still block through main's branch-protection wildcard.
+#   • Staging-CD and production redeploy have independent triggers and their
+#     own gate chains; this harness is post-merge/on-demand evidence, not an
+#     ordering dependency for either deployment path.
+#   • The current backend is molecules-server/local Docker. Teardown evidence is
+#     the exact synchronous CP purge receipt plus exact-org absence; direct
+#     provider enumeration is explicitly outside this generic runner.
+#
+# Fail-closed properties retained here: bounded readiness polls, asserted peers
+# and activity, child provenance, and E2E_REQUIRE_LIVE=1 requiring a real
+# provision→online→A2A lifecycle before a live run can report green.
 # ─────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -126,7 +162,7 @@ set -euo pipefail
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 # #48: tolerate an absent admin token here — the PR-mode early-exit below
 # (E2E_REQUIRE_LIVE=0 + no token) handles the pull_request lane cleanly. On a
-# real run (push/dispatch/cron, E2E_REQUIRE_LIVE=1) the missing-token case is
+# real run (push/dispatch, E2E_REQUIRE_LIVE=1) the missing-token case is
 # caught as a HARD FAIL just past the PR-mode block, with a clear message.
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:-}"
 RUNTIME="${E2E_RUNTIME:-hermes}"
@@ -160,10 +196,162 @@ esac
 # shellcheck source=lib/collision-proof-slug.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/collision-proof-slug.sh"
+# shellcheck source=lib/idle_digest_wait.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib/idle_digest_wait.sh"
+# Signal-driven waits for the kind:trigger scheduler daemon (fire evidence vs a
+# wedged tick loop vs a live-but-not-yet-fired daemon). Unit-tested offline by
+# lib/test_trigger_daemon_wait_unit.sh.
+# shellcheck source=lib/trigger_daemon_wait.sh
+source "$(dirname "$0")/lib/trigger_daemon_wait.sh"
+# shellcheck source=lib/self_schedule_create_retry.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib/self_schedule_create_retry.sh"
 
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
+
+# ─── the ONE place a scheduler backstop is produced ──────────────────────────
+#
+# Every trigger-daemon wait in this harness (10d fire, 10g fire, 10g DELIVER)
+# gets its never-hit backstop from here, so the watchdog number is typed ONCE
+# and every operator override passes the same `> watchdog` refusal in
+# lib/trigger_daemon_wait.sh (rc=3). Call sites pair it with `|| fail` — the
+# `fail` MUST stay in the caller, because a `fail` inside the `$( )` would only
+# `exit` the substitution subshell and hand the parent an empty backstop.
+#
+# Three sites used to spell the derivation out longhand, which is how the third
+# one drifted: 10g's DELIVER backstop was a bare `210` against the 600s watchdog
+# it was supposed to outlast, so a fire still inside the daemon's own budget was
+# reported as a delivery failure.
+#
+# The delivery cancel bound this run CONFIGURES, resolved ONCE through the lib so
+# the default AND the 60s floor apply at every reader. Re-expanding the raw
+# `${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-600}` at each site was a second copy
+# of the number: after the floor landed it would have quoted a declared `1` back
+# at an operator whose effective bound is 60, and injected a different value into
+# the workspace than the one the backstop was derived from.
+#
+# The lib's derivations now read the DAEMON's tick cadence too, so the operator
+# knob that sets it (E2E_TRIGGER_POLL_SECONDS, injected as
+# MOLECULE_TRIGGER_POLL_SECONDS) has to reach the lib at EVERY reader as well.
+# Every wrapper below therefore routes BOTH knobs, so no reader can compute
+# against a different daemon than the one provisioned. Before this, the
+# tick-wedge threshold was derived from E2E_SCHEDULER_POLL_SECS — the harness's
+# OWN observation poll, a completely different knob that merely shared the same
+# default of 10.
+e2e_trigger_delivery_cap_secs() {
+  TRIGGER_DAEMON_WATCHDOG_SECS="${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-}" \
+  TRIGGER_DAEMON_TICK_INTERVAL_SECS="${E2E_TRIGGER_POLL_SECONDS:-10}" \
+    trigger_daemon_watchdog_secs
+}
+
+# The DELIVERY-LANE STALL window — how long the daemon's durable attempt log may
+# stay frozen before the lane is called wedged. Reset by every advancement, so it
+# is not a budget for the work; see lib/trigger_daemon_wait.sh.
+#   $1 = observation poll secs
+e2e_scheduler_stall_secs() {
+  TRIGGER_DAEMON_WATCHDOG_SECS="${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-}" \
+  TRIGGER_DAEMON_TICK_INTERVAL_SECS="${E2E_TRIGGER_POLL_SECONDS:-10}" \
+    trigger_daemon_progress_stall_secs "${1:-10}"
+}
+
+# The TICK-WEDGE threshold. Takes the OBSERVATION poll (it floors the result),
+# but the load-bearing term is the daemon's tick cadence, routed above.
+#   $1 = observation poll secs
+e2e_scheduler_stale_secs() {
+  TRIGGER_DAEMON_TICK_INTERVAL_SECS="${E2E_TRIGGER_POLL_SECONDS:-10}" \
+    trigger_daemon_stale_secs "${1:-10}"
+}
+
+#   $1 = operator override ("" to derive)
+e2e_scheduler_backstop_secs() {
+  TRIGGER_DAEMON_WATCHDOG_SECS="$(e2e_trigger_delivery_cap_secs)" \
+    trigger_daemon_backstop_resolve "${1:-}"
+}
+
+# ─── the anti-vacuous-pass report for the delivery-stall detector ────────────
+#
+# A wait in which the stall detector NEVER ARMED — the attempt log was
+# unreadable every single poll, so no window was ever evaluated — returns the
+# same rc and prints the same "OK" as one in which it armed and correctly stayed
+# quiet. Indistinguishable, and the unarmed version is worth nothing. So every
+# trigger wait reports the counts, and the reader can tell the two apart.
+#
+# $1 = leg name. Prints one line; never fails the run on its own — an unarmed
+# detector is a WEAKER run, not a broken product, and reporting it as a red
+# would make a slow container-exec into a product regression.
+# THREE outcomes, not two. The first version printed one "NEVER ARMED — carries
+# NO evidence" line for both `samples == 0` cases, which fired TWICE on every
+# green run and was FALSE on one of them: a leg that returns on its probe in
+# ~59ms did not fail to find evidence, it found evidence before the detector
+# needed to look. Saying the same thing about that and about a leg that polled
+# for 64s and read nothing trains the reader to skip the line entirely — losing
+# exactly the case it exists to surface.
+#
+# THE COUNTERS ARE NORMALISED BEFORE THEY ARE COMPARED. They are `export`ed, so
+# they are reachable from the environment, and a bare `[ "$x" -gt 0 ]` on a
+# non-numeric value does not return false — it ERRORS, and the `if` reads that
+# as false. Here the only consequence is a wrong LABEL (both tests error, so a
+# fast pass would be announced as BLIND, printing "polled abc time(s)"); it
+# cannot fail a run. It is also not reachable today: trigger_daemon_wait resets
+# both to 0 on entry, before any `return`.
+#
+# Fixed anyway, because it is the identical shape to the count-guard bypass, in
+# code added by the same change, and "not reachable today" is precisely how that
+# one started. Two lines of `case` is cheaper than the next person rediscovering
+# the pattern from a confusing log line.
+# AN UNPARSEABLE COUNTER READS AS ITS OWN STATE, NOT AS THE REASSURING ONE. The
+# first version normalised garbage to 0, which lands on NOT POLLED — "not a gap,
+# the evidence arrived faster than the detector needed to look". That is the most
+# comforting of the three labels, and it would be asserted about a run where the
+# instrumentation is corrupt and we know nothing at all. Degrading to the benign
+# reading is the same error as a guard reporting success on zero rows.
+#
+# Empty is NOT garbage: `${…:-0}` maps unset/empty to 0, which is the true
+# starting value of both counters, so an empty counter legitimately reads as
+# NOT POLLED. Only a value that is present and unusable (`abc`, `-1`, `3x`)
+# trips the fourth state.
+scheduler_progress_report() {
+  # ONE normalisation point, and every branch reachable. The first version paired
+  # `${…:-0}` with a `case` whose pattern still listed `''` — but `:-` had already
+  # turned empty into `0`, so that arm could never match. An unreachable branch is
+  # the exact shape this change set has spent its whole life deleting, so it is
+  # not left in as belt-and-braces: the `-` default passes empty THROUGH and the
+  # `case` decides, which keeps the two outcomes explicit and both arms live.
+  #   ''        -> 0, the counters' true starting value  -> NOT POLLED
+  #   non-digit -> corrupt                               -> COUNTERS UNREADABLE
+  local _samples="${TRIGGER_DAEMON_PROGRESS_SAMPLES-}" _reads="${TRIGGER_DAEMON_PROGRESS_READS-}" _bad=""
+  case "$_samples" in
+    '') _samples=0 ;;
+    *[!0-9]*) _bad="samples='$_samples'"; _samples=0 ;;
+  esac
+  case "$_reads" in
+    '') _reads=0 ;;
+    *[!0-9]*) _bad="${_bad:+$_bad }reads='$_reads'"; _reads=0 ;;
+  esac
+  if [ -n "$_bad" ]; then
+    log "    [$1] delivery-stall detector COUNTERS UNREADABLE ($_bad) — the instrumentation itself is corrupt, so this leg carries no evidence in EITHER direction. Not the benign 'returned before the first read' case: that one is a real observation, this is the absence of one."
+  elif [ "$_samples" -gt 0 ]; then
+    log "    [$1] delivery-stall detector ARMED: ${_samples}/${_reads} attempt-log reads readable, ${TRIGGER_DAEMON_PROGRESS_TRANSITIONS} observed advancement(s), ${TRIGGER_DAEMON_PROGRESS_AGE:-0}s since the last one."
+  elif [ "$_reads" -eq 0 ]; then
+    log "    [$1] delivery-stall detector NOT POLLED — the wait returned on its probe before the first read. Not a gap: the evidence arrived faster than the detector needed to look."
+  else
+    log "    [$1] delivery-stall detector BLIND: polled ${_reads} time(s) and read the attempt log 0 times. THIS leg's result carries no evidence about the delivery lane — only tick-liveness was in play. Expected before a workspace's first-ever attempt (no schedule-history.json yet); anything else means the log is unreadable and the wedged-delivery signal is dark."
+  fi
+}
+
+# The refusal message, built once — $1 = knob name, $2 = the rejected value.
+scheduler_backstop_refusal() {
+  printf '%s' "Scheduler: $1='$2' is not a usable backstop. It must be a positive integer STRICTLY GREATER than the delivery ABSOLUTE CANCEL BOUND this run configures on the workspace ($(e2e_trigger_delivery_cap_secs)s, injected at provision as MOLECULE_TRIGGER_DELIVERY_ABSOLUTE_CAP_SECONDS + MOLECULE_MAX_TURN_SECONDS). To move it, set E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS (floor 60) — that moves the injected caps AND these backstops together. Do NOT go looking for a daemon-side MOLECULE_TRIGGER_DELIVERY_WATCHDOG_SECONDS to retune: scheduler v0.2.2 retired it and v0.2.3's watchdog is activity-aware, so this bound is one the harness SETS, not one it mirrors. The backstop is a never-hit safety net, never a budget: at or below the cancel bound it expires while a wedged fire is still being re-queued for its retry, so the wait can never observe the recovery and reports 'the daemon is still inside its own budget' as a red — the 360s-vs-600s inversion lib/trigger_daemon_wait.sh exists to prevent. Raise it, or unset it to take the derived 3x default."
+}
+
+# Defined before the first HTTP diagnostic (org creation below). Bash executes
+# top to bottom and does not make a later function definition available early.
+sanitize_http_body() {
+  python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/redact_secrets.py" --max-chars 4000 || printf '%s' '<redaction failed>'
+}
 
 # Collision-proof slug construction (core#2782) — runs AFTER log/fail/ok
 # are defined so the assert below can call `fail` on mismatch.
@@ -207,34 +395,73 @@ live_milestone() {
 require_live_or_die() {
   # No-op unless CI demanded a live run.
   [ "$REQUIRE_LIVE" = "1" ] || return 0
-  local required="provisioned tenant_online workspace_online a2a_roundtrip"
+
+  # ── Canonical DECLARED happy-path milestone set (the SSOT) ──────────────────
+  # This MUST equal molcontracts.HappyPathMilestones (9 ids, RFC #4428 Phase 2).
+  # The core-side derive-gate (workspace-server/internal/e2emilestones,
+  # TestHappyPathMilestonesMatchRunner) greps THIS line with the regex
+  # requiredMilestonesRE and set-compares it (both directions) to the vendored
+  # binding. Keep it a single-line quoted assignment, and when the SDK milestone
+  # set changes, change the id list here — the gate will red otherwise.
+  local required="provisioned tenant_online workspace_online a2a_roundtrip memory_online delegation_provenance cascade_guard lifecycle_pause_resume lifecycle_hibernate_wake"
+
+  # ── Mode-aware ENFORCEMENT partition ────────────────────────────────────────
+  # The DECLARED set is always all 9 (SSOT). But a milestone is only *required to
+  # have fired* when the stage that proves it was supposed to run THIS mode.
+  # Blindly enforcing all 9 would false-red smoke mode / E2E_LIFECYCLE=off, where
+  # those stages legitimately never execute (see the mode gates at the memory,
+  # delegation, and 10b lifecycle stages). This is the runner-side complement of
+  # the derive-gate: the gate locks WHICH ids are declared; this locks WHICH of
+  # them this mode must actually reach.
+  #   always              : provisioned tenant_online workspace_online a2a_roundtrip
+  #   MODE=full           : + memory_online (step 9)  + delegation_provenance (step 10)
+  #   full & lifecycle!=off: + cascade_guard + lifecycle_pause_resume + lifecycle_hibernate_wake (step 10b)
+  local enforced="provisioned tenant_online workspace_online a2a_roundtrip"
+  if [ "$MODE" = "full" ]; then
+    enforced="$enforced memory_online delegation_provenance"
+    if [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
+      enforced="$enforced cascade_guard lifecycle_pause_resume lifecycle_hibernate_wake"
+    fi
+  fi
+
+  # Drift self-check: every enforced id MUST be a member of the declared set, so
+  # enforcement can never check an id the SSOT doesn't declare (a typo would
+  # otherwise silently never be verified). Fail loud on divergence.
+  local e r found
+  for e in $enforced; do
+    found=0
+    for r in $required; do [ "$e" = "$r" ] && { found=1; break; }; done
+    [ "$found" = "1" ] || fail "require_live_or_die bug: enforced milestone '$e' is not in the declared required set — enforcement/SSOT drift. declared='$required' enforced='$enforced'"
+  done
+
   local m missing=""
-  for m in $required; do
+  for m in $enforced; do
     case " $LIVE_MILESTONES " in
       *" $m "*) ;;
       *) missing="$missing $m" ;;
     esac
   done
   if [ -n "$missing" ]; then
-    echo "[$(date +%H:%M:%S)] ❌ E2E_REQUIRE_LIVE=1 but the run did NOT prove a full live lifecycle — missing milestone(s):${missing}. Reached:${LIVE_MILESTONES:-<none>}. This is a false-green-on-skip guard: a run that validates no real provision→online→A2A cycle MUST NOT report green." >&2
+    echo "[$(date +%H:%M:%S)] ❌ E2E_REQUIRE_LIVE=1 but the run did NOT prove the milestones required for MODE=$MODE E2E_LIFECYCLE=${E2E_LIFECYCLE:-auto} — missing milestone(s):${missing}. Reached:${LIVE_MILESTONES:-<none>}. This is a false-green-on-skip guard: a run that skipped a stage it SHOULD have run MUST NOT report green." >&2
     exit 5
   fi
 }
 
 # ─── PR-mode early-exit (#48 — mirrors test_staging_concierge_creates_workspace_e2e.sh) ──
-# This harness is invoked by TWO jobs in e2e-staging-saas.yml:
-#   - e2e-staging-saas         (push/dispatch/cron only; always has creds + REQUIRE_LIVE=1)
-#   - e2e-staging-platform-boot (now ALSO pull_request; #48 made it merge-blocking)
+# This harness is invoked by two jobs in e2e-staging-saas.yml. Both emit a
+# credential-free pull-request status and run live on push/dispatch with
+# E2E_REQUIRE_LIVE=1. Their contexts are not presence-required while parked;
+# an emitted red still blocks through main's branch-protection wildcard.
 # E2E_REQUIRE_LIVE=0 on pull_request runs because PRs do not have staging creds
 # wired; without this block the script would hard-fail at the first admin-auth
 # call and red-X every PR (a false-red, not a real regression). The PR-mode gate
 # is a self-check: bash -n on the script's own syntax (catches PR-merge
-# regressions that would break the real run on push-to-main). On push / dispatch
-# / cron, E2E_REQUIRE_LIVE=1 and the real staging boot runs and HARD FAILs
+# regressions that would break the real run on push-to-main). On push / dispatch,
+# E2E_REQUIRE_LIVE=1 and the real staging boot runs and HARD FAILs
 # (exit 5 via require_live_or_die) on a run that validated no live lifecycle.
 if [ "${REQUIRE_LIVE}" = "0" ] && [ -z "${ADMIN_TOKEN}" ]; then
   log "PR-mode: E2E_REQUIRE_LIVE=0 and no MOLECULE_ADMIN_TOKEN — skipping live staging boot."
-  log "(the real staging boot runs on push-to-main / dispatch / cron with E2E_REQUIRE_LIVE=1)"
+  log "(the real staging boot runs on push-to-main / dispatch with E2E_REQUIRE_LIVE=1)"
   if ! bash -n "$0"; then
     fail "PR-mode self-check FAILED: bash -n on $0 returned non-zero — script has a syntax error"
   fi
@@ -244,7 +471,7 @@ fi
 # Beyond here we are running for real: REQUIRE_LIVE=1 OR ADMIN_TOKEN is set.
 # A real run with no admin token is a HARD FAIL (was the `:?` default before #48).
 if [ -z "${ADMIN_TOKEN}" ]; then
-  fail "MOLECULE_ADMIN_TOKEN required (Railway staging CP_ADMIN_API_TOKEN) — a non-PR run (E2E_REQUIRE_LIVE=${REQUIRE_LIVE}) needs staging creds"
+  fail "MOLECULE_ADMIN_TOKEN required (staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin) — a non-PR run (E2E_REQUIRE_LIVE=${REQUIRE_LIVE}) needs staging creds"
 fi
 
 # Per-runtime model slug dispatch — see lib/model_slug.sh for the rationale.
@@ -257,14 +484,21 @@ source "$(dirname "$0")/lib/model_slug.sh"
 # shellcheck source=lib/workspace_env_presence.sh
 source "$(dirname "$0")/lib/workspace_env_presence.sh"
 # shellcheck disable=SC1091
-# shellcheck source=lib/aws_leak_check.sh
-source "$(dirname "$0")/lib/aws_leak_check.sh"
+# shellcheck source=lib/cp_purge_receipt.sh
+source "$(dirname "$0")/lib/cp_purge_receipt.sh"
+# shellcheck source=lib/workspace_create_retry.sh
+source "$(dirname "$0")/lib/workspace_create_retry.sh"
+e2e_cp_require_local_backend || exit 2
+e2e_cp_require_staging_origin "$CP_URL" || exit 2
 # shellcheck disable=SC1091
 # shellcheck source=lib/completion_assert.sh
 # molecule-core#1995 (#1994 follow-on): real-completion + per-provider
 # liveness + byok-routing assertion helpers. Adds gates that FAIL on an
 # error-as-text payload (the trap the shape-only A2A checks missed).
 source "$(dirname "$0")/lib/completion_assert.sh"
+# shellcheck disable=SC1091
+# shellcheck source=lib/http_status_capture.sh
+source "$(dirname "$0")/lib/http_status_capture.sh"
 
 CURL_COMMON=(-sS --fail-with-body --max-time 30)
 E2E_TMP_FILES=()
@@ -302,44 +536,11 @@ e2e_tmp() {
   printf '%s' "$f"
 }
 
-# ─── EC2/EIC-backend gate (provider signal) ─────────────────────────────
-# Some sub-steps probe the EC2/EIC (SSH-via-EC2-Instance-Connect) chain,
-# which has NO analog on the molecules-server (local-docker, provider=local)
-# backend. On local-docker those probes hard-fail for backend-shape reasons,
-# not real regressions:
-#   - 7b terminal-diagnose: the CP local-docker provisioner persists the
-#     CONTAINER NAME into instance_id (non-empty, not i-prefixed), so the
-#     workspace-server diagnose handler mis-routes a local-docker WS down
-#     diagnoseRemote (EIC + ssh) instead of diagnoseLocal → ok=false.
-#   - 7c Files API PUT config.yaml: the EIC write path only applies to
-#     i-prefixed instance ids; on local-docker it shape-routes to docker
-#     CopyToContainer and should pass, but its EIC assertions are moot.
-#
-# Canonical discriminator: E2E_AWS_LEAK_CHECK. The workflow sets it to
-# 'required' iff a real EC2 backend is enabled (vars.E2E_EC2_ENABLED=='1')
-# and 'off' on molecules-server. This is the same one-line knob the
-# workflow already advertises — zero new plumbing. When available, a
-# per-workspace signal (the diagnose JSON's own `remote` boolean, which
-# reflects diagnoseLocal vs diagnoseRemote) is preferred at the call site.
-#
-# FAIL-SAFE semantics (fixes a coverage hole): ONLY an explicit 'off'
-# classifies the run as non-EC2 (and thus eligible to SKIP the EIC hard
-# checks). Every other value — 'required', the DOCUMENTED default 'auto',
-# an unset var, or any unknown token — is treated as EC2 so the EIC hard
-# checks STAY ON. The old test (== 'required') mis-classified the
-# documented default 'auto' (and an unset var) as non-EC2, silently
-# dropping ALL EIC hard-checks on a real EC2 run left at default. We do
-# not try to resolve 'auto' to the true backend here (no cheap, in-repo
-# signal — the tenant CP GET's instance_id shape is owned by another
-# repo); instead 'auto' fails safe toward keeping coverage. A real
-# local-docker run must set E2E_AWS_LEAK_CHECK=off explicitly (as the
-# workflow already does) to earn the non-EC2 skips.
-is_ec2_backend() {
-  [ "${E2E_AWS_LEAK_CHECK:-auto}" != "off" ]
-}
-
 # ─── cleanup trap ───────────────────────────────────────────────────────
 CLEANUP_DONE=0
+ORG_ID=""
+ORG_CREATION_VERIFIED=0
+CREATE_BODYFILE=""
 cleanup_org() {
   # Capture upstream exit code IMMEDIATELY — must be the first statement
   # in the trap, before any command (including the CLEANUP_DONE check)
@@ -361,58 +562,26 @@ cleanup_org() {
     return 0
   fi
 
+  if [ "$ORG_CREATION_VERIFIED" != "1" ]; then
+    log "No verified creation-returned org identity for $SLUG — skipping destructive org teardown."
+    case "$entry_rc" in 0|1|2|3|4|5) return 0 ;; *) exit 1 ;; esac
+  fi
+
   log "🧹 Tearing down org $SLUG..."
 
-  # The DELETE handler runs the GDPR Art. 17 cascade synchronously
-  # (Stripe + Redis + EC2 terminate + CF tunnel + DNS + DB rows). Real
-  # observed wall-time on prod-shaped infra is ~30–90s — EC2 termination
-  # alone takes 30–60s. The 5–15s estimate in `purge.go`'s comment is
-  # the API-call cost, NOT the AWS-side time-to-termination it waits on.
-  #
-  # Two-part patience to match reality:
-  #   1. 120s curl timeout on the DELETE itself (was 30s) so the
-  #      synchronous cascade has room to complete in-band.
-  #   2. Poll up to 60s after for organizations.status='purged' (or row
-  #      gone) instead of one rigid 10s sleep — covers the case where
-  #      DELETE returns 5xx mid-cascade and the cascade finishes anyway,
-  #      and the case where DELETE legitimately exceeds 120s and we want
-  #      eventual-consistency confirmation.
-  if curl "${CURL_COMMON[@]}" --max-time 120 -X DELETE "$CP_URL/cp/admin/tenants/$SLUG" \
-    -H "Authorization: Bearer $ADMIN_TOKEN" \
-    -H "Content-Type: application/json" \
-    -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1; then
-    ok "Teardown request accepted"
-  else
-    log "Teardown returned non-2xx (may already be gone)"
-  fi
-
-  local leak_count=1
-  local elapsed=0
-  while [ "$elapsed" -lt 60 ]; do
-    leak_count=$(curl "${CURL_COMMON[@]}" "$CP_URL/cp/admin/orgs" \
-      -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null \
-      | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for o in d.get('orgs', []) if o.get('slug')=='$SLUG' and o.get('status') != 'purged'))" \
-      2>/dev/null || echo 1)
-    if [ "$leak_count" = "0" ]; then
-      break
-    fi
-    sleep 5
-    elapsed=$((elapsed + 5))
-  done
-
-  if [ "$leak_count" != "0" ]; then
-    echo "⚠️  LEAK: org $SLUG still present post-teardown after ${elapsed}s (count=$leak_count)" >&2
-    exit 4
-  fi
-  local aws_leak_rc=0
-  e2e_verify_no_ec2_leaks_for_slug "$SLUG" || aws_leak_rc=$?
-  if [ "$aws_leak_rc" != "0" ]; then
-    case "$aws_leak_rc" in
-      2) exit 2 ;;
-      *) exit 4 ;;
-    esac
-  fi
-  ok "Teardown clean — no orphan org or EC2 resources for $SLUG (${elapsed}s)"
+  # DELETE returns only after executeOrgPurge has completed the selected
+  # provider cleanup and DB-row step. Verify the exact receipt/audit identity,
+  # then require the exact-tenant boot-events endpoint to return 404. This is
+  # honest CP purge evidence, not a claim that this generic runner scanned
+  # Docker itself.
+  local purge_verify_rc=0
+  e2e_cp_delete_and_verify_purge \
+    "$CP_URL" "$ADMIN_TOKEN" "$SLUG" "$ORG_ID" || purge_verify_rc=$?
+  case "$purge_verify_rc" in
+    0) ;;
+    2) exit 2 ;;
+    *) exit 4 ;;
+  esac
 
   # Normalize unexpected upstream exit codes to 1 (generic failure). The
   # script's documented contract (header "Exit codes" section) only emits
@@ -436,7 +605,9 @@ cleanup_org() {
 # substitution (core#2917).
 cleanup_org_and_bodyfile() {
   local entry_rc=$?
-  rm -f "$CREATE_BODYFILE" 2>/dev/null || true
+  if [ -n "$CREATE_BODYFILE" ]; then
+    rm -f "$CREATE_BODYFILE" 2>/dev/null || true
+  fi
   cleanup_org
   exit "$entry_rc"
 }
@@ -479,9 +650,10 @@ log "1/11 Creating org $SLUG via /cp/admin/orgs..."
 # set -euo pipefail, aborting the whole harness with no body
 # in the CI logs.
 CREATE_BODYFILE="$(mktemp -t create-org-resp.XXXXXX)"
-# cleanup_org_and_bodyfile (EXIT/INT/TERM trap) removes this bodyfile and
-# runs teardown, so a non-2xx org-create response is logged while the org
-# and EC2 resources are still cleaned up (core#60 / core#2917).
+# cleanup_org_and_bodyfile (EXIT/INT/TERM trap) removes this bodyfile and runs
+# teardown only after a successful create returned a valid org identity. A
+# non-2xx/invalid create response is logged but cannot authorize a slug-only
+# delete that might target a pre-existing tenant.
 set +e
 CREATE_HTTP_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$CP_URL/cp/admin/orgs" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -501,9 +673,9 @@ CREATE_RESP="$(cat "$CREATE_BODYFILE")"
 # the explicit -o bodyfile + -w '%{http_code}' above, the body
 # is always on disk for logging regardless of HTTP status.
 if [ "$CURL_RC" -ne 0 ] || [ "$CREATE_HTTP_CODE" -lt 200 ] || [ "$CREATE_HTTP_CODE" -ge 300 ]; then
-  log "❌ Org create failed (curl_rc=$CURL_RC http=$CREATE_HTTP_CODE slug_len=${#SLUG}); raw response body:"
+  log "❌ Org create failed (curl_rc=$CURL_RC http=$CREATE_HTTP_CODE slug_len=${#SLUG}); sanitized response body:"
   log "--- BEGIN CREATE RESPONSE ---"
-  log "$CREATE_RESP"
+  log "$(printf '%s' "$CREATE_RESP" | sanitize_http_body)"
   log "--- END CREATE RESPONSE ---"
   if [ "${#SLUG}" -gt 32 ]; then
     fail "Org create returned non-2xx AND slug is ${#SLUG} chars (over the CP's 32-char cap). The slug helper's assertion should have caught this; check collision-proof-slug.sh's run_id_budget math."
@@ -511,17 +683,20 @@ if [ "$CURL_RC" -ne 0 ] || [ "$CREATE_HTTP_CODE" -lt 200 ] || [ "$CREATE_HTTP_CO
   fail "Org create returned non-2xx (http=$CREATE_HTTP_CODE) — see body above. Common causes: 409=slug collision (a prior run left a stale org; the slug helper should prevent this — check E2E_RUN_ID propagation), 400=slug too long (should be caught by the 32-char cap assertion), 401=ADMIN_TOKEN not set or expired, 422=schema mismatch (check the -d payload matches the CP's expected shape)."
 fi
 if [ -z "$CREATE_RESP" ] || ! echo "$CREATE_RESP" | python3 -m json.tool >/dev/null 2>&1; then
-  log "❌ Org create returned non-JSON; raw body: $CREATE_RESP"
+  log "❌ Org create returned non-JSON; sanitized body: $(printf '%s' "$CREATE_RESP" | sanitize_http_body)"
   fail "Org create returned non-JSON (see body above)"
 fi
 # Capture org_id for tenant-guard header on every subsequent tenant call.
 # Without X-Molecule-Org-Id matching MOLECULE_ORG_ID on the tenant, the
 # tenant-guard middleware returns 404 to avoid leaking tenant existence.
 ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
-[ -z "$ORG_ID" ] && {
-  log "❌ Org create response missing 'id'; raw body: $CREATE_RESP"
-  fail "Org create response missing 'id' (see body above)"
-}
+if ! e2e_cp_validate_org_id "$ORG_ID"; then
+  log "❌ Org create response missing 'id'; sanitized body: $(printf '%s' "$CREATE_RESP" | sanitize_http_body)"
+  fail "Org create response missing a valid UUID 'id' (see body above)"
+fi
+ORG_CREATION_VERIFIED=1
+e2e_cp_publish_creation_identity "$SLUG" "$ORG_ID" \
+  || fail "Could not publish the verified org creation identity for teardown"
 ok "Org created (id=$ORG_ID http=$CREATE_HTTP_CODE slug_len=${#SLUG})"
 
 # ─── 2. Wait for tenant provisioning ────────────────────────────────────
@@ -700,15 +875,74 @@ tenant_call() {
     "$@"
 }
 
-sanitize_http_body() {
-  python3 -c '
-import re, sys
-s = sys.stdin.read()
-s = re.sub(r"(?i)(Authorization:\s*Bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[redacted]", s)
-s = re.sub(r"(?i)(\"(?:auth_token|access_token|refresh_token|token|api_key|secret|password)\"\s*:\s*\")[^\"]+\"", r"\1[redacted]\"", s)
-s = re.sub(r"(?i)((?:auth_token|access_token|refresh_token|api_key|secret|password)=)[^&\s]+", r"\1[redacted]", s)
-print(s[:4000])
-'
+# create_workspace_post — `POST /workspaces` with a bounded retry over the
+# cold-origin write window (RCA'd via core#4307's header capture: Cloudflare
+# returns an empty-body 503 + Retry-After for ~1-2s after health passes but
+# before the tenant origin accepts writes). Honors the origin's Retry-After.
+# Retry policy lives in lib/workspace_create_retry.sh (create_should_retry_cold):
+# retries ONLY an empty-body 503 or a connection reset (curl 000 / no status
+# line) — the two "never reached a handler" signatures. A JSON body (real
+# 422/400/… create error) and 502/504 (maybe-processed → non-idempotent) are
+# surfaced on the FIRST try. A persistent transient exhausts the budget and
+# returns the last body so the caller's id-check fails RED with the full header
+# diagnostic. Every attempt is logged, so a transient that self-heals stays
+# visible and is never silently masked.
+#
+# The attempt budget stays bounded but must cover the ACTUAL cold window: the
+# core#4307 RCA estimated ~1-2s, but under concurrent-provision load on the
+# shared staging docker host the tenant origin warms slower — run 546336
+# (Platform Boot) saw a persistent empty-body 503 from Cloudflare across the old
+# 4-attempt / ~8s budget. 8 attempts at Retry-After ~2s (~16s) covers the
+# observed longer window. This does NOT slow the deterministic-failure path: a
+# non-cold status (JSON app error, 502/504) is surfaced on attempt 1 by
+# create_should_retry_cold, so ONLY a genuinely-persistent cold-origin transient
+# consumes the budget — and a never-warming origin still fails RED in ~16s, well
+# under a CI job timeout. Env-overridable for a still-longer window if needed.
+#
+# Args: $1 = human label, $2 = headers dump file (-D target). Remaining args are
+# passed verbatim to `tenant_call POST /workspaces` (payload etc.). Echoes the
+# final response body on stdout; leaves the final response headers in $2.
+CREATE_MAX_ATTEMPTS="${CREATE_MAX_ATTEMPTS:-8}"
+create_workspace_post() {
+  local label="$1" hdrs="$2"; shift 2
+  local attempt resp id status ra who
+  for (( attempt = 1; attempt <= CREATE_MAX_ATTEMPTS; attempt++ )); do
+    : > "$hdrs"
+    # --fail-with-body + set -e would abort here on a non-2xx; the existing
+    # create sites disarm set -e so curl still writes the body. Same guard.
+    # A connection reset leaves $resp empty and writes no status line to $hdrs.
+    set +e
+    resp=$(tenant_call POST /workspaces -D "$hdrs" "$@")
+    local curl_rc=$?   # curl's transport exit: 0=got a response; 28=timeout
+                       # (maybe-processed), 7/56/…=connection reset/refused.
+    set -e
+    id=$(printf '%s' "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
+    if [ -n "$id" ]; then
+      printf '%s' "$resp"
+      return 0
+    fi
+    status=$(create_parse_status "$hdrs")
+    # Pass curl_rc so a client TIMEOUT (28) is NOT retried (the origin may have
+    # already processed this non-idempotent POST → re-POST would double-create),
+    # while a genuine connection reset/refused still is.
+    if ! create_should_retry_cold "$status" "$resp" "$curl_rc"; then
+      # Real app error (non-empty body), a 502/504, or any non-cold status —
+      # surface immediately so the caller's id-check names it. No retry, no
+      # masking, and no re-POST of a possibly-already-processed create.
+      printf '%s' "$resp"
+      return 0
+    fi
+    ra=$(create_parse_retry_after "$hdrs")
+    who=$(create_parse_server "$hdrs")
+    if [ "$attempt" -lt "$CREATE_MAX_ATTEMPTS" ]; then
+      echo "[$(date +%H:%M:%S)] ⏳ $label create attempt $attempt/$CREATE_MAX_ATTEMPTS: empty-body ${status:-conn-reset} from '${who:-?}' (cold-origin write window) — honoring Retry-After ${ra}s" >&2
+      sleep "$ra"
+    fi
+  done
+  # Budget exhausted on a persistent cold-origin transient — hand the last body
+  # back so the caller fails RED with the header diagnostic. Not masked.
+  printf '%s' "$resp"
+  return 0
 }
 
 wait_workspaces_online_routable() {
@@ -775,8 +1009,9 @@ wait_workspaces_online_routable() {
 # without forcing every dispatch to ship them all. Priority order
 # matters — first non-empty wins:
 #
-#   E2E_MINIMAX_API_KEY → claude-code MiniMax path. Cheapest, default
-#     for the cron canary post-2026-05-03. Routes via the claude-code
+#   E2E_MINIMAX_API_KEY → claude-code MiniMax path. Cheapest; selected as the
+#     protected push/dispatch default in 2026-05 and retained today. Routes via
+#     the claude-code
 #     template's `minimax` provider (workspace-configs-templates/
 #     claude-code-default/config.yaml:64-69) which sets
 #     ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic at boot.
@@ -858,6 +1093,188 @@ print(json.dumps({
 }))
 ")
 fi
+# seo-agent (hermes) declares HERMES_CRON_APPROVAL_MODE in its required_env:
+# hermes hard-denies code on scheduled turns without it, and preflight 422s
+# the create when it is missing. Merge it into whatever key path was chosen.
+if [ "${RUNTIME:-}" = "seo-agent" ]; then
+  SECRETS_JSON=$(SECRETS_JSON="$SECRETS_JSON" python3 -c "
+import json, os
+d = json.loads(os.environ['SECRETS_JSON'] or '{}')
+d['HERMES_CRON_APPROVAL_MODE'] = 'allow'
+print(json.dumps(d))
+")
+fi
+
+# Idle-digest sub-step (task #219): with E2E_IDLE_DIGEST_CHECK=on (the
+# ephemeral gate), inject the shrunken fire interval so the contract-driven
+# idle digest can arm + fire within the run. Additive NON-LLM env only — it can
+# never flip the platform-managed path to BYOK (the guard above is about keys).
+# MOLECULE_MAILBOX_KERNEL=1 is explicit until the native-default runtime
+# (mailbox kernel default ON) propagates into the template image pins; drop the
+# line then so this gate proves the DEFAULT, not the flag.
+if [ "${E2E_IDLE_DIGEST_CHECK:-}" = "on" ]; then
+  SECRETS_JSON=$(SECRETS_JSON_IN="$SECRETS_JSON" python3 -c "
+import json, os
+s = json.loads(os.environ['SECRETS_JSON_IN'])
+s['MOLECULE_MAILBOX_KERNEL'] = '1'
+s['MOLECULE_IDLE_FIRE_SECONDS'] = os.environ.get('E2E_IDLE_FIRE_SECONDS', '30')
+# Deterministic digest content: the goal-state provider seeds goal.yaml from
+# this env at boot (runtime bootstrap_from_env, source=env-bootstrap). No LLM
+# tool-call round-trip — the platform-managed model acked GOALSET twice in CI
+# without invoking the tool, so an A2A seed is an unacceptable flake source.
+s['MOLECULE_IDLE_GOAL'] = 'Keep the e2e pipeline green; pull the next backlog item when idle.'
+print(json.dumps(s))
+")
+  log "    idle-digest check ON: MOLECULE_IDLE_FIRE_SECONDS=${E2E_IDLE_FIRE_SECONDS:-30} injected into workspace secrets"
+fi
+
+# Scheduler autonomous-fire sub-step (P5c): with E2E_SCHEDULER_CHECK=on, shrink
+# the trigger poll so a `* * * * *` schedule fires within the run. Additive
+# NON-LLM env only — same platform-managed guard rationale as the idle block
+# above.
+#
+# This block deliberately carries NO plugin-source literal and does NOT declare
+# the scheduler. Two independent reasons, either one sufficient:
+#
+#   1. A literal here is a DUPLICATE of the SSOT. WHICH source the scheduler
+#      installs from is owned by the SDK native-plugins registry
+#      (contracts/plugin/native-plugins.registry.json), consumed by core as the
+#      generated Go binding molcontracts through
+#      workspace-server/internal/handlers/plugin_registry.go
+#      (mustNativePluginSource(SchedulerPluginName) → SchedulerPluginSource).
+#      Nothing kept a copy in this file in step with it: the literal that used to
+#      sit here was still pinned two minor versions behind the registry, and the
+#      drift was invisible precisely because the declaration was also inert (2).
+#   2. The declaration was INERT. Declaring through the `secrets` channel does not
+#      survive provisioning: buildProvisionerConfig recomputes
+#      MOLECULE_DECLARED_PLUGINS from the declared-set SSOT (workspace_provision.go
+#      desiredPluginSources → envVars["MOLECULE_DECLARED_PLUGINS"]) and OVERWRITES
+#      whatever loadWorkspaceSecrets had seeded into that same map. This is the
+#      documented contract on CreateWorkspacePayload.Plugins, and the reason the
+#      10e digest block moved to the durable payload.plugins channel.
+#
+# What actually installs the scheduler is CORE: workspace_provision_shared.go
+# calls ensureSchedulerPluginDeclared on EVERY provision (default-on kill-switch
+# MOLECULE_DECLARE_SCHEDULER_PLUGIN), resolving the source from that same
+# registry. So 10d/10f/10g now gate the PRODUCTION declare path rather than a
+# test-injected one — if that path regresses, this e2e goes red, which is the
+# whole point of the step. A test that injects the thing it is meant to prove
+# proves the mechanism, never the value production actually uses.
+#
+# Guarded by lib/test_scheduler_source_ssot_unit.sh, which fails RED if any
+# pinned scheduler plugin source is reintroduced into tests/e2e/**/*.sh.
+#
+# The DELIVERY ABSOLUTE CANCEL BOUND is injected here too, and it is the reason
+# the backstops above can claim to exceed it. Left at its defaults, scheduler
+# v0.2.3 abandons a delivery it cannot attribute at 3600s — and a fresh e2e
+# workspace ALWAYS lands in that not-attributable branch, because the turn lease
+# is workspace-global and predates the fire it is being asked about. No backstop
+# that fits a 75-minute job can exceed 3600, so the harness stops trying to
+# track the daemon's default and CONFIGURES the bound instead: the same number
+# `trigger_daemon_watchdog_secs` derives the backstops from is written onto the
+# workspace as the daemon's ceiling AND the runtime's per-turn cap. Both keys,
+# emitted by one lib function so they cannot drift apart or from the backstop —
+# the daemon prefers the cap the runtime REPORTS over its own env ceiling, so
+# the daemon key alone would move nothing on the branch that matters.
+if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
+  _SCHED_DLV_CAP_ENV=$(TRIGGER_DAEMON_WATCHDOG_SECS="${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-}" \
+    TRIGGER_DAEMON_TICK_INTERVAL_SECS="${E2E_TRIGGER_POLL_SECONDS:-10}" \
+    trigger_daemon_delivery_cap_env) \
+    || fail "Scheduler: the delivery cancel bound could not be derived (the probe cron did not parse). Nothing is injected and every backstop below would be measured against a number nothing enforces, so this run stops here rather than proceeding with an unbounded workspace."
+  # MOLECULE_TRIGGER_POLL_SECONDS comes out of the SAME lib call as the caps now.
+  # It used to be typed here while the tick-wedge threshold was derived from a
+  # DIFFERENT knob — two numbers that agreed only at their shared default.
+  SECRETS_JSON=$(SECRETS_JSON_IN="$SECRETS_JSON" DLV_CAP_ENV="$_SCHED_DLV_CAP_ENV" python3 -c "
+import json, os
+s = json.loads(os.environ['SECRETS_JSON_IN'])
+for line in os.environ['DLV_CAP_ENV'].splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    k, _, v = line.partition('=')
+    s[k] = v
+print(json.dumps(s))
+")
+
+  # ─── the timeout inventory is ASSERTED, at startup, before anything runs ───
+  #
+  # Every bound on the trigger delivery path, in order, each one either reachable
+  # or explicitly declared subsumed by a strictly tighter one. This is the guard
+  # for the defect class that produced this work: a 210s DELIVER backstop sitting
+  # UNDER the 600s delivery cancel it was supposed to outlast, so the retry it
+  # existed to allow could never happen. That inversion parsed, ran, and read as
+  # deliberate for four months because the two numbers lived in different files
+  # and nothing ever compared them. Now something does, and it runs on every
+  # scheduler-enabled e2e rather than only in the unit test — a contract checked
+  # solely offline is a contract the live configuration can still violate.
+  _SCHED_ORDERING=$(TRIGGER_DAEMON_WATCHDOG_SECS="${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-}" \
+    TRIGGER_DAEMON_TICK_INTERVAL_SECS="${E2E_TRIGGER_POLL_SECONDS:-10}" \
+    trigger_daemon_timeout_ordering_check "${E2E_SCHEDULER_POLL_SECS:-10}" 2>&1) \
+    || fail "Scheduler: the timeout inventory for this run is not reachable end to end — at least one bound can never fire, which makes it dead code pretending to be a safety net. $_SCHED_ORDERING"
+  _SCHED_LEDGER=$(TRIGGER_DAEMON_WATCHDOG_SECS="${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-}" \
+    TRIGGER_DAEMON_TICK_INTERVAL_SECS="${E2E_TRIGGER_POLL_SECONDS:-10}" \
+    trigger_daemon_timeout_ledger "${E2E_SCHEDULER_POLL_SECS:-10}" 2>/dev/null | tr '\n' ' ')
+
+  log "    scheduler check ON: injected $(printf '%s' "$_SCHED_DLV_CAP_ENV" | tr '\n' ' ') — probe cron '$(trigger_daemon_probe_cron)' (fire every $(trigger_daemon_fire_interval_secs)s), delivery cancel bound $(e2e_trigger_delivery_cap_secs)s derived as ${TRIGGER_DAEMON_CAP_FIRE_MULTIPLE}x that fire interval. The molecule-scheduler plugin itself is declared by core at provision from the SDK native-plugins registry, so this harness carries no source literal."
+  # $_SCHED_ORDERING carries the check's own row count on SUCCESS too
+  # ("timeout-ledger: checked N row(s), M reachable, ..."). Logged rather than
+  # discarded for the same reason the stall detector reports its sample count: a
+  # check that examined ZERO rows passes identically to one that examined six,
+  # and the count is the only thing that tells them apart in a log.
+  log "    scheduler timeout inventory: $_SCHED_ORDERING"
+  log "    scheduler timeout inventory rows: $_SCHED_LEDGER"
+fi
+
+# Self-schedule tool sub-step (10f): with E2E_SELF_SCHEDULE_CHECK=on, additively
+# declare the molecule-ai-plugin-schedule-self plugin (audience:self on its
+# mcpServers contribution) onto the workspace roster so the runtime's audience
+# injector renders the self-mode create_schedule tool surface. FIRING is done by
+# the scheduler trigger daemon (10d), so 10f is CO-GATED on E2E_SCHEDULER_CHECK=on
+# (enforced in the 10f VERIFY block). Additive NON-LLM env only — same
+# platform-managed guard rationale as the scheduler/digest blocks above; the plugin
+# source is the public repo, fetched anonymously at boot. Comma-appended so it
+# coexists with the scheduler + digest-mail plugins on one roster.
+if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
+  SECRETS_JSON=$(SECRETS_JSON_IN="$SECRETS_JSON" python3 -c "
+import json, os
+s = json.loads(os.environ['SECRETS_JSON_IN'])
+src = os.environ.get('E2E_SELF_SCHEDULE_PLUGIN_SOURCE', 'gitea://molecule-ai/molecule-ai-plugin-schedule-self#v0.1.2')
+existing = s.get('MOLECULE_DECLARED_PLUGINS', '').strip()
+s['MOLECULE_DECLARED_PLUGINS'] = (existing + ',' + src).strip(',') if existing else src
+print(json.dumps(s))
+")
+  log "    self-schedule check ON: declared ${E2E_SELF_SCHEDULE_PLUGIN_SOURCE:-molecule-ai-plugin-schedule-self#v0.1.2} additively onto MOLECULE_DECLARED_PLUGINS (co-gated on E2E_SCHEDULER_CHECK for the fire path)"
+fi
+
+# Native digest-provider plugin sub-step (10e, RFC molecule-core#4413): with
+# E2E_DIGEST_PLUGIN_CHECK=on, declare a native digest-provider plugin and turn on
+# the runtime's in-process digest-provider loader, so the workspace boot-installs
+# the plugin and the idle-digest assembler loads its DigestProvider IN-PROCESS.
+# We deliberately do NOT set MOLECULE_NATIVE_PLUGIN_NAMES: the load-time trust
+# gate must admit this plugin from the VENDORED native-plugins registry (the
+# runtime#310 SSOT source) — the whole point of this step. MOLECULE_MAILBOX_KERNEL
+# + the shrunken fire interval are (idempotently) set so the digest actually arms
+# and the loader runs within the window. Additive NON-LLM env only.
+if [ "${E2E_DIGEST_PLUGIN_CHECK:-}" = "on" ]; then
+  # DECLARE the digest plugin via the DURABLE DB channel (payload.plugins →
+  # workspace_declared_plugins), NOT MOLECULE_DECLARED_PLUGINS-in-secrets. Now that
+  # the scheduler is declared on EVERY workspace, provision recomputes
+  # MOLECULE_DECLARED_PLUGINS from the declared-set SSOT and OVERWRITES any
+  # secret-injected value, so a secret-declared digest plugin silently vanishes.
+  _DIGEST_SRC="${E2E_DIGEST_PLUGIN_SOURCE:-gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0}"
+  E2E_WS_PLUGINS="${E2E_WS_PLUGINS:-}${E2E_WS_PLUGINS:+,}$_DIGEST_SRC"
+  # The loader flag + digest arming are real runtime TOGGLES (not plugin decls), so
+  # they stay in the secret env.
+  SECRETS_JSON=$(SECRETS_JSON_IN="$SECRETS_JSON" python3 -c "
+import json, os
+s = json.loads(os.environ['SECRETS_JSON_IN'])
+s['MOLECULE_DIGEST_PROVIDER_PLUGINS'] = '1'          # D1 loader flag
+s.setdefault('MOLECULE_MAILBOX_KERNEL', '1')          # ensure the idle digest arms
+s.setdefault('MOLECULE_IDLE_FIRE_SECONDS', os.environ.get('E2E_IDLE_FIRE_SECONDS', '30'))
+print(json.dumps(s))
+")
+  log "    digest-plugin check ON: declared $_DIGEST_SRC via payload.plugins (durable DB channel) + MOLECULE_DIGEST_PROVIDER_PLUGINS=1 (trust source = vendored registry, no NATIVE_PLUGIN_NAMES)"
+fi
 
 MODEL_SLUG=$(pick_model_slug "$RUNTIME")
 log "    MODEL_SLUG=$MODEL_SLUG"
@@ -899,9 +1316,9 @@ log "    MODEL_SLUG=$MODEL_SLUG"
 # ─── runtime → provision-selector resolution ────────────────────────────
 # Most runtimes are selected directly by the `runtime` field. seo-agent is
 # the exception: it is NOT a registry runtime (absent from manifest.json +
-# runtime_registry.go knownRuntimes) — it is a claude-code-adapter template
+# runtime_registry.go knownRuntimes) — it is a hermes template
 # VARIANT selected by the `template` field. The ws-server Create handler reads
-# the template's config.yaml, which declares `runtime: claude-code`, and
+# the template's config.yaml, which declares `runtime: hermes`, and
 # resolves the concrete runtime from there (workspace.go:290-336). So for
 # seo-agent we send template="seo-agent" and OMIT runtime, letting the
 # template resolve it — sending an explicit runtime="seo-agent" would
@@ -923,6 +1340,7 @@ build_create_payload() {
   E2E_WS_TEMPLATE="$PROVISION_TEMPLATE" \
   E2E_WS_MODEL="$MODEL_SLUG" \
   E2E_WS_SECRETS="$SECRETS_JSON" \
+  E2E_WS_PLUGINS="${E2E_WS_PLUGINS:-}" \
   python3 -c "
 import json, os
 secrets = json.loads(os.environ['E2E_WS_SECRETS'] or '{}')
@@ -932,10 +1350,18 @@ payload = {
     'model': os.environ['E2E_WS_MODEL'],
     'secrets': secrets,
 }
+# Declared plugins ride the DURABLE DB channel (CreateWorkspacePayload.Plugins →
+# workspace_declared_plugins), NOT a MOLECULE_DECLARED_PLUGINS secret: provision
+# recomputes that env from the declared-set SSOT and OVERWRITES a secret-injected
+# value (it does now that the scheduler is declared on every workspace), so a
+# secret-declared plugin would silently vanish before boot-install.
+_plugins = [p.strip() for p in os.environ.get('E2E_WS_PLUGINS', '').split(',') if p.strip()]
+if _plugins:
+    payload['plugins'] = _plugins
 tmpl = os.environ.get('E2E_WS_TEMPLATE', '')
 if tmpl:
     # Template-selected variant (seo-agent): the template's config.yaml
-    # resolves runtime=claude-code server-side. Do NOT also send an explicit
+    # resolves runtime=hermes server-side. Do NOT also send an explicit
     # runtime — seo-agent is not a registry runtime and would 422.
     payload['template'] = tmpl
 else:
@@ -948,7 +1374,7 @@ print(json.dumps(payload))
 }
 
 if [ -n "$PROVISION_TEMPLATE" ]; then
-  log "5/11 Provisioning parent workspace (runtime=$RUNTIME via template=$PROVISION_TEMPLATE → claude-code adapter)..."
+  log "5/11 Provisioning parent workspace (runtime=$RUNTIME via template=$PROVISION_TEMPLATE → hermes adapter)..."
 else
   log "5/11 Provisioning parent workspace (runtime=$RUNTIME)..."
 fi
@@ -962,18 +1388,36 @@ fi
 # workspace"). set +e / `|| true` keeps the 22 from tripping `set -e`; curl
 # still WROTE the body to stdout (that's what --fail-with-body does), so
 # PARENT_RESP holds the 422 JSON and the id-check below surfaces WHY.
-set +e
-PARENT_RESP=$(tenant_call POST /workspaces \
+#
+# Capture the RESPONSE HEADERS too (-D), because the body alone has repeatedly
+# been useless here: this create intermittently returns a 503 with a COMPLETELY
+# EMPTY body, ~1s after step 4 declared the tenant reachable (run 496830, main
+# 6ff307d6d, "E2E Staging Platform Boot"; and 3 fresh tenants in run 494525).
+# An empty-body 503 is the tell that it did NOT come from the Go handler — that
+# would emit JSON — so it is being synthesised by something in front of the app
+# (CF edge / tenant ingress / the app's own listener not yet accepting). The
+# headers are the only thing that can distinguish those: `server:`, `cf-ray:`,
+# and the HTTP status line name the responder. Without them this red is
+# permanently un-RCA-able, which is how it survived this long.
+PARENT_HDRS=$(mktemp)
+E2E_TMP_FILES+=("$PARENT_HDRS")
+# Bounded retry over the transient empty-body cold-origin 5xx (see
+# create_workspace_post). A real create error (JSON body) still surfaces on the
+# first try; a persistent 5xx exhausts the budget and the id-check below fails
+# RED with the header diagnostic.
+PARENT_RESP=$(create_workspace_post 'E2E Parent' "$PARENT_HDRS" \
   -H "Content-Type: application/json" \
   -d "$(build_create_payload 'E2E Parent')")
-set -e
 # Surface the workspace-create error CLEARLY instead of dying on a Python
 # KeyError when the response has no 'id'. The load-bearing cases this names:
 #   - seo-agent: an "invalid template" 400 if the seo-agent template isn't
 #     present in the tenant's configs/cache dir (template-cache refresh gap).
 PARENT_ID=$(echo "$PARENT_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
 if [ -z "$PARENT_ID" ]; then
-  fail "Parent workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}). Response: $(printf '%s' "$PARENT_RESP" | sanitize_http_body)"
+  fail "Parent workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}).
+Response body: $(printf '%s' "$PARENT_RESP" | sanitize_http_body)
+Response headers (who answered? an empty body + 503 here means it was NOT the Go handler — check 'server:' / 'cf-ray:'):
+$(sanitize_http_body < "$PARENT_HDRS")"
 fi
 log "    PARENT_ID=$PARENT_ID"
 # BYOK vendor key(s) shipped in the create payload above — nothing to write
@@ -986,14 +1430,18 @@ if [ "$MODE" = "full" ]; then
   # Same --fail-with-body / set -e abort guard as the parent create above:
   # let a non-2xx return the body so the id-check below surfaces it instead
   # of the script dying opaquely on curl exit 22.
-  set +e
-  CHILD_RESP=$(tenant_call POST /workspaces \
+  CHILD_HDRS=$(mktemp)
+  E2E_TMP_FILES+=("$CHILD_HDRS")
+  # Same bounded cold-origin 5xx retry + header capture as the parent create.
+  CHILD_RESP=$(create_workspace_post 'E2E Child' "$CHILD_HDRS" \
     -H "Content-Type: application/json" \
     -d "$(build_create_payload 'E2E Child' "$PARENT_ID")")
-  set -e
   CHILD_ID=$(echo "$CHILD_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
   if [ -z "$CHILD_ID" ]; then
-    fail "Child workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}). Response: $(printf '%s' "$CHILD_RESP" | sanitize_http_body)"
+    fail "Child workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}).
+Response body: $(printf '%s' "$CHILD_RESP" | sanitize_http_body)
+Response headers (who answered? an empty body + 503 here means it was NOT the Go handler — check 'server:' / 'cf-ray:'):
+$(sanitize_http_body < "$CHILD_HDRS")"
   fi
   log "    CHILD_ID=$CHILD_ID"
   # The child's create payload carried the same vendor key(s) — nothing to
@@ -1031,16 +1479,20 @@ printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwA
 PNG_SHA=$(sha256sum "$PNG_FIXTURE" | awk '{print $1}')
 for wid in "${WS_TO_CHECK[@]}"; do
   UP_TMP=$(e2e_tmp /tmp/e2e_upload.XXXXXX)
-  UP_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$TENANT_URL/workspaces/$wid/chat/uploads" \
+  UP_CODE_FILE=$(mktemp -t e2e_upload_code.XXXXXX)
+  E2E_TMP_FILES+=("$UP_CODE_FILE")
+  capture_http_status "$UP_CODE_FILE" \
+    curl "${CURL_COMMON[@]}" -X POST "$TENANT_URL/workspaces/$wid/chat/uploads" \
     -H "Authorization: Bearer $EFFECTIVE_TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
     "${TENANT_ROUTE_HDRS[@]}" \
     -F "files=@$PNG_FIXTURE;filename=e2e-smoke.png;type=image/png" \
     -o "$UP_TMP" \
-    -w '%{http_code}' \
-    2>/dev/null || echo "000")
-  if [ "$UP_CODE" != "200" ] && [ "$UP_CODE" != "201" ]; then
-    fail "Workspace $wid image upload returned $UP_CODE: $(head -c 500 "$UP_TMP" | sanitize_http_body)"
+    -w '%{http_code}'
+  UP_CODE="$HTTP_CAPTURE_CODE"
+  UP_CURL_RC="$HTTP_CAPTURE_RC"
+  if ! http_code_is_exact_success "$UP_CODE" "$UP_CURL_RC" 200 201; then
+    fail "Workspace $wid image upload returned $UP_CODE (curl_rc=$UP_CURL_RC): $(head -c 500 "$UP_TMP" | sanitize_http_body)"
   fi
   UP_URI=$(python3 -c "
 import json, sys
@@ -1066,85 +1518,57 @@ def walk(x):
         for v in x: walk(v)
 walk(d)
 " "$UP_TMP" 2>/dev/null || echo "")
-  rm -f "$UP_TMP"
+  rm -f "$UP_TMP" "$UP_CODE_FILE"
   [ -n "$UP_URI" ] || fail "Workspace $wid upload response had no workspace URI"
   [ "$UP_MIME" = "image/png" ] || fail "Workspace $wid upload returned mime=$UP_MIME, want image/png"
 
   DOWNLOAD_PATH="$UP_URI"
   case "$DOWNLOAD_PATH" in workspace:*) DOWNLOAD_PATH="${DOWNLOAD_PATH#workspace:}" ;; esac
   DL_TMP=$(e2e_tmp /tmp/e2e_download.XXXXXX.png)
-  DL_CODE=$(curl "${CURL_COMMON[@]}" "$TENANT_URL/workspaces/$wid/chat/download?path=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$DOWNLOAD_PATH")" \
+  DL_CODE_FILE=$(mktemp -t e2e_download_code.XXXXXX)
+  E2E_TMP_FILES+=("$DL_CODE_FILE")
+  capture_http_status "$DL_CODE_FILE" \
+    curl "${CURL_COMMON[@]}" "$TENANT_URL/workspaces/$wid/chat/download?path=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$DOWNLOAD_PATH")" \
     -H "Authorization: Bearer $EFFECTIVE_TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
     "${TENANT_ROUTE_HDRS[@]}" \
     -o "$DL_TMP" \
-    -w '%{http_code}' \
-    2>/dev/null || echo "000")
-  if [ "$DL_CODE" != "200" ]; then
-    fail "Workspace $wid image download returned $DL_CODE: $(head -c 300 "$DL_TMP" | sanitize_http_body)"
+    -w '%{http_code}'
+  DL_CODE="$HTTP_CAPTURE_CODE"
+  DL_CURL_RC="$HTTP_CAPTURE_RC"
+  if ! http_code_is_exact_success "$DL_CODE" "$DL_CURL_RC" 200; then
+    fail "Workspace $wid image download returned $DL_CODE (curl_rc=$DL_CURL_RC): $(head -c 300 "$DL_TMP" | sanitize_http_body)"
   fi
   DL_SHA=$(sha256sum "$DL_TMP" | awk '{print $1}')
-  rm -f "$DL_TMP"
+  rm -f "$DL_TMP" "$DL_CODE_FILE"
   [ "$DL_SHA" = "$PNG_SHA" ] || fail "Workspace $wid image download SHA mismatch: upload=$PNG_SHA download=$DL_SHA"
   ok "    $wid image upload/download OK ($UP_MIME, sha256=$DL_SHA)"
 done
 rm -f "$PNG_FIXTURE"
 
-# ─── 7b. Canvas-terminal diagnose (EIC chain probe) ────────────────────
-# This step exists because the canvas-terminal failure of 2026-05-03
-# was structurally invisible to local-dev (handleLocalConnect uses
-# docker exec; handleRemoteConnect uses EIC + ssh). The CP provisioner
-# shipped without the tcp/22 EIC ingress rule for ~6 months and nobody
-# noticed until a paying tenant clicked Terminal in canvas. Probing the
-# diagnose endpoint here at synth-E2E time means a regression in
-#   - tenantIngressRules / workspaceIngressRules (CP)
-#   - eicSSHIngressRule helper (CP)
-#   - AuthorizeIngress source-group support (CP awsapi)
-#   - MOLECULE_EIC_ENDPOINT_SG_ID Railway env
-#   - handleRemoteConnect's send-ssh-public-key/open-tunnel/ssh chain
-# surfaces within ~20 min of merge instead of waiting for a user report.
-#
-# The diagnose endpoint runs the full EIC + ssh probe from inside the
-# tenant's workspace-server (which already has AWS creds via its IAM
-# profile) and reports per-step status. We only need to call it as the
-# tenant — no AWS creds needed on the GHA runner. Returns
-# {"ok": bool, "first_failure": "name", "steps": [...]}.
-#
-# Local-docker workspaces get diagnoseLocal (docker.Ping + container exec).
-#
-# EC2-GATED (provider signal). The EIC/ssh chain this probe asserts
-# (send-ssh-public-key, open-tunnel, wait-for-port, ssh-probe, tenant SG
-# tcp/22, MOLECULE_EIC_ENDPOINT_SG_ID) is 100% EC2-specific and has NO
-# analog on molecules-server (local-docker). Worse, on a CP-provisioned
-# local-docker workspace the diagnose handler mis-routes to diagnoseRemote
-# (it branches on raw instanceID != "" and the CP local-docker provisioner
-# persists the CONTAINER NAME into instance_id), so this probe returns
-# ok=false for a backend-shape reason, not a real regression. So:
-#   - On an EC2 backend (E2E_AWS_LEAK_CHECK=required) we run the full
-#     EIC hard-check exactly as before.
-#   - On molecules-server we use the diagnose JSON's own `remote` boolean
-#     (diagnoseLocal ⇒ remote:false) as the per-workspace provider signal:
+# ─── 7b. Canvas-terminal diagnose ──────────────────────────────────────
+# The active staging backend is local Docker. The endpoint returns
+# {"ok": bool, "remote": bool, "first_failure": "name", "steps": [...]};
+# use its own shape signal to keep the assertions honest:
 #       * remote:false ⇒ genuine diagnoseLocal container-running check —
-#         provider-agnostic, so we still HARD-assert ok=true.
-#       * remote:true  ⇒ the EIC/ssh path (either genuinely EC2 or the CP
-#         local-docker mis-route). Its EIC assertions have no local analog,
-#         so we SKIP with a clear log line rather than false-red. The
-#         provider-agnostic "container executes" guarantee is already
+#         hard-assert ok=true (apart from the known socket-less check below).
+#       * remote:true  ⇒ a response shape with no valid local-Docker assertion;
+#         skip explicitly rather than false-pass it. Container execution is
 #         covered by wait_workspaces_online_routable (step 7) + A2A (step 8).
-log "7b/11 Canvas-terminal EIC diagnose probe..."
+log "7b/11 Canvas-terminal diagnose probe..."
 for wid in "${WS_TO_CHECK[@]}"; do
   DIAG_JSON=$(tenant_call GET "/workspaces/$wid/terminal/diagnose" 2>/dev/null || echo '{}')
   DIAG_OK=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if d.get('ok') else 'false')" 2>/dev/null || echo "false")
   DIAG_REMOTE=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if d.get('remote') else 'false')" 2>/dev/null || echo "false")
   if [ "$DIAG_OK" = "true" ]; then
     ok "    $wid terminal-reachable (canvas terminal will work)"
-  elif ! is_ec2_backend && [ "$DIAG_REMOTE" = "true" ]; then
-    # Non-EC2 backend AND the workspace took the remote/EIC path — no local
-    # analog to assert. Skip (never hard-fail on the EIC chain off EC2).
-    log "    ⏭️  $wid terminal-diagnose EIC hard-check SKIPPED (non-EC2 backend, remote-path diagnose): E2E_AWS_LEAK_CHECK=${E2E_AWS_LEAK_CHECK:-off}. The EIC/ssh chain has no local-docker analog; container-executes is covered by online+routable (step 7) and A2A (step 8)."
+  elif [ "$DIAG_REMOTE" = "true" ]; then
+    # The active backend is local Docker, so a remote-shape response has no
+    # assertion we can honestly make here.
+    log "    ⏭️  $wid terminal-diagnose remote-shape hard-check SKIPPED (active backend=local-docker): this response has no valid local assertion; container execution is covered by online+routable (step 7) and A2A (step 8)."
   else
-    # Either an EC2 backend (hard EIC regression) OR a non-EC2 diagnoseLocal
-    # (remote:false) that reported ok=false — both are real failures.
+    # diagnoseLocal (remote:false) reported ok=false. Apart from the known
+    # docker-client absence below, this is a real local-Docker failure.
     DIAG_FAIL=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('first_failure','unknown'))" 2>/dev/null || echo "unknown")
     DIAG_DETAIL=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); s=[x for x in d.get('steps',[]) if not x.get('ok')]; step=s[0] if s else {}; print(' — '.join(x for x in [step.get('error',''), step.get('detail','')] if x))" 2>/dev/null || echo "")
     # #767: always emit the full diagnose JSON so operators see every step's
@@ -1153,9 +1577,7 @@ for wid in "${WS_TO_CHECK[@]}"; do
     log "── DIAGNOSTIC BURST (step 7b — terminal diagnose for $wid) ──"
     echo "$DIAG_JSON" | python3 -m json.tool 2>/dev/null || echo "$DIAG_JSON"
     log "── END DIAGNOSTIC ──"
-    if is_ec2_backend; then
-      fail "Workspace $wid terminal diagnose failed at step '$DIAG_FAIL': $DIAG_DETAIL — check tenant SG has tcp/22 from the configured EIC endpoint SG, MOLECULE_EIC_ENDPOINT_SG_ID is set in Railway, and EIC endpoint health"
-    elif [ "$DIAG_FAIL" = "docker-available" ]; then
+    if [ "$DIAG_FAIL" = "docker-available" ]; then
       # A real staging TENANT's workspace-server runs INSIDE the tenant container
       # with NO docker socket (by security design — a tenant must never reach the
       # host daemon; that IS the finding-#1 escape surface). So diagnoseLocal's
@@ -1168,37 +1590,29 @@ for wid in "${WS_TO_CHECK[@]}"; do
       # failure at ANY OTHER step (container-running / exec) still hard-fails below.
       # FOLLOW-UP: terminal_diagnose.diagnoseLocal should model the real tenant
       # terminal path instead of hard-erroring on a nil docker client.
-      log "    ⏭️  $wid terminal-diagnose docker-available SKIPPED (non-EC2 tenant workspace-server has no docker socket by design; container-exec covered by steps 7+8): $DIAG_DETAIL"
+      log "    ⏭️  $wid terminal-diagnose docker-available SKIPPED (local-Docker tenant workspace-server has no docker socket by design; container execution is covered by steps 7+8): $DIAG_DETAIL"
     else
-      fail "Workspace $wid diagnoseLocal (non-EC2, remote:false) reported ok=false at step '$DIAG_FAIL': $DIAG_DETAIL — the local-docker container-running check failed (docker.Ping / container exec)"
+      fail "Workspace $wid diagnoseLocal (remote:false) reported ok=false at step '$DIAG_FAIL': $DIAG_DETAIL — the local-Docker container-running check failed (docker.Ping / container exec)"
     fi
   fi
 done
 
-# ─── 7c. Workspace files API config.yaml round-trip ────────────────────
-# Pin the config-save path that drives the Canvas Config tab's Save &
-# Restart. Two failure classes this gate catches in one shot:
-#
-#   1. Path map drift (PR #2769). Runtime falls through to the wrong
-#      base path (e.g. /opt/configs when user-data only created /configs)
-#      → SSH `install -D` fails with EACCES on a parent dir that doesn't
-#      exist. The user-visible 500 was unobservable without exercising
-#      this code path on a fresh workspace.
-#   2. Permission drift on /configs. The path is root-owned by cloud-init,
-#      so the SSH-as-ubuntu install needs `sudo -n`. Any future change
-#      that drops the sudo, switches to a non-passwordless-sudo OS user,
-#      or moves the path to a non-ubuntu-writable dir without sudo will
-#      regress this gate.
-#
-# Round-trip: PUT a known marker, GET it back, assert content matches.
-# Marker shape includes the run id so a stale file from a prior canary
-# can't false-pass.
-log "7c/11 Files API config.yaml round-trip..."
+# ─── 7c. Workspace files API config.yaml PUT ───────────────────────────
+# Exercise the Canvas Config save path with a run-specific marker. The current
+# local-Docker tenant process has no Docker socket; until WriteFile models that
+# topology, only its exact `docker not available` 5xx is an explicit skip. All
+# other transport, auth, route, validation, and server failures remain hard
+# failures. This is a PUT check, not a read-back round trip.
+log "7c/11 Files API config.yaml PUT..."
 CONFIG_MARKER="# molecule-synth-e2e: ${E2E_RUN_ID:-unknown} ${RUNTIME} $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 CONFIG_PAYLOAD="${CONFIG_MARKER}
 name: synth-canary
 runtime: ${RUNTIME}
 "
+# (Idle-digest goal seeding happens via an A2A goal-set turn after step 8 —
+# an idle_prompt line here proved ineffective on the ephemeral topology: the
+# files-API PUT does not reboot the workspace, so the boot-time
+# migrate_from_config never re-runs. Caught by this gate's own first run.)
 for wid in "${WS_TO_CHECK[@]}"; do
   PUT_BODY=$(python3 -c "import json,sys; print(json.dumps({'content': sys.stdin.read()}))" <<< "$CONFIG_PAYLOAD")
   # Capture body to a tempfile so curl's -w '%{http_code}' is the only
@@ -1209,68 +1623,56 @@ for wid in "${WS_TO_CHECK[@]}"; do
   # post-merge by E2E Staging SaaS at 22:06 UTC: a 200-with-body got
   # misreported as "PUT returned <body>".
   PUT_TMP=$(mktemp -t synth_put.XXXXXX)
-  PUT_CODE=$(tenant_call PUT "/workspaces/$wid/files/config.yaml" \
+  PUT_CODE_FILE=$(mktemp -t synth_put_code.XXXXXX)
+  E2E_TMP_FILES+=("$PUT_TMP" "$PUT_CODE_FILE")
+  capture_http_status "$PUT_CODE_FILE" \
+    tenant_call PUT "/workspaces/$wid/files/config.yaml" \
     -H "Content-Type: application/json" \
     -d "$PUT_BODY" \
     -o "$PUT_TMP" \
-    -w '%{http_code}' \
-    2>/dev/null || echo "000")
+    -w '%{http_code}'
+  PUT_CODE="$HTTP_CAPTURE_CODE"
+  PUT_CURL_RC="$HTTP_CAPTURE_RC"
   PUT_BODY_OUT=$(cat "$PUT_TMP" 2>/dev/null || echo "")
-  rm -f "$PUT_TMP"
-  if [ "$PUT_CODE" != "200" ] && [ "$PUT_CODE" != "204" ]; then
-    # EC2-GATED hard-fail (provider signal). The failure class this gate
-    # names (path-map / permission drift in template_files_eic.go) is the
-    # SSH-via-EIC write path, which only applies to an i-prefixed EC2
-    # instance id. On molecules-server (local-docker) WriteFile shape-routes
-    # to docker CopyToContainer — a different code path with no EIC analog —
-    # so a non-2xx here is NOT the EIC regression this gate claims to catch.
-    # On an EC2 backend we hard-fail as before; off EC2 we SKIP loudly.
-    #
-    # NARROWED (fixes a coverage hole): the non-EC2 skip is gated on the
+  rm -f "$PUT_TMP" "$PUT_CODE_FILE"
+  if ! http_code_is_exact_success "$PUT_CODE" "$PUT_CURL_RC" 200 204; then
+    # The active local-Docker WriteFile path shape-routes to docker
+    # CopyToContainer. The narrow skip below is gated on the
     # SPECIFIC docker-less-tenant signal, mirroring 7b's `docker-available`
     # narrowing — NOT on "any non-2xx". A real staging tenant's
     # workspace-server runs INSIDE the tenant container with NO docker socket
-    # (#206, by security design). WriteFile's non-EIC dispatch therefore
+    # (#206, by security design). WriteFile's container dispatch therefore
     # falls through findContainer (h.docker==nil ⇒ "") to writeViaEphemeral,
     # whose first act is `if h.docker == nil { return "docker not available" }`
     # — surfaced by the handler as HTTP 500 {"error":"failed to write file:
     # docker not available"} (workspace-server container_files.go:130-131,
     # templates.go:851-853). That is the ONLY non-2xx we skip.
     #
-    # Everything else stays a HARD FAIL even off EC2, because it points at a
+    # Everything else stays a HARD FAIL because it points at a
     # real outage this step exists to catch, not a backend-shape mismatch:
     #   - 000 → CP/tenant unreachable (curl rc!=0 / connection refused).
     #   - 5xx WITHOUT the docker-not-available marker → a genuine config-write
     #     regression (e.g. writeViaEphemeral failed AFTER the docker check).
     #   - 4xx (400/401/403/404/…) → auth/route/validation regression.
-    if is_ec2_backend; then
-      fail "Workspace $wid Files API PUT config.yaml returned $PUT_CODE: $PUT_BODY_OUT — likely a path-map or permission regression in workspace-server template_files_eic.go"
-    elif [ "$PUT_CODE" != "000" ] && \
+    if [ "$PUT_CODE" != "000" ] && \
          { [ "$PUT_CODE" -ge 500 ] 2>/dev/null; } && \
          printf '%s' "$PUT_BODY_OUT" | grep -qi 'docker not available'; then
-      # Non-EC2 tenant, 5xx, body carries the docker-less signal — the
+      # Local-Docker tenant, 5xx, body carries the docker-less signal — the
       # WriteFile docker-exec dispatch has no local analog on a socket-less
       # tenant. Config-write coverage for this backend is provided by the
       # container reading /configs/config.yaml directly via bind-mount at
       # boot (asserted by online+routable step 7). SKIP this ONE sub-step.
-      log "    ⏭️  $wid Files API PUT config.yaml EIC hard-check SKIPPED (non-EC2 socket-less tenant; docker-not-available): E2E_AWS_LEAK_CHECK=${E2E_AWS_LEAK_CHECK:-auto}, PUT returned $PUT_CODE. The template_files_eic.go SSH-via-EIC write path has no local-docker analog and the docker-exec fallback needs a docker socket the tenant lacks by design (#206). Body: $PUT_BODY_OUT"
+      log "    ⏭️  $wid Files API PUT config.yaml container-write hard-check SKIPPED (local-Docker socket-less tenant; docker-not-available): PUT returned $PUT_CODE (curl_rc=$PUT_CURL_RC). The docker-exec fallback needs a socket the tenant lacks by design (#206). Body: $(printf '%s' "$PUT_BODY_OUT" | sanitize_http_body)"
       continue
     else
       # 000 (unreachable) or 5xx-without-marker or any 4xx → a real outage /
       # regression, NOT a backend-shape mismatch. Hard-fail so this gate
-      # keeps catching what it exists to catch even off EC2.
-      fail "Workspace $wid Files API PUT config.yaml returned $PUT_CODE (non-EC2 backend, NOT the docker-not-available socket-less signal): $PUT_BODY_OUT — a 000 means CP/tenant unreachable; a 5xx without 'docker not available' is a genuine config-write regression; a 4xx is an auth/route/validation regression. This is a real failure, not a local-docker shape mismatch."
+      # keeps catching what it exists to catch on local-Docker.
+      fail "Workspace $wid Files API PUT config.yaml returned $PUT_CODE (curl_rc=$PUT_CURL_RC; local-Docker backend, NOT the docker-not-available socket-less signal): $(printf '%s' "$PUT_BODY_OUT" | sanitize_http_body) — a 000 means CP/tenant unreachable; a 5xx without 'docker not available' is a genuine config-write regression; a 4xx is an auth/route/validation regression. This is a real failure, not a backend-shape mismatch."
     fi
   fi
-  # PUT-only check; the GET-back round-trip assertion was dropped
-  # 2026-05-04 because PUT (template_files_eic.go SSH-via-EIC →
-  # workspace EC2) and GET (templates.go ReadFile → docker exec on
-  # platform-tenant-local container) hit DIFFERENT paths and DIFFERENT
-  # hosts. The asymmetry is a separate latent bug — Canvas Config tab
-  # rendering reads workspace state via other endpoints, not via this
-  # GET, so the user-facing Save & Restart works (container reads
-  # /configs/config.yaml directly via bind-mount). When the read/write
-  # paths are unified, restore the GET-back marker check here.
+  # This remains PUT-only until local-Docker read/write paths share the same
+  # supported storage contract; do not describe it as round-trip coverage.
   ok "    $wid config.yaml PUT OK (HTTP $PUT_CODE)"
 done
 
@@ -1620,8 +2022,9 @@ parts = d.get('result', {}).get('parts', [])
 print(parts[0].get('text', '') if parts else '')
 " 2>/dev/null || echo "")
 if [ -z "$AGENT_TEXT" ]; then
-  fail "A2A returned no text. Raw: $A2A_RESP"
+  fail "A2A returned no text. Sanitized: $(printf '%s' "$A2A_RESP" | sanitize_http_body)"
 fi
+AGENT_TEXT_SAFE=$(printf '%s' "$AGENT_TEXT" | sanitize_http_body)
 
 # Specific error-class checks — each pattern caught a real P0 bug on
 # 2026-04-23 that a generic "error|exception" check missed or misreported:
@@ -1637,26 +2040,26 @@ fi
 # Fail LOUD with the specific pattern so CI log + alert channel makes the
 # regression unambiguous.
 if echo "$AGENT_TEXT" | grep -qF "[hermes-agent error 401]"; then
-  fail "A2A — REGRESSION: hermes gateway auth broken (API_SERVER_KEY not in runtime env). See template-hermes#12. Raw: $AGENT_TEXT"
+  fail "A2A — REGRESSION: hermes gateway auth broken (API_SERVER_KEY not in runtime env). See template-hermes#12. Sanitized: $AGENT_TEXT_SAFE"
 fi
 if echo "$AGENT_TEXT" | grep -qF "hermes-agent unreachable"; then
-  fail "A2A — REGRESSION: hermes gateway process down. Check /var/log/hermes-gateway.log on the workspace EC2. Raw: $AGENT_TEXT"
+  fail "A2A — REGRESSION: hermes gateway process down. Check /var/log/hermes-gateway.log in the workspace runtime. Sanitized: $AGENT_TEXT_SAFE"
 fi
 if echo "$AGENT_TEXT" | grep -qF "model_not_found"; then
-  fail "A2A — REGRESSION: model slug passed through with provider prefix. See template-hermes#13. Raw: $AGENT_TEXT"
+  fail "A2A — REGRESSION: model slug passed through with provider prefix. See template-hermes#13. Sanitized: $AGENT_TEXT_SAFE"
 fi
 if echo "$AGENT_TEXT" | grep -qF "Encrypted content is not supported"; then
-  fail "A2A — REGRESSION: hermes custom provider hit /v1/responses instead of chat_completions. Config.yaml should declare api_mode: chat_completions. See template-hermes#14. Raw: $AGENT_TEXT"
+  fail "A2A — REGRESSION: hermes custom provider hit /v1/responses instead of chat_completions. Config.yaml should declare api_mode: chat_completions. See template-hermes#14. Sanitized: $AGENT_TEXT_SAFE"
 fi
 if echo "$AGENT_TEXT" | grep -qF "Unknown provider"; then
-  fail "A2A — REGRESSION: install.sh set PROVIDER to a value not in hermes's registry. Run 'hermes doctor' on the workspace to see valid values. Raw: $AGENT_TEXT"
+  fail "A2A — REGRESSION: install.sh set PROVIDER to a value not in hermes's registry. Run 'hermes doctor' on the workspace to see valid values. Sanitized: $AGENT_TEXT_SAFE"
 fi
 # "Invalid API key" — the comment block lists this as a CP #238 race
 # (tenant auth chain) signal but the grep was missing. Caller-side
 # 401's containing this exact phrase don't match the generic
 # "error|exception" catch-all below, so they'd slip through.
 if echo "$AGENT_TEXT" | grep -qF "Invalid API key"; then
-  fail "A2A — REGRESSION: tenant auth chain returned 'Invalid API key'. Likely CP boot-event 401 race (CP #238) or stale OPENAI_API_KEY in the runtime env. Raw: $AGENT_TEXT"
+  fail "A2A — REGRESSION: tenant auth chain returned 'Invalid API key'. Likely CP boot-event 401 race (CP #238) or stale OPENAI_API_KEY in the runtime env. Sanitized: $AGENT_TEXT_SAFE"
 fi
 # Provider quota exhausted — distinguish from a platform regression so
 # the canary alert names the operator action directly instead of falling
@@ -1666,7 +2069,7 @@ fi
 # with a provider-side 429, that is a billing event on the configured
 # OpenAI key, not a platform regression. Tracked in #2578.
 if echo "$AGENT_TEXT" | grep -qiE "exceeded your current quota|insufficient_quota"; then
-  fail "A2A — PROVIDER QUOTA EXHAUSTED (NOT a platform regression). Operator action: top up MOLECULE_STAGING_OPENAI_API_KEY billing or rotate to a higher-quota org at Settings → Secrets and Variables → Actions. Tracked in #2578. Raw: $AGENT_TEXT"
+  fail "A2A — PROVIDER QUOTA EXHAUSTED (NOT a platform regression). Operator action: top up MOLECULE_STAGING_OPENAI_API_KEY billing or rotate to a higher-quota org at Settings → Secrets and Variables → Actions. Tracked in #2578. Sanitized: $AGENT_TEXT_SAFE"
 fi
 # Empty-completion class — the agent runtime reached the LLM and got a
 # 2xx back, but the assistant turn carried NO text part (empty content,
@@ -1681,10 +2084,10 @@ fi
 # "error-shaped response" misdirects triage to workspace-server. Observed
 # 2026-06-03/04 across every staging canary on MODEL_SLUG=MiniMax-M2 (the
 # canary default since #2710) — 100% on the parent's first cold turn,
-# identical on main's scheduled synthetic E2E and on PRs (so it is an
-# environmental backend regression, never PR-introduced).
+# identical across the then-scheduled main synthetic and PR runs (so it was an
+# environmental backend regression, not PR-introduced).
 if echo "$AGENT_TEXT" | grep -qiF "message contained no text content"; then
-  fail "A2A — EMPTY COMPLETION (backend regression, NOT a platform/workspace-server bug). The configured model (MODEL_SLUG=${MODEL_SLUG:-?}) returned a 2xx completion with no text part; the runtime surfaced 'message contained no text content.'. Operator action: check the staging LLM backend / proxy for the canary model (the claude-code MiniMax-BYOK default is the BARE registered id MiniMax-M2.7 — the colon minimax:MiniMax-M2.7 is UNREGISTERED on claude-code, internal#718) — empty assistant turns, not an auth/quota/boot fault. Raw: $AGENT_TEXT"
+  fail "A2A — EMPTY COMPLETION (backend regression, NOT a platform/workspace-server bug). The configured model (MODEL_SLUG=${MODEL_SLUG:-?}) returned a 2xx completion with no text part; the runtime surfaced 'message contained no text content.'. Operator action: check the staging LLM backend / proxy for the canary model (the claude-code MiniMax-BYOK default is the BARE registered id MiniMax-M2.7 — the colon minimax:MiniMax-M2.7 is UNREGISTERED on claude-code, internal#718) — empty assistant turns, not an auth/quota/boot fault. Sanitized: $AGENT_TEXT_SAFE"
 fi
 # Generic catch-all — falls through if none of the known regressions hit.
 # _ResultError is the claude-code runtime surfacing an LLM/backend/runtime
@@ -1693,11 +2096,10 @@ fi
 # logs. The suite still fails; this is diagnostics-only.
 if echo "$AGENT_TEXT" | grep -qiF "_ResultError"; then
   diagnose_staging_result_error "$PARENT_ID" "$A2A_RESP" "A2A parent _ResultError"
-  _redacted_agent_text=$(printf '%s' "$AGENT_TEXT" | redact_secrets)
-  fail "A2A — STAGING LLM/BACKEND/RUNTIME FAILURE (_ResultError). The canary agent surfaced its LLM/backend/runtime error as a text payload. See the diagnostic burst above for the full A2A response, workspace state, and recent activity logs (including any upstream HTTP status/body the runtime reported). Raw (redacted): ${_redacted_agent_text:0:500}"
+  fail "A2A — STAGING LLM/BACKEND/RUNTIME FAILURE (_ResultError). The canary agent surfaced its LLM/backend/runtime error as a text payload. See the diagnostic burst above for the full A2A response, workspace state, and recent activity logs (including any upstream HTTP status/body the runtime reported). Sanitized: ${AGENT_TEXT_SAFE:0:500}"
 fi
 if echo "$AGENT_TEXT" | grep -qiE "error|exception"; then
-  fail "A2A returned an error-shaped response: $AGENT_TEXT"
+  fail "A2A returned an error-shaped response: $AGENT_TEXT_SAFE"
 fi
 
 # Content assertion — the prompt asks the model to reply with exactly "PONG".
@@ -1705,10 +2107,10 @@ fi
 # that echoes the prompt back or returns truncated context won't. Normalize
 # to uppercase before matching to tolerate "pong" / "Pong".
 if ! echo "$AGENT_TEXT" | tr '[:lower:]' '[:upper:]' | grep -qF "PONG"; then
-  fail "A2A reply didn't contain expected PONG token. Real: $AGENT_TEXT"
+  fail "A2A reply didn't contain expected PONG token. Sanitized: $AGENT_TEXT_SAFE"
 fi
 
-ok "A2A parent round-trip succeeded: \"${AGENT_TEXT:0:80}\""
+ok "A2A parent round-trip succeeded: \"${AGENT_TEXT_SAFE:0:80}\""
 
 # ─── 8b. Real-completion known-answer round-trip (CORE GATE, #1994) ────
 # The existing PONG check + generic error grep above already do a lot, but
@@ -1784,6 +2186,12 @@ if [ -z "$KA_TEXT" ]; then
 fi
 # CORE GATE: contains PINEAPPLE (real round-trip) AND no error-as-text.
 a2a_assert_real_completion "$KA_TEXT" "PINEAPPLE" "A2A known-answer (parent, $RUNTIME/$MODEL_SLUG)"
+
+# ─── 8c retired: the goal is now seeded DETERMINISTICALLY at provision time
+# via the MOLECULE_IDLE_GOAL workspace secret (runtime goal-state
+# bootstrap_from_env). The prior A2A "call goal_set" seed acked GOALSET twice
+# in CI without the tool ever persisting a goal — LLM tool-follow is not a
+# gate-grade mechanism. The fire assertion in the wrapper is unchanged.
 # Real, deterministic LLM round-trip proven — the load-bearing milestone for
 # the fail-closed-on-skip guard. Stamped AFTER a2a_assert_real_completion (not
 # after the looser PONG check) so the milestone means a verified completion,
@@ -1974,6 +2382,9 @@ print(json.dumps({
     fail "HMA memory not readable after write (http=$MEM_LIST_CODE). List: $(printf '%s' "$MEM_LIST" | sanitize_http_body | head -c 200)"
   fi
   ok "HMA memory write+read roundtripped"
+  # Milestone: HMA memory write+read roundtripped against the live workspace
+  # (RFC #4428 Phase 2). Stamped ONLY here, after the hard read-back assertion.
+  live_milestone memory_online
 
   log "9b.  Peer discovery + activity log smoke..."
   # FAIL-CLOSED: assert a real 2xx, not merely "not 404". The previous
@@ -2051,7 +2462,7 @@ print(len(d if isinstance(d, list) else d.get('events', [])))" "$ACTIVITY_TMP" 2
   # 2. read back, capture version
   EDIT_GET=$(tenant_call GET "/workspaces/$PARENT_ID/memory/$EDIT_KEY")
   EDIT_VER=$(echo "$EDIT_GET" | python3 -c "import json,sys; print(json.load(sys.stdin)['version'])" 2>/dev/null || echo "")
-  [ -z "$EDIT_VER" ] && fail "memory KV GET missing version field. Body: ${EDIT_GET:0:200}"
+  [ -z "$EDIT_VER" ] && fail "memory KV GET missing version field. Body: $(printf '%s' "$EDIT_GET" | sanitize_http_body | head -c 200)"
 
   # 3. conditional update with matching version
   tenant_call POST "/workspaces/$PARENT_ID/memory" \
@@ -2062,7 +2473,7 @@ print(len(d if isinstance(d, list) else d.get('events', [])))" "$ACTIVITY_TMP" 2
   # 4. value flipped + version incremented?
   EDIT_GET2=$(tenant_call GET "/workspaces/$PARENT_ID/memory/$EDIT_KEY")
   EDIT_VAL2=$(echo "$EDIT_GET2" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'].get('step'))" 2>/dev/null || echo "")
-  [ "$EDIT_VAL2" = "2" ] || fail "memory KV Edit did not persist new value. Body: ${EDIT_GET2:0:200}"
+  [ "$EDIT_VAL2" = "2" ] || fail "memory KV Edit did not persist new value. Body: $(printf '%s' "$EDIT_GET2" | sanitize_http_body | head -c 200)"
 
   # 5. stale-version POST must 409 — pin the optimistic-lock contract.
   #
@@ -2082,7 +2493,7 @@ print(len(d if isinstance(d, list) else d.get('events', [])))" "$ACTIVITY_TMP" 2
     -o /tmp/memory_stale_resp.txt -w "%{http_code}" >/tmp/memory_stale_code.txt 2>/dev/null
   set -e
   EDIT_STALE_CODE=$(cat /tmp/memory_stale_code.txt 2>/dev/null || echo "000")
-  [ "$EDIT_STALE_CODE" = "409" ] || fail "memory KV stale Edit must 409 (optimistic-lock). Got '$EDIT_STALE_CODE': $(cat /tmp/memory_stale_resp.txt 2>/dev/null | head -c 200)"
+  [ "$EDIT_STALE_CODE" = "409" ] || fail "memory KV stale Edit must 409 (optimistic-lock). Got '$EDIT_STALE_CODE': $(cat /tmp/memory_stale_resp.txt 2>/dev/null | sanitize_http_body | head -c 200)"
 
   # cleanup
   tenant_call DELETE "/workspaces/$PARENT_ID/memory/$EDIT_KEY" >/dev/null 2>&1 || true
@@ -2093,14 +2504,19 @@ print(len(d if isinstance(d, list) else d.get('events', [])))" "$ACTIVITY_TMP" 2
   # were removed; team-shared knowledge now flows through memory v2's
   # team:<id> namespace. If anyone re-introduces a shared-context endpoint
   # without going through RFC #2789, this gate fires.
-  set +e
-  SC_CODE=$(tenant_call GET "/workspaces/$PARENT_ID/shared-context" \
-    -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
-  set -e
-  if [ "$SC_CODE" = "200" ]; then
-    fail "shared-context route should be gone but returned 200 — regression. See task #304."
+  SC_BODY=$(mktemp -t shared_context_body.XXXXXX)
+  SC_CODE_FILE=$(mktemp -t shared_context_code.XXXXXX)
+  E2E_TMP_FILES+=("$SC_BODY" "$SC_CODE_FILE")
+  capture_http_status "$SC_CODE_FILE" \
+    tenant_call GET "/workspaces/$PARENT_ID/shared-context" \
+    -o "$SC_BODY" -w "%{http_code}"
+  SC_CODE="$HTTP_CAPTURE_CODE"
+  SC_CURL_RC="$HTTP_CAPTURE_RC"
+  if ! http_code_is_exact_removed_route "$SC_CODE" "$SC_CURL_RC"; then
+    fail "shared-context route removal requires exact HTTP 404 + curl rc 22, got HTTP $SC_CODE + curl rc $SC_CURL_RC: $(head -c 300 "$SC_BODY" | sanitize_http_body)"
   fi
-  ok "shared-context route confirmed removed (HTTP $SC_CODE)"
+  ok "shared-context route confirmed removed (exact HTTP 404 + curl rc 22)"
+  rm -f "$SC_BODY" "$SC_CODE_FILE"
 else
   log "9/11 Canary mode — skipping HMA / peers / activity / memory-edit / shared-context-gone"
 fi
@@ -2165,7 +2581,32 @@ except Exception:
     # workspace, not as the tenant admin. Must still send X-Molecule-Org-Id
     # or TenantGuard 404s — previously missing, caused section 10 to
     # fail rc=22 despite everything upstream being correct (2026-04-21).
-    DELEG_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$TENANT_URL/workspaces/$CHILD_ID/a2a" \
+    # Override CURL_COMMON's --max-time 30 for THIS call only, matching the
+    # budget a2a_send_or_poll_queue uses for the PARENT leg (--max-time 90).
+    #
+    # `message/send` is SYNCHRONOUS: the response carries the child's finished
+    # reply, which this step then reads as result.parts[0].text. So this POST
+    # waits out a full agent turn on a freshly-created CHILD workspace — cold
+    # adapter start, TLS to the LLM endpoint, first prompt, first token. The
+    # comment on the parent leg records why 30s cannot cover that: cold-call
+    # latency "routinely exceeds 30s on the first request after workspace boot",
+    # with observed P95 ~25-30s.
+    #
+    # This leg is raw curl (see below) because it authenticates as the PARENT
+    # workspace token rather than the tenant admin, and in being hand-rolled it
+    # silently inherited the generic 30s cap that the parent leg overrides. The
+    # result was a REQUIRED gate failing as
+    #   Delegation A2A POST failed after 1 attempt(s) (curl_rc=28, http=000)
+    # twice on 2026-07-30 (core#4961 08:59, core#4958 11:08) — curl_rc=28 is
+    # "operation timed out", http=000 means no response was ever received.
+    #
+    # Deliberately a TIMEOUT fix, not a retry: the retry loop below is scoped to
+    # cold-start HTTP statuses, and rc=28 is MAYBE-PROCESSED — the child may be
+    # mid-turn — so re-POSTing risks double-delivering the delegation. This is
+    # the same reasoning lib/workspace_create_retry.sh encodes as
+    # "curl timeout 28 → no retry" for the non-idempotent create.
+    DELEG_CODE=$(curl "${CURL_COMMON[@]}" --max-time "${E2E_DELEG_A2A_TIMEOUT_SECS:-90}" \
+      -X POST "$TENANT_URL/workspaces/$CHILD_ID/a2a" \
       -H "Authorization: Bearer $PARENT_WS_TOKEN" \
       -H "X-Molecule-Org-Id: $ORG_ID" \
       "${TENANT_ROUTE_HDRS[@]}" \
@@ -2211,8 +2652,9 @@ try:
 except Exception:
     print('')
 " 2>/dev/null || echo "")
-  [ -z "$DELEG_TEXT" ] && fail "Delegation returned no text. Raw: ${DELEG_RESP:0:200}"
-  ok "Delegation proxy works (child responded: \"${DELEG_TEXT:0:60}\")"
+  [ -z "$DELEG_TEXT" ] && fail "Delegation returned no text. Sanitized: $(printf '%s' "$DELEG_RESP" | sanitize_http_body | head -c 200)"
+  DELEG_TEXT_SAFE=$(printf '%s' "$DELEG_TEXT" | sanitize_http_body)
+  ok "Delegation proxy works (child responded: \"${DELEG_TEXT_SAFE:0:60}\")"
 
   # FAIL-CLOSED via bounded readiness-POLL (was soft-logged false-green).
   # The activity pipeline is async, so an immediate single read can miss the
@@ -2247,6 +2689,10 @@ except Exception:
   done
   if [ "$CHILD_ACT_SEEN" = "1" ]; then
     ok "Child activity log records parent as source"
+    # Milestone: delegation provenance proven — the child's activity log records
+    # the parent as source_id after a real agent→agent A2A (RFC #4428 Phase 2).
+    # Stamped ONLY on the hard-asserted success branch (the else branch fails).
+    live_milestone delegation_provenance
   else
     fail "Child activity log never referenced parent $PARENT_ID within ${E2E_CHILD_ACTIVITY_TIMEOUT_SECS:-60}s (last http=$CHILD_ACT_LASTCODE) — delegation-provenance pipeline regression (parent not recorded as source). Previously soft-logged → false-green."
   fi
@@ -2259,7 +2705,7 @@ fi
 # coverage. Each transition is asserted against the live DB-backed status the
 # GET /workspaces/:id endpoint returns, so a regression in the Pause/Resume/
 # Hibernate handlers (workspace_restart.go) or their CP stop/re-provision
-# wiring fails the gate instead of silently leaking an EC2 / wedging a tenant.
+# wiring fails the gate instead of leaving runtime resources or wedging a tenant.
 #
 # Contract (workspace_restart.go):
 #   POST /pause     online → 'paused'  (container stopped, url cleared)  {"status":"paused"}
@@ -2310,6 +2756,10 @@ if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
       fail "Cascade guard: POST /workspaces/\$PARENT_ID/pause (no ?cascade) must be REFUSED with 409 + the descendant list while child $CHILD_ID is live — got http=$CASC_CODE. A regression here lets a parent pause strand its running children. Body: $(printf '%s' "$CASC_BODY" | sanitize_http_body | head -c 200)"
     fi
     ok "    cascade guard: parent pause refused while a child is live (HTTP 409)"
+    # Milestone: cascade guard proven — a parent pause with a live child is
+    # REFUSED 409 + descendant list (RFC #4428 Phase 2). Stamped inside the
+    # CHILD_ID branch, after the hard 409+"descendants" assertion.
+    live_milestone cascade_guard
   fi
 
   lifecycle_status() {  # echoes the live workspace status
@@ -2337,7 +2787,7 @@ if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
   # ── pause → paused ──
   PAUSE_RESP=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/pause" 2>/dev/null || echo '{}')
   PAUSE_STATUS=$(echo "$PAUSE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
-  [ "$PAUSE_STATUS" = "paused" ] || fail "Pause: POST /pause returned status='$PAUSE_STATUS' (expected 'paused'). Body: ${PAUSE_RESP:0:200}"
+  [ "$PAUSE_STATUS" = "paused" ] || fail "Pause: POST /pause returned status='$PAUSE_STATUS' (expected 'paused'). Body: $(printf '%s' "$PAUSE_RESP" | sanitize_http_body | head -c 200)"
   # Poll the DB-backed status — the response body could lie; the GET proves the row.
   wait_status "paused" 120 "pause" || fail "Pause: workspace $LIFECYCLE_WS never settled at status=paused (DB row) — Pause handler / CP stop regression (workspace_restart.go Pause)."
   ok "    pause → paused (DB-verified)"
@@ -2345,29 +2795,218 @@ if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
   # ── resume → provisioning → online ──
   RESUME_RESP=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/resume" 2>/dev/null || echo '{}')
   RESUME_STATUS=$(echo "$RESUME_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
-  [ "$RESUME_STATUS" = "provisioning" ] || fail "Resume: POST /resume returned status='$RESUME_STATUS' (expected 'provisioning'). Body: ${RESUME_RESP:0:200}"
+  [ "$RESUME_STATUS" = "provisioning" ] || fail "Resume: POST /resume returned status='$RESUME_STATUS' (expected 'provisioning'). Body: $(printf '%s' "$RESUME_RESP" | sanitize_http_body | head -c 200)"
   # Resume re-provisions from the preserved config volume; reuse the same
-  # online+routable readiness boundary the initial boot used (no fresh EC2
-  # cold-start, but CP re-provision + heartbeat recovery can still take minutes).
+  # online+routable readiness boundary the initial boot used; CP re-provision +
+  # heartbeat recovery can still take minutes.
   wait_workspaces_online_routable "    Waiting for the leaf workspace to return online after resume (up to $((WORKSPACE_ONLINE_TIMEOUT_SECS/60)) min)..." "$LIFECYCLE_WS"
   ok "    resume → provisioning → online (DB-verified)"
+  # Milestone: pause→resume lifecycle proven — leaf DB-verified paused, then
+  # resumed back to online/routable (RFC #4428 Phase 2). Stamped after both the
+  # pause and resume DB-verified assertions above complete.
+  live_milestone lifecycle_pause_resume
 
-  # ── hibernate → hibernated ──
-  HIB_RESP=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/hibernate?force=true" 2>/dev/null || echo '{}')
-  HIB_STATUS=$(echo "$HIB_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
-  [ "$HIB_STATUS" = "hibernated" ] || fail "Hibernate: POST /hibernate?force=true returned status='$HIB_STATUS' (expected 'hibernated'). Body: ${HIB_RESP:0:200}"
-  # The handler runs the claim→stop→'hibernated' sequence; poll the DB row to
-  # confirm it landed on 'hibernated' (not stuck mid-'hibernating').
+  # ── hibernate (force coverage: core#4292/#4293) ──
+  # force-hibernate only MEANS anything on a BUSY workspace. On an idle one, the
+  # atomic claim's force-path (which DROPS the `active_tasks = 0` predicate) is
+  # indistinguishable from the non-force path, so an idle hibernate cannot tell a
+  # working `force` from a broken one. core#4292 slipped this very gate for exactly
+  # that reason: 10b hibernated an IDLE leaf, `?force=true` answered 200 while the
+  # atomic claim (still carrying `AND active_tasks = 0`) matched no row and stopped
+  # nothing — the workspace stayed online and billing. #4293 fixed the claim; this
+  # step now PROVES the fix by driving a genuinely busy workspace first.
   #
-  # Do NOT trust the 200 above on its own. This is the step that caught core#4292:
-  # ?force=true skipped the handler's active-tasks 409 but never reached the atomic
-  # claim's `active_tasks = 0` predicate, so the claim matched no row, nothing was
-  # stopped, and the handler still answered 200 {"status":"hibernated"} — satisfying
-  # the HIB_STATUS assertion above while the workspace stayed online and billing.
-  # The DB row is the only witness that cannot be talked out of the truth. Keep this
-  # assertion even if the response check looks redundant: it is not.
-  wait_status "hibernated" 120 "hibernate" || fail "Hibernate: workspace $LIFECYCLE_WS never settled at status=hibernated (DB row) even though POST /hibernate?force=true answered '$HIB_STATUS'. The API claimed success and the row disagrees — suspect a no-op hibernate (atomic claim matched no row) before suspecting the container stop."
-  ok "    hibernate → hibernated (DB-verified)"
+  # active_tasks is heartbeat-fed (the agent self-reports its in-flight turn count
+  # every ~30s). Two ways to make the workspace busy, selected by E2E_BUSY_INJECT:
+  #
+  #   * E2E_BUSY_INJECT=1 (the ephemeral gate — task #92): the tenant image is
+  #     built with `-tags e2e_busy_inject`, which exposes POST
+  #     /workspaces/:id/test-busy. It pins active_tasks to a floor synchronously
+  #     (and holds it across heartbeats), so busy is DETERMINISTIC without a real
+  #     LLM turn. This route exists ONLY in the tag-built throwaway tenant image;
+  #     it is absent (404) from every shipped/staging binary. A non-busy 10b under
+  #     this mode is a hard red (see E2E_HIBERNATE_FORCE_BUSY_REQUIRED below).
+  #
+  #   * default (staging lanes, untagged images): drive a real long turn and poll
+  #     until the DB reflects it — best-effort by nature. CAPTURE-FIRST /
+  #     SOAK-TO-ENFORCE: when provably busy we run the strict force-coverage
+  #     assertions (a)+(b); otherwise we LOG LOUD and fall back to the idle
+  #     force-hibernate (a valid transition, not force-coverage) unless
+  #     E2E_HIBERNATE_FORCE_BUSY_REQUIRED=1 makes a failed drive fatal.
+
+  # Deterministic busy via the test-only inject route (E2E_BUSY_INJECT=1). Pins
+  # active_tasks=1 in the same DB column the hibernate 409 guard + atomic claim
+  # read, then confirms GET reflects it. Returns 0 iff active_tasks>0 was
+  # established. A 404 here means the tenant image was NOT built with the
+  # e2e_busy_inject tag — a wiring error the operator must fix, not a soft skip.
+  _hib_busy_inject() {
+    local bi_tmp bi_code cur deadline
+    bi_tmp=$(mktemp -t hib_inject.XXXXXX)
+    set +e
+    bi_code=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/test-busy" --max-time 20 \
+      -H "Content-Type: application/json" -d '{"active_tasks":1,"is_busy":true}' \
+      -o "$bi_tmp" -w '%{http_code}' 2>/dev/null)
+    set -e
+    bi_code=${bi_code:-000}
+    if [ "$bi_code" != "200" ]; then
+      log "    busy-inject: POST /test-busy → http=$bi_code (expected 200). If 404, the tenant image lacks -tags e2e_busy_inject. Body: $(cat "$bi_tmp" 2>/dev/null | sanitize_http_body | head -c 200)"
+      rm -f "$bi_tmp"
+      return 1
+    fi
+    rm -f "$bi_tmp"
+    # Confirm the DB reflects it. The sticky floor keeps active_tasks>=1 across
+    # heartbeats, so a single confirming read is sufficient and stable.
+    deadline=$(( $(date +%s) + 30 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      cur=$(tenant_call GET "/workspaces/$LIFECYCLE_WS" 2>/dev/null \
+        | python3 -c "import json,sys; print(int(json.load(sys.stdin).get('active_tasks') or 0))" 2>/dev/null || echo 0)
+      log "    busy-inject poll: active_tasks=${cur:-?} (want >0)"
+      if [ "${cur:-0}" -gt 0 ] 2>/dev/null; then
+        log "    active_tasks=$cur — workspace is busy via test-inject (deterministic)"
+        return 0
+      fi
+      sleep 3
+    done
+    return 1
+  }
+
+  # Release a previously-injected hold so post-wake heartbeats stop reporting busy
+  # (the sticky floor would otherwise re-raise active_tasks after the workspace
+  # wakes). No-op / harmless when the route is absent.
+  _hib_busy_release() {
+    tenant_call POST "/workspaces/$LIFECYCLE_WS/test-busy" --max-time 20 \
+      -H "Content-Type: application/json" -d '{"active_tasks":0}' \
+      -o /dev/null -w '' 2>/dev/null || true
+    log "    busy-inject: released active_tasks hold"
+  }
+
+  # Drive a long, model-independent in-flight turn WITHOUT draining the queue, so
+  # the turn stays live while we fire the two hibernate calls. Returns 0 once
+  # GET /workspaces/:id reports active_tasks>0 (the same column the handler's 409
+  # guard and atomic claim read — so the witness and the decision agree).
+  _hib_busy_drive() {
+    # Deterministic path first when the gate armed it.
+    if [ "${E2E_BUSY_INJECT:-0}" = "1" ]; then
+      _hib_busy_inject && return 0
+      return 1
+    fi
+    local sleep_secs="${E2E_HIBERNATE_BUSY_SLEEP_SECS:-180}"
+    local wait_secs="${E2E_HIBERNATE_BUSY_WAIT_SECS:-150}"
+    local busy_payload deadline cur bd_tmp bd_code bd_qid bd_attempt
+    busy_payload=$(python3 -c "
+import json, uuid
+secs = ${sleep_secs}
+print(json.dumps({
+    'jsonrpc': '2.0', 'method': 'message/send', 'id': 'e2e-busy-1',
+    'params': {'message': {'role': 'user',
+        'messageId': f'e2e-busy-{uuid.uuid4().hex[:8]}',
+        'parts': [{'kind': 'text', 'text':
+            'Platform lifecycle test. Using your shell/bash tool, run exactly this one '
+            f'command and wait for it to finish: sleep {secs}. Then reply with the single '
+            'token BUSYDONE. Do nothing else.'}]}}}))
+")
+    # Send the long turn, retrying the transient post-resume 5xx ("agent
+    # restarting" / "waking") the same way the wake path does — the leaf has just
+    # come back from resume, so its agent may still be booting. Do NOT drain the
+    # queue: we want the turn left in flight. Log the send outcome (queue_id) so a
+    # soak run shows whether the turn was even accepted.
+    bd_tmp=$(mktemp -t hib_busy.XXXXXX)
+    for bd_attempt in $(seq 1 8); do
+      : >"$bd_tmp"
+      # CURL_COMMON carries --fail-with-body, so curl EXITS NON-ZERO on 4xx/5xx
+      # while still writing the code via -w. A trailing `|| echo 000` would
+      # CONCATENATE onto that code ("503" -> "503000"), breaking the numeric and
+      # regex checks below. This function is called in `if` context so errexit is
+      # ignored throughout its body — capture the code directly, no `||`.
+      bd_code=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/a2a" --max-time 30 \
+        -H "Content-Type: application/json" \
+        -d "$busy_payload" -o "$bd_tmp" -w '%{http_code}' 2>/dev/null)
+      bd_code=${bd_code:-000}
+      if [ "$bd_code" -ge 200 ] 2>/dev/null && [ "$bd_code" -lt 300 ] 2>/dev/null; then
+        bd_qid=$(python3 -c "import json,sys; d=json.load(open('$bd_tmp')); print(d.get('queue_id') or d.get('id') or '')" 2>/dev/null || echo "")
+        log "    busy-drive A2A accepted (http=$bd_code queue_id=${bd_qid:-<none>}) — long turn in flight"
+        break
+      fi
+      if echo "$bd_code" | grep -Eq '^(502|503|504)$' && [ "$bd_attempt" -lt 8 ]; then
+        log "    busy-drive A2A attempt $bd_attempt/8: http=$bd_code (agent restarting) — backing off 15s"
+        sleep 15
+        continue
+      fi
+      log "    busy-drive A2A send got http=$bd_code (non-retryable): $(cat "$bd_tmp" 2>/dev/null | sanitize_http_body | head -c 160)"
+      break
+    done
+    rm -f "$bd_tmp"
+    # Poll active_tasks over several heartbeats (~30s cadence). Log EACH reading so
+    # a soak run shows whether the count ever leaves 0 (distinguishes "agent never
+    # ran the turn" from "turn ran but active_tasks not reported / too brief").
+    deadline=$(( $(date +%s) + wait_secs ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      cur=$(tenant_call GET "/workspaces/$LIFECYCLE_WS" 2>/dev/null \
+        | python3 -c "import json,sys; print(int(json.load(sys.stdin).get('active_tasks') or 0))" 2>/dev/null || echo 0)
+      log "    busy-drive poll: active_tasks=${cur:-?} (want >0)"
+      if [ "${cur:-0}" -gt 0 ] 2>/dev/null; then
+        log "    active_tasks=$cur — workspace is genuinely busy"
+        return 0
+      fi
+      sleep 10
+    done
+    return 1
+  }
+
+  if _hib_busy_drive; then
+    # (a) non-force hibernate on a BUSY workspace → 409, echoing the live count.
+    #     CURL_COMMON carries --fail-with-body → curl EXITS NON-ZERO on the
+    #     expected 409, still writing the code via -w. `|| echo 000` would
+    #     concatenate ("409" -> "409000") and defeat the 409 check, so capture
+    #     under a local `set +e` (this runs in the then-branch, errexit is live).
+    _NF_TMP=$(mktemp -t hib_nf.XXXXXX)
+    set +e
+    _NF_CODE=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/hibernate" --max-time 30 \
+      -o "$_NF_TMP" -w '%{http_code}' 2>/dev/null)
+    set -e
+    _NF_CODE=${_NF_CODE:-000}
+    _NF_AT=$(python3 -c "import json,sys; print(int(json.load(open('$_NF_TMP')).get('active_tasks') or 0))" 2>/dev/null || echo 0)
+    [ "$_NF_CODE" = "409" ] || fail "Hibernate(busy): non-force POST /hibernate returned http=$_NF_CODE (expected 409 active-tasks conflict). A busy workspace must refuse a non-force hibernate. Body: $(cat "$_NF_TMP" 2>/dev/null | sanitize_http_body | head -c 200)"
+    rm -f "$_NF_TMP"
+    # The 409 CODE is the hard assertion (busyness is already proven by the
+    # active_tasks>0 poll that gated entry to this branch). The count in the
+    # conflict body is corroborating, not contractual — log it, don't couple
+    # a red to its exact shape.
+    if [ "${_NF_AT:-0}" -gt 0 ] 2>/dev/null; then
+      ok "    non-force hibernate on BUSY ws → 409 (active_tasks=$_NF_AT)"
+    else
+      ok "    non-force hibernate on BUSY ws → 409 (body active-task count absent/0; code is authoritative)"
+    fi
+
+    # (b) force hibernate on the SAME busy workspace → must terminate the in-flight
+    #     task AND land 'hibernated' in the DB. This is the exact #4293 assertion:
+    #     an idle-only test can never reach it.
+    HIB_RESP=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/hibernate?force=true" 2>/dev/null || echo '{}')
+    HIB_STATUS=$(echo "$HIB_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+    [ "$HIB_STATUS" = "hibernated" ] || fail "Hibernate(busy,force): POST /hibernate?force=true returned status='$HIB_STATUS' (expected 'hibernated'). Body: $(printf '%s' "$HIB_RESP" | sanitize_http_body | head -c 200)"
+    wait_status "hibernated" 120 "hibernate-force-busy" || fail "Hibernate(busy,force): workspace $LIFECYCLE_WS never settled at status=hibernated (DB row) after force on a BUSY workspace — core#4293 regression: force must drop the active_tasks=0 claim predicate, terminate the in-flight task, and stop the container, not no-op to a lying 200."
+    ok "    force hibernate on BUSY ws → hibernated (DB-verified; core#4293 covered)"
+    # Release any injected busy hold now that the force-on-busy assertions passed,
+    # so the workspace can wake IDLE below (the sticky floor would otherwise
+    # re-raise active_tasks on the post-wake heartbeats). No-op under the
+    # real-turn drive (the route is absent / the hold was never set).
+    if [ "${E2E_BUSY_INJECT:-0}" = "1" ]; then _hib_busy_release; fi
+  else
+    # Busy-drive did not establish active_tasks>0 within the bound. Under the soak
+    # default this is a LOUD non-fatal fallback (the run still exercises the idle
+    # transition); flip E2E_HIBERNATE_FORCE_BUSY_REQUIRED=1 once the drive is proven
+    # reliable to make this a hard red instead.
+    if [ "${E2E_HIBERNATE_FORCE_BUSY_REQUIRED:-0}" = "1" ]; then
+      fail "Hibernate(force coverage): could not drive active_tasks>0 within ${E2E_HIBERNATE_BUSY_WAIT_SECS:-120}s (runtime never self-reported an in-flight turn). With E2E_HIBERNATE_FORCE_BUSY_REQUIRED=1 this is fatal — the gate must genuinely exercise force on a busy workspace (task #92)."
+    fi
+    log "    WARN[task#92 soak]: could not establish active_tasks>0 within the bound (runtime busy-report timing, or the agent did not run the sleep turn). Falling back to IDLE force-hibernate — this run does NOT cover the force-on-busy class (core#4293)."
+    HIB_RESP=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/hibernate?force=true" 2>/dev/null || echo '{}')
+    HIB_STATUS=$(echo "$HIB_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+    [ "$HIB_STATUS" = "hibernated" ] || fail "Hibernate(idle fallback): POST /hibernate?force=true returned status='$HIB_STATUS' (expected 'hibernated'). Body: $(printf '%s' "$HIB_RESP" | sanitize_http_body | head -c 200)"
+    # Even the idle path polls the DB row — the 200 alone was the #4292 lie.
+    wait_status "hibernated" 120 "hibernate" || fail "Hibernate(idle fallback): workspace $LIFECYCLE_WS never settled at status=hibernated (DB row) even though POST /hibernate?force=true answered '$HIB_STATUS' — suspect a no-op hibernate (atomic claim matched no row) before suspecting the container stop."
+    ok "    hibernate → hibernated (DB-verified; idle fallback, force-on-busy NOT covered this run)"
+  fi
 
   # ── resume-from-hibernate via auto-wake on next A2A ──
   # A hibernated workspace auto-wakes on the next incoming A2A message/send
@@ -2422,9 +3061,1228 @@ print(json.dumps({
   wait_status "online" "$WORKSPACE_ONLINE_TIMEOUT_SECS" "hibernate-wake" \
     || fail "Hibernate auto-wake: workspace $LIFECYCLE_WS never returned to status=online after a wake A2A (last A2A http=$WAKE_CODE) — auto-wake-on-message regression (a hibernated ws must re-provision on the next A2A)."
   ok "    hibernate → online via auto-wake A2A (DB-verified)"
+  # Milestone: idle force-hibernate → auto-wake → online proven, DB-verified
+  # (RFC #4428 Phase 2). Stamped at the SHARED auto-wake success — reached by
+  # both the busy and idle-fallback hibernate branches — so it is NOT contingent
+  # on the best-effort busy-drive (the force-on-busy #4293 coverage is task #92,
+  # capture-first, and deliberately NOT gated to this milestone).
+  live_milestone lifecycle_hibernate_wake
   ok "Lifecycle transitions passed: pause→resume→online + hibernate→wake→online"
 else
   log "10b/11 Lifecycle transitions skipped (MODE=$MODE, E2E_LIFECYCLE=${E2E_LIFECYCLE:-auto}) — pause/resume/hibernate only run in full mode with E2E_LIFECYCLE!=off."
+fi
+
+# ─── 10c. Idle-digest poll (task #219, E2E_IDLE_DIGEST_CHECK=on only) ──
+# Poll while the workspaces are alive until the digest has actually completed.
+# The runtime posts the digest through a real synchronous A2A/LLM call; that
+# completion can legitimately outlive a fixed `fire_seconds * N` sleep. Durable
+# goal-state (`last_included_at`) is the authoritative witness across container
+# replacement, with the current container log retained as a second signal.
+if [ "${E2E_IDLE_DIGEST_CHECK:-}" = "on" ]; then
+  _IDLE_TIMEOUT_SECS="${E2E_IDLE_DIGEST_TIMEOUT_SECS:-360}"
+  _IDLE_POLL_SECS="${E2E_IDLE_DIGEST_POLL_SECS:-10}"
+
+  # The enabled assertion requires the ephemeral topology's shared Docker
+  # daemon. A missing CLI/socket is a broken gate, not permission to skip it.
+  if idle_digest_require_docker; then
+    _ID_FIRED=""
+
+    idle_digest_probe() {
+      local _idc
+      _ID_FIRED=""
+      while IFS= read -r _idc; do
+        [ -n "$_idc" ] || continue
+        # Container logs are useful when the same container survives. Durable
+        # goal state survives CP-driven replacement under the same name and is
+        # written only after a successful digest post.
+        if docker logs "$_idc" 2>&1 | grep -F "Idle digest: fired" >/dev/null; then
+          _ID_FIRED="$_idc (runtime log)"
+          return 0
+        fi
+        if docker exec "$_idc" sh -c \
+          'grep -Eq "^last_included_at:[[:space:]]*[^[:space:]]" /workspace/.molecule/idle-prompt/providers/goal-state/goal.yaml' \
+          >/dev/null 2>&1; then
+          _ID_FIRED="$_idc (durable last_included_at)"
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    idle_digest_diagnostics() {
+      local _idc _idenv _idgoal
+      while IFS= read -r _idc; do
+        [ -n "$_idc" ] || continue
+        _idenv=$(docker exec "$_idc" sh -c 'env | grep -E "^MOLECULE_(IDLE|MAILBOX)" | sort | tr "\n" " "' 2>/dev/null || echo "exec-failed")
+        _idgoal=$(docker exec "$_idc" sh -c 'cat /workspace/.molecule/idle-prompt/providers/goal-state/goal.yaml 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 500)
+        log "    [idle-digest diag] $_idc env: ${_idenv:-none}"
+        log "    [idle-digest diag] $_idc goal.yaml: ${_idgoal:-ABSENT}"
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+    }
+
+    log "10c/11 Idle-digest: polling durable completion evidence for up to ${_IDLE_TIMEOUT_SECS}s (fire threshold=${E2E_IDLE_FIRE_SECONDS:-30}s; poll=${_IDLE_POLL_SECS}s)."
+    if idle_digest_wait "$_IDLE_TIMEOUT_SECS" "$_IDLE_POLL_SECS" idle_digest_probe; then
+      ok "    idle-digest FIRED (evidence: $_ID_FIRED)"
+    else
+      idle_digest_diagnostics
+      fail "Idle digest never completed within ${_IDLE_TIMEOUT_SECS}s — env + durable goal diagnostics above name the broken leg (task #219 sub-step)."
+    fi
+
+    unset -f idle_digest_probe idle_digest_diagnostics
+  else
+    fail "E2E_IDLE_DIGEST_CHECK=on requires a usable Docker CLI and daemon to inspect completion evidence."
+  fi
+fi
+
+# ─── 10d. Scheduler autonomous-fire (task #37, E2E_SCHEDULER_CHECK=on only) ──
+# End-to-end proof of scheduler-as-trigger-plugin (RFC): the workspace declared
+# the molecule-scheduler kind:trigger plugin at provision (secret-injection block
+# above), so it boot-installed the plugin and armed the trigger daemon. This step
+# creates a once-a-minute schedule through the SAME tenant API a user would, then
+# waits for the daemon to autonomously FIRE it — exercising the full chain:
+#   declare → boot-install → arm daemon → advertise `scheduler` capability →
+#   create routes to the runtime volume grid → daemon polls grid → self-schedules
+#   a turn (writes schedule-history.json + logs "fired schedule").
+# The whole step is behind E2E_SCHEDULER_CHECK so it stays dark until the
+# ephemeral runtime pin carries plugin boot-install + the trigger scaffold; once
+# on, its fail arms are REACHABLE (create-4xx and never-fired are distinct hard
+# failures, each with capability/grid/health diagnostics).
+if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
+  # NOTE: there is deliberately no fixed fire budget here any more. The fire
+  # wait (10d.4) is signal-driven and derives its never-hit backstop from the
+  # daemon's own delivery watchdog; E2E_SCHEDULER_TIMEOUT_SECS still overrides
+  # that backstop for callers who set it, but only UPWARDS — an override at or
+  # below the watchdog is refused outright (see e2e_scheduler_backstop_secs).
+  #
+  # On job cost: 10d fire, 10g fire and 10g DELIVER each carry a derived 1800s
+  # backstop, but at most ONE of them is ever reachable in a run — each leg
+  # `fail`s (exits) rather than continuing, so a run that reaches a later
+  # backstop necessarily passed the earlier ones on their signal, in seconds.
+  # The worst case is therefore one 1800s backstop, which is the exposure the
+  # two fire legs have already carried since the wait became signal-driven.
+  _SCHED_POLL_SECS="${E2E_SCHEDULER_POLL_SECS:-10}"
+  # Bounded pre/post-create waits that CLOSE the #4448 arm race instead of hiding
+  # it behind a longer fire timeout. cap-ready gates the create on the trigger
+  # daemon having armed (necessary precondition); create-verify then re-issues the
+  # create through the capability-advertisement lag until the schedule is CONFIRMED
+  # on the runtime volume grid — so a create that silently mis-routed to the
+  # retired DB (native-scheduler not advertised in core yet) is retried into place
+  # rather than firing nowhere for the whole fire wait (armed:0).
+  _SCHED_CAP_TIMEOUT_SECS="${E2E_SCHEDULER_CAP_TIMEOUT_SECS:-120}"
+  _SCHED_CREATE_TIMEOUT_SECS="${E2E_SCHEDULER_CREATE_TIMEOUT_SECS:-120}"
+  # A run-unique name so the durable history/grid probe can't match a stale entry
+  # from another run sharing a recycled container, and so the fired-log grep is
+  # unambiguous. Bounded + cron-safe (no spaces/quotes).
+  _SCHED_NAME="e2e-fire-${E2E_RUN_ID:-local}"
+
+  if idle_digest_require_docker; then
+    # Shared diagnostics — used by ALL fail arms below (cap-ready, create-verify,
+    # fire poll), so define it once up front. Dumps the on-volume grid + daemon
+    # heartbeat + run log for every mol-ws container so a failure names the leg.
+    scheduler_diagnostics() {
+      local _sc _grid _health _hist _caps
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
+        _health=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-health.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 300)
+        _hist=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-history.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
+        _caps=$(docker exec "$_sc" sh -c 'env | grep -E "^MOLECULE_(DECLARED_PLUGINS|TRIGGER)" | sort | tr "\n" " "' 2>/dev/null || echo "exec-failed")
+        log "    [scheduler diag] $_sc env: ${_caps:-none}"
+        log "    [scheduler diag] $_sc grid: ${_grid:-ABSENT (create never reached the volume — capability/routing gap)}"
+        log "    [scheduler diag] $_sc health: ${_health:-ABSENT (daemon never wrote a heartbeat — not armed)}"
+        log "    [scheduler diag] $_sc history: ${_hist:-ABSENT (no schedule ever fired)}"
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+    }
+
+    # ── 10d.1 Daemon-armed precondition (the "capability-ready" wait) ──
+    # BEFORE creating, wait until the trigger daemon is actually up and ticking.
+    # Observable proxy: the daemon writes /configs/schedules/schedule-health.json
+    # on every poll tick once it has armed; a NON-NULL `last_tick` proves it
+    # booted, armed its grid, and completed ≥1 poll cycle (`armed` may still be 0
+    # here — no schedule yet — that's expected). This cleanly separates the
+    # "plugin never boot-installed / daemon never armed" failure leg (health
+    # ABSENT here) from the capability-routing leg the create-verify loop handles
+    # next: the daemon being locally armed does NOT guarantee core has yet
+    # PROCESSED the heartbeat advertising `scheduler` (that lag is #4448 root cause
+    # #1), so the create step below re-issues the create until core routes it to
+    # the volume — this gate only guarantees the daemon exists to route to.
+    _SCHED_CAP_EVIDENCE=""
+    scheduler_capability_ready() {
+      local _sc _health
+      _SCHED_CAP_EVIDENCE=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _health=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-health.json 2>/dev/null' 2>/dev/null)
+        # Non-null quoted last_tick = daemon armed & ticking. A literal `null`
+        # (pre-first-tick fallback {"last_tick":null,...}) does NOT match, so the
+        # gate correctly keeps waiting until the daemon has actually ticked.
+        if printf '%s' "$_health" | grep -Eq '"last_tick"[[:space:]]*:[[:space:]]*"[^"]+"'; then
+          _SCHED_CAP_EVIDENCE="$_sc (schedule-health.json last_tick live)"
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    log "10d/11 Scheduler: waiting up to ${_SCHED_CAP_TIMEOUT_SECS}s for the trigger daemon to arm (schedule-health.json ticking) BEFORE creating the schedule — the daemon-ready precondition for the create-verify loop (#4448; poll=${_SCHED_POLL_SECS}s)."
+    if idle_digest_wait "$_SCHED_CAP_TIMEOUT_SECS" "$_SCHED_POLL_SECS" scheduler_capability_ready; then
+      ok "    trigger daemon armed & ticking — ready to accept a volume-routed create (evidence: $_SCHED_CAP_EVIDENCE)"
+    else
+      scheduler_diagnostics
+      fail "Scheduler: the workspace never advertised native-scheduler within ${_SCHED_CAP_TIMEOUT_SECS}s (no mol-ws container wrote a daemon heartbeat with a live last_tick). The molecule-scheduler trigger plugin never boot-installed / the daemon never armed, so a schedule created now would mis-route to the retired DB path (post-#4399 fires nowhere → armed:0). The diagnostics above name the leg: ABSENT health = plugin didn't boot-install (check MOLECULE_DECLARED_PLUGINS reached the container and the trigger scaffold is present in the runtime pin)."
+    fi
+
+    # ── 10d.2 Create + verify it reached the volume grid (closes race #1 & #2) ──
+    # Create via the tenant API (the exact path Canvas uses); a `* * * * *` cron
+    # fires at the top of every minute. Then VERIFY the schedule actually landed
+    # on the daemon's volume grid (/configs/schedules/schedules.yaml — read from
+    # the container directly: ground truth, NOT through core's routing).
+    #
+    # The #4448 race: right after online, core may not yet have processed the
+    # workspace's heartbeat advertising the `scheduler` capability, so
+    # scheduleBackendIsVolume is false and the create SILENTLY routes to the
+    # retired workspace_schedules DB — a 2xx, but the schedule fires nowhere
+    # post-#4399 (armed:0). The create-response `id` is the deterministic routing
+    # tell: the volume path returns id==name, the DB path returns a generated UUID.
+    #
+    # So we RE-ISSUE the create through that capability lag (bounded), but only
+    # when it is SAFE: a re-create runs only while the schedule is NOT yet on the
+    # volume grid AND the id shows a DB-misroute (a UUID) — there is no
+    # unique(workspace_id,name) constraint (migration 015), so a repeated DB-routed
+    # insert is a harmless stray, and re-posting can't collide with a volume entry
+    # (no 409). Once core has the capability the next create routes to the volume
+    # and lands. A volume-routed create writes the grid synchronously, so once
+    # id==name we only poll for file visibility (never re-create → never 409).
+    _SCHED_GRID_EVIDENCE=""
+    # The container whose volume grid carries OUR schedule. The fire wait judges
+    # daemon liveness on THIS daemon — a sibling's healthy heartbeat says nothing
+    # about the one that owns the fire (in the run that motivated this, the two
+    # idle siblings ticked normally while the owner was frozen).
+    _SCHED_TARGET_SC=""
+    scheduler_grid_has_entry() {
+      local _sc _grid
+      _SCHED_GRID_EVIDENCE=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null)
+        if printf '%s' "$_grid" | grep -Fq "$_SCHED_NAME"; then
+          _SCHED_GRID_EVIDENCE="$_sc (schedules.yaml)"
+          _SCHED_TARGET_SC="$_sc"
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    scheduler_create_once() {
+      # POST the schedule; sets _SCHED_CODE/_SCHED_BODY/_SCHED_ID. Returns 0 on a
+      # 2xx create, 1 otherwise. A non-2xx is a hard, non-retryable fail arm
+      # (routing/plugin/auth — e.g. a 502 volume-forward failure); the silent
+      # DB-misroute this step defends against returns 2xx, so callers treat a
+      # non-2xx as fatal.
+      local _tmp
+      _tmp=$(mktemp)
+      _SCHED_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/schedules" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\":\"$_SCHED_NAME\",\"cron_expr\":\"$(trigger_daemon_probe_cron)\",\"timezone\":\"UTC\",\"prompt\":\"E2E scheduler self-fire probe — reply OK.\"}" \
+        -o "$_tmp" -w '%{http_code}' 2>/dev/null) || true
+      _SCHED_BODY=$(cat "$_tmp" 2>/dev/null | sanitize_http_body); rm -f "$_tmp"
+      _SCHED_ID=$(printf '%s' "$_SCHED_BODY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
+      echo "$_SCHED_CODE" | grep -Eq '^2[0-9][0-9]$'
+    }
+
+    _SCHED_CODE=""; _SCHED_BODY=""; _SCHED_ID=""
+    _sched_do_create=1     # create on the first iteration
+    _sched_elapsed=0
+    _sched_why=""; _sched_next=""
+    log "    Scheduler: creating '* * * * *' schedule '$_SCHED_NAME' on $PARENT_ID and verifying it reached the volume grid (retrying the capability-advertisement race for up to ${_SCHED_CREATE_TIMEOUT_SECS}s; poll=${_SCHED_POLL_SECS}s) — #4448."
+    while true; do
+      if [ "$_sched_do_create" = "1" ]; then
+        if ! scheduler_create_once; then
+          scheduler_diagnostics
+          fail "Scheduler: create schedule returned http=$_SCHED_CODE (expected 2xx): ${_SCHED_BODY:0:300}. A 5xx/failed-forward here means the create routed to the volume but the runtime forward failed, or an auth/plugin fault (the silent DB-misroute returns 2xx, not 5xx). Check the workspace runtime is reachable, MOLECULE_DECLARED_PLUGINS reached the container, and the trigger scaffold is present in the runtime pin."
+        fi
+        _sched_do_create=0
+      fi
+
+      if scheduler_grid_has_entry; then
+        break   # CONFIRMED on the volume grid — the only success arm
+      fi
+
+      # Grid-absent — classify from the create-response id (deterministic routing tell).
+      if printf '%s' "$_SCHED_ID" | grep -Eiq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+        _sched_why="create mis-routed to the retired DB (id='$_SCHED_ID' is a UUID) — native-scheduler capability not advertised in core yet"
+        _sched_do_create=1; _sched_next="re-creating"   # safe: not on the volume, so no 409; DB strays fire nowhere
+      elif [ "$_SCHED_ID" = "$_SCHED_NAME" ]; then
+        _sched_why="create routed to the volume (id='$_SCHED_ID') but the grid write is not visible yet"
+        _sched_do_create=0; _sched_next="re-polling"    # do NOT re-create a volume entry (would 409); just re-poll
+      else
+        _sched_why="routing unclear (id='${_SCHED_ID:-empty}')"
+        _sched_do_create=0; _sched_next="re-polling"    # conservative: re-poll rather than risk a volume 409
+      fi
+
+      if [ "$_sched_elapsed" -ge "$_SCHED_CREATE_TIMEOUT_SECS" ]; then
+        scheduler_diagnostics
+        fail "Scheduler: schedule '$_SCHED_NAME' never reached the volume grid within ${_SCHED_CREATE_TIMEOUT_SECS}s (last: $_sched_why; create http=$_SCHED_CODE). This is the #4448 mis-route/arm race: the create kept landing in the retired core DB (native-scheduler capability never advertised — molecule-scheduler plugin didn't boot-install / daemon didn't arm) OR the runtime grid write never landed — either way the daemon will never fire it. The grid/health diagnostics above name the leg: ABSENT grid = create never reached the volume."
+      fi
+
+      log "    Scheduler: not yet on the volume grid — $_sched_why; $_sched_next (${_sched_elapsed}/${_SCHED_CREATE_TIMEOUT_SECS}s)."
+      sleep "$_SCHED_POLL_SECS"
+      _sched_elapsed=$((_sched_elapsed + _SCHED_POLL_SECS))
+    done
+    ok "    schedule '$_SCHED_NAME' created (http=$_SCHED_CODE, id='$_SCHED_ID') and CONFIRMED on the volume grid (evidence: $_SCHED_GRID_EVIDENCE) — routed to the runtime volume, not the retired DB"
+
+    # ── 10d.4 Fire poll (unchanged final step) ──
+    _SCHED_FIRED=""
+    scheduler_fire_probe() {
+      local _sc
+      _SCHED_FIRED=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        # Container log: the daemon logs `fired schedule '<name>'` (scheduler.py).
+        if docker logs "$_sc" 2>&1 | grep -F "fired schedule '$_SCHED_NAME'" >/dev/null; then
+          _SCHED_FIRED="$_sc (runtime log)"
+          return 0
+        fi
+        # Durable: schedule-history.json on the persisted config volume carries a
+        # {"name":"<name>","status":"fired"} entry, written only after a real
+        # self-scheduled turn — survives CP-driven container replacement.
+        if docker exec "$_sc" sh -c \
+          "grep -Fq '\"name\": \"$_SCHED_NAME\"' /configs/schedules/schedule-history.json 2>/dev/null && grep -Fq '\"status\": \"fired\"' /configs/schedules/schedule-history.json 2>/dev/null" \
+          >/dev/null 2>&1; then
+          _SCHED_FIRED="$_sc (durable schedule-history.json)"
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    # ── 10d.4 Fire wait — driven by TWO progress signals, no stopwatch ───────
+    # lib/trigger_daemon_wait.sh owns the policy (see its header for WHY a fixed
+    # budget was wrong here). Outcomes: 0 evidence, 2 the TICK LOOP stopped
+    # (fail fast — more time cannot help), 4 the tick loop is fine but the
+    # DELIVERY LANE has stopped finishing attempts (also fail fast, and a
+    # different defect from a dead tick), 1 the backstop elapsed while BOTH
+    # signals kept advancing (a third defect, so a third message).
+    #
+    # rc=4 is the case a heartbeat-only watchdog could never reach: tick() never
+    # awaits a delivery, so last_tick keeps advancing at full cadence while the
+    # worker sits in an await that never returns. Before this signal existed the
+    # only thing that caught that was elapsed wall-clock, which is also the only
+    # thing that reds a slow-but-healthy delivery.
+    _SCHED_STALE_SECS=$(e2e_scheduler_stale_secs "$_SCHED_POLL_SECS")
+    _SCHED_STALL_SECS=$(e2e_scheduler_stall_secs "$_SCHED_POLL_SECS") \
+      || fail "Scheduler: the delivery-stall window could not be derived (the probe cron did not parse), so the wedged-delivery signal would be unarmed for this whole leg."
+    _SCHED_BACKSTOP_SECS=$(e2e_scheduler_backstop_secs "${E2E_SCHEDULER_TIMEOUT_SECS:-}") \
+      || fail "$(scheduler_backstop_refusal E2E_SCHEDULER_TIMEOUT_SECS "${E2E_SCHEDULER_TIMEOUT_SECS:-}")"
+
+    log "    Scheduler: waiting for '$_SCHED_NAME' to fire — pass on fire evidence, FAIL FAST if ${_SCHED_TARGET_SC}'s last_tick goes stale (>${_SCHED_STALE_SECS}s) or its attempt log stops advancing (>${_SCHED_STALL_SECS}s), backstop ${_SCHED_BACKSTOP_SECS}s (poll=${_SCHED_POLL_SECS}s)."
+    _sched_rc=0
+    trigger_daemon_wait "$_SCHED_TARGET_SC" "$_SCHED_BACKSTOP_SECS" "$_SCHED_POLL_SECS"       "$_SCHED_STALE_SECS" "$_SCHED_STALL_SECS" scheduler_fire_probe || _sched_rc=$?
+    scheduler_progress_report 10d
+    case "$_sched_rc" in
+      0)
+        ok "    scheduler autonomously FIRED '$_SCHED_NAME' (evidence: $_SCHED_FIRED)"
+        ;;
+      4)
+        scheduler_diagnostics
+        fail "Scheduler: the trigger daemon's DELIVERY LANE is wedged. $_SCHED_TARGET_SC is ticking normally (last_tick age ${TRIGGER_DAEMON_LAST_AGE:-unknown}s, well inside ${_SCHED_STALE_SECS}s) but its schedule-history.json has not gained an entry for ${TRIGGER_DAEMON_PROGRESS_AGE:-unknown}s (> ${_SCHED_STALL_SECS}s) across ${TRIGGER_DAEMON_PROGRESS_SAMPLES} reads. Every terminal outcome in scheduler.py appends exactly one entry — success, deferred, transport error, and the watchdog's own cancellation — so a frozen log with a live tick means the delivery worker is stuck in an await that is not returning AND the daemon's activity-aware watchdog is not cancelling it either. Waiting longer cannot fix this: no further attempt will start while the worker is held."
+        ;;
+      2)
+        scheduler_diagnostics
+        fail "Scheduler: the trigger daemon STOPPED TICKING. $_SCHED_TARGET_SC last wrote schedule-health.json ${TRIGGER_DAEMON_LAST_AGE}s ago (> ${_SCHED_STALE_SECS}s) while '$_SCHED_NAME' is armed on its own volume grid. A daemon at or after molecule-scheduler v0.2.1 / SDK 0.5.6 advances last_tick every poll even mid-delivery, so a frozen heartbeat is not slowness — the tick loop is wedged (alive-but-hung: the supervisor sees a live process and never restarts it, and health keeps reporting armed:N/errors:{}). Waiting longer cannot fix this. Check the workspace runs a daemon at that version or newer; an older one delivers INSIDE the tick and freezes exactly this way."
+        ;;
+      *)
+        scheduler_diagnostics
+        fail "Scheduler: '$_SCHED_NAME' never fired within the ${_SCHED_BACKSTOP_SECS}s backstop, yet the daemon kept ticking the whole time (last_tick age ${TRIGGER_DAEMON_LAST_AGE:-unknown}s) — so this is NOT the frozen-tick failure. The grid/health/history diagnostics above name the leg: grid+health present but no history = the daemon is armed and alive but the delivery lane never completed a self-scheduler turn."
+        ;;
+    esac
+
+    unset -f scheduler_capability_ready scheduler_create_once scheduler_grid_has_entry scheduler_fire_probe scheduler_tick_age_secs scheduler_diagnostics
+  else
+    fail "E2E_SCHEDULER_CHECK=on requires a usable Docker CLI and daemon to inspect fire evidence."
+  fi
+fi
+
+# ─── 10g. Scheduler fire → DELIVER (send_message_to_user) — #4555 ────────────
+# Closes the #4555 coverage gap the audit flagged. 10d proves the daemon
+# autonomously FIRES a schedule, but a FIRE only self-schedules a turn — it does
+# NOT prove that turn actually DELIVERED anything to the user. Pre-this-step, the
+# DELIVER half lived ONLY as a stubbed unit test (runtime#341). This sub-step
+# drives the full chain live: create a `* * * * *` schedule whose PROMPT instructs
+# the agent to call the send_message_to_user tool with a run-unique MARKER,
+# confirm the daemon FIRES it (reusing 10d's grid + fire ground-truth), THEN poll
+# the delivery ground-truth — an activity_logs a2a_receive/notify row written by
+# the AgentMessageWriter SSOT (workspace-server/internal/handlers/
+# agent_message_writer.go: INSERT activity_type='a2a_receive', method='notify',
+# response_body={"result": <message>}, summary='Agent message: <preview>') — for
+# that same MARKER, read via GET /workspaces/:id/activity (the same endpoint 9b
+# smoke-tests; List returns a bare JSON array with no default type filter, so
+# notify rows are included). The marker landing in a notify row proves the fired
+# turn actually invoked send_message_to_user and the message reached the user.
+#
+# CO-GATE (two conditions, BOTH required):
+#   1. E2E_SCHEDULER_CHECK=on — DELIVER rides the SAME fire machinery as 10d, so
+#      it shares 10d's gate (the ephemeral happy-path lane sets it on per-PR; an
+#      independent E2E_SCHEDULE_DELIVER_CHECK, default on, can disable JUST this
+#      sub-step without disabling the fire gate — gate the sub-step, never the
+#      whole scenario).
+#   2. A REAL tool-calling LLM must be driving the workspace. DELIVER needs the
+#      agent to actually CALL a tool; a mock/canned-reply arm never invokes one,
+#      so on a no-real-LLM arm this SKIPS (never reds) — mirroring how the byok
+#      guards (8c/8d) stay best-effort when their key is absent on untrusted-fork
+#      PRs. The FIRE half (10d) stays a HARD gate on ALL arms; ONLY the DELIVER
+#      half is arm-gated.
+#      "Real tool-calling LLM present" = the platform-managed path (E2E_LLM_PATH=
+#      platform → the CP LLM proxy serves a real model; the EPHEMERAL happy-path
+#      lane's arm is exactly this: model minimax/MiniMax-M2.7 via the CP's own
+#      MINIMAX_API_KEY, NOT a BYOK E2E_MINIMAX_API_KEY — see ephemeral_cp_happy_
+#      path.sh run_scenario) OR any BYOK vendor key (MiniMax/Anthropic/OpenAI).
+#      A keyless, non-platform arm has no tool-caller → SKIP. NB: gating literally
+#      on E2E_MINIMAX_API_KEY (absent in the ephemeral lane) would SKIP forever
+#      here and make the per-PR gate vacuous — the platform path IS this lane's
+#      real-LLM arm, so it must count.
+#
+# NON-TAUTOLOGY (negative control, by construction): the DELIVER probe matches the
+# run-unique MARKER ONLY inside an activity_type=a2a_receive / method=notify row —
+# the exact shape AgentMessageWriter writes and NOTHING else does. A FIRE alone
+# writes schedule-history.json (status=fired) but NO notify row, so the fire
+# cannot satisfy DELIVER. A fired turn that does NOT call send_message_to_user
+# produces no notify row carrying the marker either (a scheduled turn has no
+# connected user session — its final assistant text is not auto-broadcast; the
+# ONLY path to a notify row is an explicit send_message_to_user call). The marker
+# is unique per run and reaches activity_logs solely via the send_message_to_user
+# / notify SSOT — so this assertion is satisfied ONLY by a real tool-driven
+# delivery, never by the fire. (Proof by demonstration: swap the prompt for one
+# that fires but omits the tool call and the deliver_probe below stays red until
+# the timeout — the fire/grid arms still pass, isolating the DELIVER leg.)
+if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ] && [ "${E2E_SCHEDULE_DELIVER_CHECK:-on}" = "on" ]; then
+  # Co-gate condition 2 — real tool-calling LLM present? Compute once, then unset.
+  schedule_deliver_real_llm_arm() {
+    [ "${E2E_LLM_PATH:-}" = "platform" ] && return 0
+    [ -n "${E2E_MINIMAX_API_KEY:-}" ] && return 0
+    [ -n "${E2E_ANTHROPIC_API_KEY:-}" ] && return 0
+    [ -n "${E2E_OPENAI_API_KEY:-}" ] && return 0
+    return 1
+  }
+  if schedule_deliver_real_llm_arm; then _DLV_LLM_READY=1; else _DLV_LLM_READY=0; fi
+  unset -f schedule_deliver_real_llm_arm
+
+  if [ "$_DLV_LLM_READY" != "1" ]; then
+    log "10g/11 Scheduler DELIVER: SKIP — no real tool-calling LLM on this arm (E2E_LLM_PATH='${E2E_LLM_PATH:-}', no BYOK key). send_message_to_user needs the agent to actually invoke a tool; the mock/canned arm never will, so asserting DELIVER here would red on a stub, not a regression. The FIRE half (10d) already ran as a hard gate on this arm; DELIVER is hard only on a real-LLM arm (#4555)."
+  elif ! idle_digest_require_docker; then
+    fail "10g DELIVER: E2E_SCHEDULER_CHECK=on requires a usable Docker CLI + daemon to read the fire/deliver ground-truth (same requirement as 10d)."
+  else
+    _DLV_NAME="e2e-deliver-${E2E_RUN_ID:-local}"
+    # Run-unique marker. Only reaches activity_logs via send_message_to_user →
+    # AgentMessageWriter; a distinct token so a stale row on a recycled container
+    # cannot false-pass and the fire alone cannot produce it.
+    _DLV_MARKER="E2E-SMTU-DELIVER-${E2E_RUN_ID:-local}"
+    # Backstop, not a budget: it must exceed the daemon's delivery watchdog for
+    # the same reason 10d's does (a 360s cap could expire while a wedged fire was
+    # still being re-queued for retry, so it could never observe the recovery).
+    _DLV_FIRE_OVERRIDE="${E2E_SCHEDULE_DELIVER_FIRE_TIMEOUT_SECS:-${E2E_SCHEDULER_TIMEOUT_SECS:-}}"
+    _DLV_FIRE_TIMEOUT_SECS=$(e2e_scheduler_backstop_secs "$_DLV_FIRE_OVERRIDE") \
+      || fail "$(scheduler_backstop_refusal E2E_SCHEDULE_DELIVER_FIRE_TIMEOUT_SECS "$_DLV_FIRE_OVERRIDE")"
+    # DELIVER window spans MULTIPLE fires: a `* * * * *` schedule re-fires every
+    # minute and each fire is an INDEPENDENT chance for the model to invoke the
+    # tool. Polling across many fire cycles absorbs the occasional turn where a
+    # capable-but-nondeterministic model acks in text without calling the tool
+    # (the same class the idle-digest A2A seed deliberately avoided). The marker
+    # only has to land ONCE — this is the NAMED flake-mitigation mechanism, not a
+    # silent retry.
+    #
+    # This used to be a bare `210`, chosen at #4568 as "~3 fire cycles + slack"
+    # of a `* * * * *` schedule. That reasoning sized a BUDGET — how long we are
+    # willing to give the model — and a budget is the wrong object here: 210s is
+    # SHORTER than the 600s delivery watchdog it has to outlast, so a first fire
+    # whose delivery wedged expired this wait while the daemon was still inside
+    # its own budget, re-queuing the retry that would have satisfied the probe.
+    # The retry it could never see IS the extra fire cycles the literal was
+    # bought to provide. The "≥3 cycles" property is a FLOOR and survives the
+    # change untouched — the derived 3x/1800s backstop is ~30 cycles — and none
+    # of it is spent on the happy path, because trigger_daemon_wait returns the
+    # instant the marker lands and fails FAST (rc=2) the instant the daemon stops
+    # ticking, which is the only state in which more cycles cannot help.
+    _DLV_DELIVER_OVERRIDE="${E2E_SCHEDULE_DELIVER_TIMEOUT_SECS:-${E2E_SCHEDULER_TIMEOUT_SECS:-}}"
+    _DLV_DELIVER_TIMEOUT_SECS=$(e2e_scheduler_backstop_secs "$_DLV_DELIVER_OVERRIDE") \
+      || fail "$(scheduler_backstop_refusal E2E_SCHEDULE_DELIVER_TIMEOUT_SECS "$_DLV_DELIVER_OVERRIDE")"
+    _DLV_POLL_SECS="${E2E_SCHEDULER_POLL_SECS:-10}"
+    # Imperative single-tool prompt — mirrors the daily-activity-report default's
+    # "deliver a report" instruction. The fired turn has no user session, so the
+    # ONLY route to the user (and a notify row) is an explicit tool call.
+    _DLV_PROMPT="You are running a scheduled background turn with no user watching. You MUST call the send_message_to_user tool exactly once, with its message set to EXACTLY this token and nothing else: ${_DLV_MARKER}. Do not just write the token as your reply — invoke the tool. Do not call any other tool."
+
+    scheduler_deliver_diagnostics() {
+      local _sc _grid _hist _act
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 300)
+        _hist=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-history.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
+        log "    [deliver diag] $_sc grid: ${_grid:-ABSENT}"
+        log "    [deliver diag] $_sc history: ${_hist:-ABSENT}"
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      _act=$(tenant_call GET "/workspaces/$PARENT_ID/activity?limit=20" 2>/dev/null | sanitize_http_body | tr '\n' ' ' | head -c 600)
+      log "    [deliver diag] recent activity (redacted): ${_act:-<none>}"
+    }
+
+    # Create the DELIVER schedule. By now 10d proved the daemon armed AND core
+    # advertises the scheduler capability, so a fresh create routes to the volume
+    # deterministically — no #4448 re-issue loop needed here.
+    _DLV_TMP=$(mktemp)
+    _DLV_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/schedules" \
+      -H "Content-Type: application/json" \
+      -d "$(DLV_NAME="$_DLV_NAME" DLV_PROMPT="$_DLV_PROMPT" DLV_CRON="$(trigger_daemon_probe_cron)" python3 -c 'import json,os; print(json.dumps({"name":os.environ["DLV_NAME"],"cron_expr":os.environ["DLV_CRON"],"timezone":"UTC","prompt":os.environ["DLV_PROMPT"]}))')" \
+      -o "$_DLV_TMP" -w '%{http_code}' 2>/dev/null) || true
+    _DLV_BODY=$(cat "$_DLV_TMP" 2>/dev/null | sanitize_http_body); rm -f "$_DLV_TMP"
+    if ! echo "$_DLV_CODE" | grep -Eq '^2[0-9][0-9]$'; then
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: create schedule '$_DLV_NAME' returned http=$_DLV_CODE (expected 2xx): ${_DLV_BODY:0:300}. The scheduler capability was advertised (10d passed), so a non-2xx here is a routing/auth regression on the create path."
+    fi
+
+    # Confirm it reached the volume grid.
+    _DLV_GRID_EVIDENCE=""
+    deliver_grid_has() {
+      local _sc _grid
+      _DLV_GRID_EVIDENCE=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null || true)
+        if printf '%s' "$_grid" | grep -Fq "$_DLV_NAME"; then _DLV_GRID_EVIDENCE="$_sc"; return 0; fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+    # This wait stays on plain idle_digest_wait — NOT trigger_daemon_wait — and
+    # on a SHORT derived budget rather than the fire backstop it used to reuse.
+    # It is about CORE ROUTING, not daemon liveness: the grid is written by core's
+    # synchronous create forward, the daemon only reads it, and the owning
+    # container (the argument trigger_daemon_wait requires) is the OUTPUT of this
+    # probe, not an input. The 201 above is the routing signal and it has already
+    # arrived — the runtime persists the entry before core relays 201 — so this
+    # only absorbs our own `docker ps` + `docker exec` observation latency. See the
+    # "grid-landing wait" block in lib/trigger_daemon_wait.sh for the full
+    # rationale and lib/test_trigger_daemon_wait_unit.sh for the bounds.
+    _DLV_GRID_CONFIRM_SECS=$(schedule_grid_confirm_secs "$_DLV_POLL_SECS")
+    log "10g/11 Scheduler DELIVER: created '$_DLV_NAME' (http=$_DLV_CODE); confirming it reached the volume grid (up to ${_DLV_GRID_CONFIRM_SECS}s; poll=${_DLV_POLL_SECS}s)."
+    if ! idle_digest_wait "$_DLV_GRID_CONFIRM_SECS" "$_DLV_POLL_SECS" deliver_grid_has; then
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: schedule '$_DLV_NAME' never reached the volume grid within ${_DLV_GRID_CONFIRM_SECS}s — core relayed http=$_DLV_CODE, which it does ONLY after the runtime persisted the entry, so the grid should have been on disk before the first probe. Core's ack and the volume therefore disagree: the create routed to a different workspace than the one whose containers we can see, or the runtime acked without writing. Deterministic — a longer wait cannot fix it (10d's identical create DID land)."
+    fi
+    ok "    DELIVER schedule '$_DLV_NAME' on the volume grid (evidence: $_DLV_GRID_EVIDENCE)"
+
+    # Confirm the daemon FIRED it (reuse 10d's fire ground-truth verbatim).
+    _DLV_FIRED=""
+    deliver_fire_probe() {
+      local _sc
+      _DLV_FIRED=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        if docker logs "$_sc" 2>&1 | grep -F "fired schedule '$_DLV_NAME'" >/dev/null; then _DLV_FIRED="$_sc (runtime log)"; return 0; fi
+        if docker exec "$_sc" sh -c \
+          "grep -Fq '\"name\": \"$_DLV_NAME\"' /configs/schedules/schedule-history.json 2>/dev/null && grep -Fq '\"status\": \"fired\"' /configs/schedules/schedule-history.json 2>/dev/null" \
+          >/dev/null 2>&1; then _DLV_FIRED="$_sc (durable schedule-history.json)"; return 0; fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+    # Same signal-driven policy as 10d: this is the SAME daemon and the same
+    # failure mode, so it must not go back to guessing after a fixed budget.
+    # _DLV_GRID_EVIDENCE is the container whose grid carries THIS schedule.
+    _DLV_STALE_SECS=$(e2e_scheduler_stale_secs "$_DLV_POLL_SECS")
+    _DLV_STALL_SECS=$(e2e_scheduler_stall_secs "$_DLV_POLL_SECS") \
+      || fail "10g DELIVER: the delivery-stall window could not be derived (the probe cron did not parse), so the wedged-delivery signal would be unarmed for this whole leg."
+    log "    DELIVER: waiting for FIRE evidence for '$_DLV_NAME' — FAIL FAST if ${_DLV_GRID_EVIDENCE}'s last_tick goes stale (>${_DLV_STALE_SECS}s) or its attempt log stops advancing (>${_DLV_STALL_SECS}s), backstop ${_DLV_FIRE_TIMEOUT_SECS}s (poll=${_DLV_POLL_SECS}s)."
+    _dlv_rc=0
+    trigger_daemon_wait "$_DLV_GRID_EVIDENCE" "$_DLV_FIRE_TIMEOUT_SECS" "$_DLV_POLL_SECS"       "$_DLV_STALE_SECS" "$_DLV_STALL_SECS" deliver_fire_probe || _dlv_rc=$?
+    scheduler_progress_report "10g fire"
+    if [ "$_dlv_rc" = "2" ]; then
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: the trigger daemon STOPPED TICKING — $_DLV_GRID_EVIDENCE last wrote schedule-health.json ${TRIGGER_DAEMON_LAST_AGE}s ago (> ${_DLV_STALE_SECS}s) with '$_DLV_NAME' armed on its grid. Same wedged-tick signature as 10d (see that step's message); more time cannot help."
+    elif [ "$_dlv_rc" = "4" ]; then
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: the trigger daemon's DELIVERY LANE is wedged — $_DLV_GRID_EVIDENCE is ticking normally (last_tick age ${TRIGGER_DAEMON_LAST_AGE:-unknown}s) but its schedule-history.json has not gained an entry for ${TRIGGER_DAEMON_PROGRESS_AGE:-unknown}s (> ${_DLV_STALL_SECS}s) across ${TRIGGER_DAEMON_PROGRESS_SAMPLES} reads, with '$_DLV_NAME' armed on its grid. Same wedged-delivery signature as 10d; more time cannot help, because no further attempt starts while the worker is held."
+    elif [ "$_dlv_rc" != "0" ]; then
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: schedule '$_DLV_NAME' reached the grid but the daemon never FIRED it within the ${_DLV_FIRE_TIMEOUT_SECS}s backstop, while still ticking (last_tick age ${TRIGGER_DAEMON_LAST_AGE:-unknown}s) — grid present, no history: a FIRE-path failure surfaced on the DELIVER schedule; see 10d for the shared mechanism."
+    fi
+    ok "    DELIVER schedule FIRED (evidence: $_DLV_FIRED) — turn self-scheduled; now asserting it DELIVERED"
+
+    # DELIVER ground-truth: an activity_logs a2a_receive/notify row (the
+    # AgentMessageWriter SSOT) carrying the run-unique marker. See the block
+    # header for why matching this specific row shape is non-tautological.
+    _DLV_DELIVERED=""
+    deliver_probe() {
+      local _tmp _code _rc
+      _DLV_DELIVERED=""
+      _tmp=$(mktemp)
+      _code=$(tenant_call GET "/workspaces/$PARENT_ID/activity?limit=50" -o "$_tmp" -w '%{http_code}' 2>/dev/null) || true
+      if ! echo "$_code" | grep -Eq '^2[0-9][0-9]$'; then rm -f "$_tmp"; return 1; fi
+      MARKER="$_DLV_MARKER" python3 -c '
+import json, os, sys
+marker = os.environ["MARKER"]
+try:
+    rows = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+if isinstance(rows, dict):
+    rows = rows.get("events", [])
+if not isinstance(rows, list):
+    sys.exit(1)
+for r in rows:
+    if not isinstance(r, dict):
+        continue
+    # The exact shape AgentMessageWriter writes for send_message_to_user / notify.
+    if r.get("activity_type") != "a2a_receive" or r.get("method") != "notify":
+        continue
+    rb = r.get("response_body")
+    hay = json.dumps(rb) if rb is not None else ""
+    summ = r.get("summary") or ""
+    if marker in hay or marker in summ:
+        sys.exit(0)
+sys.exit(1)
+' "$_tmp"
+      _rc=$?
+      rm -f "$_tmp"
+      [ "$_rc" = "0" ] && _DLV_DELIVERED="activity a2a_receive/notify row carries '$_DLV_MARKER'"
+      return "$_rc"
+    }
+    # The window is NOT spent on the happy path: the wait returns the instant the
+    # marker lands, and a wedged daemon fails fast rather than burning the
+    # backstop — no further fire can occur, so no further chance at the tool call
+    # exists. Multiple fire cycles are what absorb a nondeterministic model that
+    # acks in text without calling the tool; the backstop only bounds the case
+    # where neither ever happens.
+    # Precomputed, not inlined into the $(( )): a cron that failed to parse would
+    # make this a division by an EMPTY string, i.e. a log line that kills the run.
+    # It cannot fail here (the provision block already `fail`ed on an unparseable
+    # cron) but a log line must never be the thing that can abort a passing leg.
+    _DLV_FIRE_INTERVAL=$(trigger_daemon_fire_interval_secs) || _DLV_FIRE_INTERVAL=60
+    log "    DELIVER: polling delivery ground-truth (activity a2a_receive/notify row with marker '$_DLV_MARKER') — passes the instant the marker lands, across up to ~$(( _DLV_DELIVER_TIMEOUT_SECS / _DLV_FIRE_INTERVAL )) fire cycles before the ${_DLV_DELIVER_TIMEOUT_SECS}s backstop (poll=${_DLV_POLL_SECS}s; FAIL FAST if the daemon stops ticking or its attempt log stops advancing for ${_DLV_STALL_SECS}s)."
+    _dlv_deliver_rc=0
+    trigger_daemon_wait "$_DLV_GRID_EVIDENCE" "$_DLV_DELIVER_TIMEOUT_SECS" "$_DLV_POLL_SECS"       "$_DLV_STALE_SECS" "$_DLV_STALL_SECS" deliver_probe || _dlv_deliver_rc=$?
+    scheduler_progress_report "10g deliver"
+    if [ "$_dlv_deliver_rc" = "2" ]; then
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: the trigger daemon STOPPED TICKING mid-window — $_DLV_GRID_EVIDENCE last wrote schedule-health.json ${TRIGGER_DAEMON_LAST_AGE}s ago (> ${_DLV_STALE_SECS}s). No further fire can occur, so no further chance at the send_message_to_user call; the remaining window would have been dead time."
+    fi
+    if [ "$_dlv_deliver_rc" = "4" ]; then
+      scheduler_deliver_diagnostics
+      # This is the case the DELIVER leg most needed and could not see. The
+      # marker only lands if a fired turn calls send_message_to_user, and each
+      # fire is an independent chance — but only while attempts keep FINISHING.
+      # A worker held in a never-returning await produces no further attempt, so
+      # every remaining second of the backstop is dead time, exactly as it is
+      # under a dead tick. The heartbeat cannot tell you that: it keeps advancing.
+      fail "10g DELIVER: the delivery lane stopped finishing attempts mid-window — $_DLV_GRID_EVIDENCE is ticking normally (last_tick age ${TRIGGER_DAEMON_LAST_AGE:-unknown}s) but schedule-history.json has not gained an entry for ${TRIGGER_DAEMON_PROGRESS_AGE:-unknown}s (> ${_DLV_STALL_SECS}s) across ${TRIGGER_DAEMON_PROGRESS_SAMPLES} reads (${TRIGGER_DAEMON_PROGRESS_TRANSITIONS} advancement(s) seen earlier in this leg). No further fire can start while the worker is held, so no further chance at the send_message_to_user call exists; the remaining window would have been dead time."
+    fi
+    if [ "$_dlv_deliver_rc" = "0" ]; then
+      ok "    scheduler fired turn DELIVERED to the user via send_message_to_user (evidence: $_DLV_DELIVERED) — #4555 fire→deliver proven live on this real-LLM arm"
+    else
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: schedule '$_DLV_NAME' FIRED but no send_message_to_user delivery landed within ${_DLV_DELIVER_TIMEOUT_SECS}s — no activity_logs a2a_receive/notify row carries the marker '$_DLV_MARKER'. The fired turn did not invoke send_message_to_user, or the AgentMessageWriter deliver path is broken (the #4555 regression this gate exists to catch). The fire itself is confirmed above, so this is specifically the DELIVER leg, not a scheduler-fire fault. (Real-LLM arm: E2E_LLM_PATH='${E2E_LLM_PATH:-}'.)"
+    fi
+
+    unset -f scheduler_deliver_diagnostics deliver_grid_has deliver_fire_probe deliver_probe
+  fi
+fi
+
+# ─── 10e. Native digest-provider plugin load (RFC #4413, E2E_DIGEST_PLUGIN_CHECK=on only) ──
+# End-to-end proof that a NATIVE digest-provider plugin is loaded IN-PROCESS by
+# the runtime's idle-digest assembler, admitted by the LOAD-TIME trust gate from
+# the VENDORED native-plugins registry (runtime#310) — NOT from an env allow-list
+# (we never set MOLECULE_NATIVE_PLUGIN_NAMES). The workspace declared the plugin
+# at provision (secret-injection block above) with MOLECULE_DIGEST_PROVIDER_PLUGINS=1,
+# so it boot-installed the plugin under its repo dir and, when the digest armed,
+# build_default_providers() discovered contributes.digestProviders, imported the
+# provider, and passed the trust gate because the plugin's install name is in the
+# registry-derived native set. The runtime logs
+#   digest-provider: loaded '<provider_id>' from plugin <install-name> (native=True)
+# ONLY when all of that succeeded — the single unambiguous evidence line. The step
+# is behind E2E_DIGEST_PLUGIN_CHECK so it stays dark until the ephemeral runtime
+# pin carries the loader + the registry trust source; its fail arm is REACHABLE
+# (a refused/absent plugin never emits native=True and the diagnostics name why).
+if [ "${E2E_DIGEST_PLUGIN_CHECK:-}" = "on" ]; then
+  _DP_TIMEOUT_SECS="${E2E_DIGEST_PLUGIN_TIMEOUT_SECS:-360}"
+  _DP_POLL_SECS="${E2E_DIGEST_PLUGIN_POLL_SECS:-10}"
+  # The install-dir basename the trust gate matches = the source's repo segment
+  # (NOT the registry `name` field) — the exact identity the runtime keys on.
+  _DP_NAME=$(E2E_DIGEST_PLUGIN_SOURCE="${E2E_DIGEST_PLUGIN_SOURCE:-gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0}" python3 -c "
+import os
+s = os.environ['E2E_DIGEST_PLUGIN_SOURCE'].split('#', 1)[0].rstrip('/')
+print(s.rsplit('/', 1)[-1])
+")
+
+  if idle_digest_require_docker; then
+    _DP_LOADED=""
+    digest_plugin_probe() {
+      local _sc
+      _DP_LOADED=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        # The loader's success line (plugin_loader.py): native=True proves the
+        # registry trust gate admitted an official/reserved provider from this
+        # native plugin. Grepping the install-name + native=True is unambiguous.
+        # The line is not run-scoped, but the ephemeral gate provisions a fresh
+        # mol-ws- container per run (no reuse), so a stale prior-run match cannot
+        # occur here — same assumption 10c's generic grep already relies on.
+        if docker logs "$_sc" 2>&1 | grep -F "from plugin ${_DP_NAME} (native=True)" >/dev/null; then
+          _DP_LOADED="$_sc (runtime log)"
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    digest_plugin_diagnostics() {
+      local _sc _env _installed _warn
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _env=$(docker exec "$_sc" sh -c 'env | grep -E "^MOLECULE_(DIGEST_PROVIDER_PLUGINS|DECLARED_PLUGINS|NATIVE_PLUGIN_NAMES)" | sort | tr "\n" " "' 2>/dev/null || echo "exec-failed")
+        _installed=$(docker exec "$_sc" sh -c 'ls -1 /configs/plugins /plugins 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 300)
+        # `|| true`: a zero-match grep exits 1, which under `set -euo pipefail`
+        # (line 119) would abort this diag fn BEFORE the log lines print — and
+        # zero matches IS the loader-off leg this diagnostic exists to explain.
+        _warn=$(docker logs "$_sc" 2>&1 | grep -F "digest-provider:" | tail -n 5 | tr '\n' '|' | head -c 500 || true)
+        log "    [digest-plugin diag] $_sc env: ${_env:-none}"
+        log "    [digest-plugin diag] $_sc installed plugins: ${_installed:-ABSENT (boot-install never fetched the plugin — check MOLECULE_DECLARED_PLUGINS reached the container)}"
+        log "    [digest-plugin diag] $_sc loader lines: ${_warn:-NONE (loader never ran — flag off, or the digest never armed; refused/native=False here means the trust source rejected the plugin)}"
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+    }
+
+    log "10e/11 Digest plugin: polling for in-process native load of '${_DP_NAME}' for up to ${_DP_TIMEOUT_SECS}s (poll=${_DP_POLL_SECS}s)."
+    if idle_digest_wait "$_DP_TIMEOUT_SECS" "$_DP_POLL_SECS" digest_plugin_probe; then
+      ok "    native digest-provider plugin '${_DP_NAME}' loaded IN-PROCESS via the registry trust gate (evidence: $_DP_LOADED)"
+    else
+      digest_plugin_diagnostics
+      fail "Native digest-provider plugin '${_DP_NAME}' never loaded (native=True) within ${_DP_TIMEOUT_SECS}s. The diagnostics above name the broken leg: ABSENT installed = boot-install never fetched the plugin (MOLECULE_DECLARED_PLUGINS gap); loader lines showing native=False / 'refused' = the plugin installed but the trust gate rejected it (registry trust source not carried by the runtime pin, or install name != registry source segment); NO loader lines = MOLECULE_DIGEST_PROVIDER_PLUGINS off or the digest never armed."
+    fi
+
+    unset -f digest_plugin_probe digest_plugin_diagnostics
+  else
+    fail "E2E_DIGEST_PLUGIN_CHECK=on requires a usable Docker CLI and daemon to inspect load evidence."
+  fi
+fi
+
+# ─── 10f. Self-schedule tool (RFC, E2E_SELF_SCHEDULE_CHECK=on only) ──────────
+# End-to-end proof that the audience:self create_schedule TOOL — delivered by the
+# molecule-ai-plugin-schedule-self plugin (declared additively at provision, above)
+# and rendered onto the workspace by the runtime's audience injector — creates a
+# schedule that lands on the workspace's OWN volume grid and FIRES, using ONLY the
+# per-workspace token (no org/admin key). Firing is done by the scheduler trigger
+# daemon (10d), so this step is CO-GATED on E2E_SCHEDULER_CHECK=on.
+#
+# Deterministic (no LLM): from the gate host we `docker exec -i` into the OWN mol-ws
+# container and pipe a two-line JSON-RPC stream (initialize, then tools/call
+# create_schedule) into `npx --prefer-offline @molecule-ai/mcp-server@1.9.3 -e
+# MOLECULE_MCP_MODE=self`, capturing stdout — mirroring test_mcp_stdio_staging.sh.
+# create_schedule lives ONLY on the Node self-mode stdio surface (NOT core's Go MCP
+# HTTP bridge), so this is the sole path that exercises the real tool with no agent
+# turn (an LLM/A2A path would be non-deterministic — the flake this step avoids).
+#
+# Two legs:
+#   LEG A (injector proof): parse the rendered self mcpServers entry env from the
+#     runtime's native adapter config → assert MOLECULE_MCP_MODE=self + token-file
+#     present; NEG CONTROL: org/admin keys ABSENT from that RENDERED entry env
+#     (box-independent evidence — NOT /proc/<pid>/environ, which inherits ambient
+#     process env on a concierge box even though authHeaders() never reads it).
+#   LEG B (tool proof): create_schedule TWICE — (i) explicit workspace_id and (ii)
+#     workspace_id OMITTED (must SELF-RESOLVE via the runtime WORKSPACE_ID injection
+#     + the self-mode self-default a recent fix restored) — assert each lands on the
+#     OWN grid + the explicit one FIRES (reuses 10d's log/history verification).
+#     NEG CONTROL: a FOREIGN workspace_id is REJECTED (tool error / core 401) AND
+#     never arrives on any grid; precondition-assert the self container carries no
+#     admin/org token so the 401 leg cannot false-pass.
+#
+# Dark until preconditions confirmed (default OFF): needs a workspace-template pin
+# carrying runtime#328's self-audience injector AND a prebaked mcp-server 1.9.3 (so
+# `npx --prefer-offline` resolves offline in the no-network gate). Its fail arms are
+# REACHABLE (each leg has a distinct hard failure with diagnostics). It registers NO
+# live_milestone (LIVE_MILESTONES is a closed SSOT — adding one trips the drift gate).
+if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
+  # Co-gate: the scheduler trigger daemon (10d) supplies the FIRE path 10f depends
+  # on. Requiring E2E_SCHEDULER_CHECK=on keeps this a hard, reachable contract.
+  if [ "${E2E_SCHEDULER_CHECK:-}" != "on" ]; then
+    fail "E2E_SELF_SCHEDULE_CHECK=on requires E2E_SCHEDULER_CHECK=on — the scheduler trigger daemon (10d) fires the self-created schedule. Enable both together."
+  fi
+  _SS_TIMEOUT_SECS="${E2E_SELF_SCHEDULE_TIMEOUT_SECS:-360}"
+  _SS_POLL_SECS="${E2E_SELF_SCHEDULE_POLL_SECS:-10}"
+  _SS_CAP_TIMEOUT_SECS="${E2E_SELF_SCHEDULE_CAP_TIMEOUT_SECS:-120}"
+  _SS_CREATE_TIMEOUT_SECS="${E2E_SELF_SCHEDULE_CREATE_TIMEOUT_SECS:-120}"
+  _SS_SETTLE_SECS="${E2E_SELF_SCHEDULE_SETTLE_SECS:-30}"
+  _SS_MCP_SPEC="${E2E_SELF_SCHEDULE_MCP_SPEC:-@molecule-ai/mcp-server@1.9.3}"
+  # Run-unique names (distinct from 10d's e2e-fire-* to avoid a ScheduleStore
+  # name-collision 409 + grid-provenance ambiguity). Bounded, cron-safe.
+  _SS_SN="e2e-self-fire-${E2E_RUN_ID:-local}"
+  _SS_SN_OMIT="e2e-self-omit-${E2E_RUN_ID:-local}"
+  _SS_FN="e2e-foreign-${E2E_RUN_ID:-local}"
+
+  if idle_digest_require_docker; then
+    # Globals set by the probe fns below; pre-init so `set -u` never trips when a
+    # diagnostic reads one before its producer ran.
+    _SS_SELF_CID=""; _SS_SELF_WSID=""; _SS_CAP_EVIDENCE=""; _SS_FIRED=""
+    _SS_CLASS=""; _SS_ID=""; _SS_OUT_FILE=""; _SS_LEGA_DETAIL=""
+    _SS_CREATE_DETAIL=""
+
+    # LEG A + the rendered-launch extractor parse the DEFAULT-runtime hermes
+    # config.yaml with the runner's python; make PyYAML importable (fail-loud
+    # best-effort install) so a missing lib cannot masquerade as a missing self
+    # entry (PARSE_FAIL yaml-lib-missing). No-op when already present or for the
+    # claude-code JSON path.
+    if ! python3 -c 'import yaml' 2>/dev/null; then
+      pip install --quiet PyYAML 2>/dev/null || python3 -m pip install --quiet PyYAML 2>/dev/null || true
+    fi
+
+    # Per-runtime native MCP-config path/format the audience injector renders the
+    # self entry into (mirrors the mcp_render / plugins_reconcile SSOT, ADR-005).
+    self_schedule_adapter_config_path() {
+      local _rt
+      _rt=$(printf '%s' "${1:-claude-code}" | tr 'A-Z' 'a-z' | tr '-' '_')
+      case "$_rt" in
+        # hermes: the runtime writes native MCP servers to $HERMES_HOME/config.yaml,
+        # and the container runs the runtime under HERMES_HOME=/tmp/.hermes + HOME=/tmp
+        # (adapter._hermes_config_path), NOT the build-time installer default
+        # /home/agent/.hermes/config.yaml (which nothing rewrites at runtime). Inspect
+        # the path the injector actually renders to + hermes-agent reads. (codex/openclaw
+        # /home/agent paths are unverified for the same HOME=/tmp effect — follow-up.)
+        hermes)   printf '%s' "/tmp/.hermes/config.yaml" ;;
+        openclaw) printf '%s' "/home/agent/.openclaw/openclaw.json" ;;
+        codex)    printf '%s' "/home/agent/.codex/config.toml" ;;
+        *)        printf '%s' "/configs/.claude/settings.json" ;;
+      esac
+    }
+    self_schedule_adapter_config_format() {
+      local _rt
+      _rt=$(printf '%s' "${1:-claude-code}" | tr 'A-Z' 'a-z' | tr '-' '_')
+      case "$_rt" in
+        hermes) printf '%s' "yaml" ;;
+        codex)  printf '%s' "toml" ;;
+        *)      printf '%s' "json" ;;
+      esac
+    }
+
+    # Resolve the OWN mol-ws container: the one whose WORKSPACE_ID env == PARENT_ID
+    # (provisioner.go sets WORKSPACE_ID=<id> in every workspace container). "$WS_ID
+    # from container env" — deterministic, no name-mangling on the short-12 suffix.
+    self_schedule_resolve_own_container() {
+      local _sc _wsid
+      _SS_SELF_CID=""; _SS_SELF_WSID=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _wsid=$(docker exec "$_sc" sh -c 'printf "%s" "${WORKSPACE_ID:-}"' 2>/dev/null || true)
+        if [ -n "$_wsid" ] && [ "$_wsid" = "$PARENT_ID" ]; then
+          _SS_SELF_CID="$_sc"
+          _SS_SELF_WSID="$_wsid"
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    # $1=name present on the OWN (self) container's volume grid?
+    self_schedule_own_grid_has() {
+      local _grid
+      _grid=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null || true)
+      printf '%s' "$_grid" | grep -Fq "$1"
+    }
+
+    # $1=name present on ANY mol-ws container's volume grid? (foreign non-arrival).
+    self_schedule_any_grid_has() {
+      local _sc _grid
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null || true)
+        if printf '%s' "$_grid" | grep -Fq "$1"; then
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    # $1=name fired? Reuses 10d's verification verbatim: the daemon logs
+    # `fired schedule '<name>'` OR writes a durable {"name":..,"status":"fired"}.
+    self_schedule_fire_probe() {
+      local _name="$1" _sc
+      _SS_FIRED=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        if docker logs "$_sc" 2>&1 | grep -F "fired schedule '$_name'" >/dev/null; then
+          _SS_FIRED="$_sc (runtime log)"
+          return 0
+        fi
+        if docker exec "$_sc" sh -c \
+          "grep -Fq '\"name\": \"$_name\"' /configs/schedules/schedule-history.json 2>/dev/null && grep -Fq '\"status\": \"fired\"' /configs/schedules/schedule-history.json 2>/dev/null" \
+          >/dev/null 2>&1; then
+          _SS_FIRED="$_sc (durable schedule-history.json)"
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    # NC precondition: the self (own) workspace is ORDINARY — its container must NOT
+    # carry an admin/org token. If it did, core WorkspaceAuth would accept a FOREIGN
+    # workspace_id for ANY id and the 401 leg of the foreign-id neg control would
+    # false-pass. (LEG A's org-key control reads the RENDERED spec-env, not the
+    # container env, precisely because a concierge box can carry an org key ambiently;
+    # the self workspace here is an ordinary child, so its container env is clean.)
+    self_schedule_assert_ordinary_box() {
+      local _leak
+      _leak=$(docker exec "$_SS_SELF_CID" sh -c 'env | grep -E "^(MOLECULE_ADMIN_TOKEN|MOLECULE_ORG_API_KEY|ORG_API_KEY)=" | sed "s/=.*/=<present>/" | tr "\n" " "' 2>/dev/null || true)
+      [ -z "$_leak" ]
+    }
+
+    # LEG A: read the rendered self mcpServers entry env from the runtime's native
+    # adapter config and assert MODE=self + token-file present, org/admin keys absent
+    # — SCOPED to the self entry env (box-independent). Sets _SS_LEGA_DETAIL.
+    self_schedule_injector_proof() {
+      local _cfg _fmt _content _res
+      _cfg=$(self_schedule_adapter_config_path "$RUNTIME")
+      _fmt=$(self_schedule_adapter_config_format "$RUNTIME")
+      _content=$(docker exec "$_SS_SELF_CID" sh -c "cat '$_cfg' 2>/dev/null" 2>/dev/null || true)
+      if [ -z "$_content" ]; then
+        _SS_LEGA_DETAIL="adapter config '$_cfg' absent/empty on $_SS_SELF_CID (runtime=$RUNTIME) — the audience injector never rendered the self entry"
+        return 3
+      fi
+      _res=$(SS_CFG_RAW="$_content" SS_CFG_FMT="$_fmt" python3 -c '
+import json, os, sys
+raw = os.environ.get("SS_CFG_RAW", "")
+fmt = os.environ.get("SS_CFG_FMT", "json")
+data = None
+perr = ""
+try:
+    data = json.loads(raw)
+except Exception as e:
+    perr = str(e)
+if data is None:
+    if fmt in ("yaml", "yml"):
+        try:
+            import yaml
+            data = yaml.safe_load(raw)
+        except ImportError:
+            print("PARSE_FAIL yaml-lib-missing"); sys.exit(0)
+        except Exception as e:
+            print("PARSE_FAIL yaml:" + str(e)); sys.exit(0)
+    elif fmt == "toml":
+        try:
+            import tomllib
+            data = tomllib.loads(raw)
+        except Exception as e:
+            print("PARSE_FAIL toml:" + str(e)); sys.exit(0)
+    else:
+        print("PARSE_FAIL json:" + perr); sys.exit(0)
+found = []
+def walk(o):
+    if isinstance(o, dict):
+        env = o.get("env")
+        if isinstance(env, dict) and str(env.get("MOLECULE_MCP_MODE", "")) == "self":
+            found.append(env)
+        for v in o.values():
+            walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            walk(v)
+walk(data)
+if not found:
+    print("NO_SELF_ENTRY"); sys.exit(0)
+env = found[0]
+if str(env.get("MOLECULE_MCP_MODE", "")) != "self":
+    print("FAIL mode-not-self"); sys.exit(0)
+if not env.get("MOLECULE_WORKSPACE_TOKEN_FILE"):
+    print("FAIL token-file-absent"); sys.exit(0)
+leaked = [k for k in ("MOLECULE_API_KEY", "MOLECULE_ORG_API_KEY", "ORG_API_KEY", "MOLECULE_ADMIN_TOKEN") if k in env]
+if leaked:
+    print("FAIL org-key-leaked:" + ",".join(leaked)); sys.exit(0)
+print("OK token_file=" + str(env.get("MOLECULE_WORKSPACE_TOKEN_FILE")))
+' 2>/dev/null || echo "PARSE_FAIL exec")
+      _SS_LEGA_DETAIL="$_res (config=$_cfg fmt=$_fmt)"
+      case "$_res" in
+        OK*)           return 0 ;;
+        NO_SELF_ENTRY) return 2 ;;
+        *)             return 1 ;;
+      esac
+    }
+
+    # Drive ONE create_schedule call via the self-mode mcp-server on the OWN
+    # container. $1 = the create_schedule arguments JSON. Sets _SS_OUT_FILE (captured
+    # stdout) and _SS_CLASS ∈ {ok, tool-error, error, no-result, no-response,
+    # parse-failed}. Swallows the nonzero RC (server exits nonzero on stdin EOF —
+    # expected, mirrors test_mcp_stdio_staging.sh:128-132).
+    self_schedule_invoke_create() {
+      local _args="$1" _init _call _cfg _fmt _cfg_raw _nodebin _cpath
+      local _result_fields=()
+      _SS_ID=""
+      _SS_OUT_FILE=$(e2e_tmp /tmp/e2e_self_schedule.XXXXXX)
+      _init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-10f","version":"1.0.0"}}}'
+      _call=$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_schedule","arguments":%s}}' "$_args")
+      # Drive the PLUGIN'S RENDERED launch, NOT a hand-rolled npx: read the
+      # command/args/env the audience injector actually wrote into the adapter
+      # config (the offline `sh -c` shim + npm_config registry/cache + injected
+      # MOLECULE_MCP_MODE=self / token-file / WORKSPACE_ID), so a regression in
+      # that rendered entry is CAUGHT here instead of masked by a substitute
+      # invocation. hermes keeps node/npx OFF the container PATH (adapter_base's
+      # mcp_launch_env adds it only for children the runtime itself spawns), so we
+      # resolve the node bin and prepend it — replicating the runtime's spawn env —
+      # else the shim's npm/npx would not resolve.
+      _cfg=$(self_schedule_adapter_config_path "$RUNTIME")
+      _fmt=$(self_schedule_adapter_config_format "$RUNTIME")
+      _cfg_raw=$(docker exec "$_SS_SELF_CID" sh -c "cat '$_cfg' 2>/dev/null" 2>/dev/null || true)
+      _nodebin=$(docker exec "$_SS_SELF_CID" sh -c 'for d in "$HERMES_HOME/node/bin" "$HOME/.hermes/node/bin" /tmp/.hermes/node/bin /home/agent/.hermes/node/bin; do [ -x "$d/npx" ] && { printf "%s" "$d"; exit 0; }; done; if command -v npx >/dev/null 2>&1; then dirname "$(command -v npx)"; fi' 2>/dev/null || true)
+      _cpath=$(docker exec "$_SS_SELF_CID" sh -c 'printf "%s" "${PATH:-/usr/local/bin:/usr/bin:/bin}"' 2>/dev/null || printf '%s' "/usr/local/bin:/usr/bin:/bin")
+      local _dexec_args=()
+      mapfile -d '' _dexec_args < <(SS_CFG_RAW="$_cfg_raw" SS_CFG_FMT="$_fmt" SS_CID="$_SS_SELF_CID" SS_NODEBIN="$_nodebin" SS_CPATH="$_cpath" python3 -c '
+import json, os, sys
+raw = os.environ.get("SS_CFG_RAW", ""); fmt = os.environ.get("SS_CFG_FMT", "json")
+data = None
+try:
+    data = json.loads(raw)
+except Exception:
+    pass
+if data is None and fmt in ("yaml", "yml"):
+    try:
+        import yaml; data = yaml.safe_load(raw)
+    except Exception:
+        data = None
+if data is None and fmt == "toml":
+    try:
+        import tomllib; data = tomllib.loads(raw)
+    except Exception:
+        data = None
+entry = [None]
+def walk(o):
+    if entry[0] is not None:
+        return
+    if isinstance(o, dict):
+        env = o.get("env")
+        if isinstance(env, dict) and str(env.get("MOLECULE_MCP_MODE", "")) == "self" and ("command" in o or "args" in o):
+            entry[0] = o; return
+        for v in o.values():
+            walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            walk(v)
+walk(data if data is not None else {})
+e = entry[0]
+if e is None:
+    sys.exit(0)  # empty argv -> caller treats as no-render
+out = []
+for k, v in (e.get("env") or {}).items():
+    out.append("-e"); out.append("%s=%s" % (k, v))
+nb = os.environ.get("SS_NODEBIN", ""); cp = os.environ.get("SS_CPATH", "")
+out.append("-e"); out.append("PATH=%s" % ((nb + ":" + cp) if nb else cp))
+out.append(os.environ["SS_CID"])
+cmd = e.get("command")
+if cmd is not None:
+    out.append(str(cmd))
+for a in (e.get("args") or []):
+    out.append(str(a))
+sys.stdout.write("\0".join(out))
+' 2>/dev/null)
+      if [ "${#_dexec_args[@]}" -eq 0 ]; then
+        _SS_CLASS="no-render"
+        log "    10f: could not extract the rendered self-launch (MODE=self command entry) from $_cfg — LEG A injector-proof should have caught a missing render first"
+        return 0
+      fi
+      {
+        printf '%s\n' "$_init"
+        printf '%s\n' "$_call"
+      } | docker exec -i "${_dexec_args[@]}" > "$_SS_OUT_FILE" 2>&1 || {
+        local _rc=$?
+        log "    10f: self-mode mcp-server exited rc=$_rc (nonzero on stdin EOF is expected — mirrors test_mcp_stdio_staging.sh)"
+      }
+      mapfile -t _result_fields < <(python3 -c '
+import json, sys
+cls = "no-response"
+rid = ""
+try:
+    fh = open(sys.argv[1], "r", errors="replace")
+except Exception:
+    print("no-response"); print(""); sys.exit(0)
+for line in fh:
+    line = line.strip()
+    if not line or line[:1] != "{":
+        continue
+    try:
+        m = json.loads(line)
+    except Exception:
+        continue
+    if m.get("id") == 2:
+        if "error" in m:
+            cls = "error"
+        else:
+            r = m.get("result", None)
+            if r is None:
+                cls = "no-result"
+            elif isinstance(r, dict) and r.get("isError") is True:
+                cls = "tool-error"
+            elif isinstance(r, dict):
+                # self-mode returns an HTTP/auth rejection (e.g. core 401 on a
+                # FOREIGN workspace_id) as a NORMAL result whose content carries
+                # {"error": ...} WITHOUT isError (see self-mode.test.ts). Treat an
+                # embedded content error as a tool-error so the foreign-id neg
+                # control sees the rejection; a successful create has no error key.
+                emb = False
+                for c in (r.get("content") or []):
+                    t = c.get("text", "") if isinstance(c, dict) else ""
+                    ts = t.strip()
+                    if ts[:1] == "{":
+                        try:
+                            o = json.loads(ts)
+                        except Exception:
+                            o = None
+                        if isinstance(o, dict):
+                            if o.get("id") is not None:
+                                rid = str(o.get("id"))
+                            if o.get("error"):
+                                emb = True; break
+                cls = "tool-error" if emb else "ok"
+            else:
+                cls = "ok"
+        break
+print(cls)
+print(rid)
+' "$_SS_OUT_FILE" 2>/dev/null || printf 'parse-failed\n\n')
+      _SS_CLASS="${_result_fields[0]:-parse-failed}"
+      _SS_ID="${_result_fields[1]:-}"
+    }
+
+    # Shared diagnostics — called by EVERY fail arm below. Dumps per-container
+    # declared-plugins/mode env, installed-plugin dirs, recent self/schedule log
+    # lines, and the last captured JSON-RPC payload. Every grep is `|| true` because
+    # a zero-match grep exits 1 under `set -euo pipefail` and would abort this fn
+    # before the log lines print — and a zero match IS the leg it explains.
+    self_schedule_diagnostics() {
+      local _sc _decl _plug _slog _grid _health _state _history
+      # Always snapshot the resolved target directly. A sibling's healthy daemon is
+      # not evidence for this grid, and the target may have stopped and disappeared
+      # from `docker ps` by the time the failure arm runs.
+      if [ -n "${_SS_SELF_CID:-}" ]; then
+        _grid=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null | tr '\n' ' ' | head -c 1200 || true)
+        _health=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedule-health.json 2>/dev/null' 2>/dev/null | tr '\n' ' ' | head -c 800 || true)
+        _state=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedule-state.json 2>/dev/null' 2>/dev/null | tr '\n' ' ' | head -c 1200 || true)
+        _history=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedule-history.json 2>/dev/null' 2>/dev/null | tr '\n' ' ' | tail -c 1600 || true)
+        log "    [self-schedule diag] TARGET $_SS_SELF_CID schedules.yaml: ${_grid:-ABSENT}"
+        log "    [self-schedule diag] TARGET $_SS_SELF_CID schedule-health.json: ${_health:-ABSENT}"
+        log "    [self-schedule diag] TARGET $_SS_SELF_CID schedule-state.json: ${_state:-ABSENT}"
+        log "    [self-schedule diag] TARGET $_SS_SELF_CID schedule-history.json tail: ${_history:-ABSENT}"
+      fi
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _decl=$(docker exec "$_sc" sh -c 'env | grep -E "^MOLECULE_(DECLARED_PLUGINS|MCP_MODE|TRIGGER)" | sort | tr "\n" " "' 2>/dev/null || true)
+        _plug=$(docker exec "$_sc" sh -c 'ls -1 /configs/plugins /plugins 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 300 || true)
+        _slog=$(docker logs "$_sc" 2>&1 | grep -iE "self|schedule|mcp-server|audience" | tail -n 5 | tr '\n' '|' | head -c 500 || true)
+        log "    [self-schedule diag] $_sc declared/mode: ${_decl:-none}"
+        log "    [self-schedule diag] $_sc installed plugins: ${_plug:-ABSENT (boot-install never fetched schedule-self — check MOLECULE_DECLARED_PLUGINS reached the container)}"
+        log "    [self-schedule diag] $_sc recent self/schedule log: ${_slog:-NONE}"
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      if [ -n "${_SS_OUT_FILE:-}" ] && [ -f "${_SS_OUT_FILE:-}" ]; then
+        log "    [self-schedule diag] last create JSON-RPC payload (class=${_SS_CLASS:-?}, id=${_SS_ID:-empty}): $(sanitize_http_body < "$_SS_OUT_FILE" | tr '\n' '|' | head -c 600 || true)"
+      fi
+    }
+
+    # ── 10f.0 Resolve the own container ──
+    log "10f/11 Self-schedule: resolving the OWN workspace container (WORKSPACE_ID=$PARENT_ID) for the deterministic self-mode invocation (up to ${_SS_CAP_TIMEOUT_SECS}s; poll=${_SS_POLL_SECS}s)."
+    if idle_digest_wait "$_SS_CAP_TIMEOUT_SECS" "$_SS_POLL_SECS" self_schedule_resolve_own_container; then
+      ok "    resolved own container: $_SS_SELF_CID (WORKSPACE_ID=$_SS_SELF_WSID)"
+    else
+      self_schedule_diagnostics
+      fail "Self-schedule: no running mol-ws container reported WORKSPACE_ID=$PARENT_ID within ${_SS_CAP_TIMEOUT_SECS}s — cannot drive the self-mode create without the own container."
+    fi
+
+    # ── 10f.A Injector proof (rendered self spec-env, org-key-free) ──
+    log "    LEG A: asserting the rendered self mcpServers entry env on $_SS_SELF_CID (MOLECULE_MCP_MODE=self + token-file present; org/admin keys ABSENT)."
+    if self_schedule_injector_proof; then
+      ok "    LEG A: self-mode spec env correct AND org-key-free — $_SS_LEGA_DETAIL"
+    else
+      self_schedule_diagnostics
+      fail "LEG A self-schedule injector proof failed: $_SS_LEGA_DETAIL. Expected the rendered self entry env to carry MOLECULE_MCP_MODE=self + MOLECULE_WORKSPACE_TOKEN_FILE and to OMIT MOLECULE_API_KEY/MOLECULE_ORG_API_KEY/ORG_API_KEY/MOLECULE_ADMIN_TOKEN. NO_SELF_ENTRY = the injector never rendered an audience:self entry (template missing runtime#328 / plugin not declared); org-key-leaked = the injector leaked a privileged key onto the ordinary-box self surface (a real regression); PARSE_FAIL yaml-lib-missing = the runner python lacks PyYAML for the hermes config.yaml adapter path (verify before flipping 10f on)."
+    fi
+
+    # ── 10f.B precondition: ordinary box (no admin/org token) ──
+    if self_schedule_assert_ordinary_box; then
+      ok "    precondition: own container carries no admin/org token — the foreign-id 401 neg control is meaningful"
+    else
+      self_schedule_diagnostics
+      fail "Self-schedule precondition failed: the OWN workspace container carries an admin/org token (MOLECULE_ADMIN_TOKEN/MOLECULE_ORG_API_KEY/ORG_API_KEY present). WorkspaceAuth would then accept a FOREIGN workspace_id for any id, so the foreign-id negative control below would false-pass. Investigate token injection — the ordinary-box token model is violated."
+    fi
+
+    # ── 10f.B.1 Daemon-armed wait (mirror 10d; closes #4448 before create) ──
+    log "    LEG B: waiting up to ${_SS_CAP_TIMEOUT_SECS}s for the trigger daemon to arm (schedule-health.json ticking) before creating — #4448 arm-race guard."
+    if idle_digest_wait "$_SS_CAP_TIMEOUT_SECS" "$_SS_POLL_SECS" self_schedule_target_capability_ready; then
+      ok "    trigger daemon armed & ticking (evidence: $_SS_CAP_EVIDENCE)"
+    else
+      self_schedule_diagnostics
+      fail "Self-schedule: the trigger daemon never armed within ${_SS_CAP_TIMEOUT_SECS}s (no live last_tick). A schedule created now would not fire. 10f is co-gated on E2E_SCHEDULER_CHECK=on (10d) — check the scheduler plugin boot-installed and the daemon armed."
+    fi
+
+    # ── 10f.B.2 create with EXPLICIT workspace_id → lands on OWN grid ──
+    _SS_ARGS_EXPLICIT=$(SS_WS="$PARENT_ID" SS_NM="$_SS_SN" python3 -c 'import json,os; print(json.dumps({"workspace_id":os.environ["SS_WS"],"name":os.environ["SS_NM"],"cron_expr":"* * * * *","prompt":"e2e self-schedule explicit-id probe","enabled":True}))')
+    log "    LEG B(i): create_schedule with EXPLICIT workspace_id=$PARENT_ID name='$_SS_SN' via self-mode mcp-server ($_SS_MCP_SPEC) on $_SS_SELF_CID, retrying only a proven UUID DB-misroute for up to ${_SS_CREATE_TIMEOUT_SECS}s."
+    if self_schedule_create_until_own_grid "$_SS_ARGS_EXPLICIT" "$_SS_SN"; then
+      ok "    LEG B(i): explicit-id schedule '$_SS_SN' landed on the OWN volume grid ($_SS_SELF_CID:/configs/schedules/schedules.yaml)"
+    else
+      _ss_create_rc=$?
+      self_schedule_diagnostics
+      if [ "$_ss_create_rc" = "2" ]; then
+        fail "LEG B(i): explicit-id create_schedule failed before OWN-grid confirmation ($_SS_CREATE_DETAIL). The captured JSON-RPC payload is in the diagnostics above. A tool-error/error is not a capability-cache race and remains a hard failure."
+      fi
+      fail "LEG B(i): explicit-id schedule '$_SS_SN' never appeared on the OWN grid within ${_SS_CREATE_TIMEOUT_SECS}s ($_SS_CREATE_DETAIL). A UUID+missing-grid result was retried through the bounded capability-cache window; volume/unclear ids were poll-only to avoid duplicate creates."
+    fi
+
+    # ── 10f.B.3 create with OMITTED workspace_id → SELF-RESOLVES + lands ──
+    _SS_ARGS_OMIT=$(SS_NM="$_SS_SN_OMIT" python3 -c 'import json,os; print(json.dumps({"name":os.environ["SS_NM"],"cron_expr":"* * * * *","prompt":"e2e self-schedule omit-id probe","enabled":True}))')
+    log "    LEG B(ii): create_schedule with workspace_id OMITTED name='$_SS_SN_OMIT' — must SELF-RESOLVE to the own workspace and land, retrying only a proven UUID DB-misroute for up to ${_SS_CREATE_TIMEOUT_SECS}s."
+    if self_schedule_create_until_own_grid "$_SS_ARGS_OMIT" "$_SS_SN_OMIT"; then
+      ok "    LEG B(ii): omit-id schedule '$_SS_SN_OMIT' SELF-RESOLVED to the own workspace and landed on the OWN grid"
+    else
+      _ss_create_rc=$?
+      self_schedule_diagnostics
+      if [ "$_ss_create_rc" = "2" ]; then
+        fail "LEG B(ii): omit-id create_schedule failed before OWN-grid confirmation ($_SS_CREATE_DETAIL). The self-mode server must default workspace_id to the container's own WORKSPACE_ID; a tool-error/error is a hard self-resolution/auth failure, not a retry signal."
+      fi
+      fail "LEG B(ii): omit-id schedule '$_SS_SN_OMIT' never appeared on the OWN grid within ${_SS_CREATE_TIMEOUT_SECS}s ($_SS_CREATE_DETAIL). A UUID+missing-grid result was retried through the bounded capability-cache window; volume/unclear ids were poll-only to avoid duplicate creates."
+    fi
+
+    # ── 10f.B.4 the explicit-id self-created schedule FIRES (reuse 10d) ──
+    log "    LEG B: polling fire evidence for '$_SS_SN' for up to ${_SS_TIMEOUT_SECS}s (reuses 10d's log/history verification; poll=${_SS_POLL_SECS}s)."
+    if idle_digest_wait "$_SS_TIMEOUT_SECS" "$_SS_POLL_SECS" self_schedule_fire_probe "$_SS_SN"; then
+      ok "    LEG B: self-created schedule '$_SS_SN' autonomously FIRED (evidence: $_SS_FIRED)"
+    else
+      self_schedule_diagnostics
+      fail "LEG B: self-created schedule '$_SS_SN' never fired within ${_SS_TIMEOUT_SECS}s — it landed on the grid but the trigger daemon never delivered a self-scheduled turn (scheduler co-gate / trigger-lane leg)."
+    fi
+
+    # ── 10f.B.5 NEG CONTROL: FOREIGN workspace_id rejected + never arrives ──
+    _SS_FWS="${CHILD_ID:-00000000-0000-4000-8000-0000000ff0f0}"
+    _SS_ARGS_FOREIGN=$(SS_WS="$_SS_FWS" SS_NM="$_SS_FN" python3 -c 'import json,os; print(json.dumps({"workspace_id":os.environ["SS_WS"],"name":os.environ["SS_NM"],"cron_expr":"* * * * *","prompt":"e2e self-schedule foreign-id neg control","enabled":True}))')
+    log "    LEG B NEG CONTROL: create_schedule with FOREIGN workspace_id=$_SS_FWS name='$_SS_FN' — must be REJECTED (tool error / core 401) and never arrive on any grid."
+    self_schedule_invoke_create "$_SS_ARGS_FOREIGN"
+    case "$_SS_CLASS" in
+      tool-error|error)
+        ok "    LEG B NC: foreign-id create was REJECTED at the tool/auth boundary (class=$_SS_CLASS) — the self box carries only the per-workspace token, so core WorkspaceAuth 401s a foreign id"
+        ;;
+      *)
+        self_schedule_diagnostics
+        fail "LEG B NC: foreign-id create_schedule was NOT rejected (class=$_SS_CLASS) — a create against a FOREIGN workspace_id must fail (tool error / core 401 from WorkspaceAuth). A non-error here means the self box could mutate another workspace's grid — a cross-tenant auth regression."
+        ;;
+    esac
+    log "    LEG B NC: settling ${_SS_SETTLE_SECS}s, then asserting '$_SS_FN' arrived on NO mol-ws grid (container-inspectable non-arrival)."
+    sleep "$_SS_SETTLE_SECS"
+    if self_schedule_any_grid_has "$_SS_FN"; then
+      self_schedule_diagnostics
+      fail "LEG B NC: the foreign-named schedule '$_SS_FN' APPEARED on a mol-ws volume grid despite the rejected create — the foreign create mutated a grid it must never reach. This is a hard cross-tenant isolation failure."
+    else
+      ok "    LEG B NC: '$_SS_FN' is absent from every mol-ws volume grid — the rejected foreign create never mutated any grid (isolation holds)"
+    fi
+
+    ok "    10f self-schedule tool: LEG A injector proof + LEG B (explicit-id, omit-id self-resolve, fire) + foreign-id/org-key neg controls all PASSED"
+
+    unset -f self_schedule_adapter_config_path self_schedule_adapter_config_format \
+      self_schedule_resolve_own_container \
+      self_schedule_own_grid_has self_schedule_any_grid_has self_schedule_fire_probe \
+      self_schedule_assert_ordinary_box self_schedule_injector_proof \
+      self_schedule_invoke_create self_schedule_diagnostics
+  else
+    fail "E2E_SELF_SCHEDULE_CHECK=on requires a usable Docker CLI and daemon to drive the self-mode create_schedule tool and inspect grid/fire evidence."
+  fi
 fi
 
 # ─── 11. Teardown runs via trap ────────────────────────────────────────

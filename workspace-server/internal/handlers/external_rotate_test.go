@@ -10,6 +10,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
+	"gopkg.in/yaml.v3"
 )
 
 // external_rotate_test.go — coverage for the credential-rotate +
@@ -279,22 +280,22 @@ func TestBuildExternalConnectionPayload_StampsPlaceholders(t *testing.T) {
 	if strings.Contains(mcp, "{{MCP_SERVER_NAME}}") {
 		t.Errorf("universal_mcp_snippet still contains literal {{MCP_SERVER_NAME}}")
 	}
-	// {{PLATFORM_URL}} + {{WORKSPACE_ID}} placeholders must be substituted
-	// out of every snippet — if any snippet still contains a literal
-	// "{{PLATFORM_URL}}" or "{{WORKSPACE_ID}}", a future template author
-	// forgot to use the placeholder convention and operators see broken
-	// snippets.
-	for _, k := range []string{
-		"curl_register_template", "python_snippet",
-		"claude_code_channel_snippet", "universal_mcp_snippet",
-		"hermes_channel_snippet", "codex_snippet", "openclaw_snippet",
-	} {
+	// Every placeholder must be substituted out of every snippet — if any
+	// snippet still contains a literal "{{PLATFORM_URL}}", "{{WORKSPACE_ID}}"
+	// or "{{AUTH_TOKEN}}", a future template author forgot to use the
+	// placeholder convention (or forgot to teach stamp() about a new one) and
+	// operators see broken snippets.
+	//
+	// The loop ranges over externalSnippetTemplates rather than a
+	// hand-maintained list of keys: a hand-maintained list is the same
+	// "author must remember to add a row" failure mode that let the canvas
+	// fixture drift (#79). New snippet → automatically covered here.
+	for k := range externalSnippetTemplates {
 		v, _ := got[k].(string)
-		if strings.Contains(v, "{{PLATFORM_URL}}") {
-			t.Errorf("%s still contains literal {{PLATFORM_URL}}", k)
-		}
-		if strings.Contains(v, "{{WORKSPACE_ID}}") {
-			t.Errorf("%s still contains literal {{WORKSPACE_ID}}", k)
+		for _, ph := range []string{"{{PLATFORM_URL}}", "{{WORKSPACE_ID}}", "{{AUTH_TOKEN}}"} {
+			if strings.Contains(v, ph) {
+				t.Errorf("%s still contains literal %s", k, ph)
+			}
 		}
 	}
 }
@@ -314,8 +315,8 @@ func TestBuildExternalConnectionPayload_TrimsTrailingSlash(t *testing.T) {
 }
 
 func TestBuildExternalConnectionPayload_BlankAuthTokenIsAllowed(t *testing.T) {
-	// Re-show path: auth_token="" is the contract; the modal masks the
-	// field and labels it "rotate to reveal a new token".
+	// Re-show path: auth_token="" is the contract; the modal explains that
+	// the live token remains active and rotation is the recovery path.
 	got := BuildExternalConnectionPayload("https://platform.test", "ws-7", "", "")
 	if got["auth_token"] != "" {
 		t.Errorf("blank token must propagate as \"\"; got %v", got["auth_token"])
@@ -370,26 +371,38 @@ func TestBuildExternalConnectionPayload_McpServerNameUniquePerWorkspace(t *testi
 //   - codex: ~/.codex/config.toml [mcp_servers.<name>] — TOML rejects
 //     duplicate table keys, so a second workspace with the same name
 //     either breaks parsing or overwrites the first table.
-//   - openclaw: ~/.openclaw/mcp/<name>.json — file is keyed by <name>,
-//     `openclaw mcp set <same-name>` overwrites.
-//   - hermes: ~/.hermes/config.yaml gateway.plugin_platforms.<key>:
-//     YAML rejects duplicate mapping keys.
-//   - kimi: ~/.molecule-ai/kimi-<slug>/ per-workspace dir — single
-//     "kimi-workspace" dir would have both workspaces' envs collide.
+//   - openclaw: ~/.openclaw/openclaw.json mcp.servers.<name> — the map is
+//     keyed by <name>, so `openclaw mcp set <same-name>` overwrites.
 //
-// All four must therefore stamp the workspace-specific
-// {{MCP_SERVER_NAME}} slug. This test catches a future template author
-// who introduces a new runtime tab without plumbing the slug.
+// The three MCP hosts above key a config namespace by NAME, so they must
+// stamp the workspace-specific {{MCP_SERVER_NAME}} slug. This test catches a
+// future template author who introduces a new runtime tab without plumbing it.
+//
+//   - hermes is intentionally NOT in that set. Its plugin registers the fixed
+//     platform name `molecule`, and hermes reads it from
+//     top-level platforms.molecule. One hermes gateway therefore connects to one
+//     Molecule workspace; inventing a workspace-specific platform key makes
+//     hermes silently ignore the config.
+//
+//   - kimi is the exception: it registers no MCP server-name entry anywhere,
+//     it just needs a private directory. So it keys on {{WORKSPACE_ID}}, which
+//     is unique BY CONSTRUCTION. The name-slug is NOT: mcpServerNameForWorkspace
+//     documents that two identically-named workspaces slugify identically
+//     (external_connection.go:144-148) — which for kimi meant workspace B's
+//     `cat > .../env` silently overwriting workspace A's credentials in a
+//     shared kimi-molecule-<same-slug>/ dir. Slug-keying is a collision the
+//     other three tolerate (the config format itself errors or overwrites
+//     loudly); kimi's dir is the one place it silently destroys data.
 func TestBuildExternalConnectionPayload_AllRuntimeSnippetsAreWorkspaceUnique(t *testing.T) {
 	got := BuildExternalConnectionPayload("https://p.test", "id-a", "my-bot", "tok")
 
-	// Per-template literal that proves the slug was stamped through.
+	// Per-template literal that proves the per-workspace key was stamped through.
 	wantPerSnippet := map[string]string{
 		"universal_mcp_snippet": "claude mcp add molecule-my-bot ",
 		"codex_snippet":         "[mcp_servers.molecule-my-bot]",
 		"openclaw_snippet":      "openclaw mcp set molecule-my-bot ",
-		"hermes_channel_snippet": "          molecule-my-bot:",
-		"kimi_snippet":          "~/.molecule-ai/kimi-molecule-my-bot",
+		// Workspace-ID-keyed, not slug-keyed — see the note above.
+		"kimi_snippet": "~/.molecule-ai/kimi-id-a",
 	}
 	for key, needle := range wantPerSnippet {
 		v, _ := got[key].(string)
@@ -411,5 +424,63 @@ func TestBuildExternalConnectionPayload_AllRuntimeSnippetsAreWorkspaceUnique(t *
 		if strings.Contains(v, "{{MCP_SERVER_NAME}}") {
 			t.Errorf("%s still contains literal {{MCP_SERVER_NAME}}", k)
 		}
+	}
+}
+
+// TestBuildExternalConnectionPayload_HermesUsesRegisteredPlatformKey keeps the
+// generated config aligned with both current hermes-agent and the legacy
+// platform-plugin branch. Both parse plugin entries from the top-level
+// platforms.<registered-name>; plugin_platforms is an internal struct field,
+// not a YAML key. The plugin registers exactly `molecule`, so a
+// workspace-specific key would also be ignored.
+func TestBuildExternalConnectionPayload_HermesUsesRegisteredPlatformKey(t *testing.T) {
+	got := BuildExternalConnectionPayload("https://p.test", "id-a", "my-bot", "tok")
+	hermes, _ := got["hermes_channel_snippet"].(string)
+
+	var configLines []string
+	inConfig := false
+	for _, line := range strings.Split(hermes, "\n") {
+		if line == "#      plugins:" {
+			inConfig = true
+		}
+		if !inConfig {
+			continue
+		}
+		if line == "#" {
+			break
+		}
+		if !strings.HasPrefix(line, "#      ") {
+			t.Fatalf("unexpected Hermes config example line %q", line)
+		}
+		configLines = append(configLines, strings.TrimPrefix(line, "#      "))
+	}
+	if len(configLines) == 0 {
+		t.Fatal("Hermes snippet has no YAML config example")
+	}
+
+	var config struct {
+		Plugins struct {
+			Enabled []string `yaml:"enabled"`
+		} `yaml:"plugins"`
+		Platforms map[string]struct {
+			Enabled bool `yaml:"enabled"`
+		} `yaml:"platforms"`
+		Gateway         map[string]any `yaml:"gateway"`
+		PluginPlatforms map[string]any `yaml:"plugin_platforms"`
+	}
+	if err := yaml.Unmarshal([]byte(strings.Join(configLines, "\n")), &config); err != nil {
+		t.Fatalf("Hermes config example is invalid YAML: %v", err)
+	}
+	if len(config.Gateway) != 0 {
+		t.Error("Hermes platforms must be top-level, not nested under gateway")
+	}
+	if len(config.PluginPlatforms) != 0 {
+		t.Error("Hermes config must not use the internal plugin_platforms field name")
+	}
+	if len(config.Plugins.Enabled) != 1 || config.Plugins.Enabled[0] != "molecule" {
+		t.Errorf("Hermes plugins.enabled = %#v, want [molecule]", config.Plugins.Enabled)
+	}
+	if molecule, ok := config.Platforms["molecule"]; !ok || !molecule.Enabled {
+		t.Errorf("Hermes top-level platforms.molecule = %#v, want enabled", molecule)
 	}
 }

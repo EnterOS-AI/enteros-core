@@ -25,11 +25,10 @@ import (
 
 func TestWorkspaceCanRaiseTaskAndApprovalToUser(t *testing.T) {
 	cfg := requireStagingEnv(t)
-	slug := fmt.Sprintf("e2e-req-%d", time.Now().Unix()%100000000)
+	slug := e2eSlug("req")
 	t.Logf("workspace-requests: slug=%s", slug)
 
 	orgID := adminCreateOrg(t, cfg, slug)
-	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
 	adminToken := tenantAdminToken(t, cfg, slug)
 	tenantHost := slug + "." + cfg.subdomainSuffix
 	waitForHTTP(t, tenantHost, http.StatusOK, 10*time.Minute, "tenant /health ready")
@@ -67,11 +66,10 @@ func TestWorkspaceCanRaiseTaskAndApprovalToUser(t *testing.T) {
 // the "external + platform workspaces just inherit it SSOT-ly" design.
 func TestExternalRuntimeWorkspaceCanRaiseTaskAndApproval(t *testing.T) {
 	cfg := requireStagingEnv(t)
-	slug := fmt.Sprintf("e2e-extreq-%d", time.Now().Unix()%100000000)
+	slug := e2eSlug("extreq")
 	t.Logf("external-runtime requests: slug=%s", slug)
 
 	orgID := adminCreateOrg(t, cfg, slug)
-	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
 	adminToken := tenantAdminToken(t, cfg, slug)
 	tenantHost := slug + "." + cfg.subdomainSuffix
 	waitForHTTP(t, tenantHost, http.StatusOK, 10*time.Minute, "tenant /health ready")
@@ -144,11 +142,10 @@ func raiseRequest(t *testing.T, host, wsToken, orgID, wsID, kind, title string) 
 // (and therefore that the requester-agent A2A notification was enqueued).
 func TestWorkspaceRequestMoreInfoFlipsToInfoRequested(t *testing.T) {
 	cfg := requireStagingEnv(t)
-	slug := fmt.Sprintf("e2e-moreinfo-%d", time.Now().Unix()%100000000)
+	slug := e2eSlug("moreinfo")
 	t.Logf("more-info: slug=%s", slug)
 
 	orgID := adminCreateOrg(t, cfg, slug)
-	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
 	adminToken := tenantAdminToken(t, cfg, slug)
 	tenantHost := slug + "." + cfg.subdomainSuffix
 	waitForHTTP(t, tenantHost, http.StatusOK, 10*time.Minute, "tenant /health ready")

@@ -34,17 +34,26 @@ import (
 type CPProvisionerAPI interface {
 	Start(ctx context.Context, cfg WorkspaceConfig) (string, error)
 	Stop(ctx context.Context, workspaceID string) error
+	// EnsureImage asks the control plane to make this workspace's pinned image
+	// obtainable BEFORE the caller stops anything (core#5019, structural half).
+	//
+	// Deliberately on THIS interface rather than behind an optional type
+	// assertion on *CPProvisioner: the guard's whole value is that a restart
+	// path cannot reach Stop without having asked first, and an optional
+	// interface is exactly the shape that lets a fake — or a future second
+	// implementation — silently skip the question and still compile.
+	EnsureImage(ctx context.Context, req EnsureImageRequest) (EnsureImageResult, error)
 	// StopAndPrune is Stop + "erase the durable data volume" (internal#734),
 	// for the permanent-delete-with-erase flow ONLY. Restart/recreate use Stop.
 	StopAndPrune(ctx context.Context, workspaceID string) error
 	GetConsoleOutput(ctx context.Context, workspaceID string) (string, error)
-	// IsRunning reports whether the workspace's compute (EC2 instance) is
+	// IsRunning reports whether the workspace's provider-managed compute is
 	// currently in the running state. Surfaced on the interface (rather than
 	// only on *CPProvisioner) so the a2a-proxy reactive-health path can
-	// detect dead EC2 agents the same way it detects dead Docker containers.
+	// detect dead managed agents the same way it detects dead Docker containers.
 	// Pre-#NNN, maybeMarkContainerDead only consulted the local Docker
 	// provisioner — for SaaS tenants (h.provisioner=nil) the check was a
-	// no-op, so a dead EC2 agent would leak 502/503 to canvas with no
+	// no-op, so a dead managed agent would leak 502/503 to canvas with no
 	// auto-recovery. (true, err) on transport errors keeps callers on the
 	// alive path; (false, nil) is the only definitive "dead" signal.
 	IsRunning(ctx context.Context, workspaceID string) (bool, error)
@@ -57,8 +66,8 @@ type CPProvisionerAPI interface {
 var _ CPProvisionerAPI = (*CPProvisioner)(nil)
 
 // CPProvisioner provisions workspace agents by calling the control plane's
-// workspace provision API. The control plane creates EC2 instances with
-// Docker + the workspace runtime installed at boot from PyPI.
+// workspace provision API. The control plane selects the configured compute
+// provider and starts the workspace runtime on that backend.
 //
 // Auto-activated when MOLECULE_ORG_ID is set (SaaS tenant).
 type CPProvisioner struct {
@@ -68,6 +77,18 @@ type CPProvisioner struct {
 	adminToken    string // X-Molecule-Admin-Token — per-tenant identity (controlplane #118/#130)
 	cpAdminAPIKey string // Authorization: Bearer — gates /cp/admin/* (read-only ops routes; distinct secret from sharedSecret)
 	httpClient    *http.Client
+	// provisionHTTPClient carries ONLY the provision POST. core#5019: a
+	// workspace adopting a newly promoted template pin is stopped before the
+	// CP is asked to provision it, and the CP cannot answer until it holds the
+	// pinned image (~7GB). Sharing the 120s budget meant a cold pull blew the
+	// deadline and left the workspace with no container at all.
+	provisionHTTPClient *http.Client
+	// ensureImageHTTPClient carries ONLY the ensure-image pre-flight (core#5019,
+	// structural half). Separate from provisionHTTPClient because the two bound
+	// different operations: this one may spend minutes making a ~7GB pinned image
+	// present BEFORE the workspace is stopped; the provision that follows it is
+	// then fast. See cpEnsureImageTimeout.
+	ensureImageHTTPClient *http.Client
 	// hostStateDir is the base dir for the host-side /configs mirror the Files
 	// API serves from when there is no docker.sock into the runtime container
 	// (#206 molecules-server). Empty disables the mirror (config still delivers
@@ -145,12 +166,14 @@ func NewCPProvisioner() (*CPProvisioner, error) {
 	}
 
 	return &CPProvisioner{
-		baseURL:       baseURL,
-		orgID:         orgID,
-		sharedSecret:  sharedSecret,
-		adminToken:    adminToken,
-		cpAdminAPIKey: cpAdminAPIKey,
-		httpClient:    &http.Client{Timeout: 120 * time.Second},
+		baseURL:               baseURL,
+		orgID:                 orgID,
+		sharedSecret:          sharedSecret,
+		adminToken:            adminToken,
+		cpAdminAPIKey:         cpAdminAPIKey,
+		httpClient:            &http.Client{Timeout: cpAPITimeout},
+		provisionHTTPClient:   &http.Client{Timeout: cpProvisionTimeout},
+		ensureImageHTTPClient: &http.Client{Timeout: cpEnsureImageTimeout},
 	}, nil
 }
 
@@ -162,6 +185,39 @@ func NewCPProvisioner() (*CPProvisioner, error) {
 // deployments without a real CP still work (those don't hit a CP that
 // enforces either gate). In prod both are set by the controlplane
 // bootstrap, so both headers land on every outbound call.
+// cpAPITimeout bounds the small JSON calls to the CP (status, stop, console).
+// They are request/response only and must not hang a caller.
+const cpAPITimeout = 120 * time.Second
+
+// cpProvisionTimeout bounds the provision POST. The CP may have to pull a
+// multi-GB workspace image before it can answer -- guaranteed right after a
+// template promote, when no host has the new digest yet. Measured: a cold
+// 7.05GB pull, then the identical call returned in 13s once the image was
+// local. This is deliberately generous; the failure it prevents is not a slow
+// restart but a workspace left down (core#5019).
+const cpProvisionTimeout = 20 * time.Minute
+
+// CPProvisionCeiling exposes the provision POST's budget so a CALLER can size
+// its own context against the thing that actually has to finish inside it.
+//
+// Exported for the same reason EnsureImageClientTimeout() is: a caller deadline
+// SMALLER than this constant bounds nothing. It cancels the request before the
+// client can ever time out, so widening the client achieves precisely nothing,
+// and the failure does not even surface here — it surfaces on the CONTROL PLANE
+// as `context canceled` in the middle of a multi-GB pull, with no client-side
+// timeout anywhere in the logs to point at.
+//
+// That inversion is not hypothetical. provisionWorkspaceCP bounded the whole
+// provision at provisioner.ProvisionTimeout (3 min) while core#5019 had already
+// widened this client to 20 min and the control plane had raised its own pull
+// cap to 30 min with a 2-minute stall window. The 3-minute context beat all
+// three, and a workspace created shortly after a runtime-image promote was
+// marked terminally failed while the pull was still making steady progress.
+//
+// Callers must size their context at OR ABOVE this value. handlers has a test
+// pinning that relation, which is what stops the inversion returning quietly.
+func CPProvisionCeiling() time.Duration { return cpProvisionTimeout }
+
 func (p *CPProvisioner) provisionAuthHeaders(req *http.Request) {
 	if p.sharedSecret != "" {
 		req.Header.Set("Authorization", "Bearer "+p.sharedSecret)
@@ -189,13 +245,21 @@ func (p *CPProvisioner) adminAuthHeaders(req *http.Request) {
 }
 
 type cpProvisionRequest struct {
-	OrgID        string `json:"org_id"`
-	WorkspaceID  string `json:"workspace_id"`
-	Runtime      string `json:"runtime"`
-	Template     string `json:"template,omitempty"`
-	Tier         int    `json:"tier"`
-	InstanceType string `json:"instance_type,omitempty"`
-	DiskGB       int32  `json:"disk_gb,omitempty"`
+	OrgID       string `json:"org_id"`
+	WorkspaceID string `json:"workspace_id"`
+	// IdempotencyKey lets the CP dedupe a RETRY of this provision attempt
+	// (core#5057). Minted once per Start call and reused across that call's
+	// retries; the CP records the terminal response against
+	// (org_id, idempotency_key) and replays it rather than provisioning a
+	// second box. omitempty so the wire shape is unchanged for a CP that does
+	// not yet understand the field — an older CP simply ignores it and the
+	// retry degrades to the pre-#5057 risk profile.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	Runtime        string `json:"runtime"`
+	Template       string `json:"template,omitempty"`
+	Tier           int    `json:"tier"`
+	InstanceType   string `json:"instance_type,omitempty"`
+	DiskGB         int32  `json:"disk_gb,omitempty"`
 	// Provider routes the CP to the compute backend for this workspace box
 	// (multi-provider RFC, per-workspace). Distinct from the LLM/model provider.
 	Provider string `json:"provider,omitempty"`
@@ -215,25 +279,23 @@ type cpProvisionRequest struct {
 	Display     WorkspaceDisplayConfig `json:"display,omitempty"`
 	PlatformURL string                 `json:"platform_url"`
 	Env         map[string]string      `json:"env"`
-	// ConfigFiles are template + generated config files to write into the
-	// EC2 instance's /configs directory. OFFSEC-010: collected by
+	// ConfigFiles are small generated/compatibility config files to materialize
+	// in the workspace's /configs directory. OFFSEC-010: collected by
 	// collectCPConfigFiles which rejects symlinks and non-regular files
 	// before including them. Serialised as base64 to avoid JSON escaping.
 	//
-	// ConfigFiles is the SM-bound bundle (the CP stages it through AWS
-	// Secrets Manager as molecule/workspace/<id>/config). It's the right
-	// transport for SMALL non-secret config text only — it has a 256 KiB
-	// cap and the SM transport is sized + scoped for *secrets*. See the
-	// core-devops 10:13 SM-inventory RCA.
+	// ConfigFiles retains a 256 KiB compatibility budget. Larger
+	// template-owned assets use the separate TemplateAssets field below; the
+	// control plane owns provider-specific materialization for both fields.
 	ConfigFiles map[string]string `json:"config_files,omitempty"`
 
 	// TemplateAssets (RFC #2843 #24) are non-secret template assets
 	// (config.yaml + prompts/ — agent-skills are plugins now, RFC#2843
 	// #32) fetched from a non-secret asset channel (template repo /
 	// Gitea shallow clone per RFC §4.2 transport option (a)). They
-	// travel on a SEPARATE wire field from ConfigFiles (the SM-bound
-	// bundle) so a future CP can route them through a non-secret
-	// transport without going through the SM cap. Serialised as base64
+	// travel on a SEPARATE wire field from ConfigFiles so the CP can route them
+	// through the non-secret asset channel without the compatibility budget.
+	// Serialised as base64
 	// to avoid JSON escaping.
 	//
 	// Keys are restricted to the template-asset allowlist enforced by
@@ -250,7 +312,7 @@ type cpProvisionResponse struct {
 }
 
 // buildCPTenantEnv assembles the env map the control plane forwards to a
-// tenant EC2 workspace container, applying the forensic #145 SCM-write-token
+// managed workspace runtime, applying the forensic #145 SCM-write-token
 // guard.
 //
 // The guard strips every key classified by isSCMWriteTokenKey (GITEA_TOKEN,
@@ -297,7 +359,7 @@ func buildCPTenantEnv(cfg WorkspaceConfig) map[string]string {
 	return env
 }
 
-// Start provisions a workspace by calling the control plane → EC2.
+// Start provisions a workspace through the control plane's selected backend.
 func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, error) {
 	// p.adminToken is read from os.Getenv("ADMIN_TOKEN") at provisioner creation
 	// and is used ONLY as CP request authentication (the X-Molecule-Admin-Token
@@ -305,7 +367,7 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	// CP owns admin delivery (platform-kind only) and WS-A's scoped boot token is
 	// the ordinary box's pre-register bearer.
 	//
-	// Forensic #145 hardening: tenant workspaces run on EC2 via this path, so
+	// Forensic #145 hardening: managed workspaces run on provider compute via this path, so
 	// the SCM-write-token denylist (see buildContainerEnv) is enforced here
 	// too. Always build a filtered copy — never pass cfg.EnvVars through
 	// verbatim — so a latent persona-merged GITEA_TOKEN can't reach the
@@ -318,8 +380,7 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	// - Skips symlinks during WalkDir (prevents /etc/passwd etc. inclusion)
 	// - Validates all paths are relative and non-escaping
 	// - Caps total size at cpConfigFilesMaxBytes (a transport-DoS guard,
-	//   not the retired 12 KiB user-data ceiling — config now ships off
-	//   user-data via the CP's Secrets-Manager seeding path)
+	//   not the retired 12 KiB provider user-data ceiling)
 	configFiles, templateAssets, err := collectCPConfigFiles(cfg)
 	if err != nil {
 		return "", fmt.Errorf("cp provisioner: collect config files: %w", err)
@@ -379,13 +440,20 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 		InstanceType:    cfg.InstanceType,
 		DiskGB:          cfg.DiskGB,
 		DataPersistence: cfg.DataPersistence,
-		Provider:        cfg.Provider,
-		Kind:            kind,
-		Display:         cfg.Display,
-		PlatformURL:     cfg.PlatformURL,
-		Env:             env,
-		ConfigFiles:     configFiles,
-		TemplateAssets:  templateAssets,
+		// core#5025: resolved through the SAME seam as EnsureImage and Stop.
+		// cfg.Provider arrives from payload.Compute.Provider, which the canvas
+		// compute VALIDATOR drops whenever the persisted id is outside the
+		// cloud/billable picker set (the local Molecules-Server box is not in
+		// it) — so a workspace could be pre-warmed for the box named on its row
+		// and then provisioned with no provider at all. The pre-flight is only a
+		// guard if it resolves the box the provision actually builds.
+		Provider:       p.providerForWorkspace(ctx, cfg.WorkspaceID, cfg.Provider),
+		Kind:           kind,
+		Display:        cfg.Display,
+		PlatformURL:    cfg.PlatformURL,
+		Env:            env,
+		ConfigFiles:    configFiles,
+		TemplateAssets: templateAssets,
 	}
 
 	body, err := json.Marshal(req)
@@ -394,46 +462,150 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	}
 
 	url := p.baseURL + "/cp/workspaces/provision"
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("cp provisioner: create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	p.provisionAuthHeaders(httpReq)
 
-	resp, err := p.httpClient.Do(httpReq)
-	if err != nil {
-		return "", fmt.Errorf("cp provisioner: send: %w", err)
+	// Provisioning gets its own budget -- see cpProvisionTimeout.
+	provisionClient := p.provisionHTTPClient
+	if provisionClient == nil {
+		provisionClient = p.httpClient
 	}
-	defer func() { _ = resp.Body.Close() }()
 
-	// Cap body read at 64 KiB — the CP only ever returns small JSON
-	// responses; an unbounded read could be weaponized into log-flood
-	// DoS by a compromised upstream.
-	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	if readErr != nil {
-		return "", fmt.Errorf("cp provisioner: read response body: %w", readErr)
-	}
-	var result cpProvisionResponse
-	unmarshalErr := json.Unmarshal(respBody, &result)
-
-	if resp.StatusCode != http.StatusCreated {
-		// Prefer the structured {"error":"..."} field. Do NOT fall back
-		// to string(respBody) — our logs ingest errors, and an upstream
-		// misconfiguration that echoed the Authorization header or
-		// request body into the response would leak bearer tokens.
-		errMsg := result.Error
-		if errMsg == "" {
-			errMsg = fmt.Sprintf("<unstructured body, %d bytes>", len(respBody))
+	// core#5057 — bounded, ctx-aware retry of the provision POST.
+	//
+	// This call was single-shot, so a transient failure on the hop meant the box
+	// was NEVER CREATED: Start returned an error, provisionWorkspaceCP called
+	// markProvisionFailed, and nothing re-drove it (StartProvisioningTimeoutSweep
+	// only flips stuck rows to 'failed'). e2e-smoke then polled loaded_mcp_tools
+	// for 240s against a workspace with no box. Seen as `remote error: tls: bad
+	// record MAC` and as Cloudflare 524/502 under load — non-deterministic: the
+	// same commit passed at 20:36 and failed at 22:06, and it also struck the
+	// commit already running in production.
+	//
+	// It was the outlier on this path. Stop retries (cpStopWithRetryErr, 3
+	// attempts, ctx-aware) and the instance_id persist retries (3 attempts,
+	// exponential backoff) — but the call that CREATES the box did not.
+	// (CPProvisioner.EnsureImage is sometimes cited as a retrying neighbour. It
+	// is NOT — cp_ensure_image.go is a single client.Do with no loop; the local
+	// ensureImagePresent is likewise single-attempt best-effort. Stop is the
+	// real precedent, and the shape below follows cpStopWithRetryErr, the only
+	// ctx-aware retry in the tree.)
+	//
+	// SAFETY. Retrying is sound ONLY because the CP now dedupes on a
+	// client-supplied idempotency key (controlplane#2882, migration 073).
+	// Re-entry into the CP handler is otherwise DESTRUCTIVE: the AWS path
+	// terminates the pre-existing instance and the local-docker path
+	// `docker rm -f`s the container, so a blind retry of a request that DID land
+	// would tear down the box the first attempt created. ONE key is minted per
+	// Start call and reused across every attempt — that is exactly what makes
+	// attempt N a retry of attempt 1 rather than a second provision. DO NOT move
+	// the mint inside the loop.
+	attempts := cpProvisionRetryAttempts
+	if key, keyErr := newProvisionIdempotencyKey(); keyErr != nil {
+		// Without a key the CP cannot dedupe, so retrying would risk
+		// double-provisioning. Fall back to the old single-shot behaviour rather
+		// than retry unsafely.
+		log.Printf("CPProvisioner.Start: could not mint an idempotency key for %s (%v) — falling back to a SINGLE un-retried attempt", cfg.WorkspaceID, keyErr)
+		attempts = 1
+	} else {
+		req.IdempotencyKey = key
+		if body, err = json.Marshal(req); err != nil {
+			return "", fmt.Errorf("cp provisioner: marshal with idempotency key: %w", err)
 		}
-		return "", fmt.Errorf("cp provisioner: provision failed (%d): %s", resp.StatusCode, errMsg)
 	}
 
-	if unmarshalErr != nil {
-		return "", fmt.Errorf("cp provisioner: decode 201 response: %w", unmarshalErr)
+	var (
+		result  cpProvisionResponse
+		lastErr error
+	)
+	delay := cpProvisionRetryBaseDelay
+	for attempt := 1; ; attempt++ {
+		httpReq, reqErr := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+		if reqErr != nil {
+			return "", fmt.Errorf("cp provisioner: create request: %w", reqErr)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		p.provisionAuthHeaders(httpReq)
+
+		var (
+			statusCode int
+			respBody   []byte
+		)
+		resp, doErr := provisionClient.Do(httpReq)
+		if doErr == nil {
+			// Cap body read at 64 KiB — the CP only ever returns small JSON
+			// responses; an unbounded read could be weaponized into log-flood
+			// DoS by a compromised upstream.
+			var readErr error
+			respBody, readErr = io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+			statusCode = resp.StatusCode
+			_ = resp.Body.Close()
+			if readErr != nil {
+				doErr = fmt.Errorf("read response body: %w", readErr)
+			}
+		}
+
+		if doErr != nil {
+			// Transport error: the request may or may not have reached the CP.
+			// This is the `tls: bad record MAC` case, and precisely why the
+			// idempotency key is a precondition for retrying at all.
+			lastErr = fmt.Errorf("cp provisioner: send: %w", doErr)
+		} else {
+			result = cpProvisionResponse{}
+			unmarshalErr := json.Unmarshal(respBody, &result)
+			if statusCode == http.StatusCreated {
+				if unmarshalErr != nil {
+					return "", fmt.Errorf("cp provisioner: decode 201 response: %w", unmarshalErr)
+				}
+				if attempt > 1 {
+					log.Printf("CPProvisioner.Start: provision for %s succeeded on attempt %d/%d — same idempotency key, so this is the SAME box, not a second one", cfg.WorkspaceID, attempt, attempts)
+				}
+				lastErr = nil
+				break
+			}
+			// Prefer the structured {"error":"..."} field. Do NOT fall back
+			// to string(respBody) — our logs ingest errors, and an upstream
+			// misconfiguration that echoed the Authorization header or
+			// request body into the response would leak bearer tokens.
+			errMsg := result.Error
+			if errMsg == "" {
+				errMsg = fmt.Sprintf("<unstructured body, %d bytes>", len(respBody))
+			}
+			lastErr = fmt.Errorf("cp provisioner: provision failed (%d): %s", statusCode, errMsg)
+			if !retryableProvisionStatus(statusCode, result.Error) {
+				// A deterministic rejection (400 privileged_env_forbidden, 403,
+				// 422 RUNTIME_PIN_MISSING, ...) will fail identically forever.
+				// Retrying it only burns the provision budget.
+				return "", lastErr
+			}
+		}
+
+		if attempt >= attempts {
+			break
+		}
+		log.Printf("CPProvisioner.Start: provision attempt %d/%d for %s failed (%v) — retrying in %s", attempt, attempts, cfg.WorkspaceID, lastErr, delay)
+		// ctx-aware sleep, matching cpStopWithRetryErr: a cancelled or
+		// timed-out provision must not sit in a bare time.Sleep.
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", fmt.Errorf("cp provisioner: provision aborted during retry backoff: %w (last error: %v)", ctx.Err(), lastErr)
+		case <-timer.C:
+		}
+		delay *= 2
+		if delay > cpProvisionRetryMaxDelay {
+			delay = cpProvisionRetryMaxDelay
+		}
+	}
+	if lastErr != nil {
+		// Greppable, mirroring the LEAK-SUSPECT line cpStopWithRetryErr emits on
+		// exhaustion.
+		log.Printf("PROVISION-EXHAUSTED cpProv.Start workspace_id=%s attempts=%d last_err=%v", cfg.WorkspaceID, attempts, lastErr)
+		return "", lastErr
 	}
 
-	log.Printf("CP provisioner: workspace %s → EC2 instance %s (%s)", cfg.WorkspaceID, result.InstanceID, result.State)
+	log.Printf("CP provisioner: workspace %s → provider instance %s (%s)", cfg.WorkspaceID, result.InstanceID, result.State)
+	// Compatibility: dashboards consume this historical event name. InstanceID
+	// is now an opaque provider identifier; do not infer AWS from the event name.
 	provlog.Event("provision.ec2_started", map[string]any{
 		"workspace_id": cfg.WorkspaceID,
 		"instance_id":  result.InstanceID,
@@ -445,8 +617,8 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 }
 
 // cpConfigFilesMaxBytes bounds the aggregate config bundle this tenant
-// ships to the control plane. It is a transport-DoS guard, NOT the old
-// EC2-user-data ceiling.
+// ships to the control plane. It is a transport-DoS guard, not a provider
+// user-data limit.
 //
 // History: this was 12 KiB (12<<10) because the CP embedded the bundle in
 // EC2 user-data, which AWS caps at 16 KiB (the cap left ~4 KiB for bootstrap
@@ -456,14 +628,10 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 // client-side with "config files exceed 12288 bytes" and the workspace
 // could never provision.
 //
-// Config delivery now goes OFF user-data: the CP stages the bundle to AWS
-// Secrets Manager (molecule/workspace/<id>/config) at provision time and the
-// workspace fetches it into /configs at boot (mirrors the proven tenant
-// bootstrap-secrets pattern). The bundle travels here only inside the JSON
-// HTTP request body to the CP, which has no 16 KiB limit. The remaining
-// bound exists purely so a buggy/hostile tenant can't stream an unbounded
-// body and OOM the CP provision path — set generous (256 KiB) so legitimate
-// growth (more schedules, longer prompts, more skills) never re-hits a wall.
+// Current core sends the bundle only inside the authenticated tenant→CP JSON
+// request. The control plane chooses how its selected provider materializes
+// it. The remaining bound prevents a buggy or hostile tenant from streaming
+// an unbounded body into the CP provision path.
 const cpConfigFilesMaxBytes = 256 << 10
 
 // cpTemplateAssetsMaxBytes bounds the aggregate TEMPLATE-ASSET payload
@@ -471,11 +639,11 @@ const cpConfigFilesMaxBytes = 256 << 10
 // RFC#2843 #32; they are plugins installed post-online) delivered via the
 // generic non-secret asset channel (RFC #2843 #24). This is a SEPARATE bound
 // from cpConfigFilesMaxBytes: the config bundle is capped at 256 KiB because
-// it rides the Secrets-Manager/user-data transport, while template ASSETS
-// ride a non-secret channel. With skills removed the legitimate payload is
-// tiny (config.yaml ~8 KiB + prompts ~8 KiB), but we keep a generous 16 MiB
-// bound as a pure transport-DoS guard (not a secrets-transport limit) so a
-// runaway/malicious fetcher can't stream an unbounded body.
+// it is the compatibility field, while template assets have a dedicated
+// non-secret field. With skills removed the legitimate payload is tiny
+// (config.yaml ~8 KiB + prompts ~8 KiB), but we keep a generous 16 MiB bound
+// as a pure transport-DoS guard so a runaway or malicious fetcher cannot
+// stream an unbounded request body.
 const cpTemplateAssetsMaxBytes = 16 << 20
 
 // isCPTemplateConfigFile restricts which files from a template directory are
@@ -596,10 +764,9 @@ func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, map[string][]
 	// config.yaml + prompts/ via the non-secret asset channel
 	// (template repo, Gitea shallow clone per §4.2 transport
 	// option (a)) and land them in the SEPARATE TemplateAssets
-	// field of the provision request — NOT in ConfigFiles (the
-	// SM-bound bundle). The split is load-bearing: ConfigFiles is
-	// the bundle the CP stages through AWS Secrets Manager, which
-	// is sized + scoped for *secrets* and caps at 256 KiB.
+	// field of the provision request — NOT in ConfigFiles. The split is
+	// load-bearing: ConfigFiles retains a 256 KiB compatibility budget while
+	// template assets have their own 16 MiB transport guard.
 	//
 	// agent-skills are NOT fetched here anymore (RFC#2843 #32):
 	// skills are plugins, installed post-online via the plugin
@@ -638,15 +805,13 @@ func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, map[string][]
 	return files, assets, nil
 }
 
-// Stop terminates the workspace's EC2 instance via the control plane.
+// Stop terminates the workspace's provider-managed compute via the control plane.
 //
-// Looks up the actual EC2 instance_id from the workspaces table before
-// calling CP — earlier versions passed workspaceID (a UUID) as the
-// instance_id query param, which CP forwarded to EC2 TerminateInstances,
-// which rejected with InvalidInstanceID.Malformed (EC2 IDs are i-… not
-// UUIDs). The terminate failure then left the workspace's SG attached,
-// blocking the next provision with InvalidGroup.Duplicate — a full
-// "Save & Restart" crash on SaaS.
+// Looks up the opaque provider instance_id from the workspaces table before
+// calling CP. Historically, the AWS backend received workspaceID instead and
+// rejected it as InvalidInstanceID.Malformed, leaving provider resources
+// attached and breaking the next provision. The lookup is provider-neutral;
+// CP routes termination using compute.provider.
 func (p *CPProvisioner) Stop(ctx context.Context, workspaceID string) error {
 	return p.stopInternal(ctx, workspaceID, false)
 }
@@ -691,9 +856,8 @@ func (p *CPProvisioner) stopInternal(ctx context.Context, workspaceID string, pr
 	q := url.Values{}
 	q.Set("instance_id", instanceID)
 	if provider != "" {
-		// #2386: CP Deprovision routes by provider so a non-AWS workspace is
-		// torn down by its own backend instead of falling through to the AWS
-		// terminate path (which would leak the box).
+		// #2386: CP Deprovision routes by provider so a workspace is torn down
+		// by its owning backend instead of the legacy default path.
 		q.Set("provider", provider)
 	}
 	if prune {
@@ -713,12 +877,11 @@ func (p *CPProvisioner) stopInternal(ctx context.Context, workspaceID string, pr
 	defer func() { _ = resp.Body.Close() }()
 	// http.Client.Do only returns err on transport failure; a 4xx/5xx
 	// response is NOT an error. Without this status check, a CP that
-	// returns 5xx (AWS hiccup, missing IAM, transient outage) is read
+	// returns 5xx (provider hiccup, missing credentials, transient outage) is read
 	// as success, the workspace row is then marked status='removed' by
-	// the caller, and the EC2 stays alive forever — there's no DB row
+	// the caller, and provider compute stays alive forever — there's no DB row
 	// left to point at the orphan. This is the leak source documented
-	// in workspace_crud.go's #1843 comment ("orphan EC2 on a
-	// 0-customer account scenario"); the loud-fail path already exists
+	// in workspace_crud.go's historical #1843 orphan-compute incident; the loud-fail path already exists
 	// upstream, this just plumbs it through.
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Read a bounded slice of the body so the error message gives ops
@@ -741,7 +904,7 @@ func (p *CPProvisioner) stopInternal(ctx context.Context, workspaceID string, pr
 
 // resolveProvider reads workspaces.compute->>'provider' for the given workspace.
 // Returns ("", nil) when the row has no provider or the column is missing —
-// callers treat empty as "default provider" (AWS). Exposed as a package var
+// callers treat empty as the deployment-selected default provider. Exposed as a package var
 // so tests can substitute a stub, same pattern as resolveInstanceID.
 var resolveProvider = func(ctx context.Context, workspaceID string) (string, error) {
 	if db.DB == nil {
@@ -789,7 +952,7 @@ var resolveInstanceID = func(ctx context.Context, workspaceID string) (string, e
 	return instanceID.String, nil
 }
 
-// IsRunning checks workspace EC2 instance state via the control plane.
+// IsRunning checks workspace provider-compute state via the control plane.
 //
 // Contract (matches the Docker Provisioner.IsRunning contract —
 // critical for a2a_proxy's alive-on-transient-error path):
@@ -846,9 +1009,8 @@ func (p *CPProvisioner) IsRunning(ctx context.Context, workspaceID string) (bool
 	q := url.Values{}
 	q.Set("instance_id", instanceID)
 	if provider != "" {
-		// Sibling-leak to #2386: CP status routes by provider so a non-AWS
-		// workspace is queried by its own backend instead of falling through
-		// to the AWS status path (which would report NOT_FOUND / wrong state).
+		// Sibling-leak to #2386: CP status routes by provider so the workspace
+		// is queried through its owning backend instead of the legacy default.
 		q.Set("provider", provider)
 	}
 	u := fmt.Sprintf("%s/cp/workspaces/%s/status?%s", p.baseURL, workspaceID, q.Encode())
@@ -880,10 +1042,9 @@ func (p *CPProvisioner) IsRunning(ctx context.Context, workspaceID string) (bool
 }
 
 // GetConsoleOutput proxies a call to the CP's
-// GET /cp/admin/workspaces/:id/console endpoint, which returns the EC2
-// serial console output (AWS ec2:GetConsoleOutput under the hood) for a
-// workspace instance. The tenant platform has no AWS credentials by
-// design, so CP is the only party that can read the serial console.
+// GET /cp/admin/workspaces/:id/console endpoint, which returns the provider's
+// boot log for a workspace instance. The tenant platform has no provider
+// credentials by design, so CP is the only party that can read it.
 //
 // Returns ("", err) on transport or non-2xx — the caller decides what
 // to render to the user.
@@ -902,8 +1063,7 @@ func (p *CPProvisioner) GetConsoleOutput(ctx context.Context, workspaceID string
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("cp provisioner: console: unexpected %d", resp.StatusCode)
 	}
-	// Cap at 256 KiB — EC2 returns at most 64 KiB of serial console, but
-	// allow headroom for CP-side wrapping / metadata.
+	// Cap at 256 KiB to bound provider output plus CP-side wrapping/metadata.
 	var body struct {
 		Output string `json:"output"`
 	}

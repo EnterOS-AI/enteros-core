@@ -69,11 +69,17 @@ func MatchesSSOT(c *MCPPluginDeliveryContract) []string {
 	// Per-runtime native delivery surfaces for platform-capable runtimes. Each
 	// must be present and implemented so the platform MCP is written into the
 	// file the active runtime actually reads.
+	// ADR-004 (SDK-owns-adapter-socket): each official adapter now OVERRIDES
+	// register_mcp_server_hook to render its OWN native file, so the SSOT
+	// renderer no longer names a standalone mcp_render.render_<runtime> function
+	// but the adapter hook method itself (<Runtime>Adapter.register_mcp_server_hook).
+	// This value-pin tracks that rename; a regression back to a non-adapter
+	// renderer (or a missing per-runtime surface) still trips the gate.
 	wantRuntimes := map[string]Runtime{
-		"claude_code": {SettingsPath: "/configs/.claude/settings.json", Format: "json", Key: "mcpServers", Renderer: "mcp_render.render_claude_settings", Status: "implemented"},
-		"codex":       {SettingsPath: "~/.codex/config.toml", Format: "toml", Table: "mcp_servers", Renderer: "mcp_render.render_codex_config", Status: "implemented"},
-		"openclaw":    {SettingsPath: "~/.openclaw/openclaw.json", Format: "json", KeyPath: "mcp.servers", Renderer: "mcp_render.render_openclaw_config", Status: "implemented"},
-		"hermes":      {SettingsPath: "~/.hermes/config.yaml", Format: "yaml", Key: "mcp_servers", Renderer: "mcp_render.render_hermes_config", Status: "implemented"},
+		"claude_code": {SettingsPath: "/configs/.claude/settings.json", Format: "json", Key: "mcpServers", Renderer: "ClaudeCodeAdapter.register_mcp_server_hook", Status: "implemented"},
+		"codex":       {SettingsPath: "~/.codex/config.toml", Format: "toml", Table: "mcp_servers", Renderer: "CodexAdapter.register_mcp_server_hook", Status: "implemented"},
+		"openclaw":    {SettingsPath: "~/.openclaw/openclaw.json", Format: "json", KeyPath: "mcp.servers", Renderer: "OpenClawAdapter.register_mcp_server_hook", Status: "implemented"},
+		"hermes":      {SettingsPath: "~/.hermes/config.yaml", Format: "yaml", Key: "mcp_servers", Renderer: "HermesAgentAdapter.register_mcp_server_hook", Status: "implemented"},
 	}
 	for name, want := range wantRuntimes {
 		got, ok := c.Runtimes[name]

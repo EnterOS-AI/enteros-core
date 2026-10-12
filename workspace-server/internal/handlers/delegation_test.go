@@ -502,26 +502,39 @@ func TestIsQueuedProxyResponse(t *testing.T) {
 	// echoes verbatim into the agent chat as
 	// "Delegation completed: Delegation completed (workspace agent
 	// busy — request queued, will dispatch...)".
+	//
+	// The delegation caller now uses the unified QueuedA2AResponse predicate
+	// (a2a_queue.go); this pins the delegation-relevant shapes AND the
+	// queue_id extraction the unified matcher adds.
 	cases := []struct {
-		name string
-		body string
-		want bool
+		name        string
+		body        string
+		want        bool
+		wantQueueID string
 	}{
 		{
-			name: "real proxy busy-enqueue body",
-			body: `{"queued":true,"queue_id":"d0993390-5f5a-4f5d-90a2-66639e53e3c9","queue_depth":1,"message":"workspace agent busy — request queued, will dispatch when capacity available"}`,
-			want: true,
+			name:        "real proxy busy-enqueue body",
+			body:        `{"queued":true,"queue_id":"d0993390-5f5a-4f5d-90a2-66639e53e3c9","queue_depth":1,"message":"workspace agent busy — request queued, will dispatch when capacity available"}`,
+			want:        true,
+			wantQueueID: "d0993390-5f5a-4f5d-90a2-66639e53e3c9",
 		},
-		{"queued false explicitly", `{"queued":false}`, false},
-		{"queued field absent (real A2A reply)", `{"jsonrpc":"2.0","id":"1","result":{"kind":"message","parts":[{"kind":"text","text":"hi"}]}}`, false},
-		{"non-bool queued value (defensive)", `{"queued":"true"}`, false},
-		{"malformed JSON", `not-json`, false},
-		{"empty body", ``, false},
+		// The poll-mode / push-async short-circuit shape is ALSO recognized by
+		// the unified matcher (was previously only matched by first-boot's copy).
+		{"poll-mode status:queued shape", `{"status":"queued","delivery_mode":"poll","method":"message/send"}`, true, ""},
+		{"queued false explicitly", `{"queued":false}`, false, ""},
+		{"queued field absent (real A2A reply)", `{"jsonrpc":"2.0","id":"1","result":{"kind":"message","parts":[{"kind":"text","text":"hi"}]}}`, false, ""},
+		{"non-bool queued value (defensive)", `{"queued":"true"}`, false, ""},
+		{"malformed JSON", `not-json`, false, ""},
+		{"empty body", ``, false, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isQueuedProxyResponse([]byte(tc.body)); got != tc.want {
-				t.Errorf("isQueuedProxyResponse(%q) = %v, want %v", tc.body, got, tc.want)
+			got, gotQueueID := QueuedA2AResponse([]byte(tc.body))
+			if got != tc.want {
+				t.Errorf("QueuedA2AResponse(%q) queued = %v, want %v", tc.body, got, tc.want)
+			}
+			if gotQueueID != tc.wantQueueID {
+				t.Errorf("QueuedA2AResponse(%q) queueID = %q, want %q", tc.body, gotQueueID, tc.wantQueueID)
 			}
 		})
 	}
@@ -1117,9 +1130,18 @@ func expectExecuteDelegationFailed(mock sqlmock.Sqlmock) {
 		WithArgs("failed", sqlmock.AnyArg(), testDeliverySourceID, testDeliveryDelegationID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	// INSERT activity_logs for delegation failure ('failed' is a SQL literal, not a param)
+	// INSERT activity_logs for delegation failure ('failed' is a SQL literal, not a param).
+	//
+	// The last arg is asserted CONCRETELY, not as AnyArg: this is the
+	// target-unreachable path, and it used to write NO response_body at all —
+	// so response_body->>'delegation_id' was NULL on precisely the delegation
+	// you most need to correlate. Anything asking "did this ever get a reply?"
+	// answered "no, forever" for it, which is how a wedged target became
+	// invisible (#4314). If the correlation payload regresses to NULL, this
+	// must go red — a sixth AnyArg() would have accepted the bug back.
 	mock.ExpectExec("INSERT INTO activity_logs").
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			`{"delegation_id":"`+testDeliveryDelegationID+`"}`).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
@@ -1200,7 +1222,7 @@ func TestExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSuccess(t *testin
 			},
 		},
 	})
-	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody)
+	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody, "")
 
 	time.Sleep(100 * time.Millisecond) // let DB writes settle
 
@@ -1266,7 +1288,7 @@ func TestExecuteDelegation_ProxyErrorNon2xx_RemainsFailed(t *testing.T) {
 			},
 		},
 	})
-	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody)
+	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody, "")
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -1316,7 +1338,7 @@ func TestExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed(t *testing.T) {
 			},
 		},
 	})
-	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody)
+	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody, "")
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -1359,7 +1381,7 @@ func TestExecuteDelegation_CleanProxyResponse_Unchanged(t *testing.T) {
 			},
 		},
 	})
-	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody)
+	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody, "")
 
 	time.Sleep(100 * time.Millisecond)
 

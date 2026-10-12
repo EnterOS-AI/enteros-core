@@ -1,4 +1,5 @@
 import importlib
+import inspect
 import sys
 from pathlib import Path
 
@@ -22,11 +23,17 @@ def _no_enforced_file_contexts_by_default(monkeypatch):
     integration tests below predate that feature and only set up
     branch-protection + governance statuses; left unpatched they would pick
     up the REAL repo file (whose entries aren't in their fixtures) and
-    correctly go `wait`. Default the loader to [] so the legacy BP-path tests
-    keep asserting the BP path; the dedicated SSOT-enforced tests pass
-    `enforced_file_contexts=` explicitly to evaluate_merge_readiness (and
-    call load_enforced_file_contexts on a tmp file), so they are unaffected."""
-    monkeypatch.setattr(mq, "load_enforced_file_contexts", lambda path: [])
+    correctly go `wait`. Default the loader to the single `CI / all-required`
+    aggregator sentinel — every repo's SSOT carries exactly this line, and the
+    critical-context guard now DERIVES its per-repo critical set from it
+    (critical_context_prefixes); a realistic baseline keeps the legacy BP-path
+    tests asserting the BP path while the step-0 critical guard sees the
+    sentinel their ready fixtures already post green. The dedicated
+    SSOT-enforced tests pass `enforced_file_contexts=` explicitly (and call
+    load_enforced_file_contexts on a tmp file), so they are unaffected."""
+    monkeypatch.setattr(
+        mq, "load_enforced_file_contexts", lambda path: ["CI / all-required"]
+    )
 
 
 def test_latest_statuses_dedupes_by_context_newest_first():
@@ -64,19 +71,21 @@ def test_required_contexts_green_rejects_missing_and_pending():
     ]
 
 
-def test_required_contexts_green_rejects_volume_skipped():
-    """volume-skipped pending is a partial view, not a genuine soft-fail.
+def test_required_contexts_green_rejects_pending_with_descriptive_prefix():
+    """A required context left `pending` is a partial view, not a soft-fail.
 
-    Per sop-checklist.py:1179-1187, volume_skipped posts pending with a
-    '[volume-skipped]' prefix. The merge queue must NOT treat this as an
-    acceptable soft-fail — the gate did not finish evaluating.
+    A gate can post `pending` with a human-readable description prefix (e.g. a
+    `[volume-skipped]` note when it capped its own work). The merge queue must
+    NOT treat any such pending required context as an acceptable soft-fail —
+    the gate did not finish evaluating. Proven here against a real required
+    context so the guard tracks the live required set.
     """
     latest = mq.latest_statuses_by_context([
         {"context": "CI / all-required (pull_request)", "status": "success"},
         {
-            "context": "sop-checklist / all-items-acked (pull_request_target)",
+            "context": "Secret scan / Scan diff for credential-shaped strings (pull_request)",
             "status": "pending",
-            "description": "[volume-skipped] comment-cap=1000 hit; please file ...",
+            "description": "[volume-skipped] cap hit; please file ...",
         },
     ])
 
@@ -84,12 +93,667 @@ def test_required_contexts_green_rejects_volume_skipped():
         latest,
         [
             "CI / all-required (pull_request)",
-            "sop-checklist / all-items-acked (pull_request_target)",
+            "Secret scan / Scan diff for credential-shaped strings (pull_request)",
         ],
     )
 
     assert ok is False
-    assert "sop-checklist / all-items-acked (pull_request_target)=pending" in missing_or_bad
+    assert (
+        "Secret scan / Scan diff for credential-shaped strings (pull_request)=pending"
+        in missing_or_bad
+    )
+
+
+# ── core#4363: BP wildcard "*" handling ─────────────────────────────────────
+# Production branch protection on main is status_check_contexts=['*']. Until this
+# fix, required_contexts_green treated "*" as a LITERAL context name, so it
+# returned (False, ["*=missing"]) on EVERY PR — even a fully green one — and the
+# merge queue decided `wait` on all of them. The bot merged nothing; humans did
+# every merge. These tests exercise the ['*'] path the existing suite never did
+# (its _ready_kwargs uses a literal required_contexts list).
+
+
+def test_wildcard_all_posted_green_is_green():
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "E2E Chat / E2E Chat (pull_request)", "status": "success"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is True, bad
+    assert bad == []
+
+
+def test_wildcard_waits_on_any_posted_red():
+    # Negative control: with "*", ANY posted non-success blocks — there is no
+    # advisory tier (matches BP ['*'] and task #113).
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "E2E Chat / E2E Chat (pull_request)", "status": "failure"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["E2E Chat / E2E Chat (pull_request)=failure"]
+
+
+def test_wildcard_waits_on_any_posted_pending():
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "E2E Chat / E2E Chat (pull_request)", "status": "pending"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["E2E Chat / E2E Chat (pull_request)=pending"]
+
+
+def test_wildcard_with_zero_posted_is_failclosed_no_match():
+    # core#4363 FOLLOW-UP (was: "vacuously green at this layer"). With NO posted
+    # statuses, "*" now matches nothing and this layer itself FAILS CLOSED
+    # (`*=no-match`) instead of returning green and leaning entirely on the
+    # step-0 / step-4b backstops. A mergeable PR always has posted CI, so this
+    # never freezes a real merge — it only refuses to bless a blank board.
+    ok, bad = mq.required_contexts_green({}, ["*"])
+    assert ok is False
+    assert bad == ["*=no-match"]
+
+
+def test_wildcard_ignores_queues_own_pending_self_status():
+    # core#4420 self-jam: the `gitea-merge-queue / queue` status the queue itself
+    # posts is `pending` for the whole duration of the run that evaluates the
+    # PR, so under "*" the queue required its OWN in-flight status to be green
+    # and deadlocked — a PR could never merge on the event of its own approval.
+    # With every REAL context green, "*" must now return green DESPITE the
+    # self-status being pending. Uses the (pull_request_review) suffix the live
+    # status actually carries (which _EVENT_SUFFIX_RE deliberately does NOT
+    # strip) to prove the match is event-suffix-insensitive.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path (pull_request)", "status": "success"},
+        {"context": "gitea-merge-queue / queue (pull_request_review)", "status": "pending"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is True, bad
+    assert bad == []
+
+
+def test_wildcard_still_waits_on_a_real_pending_alongside_self_status():
+    # NEGATIVE CONTROL for the exclusion: it must be specific to the queue's own
+    # status, NOT a blanket "ignore every pending context". A genuinely pending
+    # REAL gate still blocks — and the reported `bad` list names ONLY that real
+    # context, never the (correctly-excluded) self-status. Guards the property,
+    # not the shape: if the fix ever over-reached to drop all pending contexts,
+    # `ok` would flip True here and this fails.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "E2E Chat / E2E Chat (pull_request)", "status": "pending"},
+        {"context": "gitea-merge-queue / queue (pull_request_review)", "status": "pending"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["E2E Chat / E2E Chat (pull_request)=pending"]
+
+
+_CANCELLED_TARGET = "/molecule-ai/molecule-core/actions/runs/644628/jobs/949071"
+
+
+def test_wildcard_ignores_a_cancelled_self_status():
+    # core#5156 — the EXACT measured row. Gitea's Actions engine (not any step;
+    # the job had started_at=1970 and run_attempt=0, so nothing of ours ran)
+    # stamped `failure`/"Has been cancelled" on PR #5156 head 626d2049da after
+    # a newer run evicted this one from the repo-global concurrency group while
+    # it was still QUEUED. The queue's own gate-runner status carries no verdict
+    # about the PR, and because the evicting run belongs to a DIFFERENT head SHA
+    # nothing will ever re-post here — so requiring it green latches the PR
+    # forever. With every REAL context green, "*" must return green.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "Secret scan / Scan (pull_request)", "status": "success"},
+        {
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "failure",
+            "description": "Has been cancelled",
+            "target_url": _CANCELLED_TARGET,
+        },
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is True, bad
+    assert bad == []
+
+
+def test_wildcard_still_blocks_on_a_real_failure_alongside_a_cancelled_self():
+    # NEGATIVE CONTROL: the cancellation strip must not become a blanket
+    # "cancelled anywhere is fine" or "reds are fine". A genuinely failing REAL
+    # gate still blocks, and `bad` names ONLY it.
+    latest = mq.latest_statuses_by_context([
+        {
+            "context": "CI / all-required (pull_request)",
+            "status": "failure",
+            "description": "Failing after 3m12s",
+            "target_url": "/molecule-ai/molecule-core/actions/runs/644630/jobs/949080",
+        },
+        {
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "failure",
+            "description": "Has been cancelled",
+            "target_url": _CANCELLED_TARGET,
+        },
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["CI / all-required (pull_request)=failure"]
+
+
+def test_a_cancelled_NON_self_context_still_blocks():
+    # THE load-bearing scope control. The strip is for the queue's own
+    # gate-runner context ONLY. A cancelled PRODUCT gate is still an unproven
+    # gate: nothing ran, so nothing may be blessed. It must keep blocking, and
+    # is healed by re-running the run (stranded_status_janitor), never by
+    # ignoring it here.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {
+            "context": "lint-mask-pr-atomicity / lint-mask-pr-atomicity (pull_request)",
+            "status": "failure",
+            "description": "Has been cancelled",
+            "target_url": "/molecule-ai/molecule-core/actions/runs/644844/jobs/949900",
+        },
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == [
+        "lint-mask-pr-atomicity / lint-mask-pr-atomicity (pull_request)=failure"
+    ]
+
+
+def test_cancellation_strip_requires_an_actions_target_url():
+    # A bot that POSTs a status with the same description is not the Actions
+    # engine. Without an Actions run/job target_url the row is an ordinary red.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "failure",
+            "description": "Has been cancelled",
+            "target_url": "https://example.invalid/some/bot/report",
+        },
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["gitea-merge-queue / queue (pull_request_review)=failure"]
+
+
+def test_cancellation_description_match_is_exact_not_substring():
+    # A genuine queue failure whose description merely QUOTES the phrase must
+    # still block — the same trap main-red-watchdog._is_cancel_cascade avoids.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "failure",
+            "description": "Has been cancelled by the user unexpectedly",
+            "target_url": _CANCELLED_TARGET,
+        },
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["gitea-merge-queue / queue (pull_request_review)=failure"]
+
+
+def test_literal_requirement_on_a_cancelled_self_status_is_still_honored():
+    # The strip is GLOB-only, exactly like the pending strip. A policy that
+    # LITERALLY names the context keeps a strict presence+success check.
+    latest = mq.latest_statuses_by_context([
+        {
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "failure",
+            "description": "Has been cancelled",
+            "target_url": _CANCELLED_TARGET,
+        },
+    ])
+    ok, bad = mq.required_contexts_green(
+        latest, ["gitea-merge-queue / queue (pull_request_review)"]
+    )
+    assert ok is False
+    assert bad == ["gitea-merge-queue / queue (pull_request_review)=failure"]
+
+
+def test_wildcard_with_only_a_cancelled_self_status_is_failclosed_no_match():
+    # Degenerate board: once the uninformative self-status is stripped, "*"
+    # matches nothing -> fail-closed no-match, never a vacuous green.
+    latest = mq.latest_statuses_by_context([
+        {
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "failure",
+            "description": "Has been cancelled",
+            "target_url": _CANCELLED_TARGET,
+        },
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["*=no-match"]
+
+
+def test_wildcard_still_blocks_on_a_failed_self_status():
+    # NEGATIVE CONTROL for finding #5: the self-status strip is gated on the
+    # `pending` state (fail-closed). Only the queue's OWN in-flight status is a
+    # self-referential no-op, and that status is `pending` for the whole run.
+    # A self-status in a terminal FAILURE/error state is a REAL red (a queue run
+    # that genuinely broke, e.g. a merge-actor API error) and must STILL block —
+    # it self-heals on the next clean tick when a fresh run re-posts pending then
+    # success. If the strip were state-blind (the pre-fix behaviour) `ok` would
+    # flip True here and this fails. The reported `bad` names exactly the failed
+    # self-status.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "gitea-merge-queue / queue (pull_request_review)", "status": "failure"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["gitea-merge-queue / queue (pull_request_review)=failure"]
+
+
+def test_literal_self_status_requirement_is_still_honored():
+    # The exclusion is GLOB-only. A policy that LITERALLY names the self-status
+    # as a required context still gets a strict presence+success check — proving
+    # the fix removes a self-referential wildcard match, not the context's
+    # gate-ability outright.
+    latest = mq.latest_statuses_by_context([
+        {"context": "gitea-merge-queue / queue (pull_request_review)", "status": "pending"},
+    ])
+    ok, bad = mq.required_contexts_green(
+        latest, ["gitea-merge-queue / queue (pull_request_review)"]
+    )
+    assert ok is False
+    assert bad == ["gitea-merge-queue / queue (pull_request_review)=pending"]
+
+
+def test_wildcard_with_only_self_status_is_failclosed_no_match():
+    # Degenerate board: the ONLY posted status is the queue's own. After the
+    # exclusion, "*" matches nothing -> fail-closed no-match (never a vacuous
+    # green). A real mergeable PR always has other posted CI, so this only
+    # refuses to bless a board that is blank once the self-status is removed.
+    latest = mq.latest_statuses_by_context([
+        {"context": "gitea-merge-queue / queue (pull_request_review)", "status": "pending"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["*=no-match"]
+
+
+def test_wildcard_plus_literal_dedupes_a_double_flag():
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "failure"},
+    ])
+    ok, bad = mq.required_contexts_green(
+        latest, ["*", "CI / all-required (pull_request)"]
+    )
+    assert ok is False
+    # flagged by both the wildcard sweep and the literal check -> listed ONCE
+    assert bad == ["CI / all-required (pull_request)=failure"]
+
+
+def test_self_status_context_matches_live_workflow_name_and_job(tmp_path):
+    # Finding #7 (coupling guard): SELF_STATUS_CONTEXT is a hardcoded literal
+    # ("gitea-merge-queue / queue") that MUST equal the live commit-status
+    # context Gitea posts for this workflow's queue job, i.e.
+    #   f"{workflow.name} / {queue-job-id}".
+    # Nothing else cross-checks them: rename the workflow `name:` or the `queue`
+    # job id and the self-jam strip (core#4420 / #126) silently stops matching,
+    # re-introducing the deadlock with every OTHER test still green (they all
+    # hardcode the same literal). This derives the context from the workflow
+    # YAML and asserts the coupling, so a rename fails HERE.
+    # SCRIPT is .gitea/scripts/gitea-merge-queue.py; the workflow lives at
+    # .gitea/workflows/gitea-merge-queue.yml (two levels up: scripts -> .gitea).
+    workflow = SCRIPT.parent.parent / "workflows" / "gitea-merge-queue.yml"
+    assert workflow.exists(), f"workflow not found at {workflow}"
+    text = workflow.read_text()
+
+    workflow_name = None
+    job_id = None
+    try:
+        import yaml  # PyYAML preferred when importable
+
+        # The `on:` key parses to Python True under YAML 1.1; use safe_load and
+        # tolerate that — we only need `name` and `jobs`.
+        doc = yaml.safe_load(text)
+        workflow_name = doc.get("name")
+        jobs = doc.get("jobs") or {}
+        # This queue is a single-job workflow; take the sole job id.
+        assert len(jobs) == 1, f"expected exactly one job, got {sorted(jobs)}"
+        job_id = next(iter(jobs))
+    except ImportError:
+        # Tolerant fallback parse: top-level `name:` and the first job id (the
+        # first indented key under a top-level `jobs:` block).
+        import re as _re
+
+        m = _re.search(r"(?m)^name:\s*(.+?)\s*$", text)
+        workflow_name = m.group(1).strip() if m else None
+        lines = text.splitlines()
+        in_jobs = False
+        for line in lines:
+            if _re.match(r"^jobs:\s*$", line):
+                in_jobs = True
+                continue
+            if in_jobs:
+                if line.strip() == "" or line.lstrip().startswith("#"):
+                    continue
+                jm = _re.match(r"^  (\w[\w-]*):\s*$", line)
+                if jm:
+                    job_id = jm.group(1)
+                    break
+                # any non-indented line ends the jobs block
+                if not line.startswith(" "):
+                    break
+
+    assert isinstance(workflow_name, str) and workflow_name, (
+        f"could not derive workflow name from {workflow}"
+    )
+    assert isinstance(job_id, str) and job_id, (
+        f"could not derive queue job id from {workflow}"
+    )
+    derived_context = f"{workflow_name} / {job_id}"
+    assert derived_context == mq.SELF_STATUS_CONTEXT, (
+        f"self-status coupling broke: workflow posts {derived_context!r} but "
+        f"SELF_STATUS_CONTEXT is {mq.SELF_STATUS_CONTEXT!r}. Renaming the "
+        f"workflow name or the queue job id re-introduces the #126 self-jam — "
+        f"update SELF_STATUS_CONTEXT to match."
+    )
+
+
+def test_wildcard_ready_pr_merges_end_to_end():
+    # THE POINT: with the production ['*'] required set and an all-green head,
+    # the queue now reaches decision.ready — i.e. the bot would actually merge.
+    # Before the fix this returned action="wait" forever.
+    decision = mq.evaluate_merge_readiness(**_ready_kwargs(required_contexts=["*"]))
+    assert decision.action == "merge", decision.reason
+    assert decision.ready is True
+
+
+def test_wildcard_ready_pr_with_a_red_waits_end_to_end():
+    # Negative control on the whole decision: same ['*'] set, but a red in the PR
+    # head statuses -> the bot must WAIT, never merge.
+    kwargs = _ready_kwargs(required_contexts=["*"])
+    kwargs["pr_status"] = {
+        "state": "failure",
+        "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
+            {"context": "E2E Chat / E2E Chat (pull_request)", "status": "failure"},
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(**kwargs)
+    assert decision.ready is False
+    assert decision.action == "wait"
+    # Assert the REASON names the actual red, not just that it waited. The old
+    # buggy code ALSO returned wait here (via `*=missing`), so an action-only
+    # assertion passes against the bug too — it must fail closed for the RIGHT
+    # reason (the E2E Chat failure), which only the fixed '*' sweep produces.
+    assert "E2E Chat / E2E Chat (pull_request)=failure" in decision.reason
+    assert "*=missing" not in decision.reason
+
+
+def test_wildcard_green_but_enforced_file_context_missing_waits():
+    # THE CROWN JEWEL: step 4b (.gitea/required-contexts.txt presence check) is
+    # now REACHABLE. All BP-posted contexts are green ('*' passes), but a
+    # required-contexts.txt entry never posted at all -> the queue must WAIT.
+    # Before the fix, step 4 returned wait first and this check was dead code.
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(
+            required_contexts=["*"],
+            enforced_file_contexts=[
+                # Aggregator sentinel (posted green by the ready fixture) so the
+                # step-0 critical guard passes and we reach the step-4b check.
+                "CI / all-required",
+                "E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path",
+            ],
+        )
+    )
+    assert decision.ready is False
+    assert decision.action == "wait"
+    assert "enforced" in decision.reason.lower() or "ephemeral" in decision.reason.lower()
+
+
+# --------------------------------------------------------------------------
+# core#4363 FOLLOW-UP (post-landing code review). Four hardening fixes:
+#   D) required_contexts_green generalized from literal "*" to any Gitea glob
+#      (e.g. "CI /*"), fail-closed on a zero-match.
+#   C) critical_contexts_block fail-closes when CRITICAL_REQUIRED_CONTEXT_
+#      PREFIXES parses empty (was a silent fail-open).
+#   B) is_runtime_bump_exempt gate-adequacy consults POSTED contexts under a
+#      wildcard BP set (was dead: `smoke in "*"` never matched).
+# --------------------------------------------------------------------------
+
+
+def test_glob_pattern_matches_posted_contexts_all_green():
+    # D: a narrow glob "CI /*" matches every posted CI context and passes when
+    # all are green.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["CI /*"])
+    assert ok is True, bad
+    assert bad == []
+
+
+def test_glob_pattern_waits_on_a_matched_red():
+    # D negative control: same glob, one matched context red -> WAIT, naming it.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "CI / Platform (Go) (pull_request)", "status": "failure"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["CI /*"])
+    assert ok is False
+    assert bad == ["CI / Platform (Go) (pull_request)=failure"]
+
+
+def test_glob_pattern_matching_nothing_is_failclosed():
+    # D: the exact pre-#4363 jam mechanism, now fixed the RIGHT way. A required
+    # glob that matches no posted context must WAIT (not silently pass, and not
+    # crash) — fail-closed with a `no-match` reason.
+    latest = mq.latest_statuses_by_context([
+        {"context": "E2E Chat / E2E Chat (pull_request)", "status": "success"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["CI /*"])
+    assert ok is False
+    assert bad == ["CI /*=no-match"]
+
+
+def test_literal_context_path_is_unchanged_by_glob_generalization():
+    # D: a literal (no-wildcard) entry is still an EXACT presence check —
+    # byte-for-byte the old behavior, including a missing literal -> flagged.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (push)", "status": "success"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["CI / all-required (push)"])
+    assert ok is True and bad == []
+    ok2, bad2 = mq.required_contexts_green(latest, ["CI / never-posted (push)"])
+    assert ok2 is False
+    assert bad2 == ["CI / never-posted (push)=missing"]
+
+
+@pytest.mark.parametrize(
+    ("pattern", "context", "matches"),
+    [
+        ("CI / [aA]ll-required", "CI / all-required", True),
+        ("CI / [!x]ll-required", "CI / all-required", True),
+        ("CI / [!a]ll-required", "CI / all-required", False),
+        ("{CI,E2E} / *", "E2E / smoke", True),
+        (r"CI / literal\*", "CI / literal*", True),
+        (r"CI / literal\*", "CI / literal-job", False),
+        (r"CI / literal\+", "CI / literal+", True),
+        (r"CI / \w", "CI / Z", True),
+        (r"CI / \w", "CI / é", False),
+        (r"CI / \s", "CI /  ", True),
+        # Go/RE2's ASCII \s omits vertical tab; Python's does not, even with
+        # re.ASCII. Keep this regression explicit so the translation cannot
+        # silently widen the server's match set.
+        (r"CI / \s", "CI / \v", False),
+        (r"CI / \t", "CI / \t", True),
+        ("CI / job?", "CI / job1", True),
+        ("CI / job?", "CI / job12", False),
+    ],
+)
+def test_gitea_glob_semantics_match_server_patterns(pattern, context, matches):
+    """Parity with Gitea modules/glob: classes/negation, brace alternatives,
+    escapes, and question-mark wildcards are all part of branch protection.
+
+    Python fnmatch does not implement the brace/escape cases, and the old
+    `_is_glob` check misclassified class-only patterns as literals.
+    """
+    latest = {context: {"context": context, "status": "success"}}
+    ok, bad = mq.required_contexts_green(latest, [pattern])
+    assert ok is matches
+    if matches:
+        assert bad == []
+    else:
+        assert bad == [f"{pattern}=no-match"]
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "CI / [unterminated",
+        "CI / trailing\\",
+        r"CI / invalid\q",
+        # Python accepts this as a Unicode escape while Go's regexp compiler
+        # rejects it. Treating it as valid would make the queue enforce a
+        # different policy from Gitea branch protection.
+        r"CI / \u0061*",
+        # Python interprets \1 as a backreference in this brace alternative;
+        # Go treats numeric escapes differently. Reject the ambiguous surface
+        # instead of compiling a policy with different semantics.
+        r"{CI,\1} / *",
+        # Go/RE2 supports POSIX named classes inside a character class while
+        # Python parses the same bytes as a nested set with different matches.
+        # The conservative compiler must reject that unsupported surface.
+        "CI / [[:alpha:]]",
+    ],
+)
+def test_invalid_gitea_glob_fails_closed(pattern):
+    latest = {"CI / all-required": {"status": "success"}}
+    ok, bad = mq.required_contexts_green(latest, [pattern])
+    assert ok is False
+    assert bad == [f"{pattern}=invalid-glob"]
+
+
+def test_critical_contexts_block_failcloses_on_empty_prefix_set():
+    # C: if the per-repo critical set resolves EMPTY (no env override AND the
+    # repo's SSOT carries no `<workflow> / all-required` aggregator sentinel to
+    # derive from), the step-0 backstop must BLOCK (not iterate nothing and pass
+    # vacuously).
+    reasons = mq.critical_contexts_block(
+        mq.latest_statuses_by_context([
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+        ]),
+        [],
+    )
+    assert reasons, "empty critical set must fail-closed, not pass"
+    assert "empty" in reasons[0]
+
+
+def test_critical_contexts_block_passes_when_prefixes_present_and_green():
+    # C negative control: a non-empty prefix set with all criticals green -> no
+    # block (proves the empty-guard didn't just always-block).
+    reasons = mq.critical_contexts_block(
+        mq.latest_statuses_by_context([
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+        ]),
+        ["CI / all-required"],
+    )
+    assert reasons == []
+
+
+# --------------------------------------------------------------------------
+# ROOT-CAUSE regression lock: the critical-context set is PER-REPO SSOT-derived,
+# not a hardcoded molecule-core constant. The former hardcoded default
+# ("CI / Platform (Go),CI / all-required") phantom-blocked EVERY PR on any repo
+# whose emitted context names differ — molecule-controlplane emits LOWERCASE
+# `ci / all-required` and has no `Platform (Go)` job. A context that is
+# legitimately absent-on-this-repo is NOT a missing required check; a
+# genuinely-missing/skipped aggregator STILL blocks.
+# --------------------------------------------------------------------------
+
+
+def test_critical_context_prefixes_derived_per_repo_from_ssot():
+    # molecule-controlplane SSOT (lowercase `ci`, no Platform(Go)) → the
+    # lowercase aggregator sentinel is the derived critical context.
+    cp_enforced = [
+        "ci / all-required", "ci / build", "ci / integration",
+        "pr-ephemeral-cp-gate / pr-ephemeral-gate",
+    ]
+    assert mq.critical_context_prefixes(cp_enforced) == ["ci / all-required"]
+    # molecule-core SSOT (uppercase `CI`) → uppercase aggregator.
+    core_enforced = [
+        "CI / all-required", "E2E API Smoke Test / E2E API Smoke Test",
+        "Secret scan / Scan diff for credential-shaped strings",
+    ]
+    assert mq.critical_context_prefixes(core_enforced) == ["CI / all-required"]
+
+
+def test_critical_context_prefixes_rejects_malformed_bare_sentinel():
+    # The contract is a complete emitted context (`<workflow> / all-required`),
+    # not merely a matching final token. A typo in the SSOT must therefore
+    # resolve to an empty set and trigger the caller's fail-closed guard.
+    malformed = ["all-required", "CI/all-required", " / all-required"]
+    assert mq.critical_context_prefixes(malformed) == []
+
+
+def test_critical_context_prefixes_env_override_wins():
+    # An explicit env override is honored verbatim (a repo may still pin extra
+    # critical contexts), bypassing SSOT derivation.
+    import unittest.mock as _mock
+    with _mock.patch.object(
+        mq, "CRITICAL_REQUIRED_CONTEXT_PREFIXES",
+        ["CI / Platform (Go)", "CI / all-required"],
+    ):
+        assert mq.critical_context_prefixes(["ci / all-required"]) == [
+            "CI / Platform (Go)", "CI / all-required",
+        ]
+
+
+def test_controlplane_lowercase_all_green_is_NOT_phantom_blocked():
+    # THE BUG: controlplane posts lowercase `ci / all-required` (green) and has
+    # NO `CI / Platform (Go)` job. The former hardcoded core critical set
+    # demanded both → "CRITICAL required context(s) not green" on EVERY CP PR.
+    # SSOT-derived, the critical context is the repo's OWN `ci / all-required`,
+    # which is green → NO block. path-filtered/repo-inapplicable ⇒ not-required.
+    cp_enforced = ["ci / all-required", "ci / build", "ci / serving-e2e"]
+    latest = mq.latest_statuses_by_context([
+        {"context": "ci / all-required (pull_request)", "status": "success"},
+        {"context": "ci / build (pull_request)", "status": "success"},
+        {"context": "ci / serving-e2e (pull_request)", "status": "success"},
+    ])
+    prefixes = mq.critical_context_prefixes(cp_enforced)
+    assert prefixes == ["ci / all-required"]
+    assert mq.critical_contexts_block(latest, prefixes) == []
+
+
+def test_controlplane_genuinely_missing_aggregator_still_blocks():
+    # Negative control: if CP's OWN aggregator is genuinely NOT posted (the gate
+    # did not run), the guard STILL fail-closes — the fix does not weaken the
+    # #1676 protection, it only stops demanding contexts that are inapplicable.
+    cp_enforced = ["ci / all-required", "ci / build"]
+    latest = mq.latest_statuses_by_context([
+        {"context": "ci / build (pull_request)", "status": "success"},
+    ])
+    reasons = mq.critical_contexts_block(latest, mq.critical_context_prefixes(cp_enforced))
+    assert reasons
+    assert "ci / all-required=missing" in reasons[0]
+
+
+def test_controlplane_skipped_aggregator_still_blocks():
+    # A SKIPPED aggregator (the canonical #1676 shape) is FATAL on any repo.
+    cp_enforced = ["ci / all-required"]
+    latest = mq.latest_statuses_by_context([
+        {"context": "ci / all-required (pull_request)", "status": "skipped"},
+    ])
+    reasons = mq.critical_contexts_block(latest, mq.critical_context_prefixes(cp_enforced))
+    assert reasons
+    assert "skipped" in reasons[0]
+
+
+# Runtime-bump gate-adequacy under a wildcard BP set (B) lives with the other
+# is_runtime_bump_exempt tests (search "GATE-ADEQUACY (CI side) under wildcard").
 
 
 def test_choose_next_pr_sorts_by_queue_label_timestamp_then_number():
@@ -133,10 +797,9 @@ def test_pr_needs_update_when_base_sha_absent_from_commits():
 def _ready_kwargs(**overrides):
     """Default kwargs for a fully-ready merge; override per test.
 
-    Includes the uniform governance checks (qa-review, security-review,
-    sop-checklist) as required contexts and green statuses, matching the
-    behaviour of process_once which merges GOVERNANCE_REQUIRED_CONTEXTS
-    with branch-protection contexts.
+    The uniform SOP governance gate (qa-review/security-review/sop-checklist)
+    was removed 2026-07-14, so the ready baseline is just branch-protection
+    required contexts (GOVERNANCE_REQUIRED_CONTEXTS is now empty).
     """
     base = dict(
         main_status={
@@ -150,17 +813,16 @@ def _ready_kwargs(**overrides):
                 # CRITICAL fail-closed contexts (RCA core#1676) — a genuinely
                 # ready PR has these green; the step-0 guard requires them.
                 {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
-                {"context": "qa-review / approved (pull_request_target)", "status": "success"},
-                {"context": "security-review / approved (pull_request_target)", "status": "success"},
-                {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
             ],
         },
         required_contexts=[
             "CI / all-required (pull_request)",
-            "qa-review / approved (pull_request_target)",
-            "security-review / approved (pull_request_target)",
-            "sop-checklist / all-items-acked (pull_request_target)",
         ],
+        # The repo's SSOT aggregator sentinel — critical_context_prefixes()
+        # derives the step-0 critical set from this (the ready fixture posts
+        # `CI / all-required` green above). Every real required-contexts.txt
+        # carries this line.
+        enforced_file_contexts=["CI / all-required"],
         required_approvals=2,
         approvers={"agent-reviewer-cr2", "agent-researcher"},
         request_changes=[],
@@ -176,7 +838,6 @@ def test_merge_decision_requires_main_green_pr_green_and_current_base():
 
     assert decision.ready is True
     assert decision.action == "merge"
-    assert decision.force is False  # no non-required reds present
 
 
 def test_behind_main_but_mergeable_pr_merges_directly():
@@ -191,6 +852,21 @@ def test_behind_main_but_mergeable_pr_merges_directly():
 
     assert decision.ready is True
     assert decision.action == "merge"
+
+
+def test_behind_main_updates_when_branch_protection_requires_current_head():
+    """Live Core BP sets block_on_outdated_branch=true. A conflict-free but
+    stale PR must be updated and revalidated, not sent to a merge POST that
+    Gitea will reject with HTTP 405.
+    """
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(pr_has_current_base=False, mergeable=True),
+        block_on_outdated_branch=True,
+    )
+
+    assert decision.ready is False
+    assert decision.action == "update"
+    assert "requires an up-to-date head" in decision.reason
 
 
 def test_behind_main_and_not_mergeable_pr_updates():
@@ -366,51 +1042,30 @@ def test_merge_blocked_when_insufficient_genuine_approvals():
     assert "insufficient genuine approvals" in decision.reason
 
 
-def test_governance_red_blocks_merge():
-    # Uniform gate: qa-review, security-review, sop-checklist are ALWAYS
-    # required. If any of them fail/pending, the PR is blocked.
+def test_removed_sop_contexts_do_not_block_merge():
+    # Regression for the 2026-07-14 SOP-gate removal: qa-review /
+    # security-review / sop-checklist are no longer required, so a PR that is
+    # otherwise ready (BP-required CI green, genuine approvals, mergeable) must
+    # merge even if those now-orphan contexts are red — they are non-required
+    # noise and must never block. (Before removal these were a uniform gate.)
     pr_status = {
-        "state": "failure",
+        "state": "success",
         "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
             {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
             {"context": "qa-review / approved (pull_request_target)", "status": "failure"},
             {"context": "security-review / approved (pull_request_target)", "status": "pending"},
             {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "failure"},
-            {"context": "Staging SaaS / e2e (pull_request)", "status": "failure"},
         ],
     }
     decision = mq.evaluate_merge_readiness(**_ready_kwargs(pr_status=pr_status))
-    assert decision.ready is False
-    assert decision.action == "wait"
-    assert "required contexts not green" in decision.reason
-
-
-def test_non_required_red_does_not_block_merge():
-    # Uniform gate flip (CTO #2407): qa-review, security-review, sop-checklist
-    # are REQUIRED for ALL PRs. A PR with these failing/pending must NOT be
-    # force-mergeable, even if BP-required CI is green and approvals are genuine.
-    pr_status = {
-        "state": "failure",
-        "statuses": [
-            {"context": "CI / all-required (pull_request)", "status": "success"},
-            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
-            {"context": "qa-review / approved (pull_request)", "status": "failure"},
-            {"context": "security-review / approved (pull_request)", "status": "pending"},
-            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "failure"},
-            {"context": "Staging SaaS / e2e (pull_request)", "status": "failure"},
-        ],
-    }
-    decision = mq.evaluate_merge_readiness(**_ready_kwargs(pr_status=pr_status))
-    assert decision.ready is False
-    assert decision.action == "wait"
-    assert "required contexts not green" in decision.reason
-    assert decision.force is False
+    assert decision.ready is True, decision.reason
 
 
 def test_non_required_advisory_red_does_not_block_merge():
-    # Governance checks are green; only advisory non-required reds (Staging SaaS)
-    # are present → PR is still mergeable with force_merge bypassing the advisory.
+    # Governance checks are green; only an actually non-required advisory red
+    # is present, so evaluation proceeds. The write still uses Gitea's normal
+    # protected merge endpoint; no administrator override is available.
     pr_status = {
         "state": "failure",  # combined polluted by advisory non-required reds
         "statuses": [
@@ -425,7 +1080,6 @@ def test_non_required_advisory_red_does_not_block_merge():
     decision = mq.evaluate_merge_readiness(**_ready_kwargs(pr_status=pr_status))
     assert decision.ready is True
     assert decision.action == "merge"
-    assert decision.force is True
 
 
 def test_failing_required_context_blocks_even_with_approvals():
@@ -438,17 +1092,15 @@ def test_failing_required_context_blocks_even_with_approvals():
     decision = mq.evaluate_merge_readiness(**_ready_kwargs(pr_status=pr_status))
     assert decision.ready is False
     assert decision.action == "wait"
-    assert decision.force is False
     # all-required IS a CRITICAL fail-closed context (RCA core#1676); a failing
-    # all-required is now caught by the step-0 critical guard (an even stronger
-    # block — force_merge cannot bypass it).
+    # all-required is caught by the step-0 critical guard.
     assert "required context" in decision.reason.lower()
 
 
 # --------------------------------------------------------------------------
 # CRITICAL fail-closed contexts (RCA core#1676 — merged with
 # CI/Platform(Go)=failure AND CI/all-required=skipped onto a red main; the
-# force_merge path swept these up as "non-required reds" and bypassed them).
+# former force-merge path swept these up as "non-required reds" and bypassed them).
 # --------------------------------------------------------------------------
 
 def _rca_1676_statuses():
@@ -466,17 +1118,22 @@ def _rca_1676_statuses():
 
 
 def test_critical_contexts_block_helper_flags_1676():
+    # The canonical #1676 shape is `all-required = skipped`: the aggregator
+    # sentinel did not actually run, so nothing gated the required jobs. The
+    # SSOT-derived critical set (the `CI / all-required` aggregator) flags the
+    # skip and BLOCKS — force cannot bypass it. (Platform(Go) is a sub-job the
+    # aggregator `needs:`; a green aggregator transitively proves it, so it is
+    # no longer enumerated as a separate hardcoded critical context.)
     latest = mq.latest_statuses_by_context(_rca_1676_statuses()["statuses"])
-    reasons = mq.critical_contexts_block(latest)
+    reasons = mq.critical_contexts_block(latest, ["CI / all-required"])
     joined = " ".join(reasons)
-    assert "CI / Platform (Go)" in joined
     assert "CI / all-required" in joined
+    assert "skipped" in joined
 
 
-def test_critical_guard_blocks_1676_even_force_merge_path():
-    # mergeable=True + genuine approvals is the EXACT force_merge precondition
-    # that let #1676 through. The step-0 critical guard must block it anyway,
-    # and the decision must NOT be a (forced) merge.
+def test_critical_guard_blocks_1676_former_force_regression():
+    # mergeable=True + genuine approvals reproduces the old fail-open shape
+    # that let #1676 through. The step-0 critical guard must still block it.
     decision = mq.evaluate_merge_readiness(
         **_ready_kwargs(
             pr_status=_rca_1676_statuses(),
@@ -488,7 +1145,6 @@ def test_critical_guard_blocks_1676_even_force_merge_path():
     )
     assert decision.ready is False
     assert decision.action == "wait"
-    assert decision.force is False
     assert "CRITICAL" in decision.reason
 
 
@@ -507,19 +1163,23 @@ def test_critical_guard_blocks_skipped_all_required():
     assert "CI / all-required" in decision.reason
 
 
-def test_critical_guard_blocks_missing_platform_go():
+def test_critical_guard_blocks_missing_aggregator():
+    # The repo's own aggregator sentinel (SSOT-derived critical context) is
+    # ENTIRELY ABSENT from the posted statuses → cannot prove green → BLOCK.
+    # This is the genuinely-missing case the guard must still catch (as opposed
+    # to a context that is legitimately not applicable to the repo).
     statuses = {
         "state": "success",
         "statuses": [
-            {"context": "CI / all-required (pull_request)", "status": "success"},
-            # CI / Platform (Go) entirely absent → cannot prove green → BLOCK.
+            {"context": "some-other-lint / lint (pull_request)", "status": "success"},
+            # CI / all-required entirely absent → cannot prove green → BLOCK.
         ],
     }
     decision = mq.evaluate_merge_readiness(
         **_ready_kwargs(pr_status=statuses, required_contexts=[], mergeable=True)
     )
     assert decision.ready is False
-    assert "CI / Platform (Go)=missing" in decision.reason
+    assert "CI / all-required=missing" in decision.reason
 
 
 def test_critical_guard_allows_when_both_green():
@@ -544,6 +1204,223 @@ def test_critical_guard_allows_when_both_green():
     assert decision.action == "merge"
 
 
+# --------------------------------------------------------------------------
+# Gitea 1.27 filtered-workflow PLACEHOLDERS (CreateSkippedCommitStatusFor-
+# FilteredWorkflow). Row shapes are copied from live heads; see
+# FILTERED_WORKFLOW_PLACEHOLDER_DESCRIPTION in the script.
+# --------------------------------------------------------------------------
+
+
+def _placeholder(context, sid):
+    """A live Gitea 1.27 placeholder, verbatim (PR #5212 head, status id 13)."""
+    return {
+        "id": sid,
+        "context": context,
+        "status": "skipped",
+        "description": "Skipped",
+        "target_url": "",
+        "creator": None,
+    }
+
+
+_ACTIONS_DESCRIPTIONS = {
+    "success": "Successful in 2s",
+    "failure": "Failing after 58s",
+    "skipped": "Skipped",
+    "pending": "Waiting to run",
+}
+
+
+def _run_row(context, state, sid, job=1076641):
+    """A status the Actions engine wrote for a job that EXISTED (has its URL)."""
+    return {
+        "id": sid,
+        "context": context,
+        "status": state,
+        "description": _ACTIONS_DESCRIPTIONS[state],
+        "target_url": f"/molecule-ai/molecule-core/actions/runs/763155/jobs/{job}",
+        "creator": None,
+    }
+
+
+def test_placeholders_on_a_green_pr_head_do_not_block_the_merge():
+    # PR #5135 (head e99eb1e6aa): 41 real contexts, all success, plus 102
+    # placeholders -- among them the aggregator's own `(push)` flavour, because
+    # ci.yml only runs on push to main. The queue logged
+    #   CRITICAL required context(s) not green (fail-closed):
+    #   CI / all-required=skipped (critical context not green)
+    # and the PR was merged by hand. Without the fix this test fails the same way.
+    pr_status = {
+        "state": "success",
+        "statuses": [
+            _run_row("CI / all-required (pull_request)", "success", 230),
+            _run_row("CI / Platform (Go) (pull_request)", "success", 229, job=1076600),
+            _placeholder("CI / all-required (push)", 21),
+            _placeholder("CI / Platform (Go) (push)", 6),
+            _placeholder(
+                "Check migration collisions / Migration version collision check (pull_request)",
+                151,
+            ),
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(
+            pr_status=pr_status,
+            required_contexts=["*"],
+            required_approvals=1,
+            approvers={"claude-ceo-assistant"},
+        )
+    )
+    assert decision.action == "merge", decision.reason
+    assert decision.ready is True
+
+
+def test_a_real_skip_of_the_aggregator_still_blocks_beside_a_placeholder():
+    # PR #5212 (head 0c75646966): Platform (Go) failed, so all-required was
+    # SKIPPED by the engine (the core#1676 shape) -- a real job with an Actions
+    # URL. The placeholder next to it must not change the verdict.
+    pr_status = {
+        "state": "failure",
+        "statuses": [
+            _run_row("CI / Platform (Go) (pull_request)", "failure", 225, job=1076636),
+            _run_row("CI / all-required (pull_request)", "skipped", 227),
+            _placeholder("CI / all-required (push)", 13),
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(pr_status=pr_status, required_contexts=["*"])
+    )
+    assert decision.ready is False
+    assert decision.action == "wait"
+    assert "CRITICAL" in decision.reason
+    assert "CI / all-required=skipped" in decision.reason
+
+
+def test_a_placeholder_alone_never_proves_the_aggregator_green():
+    # Only the placeholder exists for the aggregator: nothing ran, so the
+    # step-0 guard must report it MISSING and block -- never pass.
+    pr_status = {
+        "state": "success",
+        "statuses": [
+            _run_row("CI / Platform (Go) (pull_request)", "success", 5),
+            _placeholder("CI / all-required (push)", 11),
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(pr_status=pr_status, required_contexts=["*"])
+    )
+    assert decision.ready is False
+    assert "CI / all-required=missing" in decision.reason
+
+
+def test_a_literal_requirement_met_only_by_a_placeholder_is_missing():
+    context = "Secret scan / Scan diff for credential-shaped strings (pull_request)"
+    latest = mq.latest_statuses_by_context([
+        _run_row("CI / all-required (pull_request)", "success", 2),
+        _placeholder(context, 3),
+    ])
+    ok, bad = mq.required_contexts_green(latest, [context])
+    assert ok is False
+    assert bad == [f"{context}=missing"]
+
+
+def test_wildcard_sweep_skips_placeholders_but_flags_a_real_skip():
+    latest = mq.latest_statuses_by_context([
+        _run_row("CI / all-required (pull_request)", "success", 30),
+        _placeholder("CI / all-required (push)", 11),
+        _placeholder("Harness Replays / Harness Replays (push)", 26),
+        _run_row("E2E Chat / E2E Chat (pull_request)", "skipped", 31, job=7),
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["E2E Chat / E2E Chat (pull_request)=skipped"]
+
+
+@pytest.mark.parametrize(
+    "mutate, expected",
+    [
+        pytest.param(lambda s: s, True, id="live-placeholder-shape"),
+        # A real job-level skip: the engine linked the job it skipped.
+        pytest.param(
+            lambda s: {**s, "target_url": "/o/r/actions/runs/1/jobs/2"}, False,
+            id="real-job-skip-has-actions-url",
+        ),
+        # Conductor-snapshot rows carry only context+status: cannot prove it.
+        pytest.param(
+            lambda s: {k: v for k, v in s.items() if k != "target_url"}, False,
+            id="no-target_url-field",
+        ),
+        pytest.param(
+            lambda s: {k: v for k, v in s.items() if k != "description"}, False,
+            id="no-description-field",
+        ),
+        pytest.param(lambda s: {**s, "target_url": None}, False, id="target_url-null"),
+        pytest.param(
+            lambda s: {**s, "description": "Has been skipped"}, False,
+            id="other-description",
+        ),
+        pytest.param(
+            lambda s: {**s, "description": "Skipped by a bot"}, False,
+            id="description-not-exact",
+        ),
+        # POSTed through the API by a user: never a placeholder.
+        pytest.param(
+            lambda s: {**s, "creator": {"login": "claude-status-reaper"}}, False,
+            id="api-user-creator",
+        ),
+        pytest.param(lambda s: {**s, "status": "success"}, False, id="state-success"),
+        pytest.param(lambda s: {**s, "status": "failure"}, False, id="state-failure"),
+    ],
+)
+def test_placeholder_recognition_needs_every_predicate(mutate, expected):
+    row = mutate(_placeholder("CI / all-required (push)", 11))
+    assert mq.is_filtered_workflow_placeholder(row) is expected
+
+
+def test_get_combined_status_never_lets_a_placeholder_mask_a_real_row(monkeypatch):
+    # Gitea dedupes a new workflow status only against an IDENTICAL latest row,
+    # so a placeholder can be written AFTER a real result for the same context
+    # (the same commit later pushed to a branch the workflow filters out). The
+    # server-reduced combined view then shows the placeholder; the real verdict
+    # underneath must still decide.
+    monkeypatch.setattr(mq, "OWNER", "o")
+    monkeypatch.setattr(mq, "NAME", "r")
+    monkeypatch.delenv("CONDUCTOR_SNAPSHOT_FILE", raising=False)
+    masked = "Harness Replays / Harness Replays (push)"
+    only_placeholder = "design-token-drift / Canvas design-token SSOT drift (push)"
+
+    def fake_api(method, path, *, query=None, **kw):
+        if path.endswith("/status"):
+            return 200, {
+                "state": "success",
+                "statuses": [
+                    _placeholder(masked, 40),
+                    _placeholder(only_placeholder, 41),
+                    _run_row("CI / all-required (push)", "success", 42),
+                ],
+            }
+        raise mq.ApiError(f"unexpected {path}")
+
+    monkeypatch.setattr(mq, "api", fake_api)
+    monkeypatch.setattr(mq, "api_paginated", lambda *a, **k: [
+        _run_row(masked, "pending", 9),
+        _run_row(masked, "failure", 12),
+        _placeholder(masked, 40),
+        _placeholder(only_placeholder, 41),
+        _run_row("CI / all-required (push)", "success", 42),
+    ])
+
+    combined = mq.get_combined_status("d" * 40)
+    latest = mq.latest_statuses_by_context(combined["statuses"])
+
+    assert latest[masked]["status"] == "failure"
+    assert latest[masked]["id"] == 12
+    assert only_placeholder not in latest
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == [f"{masked}=failure"]
+
+
 def test_unmergeable_pr_blocks():
     decision = mq.evaluate_merge_readiness(**_ready_kwargs(mergeable=False))
     assert decision.ready is False
@@ -564,6 +1441,7 @@ def test_parse_branch_protection_uses_status_check_contexts():
         ],
         "required_approvals": 2,
         "block_on_rejected_reviews": True,
+        "block_on_outdated_branch": True,
     })
     assert bp.required_contexts == [
         "CI / all-required (pull_request)",
@@ -571,6 +1449,7 @@ def test_parse_branch_protection_uses_status_check_contexts():
     ]
     assert bp.required_approvals == 2
     assert bp.block_on_rejected_reviews is True
+    assert bp.block_on_outdated_branch is True
 
 
 def test_parse_branch_protection_fail_closed_when_contexts_missing():
@@ -706,6 +1585,419 @@ def test_evaluate_merge_readiness_floor_does_not_break_runtime_bump_exemption():
 
 
 # --------------------------------------------------------------------------
+# Gitea merge/update write contracts
+# --------------------------------------------------------------------------
+
+def test_merge_pull_uses_lowercase_gitea_contract_and_exact_head(monkeypatch):
+    """The live Gitea schema requires lowercase JSON keys. Pinning the head
+    also prevents a reviewed decision from merging a branch that moved between
+    the final status read and the merge POST.
+    """
+    captured = {}
+    reasserted = []
+
+    def fake_api(method, path, *, body=None, query=None, expect_json=True):
+        captured.update(
+            method=method,
+            path=path,
+            body=body,
+            query=query,
+            expect_json=expect_json,
+        )
+        return 200, None
+
+    monkeypatch.setattr(mq, "OWNER", "molecule-ai")
+    monkeypatch.setattr(mq, "NAME", "molecule-core")
+    monkeypatch.setattr(mq, "api", fake_api)
+    monkeypatch.setattr(
+        mq,
+        "reassert_queue_runner_status",
+        lambda sha, *, dry_run: reasserted.append((sha, dry_run)),
+    )
+
+    head_sha = "a" * 40
+    mq.merge_pull(123, dry_run=False, head_commit_id=head_sha)
+
+    assert reasserted == [(head_sha, False)]
+    assert captured == {
+        "method": "POST",
+        "path": "/repos/molecule-ai/molecule-core/pulls/123/merge",
+        "body": {
+            "do": "merge",
+            "merge_title_field": "Merge PR #123 via Gitea merge queue",
+            "merge_message_field": (
+                "Serialized merge by gitea-merge-queue after current-main, "
+                "genuine approvals, and required CI checks were green."
+            ),
+            "head_commit_id": head_sha,
+        },
+        "query": None,
+        "expect_json": False,
+    }
+
+
+def test_merge_pull_exposes_no_admin_force_override():
+    """The queue must have no call surface that can request Gitea's
+    administrator branch-protection override.
+    """
+    assert "force" not in inspect.signature(mq.merge_pull).parameters
+
+
+def test_reassert_queue_runner_status_clears_only_exact_non_success_contexts(monkeypatch):
+    """The server-side wildcard sees the running queue status even though the
+    user-space gate excludes it. Reassert only that exact runner context; a
+    pending product context must never be rewritten by this helper.
+    """
+    head_sha = "a" * 40
+    observed = {"live": [], "writes": []}
+    write_visible = False
+    monkeypatch.setattr(mq, "OWNER", "molecule-ai")
+    monkeypatch.setattr(mq, "NAME", "molecule-core")
+
+    def fake_combined(sha, *, prefer_live=False):
+        nonlocal write_visible
+        observed["live"].append((sha, prefer_live))
+        return {"state": "pending", "statuses": [
+            {
+                "context": "gitea-merge-queue / queue (pull_request_review)",
+                "status": "success" if write_visible else "pending",
+                "target_url": "/molecule-ai/molecule-core/actions/runs/1/jobs/2",
+            },
+            {
+                "context": "E2E API Smoke Test / E2E API Smoke Test (pull_request)",
+                "status": "pending",
+            },
+        ]}
+
+    def fake_api(method, path, *, body=None, **kwargs):
+        nonlocal write_visible
+        observed["writes"].append((method, path, body))
+        write_visible = True
+        return 201, {"context": body["context"], "status": "success"}
+
+    monkeypatch.setattr(mq, "get_combined_status", fake_combined)
+    monkeypatch.setattr(mq, "api", fake_api)
+
+    mq.reassert_queue_runner_status(head_sha, dry_run=False)
+
+    assert observed["live"] == [(head_sha, True), (head_sha, True)]
+    assert observed["writes"] == [(
+        "POST",
+        f"/repos/{mq.OWNER}/{mq.NAME}/statuses/{head_sha}",
+        {
+            "state": "success",
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "description": "Merge queue gates passed; protected merge write in progress",
+            "target_url": "/molecule-ai/molecule-core/actions/runs/1/jobs/2",
+        },
+    )]
+
+
+def test_reassert_queue_runner_status_clears_failed_self_status(monkeypatch):
+    """A prior failed queue-runner row may be replaced only after this queue
+    evaluation has passed every live merge gate.
+    """
+    writes = []
+    write_visible = False
+
+    def fake_combined(sha, *, prefer_live=False):
+        return {
+            "state": "success" if write_visible else "failure",
+            "statuses": [{
+                "context": "gitea-merge-queue / queue (pull_request_review)",
+                "status": "success" if write_visible else "failure",
+            }],
+        }
+
+    def fake_api(method, path, *, body=None, **kwargs):
+        nonlocal write_visible
+        writes.append(body)
+        write_visible = True
+        return 201, {"context": body["context"], "status": "success"}
+
+    monkeypatch.setattr(mq, "get_combined_status", fake_combined)
+    monkeypatch.setattr(mq, "api", fake_api)
+    mq.reassert_queue_runner_status("b" * 40, dry_run=False)
+    assert [body["state"] for body in writes] == ["success"]
+
+
+def test_reassert_queue_runner_status_drops_untrusted_target_url(monkeypatch):
+    """Do not propagate an attacker-controlled external link while repairing
+    the exact runner context; only Gitea's canonical same-repo Actions path is
+    useful audit metadata.
+    """
+    writes = []
+    write_visible = False
+
+    def fake_combined(sha, *, prefer_live=False):
+        return {
+            "state": "success" if write_visible else "pending",
+            "statuses": [{
+                "context": "gitea-merge-queue / queue (pull_request_review)",
+                "status": "success" if write_visible else "pending",
+                "target_url": "https://attacker.invalid/lookalike/actions/runs/1/jobs/2",
+            }],
+        }
+
+    def fake_api(method, path, *, body=None, **kwargs):
+        nonlocal write_visible
+        writes.append(body)
+        write_visible = True
+        return 201, {"context": body["context"], "status": "success"}
+
+    monkeypatch.setattr(mq, "get_combined_status", fake_combined)
+    monkeypatch.setattr(mq, "api", fake_api)
+    mq.reassert_queue_runner_status("2" * 40, dry_run=False)
+    assert "target_url" not in writes[0]
+
+
+def test_reassert_queue_runner_status_noops_when_absent_or_green(monkeypatch):
+    """No status write is needed when the queue runner is absent or green."""
+    responses = iter([
+        {"state": "success", "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+        ]},
+        {"state": "success", "statuses": [
+            {
+                "context": "gitea-merge-queue / queue (pull_request_review)",
+                "status": "success",
+            },
+        ]},
+    ])
+    monkeypatch.setattr(
+        mq,
+        "get_combined_status",
+        lambda sha, *, prefer_live=False: next(responses),
+    )
+    monkeypatch.setattr(
+        mq,
+        "api",
+        lambda *a, **k: pytest.fail("status API must not be called"),
+    )
+
+    mq.reassert_queue_runner_status("c" * 40, dry_run=False)
+    mq.reassert_queue_runner_status("d" * 40, dry_run=False)
+
+
+def test_reassert_queue_runner_status_confirmation_is_fail_closed(monkeypatch):
+    """A successful write that never becomes live cannot authorize merge."""
+    live_reads = []
+
+    def still_pending(sha, *, prefer_live=False):
+        live_reads.append((sha, prefer_live))
+        return {
+            "state": "pending",
+            "statuses": [{
+                "context": "gitea-merge-queue / queue (pull_request_review)",
+                "status": "pending",
+            }],
+        }
+
+    monkeypatch.setattr(mq, "get_combined_status", still_pending)
+    monkeypatch.setattr(
+        mq,
+        "api",
+        lambda *a, **k: (201, {
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "success",
+        }),
+    )
+    monkeypatch.setattr(mq.time, "sleep", lambda _: None)
+
+    with pytest.raises(mq.ApiError, match="not visible as success"):
+        mq.reassert_queue_runner_status("e" * 40, dry_run=False)
+    assert len(live_reads) == 1 + mq.SELF_STATUS_CONFIRM_ATTEMPTS
+
+
+def test_reassert_rejects_malformed_write_response_before_polling(monkeypatch):
+    """The visibility poll cannot launder a malformed status-write response."""
+    context = "gitea-merge-queue / queue (pull_request_review)"
+    reads = []
+
+    def pending(sha, *, prefer_live=False):
+        reads.append((sha, prefer_live))
+        return {"state": "pending", "statuses": [{
+            "context": context,
+            "status": "pending",
+        }]}
+
+    monkeypatch.setattr(mq, "get_combined_status", pending)
+    monkeypatch.setattr(mq, "api", lambda *a, **k: (201, {"status": "success"}))
+
+    with pytest.raises(mq.ApiError, match="did not confirm success"):
+        mq.reassert_queue_runner_status("8" * 40, dry_run=False)
+
+    assert reads == [("8" * 40, True)]
+
+
+def test_reassert_waits_for_live_read_after_write_visibility(monkeypatch):
+    """The POST response is not enough: wildcard branch protection reads the
+    commit-status view, so wait until that independent live read sees success.
+    """
+    context = "gitea-merge-queue / queue (pull_request_review)"
+    responses = iter([
+        {"state": "pending", "statuses": [{"context": context, "status": "pending"}]},
+        {"state": "pending", "statuses": [{"context": context, "status": "pending"}]},
+        {"state": "success", "statuses": [{"context": context, "status": "success"}]},
+    ])
+    sleeps = []
+    monkeypatch.setattr(
+        mq,
+        "get_combined_status",
+        lambda sha, *, prefer_live=False: next(responses),
+    )
+    monkeypatch.setattr(
+        mq,
+        "api",
+        lambda *a, **k: (201, {"context": context, "status": "success"}),
+    )
+    monkeypatch.setattr(mq.time, "sleep", sleeps.append)
+
+    mq.reassert_queue_runner_status("9" * 40, dry_run=False)
+
+    assert sleeps == [mq.SELF_STATUS_CONFIRM_DELAY_SECONDS]
+
+
+def test_reassert_queue_runner_status_api_failure_propagates(monkeypatch):
+    """A rejected status write is a hard stop, never a best-effort bypass."""
+    monkeypatch.setattr(mq, "get_combined_status", lambda sha, *, prefer_live=False: {
+        "state": "pending",
+        "statuses": [{
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "pending",
+        }],
+    })
+
+    def reject_write(*args, **kwargs):
+        raise mq.ApiError("POST status -> HTTP 403")
+
+    monkeypatch.setattr(mq, "api", reject_write)
+    with pytest.raises(mq.ApiError, match="HTTP 403"):
+        mq.reassert_queue_runner_status("f" * 40, dry_run=False)
+
+
+def test_reassert_queue_runner_status_dry_run_never_writes(monkeypatch):
+    """The evaluator may describe the reconciliation but dry-run is read-only."""
+    monkeypatch.setattr(mq, "get_combined_status", lambda sha, *, prefer_live=False: {
+        "state": "pending",
+        "statuses": [{
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "pending",
+        }],
+    })
+    monkeypatch.setattr(
+        mq,
+        "api",
+        lambda *a, **k: pytest.fail("dry-run must not write status"),
+    )
+    mq.reassert_queue_runner_status("1" * 40, dry_run=True)
+
+
+def test_merge_pull_status_reassertion_failure_prevents_merge(monkeypatch):
+    """The protected merge POST is never attempted if the exact runner-status
+    success write cannot be proven.
+    """
+    merge_posts = []
+
+    def fail_reassert(sha, *, dry_run):
+        raise mq.ApiError("status write denied")
+
+    monkeypatch.setattr(mq, "reassert_queue_runner_status", fail_reassert)
+    monkeypatch.setattr(
+        mq,
+        "api",
+        lambda method, path, **kwargs: merge_posts.append((method, path)),
+    )
+
+    with pytest.raises(mq.ApiError, match="status write denied"):
+        mq.merge_pull(321, dry_run=False, head_commit_id="f" * 40)
+    assert merge_posts == []
+
+
+def test_merge_pull_retries_only_status_propagation_405(monkeypatch):
+    """A short Gitea visibility race is retried through the same ordinary
+    protected endpoint; no force/admin parameter is introduced.
+    """
+    calls = {"reassert": 0, "merge": 0, "sleeps": []}
+
+    def reassert(sha, *, dry_run):
+        calls["reassert"] += 1
+
+    def fake_api(method, path, **kwargs):
+        calls["merge"] += 1
+        if calls["merge"] == 1:
+            raise mq.ApiError(
+                "POST /pulls/321/merge -> HTTP 405: "
+                '{"message":"Not all required status checks successful"}'
+            )
+        return 200, None
+
+    monkeypatch.setattr(mq, "reassert_queue_runner_status", reassert)
+    monkeypatch.setattr(mq, "api", fake_api)
+    monkeypatch.setattr(mq.time, "sleep", calls["sleeps"].append)
+
+    mq.merge_pull(321, dry_run=False, head_commit_id="f" * 40)
+
+    assert calls == {
+        "reassert": 2,
+        "merge": 2,
+        "sleeps": [mq.MERGE_STATUS_RETRY_DELAY_SECONDS],
+    }
+
+
+def test_merge_pull_does_not_retry_unrelated_405(monkeypatch):
+    """Permission and policy refusals remain immediate fail-closed errors."""
+    calls = {"reassert": 0, "merge": 0, "sleeps": []}
+
+    def reassert(sha, *, dry_run):
+        calls["reassert"] += 1
+
+    def forbidden(*args, **kwargs):
+        calls["merge"] += 1
+        raise mq.ApiError("POST /pulls/321/merge -> HTTP 405: merge forbidden")
+
+    monkeypatch.setattr(mq, "reassert_queue_runner_status", reassert)
+    monkeypatch.setattr(mq, "api", forbidden)
+    monkeypatch.setattr(mq.time, "sleep", calls["sleeps"].append)
+
+    with pytest.raises(mq.MergePermissionError, match="merge forbidden"):
+        mq.merge_pull(321, dry_run=False, head_commit_id="f" * 40)
+
+    assert calls == {"reassert": 1, "merge": 1, "sleeps": []}
+
+
+def test_merge_pull_exhausted_status_race_is_a_hard_failure(monkeypatch):
+    """Bounded retries may absorb propagation lag, never convert a persistent
+    protected-endpoint refusal into a green queue result.
+    """
+    calls = {"reassert": 0, "merge": 0, "sleeps": []}
+
+    def reassert(sha, *, dry_run):
+        calls["reassert"] += 1
+
+    def still_refused(*args, **kwargs):
+        calls["merge"] += 1
+        raise mq.ApiError(
+            "POST /pulls/321/merge -> HTTP 405: "
+            '{"message":"Not all required status checks successful"}'
+        )
+
+    monkeypatch.setattr(mq, "reassert_queue_runner_status", reassert)
+    monkeypatch.setattr(mq, "api", still_refused)
+    monkeypatch.setattr(mq.time, "sleep", calls["sleeps"].append)
+
+    with pytest.raises(mq.MergePermissionError, match="required status"):
+        mq.merge_pull(321, dry_run=False, head_commit_id="f" * 40)
+
+    assert calls == {
+        "reassert": mq.MERGE_STATUS_RETRY_ATTEMPTS,
+        "merge": mq.MERGE_STATUS_RETRY_ATTEMPTS,
+        "sleeps": [mq.MERGE_STATUS_RETRY_DELAY_SECONDS]
+        * (mq.MERGE_STATUS_RETRY_ATTEMPTS - 1),
+    }
+
+
+# --------------------------------------------------------------------------
 # Fix 2: HOL — a permanent merge error HOLDS the PR (applies HOLD_LABEL)
 # --------------------------------------------------------------------------
 
@@ -761,7 +2053,7 @@ def test_process_once_holds_pr_on_permanent_merge_error(monkeypatch):
          "official": True, "stale": False, "dismissed": False, "commit_id": head_sha},
     ])
 
-    def fake_merge(pr_number, *, dry_run, force=False):
+    def fake_merge(pr_number, *, dry_run, head_commit_id=None):
         calls["merge_attempts"] += 1
         raise mq.MergePermissionError("POST /merge -> HTTP 405: User not allowed to merge PR")
     monkeypatch.setattr(mq, "merge_pull", fake_merge)
@@ -777,6 +2069,185 @@ def test_process_once_holds_pr_on_permanent_merge_error(monkeypatch):
     assert calls["merge_attempts"] == 1
     # The HOL fix: PR was held, not silently left re-selectable.
     assert calls["hold_label"] == (100, "merge-queue-hold")
+
+
+def test_hold_pr_fails_tick_when_queue_token_cannot_write_durable_hold(monkeypatch):
+    """A merge refusal must not finish green when the token cannot persist the
+    opt-out label. The red queue status is the least-privilege durable signal.
+    """
+    calls = []
+
+    def forbidden_label(*args, **kwargs):
+        calls.append("label")
+        raise mq.ApiError("POST /labels -> HTTP 403: issue write forbidden")
+
+    def forbidden_comment(*args, **kwargs):
+        calls.append("comment")
+        raise mq.ApiError("POST /comments -> HTTP 403: issue write forbidden")
+
+    monkeypatch.setattr(mq, "add_label_by_name", forbidden_label)
+    monkeypatch.setattr(mq, "post_comment", forbidden_comment)
+
+    with pytest.raises(mq.ApiError, match="could not durably hold PR #100"):
+        mq.hold_pr(100, "normal merge refused; no bypass attempted", dry_run=False)
+    assert calls == ["label", "comment"]
+
+
+def test_successful_branch_update_comment_is_best_effort(monkeypatch, capsys):
+    """A queue token with write:repository but no write:issue can refresh a
+    stale branch. The optional follow-up comment must not turn that successful
+    update into a red queue tick.
+    """
+    calls = {"update_attempts": 0, "merge_attempts": 0, "hold_label": None}
+    _stale_pr_update_409_monkeypatch(
+        monkeypatch,
+        queued_issues=[
+            {"number": 4403, "pull_request": {}, "labels": [],
+             "created_at": "2026-07-15T00:00:00Z"},
+        ],
+        calls=calls,
+    )
+
+    def successful_update(pr_number, *, dry_run):
+        calls["update_attempts"] += 1
+
+    def forbidden_comment(*args, **kwargs):
+        raise mq.ApiError(
+            "POST /issues/4403/comments -> HTTP 403: write:issue required"
+        )
+
+    monkeypatch.setattr(mq, "update_pull", successful_update)
+    monkeypatch.setattr(mq, "post_comment", forbidden_comment)
+
+    assert mq.process_once(dry_run=False) == 0
+    assert calls["update_attempts"] == 1
+    assert calls["merge_attempts"] == 0
+    assert "could not post branch-update comment" in capsys.readouterr().err
+
+
+def test_successful_branch_update_comment_absorbs_transport_failure(
+    monkeypatch, capsys
+):
+    def unavailable_comment(*args, **kwargs):
+        raise mq.urllib.error.URLError("temporary DNS failure")
+
+    monkeypatch.setattr(mq, "post_comment", unavailable_comment)
+
+    mq.post_branch_update_comment_best_effort(
+        4403,
+        "branch refreshed; waiting for CI",
+        dry_run=False,
+    )
+    assert "could not post branch-update comment" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Fork-PR skip-comment is best-effort: the merge-actor token (AUTO_SYNC_TOKEN)
+# lacks write:issue, so posting the "fork PRs not supported" skip comment 403s.
+# That 403 must NOT propagate and crash the tick before the queue reaches the
+# other candidates. Same graceful-degrade philosophy as the #4505 BP-read
+# fallback. (Regression: one un-commentable fork PR wedged the whole queue.)
+# --------------------------------------------------------------------------
+def test_post_skip_comment_best_effort_absorbs_write_issue_403(monkeypatch, capsys):
+    """The helper swallows a 403 (write:issue missing) and only warns."""
+    def forbidden_comment(*args, **kwargs):
+        raise mq.ApiError("POST /issues/200/comments -> HTTP 403: write:issue required")
+
+    monkeypatch.setattr(mq, "post_comment", forbidden_comment)
+
+    # Must NOT raise.
+    mq.post_skip_comment_best_effort(200, "fork PRs are not supported", dry_run=False)
+    assert "could not post skip comment" in capsys.readouterr().err
+
+
+def test_post_skip_comment_best_effort_absorbs_transport_failure(monkeypatch, capsys):
+    def unavailable_comment(*args, **kwargs):
+        raise mq.urllib.error.URLError("temporary DNS failure")
+
+    monkeypatch.setattr(mq, "post_comment", unavailable_comment)
+
+    mq.post_skip_comment_best_effort(200, "fork PRs are not supported", dry_run=False)
+    assert "could not post skip comment" in capsys.readouterr().err
+
+
+def test_evaluate_candidate_fork_pr_skips_when_comment_forbidden(monkeypatch):
+    """A fork PR whose skip-comment POST 403s is cleanly SKIPPED (decision=None),
+    not raised. Directly exercises the crash site inside _evaluate_candidate."""
+    monkeypatch.setattr(mq, "OWNER", "molecule-ai")
+    monkeypatch.setattr(mq, "NAME", "molecule-core")
+    monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
+    monkeypatch.setattr(mq, "OPT_OUT_LABELS", {"merge-queue-hold", "do-not-auto-merge", "wip"})
+    # Fork PR: head.repo_id != base.repo_id.
+    monkeypatch.setattr(mq, "get_pull", lambda n: {
+        "state": "open", "number": n, "mergeable": True,
+        "base": {"ref": "main", "repo_id": 1},
+        "head": {"sha": "a" * 40, "repo_id": 99},
+        "labels": [],
+    })
+
+    def forbidden_comment(*args, **kwargs):
+        raise mq.ApiError("POST /issues/200/comments -> HTTP 403: write:issue required")
+
+    monkeypatch.setattr(mq, "post_comment", forbidden_comment)
+
+    decision, ctx = mq._evaluate_candidate(
+        {"number": 200},
+        main_sha="b" * 40,
+        main_status={"state": "success", "statuses": []},
+        required_contexts=["CI / all-required (pull_request)"],
+        required_approvals=2,
+        dry_run=False,
+    )
+    assert decision is None            # skipped, not merged
+    assert ctx["pr_number"] == 200
+
+
+def test_process_once_fork_pr_comment_403_does_not_wedge_queue(monkeypatch, capsys):
+    """END-TO-END regression: a fork PR at the HEAD of the FIFO queue whose
+    skip-comment 403s must NOT crash the tick — the ready PR behind it still
+    merges. Before the fix, the 403 propagated out of the scan loop and wedged
+    every landing behind the un-commentable fork."""
+    calls = {"merge_attempts": 0, "hold_label": None, "updated": False, "merge_head_commit_id": None}
+    _fully_ready_process_once_monkeypatch(monkeypatch, mergeable=True, calls=calls)
+
+    head_sha = "a" * 40
+    # FIFO: the fork PR (#200, older) is scanned BEFORE the ready PR (#102).
+    monkeypatch.setattr(mq, "list_candidate_issues", lambda *, auto_discover: [
+        {"number": 200, "pull_request": {}, "labels": [{"name": "merge-queue"}],
+         "created_at": "2026-05-01T00:00:00Z"},
+        {"number": 102, "pull_request": {}, "labels": [{"name": "merge-queue"}],
+         "created_at": "2026-06-01T00:00:00Z"},
+    ])
+
+    def get_pull_dispatch(n):
+        if n == 200:  # fork PR: head.repo_id != base.repo_id
+            return {
+                "state": "open", "number": 200, "mergeable": True,
+                "base": {"ref": "main", "repo_id": 1},
+                "head": {"sha": head_sha, "repo_id": 99},
+                "labels": [{"name": "merge-queue"}],
+            }
+        return {  # #102: fully ready, same-repo
+            "state": "open", "number": n, "mergeable": True,
+            "base": {"ref": "main", "repo_id": 1},
+            "head": {"sha": head_sha, "repo_id": 1},
+            "labels": [{"name": "merge-queue"}],
+        }
+    monkeypatch.setattr(mq, "get_pull", get_pull_dispatch)
+
+    def forbidden_comment(*args, **kwargs):
+        raise mq.ApiError("POST /issues/200/comments -> HTTP 403: write:issue required")
+
+    monkeypatch.setattr(mq, "post_comment", forbidden_comment)
+
+    # No exception: the fork's un-postable skip comment must not wedge the tick.
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    # The PR behind the fork STILL merged — the queue proceeded.
+    assert calls["merge_attempts"] == 1
+    assert calls["merge_head_commit_id"] == head_sha
+    assert "could not post skip comment" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------
@@ -836,8 +2307,9 @@ def _fully_ready_process_once_monkeypatch(monkeypatch, mergeable, calls):
          "official": True, "stale": False, "dismissed": False, "commit_id": head_sha},
     ])
 
-    def fake_merge(pr_number, *, dry_run, force=False):
+    def fake_merge(pr_number, *, dry_run, head_commit_id=None):
         calls["merge_attempts"] += 1
+        calls["merge_head_commit_id"] = head_commit_id
     monkeypatch.setattr(mq, "merge_pull", fake_merge)
 
     def fake_add_label(pr_number, label_name, *, dry_run):
@@ -896,6 +2368,7 @@ def test_process_once_merges_when_mergeable_is_true(monkeypatch):
 
     assert rc == 0
     assert calls["merge_attempts"] == 1
+    assert calls["merge_head_commit_id"] == "a" * 40
     assert calls["hold_label"] is None
 
 
@@ -1137,8 +2610,46 @@ def test_get_combined_status_propagates_paginated_statuses_error(monkeypatch):
         mq.get_combined_status("a" * 40)
 
 
-def test_process_once_holds_tick_when_branch_protection_unavailable(monkeypatch):
-    """BP enumeration failure → HOLD the whole tick (no merge, rc 0)."""
+def test_get_combined_status_uses_newest_id_when_history_order_is_unstable(monkeypatch):
+    """The paginated history is not a stable newest-first stream.
+
+    Gitea can return an older pending row before the completed row for the same
+    context when status writes move page boundaries during a queue run.  The
+    combined endpoint is also capped and may omit that context, so enrichment
+    must choose the greatest status id instead of trusting response order.
+    """
+    monkeypatch.setattr(mq, "OWNER", "o")
+    monkeypatch.setattr(mq, "NAME", "r")
+
+    def fake_api(method, path, *, query=None, **kw):
+        if path.endswith("/status"):
+            return 200, {"state": "success", "statuses": []}
+        raise mq.ApiError(f"unexpected {path}")
+
+    monkeypatch.setattr(mq, "api", fake_api)
+    monkeypatch.setattr(mq, "api_paginated", lambda *a, **k: [
+        {
+            "id": 96,
+            "context": "Handlers Postgres Integration / detect-changes (pull_request)",
+            "status": "pending",
+        },
+        {
+            "id": 105,
+            "context": "Handlers Postgres Integration / detect-changes (pull_request)",
+            "status": "success",
+        },
+    ])
+
+    combined = mq.get_combined_status("b" * 40)
+    latest = mq.latest_statuses_by_context(combined["statuses"])
+
+    assert latest[
+        "Handlers Postgres Integration / detect-changes (pull_request)"
+    ]["status"] == "success"
+
+
+def test_process_once_fails_when_branch_protection_unavailable(monkeypatch):
+    """BP enumeration failure → no merge and a non-success queue context."""
     merged = {"called": False}
     monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
 
@@ -1148,7 +2659,7 @@ def test_process_once_holds_tick_when_branch_protection_unavailable(monkeypatch)
     monkeypatch.setattr(mq, "merge_pull", lambda *a, **k: merged.__setitem__("called", True))
 
     rc = mq.process_once(dry_run=False)
-    assert rc == 0
+    assert rc == 1
     assert merged["called"] is False
 
 
@@ -1259,7 +2770,7 @@ def _stale_pr_update_409_monkeypatch(monkeypatch, queued_issues, calls):
         )
     monkeypatch.setattr(mq, "update_pull", fake_update)
 
-    def fake_merge(pr_number, *, dry_run, force=False):
+    def fake_merge(pr_number, *, dry_run, head_commit_id=None):
         calls["merge_attempts"] += 1
     monkeypatch.setattr(mq, "merge_pull", fake_merge)
 
@@ -1517,7 +3028,7 @@ def _wire_ready_process_once(monkeypatch, *, issues, pr_payload, calls):
          "official": True, "stale": False, "dismissed": False, "commit_id": head_sha},
     ])
 
-    def fake_merge(pr_number, *, dry_run, force=False):
+    def fake_merge(pr_number, *, dry_run, head_commit_id=None):
         calls["merged"] = pr_number
     monkeypatch.setattr(mq, "merge_pull", fake_merge)
     monkeypatch.setattr(mq, "update_pull", lambda *a, **k: calls.__setitem__("updated", True))
@@ -1707,7 +3218,7 @@ def _wire_multi_candidate_process_once(monkeypatch, *, issues, pulls, reviews, c
     )
     monkeypatch.setattr(mq, "get_pull_reviews", lambda n: reviews[n])
 
-    def fake_merge(pr_number, *, dry_run, force=False):
+    def fake_merge(pr_number, *, dry_run, head_commit_id=None):
         calls.setdefault("merged", [])
         calls["merged"].append(pr_number)
     monkeypatch.setattr(mq, "merge_pull", fake_merge)
@@ -2635,6 +4146,62 @@ def test_runtime_bump_exempt_accepts_case_insensitive_smoke_substring(monkeypatc
     assert "v0.5.1" in reason
 
 
+# ---- CONDITION 2a: GATE-ADEQUACY (CI side) under wildcard BP (core#4363 fix B) ----
+
+def test_runtime_bump_exempt_under_wildcard_reads_posted_smoke(monkeypatch):
+    # B: production BP is ['*'], which names no contexts — so `smoke in '*'`
+    # never matched and the exemption was DEAD (every bump PR fell to the
+    # 2-genuine path). Adequacy now reads the POSTED contexts: a runtime smoke
+    # context posted on the head (required-to-be-green under '*') satisfies
+    # CONDITION 2a and the bump qualifies.
+    _set_allowlist(monkeypatch, "claude-code")
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file(added="claude-code@v0.5.1", removed="claude-code@v0.5.0")],
+        required_contexts=["*"],
+        latest_runtime_v_tag="v0.5.1",
+        rc_active=False,
+        posted_contexts=["CI / runtime-provision-smoke (pull_request)"],
+    )
+    assert exempt is True, f"expected exempt under wildcard, got: {reason}"
+
+
+def test_runtime_bump_not_exempt_under_wildcard_when_no_smoke_posted(monkeypatch):
+    # B negative control: wildcard BP, allowlisted runtime, but NO runtime smoke
+    # context posted -> adequacy fails -> NOT exempt (fail-closed to 2-genuine).
+    # The exemption never fires without a real runtime gate actually running.
+    _set_allowlist(monkeypatch, "claude-code")
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file(added="claude-code@v0.5.1", removed="claude-code@v0.5.0")],
+        required_contexts=["*"],
+        latest_runtime_v_tag="v0.5.1",
+        rc_active=False,
+        posted_contexts=["CI / all-required (pull_request)", "CI / Platform (Go) (pull_request)"],
+    )
+    assert exempt is False
+    assert "no runtime-provision/compat smoke" in reason
+
+
+def test_runtime_bump_not_exempt_under_wildcard_when_posted_is_empty(monkeypatch):
+    # B fail-closed: wildcard BP but the posted set is empty (statuses not yet
+    # reported) -> no gate to verify adequacy against -> NOT exempt.
+    _set_allowlist(monkeypatch, "claude-code")
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file(added="claude-code@v0.5.1", removed="claude-code@v0.5.0")],
+        required_contexts=["*"],
+        latest_runtime_v_tag="v0.5.1",
+        rc_active=False,
+        posted_contexts=[],
+    )
+    assert exempt is False
+    assert "empty" in reason
+
+
 # ---- CONDITION 2b: GATE-ADEQUACY (template allowlist) ----
 
 def test_runtime_bump_exempt_rejects_runtime_not_on_allowlist(monkeypatch):
@@ -3270,14 +4837,19 @@ def test_enforced_file_red_blocks_merge_not_forced_over():
         ],
     }
     decision = mq.evaluate_merge_readiness(
-        **_ready_kwargs(pr_status=pr_status),
-        enforced_file_contexts=[
-            "E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace"
-        ],
+        **_ready_kwargs(
+            pr_status=pr_status,
+            # Realistic SSOT: the aggregator sentinel is always present (and
+            # green here) so the step-0 critical guard is satisfied and we reach
+            # the step-4b enforced-file check under test.
+            enforced_file_contexts=[
+                "CI / all-required",
+                "E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace",
+            ],
+        ),
     )
     assert decision.ready is False
     assert decision.action == "wait"
-    assert decision.force is False
     assert "enforced required-contexts.txt" in decision.reason
 
 
@@ -3297,10 +4869,13 @@ def test_enforced_file_green_allows_merge():
         ],
     }
     decision = mq.evaluate_merge_readiness(
-        **_ready_kwargs(pr_status=pr_status),
-        enforced_file_contexts=[
-            "E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace"
-        ],
+        **_ready_kwargs(
+            pr_status=pr_status,
+            enforced_file_contexts=[
+                "CI / all-required",
+                "E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace",
+            ],
+        ),
     )
     assert decision.ready is True
     assert decision.action == "merge"
@@ -3332,14 +4907,13 @@ def test_parked_pending_context_does_not_block(tmp_path):
         ],
     }
     decision = mq.evaluate_merge_readiness(
-        **_ready_kwargs(pr_status=pr_status),
-        enforced_file_contexts=enforced,
+        **_ready_kwargs(pr_status=pr_status, enforced_file_contexts=enforced),
     )
     # Only "CI / all-required" is enforced from the file; it is green, and the
-    # parked red is treated as a non-required advisory red (force bypass).
+    # parked red is treated as a genuinely non-required advisory status. The
+    # eventual write still uses the normal protected endpoint.
     assert decision.ready is True
     assert decision.action == "merge"
-    assert decision.force is True  # advisory red present → force bypass
 
 
 # ==========================================================================
@@ -3423,7 +4997,7 @@ def _live_recheck_process_once_monkeypatch(
          "official": True, "stale": False, "dismissed": False, "commit_id": head_sha},
     ])
 
-    def fake_merge(pr_number, *, dry_run, force=False):
+    def fake_merge(pr_number, *, dry_run, head_commit_id=None):
         calls["merge_attempts"] += 1
     monkeypatch.setattr(mq, "merge_pull", fake_merge)
     monkeypatch.setattr(mq, "add_label_by_name", lambda *a, **k: None)
@@ -3465,16 +5039,16 @@ def test_process_once_live_recheck_red_required_aborts_merge(monkeypatch, capsys
 
 
 def test_process_once_live_recheck_red_critical_aborts_merge(monkeypatch, capsys):
-    """(a, variant) A CRITICAL context (CI / Platform (Go)) flipping red on the
-    live re-fetch also aborts — the critical guard is re-run live and force
-    cannot bypass it."""
+    """(a, variant) The CRITICAL context — the repo's `CI / all-required`
+    aggregator sentinel (SSOT-derived) — flipping red on the live re-fetch
+    aborts: the critical guard is re-run live and force cannot bypass it."""
     calls = {"merge_attempts": 0, "live_refetch_shas": [], "updated": False}
     head_sha = _live_recheck_process_once_monkeypatch(
         monkeypatch,
         live_pr_statuses=[
-            {"context": "CI / all-required (pull_request)", "status": "success"},
-            # CRITICAL context now RED on the live re-fetch.
-            {"context": "CI / Platform (Go) (pull_request)", "status": "failure"},
+            # CRITICAL aggregator sentinel now RED on the live re-fetch.
+            {"context": "CI / all-required (pull_request)", "status": "failure"},
+            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
             {"context": "qa-review / approved (pull_request_target)", "status": "success"},
             {"context": "security-review / approved (pull_request_target)", "status": "success"},
             {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
@@ -3489,7 +5063,7 @@ def test_process_once_live_recheck_red_critical_aborts_merge(monkeypatch, capsys
     assert calls["live_refetch_shas"] == [head_sha]
     out = capsys.readouterr().out
     assert "PR #333 SKIPPED: live pre-merge re-check" in out
-    assert "CI / Platform (Go)" in out
+    assert "CI / all-required" in out
 
 
 def test_process_once_live_recheck_green_merges_normally(monkeypatch, capsys):
@@ -3556,12 +5130,15 @@ def test_process_once_live_recheck_red_enforced_file_context_aborts_merge(monkey
         calls=calls,
     )
     # The SAME enforced set the decision used must be re-checked live. Override
-    # the autouse [] stub for THIS test so process_once sees a non-empty
-    # enforced set (event-stripped form, as the loader produces).
+    # the autouse stub for THIS test so process_once sees this enforced set
+    # (event-stripped form, as the loader produces). Includes the aggregator
+    # sentinel (always present in a real SSOT; green here) so the step-0 critical
+    # guard passes and the decision reaches the enforced-file check.
     monkeypatch.setattr(
         mq, "load_enforced_file_contexts",
         lambda path: [
-            "E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace"
+            "CI / all-required",
+            "E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace",
         ],
     )
 
@@ -3640,7 +5217,7 @@ def test_live_premerge_status_regressions_helper(monkeypatch):
     regressions = mq.live_premerge_status_regressions(
         "a" * 40,
         required_contexts=["CI / all-required (pull_request)"],
-        enforced_file_contexts=[],
+        enforced_file_contexts=["CI / all-required"],
     )
     assert regressions == []
     assert seen["prefer_live"] is True  # snapshot genuinely bypassed
@@ -3655,7 +5232,198 @@ def test_live_premerge_status_regressions_helper(monkeypatch):
     regressions = mq.live_premerge_status_regressions(
         "a" * 40,
         required_contexts=["CI / all-required (pull_request)"],
-        enforced_file_contexts=[],
+        enforced_file_contexts=["CI / all-required"],
     )
     assert regressions  # non-empty → abort
     assert any("CI / all-required" in r for r in regressions)
+
+
+# --------------------------------------------------------------------------
+# BP-read 403 fallback (repo-wide merge-queue jam regression)
+# --------------------------------------------------------------------------
+# The `/branch_protections/{branch}` READ endpoint is admin-only. The queue's
+# non-bypass merge actor is a WRITE collaborator (least privilege — write is all
+# it needs to merge), so this read legitimately 403s. Fail-closing on that 403
+# red-stamped `gitea-merge-queue / queue` on EVERY PR under a `['*']` BP and
+# jammed the whole repo. The fix: on 403, FALL BACK to Gitea's own merge-time
+# enforcement (the protected merge endpoint re-checks BP server-side and 405s an
+# unready PR) instead of holding the whole tick.
+
+
+def test_get_branch_protection_falls_back_to_env_on_403(monkeypatch):
+    """The admin-only /branch_protections read 403s for the write-scoped merge
+    actor. get_branch_protection must NOT raise (fail-closed) — it must return a
+    fallback BranchProtection(fallback=True) with the SAFE env-derived gate."""
+    def forbid(method, path, *, body=None, query=None, expect_json=True):
+        assert "branch_protections" in path
+        raise mq.ApiError(
+            f"GET {path} -> HTTP 403: user should be an owner or a "
+            "collaborator with admin write of a repository"
+        )
+    monkeypatch.setattr(mq, "api", forbid)
+    bp = mq.get_branch_protection("main")
+    assert bp.fallback is True
+    # Approval FLOOR preserved (never 0). This is the ONLY approval gate when a
+    # repo's BP records required_approvals=0 (Gitea then enforces none at merge).
+    assert bp.required_approvals == mq.REQUIRED_APPROVALS_DEFAULT
+    assert bp.required_approvals >= 1
+    # Client named-context set is EMPTY in fallback: the repo's actual context
+    # casing/naming is unknown to a hard-coded env literal, so gating on one
+    # would FALSE-WAIT a green PR. The named gate defers to Gitea's case-correct
+    # server-side '*' check; case-correct SSOT backstops (critical + enforced
+    # file) and the approval floor still apply and do NOT use this field.
+    assert bp.required_contexts == []
+
+
+def test_get_branch_protection_still_fail_closed_on_non_403(monkeypatch):
+    """A transient 5xx/network error is NOT a deterministic permission state and
+    could self-resolve — it must stay FAIL-CLOSED (HOLD the tick, retry next
+    tick), never drop to the permissive fallback on a possible Gitea blip."""
+    def flaky(method, path, *, body=None, query=None, expect_json=True):
+        raise mq.ApiError(f"GET {path} -> HTTP 502: bad gateway")
+    monkeypatch.setattr(mq, "api", flaky)
+    with pytest.raises(mq.BranchProtectionUnavailable):
+        mq.get_branch_protection("main")
+
+
+def _setup_bp403_process_once(monkeypatch, *, reviews, merge_fn):
+    """Wire process_once so the ONLY authoritative branch-protection read
+    (get_branch_protection -> api) 403s, exercising the REAL fallback end to
+    end. Every other collaborator is faked. `reviews` sets the PR approval
+    state; `merge_fn` the merge outcome. Returns (head_sha, main_sha)."""
+    monkeypatch.setattr(mq, "OWNER", "molecule-ai")
+    monkeypatch.setattr(mq, "NAME", "molecule-controlplane")
+    monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
+    monkeypatch.setattr(mq, "QUEUE_LABEL", "merge-queue")
+    monkeypatch.setattr(mq, "HOLD_LABEL", "merge-queue-hold")
+    monkeypatch.setattr(mq, "AUTO_DISCOVER", True)
+    monkeypatch.setattr(
+        mq, "OPT_OUT_LABELS", {"merge-queue-hold", "do-not-auto-merge", "wip"}
+    )
+    monkeypatch.setattr(mq, "REVIEWER_SET", REVIEWERS)
+
+    # The authoritative BP read is FORBIDDEN (admin-only endpoint, write actor).
+    # get_branch_protection runs FOR REAL over this api and must fall back — it
+    # is the ONLY real api call left on this path (everything else is faked).
+    def forbid_bp(method, path, *, body=None, query=None, expect_json=True):
+        assert "branch_protections" in path, (
+            f"unexpected real api call in fallback path: {method} {path}"
+        )
+        raise mq.ApiError(
+            f"{method} {path} -> HTTP 403: user should be an owner or a "
+            "collaborator with admin write of a repository"
+        )
+    monkeypatch.setattr(mq, "api", forbid_bp)
+
+    main_sha = "b" * 40
+    head_sha = "a" * 40
+    monkeypatch.setattr(mq, "get_branch_head", lambda branch: main_sha)
+
+    def fake_combined(sha, *, prefer_live=False):
+        if sha == main_sha:
+            return {"state": "success", "statuses": [
+                {"context": "CI / all-required (push)", "status": "success"}]}
+        return {"state": "success", "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
+        ]}
+    monkeypatch.setattr(mq, "get_combined_status", fake_combined)
+
+    monkeypatch.setattr(mq, "list_candidate_issues", lambda *, auto_discover: [
+        {"number": 2734, "pull_request": {}, "labels": [],
+         "created_at": "2026-07-18T00:00:00Z"}])
+    monkeypatch.setattr(mq, "get_pull", lambda n: {
+        "state": "open", "number": n, "mergeable": True,
+        "base": {"ref": "main", "repo_id": 1},
+        "head": {"sha": head_sha, "repo_id": 1},
+        "labels": []})
+    monkeypatch.setattr(
+        mq, "get_pull_commits", lambda n: [{"sha": main_sha}, {"sha": head_sha}]
+    )
+    monkeypatch.setattr(mq, "get_pull_reviews", lambda n: reviews)
+    # Runtime-bump exemption helpers issue their own API calls; fake them to a
+    # clean NON-bump result so the only REAL api() call on this path stays the
+    # branch-protection read (which 403s and exercises the fallback).
+    monkeypatch.setattr(mq, "get_pull_diff_files", lambda n: [])
+    monkeypatch.setattr(mq, "latest_runtime_v_tag_for", lambda pr: None)
+    monkeypatch.setattr(mq, "merge_pull", merge_fn)
+    monkeypatch.setattr(mq, "post_comment", lambda *a, **k: None)
+    return head_sha, main_sha
+
+
+def test_process_once_bp403_proceeds_to_merge_attempt(monkeypatch):
+    """REGRESSION (the repo-wide jam): a 403 on the admin-only branch_protections
+    read must NOT hold the whole tick (the old fail-closed behaviour that
+    red-stamped every PR). With a ready+approved+green PR the queue must PROCEED
+    to the actual protected-merge attempt via the fallback path."""
+    merged = {"n": 0, "pr": None, "head": None}
+
+    def fake_merge(pr_number, *, dry_run, head_commit_id=None):
+        merged["n"] += 1
+        merged["pr"] = pr_number
+        merged["head"] = head_commit_id
+
+    head_sha, _ = _setup_bp403_process_once(
+        monkeypatch,
+        reviews=[{"state": "APPROVED", "user": {"login": "agent-researcher"},
+                  "official": True, "stale": False, "dismissed": False,
+                  "commit_id": "a" * 40}],
+        merge_fn=fake_merge,
+    )
+    rc = mq.process_once(dry_run=False)
+    assert rc == 0
+    # THE POINT: the merge was ATTEMPTED (queue did not fail-closed hold the
+    # tick), with the exact reviewed head pinned.
+    assert merged["n"] == 1
+    assert merged["pr"] == 2734
+    assert merged["head"] == head_sha
+
+
+def test_process_once_bp403_fallback_cannot_merge_what_gitea_rejects(monkeypatch):
+    """INVARIANT: the fallback grants NO new privilege. Gitea's server-side
+    branch-protection check is the authority — it 405s an unready PR (e.g. a
+    context red only under the real '*' set that the env-subset client gate
+    doesn't see) and the queue must HOLD, never merge past the server gate."""
+    calls = {"merge_attempts": 0, "hold": None}
+
+    def gitea_rejects(pr_number, *, dry_run, head_commit_id=None):
+        calls["merge_attempts"] += 1
+        raise mq.MergePermissionError(
+            "POST /pulls/2734/merge -> HTTP 405: Not all required status "
+            "checks successful"
+        )
+
+    _setup_bp403_process_once(
+        monkeypatch,
+        reviews=[{"state": "APPROVED", "user": {"login": "agent-researcher"},
+                  "official": True, "stale": False, "dismissed": False,
+                  "commit_id": "a" * 40}],
+        merge_fn=gitea_rejects,
+    )
+
+    def record_hold(pr_number, label_name, *, dry_run):
+        calls["hold"] = (pr_number, label_name)
+    monkeypatch.setattr(mq, "add_label_by_name", record_hold)
+
+    rc = mq.process_once(dry_run=False)
+    assert rc == 0
+    # Merge attempted through the protected endpoint, Gitea refused (405), PR
+    # HELD — never merged. Gitea, not the queue, is the final gate.
+    assert calls["merge_attempts"] == 1
+    assert calls["hold"] == (2734, "merge-queue-hold")
+
+
+def test_process_once_bp403_fallback_refuses_unapproved_pr(monkeypatch):
+    """INVARIANT: in fallback mode the client-side approval FLOOR still applies
+    (it is the only approval gate when BP records required_approvals=0). An
+    unapproved PR must WAIT — merge is never even attempted."""
+    calls = {"merge_attempts": 0}
+
+    def must_not_merge(pr_number, *, dry_run, head_commit_id=None):
+        calls["merge_attempts"] += 1
+        raise AssertionError("merge must not be attempted for an unapproved PR")
+
+    _setup_bp403_process_once(monkeypatch, reviews=[], merge_fn=must_not_merge)
+    rc = mq.process_once(dry_run=False)
+    assert rc == 0
+    assert calls["merge_attempts"] == 0

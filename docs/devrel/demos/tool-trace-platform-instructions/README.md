@@ -1,5 +1,12 @@
 # Tool Trace + Platform Instructions Demo
 
+> **Historical demo (April 2026).** The example domain, instruction scopes,
+> response shapes, and in-core `workspace/` source paths below have not been
+> revalidated against the current domain-only platform and standalone
+> `molecule-ai-workspace-runtime` repository. Do not use this as a current
+> runbook; follow the [platform API](../../../api-protocol/platform-api.md) and
+> [workspace runtime](../../../agent-runtime/workspace-runtime.md) references.
+
 Two platform-level features merged in PR #1686:
 
 - **Tool Trace** — every A2A response includes a `tool_trace` list in `Message.metadata`, stored in `activity_logs.tool_trace` JSONB. Verifies agent claims ("I checked X") against actual tool calls.

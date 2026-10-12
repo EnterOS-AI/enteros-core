@@ -49,7 +49,7 @@
 #
 # Required env (mirrors test_staging_full_saas.sh):
 #   MOLECULE_CP_URL          default: https://staging-api.moleculesai.app
-#   MOLECULE_ADMIN_TOKEN     CP admin bearer (Railway CP_ADMIN_API_TOKEN)
+#   MOLECULE_ADMIN_TOKEN     staging CP admin bearer from Infisical
 #
 # Optional env:
 #   E2E_PROVIDER                default molecules-server (the local-docker compute backend).
@@ -86,7 +86,7 @@
 set -euo pipefail
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
-ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway staging CP_ADMIN_API_TOKEN}"
+ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 # RUN_ID_SUFFIX removed (core#2782 follow-up shellcheck): the slug
 # now comes from make_collision_proof_slug below; the old suffix
@@ -115,6 +115,12 @@ PROVIDER="${E2E_PROVIDER:-molecules-server}"
 # shellcheck source=lib/collision-proof-slug.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/collision-proof-slug.sh"
+# Shared tenant routing/CORS topology helper (derive_tenant_topology). Default (all
+# MOLECULE_TENANT_* unset) reproduces exact staging behaviour byte-for-byte; the
+# ephemeral-CP runner sets MOLECULE_TENANT_URL/_ROUTE_DOMAIN/_ORIGIN_TEMPLATE.
+# shellcheck source=lib/tenant_topology.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib/tenant_topology.sh"
 
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
@@ -135,10 +141,11 @@ require_transition() {  # $1 = human label
   log "    [require-live] transition ${TRANSITIONS_VERIFIED}/${EXPECTED_TRANSITIONS} proven: $1"
 }
 
-# Redact bearer tokens from any HTTP body before logging (mirrors the
-# full-saas sanitize_http_body so transient-error logs never leak creds).
+# Redact credential-shaped values from HTTP bodies before logging. Keep the
+# implementation in the shared E2E redactor so compound keys such as
+# platform_inbound_secret cannot drift between harnesses.
 sanitize_http_body() {
-  sed -E 's/(Bearer|token)[[:space:]]+[A-Za-z0-9._-]+/\1 REDACTED/g'
+  python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/redact_secrets.py" --max-chars 4000 || printf '%s' '<redaction failed>'
 }
 
 # Bounded retry-on-transient for POST /registry/register. The tenant edge
@@ -159,8 +166,10 @@ register_with_retry() {  # $1 = step label, $2 = request body
     set +e
     resp=$(curl -sS --max-time 30 -w "\nHTTP_CODE=%{http_code}" -X POST \
       "$TENANT_URL/registry/register" \
+      "${TENANT_ROUTE_HDRS[@]}" \
       -H "Authorization: Bearer $WS_AUTH_TOKEN" \
       -H "X-Molecule-Org-Id: $ORG_ID" \
+      -H "Origin: $TENANT_ORIGIN" \
       -H "Content-Type: application/json" \
       -d "$body")
     set -e
@@ -271,7 +280,7 @@ CREATE_RESP=$(admin_call POST /cp/admin/orgs \
   -d "{\"slug\":\"$SLUG\",\"name\":\"E2E ext $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\",\"provider\":\"$PROVIDER\"}")
 set -e
 ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
-[ -z "$ORG_ID" ] && fail "Org create response missing 'id': $(printf '%s' "$CREATE_RESP" | sanitize_http_body 2>/dev/null || printf '%s' "$CREATE_RESP")"
+[ -z "$ORG_ID" ] && fail "Org create response missing 'id': $(printf '%s' "$CREATE_RESP" | sanitize_http_body 2>/dev/null)"
 ok "Org created (id=$ORG_ID)"
 
 # ─── 2. Wait for tenant provisioning ────────────────────────────────────
@@ -321,16 +330,16 @@ print('(no org row found for slug=$SLUG — DB drift?)')
 done
 ok "Tenant provisioning complete"
 
-# Derive tenant URL the same way the full-saas harness does.
-CP_HOST=$(echo "$CP_URL" | sed -E 's#^https?://##; s#/.*$##')
-case "$CP_HOST" in
-  api.*)         DERIVED_DOMAIN="${CP_HOST#api.}" ;;
-  staging-api.*) DERIVED_DOMAIN="staging.${CP_HOST#staging-api.}" ;;
-  *)             DERIVED_DOMAIN="$CP_HOST" ;;
-esac
-TENANT_DOMAIN="${MOLECULE_TENANT_DOMAIN:-$DERIVED_DOMAIN}"
-TENANT_URL="https://$SLUG.$TENANT_DOMAIN"
+# Derive tenant routing/CORS topology via the shared helper. Sets TENANT_URL,
+# TENANT_ROUTE_HOST, TENANT_ROUTE_HDRS[] (Host + X-Molecule-Org-Slug, empty on
+# staging), TENANT_ORIGIN. Default (all MOLECULE_TENANT_* unset) reproduces the
+# exact staging slug.<domain> subdomain + Origin byte-for-byte.
+derive_tenant_topology "$SLUG" "$CP_URL" \
+  || fail "Could not derive tenant topology for $SLUG (set MOLECULE_TENANT_ORIGIN_TEMPLATE for ephemeral slug-routing)"
 log "    TENANT_URL=$TENANT_URL"
+if [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+  log "    tenant routing via Host=$TENANT_ROUTE_HOST + X-Molecule-Org-Slug=$SLUG; CORS Origin=$TENANT_ORIGIN (ephemeral-CP slug routing)"
+fi
 
 # ─── 3. Per-tenant admin token + TLS readiness ──────────────────────────
 log "3/8 Fetching per-tenant admin token..."
@@ -342,9 +351,18 @@ ok "Token retrieved (len=${#TENANT_TOKEN})"
 log "Waiting for tenant TLS / DNS..."
 TLS_DEADLINE=$(( $(date +%s) + 15 * 60 ))
 while true; do
-  if curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1; then break; fi
+  # Under ephemeral slug-routing /health is answered by the CP's OWN global
+  # handler for ANY Host, so probing it proves NOTHING (vacuous readiness). Probe
+  # /org/identity — a tenant-owned handler the CP proxies through — WITH the route
+  # headers + X-Molecule-Org-Id so a not-yet-routable tenant is actually caught.
+  # Staging (empty TENANT_ROUTE_HDRS) keeps the global /health check unchanged.
+  if [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+    curl -sSfk --max-time 5 "${TENANT_ROUTE_HDRS[@]}" -H "X-Molecule-Org-Id: $ORG_ID" -H "Origin: $TENANT_ORIGIN" "$TENANT_URL/org/identity" >/dev/null 2>&1 && break
+  else
+    curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1 && break
+  fi
   if [ "$(date +%s)" -gt "$TLS_DEADLINE" ]; then
-    fail "Tenant URL never responded 2xx on /health within 15min"
+    fail "Tenant never became routable within 15min (probe: $( [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ] && echo '/org/identity via route headers' || echo '/health' ))"
   fi
   sleep 5
 done
@@ -353,8 +371,10 @@ ok "Tenant reachable"
 tenant_call() {
   local method="$1"; shift; local path="$1"; shift
   curl "${CURL_COMMON[@]}" -X "$method" "$TENANT_URL$path" \
+    "${TENANT_ROUTE_HDRS[@]}" \
     -H "Authorization: Bearer $TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
+    -H "Origin: $TENANT_ORIGIN" \
     "$@"
 }
 
@@ -383,7 +403,7 @@ try:
 except Exception:
     print('')
 ")
-[ -z "$WS_ID" ] && fail "Workspace create missing id: $(printf '%s' "$WS_CREATE_RESP" | sanitize_http_body 2>/dev/null || printf '%s' "$WS_CREATE_RESP")"
+[ -z "$WS_ID" ] && fail "Workspace create missing id: $(printf '%s' "$WS_CREATE_RESP" | sanitize_http_body 2>/dev/null)"
 [ "$WS_RESP_STATUS" != "awaiting_agent" ] && fail "Expected response status=awaiting_agent, got $WS_RESP_STATUS"
 ok "Workspace created (id=$WS_ID, response status=awaiting_agent)"
 
@@ -452,7 +472,7 @@ REGISTER_DELIVERY_MODE=$(echo "$REGISTER_BODY_JSON" | python3 -c "import json,sy
 if [ "$REGISTER_DELIVERY_MODE" = "poll" ]; then
   ok "delivery_mode=poll (register response echoed explicit value)"
 else
-  fail "Register response delivery_mode=$REGISTER_DELIVERY_MODE (expected poll). Body: $REGISTER_BODY_JSON"
+  fail "Register response delivery_mode=$REGISTER_DELIVERY_MODE (expected poll). Body: $(printf '%s' "$REGISTER_BODY_JSON" | sanitize_http_body)"
 fi
 
 # ─── 6. Stop heartbeating; wait past REMOTE_LIVENESS_STALE_AFTER ────────
@@ -540,7 +560,7 @@ try:
 except Exception:
     print('')
 ")
-  [ -z "$wid" ] && fail "[$rt] create missing id: $resp"
+  [ -z "$wid" ] && fail "[$rt] create missing id: $(printf '%s' "$resp" | sanitize_http_body)"
   [ "$status" = "awaiting_agent" ] || fail "[$rt] create status='$status' (expected awaiting_agent — external/poll path)"
   [ -z "$auth" ] && fail "[$rt] create returned no workspace auth token — register impossible"
 
@@ -583,8 +603,10 @@ print(json.dumps({
     : >"$a2a_tmp"
     set +e
     a2a_code=$(curl -sS --max-time 60 -X POST "$TENANT_URL/workspaces/$wid/a2a" \
+      "${TENANT_ROUTE_HDRS[@]}" \
       -H "Authorization: Bearer $TENANT_TOKEN" \
       -H "X-Molecule-Org-Id: $ORG_ID" \
+      -H "Origin: $TENANT_ORIGIN" \
       -H "Content-Type: application/json" \
       -d "$a2a_payload" -o "$a2a_tmp" -w '%{http_code}' 2>/dev/null)
     a2a_rc=$?

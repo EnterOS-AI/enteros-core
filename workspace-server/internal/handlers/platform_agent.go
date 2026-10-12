@@ -195,9 +195,9 @@ func resolveConciergeAdminCredential(ctx context.Context, workspaceID string) st
 // SaaS, else the raw ADMIN_TOKEN (see resolveConciergeAdminCredential); the
 // platform URL is the in-cluster PLATFORM_URL (e.g. http://platform:8080). Existing
 // values in env win, so an operator/CP override is never clobbered. No-op for a
-// non-platform workspace. Best-effort: when orgAdminCred is empty (pure-local dev
-// with AdminAuth fail-open) the key is simply absent and the MCP — which only runs
-// on the platform-agent image anyway — is unauthenticated locally.
+// non-platform workspace. Best-effort: when orgAdminCred is empty the key is
+// absent and management MCP calls fail closed; local operators must configure
+// ADMIN_TOKEN rather than relying on unauthenticated bootstrap.
 func conciergePlatformMCPEnv(env map[string]string, workspaceID, orgAdminCred string) {
 	setIfAbsent := func(k, v string) {
 		if v == "" {
@@ -207,6 +207,18 @@ func conciergePlatformMCPEnv(env map[string]string, workspaceID, orgAdminCred st
 			env[k] = v
 		}
 	}
+
+	// Platform-agent identity marker (runtime wheel:
+	// platform_agent_identity.PLATFORM_AGENT_IMAGE_ENV). Historically only the
+	// baked Dockerfile.platform-agent image set it; a concierge on a PLAIN
+	// runtime image (hermes) had to infer platform-ness from "management MCP
+	// present in the rendered runtime config" — a signal that only becomes
+	// true MID-boot, so the runtime's boot-step emitter silently dropped
+	// steps 1-4 (PLG/ID/RT/MCP idle keycaps on the Enter OS screen,
+	// 2026-07-19). This function is kind-gated to the concierge, which IS the
+	// platform agent regardless of which image it runs — stamp the marker so
+	// every consumer of the identity gate is correct from process start.
+	setIfAbsent("MOLECULE_PLATFORM_AGENT_IMAGE_BAKED", "1")
 	// The management MCP's SELF default: install_plugin / get_conversation_history
 	// fall back to MOLECULE_WORKSPACE_ID when workspace_id is omitted, making
 	// "act on MY OWN workspace" the zero-config case (self-reprovision §5.2).
@@ -382,18 +394,53 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 	if configFiles == nil {
 		configFiles = map[string][]byte{}
 	}
-	if composed, err := h.composeConciergeRuntimeConfig(runtime); err != nil {
-		// Base config unavailable (template-cache miss / a test without the
-		// template tree). Fall back to the delivered config UNCHANGED and keep the
-		// historical {{CONCIERGE_NAME}} substitution so we never regress the
-		// claude-code path — but log loudly so a real cache miss is visible.
+	// Resolve the concierge's identity name ONCE, here, and use that ONE value for
+	// BOTH the composed config.yaml and the persona's {{CONCIERGE_NAME}}
+	// substitution. Previously the raw `name` went to both while the
+	// empty-name fallback lived only inside composeConciergeRuntimeConfig: an empty
+	// name (reachable on restart paths that do not hydrate payload.Name from the
+	// workspace row — see workspace_dispatchers.go) produced
+	// `name: Org Concierge` in config.yaml and `# You are  — the Org Concierge` in
+	// the persona. The agent card and the system prompt then disagreed about who
+	// the agent is, which is the SAME class of defect (two competing identities in
+	// one prompt) this whole change exists to remove.
+	identityName := resolveConciergeIdentityName(workspaceID, runtime, name)
+	if composed, err := h.composeConciergeRuntimeConfig(runtime, identityName); err != nil {
+		// Base config unavailable (template-cache miss after a fleet restart, an
+		// image without the template tree, a test without fixtures). Fall back to
+		// the delivered config and keep the historical {{CONCIERGE_NAME}}
+		// substitution so we never regress the claude-code path — but log loudly so
+		// a real cache miss is visible.
 		log.Printf("Provisioner: concierge %s could not compose runtime-native config for runtime=%q (%v) — keeping delivered config + {{CONCIERGE_NAME}} substitution", workspaceID, runtime, err)
+		// The DELIVERED config.yaml is frequently the runtime BASE template itself
+		// (that is what the asset channel ships), so falling through UNCHANGED here
+		// re-shipped the vendor `name`/`description` — i.e. the exact incident, on
+		// the exact degraded path this branch documents. Apply the identity
+		// override to the delivered bytes too.
+		//
+		// BOOT SAFETY (same rule as graftConciergeSchedules / stripConciergePersonaGraft):
+		// an unloadable config.yaml BRICKS boot, so on ANY problem — no delivered
+		// config, unparseable, not a mapping, failed round-trip — we ship the
+		// delivered bytes UNCHANGED and log at ERROR. A wrong identity is bad; a
+		// workspace that cannot boot is worse.
+		if delivered, ok := configFiles["config.yaml"]; ok && len(delivered) > 0 {
+			if fixed, oerr := overrideConciergeIdentityBytes(delivered, identityName); oerr != nil {
+				log.Printf("Provisioner: ERROR concierge %s runtime=%q — could not override the vendor identity on the DELIVERED config.yaml (%v); shipping it UNCHANGED to stay boot-safe. If that config came from the runtime base template the concierge will boot with the VENDOR name/description as its Role and may introduce itself as the vendor's agent",
+					workspaceID, runtime, oerr)
+			} else {
+				configFiles["config.yaml"] = fixed
+				log.Printf("Provisioner: concierge %s runtime=%q — compose unavailable; overrode name/description on the DELIVERED config.yaml (name=%q) so no vendor identity ships",
+					workspaceID, runtime, identityName)
+			}
+		} else {
+			log.Printf("Provisioner: concierge %s runtime=%q — compose unavailable and NO config.yaml was delivered; nothing to identity-override", workspaceID, runtime)
+		}
 		if prompt, ok := configFiles["system-prompt.md"]; ok {
-			configFiles["system-prompt.md"] = substituteConciergeName(prompt, name)
+			configFiles["system-prompt.md"] = substituteConciergeName(prompt, identityName)
 		}
 	} else {
 		configFiles["config.yaml"] = composed
-		persona := substituteConciergeName(h.resolveConciergePersonaBytes(configFiles), name)
+		persona := substituteConciergeName(h.resolveConciergePersonaBytes(configFiles), identityName)
 		if len(persona) > 0 {
 			// Always land the persona at prompts/concierge.md (the path the
 			// grafted prompt_files references for non-claude-code runtimes); ALSO
@@ -403,9 +450,33 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 			if runtime == claudeCodeRuntime {
 				configFiles["system-prompt.md"] = persona
 			}
+			log.Printf("Provisioner: concierge %s composed runtime-native /configs for runtime=%q (persona grafted per convention, name=%q, %d config file(s))",
+				workspaceID, runtime, identityName, len(configFiles))
+		} else {
+			// NO persona resolved. composeConciergeRuntimeConfig ALWAYS grafts
+			// prompt_files: [prompts/concierge.md] for a non-claude-code runtime, so
+			// shipping `composed` now would declare a prompt file we did not deliver:
+			// the runtime loads NOTHING for its role and the concierge boots with its
+			// BASE RUNTIME identity (observed live on a hermes concierge: it introduced
+			// itself as the base template's "self-improving AI agent", had no Org
+			// Concierge role, and told the user it had no management MCP even though
+			// all 54 verbs were registered). Two things must hold here:
+			//
+			//   1. NEVER declare a prompt file that is not in configFiles. Strip the
+			//      graft so the delivered config is at least self-consistent (the
+			//      runtime falls back to its documented default) instead of silently
+			//      dangling.
+			//   2. Say so LOUDLY. The old code logged the "persona grafted" success
+			//      line on this branch too, so the one signal an operator had reported
+			//      GREEN on the exact failure it was meant to catch.
+			log.Printf("Provisioner: ERROR concierge %s runtime=%q — NO persona resolved (platform-agent template %q unavailable in configs/cache); stripping the prompt_files graft so the config does not reference an undelivered file. The concierge will boot WITHOUT its Org Concierge identity",
+				workspaceID, runtime, conciergePersonaPromptPath)
+			if stripped, serr := stripConciergePersonaGraft(composed); serr != nil {
+				log.Printf("Provisioner: concierge %s could not strip the prompt_files graft (%v) — shipping the composed config as-is", workspaceID, serr)
+			} else {
+				configFiles["config.yaml"] = stripped
+			}
 		}
-		log.Printf("Provisioner: concierge %s composed runtime-native /configs for runtime=%q (persona grafted per convention, name=%q, %d config file(s))",
-			workspaceID, runtime, name, len(configFiles))
 	}
 	return configFiles
 }
@@ -460,7 +531,12 @@ func conciergeBaseTemplateName(runtime string) string {
 //   - prompt_files -> [prompts/concierge.md]  for every NON-claude-code runtime
 //     (the persona is the sole system-prompt file; claude-code reads
 //     system-prompt.md, delivered separately, so its prompt_files is untouched).
-func (h *WorkspaceHandler) composeConciergeRuntimeConfig(runtime string) ([]byte, error) {
+//   - name/description -> the ORG CONCIERGE's (setConciergeIdentity). These two
+//     fields, and ONLY these two, are what the runtime renders into the system
+//     prompt as the agent's Role. Vendor strings that survive elsewhere in the
+//     document (YAML comments, provider notes, model display names) are not
+//     rendered and are deliberately left alone.
+func (h *WorkspaceHandler) composeConciergeRuntimeConfig(runtime, conciergeName string) ([]byte, error) {
 	base := conciergeBaseTemplateName(runtime)
 	dir, err := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, base)
 	if err != nil {
@@ -483,6 +559,29 @@ func (h *WorkspaceHandler) composeConciergeRuntimeConfig(runtime string) ([]byte
 	if rc := yamlMappingGet(root, "runtime_config"); rc != nil && rc.Kind == yaml.MappingNode {
 		yamlMappingSet(rc, "required_env", yamlEmptySeq())
 	}
+	// Replace the base template's VENDOR identity with the ORG CONCIERGE's.
+	//
+	// The base config's `name`/`description` describe the runtime vendor — for
+	// the default hermes runtime, "Hermes Agent" / "Nous Research hermes-agent —
+	// the self-improving AI agent …". The runtime renders `description` into the
+	// system prompt as the agent's **Role**, so leaving it in place seats a
+	// SECOND, COMPETING IDENTITY beside the grafted Org Concierge persona and the
+	// model chooses between them non-deterministically.
+	//
+	// Observed on prod 2026-08-06: two concierges on the same build, both with a
+	// correct fully-substituted persona at prompts/concierge.md — one introduced
+	// itself as the org concierge, the other as "Hermes Agent, operated by Nous
+	// Research — a self-improving AI agent", quoting this description. Clearing
+	// the persona's conversation history did NOT fix the second one; overriding
+	// these two fields did. Delivering the persona (#2890) is necessary but not
+	// sufficient — the competing identity has to go with it.
+	//
+	// The override mutates `root` IN PLACE, i.e. the same node tree both exits of
+	// this function marshal — the plain `out` below AND the re-marshal inside
+	// graftConciergeSchedules. Applying it to a copy (or to the marshaled bytes)
+	// would silently drop the identity on the grafted path, which is the path every
+	// self-host concierge takes.
+	setConciergeIdentity(root, resolveConciergeIdentityName("(compose)", runtime, conciergeName))
 	// Graft the persona per the runtime's convention. claude-code reads
 	// system-prompt.md (delivered separately); every other runtime reads the
 	// prompt_files list, so the persona becomes its sole prompt file.
@@ -493,7 +592,122 @@ func (h *WorkspaceHandler) composeConciergeRuntimeConfig(runtime string) ([]byte
 	if err != nil {
 		return nil, fmt.Errorf("marshal composed concierge config %q: %w", base, err)
 	}
+	// Self-host only: graft the platform-agent template's runtime-native
+	// `schedules:` node onto the composed config so the concierge boots with the
+	// template's schedules. Boot-safe: on ANY problem (SaaS, no template, no
+	// schedules node, unparseable template, failed round-trip) we ship `out` —
+	// the composed config WITHOUT schedules — unchanged.
+	if withSched, grafted := h.graftConciergeSchedules(&doc, root); grafted {
+		out = withSched
+	}
 	return out, nil
+}
+
+// stripConciergePersonaGraft removes the prompt_files graft that
+// composeConciergeRuntimeConfig unconditionally adds for a non-claude-code
+// runtime. It is used on the ONE path where that graft cannot be honored: no
+// persona bytes were resolved, so prompts/concierge.md will NOT be delivered.
+// Declaring a prompt file that is absent from /configs makes the runtime load
+// nothing for its role — the concierge then boots with its BASE RUNTIME identity
+// and no Org Concierge persona.
+//
+// Returns the re-marshaled config with the key removed; the composed bytes
+// unchanged when nothing was grafted (the claude-code path); or an error, in
+// which case the caller ships the composed config as-is — an unloadable
+// config.yaml bricks boot, so a dangling reference is still preferred over a
+// broken document (same boot-safety rule as graftConciergeSchedules).
+func stripConciergePersonaGraft(composed []byte) ([]byte, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(composed, &doc); err != nil {
+		return nil, fmt.Errorf("parse composed concierge config: %w", err)
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("composed concierge config is not a YAML mapping")
+	}
+	if !yamlMappingDelete(doc.Content[0], "prompt_files") {
+		return composed, nil // nothing grafted (claude-code) — ship unchanged.
+	}
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return nil, fmt.Errorf("marshal stripped concierge config: %w", err)
+	}
+	var probe map[string]interface{}
+	if err := yaml.Unmarshal(out, &probe); err != nil {
+		return nil, fmt.Errorf("stripped concierge config fails to re-parse: %w", err)
+	}
+	return out, nil
+}
+
+// yamlMappingDelete removes key from a mapping node, reporting whether it was
+// present (companion to yamlMappingGet/yamlMappingSet).
+func yamlMappingDelete(m *yaml.Node, key string) bool {
+	if m == nil || m.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			m.Content = append(m.Content[:i], m.Content[i+2:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// graftConciergeSchedules grafts the platform-agent template's top-level
+// `schedules:` node onto the composed concierge config root and returns the
+// re-marshaled bytes. It is a ONE-TIME, GENERIC enablement: whatever runtime-
+// native `schedules:` the platform-agent template carries survives concierge
+// config composition — the schedule content is NEVER hardcoded in Go.
+//
+// Gate: only self-host deployments (SelfHostPlatformSeedEnabled — MOLECULE_ORG_ID
+// unset) graft; on SaaS the concierge config stays byte-identical (grafted=false).
+//
+// The template's schedules are already runtime-native (cron/inline prompt), so
+// this is a pure passthrough — renderTemplateSchedulesYAML is NOT called.
+//
+// Boot-safety (mirrors appendYAMLBlockChecked): after grafting, the whole doc is
+// re-marshaled and re-parsed (round-trip guard). If the template dir is
+// unresolvable, its config.yaml is missing/unparseable, it carries no schedules
+// node, or the merged doc fails the round-trip, grafted=false is returned and the
+// caller ships the composed config UNCHANGED — an unloadable config.yaml bricks
+// boot, so a missing schedule is always preferred over a broken config.
+func (h *WorkspaceHandler) graftConciergeSchedules(doc, root *yaml.Node) ([]byte, bool) {
+	if !SelfHostPlatformSeedEnabled() {
+		return nil, false // SaaS: concierge config stays byte-identical.
+	}
+	dir, err := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, "platform-agent")
+	if err != nil {
+		return nil, false
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "config.yaml"))
+	if err != nil {
+		return nil, false
+	}
+	var tdoc yaml.Node
+	if err := yaml.Unmarshal(raw, &tdoc); err != nil {
+		log.Printf("Provisioner: concierge schedules graft — platform-agent config.yaml unparseable (%v); shipping composed config WITHOUT schedules", err)
+		return nil, false
+	}
+	if tdoc.Kind != yaml.DocumentNode || len(tdoc.Content) == 0 || tdoc.Content[0].Kind != yaml.MappingNode {
+		return nil, false
+	}
+	sched := yamlMappingGet(tdoc.Content[0], "schedules")
+	if sched == nil {
+		return nil, false // template carries no schedules → no-op.
+	}
+	// Graft the node, then round-trip-guard the WHOLE merged doc.
+	yamlMappingSet(root, "schedules", sched)
+	merged, err := yaml.Marshal(doc)
+	if err != nil {
+		log.Printf("Provisioner: concierge schedules graft — re-marshal failed (%v); shipping composed config WITHOUT schedules", err)
+		return nil, false
+	}
+	var probe map[string]interface{}
+	if err := yaml.Unmarshal(merged, &probe); err != nil {
+		log.Printf("Provisioner: concierge schedules graft — merged config.yaml fails to re-parse (%v); shipping composed config WITHOUT schedules (would brick boot)", err)
+		return nil, false
+	}
+	return merged, true
 }
 
 // resolveConciergePersonaBytes returns the RAW (unsubstituted) concierge persona
@@ -562,6 +776,102 @@ func yamlStringSeq(items ...string) *yaml.Node {
 	return seq
 }
 
+// yamlString returns a plain string scalar node.
+func yamlString(v string) *yaml.Node {
+	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: v}
+}
+
+// conciergeFallbackName is the identity used when the caller could not resolve
+// the org's concierge name. It is deliberately generic-but-correct: an unknown
+// name is NOT a reason to fall back to the base runtime template's vendor name,
+// which is the very identity this override exists to remove.
+const conciergeFallbackName = "Org Concierge"
+
+// resolveConciergeIdentityName resolves the ONE name the concierge is known by.
+//
+// It exists so config.yaml and prompts/concierge.md can never disagree. The
+// empty-name fallback used to live inside composeConciergeRuntimeConfig only,
+// while applyConciergeProvisionConfig passed the RAW name to
+// substituteConciergeName — so an empty name yielded `name: Org Concierge` in the
+// agent card and `# You are  — the Org Concierge` in the persona: two documents,
+// two different answers to "who are you". Callers resolve once and thread the
+// result everywhere.
+//
+// An empty name is reachable in production: restart/reconcile paths that do not
+// hydrate payload.Name from the workspace row (a hazard workspace_dispatchers.go
+// documents) call in with "". Logged, because a nameless concierge is a real
+// upstream defect that should be visible — but never fatal, and NEVER a reason to
+// fall back to the base runtime template's vendor name.
+//
+// scope is only a log label (workspace id, or "(compose)" for a direct compose).
+func resolveConciergeIdentityName(scope, runtime, conciergeName string) string {
+	if n := strings.TrimSpace(conciergeName); n != "" {
+		return n
+	}
+	log.Printf("Provisioner: concierge %s runtime=%q got an EMPTY concierge name — falling back to %q for BOTH config.yaml and the persona substitution, rather than the base template's vendor name",
+		scope, runtime, conciergeFallbackName)
+	return conciergeFallbackName
+}
+
+// setConciergeIdentity writes the ORG CONCIERGE identity onto a config root
+// mapping node, replacing whatever vendor `name`/`description` the base runtime
+// template carried. It is the SSOT for the override so the composed path and the
+// compose-ERROR fallback path can never drift apart.
+//
+// Only these two fields are rewritten. Vendor strings elsewhere in a real runtime
+// template — YAML comments, provider notes, model display names — are NOT touched
+// and NOT rendered as the agent's Role, so they are out of scope by design (see
+// concierge_identity_name_description_test.go, which measures exactly that against
+// the real 477-line hermes template).
+func setConciergeIdentity(root *yaml.Node, name string) {
+	yamlMappingSet(root, "name", yamlString(name))
+	yamlMappingSet(root, "description", yamlString(conciergeRoleDescription))
+}
+
+// overrideConciergeIdentityBytes applies setConciergeIdentity to an ALREADY
+// SERIALIZED config.yaml. It is the compose-ERROR fallback's path: when
+// composeConciergeRuntimeConfig cannot reach the runtime's base template, the
+// config we ship is whatever was DELIVERED — which is frequently that same base
+// template, vendor identity and all.
+//
+// Boot-safety contract (same rule as graftConciergeSchedules /
+// stripConciergePersonaGraft): this returns an error rather than a
+// best-effort document on ANY problem — empty input, unparseable YAML, a
+// non-mapping root, a failed marshal, or output that does not re-parse. The
+// caller must then ship the input UNCHANGED. An unloadable config.yaml bricks
+// workspace boot, so a wrong identity always loses to a broken document.
+func overrideConciergeIdentityBytes(cfg []byte, name string) ([]byte, error) {
+	if len(strings.TrimSpace(string(cfg))) == 0 {
+		return nil, fmt.Errorf("delivered config.yaml is empty")
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(cfg, &doc); err != nil {
+		return nil, fmt.Errorf("parse delivered config.yaml: %w", err)
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("delivered config.yaml is not a YAML mapping")
+	}
+	setConciergeIdentity(doc.Content[0], name)
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return nil, fmt.Errorf("marshal identity-overridden config.yaml: %w", err)
+	}
+	var probe map[string]interface{}
+	if err := yaml.Unmarshal(out, &probe); err != nil {
+		return nil, fmt.Errorf("identity-overridden config.yaml fails to re-parse: %w", err)
+	}
+	return out, nil
+}
+
+// conciergeRoleDescription replaces the base runtime template's vendor blurb.
+// The runtime renders `description` into the system prompt as the agent's
+// **Role**, so this text is prompt material, not documentation — it must
+// describe the org-concierge role and name no runtime vendor.
+const conciergeRoleDescription = "The organization's platform agent — the org concierge. " +
+	"The single org-root agent above every workspace, and the organization's one front door: " +
+	"the default chat target for its members. An orchestrator that routes and delegates work to " +
+	"workspaces rather than performing it directly."
+
 // conciergeNamePlaceholder is the {{CONCIERGE_NAME}} marker the template's
 // prompts/concierge.md carries where the per-instance name goes. The runtime's
 // build_system_prompt does NOT template prompt files, so applyConciergeProvisionConfig
@@ -580,10 +890,12 @@ func substituteConciergeName(prompt []byte, name string) []byte {
 	// on the hot path. strings.Replace is in the standard library and
 	// handles the empty-name case safely (the placeholder is replaced
 	// with "" — leaving the prompt with a blank first line. We
-	// intentionally do NOT guard against empty name here: the caller
-	// (defaultPlatformAgentName) guarantees a non-empty name; if it
-	// somehow becomes empty, an empty first line is the louder failure
-	// mode (visible in the agent's startup log) than a silent skip.
+	// intentionally do NOT guard against empty name here: the concierge
+	// caller resolves the name through resolveConciergeIdentityName, which
+	// guarantees a non-empty value AND is the SAME value written into
+	// config.yaml, so the two documents cannot disagree. If some other
+	// caller passes an empty name, an empty first line is the louder
+	// failure mode (visible in the agent's startup log) than a silent skip.
 	// CR2 RC 11903 QF1004: strings.ReplaceAll (replaces all) replaces
 	// the legacy strings.Replace(s, old, new, -1) "replace all" idiom
 	// with the dedicated stdlib helper.
@@ -883,6 +1195,19 @@ func (h *WorkspaceHandler) reconcileExistingConciergeModel(ctx context.Context, 
 	// envVars for this provision). This also covers a stale/unknown id that does
 	// not derive to the platform provider — left to the customer-pick path rather
 	// than auto-rewritten.
+	//
+	// KNOWN GAP, deliberately NOT closed here (2026-08-04, sdk#203 adoption): an
+	// id the registry has since WITHDRAWN (e.g. moonshot/kimi-k2.6 after the
+	// platform's Moonshot vendor account was suspended) also stops deriving to
+	// `platform`, so a concierge already stored on one is read here as a customer
+	// BYOK pick and FROZEN on a model that can no longer be served. Auto-rewriting
+	// every non-deriving id was tried and REJECTED: it also rewrites genuinely
+	// customer-chosen ids that happen to be unroutable for unrelated registry
+	// reasons (e.g. a colon-form `anthropic:claude-opus-4-8` on hermes), which is
+	// exactly the platform-overrides-customer violation the CTO directive forbids.
+	// Closing this properly needs a WITHDRAWN-vs-never-registered distinction the
+	// registry does not currently express. Blast radius today is zero: no live
+	// workspace is stored on a withdrawn id (verified 2026-08-04).
 	if !conciergeModelIsPlatformManaged(runtime, existing) {
 		return
 	}
@@ -1000,43 +1325,31 @@ func conciergeModelIsPlatformManaged(runtime, model string) bool {
 // a defense-in-depth refusal for this PRIVILEGED name on any non-platform
 // workspace. The post-online reconcile + boot-install then install it.
 //
-// conciergePlatformMCPRepoPath is the fleet-fixed owner/repo of the management-MCP
-// plugin. It is HOST-agnostic on purpose: it names WHICH repo, never WHERE it is
-// served. The registry/SCM host is threaded to the box out-of-band via
-// MOLECULE_PLUGIN_REGISTRY (see pluginRegistryBase + conciergePlatformMCPEnv), so a
-// self-host / mirror / airgap overrides the host WITHOUT editing this source.
-const conciergePlatformMCPRepoPath = "molecule-ai/molecule-ai-plugin-molecule-platform-mcp"
-
-// conciergePlatformMCPRef is the pinned ref the box fetches. It MUST stay set: the
-// gitea resolver rejects an unpinned spec in production (PLUGIN_ALLOW_UNPINNED is
-// unset by default — see plugins/gitea.go), so an unpinned source would record the
-// declaration but then FAIL to fetch at boot-install time → no management MCP, no
-// create_workspace. #main matches the established seo-all convention.
-const conciergePlatformMCPRef = "main"
-
 // conciergePlatformMCPSource is the source-contract string recorded into
-// workspace_declared_plugins and consumed by the box boot-install. It is kept in
-// gitea:// wire form (NOT a full URL) for a deliberate reason:
+// workspace_declared_plugins and consumed by the box boot-install. It is NO
+// LONGER a hand-built literal: it is sourced (by name) from the SDK
+// native-plugins registry SSOT (plugin_registry.go), the install:concierge
+// entry. Consuming the registry removes the hand-kept RepoPath/Ref/Source
+// constants that previously duplicated the plugin repo's coordinates.
+//
+// The registry value is `gitea://molecule-ai/molecule-ai-plugin-molecule-platform-mcp#main`
+// — the same gitea:// WIRE FORM the old literal used, kept deliberately:
 //
 //   - REGISTRY-CONFIGURABLE / provider-agnostic: the gitea:// scheme carries NO
-//     host. Both the older and the updated box resolvers resolve gitea://owner/repo
-//     against a configurable registry base — the platform default git.moleculesai.app
-//     OR the MOLECULE_PLUGIN_REGISTRY this handler now threads into the box env — so
-//     the host is no longer hardcoded and a mirror/airgap install just sets that env.
-//     Because the host lives in the box env, this constant does not read it and can
-//     stay a compile-time const (the 3 call sites are unchanged).
+//     host. The box resolver resolves gitea://owner/repo against a configurable
+//     registry base — the platform default git.moleculesai.app OR the
+//     MOLECULE_PLUGIN_REGISTRY this handler threads into the box env — so the host
+//     is not hardcoded and a mirror/airgap install just sets that env.
+//   - PINNED ref (#main): the gitea resolver rejects an unpinned spec in
+//     production (PLUGIN_ALLOW_UNPINNED unset by default), so the ref must stay
+//     set or the declaration records but fails to fetch → no management MCP.
+//   - A bare name is NOT acceptable (parses to the `local` image-baked scheme).
+//     The #ref does NOT affect PluginNameFromSource, so conciergePlatformMCPName
+//     below still equals the derivation.
 //
-//   - ROLLOUT-SAFE back-compat: EVERY box image already understands gitea:// (the
-//     boot-install "ONLY fetches gitea:// sources" today), whereas a full URL is only
-//     understood by the updated resolver. Emitting gitea:// keeps the concierge's
-//     management MCP working on not-yet-updated boxes mid-rollout; the updated box
-//     "handles both", so this can flip to a full `{registry}/…#ref` URL once the
-//     fleet is fully on the new image.
-//
-// A bare name is NOT acceptable: it parses to the `local` scheme (image-baked
-// plugins only) and this is a Gitea-only repo. The #ref does NOT affect
-// PluginNameFromSource, so conciergePlatformMCPName below is unchanged.
-const conciergePlatformMCPSource = "gitea://" + conciergePlatformMCPRepoPath + "#" + conciergePlatformMCPRef
+// mustNativePluginSource panics at startup if the registry drops this privileged
+// plugin, rather than recording an empty source the box then can't fetch.
+var conciergePlatformMCPSource = mustNativePluginSource(conciergePlatformMCPName)
 
 // conciergePluginRegistryEnvVar names the box-facing env var that carries the
 // SCM/registry base the plugin boot-install fetches plugin repos from. Setting it
@@ -1525,6 +1838,25 @@ type localProvisionerIsRunning interface {
 	IsRunning(ctx context.Context, workspaceID string) (bool, error)
 }
 
+// platformRootConflictError is returned by installPlatformAgent when the caller
+// asked to install a platform root under an id that differs from the org's
+// CURRENT, ONLINE one. Honouring it would demote a live concierge and put a
+// container-less row in its place (this install never provisions), destroying
+// the org's concierge with no path back. The caller gets 409 and the id of the
+// root that is actually serving, so it can either target that id or go through
+// POST /admin/org/platform-agent/ensure, which repairs in place.
+type platformRootConflictError struct {
+	ExistingID  string
+	RequestedID string
+}
+
+func (e *platformRootConflictError) Error() string {
+	return fmt.Sprintf(
+		"refusing to displace the ONLINE platform root %s with %s: this install is row-only "+
+			"(it never provisions), so the org would be left with a concierge that has no container",
+		e.ExistingID, e.RequestedID)
+}
+
 type installPlatformAgentPayload struct {
 	// ID is the platform agent's workspace id (a deterministic uuidv5 the
 	// control plane derives per org). Required.
@@ -1569,6 +1901,20 @@ func InstallPlatformAgent(c *gin.Context) {
 		name = defaultPlatformAgentName()
 	}
 	if err := installPlatformAgent(c.Request.Context(), db.DB, p.ID, name, p.Runtime); err != nil {
+		// A foreign id aimed at a LIVE concierge is a caller error, not a server
+		// fault: answer 409 with the id that is actually serving. Additive-safe for
+		// the frozen CP contract — the CP always sends the canonical id, which IS
+		// the existing root's id, so this arm is unreachable for it.
+		var conflict *platformRootConflictError
+		if errors.As(err, &conflict) {
+			log.Printf("InstallPlatformAgent: %v", conflict)
+			c.JSON(http.StatusConflict, gin.H{
+				"error":             conflict.Error(),
+				"code":              "PLATFORM_ROOT_ONLINE",
+				"platform_agent_id": conflict.ExistingID,
+			})
+			return
+		}
 		log.Printf("InstallPlatformAgent: %v (id=%s)", err, p.ID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "install failed"})
 		return
@@ -1608,6 +1954,57 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 	//    platform agent (defense-in-depth: covers pathological cases where a
 	//    platform root was created with a non-canonical id, e.g. test fixtures
 	//    or a prior failed migration).
+	//
+	//    ...but ONLY when the root it displaces is not a LIVE concierge. This
+	//    install is row-only: it never provisions (see the handler's frozen
+	//    contract), so demoting an ONLINE root and upserting a container-less one
+	//    in its place leaves the org with a concierge that has no container and
+	//    no path to getting one — the canvas resolves the new root, its status
+	//    never reaches 'online', and the composer is disabled forever. One POST
+	//    with a foreign id permanently destroys a working org concierge.
+	//
+	//    This is not hypothetical: it is what canvas/e2e/staging-concierge.spec.ts
+	//    did to every staging E2E org from 2026-06-11 (when the downgrade above
+	//    replaced the uniq_workspaces_one_platform_root COLLISION that used to
+	//    reject a foreign id loudly) until this guard.
+	//
+	//    The CP is unaffected: it always supplies the canonical derived id, which
+	//    equals the existing root's id, so `id <> $1` excludes it and neither the
+	//    downgrade nor this guard ever fires. The guard's ONLY reachable arm is
+	//    the destructive one it exists to stop.
+	//
+	//    LIVE = status IN ('online','degraded') — NOT 'online' alone. This guard
+	//    originally probed `status = 'online'`, and the comment here enumerated the
+	//    safe-to-repair states as "offline / failed / provisioning / removed",
+	//    silently omitting 'degraded'. That omission was the whole bug: a DEGRADED
+	//    concierge has a real, running container — it is merely failing its health
+	//    probe — so displacing it with a row-only install (this endpoint never
+	//    provisions) orphans that container and leaves the org with a concierge that
+	//    has none. Exactly the destruction the guard exists to prevent, just in a
+	//    narrower window.
+	//
+	//    ('online','degraded') is the codebase's canonical container-backed
+	//    predicate, not a value invented here — see registry/cp_instance_reconciler.go
+	//    :168 and :294, registry/healthsweep.go, registry/hibernation.go,
+	//    registry/wedged_agent.go. Guard the PROPERTY (has a container that a row-only
+	//    install would orphan), never one status literal that happens to be the state
+	//    you saw while debugging.
+	var liveRootID string
+	err = tx.QueryRowContext(ctx, `
+		SELECT id FROM workspaces
+		WHERE kind = 'platform' AND parent_id IS NULL AND id <> $1
+		  AND status IN ('online', 'degraded')
+		LIMIT 1
+	`, platformID).Scan(&liveRootID)
+	switch {
+	case err == nil:
+		return &platformRootConflictError{ExistingID: liveRootID, RequestedID: platformID}
+	case errors.Is(err, sql.ErrNoRows):
+		// No live foreign root — the downgrade below is safe.
+	default:
+		return fmt.Errorf("probe existing platform root: %w", err)
+	}
+
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE workspaces SET kind = 'workspace', updated_at = now()
 		WHERE kind = 'platform' AND parent_id IS NULL AND id <> $1

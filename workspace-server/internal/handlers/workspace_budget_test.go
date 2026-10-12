@@ -35,6 +35,7 @@ var wsColumns = []string{
 	"budget_limit", "monthly_spend",
 	"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 	"loaded_mcp_tools",
+	"mcp_surface",
 }
 
 // ==================== GET — financial fields stripped from open endpoint ====================
@@ -59,6 +60,7 @@ func TestWorkspaceBudget_Get_NilLimit(t *testing.T) {
 				false, // broadcast_enabled
 				true,  // talk_to_user_enabled
 				[]byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 
 	w := httptest.NewRecorder()
@@ -105,6 +107,7 @@ func TestWorkspaceBudget_Get_WithLimit(t *testing.T) {
 				int64(123),  // monthly_spend = $1.23 in DB
 				false, true, // broadcast_enabled, talk_to_user_enabled
 				[]byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 
 	w := httptest.NewRecorder()
@@ -279,7 +282,7 @@ func TestWorkspaceBudget_A2A_ExceededReturns402(t *testing.T) {
 	body := `{"message":{"role":"user","parts":[{"text":"hello"}]}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-over-budget/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusPaymentRequired {
 		t.Errorf("expected 402 when budget exceeded, got %d: %s", w.Code, w.Body.String())
@@ -316,7 +319,7 @@ func TestWorkspaceBudget_A2A_AboveLimitReturns402(t *testing.T) {
 	body := `{"message":{"role":"user","parts":[{"text":"test"}]}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-way-over/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusPaymentRequired {
 		t.Errorf("expected 402 when spend > limit, got %d: %s", w.Code, w.Body.String())
@@ -362,7 +365,7 @@ func TestWorkspaceBudget_A2A_UnderLimitPassesThrough(t *testing.T) {
 	body := `{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"role":"user","parts":[{"text":"hello"}]}}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-under-budget/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	// Give the async logA2ASuccess goroutine a moment to fire
 	time.Sleep(50 * time.Millisecond)
@@ -407,7 +410,7 @@ func TestWorkspaceBudget_A2A_NilLimitPassesThrough(t *testing.T) {
 	body := `{"jsonrpc":"2.0","id":"2","method":"message/send","params":{"message":{"role":"user","parts":[{"text":"hi"}]}}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-no-limit/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	time.Sleep(50 * time.Millisecond)
 
@@ -450,7 +453,7 @@ func TestWorkspaceBudget_A2A_DBErrorFailOpen(t *testing.T) {
 	body := `{"jsonrpc":"2.0","id":"3","method":"message/send","params":{"message":{"role":"user","parts":[{"text":"fail-open test"}]}}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-db-err-budget/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	time.Sleep(50 * time.Millisecond)
 

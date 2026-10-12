@@ -40,9 +40,9 @@ def test_invalid_provider_fails_closed():
     assert "unsupported CONTROLPLANE_DEPLOY_PROVIDER=bogus" in result.stdout
 
 
-def test_railway_provider_requires_explicit_selection():
+def test_retired_railway_provider_fails_closed():
     result = run_script("--tag", "staging-deadbee", "--dry-run", provider="railway")
 
-    assert result.returncode == 0, result.stdout
-    assert "DRY-RUN: would set Railway staging" in result.stdout
-    assert "TARGET_IMAGE=registry.moleculesai.app/molecule-ai/molecule-tenant:staging-deadbee" in result.stdout
+    assert result.returncode == 2
+    assert "unsupported CONTROLPLANE_DEPLOY_PROVIDER=railway" in result.stdout
+    assert "supported providers: none, external, ci-on-merge" in result.stdout

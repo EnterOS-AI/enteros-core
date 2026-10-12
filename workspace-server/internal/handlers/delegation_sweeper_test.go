@@ -14,7 +14,16 @@ import (
 //
 //   1. Deadline-exceeded rows are marked failed.
 //   2. Heartbeat-stale rows (lastBeat older than threshold) are marked stuck.
-//   3. NULL last_heartbeat is NOT marked stuck (free first-beat pass).
+//   3. NULL heartbeat is NOT marked stuck (free first-beat pass).
+//
+// NOTE on the `beat` column: the sweeper's stuck arm keys on
+// COALESCE(d.last_heartbeat, w.last_heartbeat_at) — the TARGET WORKSPACE's
+// heartbeat, joined in. delegations.last_heartbeat is written by
+// DelegationLedger.Heartbeat, which has ZERO production call sites and is
+// therefore always NULL in the field; keying stuck detection on it alone made
+// the whole arm dead code (#4316). The COALESCE keeps the dedicated column
+// authoritative if it ever gains a writer, and falls back to the signal that
+// actually exists today.
 //   4. Healthy in-flight rows (recent heartbeat, future deadline) are
 //      left alone.
 //   5. Empty in-flight set is a clean no-op.
@@ -25,10 +34,10 @@ import (
 func TestSweeper_HappyPath_NoInflightRowsIsCleanNoOp(t *testing.T) {
 	mock := setupTestDB(t)
 	ledger := NewDelegationLedger(nil)
-	sw := NewDelegationSweeper(nil, ledger)
+	sw := newTestSweeper(ledger)
 
-	mock.ExpectQuery(`SELECT delegation_id, last_heartbeat, deadline\s+FROM delegations`).
-		WillReturnRows(sqlmock.NewRows([]string{"delegation_id", "last_heartbeat", "deadline"}))
+	mock.ExpectQuery(`SELECT d\.delegation_id, d\.caller_id, d\.callee_id`).
+		WillReturnRows(sqlmock.NewRows([]string{"delegation_id", "caller_id", "callee_id", "status", "beat", "deadline"}))
 
 	res := sw.Sweep(context.Background())
 	if res.DeadlineFailures != 0 || res.StuckMarked != 0 || res.Errors != 0 {
@@ -42,12 +51,12 @@ func TestSweeper_HappyPath_NoInflightRowsIsCleanNoOp(t *testing.T) {
 func TestSweeper_DeadlineExceededIsMarkedFailed(t *testing.T) {
 	mock := setupTestDB(t)
 	ledger := NewDelegationLedger(nil)
-	sw := NewDelegationSweeper(nil, ledger)
+	sw := newTestSweeper(ledger)
 
 	past := time.Now().Add(-1 * time.Minute)
-	mock.ExpectQuery(`SELECT delegation_id, last_heartbeat, deadline\s+FROM delegations`).
-		WillReturnRows(sqlmock.NewRows([]string{"delegation_id", "last_heartbeat", "deadline"}).
-			AddRow("deleg-overdue", time.Now(), past))
+	mock.ExpectQuery(`SELECT d\.delegation_id, d\.caller_id, d\.callee_id`).
+		WillReturnRows(sqlmock.NewRows([]string{"delegation_id", "caller_id", "callee_id", "status", "beat", "deadline"}).
+			AddRow("deleg-overdue", "caller-ws", "callee-ws", "in_progress", time.Now(), past))
 
 	// SetStatus reads current status...
 	mock.ExpectQuery(`SELECT status FROM delegations WHERE delegation_id = \$1`).
@@ -55,7 +64,7 @@ func TestSweeper_DeadlineExceededIsMarkedFailed(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("in_progress"))
 	// ...then updates to failed.
 	mock.ExpectExec(`UPDATE delegations`).
-		WithArgs("deleg-overdue", "failed", "deadline exceeded by sweeper", "").
+		WithArgs("deleg-overdue", "failed", "deadline exceeded by sweeper", "", "in_progress").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	res := sw.Sweep(context.Background())
@@ -70,15 +79,15 @@ func TestSweeper_DeadlineExceededIsMarkedFailed(t *testing.T) {
 func TestSweeper_StaleHeartbeatIsMarkedStuck(t *testing.T) {
 	mock := setupTestDB(t)
 	ledger := NewDelegationLedger(nil)
-	sw := NewDelegationSweeper(nil, ledger)
+	sw := newTestSweeper(ledger)
 
 	// Last heartbeat 30min ago — well past the 10min default threshold.
 	staleBeat := time.Now().Add(-30 * time.Minute)
 	future := time.Now().Add(2 * time.Hour) // deadline NOT exceeded
 
-	mock.ExpectQuery(`SELECT delegation_id, last_heartbeat, deadline\s+FROM delegations`).
-		WillReturnRows(sqlmock.NewRows([]string{"delegation_id", "last_heartbeat", "deadline"}).
-			AddRow("deleg-stuck", staleBeat, future))
+	mock.ExpectQuery(`SELECT d\.delegation_id, d\.caller_id, d\.callee_id`).
+		WillReturnRows(sqlmock.NewRows([]string{"delegation_id", "caller_id", "callee_id", "status", "beat", "deadline"}).
+			AddRow("deleg-stuck", "caller-ws", "callee-ws", "in_progress", staleBeat, future))
 
 	mock.ExpectQuery(`SELECT status FROM delegations WHERE delegation_id = \$1`).
 		WithArgs("deleg-stuck").
@@ -87,7 +96,7 @@ func TestSweeper_StaleHeartbeatIsMarkedStuck(t *testing.T) {
 	// We can't predict the exact "no heartbeat for Xs" string because
 	// the suffix depends on now() at sweep time; just match against any.
 	mock.ExpectExec(`UPDATE delegations`).
-		WithArgs("deleg-stuck", "stuck", sqlmock.AnyArg(), "").
+		WithArgs("deleg-stuck", "stuck", sqlmock.AnyArg(), "", "in_progress").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	res := sw.Sweep(context.Background())
@@ -105,12 +114,12 @@ func TestSweeper_NullHeartbeatIsLeftAlone(t *testing.T) {
 	// emit its first beat.
 	mock := setupTestDB(t)
 	ledger := NewDelegationLedger(nil)
-	sw := NewDelegationSweeper(nil, ledger)
+	sw := newTestSweeper(ledger)
 
 	future := time.Now().Add(2 * time.Hour)
-	mock.ExpectQuery(`SELECT delegation_id, last_heartbeat, deadline\s+FROM delegations`).
-		WillReturnRows(sqlmock.NewRows([]string{"delegation_id", "last_heartbeat", "deadline"}).
-			AddRow("deleg-fresh", sql.NullTime{}, future))
+	mock.ExpectQuery(`SELECT d\.delegation_id, d\.caller_id, d\.callee_id`).
+		WillReturnRows(sqlmock.NewRows([]string{"delegation_id", "caller_id", "callee_id", "status", "beat", "deadline"}).
+			AddRow("deleg-fresh", "caller-ws", "callee-ws", "in_progress", sql.NullTime{}, future))
 
 	res := sw.Sweep(context.Background())
 	if res.StuckMarked != 0 {
@@ -127,14 +136,14 @@ func TestSweeper_NullHeartbeatIsLeftAlone(t *testing.T) {
 func TestSweeper_HealthyInflightRowsAreLeftAlone(t *testing.T) {
 	mock := setupTestDB(t)
 	ledger := NewDelegationLedger(nil)
-	sw := NewDelegationSweeper(nil, ledger)
+	sw := newTestSweeper(ledger)
 
 	freshBeat := time.Now().Add(-1 * time.Minute) // well within 10min threshold
 	future := time.Now().Add(2 * time.Hour)
 
-	mock.ExpectQuery(`SELECT delegation_id, last_heartbeat, deadline\s+FROM delegations`).
-		WillReturnRows(sqlmock.NewRows([]string{"delegation_id", "last_heartbeat", "deadline"}).
-			AddRow("deleg-healthy", freshBeat, future))
+	mock.ExpectQuery(`SELECT d\.delegation_id, d\.caller_id, d\.callee_id`).
+		WillReturnRows(sqlmock.NewRows([]string{"delegation_id", "caller_id", "callee_id", "status", "beat", "deadline"}).
+			AddRow("deleg-healthy", "caller-ws", "callee-ws", "in_progress", freshBeat, future))
 
 	res := sw.Sweep(context.Background())
 	if res.DeadlineFailures != 0 || res.StuckMarked != 0 {
@@ -150,21 +159,21 @@ func TestSweeper_DeadlineFiresFirstNotStuck(t *testing.T) {
 	// failed (deadline) not stuck — deadline is the stronger statement.
 	mock := setupTestDB(t)
 	ledger := NewDelegationLedger(nil)
-	sw := NewDelegationSweeper(nil, ledger)
+	sw := newTestSweeper(ledger)
 
 	staleBeat := time.Now().Add(-30 * time.Minute)
 	past := time.Now().Add(-5 * time.Minute)
 
-	mock.ExpectQuery(`SELECT delegation_id, last_heartbeat, deadline\s+FROM delegations`).
-		WillReturnRows(sqlmock.NewRows([]string{"delegation_id", "last_heartbeat", "deadline"}).
-			AddRow("deleg-both", staleBeat, past))
+	mock.ExpectQuery(`SELECT d\.delegation_id, d\.caller_id, d\.callee_id`).
+		WillReturnRows(sqlmock.NewRows([]string{"delegation_id", "caller_id", "callee_id", "status", "beat", "deadline"}).
+			AddRow("deleg-both", "caller-ws", "callee-ws", "in_progress", staleBeat, past))
 
 	// Only the failed transition fires; no stuck transition.
 	mock.ExpectQuery(`SELECT status FROM delegations WHERE delegation_id = \$1`).
 		WithArgs("deleg-both").
 		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("in_progress"))
 	mock.ExpectExec(`UPDATE delegations`).
-		WithArgs("deleg-both", "failed", "deadline exceeded by sweeper", "").
+		WithArgs("deleg-both", "failed", "deadline exceeded by sweeper", "", "in_progress").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	res := sw.Sweep(context.Background())
@@ -179,14 +188,14 @@ func TestSweeper_DeadlineFiresFirstNotStuck(t *testing.T) {
 func TestSweeper_MixedSetAppliesBothRules(t *testing.T) {
 	mock := setupTestDB(t)
 	ledger := NewDelegationLedger(nil)
-	sw := NewDelegationSweeper(nil, ledger)
+	sw := newTestSweeper(ledger)
 
 	now := time.Now()
-	mock.ExpectQuery(`SELECT delegation_id, last_heartbeat, deadline\s+FROM delegations`).
-		WillReturnRows(sqlmock.NewRows([]string{"delegation_id", "last_heartbeat", "deadline"}).
-			AddRow("deleg-overdue", now, now.Add(-1*time.Minute)).      // deadline → failed
-			AddRow("deleg-stuck", now.Add(-30*time.Minute), now.Add(2*time.Hour)). // stale → stuck
-			AddRow("deleg-healthy", now.Add(-30*time.Second), now.Add(2*time.Hour)), // healthy → no-op
+	mock.ExpectQuery(`SELECT d\.delegation_id, d\.caller_id, d\.callee_id`).
+		WillReturnRows(sqlmock.NewRows([]string{"delegation_id", "caller_id", "callee_id", "status", "beat", "deadline"}).
+			AddRow("deleg-overdue", "caller-ws", "callee-ws", "in_progress", now, now.Add(-1*time.Minute)).                   // deadline → failed
+			AddRow("deleg-stuck", "caller-ws", "callee-ws", "in_progress", now.Add(-30*time.Minute), now.Add(2*time.Hour)).   // stale → stuck
+			AddRow("deleg-healthy", "caller-ws", "callee-ws", "in_progress", now.Add(-30*time.Second), now.Add(2*time.Hour)), // healthy → no-op
 		)
 
 	// 1st: deadline → failed
@@ -194,7 +203,7 @@ func TestSweeper_MixedSetAppliesBothRules(t *testing.T) {
 		WithArgs("deleg-overdue").
 		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("in_progress"))
 	mock.ExpectExec(`UPDATE delegations`).
-		WithArgs("deleg-overdue", "failed", "deadline exceeded by sweeper", "").
+		WithArgs("deleg-overdue", "failed", "deadline exceeded by sweeper", "", "in_progress").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// 2nd: stale → stuck
@@ -202,7 +211,7 @@ func TestSweeper_MixedSetAppliesBothRules(t *testing.T) {
 		WithArgs("deleg-stuck").
 		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("in_progress"))
 	mock.ExpectExec(`UPDATE delegations`).
-		WithArgs("deleg-stuck", "stuck", sqlmock.AnyArg(), "").
+		WithArgs("deleg-stuck", "stuck", sqlmock.AnyArg(), "", "in_progress").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// 3rd: healthy — no SQL fired
@@ -223,12 +232,12 @@ func TestSweeper_TerminalReplayFromConcurrentCompletionIsIgnored(t *testing.T) {
 	// row is correctly left in completed state.
 	mock := setupTestDB(t)
 	ledger := NewDelegationLedger(nil)
-	sw := NewDelegationSweeper(nil, ledger)
+	sw := newTestSweeper(ledger)
 
 	past := time.Now().Add(-1 * time.Minute)
-	mock.ExpectQuery(`SELECT delegation_id, last_heartbeat, deadline\s+FROM delegations`).
-		WillReturnRows(sqlmock.NewRows([]string{"delegation_id", "last_heartbeat", "deadline"}).
-			AddRow("deleg-raced", time.Now(), past))
+	mock.ExpectQuery(`SELECT d\.delegation_id, d\.caller_id, d\.callee_id`).
+		WillReturnRows(sqlmock.NewRows([]string{"delegation_id", "caller_id", "callee_id", "status", "beat", "deadline"}).
+			AddRow("deleg-raced", "caller-ws", "callee-ws", "in_progress", time.Now(), past))
 
 	// SetStatus's status read finds the row already completed (concurrent UpdateStatus won).
 	mock.ExpectQuery(`SELECT status FROM delegations WHERE delegation_id = \$1`).
@@ -311,4 +320,18 @@ func TestSweeperConstructor_DefaultsWhenEnvUnset(t *testing.T) {
 	if sw.Threshold() != defaultStuckThreshold {
 		t.Errorf("default threshold not used: got %v", sw.Threshold())
 	}
+}
+
+// newTestSweeper builds a sweeper whose BOOT GRACE has already elapsed.
+//
+// Production suppresses the stuck arm for one threshold after start: the
+// staleness signal is workspaces.last_heartbeat_at, written by the workspaces TO
+// THIS SERVER, so our own downtime makes every callee look stale at once and the
+// immediate boot sweep would mass-mark the fleet stuck. Unit tests are not
+// exercising that path (TestSweeper_BootGrace_... pins it explicitly), so they
+// start from a sweeper that has been up for a day.
+func newTestSweeper(ledger *DelegationLedger) *DelegationSweeper {
+	sw := NewDelegationSweeper(nil, ledger)
+	sw.startedAt = time.Now().Add(-24 * time.Hour)
+	return sw
 }

@@ -11,8 +11,15 @@
 # WHAT THIS FILE IS: the explicit, tight, checked-in set of paths whose change
 # requires a DISTINCT non-author approval AND a distinct non-author merger
 # (author != approver, author != merger). Read by:
-#   - PREVENTIVE: .gitea/workflows/reserved-path-review.yml (required CI gate).
 #   - DETECTIVE:  .gitea/scripts/audit-force-merge.sh (incident.reserved_self_merge).
+#
+# NOTE (2026-07-17, CTO directive): the PREVENTIVE per-PR gate
+# (.gitea/workflows/reserved-path-review.yml — the blocking `reserved-path-review`
+# commit status) was RETIRED. Enforcement is now DETECTIVE-only (audit-force-merge)
+# plus the peer-approval floor (REVIEWER_SET + REQUIRED_APPROVALS in
+# gitea-merge-queue.py). This file still names the reserved paths the detective
+# audit keys on; changing a reserved path no longer hard-blocks on a distinct
+# CI-side approval at merge time.
 #
 # FORMAT: one gitignore-style pattern per line. Blank + #-comment lines ignored.
 # Trailing "/" = dir prefix; "*" = glob; otherwise exact-or-dir-prefix.

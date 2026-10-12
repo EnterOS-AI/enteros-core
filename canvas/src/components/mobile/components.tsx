@@ -225,9 +225,9 @@ export function WorkspacePill({
             fontWeight: 700,
           }}
         >
-          M
+          E
         </span>
-        <span style={{ fontSize: 13.5, fontWeight: 600, color: p.text }}>Molecule AI</span>
+        <span style={{ fontSize: 13.5, fontWeight: 600, color: p.text }}>Enter OS</span>
       </span>
       <span
         style={{

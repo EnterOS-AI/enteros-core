@@ -113,13 +113,13 @@ export function buildCsp(nonce: string, isDev: boolean): string {
 }
 
 export function middleware(request: NextRequest) {
-  // Redirect /en, /zh, etc. locale prefixes back to root
+  // Accept locale entry URLs without a browser redirect. A cached root -> /en
+  // redirect (e.g. from another local app on this port) would otherwise loop
+  // against our /en -> / redirect. Preserve the path and query when rewriting.
   const pathname = request.nextUrl.pathname;
   const locales =
     /^\/(en|zh|ja|ko|fr|de|es|pt|it|ru|ar|hi|th|vi|nl|sv|da|nb|fi|pl|cs|tr|uk|he|id|ms)(\/|$)/;
-  if (locales.test(pathname)) {
-    return NextResponse.redirect(new URL("/", request.url));
-  }
+  const localeMatch = pathname.match(locales);
 
   // Generate a fresh, per-request nonce.
   // Buffer.from(uuid).toString('base64') gives a URL-safe-ish base64 string
@@ -135,9 +135,14 @@ export function middleware(request: NextRequest) {
   requestHeaders.set("x-nonce", nonce);
   requestHeaders.set("Content-Security-Policy", csp);
 
-  const response = NextResponse.next({
-    request: { headers: requestHeaders },
-  });
+  const options = { request: { headers: requestHeaders } };
+  const destination = request.nextUrl.clone();
+  destination.pathname = localeMatch
+    ? `/${pathname.slice(localeMatch[0].length)}`
+    : pathname;
+  const response = localeMatch
+    ? NextResponse.rewrite(destination, options)
+    : NextResponse.next(options);
   response.headers.set("Content-Security-Policy", csp);
 
   return response;

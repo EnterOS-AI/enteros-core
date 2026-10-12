@@ -12,14 +12,14 @@ import (
 // Proves a parent org template can compose a subtree from a sibling repo
 // via a directory symlink. Pattern that gets shipped:
 //
-//   /org-templates/parent-template/                  ← imported by POST /org/import
-//     org.yaml                                       (workspaces: !include dev/dev-lead/workspace.yaml)
-//     dev → /org-templates/molecule-dev-department/  (symlink)
-//   /org-templates/molecule-dev-department/          (sibling repo)
-//     dev-lead/
-//       workspace.yaml                               (children: !include ./core-platform/workspace.yaml)
-//       core-platform/
-//         workspace.yaml
+//	/org-templates/parent-template/                  ← imported by POST /org/import
+//	  org.yaml                                       (workspaces: !include dev/dev-lead/workspace.yaml)
+//	  dev → /org-templates/molecule-dev-department/  (symlink)
+//	/org-templates/molecule-dev-department/          (sibling repo)
+//	  dev-lead/
+//	    workspace.yaml                               (children: !include ./core-platform/workspace.yaml)
+//	    core-platform/
+//	      workspace.yaml
 //
 // resolveYAMLIncludes resolves paths via filepath.Abs/Rel (no symlink
 // following at the path-string layer), so the security check passes. The

@@ -55,10 +55,21 @@ type WorkspaceHandler struct {
 	// auth chain. Production callers still pass *CPProvisioner via
 	// SetCPProvisioner, which satisfies the interface — see the
 	// compile-time assertion in internal/provisioner/cp_provisioner.go.
-	cpProv      provisioner.CPProvisionerAPI
-	platformURL string
-	configsDir  string // path to workspace-configs-templates/ (for reading templates)
-	cacheDir    string // optional runtime-refreshed template cache; overrides configsDir by template id
+	cpProv provisioner.CPProvisionerAPI
+	// sidecarProv is the desktop-sidecar backend (design §5). ONE backend: the
+	// Local (Docker) impl on self-host, the CP impl on SaaS (deferred), or nil
+	// -> the availability-gate default, so the desktop feature is cleanly
+	// ABSENT (decision 4) rather than broken.
+	sidecarProv provisioner.SidecarProvisioner
+	// desktopGateway is the desktop enforcement gateway the desktop HTTP route
+	// proxies to (decision B: the authenticated seam the in-container agent
+	// tool calls; the platform layer is a gateway, NOT an MCP tool, so the agent
+	// surface stays in the runtime and remains plugin-extractable). nil ->
+	// routes report unavailable.
+	desktopGateway desktopGateway
+	platformURL    string
+	configsDir     string // path to workspace-configs-templates/ (for reading templates)
+	cacheDir       string // optional runtime-refreshed template cache; overrides configsDir by template id
 	// envMutators runs registered EnvMutator plugins right before
 	// container Start, after built-in secret loads. Nil = no plugins
 	// registered; Registry.Run handles a nil receiver as a no-op so the
@@ -134,6 +145,38 @@ type WorkspaceHandler struct {
 	// for async DB users (restart, provision) before asserting results.
 	// Matches the pattern from main commit 1c3b4ff3.
 	asyncWG sync.WaitGroup
+
+	// wakeDecide / wakeMarkDelivered route the restart-context wake through the
+	// wake-lifecycle desired-state owner (PR-D). BOTH nil by default: a bare
+	// &WorkspaceHandler{} (every existing unit test) leaves them unset, so the
+	// restart-context path keeps its pre-PR-D behavior verbatim — no wake_intents
+	// write, no generation bump, and enqueueRestartContext falls back to its
+	// legacy per-workspace idempotency key. Production wires them via SetWakeHooks
+	// to this handler's own DecideWake / MarkWakeDelivered. Mirrors the
+	// StallWatchdog.SetWakeHooks nil-safe late-wiring pattern.
+	wakeDecide        func(ctx context.Context, workspaceID string, kind WakeKind, dedupSeed string) (WakeDecision, error)
+	wakeMarkDelivered func(ctx context.Context, workspaceID, idempotencyKey string) error
+
+	// wakeReEmit re-emits a STUCK wake intent through its existing idempotency
+	// key — the re-drive side of the generation loop (wake_redrive.go PR-F). nil
+	// by default: a bare &WorkspaceHandler{} leaves it unset, so ReDriveStuckWakes
+	// is a full no-op (nothing to re-emit ⇒ no scan, no bounding). Production wires
+	// it via SetWakeReEmitter to WakeReEmitter(greeter). Exactly-once safety is the
+	// re-emission path's own (has_greeted CAS / queue dedup), never re-drive's.
+	wakeReEmit func(ctx context.Context, workspaceID string, kind WakeKind, idempotencyKey string, generation int64) error
+}
+
+// SetWakeHooks wires the wake-lifecycle desired-state owner into this handler's
+// proactive-wake emitters (currently restart-context, PR-D). Late-wiring and
+// nil-safe (mirrors StallWatchdog.SetWakeHooks / RegistryHandler's setters) so
+// the struct's zero value — and every existing bare-handler test — behaves
+// exactly as pre-PR-D. Production calls this once, after the handler exists.
+func (h *WorkspaceHandler) SetWakeHooks(
+	decide func(ctx context.Context, workspaceID string, kind WakeKind, dedupSeed string) (WakeDecision, error),
+	delivered func(ctx context.Context, workspaceID, idempotencyKey string) error,
+) {
+	h.wakeDecide = decide
+	h.wakeMarkDelivered = delivered
 }
 
 // deadProbeRecord tracks consecutive "container looks dead" observations
@@ -300,6 +343,14 @@ func (h *WorkspaceHandler) SetCPProvisioner(cp provisioner.CPProvisionerAPI) {
 	h.cpProv = cp
 }
 
+// SetSidecarProvisioner wires the desktop-sidecar backend (design §5). Pass the
+// Local (Docker) backend on self-host, the CP backend on SaaS once wired, or
+// leave unset — the handler then defaults to the availability-gate backend so
+// the desktop feature is cleanly absent (decision 4), never broken.
+func (h *WorkspaceHandler) SetSidecarProvisioner(sp provisioner.SidecarProvisioner) {
+	h.sidecarProv = sp
+}
+
 // SetEnvMutators wires a provisionhook.Registry into the handler. Plugins
 // living in separate repos register on the same Registry instance during
 // boot (see cmd/server/main.go) and main.go calls this setter once before
@@ -344,8 +395,8 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 
 	id := uuid.New().String()
 	if h.IsSaaS() {
-		// SaaS hard gate: every hosted workspace gets its own sibling
-		// EC2 instance, so T4 is the only meaningful runtime boundary.
+		// Hosted-mode hard gate: provider-managed workspaces use the T4
+		// isolation contract, regardless of the configured compute provider.
 		// Do not trust stale clients/templates that still send T1/T2/T3.
 		payload.Tier = 4
 	} else if payload.Tier == 0 {
@@ -454,6 +505,22 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			// and unset/local falls back to the same literal, so no behavior change
 			// today; a later platform-default flip is a separate KMS edit.
 			payload.Runtime = bareCreateDefaultRuntime()
+			// SELF-HOST (2026-07-20 operator decision): a bare create should
+			// follow the ONBOARDING-SELECTED runtime — the platform root's own
+			// runtime (hermes on the current default) — not the SaaS literal.
+			// Same "follow the onboarding selection" doctrine as the model
+			// fallback. Templates that PIN a runtime are untouched
+			// (controlplane#188 fail-closed stands); this only shapes the
+			// no-template, no-runtime default. Gated on no CP proxy (self-host).
+			if !PlatformManagedProxyConfigured() {
+				var rootRuntime string
+				_ = db.DB.QueryRowContext(c.Request.Context(),
+					`SELECT COALESCE(runtime,'') FROM workspaces WHERE kind='platform' AND status != 'removed' LIMIT 1`,
+				).Scan(&rootRuntime)
+				if strings.TrimSpace(rootRuntime) != "" {
+					payload.Runtime = rootRuntime
+				}
+			}
 		}
 	}
 
@@ -513,8 +580,8 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	//
 	// Fail-closed at the Create boundary so the caller learns the
 	// contract immediately — same shape as the controlplane#188
-	// runtime-unresolved gate above. Caller fixes the request, no
-	// EC2 launched, no stuck workspace, no operator paging.
+	// runtime-unresolved gate above. Caller fixes the request, no provider
+	// compute launched, no stuck workspace, no operator paging.
 	isExternal := payload.External || isExternalLikeRuntime(payload.Runtime)
 	if payload.Model == "" && !isExternal {
 		log.Printf("Create: FAIL-CLOSED — model is required (runtime=%q template=%q); refusing the silent DefaultModel fallback per CTO 2026-05-22 SSOT directive", payload.Runtime, payload.Template)
@@ -680,6 +747,28 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// workspace when the org has no platform-agent — so tenants provisioned
 	// without a concierge (e.g. JRS's lone SEO Agent) nest new workspaces under
 	// that root instead of scattering them as bare-root siblings.
+	// Validate a CALLER-SUPPLIED parent_id before it reaches the INSERT. Only
+	// the explicit value is checked — the defaulted one below is server-derived
+	// from this same table. See validateCreateParentID for why creating under
+	// an arbitrary parent is a privilege grant (team:<parent> read+write,
+	// retroactively) and for the scope note on org-scoping.
+	if payload.ParentID != nil {
+		if err := validateCreateParentID(ctx, db.DB, c, *payload.ParentID); err != nil {
+			var rej *reparentError
+			if errors.As(err, &rej) {
+				resp := gin.H{"error": rej.Message, "code": rej.Code}
+				for k, v := range rej.Details {
+					resp[k] = v
+				}
+				c.JSON(rej.Status, resp)
+				return
+			}
+			log.Printf("Create workspace: parent_id validation error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate parent workspace"})
+			return
+		}
+	}
+
 	if payload.ParentID == nil {
 		if rootID := defaultCreateParentID(ctx); rootID != "" {
 			payload.ParentID = &rootID
@@ -843,6 +932,23 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create workspace"})
 		return
 	}
+
+	// Tamper-evident audit append. Placed immediately after the commit — the
+	// workspaces row is durable from here on, so this is the earliest point at
+	// which "a workspace was created" is a true statement, and every later
+	// return path (external 201, provisioned 201, provisioning failure) is
+	// covered by the one call. agent_id records WHICH credential authenticated
+	// the AdminAuth-gated call; without it a create is unattributable after the
+	// fact (see the 2026-07-23 client-tenant incident).
+	RecordAuditEvent(ctx, db.DB, auditEntryFromGin(c, id, AuditOpWorkspaceCreate, false, map[string]any{
+		"workspace_id":   id,
+		"workspace_name": payload.Name,
+		"parent_id":      payload.ParentID,
+		"runtime":        payload.Runtime,
+		"template":       payload.Template,
+		"tier":           payload.Tier,
+		"external":       payload.External,
+	}))
 
 	// Persist canvas-selected model as the MODEL workspace_secret so it
 	// survives restart and is picked up by CP user-data when regenerating
@@ -1086,6 +1192,242 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		}
 	}
 
+	// C2 ordering (scheduler-as-trigger-plugin RFC §8A P3): parse the
+	// template's schedules: block and declare the molecule-scheduler trigger
+	// plugin BEFORE the provision dispatch. provisionWorkspaceAuto spawns the
+	// provision goroutine that assembles MOLECULE_DECLARED_PLUGINS from
+	// workspace_declared_plugins (buildProvisionerConfig →
+	// desiredPluginSources), so the declare must land first or first boot races
+	// the declaration and could come up without the scheduler daemon until the
+	// next online reconcile. The parsed schedules also feed the config.yaml
+	// render below (single parse). Non-fatal: a broken schedules block or a
+	// declare hiccup must never block workspace creation.
+	var templateScheds []OrgSchedule
+	if templatePath != "" {
+		var schedParseErr error
+		templateScheds, schedParseErr = parseTemplateSchedules(templatePath)
+		if schedParseErr != nil {
+			// Non-fatal: skip schedule delivery for this create. templateScheds
+			// is confined to this block (post-P4b the legacy DB seed that used to
+			// consume it after the render is gone), so no explicit reset is
+			// needed — the render below is in the else arm and never runs here.
+			log.Printf("Create %s: parsing template schedules: %v (continuing)", id, schedParseErr)
+		} else if len(templateScheds) > 0 {
+			// P4b (issue #4411): render the template's RESOLVED schedules into
+			// the DELIVERED config.yaml so the runtime's boot/reload seeding
+			// (seed_schedules_from_workspace_config, molecule-ai-workspace-
+			// runtime#318) reconciles them onto the volume-authoritative grid —
+			// the SAME volume path #4444 wired for the ORG-IMPORT leg
+			// (org_import.go), now closing the direct-create asymmetry: a
+			// directly-created workspace whose template declares schedules used
+			// to get ONLY the legacy DB seed and NO schedules: block in its
+			// config.yaml, so its schedules never reached the volume grid and
+			// would vanish once the DB seed is retired.
+			//
+			// On the template path configFiles is nil and the delivered
+			// config.yaml is the template's on-disk copy (CopyTemplateToContainer
+			// / the collectCPConfigFiles TemplatePath walk). Read that copy as the
+			// BASE and hand a combined file to the provisioner via ConfigFiles so
+			// it OVERRIDES the template copy (Docker: WriteFilesToContainer runs
+			// AFTER CopyTemplateToContainer; CP: collectCPConfigFiles has the
+			// ConfigFiles map overwrite the TemplatePath-walked config.yaml).
+			//
+			// The template's config.yaml IS the schedule source: it carries a RAW
+			// authoring `schedules:` block (core's `cron_expr` alias, possibly
+			// `prompt_file` refs) that parseTemplateSchedules read above. That raw
+			// block must NOT ship to the runtime's config-seeding — the runtime
+			// wants the native `cron` key and inlined prompts, and appending the
+			// rendered block alongside the raw one would DUPLICATE the
+			// `schedules:` key (an unloadable config.yaml that bricks boot). So
+			// STRIP the raw block and append the RENDERED, runtime-native one in
+			// its place. Reuses renderTemplateSchedulesYAML + appendYAMLBlockChecked
+			// verbatim — same caps / name-contract / prompt-inlining / yaml-emitter
+			// round-trip guards as the org-import leg. Prompt refs resolve against
+			// templatePath (filesDir="") the same as the org-import render leg.
+			//
+			// This is now the ONLY schedule delivery path — the legacy core-DB
+			// seed was retired in P4b. Must run BEFORE provisionWorkspaceAuto,
+			// which captures configFiles for the provision goroutine. Byte-
+			// identical when the template renders no schedules (nothing is
+			// stripped or appended — configFiles stays nil, the template copy
+			// ships unchanged).
+			schedBlock, schedRendered, schedSkipped := renderTemplateSchedulesYAML(templateScheds, templatePath, "", payload.Name)
+			if schedBlock != "" {
+				if baseCfg, readErr := os.ReadFile(filepath.Join(templatePath, "config.yaml")); readErr != nil {
+					// parseTemplateSchedules already read this file above, so a
+					// read failure here is unexpected. Post-P4b there is NO legacy
+					// DB seed fallback, so these template schedules would be
+					// DROPPED for this workspace — log loudly rather than fail the
+					// create (the workspace still provisions; the schedules can be
+					// re-added). If this ever fires in practice, the config.yaml
+					// render should be made fail-closed instead.
+					log.Printf("Create %s: reading template config.yaml to append schedules failed: %v — template schedules DROPPED (no DB fallback post-P4b)", id, readErr)
+				} else if combined, appended := appendYAMLBlockChecked(stripTopLevelYAMLKey(baseCfg, "schedules"), schedBlock, "schedules", payload.Name); appended {
+					if configFiles == nil {
+						configFiles = map[string][]byte{}
+					}
+					configFiles["config.yaml"] = combined
+					log.Printf("Create %s: rendered %d schedule(s) into delivered config.yaml (skipped=%d of %d)", id, schedRendered, schedSkipped, len(templateScheds))
+				}
+			}
+			// C2 ordering (unchanged from #4444): declare molecule-scheduler
+			// BEFORE the provision dispatch so first boot installs the daemon
+			// (buildProvisionerConfig → desiredPluginSources reads
+			// workspace_declared_plugins at dispatch time).
+			if declErr := ensureSchedulerPluginDeclared(ctx, id); declErr != nil {
+				log.Printf("Create %s: pre-provision scheduler plugin declare failed (non-fatal): %v", id, declErr)
+			}
+		}
+	}
+
+	// Per-install plugin settings (RFC plugin-config). A template's `plugins:`
+	// entries may carry `config:`; render each one to
+	// plugin-settings/<install-name>.json in the DELIVERED bundle so the runtime
+	// resolves it over the plugin's declared defaults
+	// (molecule_runtime/plugin_settings.py, runtime#357).
+	//
+	// MUST run BEFORE provisionWorkspaceAuto — that dispatch captures configFiles
+	// for the provision goroutine, exactly like the schedules render above.
+	//
+	// Layers 2-5 only. Layer 1 (contributes.configuration.*.default) is NOT
+	// rendered here and cannot be: it lives in the plugin's manifest, which core
+	// does not hold at provision time because plugins install post-online via the
+	// reconcile — strictly AFTER this file ships. The runtime supplies it.
+	//
+	// Byte-identical when no template plugin declares `config:`:
+	// renderPluginSettingsFiles returns nil and configFiles is left untouched
+	// (mergePluginSettingsIntoConfigFiles does not allocate for an empty set).
+	//
+	// Non-fatal throughout — a broken plugins block must never block a create.
+	if templatePath != "" {
+		if baseCfg, readErr := os.ReadFile(filepath.Join(templatePath, "config.yaml")); readErr == nil {
+			if rendered, rErr := renderPluginSettingsFiles(baseCfg, payload.Name); rErr != nil {
+				log.Printf("Create %s: rendering plugin settings: %v (continuing)", id, rErr)
+			} else if updated, n := mergePluginSettingsIntoConfigFiles(configFiles, rendered); n > 0 {
+				configFiles = updated
+				log.Printf("Create %s: delivered plugin settings for %d plugin(s)", id, n)
+			}
+		}
+	}
+
+	// SaaS leg: on a fresh tenant the real template config arrives via the Gitea
+	// asset channel, not the local templatePath (which may be empty or fall back
+	// to <runtime>-default and miss the real template's `plugins:` entirely).
+	// Render from the SAME fetched bytes the declared-plugin seeding below uses,
+	// so settings and declarations cannot disagree about which plugins exist.
+	//
+	// On key collision the FETCHED render wins (mergePluginSettingsIntoConfigFiles
+	// overwrites), which is correct: on SaaS the fetched bytes ARE the real
+	// template, while templatePath may be a <runtime>-default fallback that never
+	// declared these plugins at all.
+	if h.giteaTemplateFetcher != nil && payload.Template != "" {
+		if identity := templateIdentityForTemplateOrRuntime(payload.Template, payload.Runtime); identity != "" {
+			if fetched, ferr := h.giteaTemplateFetcher.Load(ctx, identity); ferr != nil {
+				log.Printf("Create %s: fetch template assets for plugin settings: %v (continuing)", id, ferr)
+			} else if rendered, rErr := renderPluginSettingsFiles(fetched["config.yaml"], payload.Name); rErr != nil {
+				log.Printf("Create %s: rendering fetched plugin settings: %v (continuing)", id, rErr)
+			} else if updated, n := mergePluginSettingsIntoConfigFiles(configFiles, rendered); n > 0 {
+				configFiles = updated
+				log.Printf("Create %s: delivered plugin settings for %d plugin(s) from fetched template", id, n)
+			}
+		}
+	}
+
+	// Layer 6: record what the template supplied and overlay any operator
+	// override onto the bytes this workspace is about to receive. Without this
+	// the DB would remember an override while the freshly provisioned workspace
+	// quietly ran the template value — the edit would survive in storage and
+	// die on the box. Non-fatal; see applyPluginSettingsLayers.
+	if pluginSettingsLayersEnabled() && len(configFiles) > 0 && db.DB != nil {
+		if updated, n := applyPluginSettingsLayers(ctx, db.DB, id, configFiles); n > 0 {
+			configFiles = updated
+			log.Printf("Create %s: re-applied operator overrides to %d plugin settings file(s)", id, n)
+		}
+	}
+
+	// Payload-declared plugins (CreateWorkspacePayload.Plugins): the API-level
+	// equivalent of a template's `plugins:` block for callers that don't own a
+	// template (e.g. an e2e harness declaring a native plugin to exercise its
+	// boot-install). Seeded pre-dispatch, alongside the scheduler declare above,
+	// so the entries land in workspace_declared_plugins BEFORE provisionWorkspaceAuto
+	// captures the declared set: the provision goroutine's buildProvisionerConfig →
+	// desiredPluginSources reads workspace_declared_plugins at dispatch time, so a
+	// payload plugin is present in the FIRST-BOOT MOLECULE_DECLARED_PLUGINS rather
+	// than arriving only via the post-online reconcile → docker-cp → mid-lifecycle
+	// restart. Flows through the SAME seedTemplatePlugins → recordDeclaredPlugin
+	// chokepoint as the template blocks, so it inherits the idempotent ON CONFLICT
+	// upsert AND the privileged-plugin kind-gate (the concierge MCP can never be
+	// declared here on a non-platform workspace). Seeded unconditionally on
+	// len(payload.Plugins) > 0 — there is no provisionOK yet pre-dispatch, and a
+	// later provision failure tears down the workspace anyway. The maxTemplatePlugins
+	// count cap (payloadPluginsToSeed) mirrors parseTemplatePlugins so a hostile
+	// payload can't enqueue an unbounded declared set. Non-fatal: a bad entry never
+	// blocks provisioning.
+	if len(payload.Plugins) > 0 {
+		if declared, ok := payloadPluginsToSeed(payload.Plugins); !ok {
+			log.Printf("Create %s: payload declares more than the %d-plugin cap — skipping payload plugin seed", id, maxTemplatePlugins)
+		} else if len(declared) > 0 {
+			recorded, skipped := seedTemplatePlugins(ctx, id, declared)
+			log.Printf("Create %s: recorded %d/%d payload-declared plugins (skipped=%d)", id, recorded, len(declared), skipped)
+		}
+	}
+
+	// molecule-core#5035 — REQUIRED-ENV FAIL-FAST AT THE CREATE BOUNDARY.
+	//
+	// Empirical trigger (org reno-stars, 2026-08-02): the seo-agent template
+	// declares runtime_config.required_env: [TENANT_NAME, TENANT_DOMAIN,
+	// TENANT_DOMAIN_APEX, TENANT_DOMAIN_FULL, TENANT_TIMEZONE] and none were
+	// set for that org. Create logged at 21:36:11, the provision goroutine
+	// refused correctly at 21:36:15 — and the handler still answered 201
+	// Created at 21:36:17. The caller was handed a workspace id and a
+	// `provisioning` status for something the platform had ALREADY decided to
+	// refuse; it surfaced later only as status=failed with compute={}.
+	//
+	// This runs the SAME check (missingRequiredEnv, via
+	// createBoundaryMissingRequiredEnv) against the SAME config source the
+	// provision-time preflight uses, over the SAME secret env
+	// (loadWorkspaceSecrets) — no parallel validator, no new store. It runs
+	// here, at the end of config assembly, because this is the first point
+	// where the delivered config.yaml is final AND the payload's secrets are
+	// committed, and the last point before the async dispatch.
+	//
+	// Response shape matches the TEMPLATE_UNAVAILABLE gate above: the
+	// workspace row is already committed, so mark it failed (which also
+	// persists the reason to last_sample_error — the field this issue's read
+	// fix now surfaces) and return 422 naming the missing vars. No backend
+	// was picked, so there is nothing to deprovision.
+	//
+	// Fails OPEN on anything undecidable at this boundary — no readable
+	// config.yaml, a secret-load failure, a var a provision-time injector may
+	// supply (isProvisionInjectedEnv), or a self-host stack where
+	// applySelfHostTenantDefaults fills the TENANT_* vars itself. The
+	// provision-time preflight is unchanged and remains the backstop.
+	if reqEnv, _, _, secErr := loadWorkspaceSecrets(ctx, id); secErr == "" && reqEnv != nil {
+		if !PlatformManagedProxyConfigured() {
+			// Self-host: the provisioner generates branded TENANT_* placeholders
+			// rather than failing first boot (2026-07-19 operator decision), so
+			// mirror that here or the gate would 422 a create the provisioner
+			// would have happily completed.
+			applySelfHostTenantDefaults(reqEnv, createBoundaryMissingRequiredEnv(configFiles, templatePath, reqEnv))
+		}
+		if missing := createBoundaryMissingRequiredEnv(configFiles, templatePath, reqEnv); len(missing) > 0 {
+			msg := formatMissingEnvError(missing)
+			log.Printf("Create: 422 MISSING_REQUIRED_ENV (template=%q runtime=%q): %v [molecule-core#5035 create-boundary hard-reject]", payload.Template, payload.Runtime, missing)
+			h.markProvisionFailed(ctx, id, msg, map[string]interface{}{
+				"code":    "MISSING_REQUIRED_ENV",
+				"missing": missing,
+			})
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":    msg,
+				"missing":  missing,
+				"template": payload.Template,
+				"runtime":  payload.Runtime,
+				"code":     "MISSING_REQUIRED_ENV",
+			})
+			return
+		}
+	}
+
 	// Auto-provision — pick backend: control plane (SaaS) or Docker (self-hosted).
 	// Routing AND the no-backend mark-failed path are both inside
 	// provisionWorkspaceAuto (single source of truth). The Create-specific
@@ -1103,32 +1445,6 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			ON CONFLICT (workspace_id) DO UPDATE SET data = $2::jsonb
 		`, id, cfgJSON); err != nil {
 			log.Printf("Create: workspace_config persist failed for %s: %v", id, err)
-		}
-	}
-
-	// Seed schedules declared in the workspace template's config.yaml
-	// AFTER provisionWorkspaceAuto succeeds so the scheduler never
-	// fires cron rows against a workspace whose backend never wired
-	// (review feedback PR #1929#1). Async EC2 provisioning may still
-	// fail downstream; scheduler.go is expected to handle non-online
-	// status as a no-op tick. Idempotent across re-creates via
-	// orgImportScheduleSQL's ON CONFLICT clause; runtime-added rows
-	// are preserved (Issue #24 contract). Restart does not re-seed
-	// (so user-deleted template rows stay deleted).
-	//
-	// Non-fatal: a broken schedules: block must never block workspace
-	// provisioning — the workspace row is already live and the grid
-	// is recoverable via POST /workspaces/{id}/schedules.
-	if provisionOK && templatePath != "" {
-		if templateScheds, parseErr := parseTemplateSchedules(templatePath); parseErr != nil {
-			log.Printf("Create %s: parsing template schedules: %v (continuing)", id, parseErr)
-		} else if len(templateScheds) > 0 {
-			seeded, skipped := seedTemplateSchedules(ctx, id, templatePath, templateScheds)
-			if skipped > 0 {
-				log.Printf("Create %s: template schedule partial-seed: seeded=%d skipped=%d total=%d", id, seeded, skipped, len(templateScheds))
-			} else {
-				log.Printf("Create %s: seeded %d/%d template schedules", id, seeded, len(templateScheds))
-			}
 		}
 	}
 
@@ -1239,7 +1555,7 @@ func scanWorkspaceRow(rows interface {
 	Scan(dest ...interface{}) error
 }) (map[string]interface{}, error) {
 	var id, name, role, status, url, sampleError, currentTask, runtime, workspaceDir, kind string
-	var computeRaw, loadedMCPToolsRaw []byte
+	var computeRaw, loadedMCPToolsRaw, mcpSurfaceRaw []byte
 	var tier, activeTasks, maxConcurrentTasks, uptimeSeconds int
 	var errorRate, x, y float64
 	var collapsed, broadcastEnabled, talkToUserEnabled bool
@@ -1252,7 +1568,7 @@ func scanWorkspaceRow(rows interface {
 		&parentID, &activeTasks, &maxConcurrentTasks, &errorRate, &sampleError, &uptimeSeconds,
 		&currentTask, &runtime, &workspaceDir, &x, &y, &collapsed,
 		&budgetLimit, &monthlySpend, &broadcastEnabled, &talkToUserEnabled, &computeRaw, &kind,
-		&loadedMCPToolsRaw)
+		&loadedMCPToolsRaw, &mcpSurfaceRaw)
 	if err != nil {
 		return nil, err
 	}
@@ -1323,6 +1639,24 @@ func scanWorkspaceRow(rows interface {
 	}
 	ws["loaded_mcp_tools"] = loadedMCPTools
 
+	// core#5137: mcp_surface is the CONSUMER-side corroboration of the count
+	// above — how many of those reported ids sit in a namespace this workspace's
+	// model has actually been observed dispatching from (see
+	// registry.go's recordMCPSurfaceCorroboration). It is emitted NEXT TO
+	// loaded_mcp_tools, never in place of it: the raw list stays exactly as the
+	// runtime reported it so the claim remains auditable.
+	//
+	// null means "core has not evaluated this row yet" — NOT "no evidence
+	// available" and NOT "fine". Unlike loaded_mcp_tools this is deliberately
+	// NOT defaulted to an empty object: an empty object would read as a
+	// zero-count verdict, which is a claim, and a row core has never classified
+	// has made no claim.
+	if len(mcpSurfaceRaw) > 0 && string(mcpSurfaceRaw) != "null" {
+		ws["mcp_surface"] = json.RawMessage(mcpSurfaceRaw)
+	} else {
+		ws["mcp_surface"] = nil
+	}
+
 	return ws, nil
 }
 
@@ -1339,7 +1673,8 @@ const workspaceListQuery = `
 		   w.broadcast_enabled, w.talk_to_user_enabled,
 		   COALESCE(w.compute, '{}'::jsonb),
 		   COALESCE(w.kind, 'workspace'),
-		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb)
+		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb),
+		   COALESCE(w.mcp_surface::text, '')
 	FROM workspaces w
 	LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 	WHERE w.status != 'removed'
@@ -1349,8 +1684,8 @@ const workspaceListQuery = `
 func (h *WorkspaceHandler) List(c *gin.Context) {
 	rows, err := db.DB.QueryContext(c.Request.Context(), workspaceListQuery)
 	if err != nil {
-		log.Printf("List workspaces error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
+		log.Printf("List workspaces: database query failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list workspaces"})
 		return
 	}
 	defer rows.Close()
@@ -1359,8 +1694,11 @@ func (h *WorkspaceHandler) List(c *gin.Context) {
 	for rows.Next() {
 		ws, err := scanWorkspaceRow(rows)
 		if err != nil {
-			log.Printf("List scan error: %v", err)
-			continue
+			// A partial roster is indistinguishable from a complete roster to
+			// callers, so a single unreadable row invalidates the whole result.
+			log.Printf("List workspaces: database row scan failed")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list workspaces"})
+			return
 		}
 		// #2054 phase 2: surface per-runtime provision-timeout for
 		// canvas's ProvisioningTimeout banner. Decorating per-row
@@ -1369,11 +1707,47 @@ func (h *WorkspaceHandler) List(c *gin.Context) {
 		if rt, _ := ws["runtime"].(string); rt != "" {
 			h.addProvisionTimeoutMs(ws, rt)
 		}
+		// Boot-telemetry replay: BOOT_STEP broadcasts are ephemeral, so a
+		// canvas re-hydrate mid-boot used to reset the boot screen to
+		// "waiting for boot telemetry". Attach the observed history
+		// (events/boottrace.go) for rows still provisioning so the client
+		// restores keycaps + watchdog log across reloads/reconnects. The
+		// capability is reached via a narrow assertion on the injected
+		// emitter — NOT a package global — so the #1814 interface seam
+		// stays intact: test fakes simply don't have it and skip.
+		//
+		// Contract with the canvas (canvas.ts hydrate):
+		//   - `boot_steps` present + `boot_generation` present → authoritative
+		//     for THAT generation: same gen as the client holds → merge; a
+		//     different gen → the client resets to the replay (stale-boot
+		//     telemetry must not survive a reprovision), even when empty
+		//     (the WORKSPACE_PROVISIONING reset mints a fresh empty entry).
+		//   - `boot_steps` present WITHOUT a generation → this instance holds
+		//     no trace entry (restarted mid-boot / other instance) — the
+		//     client keeps its own richer local state.
+		//   - field absent → platform doesn't track boot history (old build /
+		//     fake emitter); the client keeps its own state.
+		if status, _ := ws["status"].(string); status == string(models.StatusProvisioning) {
+			if replayer, ok := h.broadcaster.(interface {
+				BootReplayFor(string) ([]events.BootStepRecord, string, bool)
+			}); ok {
+				if id, _ := ws["id"].(string); id != "" {
+					steps, gen, known := replayer.BootReplayFor(id)
+					if steps == nil {
+						steps = []events.BootStepRecord{}
+					}
+					ws["boot_steps"] = steps
+					if known && gen != "" {
+						ws["boot_generation"] = gen
+					}
+				}
+			}
+		}
 		workspaces = append(workspaces, ws)
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("List rows error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "query iteration failed"})
+		log.Printf("List workspaces: database row iteration failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list workspaces"})
 		return
 	}
 
@@ -1403,7 +1777,8 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 			   w.broadcast_enabled, w.talk_to_user_enabled,
 			   COALESCE(w.compute, '{}'::jsonb),
 		   COALESCE(w.kind, 'workspace'),
-		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb)
+		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb),
+		   COALESCE(w.mcp_surface::text, '')
 		FROM workspaces w
 		LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 		WHERE w.id = $1
@@ -1420,7 +1795,7 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 		return
 	}
 
-	// #2429: workspaces with status='removed' return 410 Gone (not 200)
+	// Workspaces with status='removed' return 410 Gone (not 200)
 	// so callers fail loudly at startup instead of after 60s of revoked-
 	// token heartbeats. The audit-trail consumers that need the body of
 	// a removed workspace opt in via ?include_removed=true.
@@ -1446,7 +1821,7 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 			body := gin.H{
 				"error": "workspace removed",
 				"id":    id,
-				"hint":  "Regenerate workspace + token from the canvas → Tokens tab",
+				"hint":  "Create a replacement workspace in Canvas, then open Settings → Workspace Tokens → + New Token",
 			}
 			if removedAt.IsZero() {
 				body["removed_at"] = nil
@@ -1460,11 +1835,27 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 
 	// Strip sensitive fields — GET /workspaces/:id is on the open router.
 	// Any caller with a valid UUID would otherwise read operational data.
+	//
+	// last_sample_error is NOT stripped (molecule-core#5035). It used to be,
+	// as "internal error details", and that strip is the whole reason a
+	// refused provision presented as a SILENT one: the platform records a
+	// precise, actionable reason in the column (markProvisionFailed persists
+	// the same abort message it broadcasts as WORKSPACE_PROVISION_FAILED),
+	// GET /workspaces already returns it, and this single-workspace read —
+	// the one canvas nodes and every operator poll actually hit — dropped it.
+	// Org reno-stars sat on a `failed` workspace with compute={} and no
+	// visible cause for weeks; the stored reason named the five unset
+	// TENANT_* vars and the exact place to set them.
+	//
+	// The strings are user-facing by construction: formatMissingEnvError /
+	// formatMissingModelError and friends are written to be rendered verbatim
+	// in the canvas Events tab and Details banner, and the same text is
+	// already published to clients on the WORKSPACE_PROVISION_FAILED event.
+	// The genuinely sensitive fields below stay stripped.
 	delete(ws, "budget_limit")
 	delete(ws, "monthly_spend")
-	delete(ws, "current_task")      // operational surveillance risk (#955)
-	delete(ws, "last_sample_error") // internal error details
-	delete(ws, "workspace_dir")     // host path disclosure
+	delete(ws, "current_task")  // operational surveillance risk (#955)
+	delete(ws, "workspace_dir") // host path disclosure
 
 	// #817: expose last_outbound_at so orchestrators can detect silent
 	// workspaces. Non-sensitive — just a timestamp of the most recent

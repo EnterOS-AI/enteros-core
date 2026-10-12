@@ -236,3 +236,30 @@ func TestPluginNameFromSource(t *testing.T) {
 		}
 	}
 }
+
+// ---- BoxFetchable ----
+
+// TestSource_BoxFetchable is the SSOT check for the box-fetchability predicate
+// that drives the reconcile restart-suppression: only host-side "local" is NOT
+// fetchable by the in-container boot materializer; every remote scheme is,
+// including unknown ones (fail toward the visible restart loop, never toward
+// silently suppressing a legitimate remote plugin's restart).
+func TestSource_BoxFetchable(t *testing.T) {
+	cases := []struct {
+		scheme string
+		want   bool
+	}{
+		{"local", false},  // host-side: LocalResolver reads the host plugins/ dir
+		{"github", true},  // remote pull
+		{"gitea", true},   // remote pull
+		{"presign", true}, // presigned URL pull
+		{"clawhub", true}, // registry pull
+		{"https", true},   // remote pull
+		{"someday", true}, // unknown → default fetchable (loop is visible, safer)
+	}
+	for _, c := range cases {
+		if got := (Source{Scheme: c.scheme, Spec: "x"}).BoxFetchable(); got != c.want {
+			t.Errorf("Source{Scheme:%q}.BoxFetchable() = %v, want %v", c.scheme, got, c.want)
+		}
+	}
+}

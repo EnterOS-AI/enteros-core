@@ -1,5 +1,10 @@
 # Wildcard DNS + Cloudflare Worker Proxy
 
+> **Historical design.** The per-tenant EC2, Railway, and Worker routing model
+> below predates the June 2026 domain-only rebuild and is not a current DNS or
+> incident runbook. See [Workspace Placement](workspace-placement.md) and the
+> internal incident handbook for the deployed access model.
+
 > **Status:** Planned — replaces per-tenant DNS record creation.
 >
 > **Problem:** When a user creates an org, we create an EC2 instance and a

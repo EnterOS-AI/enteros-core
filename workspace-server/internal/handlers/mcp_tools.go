@@ -13,9 +13,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/a2aresp"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
 	"github.com/google/uuid"
 )
@@ -45,7 +45,133 @@ func insertMCPDelegationRow(ctx context.Context, db *sql.DB, workspaceID, target
 
 // updateMCPDelegationStatus updates a delegation activity row's status.
 // Mirrors updateDelegationStatus (delegation.go) for the MCP tool path.
-func updateMCPDelegationStatus(ctx context.Context, db *sql.DB, workspaceID, delegationID, status, errorDetail string) {
+// ledgerStatusForMCP maps the MCP path's activity_logs status onto the delegations
+// vocabulary. They are NOT the same vocabulary, and mirroring naively is a trap:
+//
+//	MCP writes          delegations means
+//	----------          -----------------
+//	queued          ->  queued        (created, not yet dispatched)
+//	dispatched      ->  completed     (!) the SYNC route is synchronous: the proxy
+//	                                  RETURNED the target's answer and the tool hands
+//	                                  it straight back to the agent. The delegation is
+//	                                  DONE. Mirroring this as `dispatched` would leave
+//	                                  the row in-flight forever, and the sweeper would
+//	                                  deadline-fail a delegation that SUCCEEDED — the
+//	                                  exact #4314 lie, at scale, on every sync delegate.
+//	delivered       ->  in_progress   the ASYNC route: the target accepted the task and
+//	                                  is working. Not done. `delivered` is not even in
+//	                                  the delegations CHECK constraint.
+//	failed          ->  failed
+//
+// This is the whole reason the mapping is explicit and in one place rather than a
+// pass-through: two vocabularies that overlap in spelling and differ in meaning is
+// precisely what produced #4314.
+// asyncMCPCompletionWired is the #4338 INTERLOCK, and it is the single thing that
+// unlocks the Phase-2 flag flip.
+//
+// FALSE meant: no code path moved an async MCP delegation from `in_progress` to
+// `completed`. The target did the work, answered, and the ledger row never heard about
+// it — so the sweeper deadline-failed it at 6h and told the caller a delegation that
+// SUCCEEDED had failed. WarnOnPartialDelegationRollout reads this constant at boot and
+// REFUSES TO START if DELEGATION_LEDGER_WRITE is on while it is false, which is what
+// made "do not flip the flag yet" enforceable instead of a comment somebody has to
+// remember to read.
+//
+// IT IS NOW TRUE, because #4338 landed:
+//
+//   - completeAsyncMCPDelegation (mcp_async_completion.go) terminalizes the successful
+//     async delegation AND pushes the caller's single delegate_result carrying the
+//     answer;
+//   - asyncMCPAnswer decides whether a 2xx is an ANSWER at all, so the platform's
+//     synthetic `queued` acks (poll-mode, boot-turn, busy/settling) do NOT terminalize
+//     anything and keep the previous `delivered` -> in_progress behaviour;
+//   - the FAILURE half (failAsyncMCPDelegation, core#4316) is untouched and still
+//     terminalizes-and-notifies. #4338's scope note is explicit that closing it by
+//     wiring only the completion path would leave the failure path silent. Both halves
+//     are wired; neither may be removed without putting this constant back to false.
+//
+// Covered by TestIntegration_AsyncMCPCompletion_* and, as the negative control,
+// TestIntegration_AsyncMCPTargetNeverAnswers_DeadlineFailsAndNotifiesOnce — a target
+// that never answers must still deadline-fail and notify exactly once, or this
+// constant is lying about what was built.
+//
+// FLIPPING THIS DOES NOT ENABLE ANYTHING. It removes the boot refusal; the ledger and
+// the inbox push remain gated on their own flags, both still off everywhere. Enabling
+// them is a separate, deliberate step with its own canary.
+const asyncMCPCompletionWired = true
+
+// mcpDelegationRoute — WHICH TOOL is speaking. The map below MUST key on this and
+// not on the activity_logs string alone, because the two routes SHARE that string
+// and mean different things by it.
+//
+// `dispatched` is the trap. On the SYNC route it means "the proxy returned the
+// target's answer and we handed it to the agent" — done. On the ASYNC route the
+// natural reading is "we sent it to the target" — very much NOT done. The first cut
+// keyed on the string, so `dispatched` mapped to `completed` unconditionally. That
+// was correct only by the accident that no async code path writes `dispatched`
+// TODAY. The moment anyone adds one — the most natural edit in the world — every
+// async delegation would instantly terminalize as `completed` with an EMPTY answer,
+// drop out of awaiting-reply, and fire "Delegation completed" at the caller before
+// the target had done anything. Keyed on the route, that edit is simply correct.
+type mcpDelegationRoute int
+
+const (
+	// mcpSyncRoute — delegate_task. The tool BLOCKS; the agent gets the answer (or
+	// the error) as the tool's return value. It has already been told.
+	mcpSyncRoute mcpDelegationRoute = iota
+	// mcpAsyncRoute — delegate_task_async. The tool returns a task_id immediately and
+	// the agent moves on. It is NOT blocking, so the ONLY way it ever learns the
+	// outcome is an inbox reply. Nothing on this path may terminalize in silence.
+	mcpAsyncRoute
+)
+
+func ledgerStatusForMCP(route mcpDelegationRoute, mcpStatus string) (string, bool) {
+	switch mcpStatus {
+	case "queued":
+		return "queued", true
+	case "dispatched":
+		if route == mcpSyncRoute {
+			// The blocking tool already returned the answer to the agent. DONE.
+			return "completed", true
+		}
+		// Async: "we dispatched it" is not an answer. The target still owes one.
+		return "in_progress", true
+	case "delivered":
+		return "in_progress", true // async: target accepted, still working
+	case "completed":
+		// #4338. The ONLY status either route writes that means "the target answered
+		// and we are holding the answer". On the async route it is written by
+		// completeAsyncMCPDelegation and ONLY after asyncMCPAnswer has proved the
+		// response is a final answer rather than one of the platform's synthetic
+		// `queued` acks — so unlike `dispatched`, this word means the same thing on
+		// both routes and needs no route split.
+		return "completed", true
+	case "failed":
+		return "failed", true
+	}
+	return "", false
+}
+
+func updateMCPDelegationStatus(ctx context.Context, db *sql.DB, route mcpDelegationRoute,
+	workspaceID, delegationID, status, errorDetail string,
+) ReplyAuthority {
+	return updateMCPDelegationStatusWithResult(ctx, db, route, workspaceID, delegationID,
+		status, errorDetail, "")
+}
+
+// updateMCPDelegationStatusWithResult is updateMCPDelegationStatus plus the target's
+// ANSWER (#4338). Only the async completion path passes a non-empty resultPreview;
+// every other call site funnels through the wrapper above with "", so the statement
+// below — and the strict-sqlmock expectations pinned to it — are unchanged.
+//
+// The preview matters beyond decoration: `delegations.result_preview` is what the
+// operator dashboard and the digest show for a finished delegation, and the ledger's
+// same-status replay arm can only backfill a detail column it was actually given. A
+// completion that terminalizes without its result produces a row recording THAT a
+// delegation ended and never WHAT it returned.
+func updateMCPDelegationStatusWithResult(ctx context.Context, db *sql.DB, route mcpDelegationRoute,
+	workspaceID, delegationID, status, errorDetail, resultPreview string,
+) ReplyAuthority {
 	if _, err := db.ExecContext(ctx, `
 		UPDATE activity_logs
 		SET status = $1, error_detail = CASE WHEN $2 = '' THEN error_detail ELSE $2 END
@@ -54,6 +180,65 @@ func updateMCPDelegationStatus(ctx context.Context, db *sql.DB, workspaceID, del
 		  AND request_body->>'delegation_id' = $4
 	`, status, errorDetail, workspaceID, delegationID); err != nil {
 		log.Printf("MCP Delegation %s: status update failed: %v", delegationID, err)
+	}
+
+	// #4338: persist the answer so check_task_status — the async agent's own polling
+	// route, which reads activity_logs.response_body — does not report `completed`
+	// with nothing in it.
+	if resultPreview != "" {
+		recordAsyncMCPResultBody(ctx, db, workspaceID, delegationID, resultPreview)
+	}
+
+	// ...AND MIRROR TO THE LEDGER.
+	//
+	// This function wrote activity_logs ONLY. Adding the ledger INSERT to the MCP
+	// routes without this would have been WORSE THAN NOT INSERTING AT ALL: the rows
+	// would be created and never terminalize, so the sweeper would deadline-fail every
+	// MCP delegation at 6h and fire "Delegation failed" at callers whose delegations
+	// had SUCCEEDED. That is the very incident this change set exists to prevent.
+	//
+	// Gated by recordLedgerStatus, so it stays a no-op while the ledger is dark.
+	if ledgerStatus, ok := ledgerStatusForMCP(route, status); ok {
+		return recordLedgerStatus(ctx, delegationID, ledgerStatus, errorDetail, resultPreview)
+	}
+	// A status the ledger does not model — it was never consulted, so it cannot have
+	// arbitrated. Never ReplyNotMine: that would VETO a reply the ledger has no
+	// opinion about. See ReplyAuthority.
+	return ReplyUnarbitrated
+}
+
+// failAsyncMCPDelegation terminalizes a failed async MCP delegation AND TELLS THE
+// CALLER. Both halves, always, in one place — because doing only the first half is a
+// silent death and doing only the second is a lie.
+//
+// THE ASYNC CALLER IS NOT BLOCKING. delegate_task_async handed the agent a task_id
+// and returned; the agent went off and did other things. When the detached goroutine
+// below fails — the target is offline, the proxy 5xx's, the A2A body won't marshal —
+// the delegation moves queued -> failed, which is TERMINAL. It drops out of the
+// awaiting-reply count, so the digest stops showing it. And nothing was ever sent to
+// the caller. The agent asked a peer to do something, the request died, and the
+// platform told it nothing, forever.
+//
+// That is #4314 verbatim, on the newest code in this change set: a terminal
+// transition that owes exactly one caller reply and emits none. Review caught it
+// against a real database (delegations.status='failed', inbox delegate_result rows=0).
+//
+// NOTE this is NOT the gap #4338 tracks. #4338 is the missing COMPLETION writer — the
+// happy path that never leaves `in_progress`. This is the FAILURE path, which
+// terminalizes promptly and correctly and says nothing. Opposite direction, and it
+// must not be closed by wiring only the completion side.
+//
+// Reply gated on mayReply(): the ledger decides who owns the single notification, and
+// when it cannot decide (dark, or no row) nobody else will speak, so we do.
+func failAsyncMCPDelegation(ctx context.Context, db *sql.DB, callerID, targetID, delegationID, errorDetail string) {
+	authority := updateMCPDelegationStatus(ctx, db, mcpAsyncRoute,
+		callerID, delegationID, "failed", errorDetail)
+	if !mayReply(authority) {
+		return
+	}
+	if emitTerminalDelegationReply(ctx, callerID, targetID, delegationID, "failed", errorDetail) {
+		log.Printf("MCP delegate_task_async %s: terminal reply to caller FAILED — the "+
+			"caller will never learn this delegation died", delegationID)
 	}
 }
 
@@ -242,6 +427,18 @@ func (h *MCPHandler) toolDelegateTask(ctx context.Context, callerID string, args
 		log.Printf("MCP delegate_task: failed to record delegation row: %v", err)
 		// Non-fatal: still make the A2A call even if activity log write fails.
 	}
+	// ...AND THE LEDGER. insertMCPDelegationRow writes activity_logs ONLY.
+	//
+	// delegate_task / delegate_task_async are the PRIMARY agent-facing delegation
+	// routes — this is how agents actually delegate — and they created no `delegations`
+	// row at all. So when DELEGATION_LEDGER_WRITE flips on, the idle digest, the
+	// sweeper and the operator dashboard would every one of them be blind to the main
+	// path: "you have {n} sent awaiting a reply" would read zero while the agent sat
+	// waiting, and a wedged MCP delegation could never be swept, because there was
+	// nothing to sweep. #4314 in the one place it matters most.
+	//
+	// Gated by recordLedgerInsert, so this stays a no-op while the ledger is dark.
+	recordLedgerInsert(ctx, callerID, targetID, delegationID, task, "")
 
 	attachments, _ := parseAgentMessageAttachments(args["attachments"])
 
@@ -266,18 +463,23 @@ func (h *MCPHandler) toolDelegateTask(ctx context.Context, callerID string, args
 
 	status, body, err := h.proxyA2ARequest(reqCtx, targetID, a2aBody, callerID, true)
 	if err != nil {
-		updateMCPDelegationStatus(ctx, h.database, callerID, delegationID, "failed", err.Error())
+		updateMCPDelegationStatus(ctx, h.database, mcpSyncRoute, callerID, delegationID, "failed", err.Error())
 		return "", fmt.Errorf("A2A proxy failed: %w", err)
 	}
 	if status < 200 || status >= 300 {
-		updateMCPDelegationStatus(ctx, h.database, callerID, delegationID, "failed", fmt.Sprintf("A2A proxy returned status %d", status))
+		updateMCPDelegationStatus(ctx, h.database, mcpSyncRoute, callerID, delegationID, "failed", fmt.Sprintf("A2A proxy returned status %d", status))
 		return "", fmt.Errorf("A2A proxy returned status %d", status)
 	}
 	if msg := extractA2AErrorMessage(body); msg != "" {
-		updateMCPDelegationStatus(ctx, h.database, callerID, delegationID, "failed", msg)
+		updateMCPDelegationStatus(ctx, h.database, mcpSyncRoute, callerID, delegationID, "failed", msg)
 		return "", fmt.Errorf("A2A delegation failed: %s", msg)
 	}
-	updateMCPDelegationStatus(ctx, h.database, callerID, delegationID, "dispatched", "")
+	// NO INBOX REPLY ON THE SYNC ROUTE — not on success, and not on any of the three
+	// failure arms above. delegate_task BLOCKS: the agent receives the answer, or the
+	// error, as this tool's return value. Pushing a delegate_result as well would be a
+	// DUPLICATE — the caller told twice about one delegation, which is the other half
+	// of the single-reply rule. The authority is deliberately discarded here.
+	updateMCPDelegationStatus(ctx, h.database, mcpSyncRoute, callerID, delegationID, "dispatched", "")
 
 	return extractA2AText(body), nil
 }
@@ -309,8 +511,16 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 		log.Printf("MCP delegate_task_async: failed to record delegation row: %v", err)
 		// Non-fatal: still fire the A2A call.
 	} else {
-		updateMCPDelegationStatus(ctx, h.database, callerID, delegationID, "queued", "")
+		updateMCPDelegationStatus(ctx, h.database, mcpAsyncRoute, callerID, delegationID, "queued", "")
 	}
+	// ...AND THE LEDGER — see toolDelegateTask. The async route needs it even more: its
+	// whole point is that the caller does NOT block on the answer, so the ledger row is
+	// the only thing that can later tell the caller it is still waiting, or that the
+	// target went silent. With no row, an async delegation that dies is invisible
+	// forever — which is #4314 on the route agents actually use.
+	//
+	// Gated by recordLedgerInsert, so it stays a no-op while the ledger is dark.
+	recordLedgerInsert(ctx, callerID, targetID, delegationID, task, "")
 
 	// Fire and forget in a detached goroutine. Use a background context so
 	// the call is not cancelled when the HTTP request completes.
@@ -339,7 +549,8 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 			log.Printf("toolDelegateTask %s: json.Marshal a2aBody failed: %v", delegationID, marshalErr)
 			// Bail out: proceeding would call proxyA2ARequest with a
 			// nil/empty body, dispatching a malformed A2A request.
-			updateMCPDelegationStatus(bgCtx, h.database, callerID, delegationID, "failed", fmt.Sprintf("marshal_error: %v", marshalErr))
+			failAsyncMCPDelegation(bgCtx, h.database, callerID, targetID, delegationID,
+				fmt.Sprintf("marshal_error: %v", marshalErr))
 			return
 		}
 
@@ -353,15 +564,40 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 				log.Printf("MCPHandler.delegate_task_async: A2A proxy to %s returned status %d", targetID, status)
 				errorDetail = fmt.Sprintf("http_status: %d", status)
 			}
-			updateMCPDelegationStatus(bgCtx, h.database, callerID, delegationID, "failed", errorDetail)
+			failAsyncMCPDelegation(bgCtx, h.database, callerID, targetID, delegationID, errorDetail)
 			return
 		}
 		if msg := extractA2AErrorMessage(respBody); msg != "" {
-			updateMCPDelegationStatus(bgCtx, h.database, callerID, delegationID, "failed", msg)
+			failAsyncMCPDelegation(bgCtx, h.database, callerID, targetID, delegationID, msg)
 			return
 		}
 
-		updateMCPDelegationStatus(bgCtx, h.database, callerID, delegationID, "delivered", "")
+		// #4338 — THE COMPLETION WRITER. This used to be an unconditional `delivered`
+		// write, and it was the LAST status any code wrote for an async MCP delegation:
+		// `delivered` mirrors to the ledger as `in_progress`, and nothing moved it on.
+		// With DELEGATION_LEDGER_WRITE on, every async delegation would then sit at
+		// in_progress until its 6h deadline and be deadline-FAILED by the sweeper —
+		// including the ones whose target had answered an hour in.
+		//
+		// The answer is already in hand: A2A message/send is a request/response RPC, so
+		// respBody is the same body the SYNC route hands straight back to its caller.
+		// What was missing was reporting it against the delegation_id.
+		//
+		// BUT A 2xx IS NOT ALWAYS AN ANSWER. proxyA2ARequest mints synthetic `queued`
+		// acks — poll-mode targets, a platform boot turn in flight, a busy/settling
+		// target whose message was enqueued for drain — and in every one of those the
+		// target has not read the message yet. Terminalizing an ack would fire
+		// "Delegation completed" with an EMPTY result before the work started, which is
+		// the same false notification this issue exists to prevent, pointed the other
+		// way. asyncMCPAnswer is the gate; when it says no we fall through to exactly
+		// the previous `delivered` behaviour and the delegation stays visible as
+		// awaiting-reply until the drain, the agent's own status POST, or the sweeper
+		// resolves it.
+		if answer, ok := asyncMCPAnswer(respBody); ok {
+			completeAsyncMCPDelegation(bgCtx, h.database, callerID, targetID, delegationID, answer)
+			return
+		}
+		updateMCPDelegationStatus(bgCtx, h.database, mcpAsyncRoute, callerID, delegationID, "delivered", "")
 	})
 
 	return fmt.Sprintf(`{"task_id":%q,"status":"queued","target_id":%q}`, delegationID, targetID), nil
@@ -425,9 +661,13 @@ func (h *MCPHandler) toolSendMessageToUser(ctx context.Context, workspaceID stri
 		return "", fmt.Errorf("message is required")
 	}
 
-	// Check send_message_to_user is enabled (C3).
-	if os.Getenv("MOLECULE_MCP_ALLOW_SEND_MESSAGE") != "true" {
-		return "", fmt.Errorf("send_message_to_user is not enabled on this MCP bridge (set MOLECULE_MCP_ALLOW_SEND_MESSAGE=true)")
+	// C3 posture. Enabled by default (core#5047); mcpSendMessageEnabled is the
+	// SINGLE read site shared with the tools/list filter so a caller can never
+	// see the tool listed and then be refused here (or vice versa). Only an
+	// operator kill-switch (MOLECULE_MCP_ALLOW_SEND_MESSAGE=0|false|no|off)
+	// reaches this branch.
+	if !mcpSendMessageEnabled() {
+		return "", fmt.Errorf("send_message_to_user is disabled on this MCP bridge (operator set MOLECULE_MCP_ALLOW_SEND_MESSAGE to a falsy value)")
 	}
 
 	// Single source of truth for chat-bearing agent → user messages —
@@ -452,9 +692,9 @@ func (h *MCPHandler) toolSendMessageToUser(ctx context.Context, workspaceID stri
 
 // toolRequestUserAction implements request_user_action — the agent raises a
 // tracked ask for the human user (it appears in the concierge Tasks list).
-// Mirrors the user_tasks REST Create handler. Unlike send_message_to_user it
-// is not gated behind MOLECULE_MCP_ALLOW_SEND_MESSAGE — raising an ask is
-// always allowed.
+// Mirrors the user_tasks REST Create handler. It carries no kill-switch of
+// its own — raising an ask is always allowed, even where an operator has
+// disabled send_message_to_user via MOLECULE_MCP_ALLOW_SEND_MESSAGE.
 func (h *MCPHandler) toolRequestUserAction(ctx context.Context, workspaceID string, args map[string]interface{}) (string, error) {
 	title, _ := args["title"].(string)
 	if title == "" {
@@ -630,56 +870,41 @@ func (h *MCPHandler) toolRecallMemory(ctx context.Context, workspaceID string, a
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// extractA2AText extracts human-readable text from an A2A JSON-RPC response body.
-// Falls back to the raw JSON when no text part can be found.
+// extractA2AText extracts human-readable text from an A2A JSON-RPC response
+// body via the a2aresp SSOT (internal/a2aresp owns the full shape matrix —
+// bare parts, nested message, task status.message, and artifacts). This call
+// site keeps only its legacy contract on top: A2A errors surface as
+// "[error] <msg>", and a response with NO extractable text falls back to the
+// raw result JSON so check_task_status shows something rather than empty
+// (greetingTextFromReply rejects that "{"-prefixed fallback and degrades to
+// the static greeting).
 func extractA2AText(body []byte) string {
+	if msg := a2aresp.ErrorMessage(body); msg != "" {
+		return "[error] " + msg
+	}
+	if text := a2aresp.Text(body); text != "" {
+		return text
+	}
+	// No text part — preserve the raw-JSON diagnostic fallback.
 	var resp map[string]interface{}
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return string(body)
 	}
-
-	// Propagate A2A errors.
-	if errObj, ok := resp["error"].(map[string]interface{}); ok {
-		if msg, ok := errObj["message"].(string); ok {
-			return "[error] " + msg
+	// Only marshal an OBJECT result. A scalar/array/null result (e.g.
+	// {"result":42} or {"result":[1,2]}) would marshal to "42"/"[1,2]" — a
+	// fragment greetingTextFromReply does NOT reject (it only rejects a "{" or
+	// "[{" prefix), so a malformed scalar could ship as the greeting. Falling
+	// back to the whole envelope string(body) is always "{"-prefixed and thus
+	// rejected, degrading safely to the static greeting.
+	if result, ok := resp["result"].(map[string]interface{}); ok {
+		b, err := json.Marshal(result)
+		if err != nil {
+			log.Printf("extractA2AText: json.Marshal result failed: %v", err)
+			return string(body)
 		}
+		return string(b)
 	}
-
-	result, ok := resp["result"].(map[string]interface{})
-	if !ok {
-		return string(body)
-	}
-
-	// Format 1: result.artifacts[0].parts[0].text
-	if artifacts, ok := result["artifacts"].([]interface{}); ok && len(artifacts) > 0 {
-		if art, ok := artifacts[0].(map[string]interface{}); ok {
-			if parts, ok := art["parts"].([]interface{}); ok && len(parts) > 0 {
-				if part, ok := parts[0].(map[string]interface{}); ok {
-					if text, ok := part["text"].(string); ok && text != "" {
-						return text
-					}
-				}
-			}
-		}
-	}
-
-	// Format 2: result.message.parts[0].text
-	if msg, ok := result["message"].(map[string]interface{}); ok {
-		if parts, ok := msg["parts"].([]interface{}); ok && len(parts) > 0 {
-			if part, ok := parts[0].(map[string]interface{}); ok {
-				if text, ok := part["text"].(string); ok && text != "" {
-					return text
-				}
-			}
-		}
-	}
-
-	// Fallback: marshal result as JSON.
-	b, marshalErr := json.Marshal(result)
-	if marshalErr != nil {
-		log.Printf("extractA2AText: json.Marshal result failed: %v", marshalErr)
-	}
-	return string(b)
+	return string(body)
 }
 
 func extractA2AErrorMessage(body []byte) string {

@@ -236,7 +236,7 @@ export function DetailsTab({ workspaceId, data }: Props) {
 
       {/* Error details — shown when the workspace failed to boot. The
           control plane's bootstrap watcher writes last_sample_error with
-          the real traceback from the EC2 serial console, so users see
+          the real traceback from the provider boot log, so users see
           "ModuleNotFoundError: ..." instead of a generic timeout. */}
       {(data.status === "failed" || (data.status === "degraded" && data.lastSampleError)) && (
         <Section title="Error">

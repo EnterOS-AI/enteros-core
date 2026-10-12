@@ -8,10 +8,8 @@ import { getTenantSlug } from "./tenant";
 export const PLATFORM_URL =
   process.env.NEXT_PUBLIC_PLATFORM_URL ?? "http://localhost:8080";
 
-// 35s is long enough for the slowest server-side path (EIC SSH
-// tunnel for tenant EC2 file operations, bounded server-side by
-// `eicFileOpTimeout = 30 * time.Second` in
-// workspace-server/internal/handlers/template_files_eic.go) so the
+// 35s is long enough for the slowest server-side path, including the
+// bounded legacy remote-host file-operation fallback, so the
 // canvas surfaces the server's real error instead of aborting first
 // with a generic timeout. Shorter values caused "Save & Restart" to
 // time out at the client before the backend returned its 5xx. The
@@ -27,20 +25,35 @@ export interface RequestOptions {
 }
 
 /**
+ * Error thrown by `request()` on a non-ok HTTP response. Carries the raw
+ * signals a caller-side classifier needs without re-parsing the message:
+ *  - `status`   — the HTTP status code
+ *  - `bodyText` — the raw (possibly empty) response body
+ *  - `retryAfter` — the origin's `Retry-After` header, or null
+ * `workspaceCreateRetry.ts` classifies the cold-origin 503 window off these.
+ */
+export type ApiError = Error & {
+  status?: number;
+  bodyText?: string;
+  retryAfter?: string | null;
+};
+
+/**
  * Build the platform auth header set used by every authenticated fetch
  * from the canvas. Returns a fresh object so callers can mutate (e.g.
  * append `Content-Type` for JSON requests, omit it for FormData).
  *
  * SaaS cross-origin shape:
  *  - `X-Molecule-Org-Slug` — derived from `window.location.hostname`
- *    by `getTenantSlug()`. Control plane uses it for fly-replay
+ *    by `getTenantSlug()`. The platform uses it to validate tenant
  *    routing. Empty on localhost / non-tenant hosts — safe to omit.
- *  - `Authorization: Bearer <token>` — `NEXT_PUBLIC_ADMIN_TOKEN` baked
- *    into the canvas build (see canvas/Dockerfile L8/L11). Required by
- *    the workspace-server when `ADMIN_TOKEN` is set on the server side
- *    (Tier-2b AdminAuth gate, wsauth_middleware.go ~L245). Empty when
- *    no admin token was provisioned — the Tier-1 session-cookie path
- *    handles that case via `credentials:"include"`.
+ *  - `Authorization: Bearer <token>` — optional local-development and
+ *    ephemeral-E2E compatibility path. `scripts/dev-start.sh` supplies a
+ *    matching `ADMIN_TOKEN` / `NEXT_PUBLIC_ADMIN_TOKEN` pair. Production
+ *    SaaS builds leave this public value empty and authenticate browser
+ *    requests with the verified control-plane session cookie carried by
+ *    `credentials:"include"`; never bake a tenant admin secret into the
+ *    public Canvas bundle.
  *
  * Why a shared helper: the two-line "read env, attach bearer; read
  * slug, attach header" pattern was duplicated across `request()` and
@@ -167,11 +180,19 @@ async function request<T>(
         if (err instanceof PlatformUnavailableError) throw err;
       }
     }
-    const apiErr = new Error(`API ${method} ${path}: ${res.status} ${text}`);
+    const apiErr = new Error(`API ${method} ${path}: ${res.status} ${text}`) as ApiError;
     // Attach the HTTP status so callers can branch without parsing the
     // message (e.g. useChatSend treats a Cloudflare 524/522/504 on a held
     // long A2A turn as "still processing", not "agent unreachable").
-    (apiErr as Error & { status?: number }).status = res.status;
+    apiErr.status = res.status;
+    // Attach the raw response body and Retry-After so the cold-origin
+    // create-retry classifier (workspaceCreateRetry.ts) can decide on the
+    // SAME raw signals as the E2E's tests/e2e/lib/workspace_create_retry.sh:
+    // emptiness of the body is the "never reached a handler" signal, and the
+    // origin's Retry-After bounds the backoff. `headers` is optional-chained
+    // so error mocks without a Headers object don't throw here.
+    apiErr.bodyText = text;
+    apiErr.retryAfter = res.headers?.get?.("Retry-After") ?? null;
     throw apiErr;
   }
   return res.json();

@@ -4,7 +4,7 @@
 **Date:** 2026-07-07
 **Tracking:** [#3496](https://git.moleculesai.app/molecule-ai/molecule-core/issues/3496)
 **Design SSOT:** [`docs/design/rfc-selfhost-onboarding-scene.md`](../design/rfc-selfhost-onboarding-scene.md)
-**Related:** [`rfc-platform-agent.md`](../design/rfc-platform-agent.md) (addendum), [ADR-002](ADR-002-local-build-mode-via-registry-presence.md) (zero-config OSS onboarding — this decision completes that story for the concierge)
+**Related:** [`rfc-platform-agent.md`](../design/rfc-platform-agent.md) (addendum), [ADR-002](archive/ADR-002-local-build-mode-via-registry-presence.md) (zero-config OSS onboarding — this decision completes that story for the concierge)
 
 ## Context
 

@@ -1,5 +1,10 @@
 # MeDo Smoke Test Log — 2026-04-13 (Run 4)
 
+> **Historical smoke-test record.** This log predates the standalone workspace
+> runtime/template repositories and the current authenticated A2A path. Its
+> image names, source paths, operator steps, and open-issue list are evidence
+> from that run, not current build or operations guidance.
+
 **Tester:** PM (direct execution)  
 **Goal:** Install Miaoda App Builder skill → build "Hello Molecule AI" landing page → publish → URL.  
 **Credits spent:** 0 across all four runs.

@@ -3,8 +3,9 @@ name: redeploy-tenants-on-staging
 # MANUAL rollback / pin path for the local-docker STAGING tenant fleet.
 #
 # SUPERSEDED FOR THE AUTO PATH by staging-tenant-cd.yml (2026-07-04): the gated
-# CD pipeline (await-image -> e2e-smoke HARD GATE -> advance-pin ->
-# redeploy-fleet) now owns the automatic staging fleet roll on a staging push.
+# CD pipeline (await immutable image -> advance pin -> roll fleet -> live E2E
+# hard gate, with rollback on failure) owns the automatic main-driven staging
+# fleet roll.
 # Leaving this workflow ALSO auto-triggering on staging push would roll the fleet
 # a SECOND time, UNGATED, racing the gated pipeline — so the `push:` trigger was
 # removed. This file is retained as the operator's hand-run rollback / pin path
@@ -20,13 +21,13 @@ name: redeploy-tenants-on-staging
 # volume is intact after the roll).
 #
 # Rollback / pin: set the repo/org var STAGING_REDEPLOY_TARGET_TAG to a
-# known-good tag (e.g. staging-<sha>) and run via workflow_dispatch, OR pass the
-# `image_tag` dispatch input; unset the var afterward.
+# known-good tag (e.g. staging-<sha>) and run via workflow_dispatch; unset the
+# variable afterward. Flat dispatch intentionally has no `image_tag` input.
 
 on:
   # workflow_dispatch ONLY — the auto path moved to staging-tenant-cd.yml.
-  # No inputs: map (Gitea rejects the workflow if present — lint-workflow-yaml
-  # Rule 1). The roll target is read from the repo/org var
+  # No inputs map under the repository's flat-dispatch policy. The roll target
+  # is read from the repo/org var
   # STAGING_REDEPLOY_TARGET_TAG (else defaults to staging-latest).
   workflow_dispatch: {}
 
@@ -56,10 +57,47 @@ jobs:
         env:
           TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
           CANVAS_APP_IMAGE: ${{ env.CANVAS_APP_IMAGE }}
+          # Same SSOT as staging-tenant-cd.yml. A manual redeploy that omitted this
+          # would strip the managed flags off the fleet — turning an in-flight
+          # burn-in off, silently, from a button that says "redeploy".
+          STAGING_TENANT_FLAGS: ${{ vars.STAGING_TENANT_FLAGS }}
+          # Pre-existing injection sink, fixed here because it is the same shape as
+          # the one review caught above and sits three lines away: a ${{ }} expansion
+          # inside a run: body is spliced in as SHELL CODE, on a privileged
+          # docker-host runner. Passed as an env VALUE instead.
+          STAGING_REDEPLOY_TARGET_TAG: ${{ vars.STAGING_REDEPLOY_TARGET_TAG }}
         run: |
           set -euo pipefail
           # Precedence: operator pin var > moving staging-latest.
-          TAG="${{ vars.STAGING_REDEPLOY_TARGET_TAG }}"
+          TAG="${STAGING_REDEPLOY_TARGET_TAG-}"
           [ -n "$TAG" ] || TAG="staging-latest"
           echo "::notice::manual staging fleet redeploy target tag = ${TAG}"
-          bash scripts/deploy/redeploy-staging-fleet.sh --tag "$TAG"
+          TENANT_FLAGS="${STAGING_TENANT_FLAGS-}" \
+            bash scripts/deploy/redeploy-staging-fleet.sh --tag "$TAG"
+
+      # ── Enter OS rebrand Phase 2 (internal#1089): ADVISORY dual-domain arm ──
+      # The BLOCKING gate is unchanged and just ran above: the shared swap
+      # script health-gates every rolled tenant's /buildinfo DAEMON-SIDE — the
+      # service behind <slug>.staging.moleculesai.app. This step ADDS a second,
+      # NON-blocking probe of the SAME tenants through the NEW brand edge
+      # (https://<slug>.staging.enteros.ai/buildinfo, runner-side through
+      # DNS + CF + tunnel ingress), measuring enteros.ai routing readiness the
+      # daemon-side gate cannot see. Until ops seeds the staging enteros.ai
+      # tenant DNS/ingress this WARNS on every roll — that is the readiness
+      # signal, not noise; the ::warning:: names exactly what to check.
+      #
+      # FLIP-TO-BLOCKING CONDITION: once ops seeds staging enteros.ai tenant
+      # routing AND this step has soaked green across consecutive rolls, delete
+      # the continue-on-error line below (and wire EXPECTED_BUILD_SHA from the
+      # image's OCI revision label) so BOTH domains gate the roll. The probe
+      # script already fails closed, so the flip is only removing the mask.
+      - name: Probe enteros.ai tenant buildinfo (advisory Phase-2 arm)
+        # internal#1089 — Enter OS Phase 2: advisory until staging enteros.ai
+        # routing is ops-seeded + soak-green (flip condition in the comment above).
+        continue-on-error: true
+        env:
+          ENTEROS_STAGING_TENANT_DOMAIN: ${{ vars.ENTEROS_STAGING_TENANT_DOMAIN || 'staging.enteros.ai' }}
+        run: |
+          set -euo pipefail
+          bash scripts/deploy/probe-enteros-buildinfo.sh \
+            --cp-env staging --domain "$ENTEROS_STAGING_TENANT_DOMAIN"

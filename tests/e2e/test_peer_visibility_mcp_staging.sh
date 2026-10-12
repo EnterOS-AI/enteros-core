@@ -36,7 +36,7 @@
 #
 # AUTH MODEL (mirrors tests/e2e/test_staging_full_saas.sh)
 # --------------------------------------------------------
-#   Single MOLECULE_ADMIN_TOKEN (= CP_ADMIN_API_TOKEN on Railway staging)
+#   Single MOLECULE_ADMIN_TOKEN (= staging CP_ADMIN_API_TOKEN from Infisical)
 #   drives: POST /cp/admin/orgs (provision), GET
 #   /cp/admin/orgs/:slug/admin-token (per-tenant token), DELETE
 #   /cp/admin/tenants/:slug (teardown). The per-tenant admin token drives
@@ -46,12 +46,12 @@
 #   token-mint routes are used in this E2E (feedback_no_dev_only_routes_in_e2e).
 #
 # Required env:
-#   MOLECULE_ADMIN_TOKEN   CP admin bearer — Railway staging CP_ADMIN_API_TOKEN
+#   MOLECULE_ADMIN_TOKEN   staging CP admin bearer from Infisical /shared/controlplane-admin
 # Optional env:
 #   MOLECULE_CP_URL        default https://staging-api.moleculesai.app
 #   E2E_RUN_ID             slug suffix; CI passes ${GITHUB_RUN_ID}
 #   PV_RUNTIMES            space list; default "hermes openclaw claude-code"
-#   E2E_PROVISION_TIMEOUT_SECS  default 1800 (hermes/openclaw cold EC2 budget)
+#   E2E_PROVISION_TIMEOUT_SECS  default 1800 (hermes/openclaw cold-provision budget)
 #   E2E_MINIMAX_API_KEY / E2E_ANTHROPIC_API_KEY / E2E_OPENAI_API_KEY
 #                          DEPRECATED for this script — platform-managed models
 #                          use the CP LLM proxy; direct vendor keys are blocked
@@ -77,14 +77,28 @@ set -uo pipefail
 # local.sh). Only provisioning/teardown differs per backend.
 # shellcheck source=tests/e2e/lib/peer_visibility_assert.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/peer_visibility_assert.sh"
+# Shared ephemeral-topology contract (derive_tenant_topology). Default (all
+# MOLECULE_TENANT_* unset) reproduces exact staging routing byte-for-byte; the
+# ephemeral runner points MOLECULE_TENANT_URL at the CP base +
+# MOLECULE_TENANT_ROUTE_DOMAIN=lvh.me so the CP wildcard proxy resolves the tenant.
+# shellcheck source=tests/e2e/lib/tenant_topology.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/tenant_topology.sh"
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
-ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway staging CP_ADMIN_API_TOKEN}"
+ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
 # RUN_ID_SUFFIX removed (core#2782 follow-up shellcheck): the slug
 # now comes from make_collision_proof_slug below; the old suffix
 # var is dead.
 PV_RUNTIMES="${PV_RUNTIMES:-hermes openclaw claude-code}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-1800}"
+# Provisioning mode: `managed` (default, unset) = real runtime workspaces booted
+# to `online` (exact staging behaviour). `external` = `external:true` rows,
+# awaiting_agent, NO container/LLM boot — the ephemeral-CP secret-free port that
+# exercises ONLY the platform-side literal-MCP peer-visibility contract.
+PV_PROVISION_MODE="${PV_PROVISION_MODE:-managed}"
+# Ephemeral slug-routing headers; set by derive_tenant_topology in step 3. Init
+# empty so tenant_call is safe under `set -u` before derivation and on staging.
+TENANT_ROUTE_HDRS=()
 
 # Collision-proof slug (core#2782). The prior `head -c 32` truncation
 # dropped the run_attempt suffix and let two parallel/retry runs
@@ -126,6 +140,7 @@ admin_call() {
 tenant_call() {
   local method="$1" path="$2"; shift 2
   curl -sS -X "$method" "$TENANT_URL$path" \
+    ${TENANT_ROUTE_HDRS[@]+"${TENANT_ROUTE_HDRS[@]}"} \
     -H "Authorization: Bearer $TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
     -H "Content-Type: application/json" "$@"
@@ -134,6 +149,7 @@ tenant_call() {
 tenant_call_capture() {
   local method="$1" path="$2" out="$3"; shift 3
   curl -sS -o "$out" -w "%{http_code}" -X "$method" "$TENANT_URL$path" \
+    ${TENANT_ROUTE_HDRS[@]+"${TENANT_ROUTE_HDRS[@]}"} \
     -H "Authorization: Bearer $TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
     -H "Content-Type: application/json" "$@"
@@ -183,7 +199,34 @@ print(sum(1 for o in orgs if o.get('slug') == '$SLUG' and o.get('instance_status
     fi
     sleep 5
   done
-  echo "::warning::[teardown] $SLUG still present after 120s — sweep-stale-e2e-orgs will catch it within MAX_AGE_MINUTES" >&2
+  # A slow purge is an INFRA sub-step, not the thing under test. Escalating rc 0->4
+  # here fails the whole scenario — and peer_visibility is in E2E_EPHEMERAL_EXTRA_GATING,
+  # so on the ephemeral CP that turns a PASS into a merge-block. Observed on core#4923
+  # run 584794: the gate printed
+  #   ✅ GATE PASSED — every runtime under test sees its platform peers via the literal MCP call
+  # (3/3 peers on all three runtimes) and was then failed by this line alone.
+  #
+  # The escalation is RIGHT on staging, where a leaked tenant is durable and has caused
+  # a real provisioning outage. It is wrong on the ephemeral CP: that control plane is
+  # destroyed with the job, so a tenant outliving teardown by minutes outlives nothing —
+  # and the remediation this message names (sweep-stale-e2e-orgs, 90m age floor, "a later
+  # main push") does not apply to an ephemeral CP at all, so it points the reader at a
+  # sweeper that will never see this org.
+  #
+  # E2E_CP_ALLOW_EPHEMERAL_LOOPBACK is the discriminator: ephemeral_cp_happy_path.sh sets
+  # it on BOTH peer_visibility invocations (managed and external) and nothing else sets it.
+  # NOT E2E_INFRA_BACKEND=local-docker — staging-tenant-cd.yml and runtime-default-flip-gate.yml
+  # set that too, so it would silently disarm the check on staging, which is the one place
+  # it must keep biting.
+  #
+  # This scenario also provisions FOUR workspaces (parent + three runtimes), more than its
+  # peers, so it is the likeliest to exceed a fixed 120s purge budget for reasons that are
+  # load rather than breakage.
+  if [ "${E2E_CP_ALLOW_EPHEMERAL_LOOPBACK:-0}" = "1" ]; then
+    echo "::warning::[teardown] $SLUG outlived the 120s purge budget on an EPHEMERAL CP. The control plane is torn down with this job, so this is not a durable leak and does NOT fail the gate. (sweep-stale-e2e-orgs does not apply here.) Scenario result is unchanged: rc=$rc" >&2
+    exit "$rc"
+  fi
+  echo "::warning::[teardown] $SLUG still present after 120s — investigate now; sweep-stale-e2e-orgs retries on a later main push after its 90m age floor" >&2
   [ "$rc" -eq 0 ] && rc=4
   exit "$rc"
 }
@@ -197,8 +240,8 @@ ORG_ID=$(echo "$CREATE" | python3 -c "import sys,json; print(json.load(sys.stdin
 [ -n "$ORG_ID" ] || fail "org creation failed: $(echo "$CREATE" | head -c 300)"
 log "    ORG_ID=$ORG_ID"
 
-# ─── 2. Wait for tenant EC2 + DNS ──────────────────────────────────────
-log "2/6 waiting for tenant instance_status=running (cold EC2 + cloudflared)..."
+# ─── 2. Wait for tenant environment + DNS ──────────────────────────────
+log "2/6 waiting for tenant instance_status=running (provider + routing)..."
 DEADLINE=$(( $(date +%s) + PROVISION_TIMEOUT_SECS ))
 while true; do
   [ "$(date +%s)" -gt "$DEADLINE" ] && fail "tenant never came up within ${PROVISION_TIMEOUT_SECS}s"
@@ -222,18 +265,28 @@ TT_RESP=$(admin_call GET "/cp/admin/orgs/$SLUG/admin-token")
 TENANT_TOKEN=$(echo "$TT_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('admin_token',''))" 2>/dev/null)
 [ -n "$TENANT_TOKEN" ] || fail "tenant token fetch failed: $(echo "$TT_RESP" | head -c 200)"
 
-CP_HOST=$(echo "$CP_URL" | sed -E 's#^https?://##; s#/.*$##')
-case "$CP_HOST" in
-  api.*)         DERIVED_DOMAIN="${CP_HOST#api.}" ;;
-  staging-api.*) DERIVED_DOMAIN="staging.${CP_HOST#staging-api.}" ;;
-  *)             DERIVED_DOMAIN="$CP_HOST" ;;
-esac
-TENANT_URL="https://${SLUG}.${DERIVED_DOMAIN}"
+# Ephemeral-topology-aware tenant routing (shared contract). Default (all
+# MOLECULE_TENANT_* unset) sets TENANT_URL=https://$SLUG.<derived-domain> with an
+# EMPTY TENANT_ROUTE_HDRS ⇒ exact staging behaviour byte-for-byte. Under the
+# ephemeral CP, MOLECULE_TENANT_URL=$CP_BASE_URL + MOLECULE_TENANT_ROUTE_DOMAIN
+# make TENANT_URL the CP base and TENANT_ROUTE_HDRS carry Host + X-Molecule-Org-Slug.
+derive_tenant_topology "$SLUG" "$CP_URL" || fail "could not derive tenant topology for $SLUG"
 log "    tenant url: $TENANT_URL"
+if [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+  log "    tenant routing via Host=$TENANT_ROUTE_HOST + X-Molecule-Org-Slug=$SLUG (ephemeral slug routing)"
+fi
 
-log "3b. waiting for tenant /health (TLS/DNS, up to 10min)..."
+# Under ephemeral slug-routing the CP's GLOBAL /health answers ANY Host, so a
+# /health probe is vacuous (2xx on iteration 1 without the tenant route up).
+# Probe a tenant-owned handler WITH the routing headers so a not-yet-routable
+# tenant is actually caught. Staging (empty TENANT_ROUTE_HDRS) keeps /health.
+log "3b. waiting for tenant readiness (TLS/DNS, up to 10min)..."
 for i in $(seq 1 120); do
-  curl -fsS "$TENANT_URL/health" -m 5 -k >/dev/null 2>&1 && { log "    /health ok (attempt $i)"; break; }
+  if [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+    curl -fsSk -m 5 "${TENANT_ROUTE_HDRS[@]}" -H "X-Molecule-Org-Id: $ORG_ID" "$TENANT_URL/org/identity" >/dev/null 2>&1 && { log "    tenant route ready (attempt $i)"; break; }
+  else
+    curl -fsS "$TENANT_URL/health" -m 5 -k >/dev/null 2>&1 && { log "    /health ok (attempt $i)"; break; }
+  fi
   sleep 5
 done
 BUILDINFO=$(curl -fsS "$TENANT_URL/buildinfo" -m 10 2>/dev/null || true)
@@ -267,16 +320,28 @@ SECRETS_JSON='{}'
 pv_platform_model_for_runtime() {
   if [ -n "${E2E_MODEL_SLUG:-}" ]; then printf '%s' "$E2E_MODEL_SLUG"; return 0; fi
   case "$1" in
-    claude-code) printf 'anthropic/claude-sonnet-4-6' ;;
-    hermes|openclaw) printf 'moonshot/kimi-k2.6' ;;
-    *) printf 'moonshot/kimi-k2.6' ;;
+    # 2026-08-04: sdk#203 narrowed every platform arm to minimax-only (the
+    # Moonshot vendor account is suspended and the anthropic/* platform ids were
+    # withdrawn under the same directive). Both former defaults now 422
+    # UNREGISTERED_MODEL_FOR_RUNTIME at create, so every runtime uses the ONE
+    # shared platform default here.
+    claude-code) printf 'minimax/MiniMax-M2.7' ;;
+    hermes|openclaw) printf 'minimax/MiniMax-M2.7' ;;
+    *) printf 'minimax/MiniMax-M2.7' ;;
   esac
 }
 
-log "4/6 provisioning parent (claude-code) + one sibling per runtime under test..."
-PARENT_MODEL=$(pv_platform_model_for_runtime claude-code)
+log "4/6 provisioning parent + one sibling per runtime under test (mode=${PV_PROVISION_MODE})..."
+# EXTERNAL mode (the ephemeral-CP port): create `external:true` rows so the
+# literal-MCP peer-visibility contract runs WITHOUT booting runtime containers /
+# backed platform models. Default (mode=managed, unset) = exact staging behaviour.
+if [ "$PV_PROVISION_MODE" = "external" ]; then
+  PARENT_RT="external"; PARENT_MODEL="external:custom"; PARENT_EXTRA=',"external":true'
+else
+  PARENT_RT="claude-code"; PARENT_MODEL=$(pv_platform_model_for_runtime claude-code); PARENT_EXTRA=""
+fi
 P_RESP=$(tenant_call POST /workspaces \
-  -d "{\"name\":\"pv-parent\",\"runtime\":\"claude-code\",\"model\":\"$PARENT_MODEL\",\"tier\":3,\"secrets\":$SECRETS_JSON}")
+  -d "{\"name\":\"pv-parent\",\"runtime\":\"$PARENT_RT\",\"model\":\"$PARENT_MODEL\",\"tier\":3$PARENT_EXTRA,\"secrets\":$SECRETS_JSON}")
 PARENT_ID=$(echo "$P_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
 [ -n "$PARENT_ID" ] || fail "parent create failed: $(echo "$P_RESP" | head -c 300)"
 log "    PARENT_ID=$PARENT_ID"
@@ -285,9 +350,13 @@ log "    PARENT_ID=$PARENT_ID"
 declare -A WS_IDS WS_TOKENS
 ALL_WS_IDS="$PARENT_ID"
 for rt in $PV_RUNTIMES; do
-  RT_MODEL=$(pv_platform_model_for_runtime "$rt")
+  if [ "$PV_PROVISION_MODE" = "external" ]; then
+    CREATE_RT="external"; RT_MODEL="external:custom"; RT_EXTRA=',"external":true'
+  else
+    CREATE_RT="$rt"; RT_MODEL=$(pv_platform_model_for_runtime "$rt"); RT_EXTRA=""
+  fi
   R=$(tenant_call POST /workspaces \
-    -d "{\"name\":\"pv-$rt\",\"runtime\":\"$rt\",\"model\":\"$RT_MODEL\",\"tier\":2,\"parent_id\":\"$PARENT_ID\",\"secrets\":$SECRETS_JSON}")
+    -d "{\"name\":\"pv-$rt\",\"runtime\":\"$CREATE_RT\",\"model\":\"$RT_MODEL\",\"tier\":2,\"parent_id\":\"$PARENT_ID\"$RT_EXTRA,\"secrets\":$SECRETS_JSON}")
   WID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
   WTOK=$(echo "$R" | extract_auth_token)
   [ -n "$WID" ] || fail "$rt workspace create failed: $(printf '%s' "$R" | head -c 300)"
@@ -307,6 +376,11 @@ if [ "${PV_TOKEN_DIAGNOSTIC_ONLY:-0}" = "1" ]; then
 fi
 
 # ─── 5. Wait for every sibling online ──────────────────────────────────
+# EXTERNAL rows are `awaiting_agent` by design (no container ever reaches
+# `online`); the literal-MCP peer path is PLATFORM-side, so skip the boot-wait.
+if [ "$PV_PROVISION_MODE" = "external" ]; then
+  log "5/6 external mode — workspaces are awaiting_agent; skipping the online-wait, driving MCP directly"
+else
 log "5/6 waiting for all workspaces status=online (up to ${PROVISION_TIMEOUT_SECS}s — cold boot)..."
 WS_DEADLINE=$(( $(date +%s) + PROVISION_TIMEOUT_SECS ))
 for rt in $PV_RUNTIMES; do
@@ -330,6 +404,7 @@ print(w.get('status') or '')
   done
   ok "    $rt online"
 done
+fi
 
 # ─── 6. THE GATE — literal mcp_molecule_list_peers via POST /:id/mcp ────
 # This is the byte-for-byte user-facing call. NOT GET /registry/:id/peers,
@@ -339,6 +414,13 @@ log "6/6 driving the LITERAL list_peers MCP call per runtime..."
 echo ""
 REGRESSED=0
 declare -A VERDICT
+# Thread the ephemeral slug-routing headers into the SHARED MCP assertion. The
+# literal list_peers curl lives in peer_visibility_assert.sh; under the ephemeral
+# CP the MCP call goes to the CP base URL and the tenant is resolved by Host +
+# X-Molecule-Org-Slug. pv_assert_runtime reads PV_ROUTE_HDRS in-scope (sourced
+# lib). Default (staging/local, empty) ⇒ unchanged.
+# shellcheck disable=SC2034  # consumed cross-file in lib/peer_visibility_assert.sh
+PV_ROUTE_HDRS=(${TENANT_ROUTE_HDRS[@]+"${TENANT_ROUTE_HDRS[@]}"})
 
 for rt in $PV_RUNTIMES; do
   wid="${WS_IDS[$rt]}"

@@ -22,6 +22,11 @@
 
 set -uo pipefail
 BASE="${BASE:-http://localhost:8080}"
+# shellcheck source=_lib.sh
+source "$(dirname "$0")/_lib.sh"
+e2e_load_local_admin_token
+HUMAN_AUTH=()
+e2e_human_auth_args HUMAN_AUTH || exit 2
 fails=0
 
 # Per-run scratch dir collected under one trap so every per-runtime
@@ -83,7 +88,7 @@ round_trip() {
   test_file=$(mktemp "$TMPDIR_E2E/e2e-mr-${label}-XXXX.txt")
   expected="secret-$(openssl rand -hex 6)"
   echo "$expected" > "$test_file"
-  upload=$(curl -s -X POST "$BASE/workspaces/$wsid/chat/uploads" -F "files=@$test_file")
+  upload=$(curl -s -X POST "$BASE/workspaces/$wsid/chat/uploads" ${HUMAN_AUTH[@]+"${HUMAN_AUTH[@]}"} -F "files=@$test_file")
   uri=$(echo "$upload" | python3 -c 'import json,sys;print(json.load(sys.stdin)["files"][0]["uri"])' 2>/dev/null)
   [ -z "$uri" ] && { echo "FAIL $label: upload returned no URI: $upload"; return 1; }
   payload=$(URI="$uri" python3 -c '
@@ -98,6 +103,7 @@ print(json.dumps({
 
   # Hit the platform proxy, with generous timeout — some runtimes warm on first call
   reply=$(curl -s -X POST "$BASE/workspaces/$wsid/a2a" \
+    ${HUMAN_AUTH[@]+"${HUMAN_AUTH[@]}"} \
     -H 'Content-Type: application/json' --max-time 120 -d "$payload")
   reply_text=$(echo "$reply" | python3 -c '
 import json, sys, re
@@ -132,7 +138,7 @@ check_runtime() {
   printf "\n======================== %s (%s) ========================\n" "$label" "$wsid"
 
   local status
-  status=$(curl -s "$BASE/workspaces/$wsid" | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])')
+  status=$(curl -s "$BASE/workspaces/$wsid" ${HUMAN_AUTH[@]+"${HUMAN_AUTH[@]}"} | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])')
   if [ "$status" != "online" ]; then
     echo "FAIL $label: workspace status=$status"
     fails=$((fails + 1)); return

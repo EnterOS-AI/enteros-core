@@ -42,9 +42,9 @@ import (
 	"testing"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq"
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 // integrationDB_Budget opens the integration PG connection, wipes our

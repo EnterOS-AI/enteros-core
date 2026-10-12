@@ -146,6 +146,22 @@ func appendCapped(buf *bytes.Buffer, p []byte) {
 	buf.Write(tail)
 }
 
+// stallExemptFunc lets a caller declare that a particular silence is
+// LEGITIMATE: it receives the tail of the output captured so far and returns
+// true when the process is known to be in a quiet-but-healthy phase (e.g.
+// BuildKit's final image unpack, which emits nothing for minutes on a
+// multi-GB image). An exempt silence gets an EXTENDED grace
+// (stallExemptFactor × stallGrace) rather than an unlimited one — a daemon
+// that wedges mid-unpack still dies with the diagnostic stall error instead
+// of silently running to the (much larger, per-runtime) absolute ceiling.
+type stallExemptFunc func(tail []byte) bool
+
+// stallExemptFactor multiplies the stall grace for a recognized quiet phase.
+// 4× the 4m default = 16 minutes of tolerated silent unpack — comfortably
+// clears a multi-GB image on slow disk while still bounding a genuine
+// mid-phase hang well below a 30-minute runtime ceiling.
+const stallExemptFactor = 4
+
 // runStreamingCommand runs cmd, streaming its merged stdout+stderr in chunks,
 // and returns the (tail-capped) captured output plus an error.
 //
@@ -169,6 +185,13 @@ func appendCapped(buf *bytes.Buffer, p []byte) {
 // over-long single line can never stop it draining and wedge Wait() — see the
 // reader goroutine below.
 func runStreamingCommand(ctx context.Context, cmd *exec.Cmd, stallGrace, ceiling time.Duration) ([]byte, error) {
+	return runStreamingCommandExempt(ctx, cmd, stallGrace, ceiling, nil)
+}
+
+// runStreamingCommandExempt is runStreamingCommand with an optional
+// stall-exemption hook (nil = never exempt, identical behavior). See
+// stallExemptFunc for the contract.
+func runStreamingCommandExempt(ctx context.Context, cmd *exec.Cmd, stallGrace, ceiling time.Duration, stallExempt stallExemptFunc) ([]byte, error) {
 	// Merge stdout+stderr into one pipe so ordering is preserved and a
 	// single reader drains both — matching CombinedOutput's semantics.
 	pr, pw := io.Pipe()
@@ -200,6 +223,18 @@ func runStreamingCommand(ctx context.Context, cmd *exec.Cmd, stallGrace, ceiling
 		mu.Lock()
 		defer mu.Unlock()
 		return time.Since(lastSeen)
+	}
+	// outputTail snapshots the last few KB of captured output for the
+	// stall-exemption check — enough to hold the final progress lines
+	// without copying the whole buffer every poll tick.
+	outputTail := func() []byte {
+		mu.Lock()
+		defer mu.Unlock()
+		b := buf.Bytes()
+		if len(b) > 4096 {
+			b = b[len(b)-4096:]
+		}
+		return append([]byte(nil), b...)
 	}
 
 	// Reader goroutine: drain the merged pipe to EOF in fixed-size CHUNKS,
@@ -335,7 +370,12 @@ func runStreamingCommand(ctx context.Context, cmd *exec.Cmd, stallGrace, ceiling
 				kill(fmt.Errorf("%w %s", errBuildCeiling, ceiling))
 				continue
 			}
-			if stallGrace > 0 && sinceProgress() > stallGrace {
+			if silence := sinceProgress(); stallGrace > 0 && silence > stallGrace {
+				// A recognized quiet-but-healthy phase (see stallExemptFunc)
+				// earns an extended — but still bounded — grace.
+				if stallExempt != nil && silence <= stallGrace*stallExemptFactor && stallExempt(outputTail()) {
+					continue
+				}
 				kill(fmt.Errorf("%w %s", errBuildStalled, stallGrace))
 				continue
 			}

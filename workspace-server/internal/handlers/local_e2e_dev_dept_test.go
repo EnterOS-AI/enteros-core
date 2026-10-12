@@ -21,14 +21,14 @@ import (
 // (Set up by the orchestrator before running this test.)
 //
 // What this proves end-to-end through real platform code:
-//   1. resolveYAMLIncludes follows the dev-lead symlink at the parent's
-//      template root and pulls in the dev-department subtree.
-//   2. Recursive !include's inside the symlinked subtree resolve
-//      correctly via the chain dev-lead/workspace.yaml →
-//      ./core-lead/workspace.yaml → ./core-be/workspace.yaml etc.
-//   3. The resolved YAML unmarshals into a complete OrgTemplate with the
-//      expected count of workspaces (parent's PM+Marketing+Research +
-//      dev-department's atomized 28 workspaces).
+//  1. resolveYAMLIncludes follows the dev-lead symlink at the parent's
+//     template root and pulls in the dev-department subtree.
+//  2. Recursive !include's inside the symlinked subtree resolve
+//     correctly via the chain dev-lead/workspace.yaml →
+//     ./core-lead/workspace.yaml → ./core-be/workspace.yaml etc.
+//  3. The resolved YAML unmarshals into a complete OrgTemplate with the
+//     expected count of workspaces (parent's PM+Marketing+Research +
+//     dev-department's atomized 28 workspaces).
 //
 // Skipped if the local-e2e-deploy fixture isn't present — won't block
 // CI on hosts that haven't set it up.
@@ -110,11 +110,11 @@ func TestLocalE2E_DevDepartmentExtraction(t *testing.T) {
 // resolveYAMLIncludes returning a populated OrgTemplate is necessary but
 // not sufficient — `POST /org/import` then does:
 //
-//   1. resolveInsideRoot(orgBaseDir, ws.FilesDir) → must return a path
-//      that exists and stat-resolves to a directory (org_import.go:313-317).
-//   2. CopyTemplateToContainer(ctx, containerID, templatePath) → walks
-//      the dir with filepath.Walk and tars its contents into the
-//      workspace's /configs/ mount (provisioner.go:766-820).
+//  1. resolveInsideRoot(orgBaseDir, ws.FilesDir) → must return a path
+//     that exists and stat-resolves to a directory (org_import.go:313-317).
+//  2. CopyTemplateToContainer(ctx, containerID, templatePath) → walks
+//     the dir with filepath.Walk and tars its contents into the
+//     workspace's /configs/ mount (provisioner.go:766-820).
 //
 // This stage-2 test exercises both #1 and #2 against every workspace in
 // the resolved tree, mimicking what the platform does post-include-

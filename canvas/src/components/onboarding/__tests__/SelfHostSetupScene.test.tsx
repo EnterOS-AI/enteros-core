@@ -234,6 +234,34 @@ describe("gate matrix", () => {
     expect(screen.queryByTestId("selfhost-setup-scene")).toBeNull();
   });
 
+  it("still resolves the pre-gate hold when gate evaluation REJECTS (spinner must never strand)", async () => {
+    // getSlug runs before the gate's internal try/catch, so a throwing slug
+    // provider rejects evaluateSelfHostSetupGate itself — the .catch arm in
+    // the scene must still flip selfHostGateResolved or the shell's pre-gate
+    // loading screen spins forever (worse than the legacy no-concierge view).
+    routeApi();
+    useCanvasStore.getState().setSelfHostGateResolved(false);
+    (getTenantSlug as Mock).mockImplementationOnce(() => {
+      throw new Error("slug provider exploded");
+    });
+    render(<SelfHostSetupScene />);
+    await flush();
+    expect(screen.queryByTestId("selfhost-setup-scene")).toBeNull();
+    expect(useCanvasStore.getState().selfHostGateResolved).toBe(true);
+  });
+
+  it("does NOT touch the gate-resolved flag when unmounted before the rejection lands", async () => {
+    routeApi();
+    useCanvasStore.getState().setSelfHostGateResolved(false);
+    (getTenantSlug as Mock).mockImplementationOnce(() => {
+      throw new Error("slug provider exploded");
+    });
+    const { unmount } = render(<SelfHostSetupScene />);
+    unmount(); // cancelled=true before the .catch settles
+    await flush();
+    expect(useCanvasStore.getState().selfHostGateResolved).toBe(false);
+  });
+
   it("never renders when the platform root is online (configured)", async () => {
     routeApi();
     seedNodes([platformNode({ status: "online" })]);
@@ -747,7 +775,7 @@ describe("provision watch", () => {
       });
     });
     expect(screen.getByTestId("scene-error").textContent).toContain(
-      "Molecule's hosted proxy",
+      "Enter OS hosted proxy",
     );
   });
 
@@ -852,7 +880,7 @@ describe("provision watch", () => {
       await vi.advanceTimersByTimeAsync(WATCH_POLL_MS);
     });
     expect(screen.getByTestId("scene-error").textContent).toContain(
-      "Molecule's hosted proxy",
+      "Enter OS hosted proxy",
     );
 
     // Second scene instance: failed row WITHOUT last_sample_error → generic.
@@ -1004,7 +1032,7 @@ describe("derived-state resume", () => {
     render(<SelfHostSetupScene />);
     await flush();
     expect(screen.getByTestId("scene-error").textContent).toContain(
-      "Molecule's hosted proxy",
+      "Enter OS hosted proxy",
     );
     fireEvent.click(screen.getByTestId("scene-adjust"));
     expect(screen.getByTestId("scene-step-welcome")).toBeTruthy();

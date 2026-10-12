@@ -392,7 +392,14 @@ func TestInstallPlatformAgent_PreservesRemovedStatusOnConflict(t *testing.T) {
 	mock := setupTestDB(t)
 
 	mock.ExpectBegin()
-	// 0. downgrade any other platform root (no-op here, still issued).
+	// 0a. probe for a LIVE (online) foreign platform root. The install refuses to
+	//     displace one — demoting a live concierge and upserting a container-less
+	//     row it never provisions would destroy the org's concierge. No live root
+	//     here, so the install proceeds to the downgrade below.
+	mock.ExpectQuery(`SELECT id FROM workspaces.*AND status IN \('online', 'degraded'\)`).
+		WithArgs("pa-removed").
+		WillReturnError(sql.ErrNoRows)
+	// 0b. downgrade any other platform root (no-op here, still issued).
 	mock.ExpectExec(`UPDATE workspaces SET kind = 'workspace'.*WHERE kind = 'platform' AND parent_id IS NULL AND id <> \$1`).
 		WithArgs("pa-removed").
 		WillReturnResult(sqlmock.NewResult(0, 0))

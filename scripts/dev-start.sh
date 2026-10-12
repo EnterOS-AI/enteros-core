@@ -5,14 +5,16 @@
 #   1. Generates ADMIN_TOKEN into .env if missing (closes #684 fail-open)
 #   2. Runs infra/scripts/setup.sh (postgres + redis + minio + langfuse +
 #      clickhouse + populates template/plugin registry from manifest.json)
-#   3. Starts the platform (Go :8080), waits for /health
+#   3. Builds and starts the platform (Go or Docker :8080), waits for /health
 #   4. Starts the canvas (Next.js :3000), waits for HTTP 200
+#      4b. Starts logdy (if installed) tailing the platform/canvas host
+#          log files — Dozzle can't see them since they're not containers
 #   5. Prints a readiness banner with API-key add instructions
-#   6. On Ctrl-C, kills both background processes and tears down infra
+#   6. On Ctrl-C, kills all background processes and tears down infra
 #
 # Prerequisites:
 #   - Docker + Docker Compose v2  (for postgres/redis/langfuse/etc)
-#   - Go 1.25+                     (for the platform binary)
+#   - Go 1.25+                     (optional; Docker is used on Windows)
 #   - Node.js 20+                  (for the canvas)
 #   - jq                           (for setup.sh's manifest clone — optional;
 #                                   without it, template palette will be
@@ -41,16 +43,31 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=scripts/lib/docker-reset.sh
 # shellcheck disable=SC1091
 . "$ROOT/scripts/lib/docker-reset.sh"
+# shellcheck source=scripts/lib/dev-startup.sh
+. "$ROOT/scripts/lib/dev-startup.sh"
 ENV_FILE="$ROOT/.env"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-molecule-core}"
 export COMPOSE_PROJECT_NAME
+# Compose derives container names from the project; every by-name docker
+# inspect/rm/logs below must use this, never a hardcoded molecule-core-…
+LANGFUSE_CONTAINER="${COMPOSE_PROJECT_NAME}-langfuse-1"
 PLATFORM_PID=
+PLATFORM_LOG_PID=
 CANVAS_PID=
+LOGDY_PID=
+BUILD_PID=
+PLATFORM_BUILD_DIR=
 FRESH=0
+PLATFORM_REQUESTED_MODE=auto
 
 print_usage() {
     cat <<'USAGE'
-Usage: ./scripts/dev-start.sh [--fresh]
+Usage: ./scripts/dev-start.sh [--fresh] [--docker-platform | --host-platform]
+
+  --docker-platform  Build and run the platform in Docker.
+  --host-platform    Build and run the platform with host Go.
+                     Default: Docker on Windows, host Go on Linux/macOS
+                     (with Docker fallback if Go cannot be installed).
 
   (no args)   Incremental start — reuses the existing .env, local DB /
               object-store state, and any already-built runtime images.
@@ -67,7 +84,7 @@ Usage: ./scripts/dev-start.sh [--fresh]
                   runtime image (hermes, etc.) rebuilds from current source
                   instead of reusing a cached tag;
                 • on the docker-compose platform fallback, rebuilds the core
-                  image with --no-cache (on the default `go run` path the core
+                  image with --no-cache (on the host Go path the core
                   always recompiles from source anyway).
 
   -h, --help  Show this help.
@@ -77,6 +94,12 @@ USAGE
 for arg in "$@"; do
     case "$arg" in
         --fresh|--remove-volumes) FRESH=1 ;;
+        --docker-platform)
+            [ "$PLATFORM_REQUESTED_MODE" != host ] || { echo "Choose only one platform mode" >&2; exit 2; }
+            PLATFORM_REQUESTED_MODE=docker ;;
+        --host-platform)
+            [ "$PLATFORM_REQUESTED_MODE" != docker ] || { echo "Choose only one platform mode" >&2; exit 2; }
+            PLATFORM_REQUESTED_MODE=host ;;
         -h|--help) print_usage; exit 0 ;;
         # Fail loud on unknown flags — the whole point of this parser is that a
         # mistyped/unsupported flag (e.g. --fresh before it existed) must NOT be
@@ -84,6 +107,23 @@ for arg in "$@"; do
         *) echo "dev-start.sh: unknown option '$arg' (try --help)" >&2; exit 2 ;;
     esac
 done
+
+for required_tool in docker node curl; do
+    command -v "$required_tool" >/dev/null 2>&1 || {
+        echo "dev-start.sh: $required_tool is required on PATH" >&2
+        exit 1
+    }
+done
+docker compose version >/dev/null 2>&1 || {
+    echo "dev-start.sh: Docker Compose v2 or newer is required" >&2
+    exit 1
+}
+
+DEV_LOG_DIR=${MOLECULE_DEV_LOG_DIR:-/tmp}
+mkdir -p "$DEV_LOG_DIR"
+PLATFORM_LOG="$DEV_LOG_DIR/molecule-platform.log"
+CANVAS_LOG="$DEV_LOG_DIR/molecule-canvas.log"
+LOGDY_LOG="$DEV_LOG_DIR/molecule-logdy.log"
 
 process_cwd() {
     # $1 = pid. Prints the process cwd, or nothing when the process vanished.
@@ -149,7 +189,7 @@ cleanup_dev_stack() {
     # named volumes so the local DB/object-store state survives restarts.
     docker compose -f "$ROOT/docker-compose.yml" down --remove-orphans >/dev/null 2>&1 || true
     docker compose -f "$ROOT/docker-compose.infra.yml" down --remove-orphans >/dev/null 2>&1 || true
-    docker rm -f molecule-core-langfuse-1 >/dev/null 2>&1 || true
+    docker rm -f "$LANGFUSE_CONTAINER" >/dev/null 2>&1 || true
 }
 
 fresh_reset() {
@@ -171,7 +211,7 @@ fresh_reset() {
         || echo "    WARN: 'docker compose -f docker-compose.yml down -v' failed — local DB/Redis volumes may persist" >&2
     docker compose -f "$ROOT/docker-compose.infra.yml" down -v --remove-orphans >/dev/null 2>&1 \
         || echo "    WARN: 'docker compose -f docker-compose.infra.yml down -v' failed — MinIO/Langfuse volumes may persist" >&2
-    docker rm -f molecule-core-langfuse-1 >/dev/null 2>&1 || true
+    docker rm -f "$LANGFUSE_CONTAINER" >/dev/null 2>&1 || true
     # Dynamically-spawned ws-<uuid> workspace containers + volumes (UUID-scoped so
     # an unrelated project's ws-* object on the same host is never touched).
     mol_purge_ws_objects
@@ -195,18 +235,23 @@ fresh_reset() {
 }
 
 cleanup() {
+    # Disable traps before teardown so Ctrl-C cannot run cleanup twice.
+    trap - EXIT INT TERM
     echo ""
     echo "==> Shutting down..."
-    if [ -n "${PLATFORM_PID:-}" ]; then
-        kill "$PLATFORM_PID" 2>/dev/null || true
-    fi
-    if [ -n "${CANVAS_PID:-}" ]; then
-        kill "$CANVAS_PID" 2>/dev/null || true
+    for child in "${BUILD_PID:-}" "${PLATFORM_PID:-}" "${PLATFORM_LOG_PID:-}" "${CANVAS_PID:-}" "${LOGDY_PID:-}"; do
+        dev_stop_process "$child"
+    done
+    if [ -n "${PLATFORM_BUILD_DIR:-}" ]; then
+        rm -f "$PLATFORM_BUILD_DIR/platform" "$PLATFORM_BUILD_DIR/platform.exe"
+        rmdir "$PLATFORM_BUILD_DIR" 2>/dev/null || true
     fi
     cleanup_dev_stack
     echo "    Done."
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ─────────────────────────────────────────────── 1. dev-mode auth posture
 #
@@ -228,9 +273,11 @@ trap cleanup EXIT INT TERM
 #   NEXT_PUBLIC_ADMIN_TOKEN    — same value, baked into the canvas bundle so
 #                                the browser sends the matching bearer.
 #
-# For SaaS the platform is provisioned with a random ADMIN_TOKEN + the
-# canvas image baked with the matching NEXT_PUBLIC_ADMIN_TOKEN, plus
-# MOLECULE_ENV=production. Same shape, stronger secret.
+# This matching `NEXT_PUBLIC_ADMIN_TOKEN` pair is local-development-only.
+# Production/SaaS Canvas must not bake the tenant `ADMIN_TOKEN` into public
+# JavaScript. Browser requests authenticate with a verified control-plane
+# session or a deliberately supplied org/admin credential; the server still
+# runs with `MOLECULE_ENV=production` and fail-closed route middleware.
 if [ -f "$ENV_FILE" ] && grep -q '^MOLECULE_ENV=' "$ENV_FILE"; then
     echo "==> Reusing MOLECULE_ENV from existing .env"
 else
@@ -325,33 +372,7 @@ fi
 # MOLECULE_*_HOST_PORT vars (or a non-local DATABASE_URL/REDIS_URL) yourself to
 # override.
 pick_port() {
-    # $1 = preferred port. Echoes it when free on IPv4 AND IPv6, else a free
-    # ephemeral port. Degrades to the preferred port if python3 is absent.
-    if command -v python3 >/dev/null 2>&1; then
-        python3 - "$1" <<'PY'
-import socket, sys
-pref = int(sys.argv[1])
-def free(port):
-    for fam, addr in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
-        s = socket.socket(fam, socket.SOCK_STREAM)
-        try:
-            s.bind((addr, port))
-        except OSError:
-            s.close()
-            return False
-        s.close()
-    return True
-if free(pref):
-    print(pref)
-else:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    print(s.getsockname()[1])
-    s.close()
-PY
-    else
-        echo "$1"
-    fi
+    node "$ROOT/scripts/lib/dev-port.cjs" "$1"
 }
 
 MOLECULE_PG_HOST_PORT=${MOLECULE_PG_HOST_PORT:-$(pick_port 5432)}
@@ -360,6 +381,12 @@ MOLECULE_MINIO_HOST_PORT=${MOLECULE_MINIO_HOST_PORT:-$(pick_port 9000)}
 MOLECULE_MINIO_CONSOLE_HOST_PORT=${MOLECULE_MINIO_CONSOLE_HOST_PORT:-$(pick_port 9001)}
 PLATFORM_PORT=$(pick_port 8080)
 CANVAS_PORT=$(pick_port 3000)
+# Dozzle (container-log viewer) on :3110; logdy (HOST-process log viewer, see
+# section 4b) sits sequentially on :3111. DOZZLE_PORT is exported so the compose
+# dozzle service publishes on the SAME port this script advertises below.
+DOZZLE_PORT=${DOZZLE_PORT:-$(pick_port 3110)}
+LOGDY_PORT=${LOGDY_PORT:-$(pick_port 3111)}
+export DOZZLE_PORT
 export MOLECULE_PG_HOST_PORT MOLECULE_REDIS_HOST_PORT \
        MOLECULE_MINIO_HOST_PORT MOLECULE_MINIO_CONSOLE_HOST_PORT
 
@@ -425,6 +452,9 @@ MOLECULE_LANGFUSE_HOST_PORT=${MOLECULE_LANGFUSE_HOST_PORT:-$(pick_port 3001)}
 export MOLECULE_LANGFUSE_HOST_PORT
 export LANGFUSE_PUBLIC_KEY="${LANGFUSE_PUBLIC_KEY:-pk-lf-0000000000000000000000000000000000000001}"
 export LANGFUSE_SECRET_KEY="${LANGFUSE_SECRET_KEY:-sk-lf-0000000000000000000000000000000000000002}"
+# Same keys under the names the compose langfuse service seeds the org with.
+export LANGFUSE_INIT_PROJECT_PUBLIC_KEY="$LANGFUSE_PUBLIC_KEY"
+export LANGFUSE_INIT_PROJECT_SECRET_KEY="$LANGFUSE_SECRET_KEY"
 export LANGFUSE_HOST="http://127.0.0.1:${MOLECULE_LANGFUSE_HOST_PORT}"          # platform reader (host)
 export MOLECULE_WORKSPACE_LANGFUSE_HOST="http://langfuse-web:3000"             # agent producer (docker net)
 echo "    Langfuse   ${LANGFUSE_HOST}  (traces UI + platform /traces proxy)"
@@ -460,10 +490,10 @@ wait_for_langfuse_http() {
     echo "    Waiting for Langfuse HTTP..."
     i=1
     while [ "$i" -le 90 ]; do
-        running=$(docker inspect -f '{{.State.Running}}' molecule-core-langfuse-1 2>/dev/null || echo false)
+        running=$(docker inspect -f '{{.State.Running}}' "$LANGFUSE_CONTAINER" 2>/dev/null || echo false)
         if [ "$running" != "true" ]; then
             echo "    ✗ Langfuse exited before becoming ready — last logs:"
-            docker logs --tail 80 molecule-core-langfuse-1 2>&1 | sed 's/^/      /'
+            docker logs --tail 80 "$LANGFUSE_CONTAINER" 2>&1 | sed 's/^/      /'
             return 1
         fi
 
@@ -480,36 +510,24 @@ wait_for_langfuse_http() {
     done
 
     echo "    ✗ Langfuse did not respond in 90s — last logs:"
-    docker logs --tail 80 molecule-core-langfuse-1 2>&1 | sed 's/^/      /'
+    docker logs --tail 80 "$LANGFUSE_CONTAINER" 2>&1 | sed 's/^/      /'
     return 1
 }
 
 # ─────────────────────────────────────────── Langfuse web (trace UI + API)
-# setup.sh brings up the Langfuse deps (clickhouse + langfuse-db-init) but NOT
-# the web app (it lives in docker-compose.yml, whose network ownership
-# conflicts with infra's external net). Run it directly on molecule-core-net
-# with a `langfuse-web` alias so agents resolve it, seeded with a deterministic
-# project + keys. clickhouse password mirrors docker-compose.infra.yml's
-# ${CLICKHOUSE_PASSWORD:-langfuse-dev}; the migration URL embeds it.
+# setup.sh brings up the Langfuse deps (clickhouse + langfuse-db-init) but not
+# the web app. That lives in docker-compose.yml as the ONE Langfuse definition;
+# bring it up from there — parameterized by the exported env above — so this
+# script and plain `docker compose up` cannot drift apart.
 echo "==> Starting Langfuse (trace UI on :${MOLECULE_LANGFUSE_HOST_PORT})"
 wait_for_langfuse_clickhouse_native
-docker rm -f molecule-core-langfuse-1 >/dev/null 2>&1 || true
-if docker run -d --name molecule-core-langfuse-1 --network molecule-core-net \
-  --network-alias langfuse-web -p "127.0.0.1:${MOLECULE_LANGFUSE_HOST_PORT}:3000" \
-  -e DATABASE_URL="postgres://${POSTGRES_USER:-dev}:${POSTGRES_PASSWORD:-dev}@postgres:5432/langfuse" \
-  -e CLICKHOUSE_URL="http://langfuse-clickhouse:8123" \
-  -e CLICKHOUSE_MIGRATION_URL="clickhouse://langfuse:${CLICKHOUSE_PASSWORD:-langfuse-dev}@langfuse-clickhouse:9000" \
-  -e CLICKHOUSE_USER="langfuse" -e CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:-langfuse-dev}" \
-  -e NEXTAUTH_SECRET="${LANGFUSE_SECRET:-changeme-langfuse-secret}" \
-  -e NEXTAUTH_URL="${LANGFUSE_HOST}" -e SALT="${LANGFUSE_SALT:-changeme-langfuse-salt}" \
-  -e TELEMETRY_ENABLED="false" \
-  -e LANGFUSE_INIT_ORG_ID="molecule" -e LANGFUSE_INIT_ORG_NAME="Molecule" \
-  -e LANGFUSE_INIT_PROJECT_ID="molecule-local" -e LANGFUSE_INIT_PROJECT_NAME="Molecule Local" \
-  -e LANGFUSE_INIT_PROJECT_PUBLIC_KEY="${LANGFUSE_PUBLIC_KEY}" \
-  -e LANGFUSE_INIT_PROJECT_SECRET_KEY="${LANGFUSE_SECRET_KEY}" \
-  -e LANGFUSE_INIT_USER_EMAIL="dev@molecule.local" -e LANGFUSE_INIT_USER_NAME="Dev" \
-  -e LANGFUSE_INIT_USER_PASSWORD="dev-langfuse-pw" \
-  langfuse/langfuse@sha256:e7aafd3ccf721821b40f8b2251220b4bb8af5e4877b5c5a8846af5b3318aaf1d >/dev/null 2>&1; then
+# Remove a stale non-compose Langfuse container from pre-unification checkouts;
+# compose refuses to reuse the name otherwise.
+if docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' \
+    "$LANGFUSE_CONTAINER" 2>/dev/null | grep -Fqvx "$COMPOSE_PROJECT_NAME"; then
+    docker rm -f "$LANGFUSE_CONTAINER" >/dev/null 2>&1 || true
+fi
+if docker compose -f "$ROOT/docker-compose.yml" up -d langfuse; then
     echo "    Langfuse container started (first boot ~15-30s)"
 else
     echo "    ✗ Langfuse failed to start"
@@ -517,77 +535,192 @@ else
 fi
 wait_for_langfuse_http
 
-# ─────────────────────────────────────────────── 3. platform
-#
-# Two paths:
-#   (a) `go` is on PATH → run the platform directly via `go run`.
-#       Fast iteration, attaches to /tmp/molecule-platform.log.
-#   (b) `go` is NOT on PATH → fall back to the published platform
-#       container image. Slower first run (image pull) but the script
-#       still works on a fresh dev box without forcing the dev to
-#       install Go just to read logs.
-#
-# The earlier version of this script silently called `go run` and died
-# with `go: not found` on dev boxes where Go wasn't installed; the
-# script's own prerequisite list (line 13-21) said "Go 1.25+" but the
-# user had no signpost between "open the doc" and "command not found
-# at line 111." This branch makes the failure path either succeed
-# (fallback) or fail loud with explicit install guidance.
-
-if command -v go >/dev/null 2>&1; then
-    echo "==> Starting Platform (Go :${PLATFORM_PORT})"
-    cd "$ROOT/workspace-server"
-    # PORT inline (not exported) so the canvas child below doesn't inherit it.
-    PORT="$PLATFORM_PORT" go run ./cmd/server > /tmp/molecule-platform.log 2>&1 &
-    PLATFORM_PID=$!
+# ─────────────────────────────────────────── Dozzle (container log viewer)
+# Dozzle tails EVERY container's stdout via the Docker socket (infra, platform,
+# langfuse, and each ws-<id> workspace runtime) — the container-side complement
+# to logdy's host-process view (section 4b). Resilient: a Dozzle failure must
+# NOT abort the whole dev stack, so warn and carry on rather than exit.
+echo "==> Starting Dozzle (container log viewer on :${DOZZLE_PORT})"
+if docker compose -f "$ROOT/docker-compose.yml" up -d dozzle; then
+    echo "    Dozzle ready — http://127.0.0.1:${DOZZLE_PORT}"
 else
-    echo "==> Go not found on PATH — falling back to docker-compose platform service"
-    echo "    (Install Go 1.25+ for faster iteration: https://go.dev/dl/)"
-    cd "$ROOT"
-    # Bring up just the platform service from docker-compose.yml. infra/setup.sh
-    # already brought up postgres+redis+etc on docker-compose.infra.yml; this
-    # adds the platform container on top. docker-compose.yml already reads
-    # dynamic ports via ${PLATFORM_PUBLISH_PORT}/${PLATFORM_PORT}; publish the
-    # container on the same dynamic host port we chose above so the
-    # wait-for-/health loop (127.0.0.1:$PLATFORM_PORT) matches.
-    export PLATFORM_PORT PLATFORM_PUBLISH_PORT="$PLATFORM_PORT"
-    # Truncate the log once, then APPEND both steps so the --fresh from-scratch
-    # build transcript is preserved above the up output (a bare `>` on the up
-    # would clobber it) while a normal run still starts from an empty log.
-    : > /tmp/molecule-platform.log
-    if [ "$FRESH" -eq 1 ]; then
-        # --fresh: force a from-scratch image first; the shared `up --build` below
-        # is then a fast cache hit rather than a duplicated up + failure handler.
-        echo "    --fresh: rebuilding platform image with --no-cache"
-        docker compose build --no-cache platform >> /tmp/molecule-platform.log 2>&1 || {
-            echo "    ✗ docker compose build --no-cache platform failed — see /tmp/molecule-platform.log"
-            exit 1
-        }
-    fi
-    docker compose up -d --build platform >> /tmp/molecule-platform.log 2>&1 || {
-        echo "    ✗ docker compose up platform failed — see /tmp/molecule-platform.log"
-        echo "    Either install Go 1.25+ (https://go.dev/dl/) and rerun, or fix the docker fallback."
-        exit 1
-    }
-    # PLATFORM_PID is unset on this path; cleanup() handles that with `kill ... 2>/dev/null || true`.
-    PLATFORM_PID=
+    echo "    WARN: Dozzle failed to start — container logs still available via 'docker logs'" >&2
 fi
 
-echo "    Waiting for Platform /health..."
-PLATFORM_READY=0
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
-         21 22 23 24 25 26 27 28 29 30; do
-    if curl -sf "http://127.0.0.1:${PLATFORM_PORT}/health" >/dev/null 2>&1; then
-        echo "    Platform ready (t+${i}s)"
-        PLATFORM_READY=1
-        break
+# ─────────────────────────────────────────────── 3. platform
+#
+# Windows uses the Linux development container by default. Host Go remains
+# available explicitly. Linux/macOS prefer Go, bootstrapping the pinned
+# toolchain if needed, and use Docker if bootstrap is unavailable. In both
+# modes compilation finishes BEFORE the HTTP readiness deadline begins.
+
+# Pinned bootstrap toolchain. Any go >= 1.21 on PATH is also fine as-is:
+# Go's own GOTOOLCHAIN mechanism then auto-fetches the exact version
+# workspace-server/go.mod requires. Refresh procedure (all five lines
+# together): pick the release from https://go.dev/dl/?mode=json and copy
+# its per-platform archive sha256 sums.
+GO_BOOTSTRAP_VERSION="go1.26.5"
+GO_SHA256_DARWIN_ARM64="efb87ff28af9a188d0536ef5d42e63dd52ba8263cd7344a993cc48dd11dedb6a"
+GO_SHA256_DARWIN_AMD64="6231d8d3b8f5552ec6cbf6d685bdd5482e1e703214b120e89b3bf0d7bf1ef725"
+GO_SHA256_LINUX_ARM64="fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49"
+GO_SHA256_LINUX_AMD64="5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
+
+# go_is_usable: go on PATH with major.minor >= 1.21 (GOTOOLCHAIN takes it
+# from there). Unparseable version output = not usable (fail toward
+# bootstrap, which is deterministic).
+go_is_usable() {
+    command -v go >/dev/null 2>&1 || return 1
+    go_ver_mm=$(go version 2>/dev/null | sed -n 's/^go version go\([0-9]*\.[0-9]*\).*/\1/p')
+    [ -n "$go_ver_mm" ] || return 1
+    [ "$(printf '%s\n' "$go_ver_mm" | cut -d. -f1)" -gt 1 ] 2>/dev/null && return 0
+    [ "$(printf '%s\n' "$go_ver_mm" | cut -d. -f1)" -eq 1 ] 2>/dev/null \
+        && [ "$(printf '%s\n' "$go_ver_mm" | cut -d. -f2)" -ge 21 ] 2>/dev/null
+}
+
+# bootstrap_go_toolchain: hermetic per-user Go install. Returns 0 with the
+# toolchain's bin FIRST on PATH, non-zero (with a reason on stderr) when
+# this host can't be bootstrapped — the caller then uses the container
+# fallback. Download + verify + extract happen in a temp dir with an
+# atomic rename at the end, so a killed run never leaves a half-installed
+# toolchain that a later run would trust.
+bootstrap_go_toolchain() {
+    go_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    case "$go_os" in
+        darwin|linux) ;;
+        *) echo "    bootstrap: unsupported OS '$go_os'" >&2; return 1 ;;
+    esac
+    case "$(uname -m)" in
+        arm64|aarch64) go_arch=arm64 ;;
+        x86_64|amd64)  go_arch=amd64 ;;
+        *) echo "    bootstrap: unsupported arch '$(uname -m)'" >&2; return 1 ;;
+    esac
+    case "${go_os}-${go_arch}" in
+        darwin-arm64) go_sha="$GO_SHA256_DARWIN_ARM64" ;;
+        darwin-amd64) go_sha="$GO_SHA256_DARWIN_AMD64" ;;
+        linux-arm64)  go_sha="$GO_SHA256_LINUX_ARM64" ;;
+        linux-amd64)  go_sha="$GO_SHA256_LINUX_AMD64" ;;
+    esac
+
+    go_dest="$HOME/.molecule-ai/toolchains/${GO_BOOTSTRAP_VERSION}"
+    if [ -x "$go_dest/go/bin/go" ]; then
+        PATH="$go_dest/go/bin:$PATH"; export PATH
+        echo "    Using cached hermetic Go toolchain: $go_dest"
+        return 0
+    fi
+
+    go_tarball="${GO_BOOTSTRAP_VERSION}.${go_os}-${go_arch}.tar.gz"
+    go_url="https://go.dev/dl/${go_tarball}"
+    # Stage INSIDE the toolchains dir so the final mv is an atomic same-fs
+    # rename — a killed run leaves only a .stage.* dir (never a half-install
+    # the cache check above would trust), and a later run redoes it cleanly.
+    mkdir -p "$(dirname "$go_dest")" || return 1
+    go_tmp=$(mktemp -d "$(dirname "$go_dest")/.stage.XXXXXX") || return 1
+    echo "==> Go not found — bootstrapping hermetic ${GO_BOOTSTRAP_VERSION} (${go_os}/${go_arch}, ~70MB, one-time)"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 3 -o "$go_tmp/$go_tarball" "$go_url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$go_tmp/$go_tarball" "$go_url"
+    else
+        echo "    bootstrap: neither curl nor wget available" >&2
+        rm -rf "$go_tmp"; return 1
+    fi || { echo "    bootstrap: download failed ($go_url)" >&2; rm -rf "$go_tmp"; return 1; }
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        go_got=$(sha256sum "$go_tmp/$go_tarball" | cut -d' ' -f1)
+    elif command -v shasum >/dev/null 2>&1; then
+        go_got=$(shasum -a 256 "$go_tmp/$go_tarball" | cut -d' ' -f1)
+    else
+        echo "    bootstrap: no sha256 tool (sha256sum/shasum) — refusing unverified toolchain" >&2
+        rm -rf "$go_tmp"; return 1
+    fi
+    if [ "$go_got" != "$go_sha" ]; then
+        echo "    bootstrap: CHECKSUM MISMATCH for $go_tarball (got $go_got) — refusing" >&2
+        rm -rf "$go_tmp"; return 1
+    fi
+
+    mkdir -p "$go_tmp/extract" \
+        && tar -xzf "$go_tmp/$go_tarball" -C "$go_tmp/extract" \
+        && mv "$go_tmp/extract" "$go_dest" \
+        || { echo "    bootstrap: extract/install failed" >&2; rm -rf "$go_tmp"; return 1; }
+    rm -rf "$go_tmp"
+
+    PATH="$go_dest/go/bin:$PATH"; export PATH
+    echo "    Hermetic Go installed: $go_dest (system untouched; delete that dir to remove)"
+    return 0
+}
+
+PLATFORM_MODE=$PLATFORM_REQUESTED_MODE
+if [ "$PLATFORM_MODE" = auto ]; then
+    PLATFORM_MODE=$(dev_default_platform_mode)
+fi
+if [ "$PLATFORM_MODE" = host ] && ! go_is_usable; then
+    bootstrap_go_toolchain || true
+    if ! go_is_usable; then
+        if [ "$PLATFORM_REQUESTED_MODE" = host ]; then
+            echo "Host platform requested but no usable Go toolchain is available." >&2
+            exit 1
+        fi
+        PLATFORM_MODE=docker
+    fi
+fi
+
+: > "$PLATFORM_LOG"
+if [ "$PLATFORM_MODE" = host ]; then
+    echo "==> Building Platform with Go (first build may take several minutes)"
+    cd "$ROOT/workspace-server"
+    PLATFORM_BUILD_DIR=$(mktemp -d "${TMPDIR:-/tmp}/molecule-platform.XXXXXX")
+    PLATFORM_BINARY="$PLATFORM_BUILD_DIR/platform"
+    case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) PLATFORM_BINARY="$PLATFORM_BINARY.exe" ;; esac
+    go build -o "$PLATFORM_BINARY" ./cmd/server >> "$PLATFORM_LOG" 2>&1 &
+    BUILD_PID=$!
+else
+    echo "==> Building Platform in Docker (first build may take several minutes)"
+    cd "$ROOT"
+    export PLATFORM_PORT PLATFORM_PUBLISH_PORT="$PLATFORM_PORT"
+    if [ "$FRESH" -eq 1 ]; then
+        dev_compose_platform build --no-cache platform >> "$PLATFORM_LOG" 2>&1 &
+    else
+        dev_compose_platform build platform >> "$PLATFORM_LOG" 2>&1 &
+    fi
+    BUILD_PID=$!
+fi
+
+build_started=$(date +%s)
+next_progress=$((build_started + 30))
+while kill -0 "$BUILD_PID" 2>/dev/null; do
+    now=$(date +%s)
+    if [ "$now" -ge "$next_progress" ]; then
+        echo "    building platform — $((now - build_started))s elapsed (log: $PLATFORM_LOG)"
+        next_progress=$((now + 30))
     fi
     sleep 1
 done
-if [ "$PLATFORM_READY" -ne 1 ]; then
-    echo "    ✗ Platform did not respond in 30s — check /tmp/molecule-platform.log"
+if ! wait "$BUILD_PID"; then
+    BUILD_PID=
+    echo "    Platform build failed." >&2
+    dev_service_logs host "" "$PLATFORM_LOG"
     exit 1
 fi
+BUILD_PID=
+
+echo "==> Starting Platform ($PLATFORM_MODE :${PLATFORM_PORT})"
+if [ "$PLATFORM_MODE" = host ]; then
+    # Run the built binary directly: cleanup owns the actual server PID.
+    PORT="$PLATFORM_PORT" "$PLATFORM_BINARY" >> "$PLATFORM_LOG" 2>&1 &
+    PLATFORM_PID=$!
+    PLATFORM_ID=$PLATFORM_PID
+else
+    if ! dev_compose_platform up -d --no-deps --no-build platform >> "$PLATFORM_LOG" 2>&1; then
+        echo "    Platform container could not start." >&2
+        dev_service_logs host "" "$PLATFORM_LOG"
+        exit 1
+    fi
+    PLATFORM_ID=$(dev_compose_platform ps -a -q platform)
+    docker logs --follow "$PLATFORM_ID" >> "$PLATFORM_LOG" 2>&1 &
+    PLATFORM_LOG_PID=$!
+fi
+dev_wait_http Platform "http://127.0.0.1:${PLATFORM_PORT}/health" \
+    "$PLATFORM_MODE" "$PLATFORM_ID" "$PLATFORM_LOG" 180
 
 # ─────────────────────────────────────────────── 4. canvas
 
@@ -600,27 +733,62 @@ fi
 # Invoke Next directly with the dynamic port — package.json's dev script pins
 # `-p 3000`, which would override a PORT env var. NEXT_PUBLIC_* / CORS_ORIGINS
 # were exported above so the browser bundle and the platform's CORS agree.
-./node_modules/.bin/next dev --turbopack -p "$CANVAS_PORT" > /tmp/molecule-canvas.log 2>&1 &
+node ./node_modules/next/dist/bin/next dev --turbopack -p "$CANVAS_PORT" > "$CANVAS_LOG" 2>&1 &
 CANVAS_PID=$!
 
-echo "    Waiting for Canvas HTTP 200..."
-CANVAS_READY=0
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
-         21 22 23 24 25 26 27 28 29 30; do
-    code=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:${CANVAS_PORT}/" 2>/dev/null || echo "0")
-    if [ "$code" = "200" ]; then
-        echo "    Canvas ready (t+${i}s)"
-        CANVAS_READY=1
-        break
-    fi
-    sleep 1
-done
-if [ "$CANVAS_READY" -ne 1 ]; then
-    echo "    ✗ Canvas did not respond in 30s — check /tmp/molecule-canvas.log"
+# ─────────────────────────────────────────── 4b. host log viewer (logdy)
+#
+# Platform (`go run ./cmd/server`) and Canvas (`next dev`) above are HOST
+# processes, not containers, so their output lands in
+# /tmp/molecule-platform.log / /tmp/molecule-canvas.log — Dozzle (:3110)
+# only tails container logs via the Docker socket and can never see them.
+#
+# Surface these with logdy (https://logdy.dev — single static binary) run
+# as a HOST process, not as an added docker-compose service bind-mounting
+# /tmp: on Docker Desktop for Windows that bind mount is fragile in two
+# independent ways that don't show up as an obvious error —
+#   1. Docker Desktop only shares WINDOWS DRIVE paths (C:/Users/... or
+#      //c/Users/...) into its WSL2/Hyper-V backend. A bare `/tmp:...`
+#      compose volume resolves inside the Desktop VM's OWN root filesystem,
+#      not this host's /tmp — a different, unrelated directory — so the
+#      mount is either empty or errors, never the files we want.
+#   2. Even fixed up, Git-Bash/MSYS rewrites POSIX-looking path arguments
+#      before they reach the docker CLI, which can mangle a manually-typed
+#      bind-mount source further.
+# Running logdy as a plain host process sidesteps both: it opens the files
+# by path on the SAME host that wrote them, no VM/path-translation layer
+# involved, and the exact same invocation works on macOS/Linux too.
+#
+# Soft-dependency (same posture as jq in infra/scripts/setup.sh): skip with
+# install instructions if it's not on PATH rather than failing the script.
+if command -v logdy >/dev/null 2>&1; then
+    echo "==> Starting logdy log viewer (:${LOGDY_PORT}) — platform + canvas host logs"
+    logdy follow "$PLATFORM_LOG" "$CANVAS_LOG" \
+        --full-read -p "$LOGDY_PORT" > "$LOGDY_LOG" 2>&1 &
+    LOGDY_PID=$!
+else
+    echo "==> logdy not found on PATH — skipping live log viewer for host logs"
+    echo "    Install: curl -sSL https://logdy.dev/install.sh | sh   (https://logdy.dev)"
+    echo "    Logs remain readable at $PLATFORM_LOG and $CANVAS_LOG"
+fi
+
+dev_wait_http Canvas "http://127.0.0.1:${CANVAS_PORT}/" host "$CANVAS_PID" "$CANVAS_LOG" 180
+if ! dev_service_alive "$PLATFORM_MODE" "$PLATFORM_ID"; then
+    echo "    Platform exited while Canvas was starting." >&2
+    dev_service_logs "$PLATFORM_MODE" "$PLATFORM_ID" "$PLATFORM_LOG"
     exit 1
 fi
 
 # ─────────────────────────────────────────────── 5. readiness banner
+
+if [ -n "${LOGDY_PID:-}" ]; then
+    LOGS_LINE="  Logs:      http://127.0.0.1:${LOGDY_PORT}   (live tail: platform + canvas host logs)"
+else
+    LOGS_LINE="  Logs:      $PLATFORM_LOG · $CANVAS_LOG"
+fi
+# Dozzle sees every CONTAINER's logs (infra + platform + langfuse + each
+# ws-<id> workspace); logdy above covers the HOST processes. Shown together.
+DOZZLE_LINE="  Dozzle:    http://127.0.0.1:${DOZZLE_PORT}   (live tail: ALL container logs)"
 
 cat <<EOF
 
@@ -639,8 +807,9 @@ cat <<EOF
   MinIO:     127.0.0.1:${MOLECULE_MINIO_HOST_PORT} (S3 API, bucket: ${MOLECULE_WORKSPACE_DATA_BUCKET})
 
   Auth:      fail-closed — canvas uses the dev ADMIN_TOKEN (see .env)
-  Logs:      /tmp/molecule-platform.log · /tmp/molecule-canvas.log
-             docker logs molecule-core-langfuse-1   (trace sink)
+${LOGS_LINE}
+${DOZZLE_LINE}
+             docker logs ${LANGFUSE_CONTAINER}   (trace sink)
              docker logs molecule-core-minio-1      (object store)
 
   Ports are dynamic: the conventional port is used when free, else a free
@@ -662,4 +831,18 @@ cat <<EOF
 ═══════════════════════════════════════════════════════════
 EOF
 
-wait
+# Keep supervising both required services after readiness. Waiting for all
+# children would hide a dead platform while Canvas/logdy continued running.
+while :; do
+    if ! dev_service_alive "$PLATFORM_MODE" "$PLATFORM_ID"; then
+        echo "Platform stopped." >&2
+        dev_service_logs "$PLATFORM_MODE" "$PLATFORM_ID" "$PLATFORM_LOG"
+        exit 1
+    fi
+    if ! dev_service_alive host "$CANVAS_PID"; then
+        echo "Canvas stopped." >&2
+        dev_service_logs host "$CANVAS_PID" "$CANVAS_LOG"
+        exit 1
+    fi
+    sleep 2
+done

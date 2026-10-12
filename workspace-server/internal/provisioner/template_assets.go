@@ -4,10 +4,9 @@ package provisioner
 //
 // This is the "generic, non-secret asset channel" the RFC proposes:
 // a workspace's template assets (config.yaml + prompts/) are
-// materialized from a template identity (resolved by the caller —
-// the template repo path, a cached ref, etc.) rather than forced
-// through the AWS Secrets Manager config bundle path that caps at
-// cpConfigFilesMaxBytes (256 KiB).
+// materialized from a template identity (resolved by the caller — the template
+// repo path, a cached ref, etc.) through a distinct TemplateAssets wire field,
+// rather than the smaller ConfigFiles compatibility field.
 //
 // agent-skills are NO LONGER carried on this channel (RFC#2843 #32):
 // skills are PLUGINS now, installed dynamically post-online via the
@@ -35,11 +34,9 @@ package provisioner
 // Transport split (Reviewer-CR2 addendum on the prior head):
 // fetched assets go to a SEPARATE wire field (TemplateAssets on
 // cpProvisionRequest) rather than being merged into ConfigFiles.
-// ConfigFiles is the bundle the CP stages through AWS Secrets
-// Manager — the wrong layer for non-secret assets per the
-// core-devops 10:13 SM-inventory RCA. The split lets a future CP
-// route TemplateAssets through a non-secret channel (Gitea asset
-// pin, S3 non-secret bucket, etc.) without a wire-shape change.
+// ConfigFiles retains a smaller compatibility budget. The split lets the CP
+// route TemplateAssets through its non-secret, provider-specific materializer
+// without a wire-shape change.
 //
 // Concurrency: the fetcher's Load is called from prepareProvisionContext,
 // which serializes per-workspace (the existing per-workspace

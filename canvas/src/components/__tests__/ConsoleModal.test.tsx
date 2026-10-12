@@ -49,7 +49,7 @@ describe("ConsoleModal", () => {
     render(<ConsoleModal workspaceId="ws-1" open={true} onClose={() => {}} />);
     await waitFor(() => {
       const err = screen.getByTestId("console-error");
-      expect(err.textContent).toMatch(/No EC2 instance found/i);
+      expect(err.textContent).toMatch(/No workspace host found/i);
     });
   });
 
@@ -95,7 +95,7 @@ describe("ConsoleModal — WCAG 2.1 dialog accessibility", () => {
     const labelledBy = dialog.getAttribute("aria-labelledby");
     expect(labelledBy).toBeTruthy();
     const titleEl = document.getElementById(labelledBy!);
-    expect(titleEl?.textContent?.trim()).toBe("EC2 console output");
+    expect(titleEl?.textContent?.trim()).toBe("Workspace boot logs");
   });
 
   it("backdrop div has aria-label for screen readers (WCAG 2.4.6)", async () => {
@@ -111,7 +111,7 @@ describe("ConsoleModal — WCAG 2.1 dialog accessibility", () => {
     render(<ConsoleModal workspaceId="ws-1" open={true} onClose={() => {}} />);
     const alert = await waitFor(() => screen.getByRole("alert"));
     expect(alert).toBeTruthy();
-    expect(alert.textContent).toMatch(/No EC2 instance found/i);
+    expect(alert.textContent).toMatch(/No workspace host found/i);
   });
 
   it("Close button has accessible name via aria-label", async () => {

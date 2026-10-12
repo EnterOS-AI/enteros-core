@@ -36,8 +36,8 @@
 #
 # Env contract:
 #   BASE                      default http://localhost:8080
-#   MOLECULE_ADMIN_TOKEN      platform admin bearer IF the local stack sets
-#                             ADMIN_TOKEN (devmode fail-open if unset). Used by
+#   MOLECULE_ADMIN_TOKEN      required platform admin bearer matching
+#                             ADMIN_TOKEN. Used by
 #                             _lib.sh helpers for admin-gated GET/DELETE.
 #   E2E_CONCIERGE_ONLINE_SECS default 300 (local boot budget)
 #   E2E_AGENT_ACT_SECS        default 300 (LLM think+tool-call budget)
@@ -71,7 +71,8 @@ fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 skip_loud() { echo "[$(date +%H:%M:%S)] ⏭️  SKIP (local path not runnable): $*" >&2; exit 0; }
 
-# Admin-auth curl args (if the local stack set ADMIN_TOKEN; else empty / fail-open).
+e2e_require_admin_token
+# Admin-auth curl args for list and cleanup.
 ADMIN_AUTH=()
 e2e_admin_auth_args ADMIN_AUTH
 

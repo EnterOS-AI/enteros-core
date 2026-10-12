@@ -2,25 +2,54 @@
 include:
   - docker-compose.infra.yml
 
+# Bounded json-file logging shared by the long-running services below. Dozzle
+# reads container stdout via the json-file driver, so keeping that driver (with
+# rotation) means every container's logs stay COMPLETE in Dozzle AND capped on
+# disk at max 3 × 10m per container. Referenced with `logging: *default-logging`.
+# NOTE: YAML anchors do not cross the `include:` boundary — this applies only to
+# services defined in THIS file; infra services set their own in
+# docker-compose.infra.yml if desired.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   # --- Observability ---
-  # digest-pinned 2026-05-10 (sha256:e7aafd3ccf721821b40f8b2251220b4bb8af5e4877b5c5a8846af5b3318aaf1d, linux/amd64)
+  # Digest pins in this file are MULTI-ARCH manifest-list digests (amd64+arm64),
+  # never platform-specific image digests — see the note in
+  # docker-compose.infra.yml for the refresh procedure.
+  #
+  # This service is the ONE definition of the Langfuse web app: dev-start.sh
+  # brings it up via `docker compose up -d langfuse` (dynamic port + generated
+  # keys arrive via the exported env), and a plain `docker compose up` gets it
+  # with the defaults below.
   langfuse:
-    image: langfuse/langfuse@sha256:e7aafd3ccf721821b40f8b2251220b4bb8af5e4877b5c5a8846af5b3318aaf1d
+    image: langfuse/langfuse:2.95.11@sha256:85c278dcab96c15db94191a5c1664f85aba2d7fb6771a00e99681c902c4b7015
+    logging: *default-logging
     depends_on:
       langfuse-clickhouse:
         condition: service_healthy
       langfuse-db-init:
         condition: service_completed_successfully
     environment:
+      # Next.js standalone binds the interface named by HOSTNAME; without this
+      # it binds only the container-hostname eth0 address and nothing listens
+      # on loopback (same fix as canvas/Dockerfile).
+      HOSTNAME: "0.0.0.0"
       DATABASE_URL: postgres://${POSTGRES_USER:-dev}:${POSTGRES_PASSWORD:-dev}@postgres:5432/langfuse
       # Langfuse v2 expects the HTTP interface (port 8123). The previous
       # clickhouse://...:9000 native-protocol URL is rejected with
       # "ClickHouse URL protocol must be either http or https".
       CLICKHOUSE_URL: http://langfuse-clickhouse:8123
-      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      # Credentials embedded: the bundled migrate binary reads only the URL,
+      # not CLICKHOUSE_USER/PASSWORD. Password default mirrors
+      # docker-compose.infra.yml's langfuse-clickhouse service — the two MUST
+      # stay in lockstep or migrations fail auth.
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse:${CLICKHOUSE_PASSWORD:-langfuse-dev}@langfuse-clickhouse:9000
       CLICKHOUSE_USER: langfuse
-      CLICKHOUSE_PASSWORD: langfuse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-langfuse-dev}
       NEXTAUTH_SECRET: ${LANGFUSE_SECRET:-changeme-langfuse-secret}
       NEXTAUTH_URL: ${LANGFUSE_HOST:-http://127.0.0.1:3001}
       SALT: ${LANGFUSE_SALT:-changeme-langfuse-salt}
@@ -41,9 +70,14 @@ services:
     ports:
       - "127.0.0.1:${MOLECULE_LANGFUSE_HOST_PORT:-3001}:3000"
     networks:
-      - molecule-core-net
+      molecule-core-net:
+        # Workspace agents resolve the trace endpoint as langfuse-web.
+        aliases:
+          - langfuse-web
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/public/health || exit 1"]
+      # 127.0.0.1, not localhost: busybox wget resolves localhost to [::1]
+      # first, and the app (bound 0.0.0.0 via HOSTNAME above) is IPv4-only.
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:3000/api/public/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -62,6 +96,7 @@ services:
       # already uses context=. , this aligns local with CI.
       context: .
       dockerfile: workspace-server/Dockerfile
+    logging: *default-logging
     depends_on:
       postgres:
         condition: service_healthy
@@ -73,15 +108,13 @@ services:
       PORT: "${PLATFORM_PORT:-8080}"
       PLATFORM_URL: "http://platform:${PLATFORM_PORT:-8080}"
       # Container network namespace is already isolated; "all interfaces"
-      # inside the container = the bridge interface only. The fail-open
-      # default (127.0.0.1) would block host-to-container access.
+      # inside the container = the bridge interface only. The local-process
+      # loopback default (127.0.0.1) would block host-to-container access.
       BIND_ADDR: "${BIND_ADDR:-0.0.0.0}"
-      # Default MOLECULE_ENV=development so the WorkspaceAuth / AdminAuth
-      # middleware fail-open path activates when ADMIN_TOKEN is unset —
-      # otherwise the canvas (which runs without a bearer in pure local
-      # dev) gets 401 "missing workspace auth token" on every request.
-      # Override to "production" for SaaS/staged deploys; in those modes
-      # ADMIN_TOKEN must also be set or every request rejects.
+      # MOLECULE_ENV controls local conveniences, not authentication. Auth
+      # fails closed in every environment; configure ADMIN_TOKEN for this
+      # standalone stack and pass the matching local-only Canvas build value.
+      # Production/SaaS uses verified sessions and must not publish that secret.
       MOLECULE_ENV: "${MOLECULE_ENV:-development}"
       # Self-hosted: the platform agent (concierge, the org root) is seeded
       # UNCONDITIONALLY on boot when MOLECULE_ORG_ID is unset — no opt-in flag
@@ -129,18 +162,13 @@ services:
       GITHUB_APP_ID: "${GITHUB_APP_ID:-}"
       GITHUB_APP_INSTALLATION_ID: "${GITHUB_APP_INSTALLATION_ID:-}"
       GITHUB_APP_PRIVATE_KEY_FILE: "/secrets/github-app.pem"
-      # ADMIN_TOKEN — required to fully close issue #684 (AdminAuth bearer bypass, PR #729).
-      # When set, only this exact value is accepted on all /admin/* and /approvals/* routes;
-      # workspace bearer tokens are no longer accepted as admin credentials.
-      # Unset (default) → backward-compat fallback: any valid workspace token passes AdminAuth
-      # (same behaviour as before PR #729, still vulnerable to #684).
+      # ADMIN_TOKEN is the bootstrap/break-glass admin credential. Verified CP
+      # sessions and org API tokens are also accepted; when ADMIN_TOKEN is set,
+      # workspace bearer tokens are rejected on admin routes. Leaving it unset
+      # retains the deprecated workspace-token fallback after bootstrap.
       # Generate: openssl rand -base64 32
-      # Store in fly secrets / deployment env — NEVER commit the actual value.
+      # Store in the deployment secret manager — NEVER commit the actual value.
       ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
-      # Workspace hibernation default (issue #724 / PR #724). Sets platform-wide idle
-      # threshold (minutes); per-workspace column takes precedence. Leave empty to
-      # rely on per-workspace config only (current behaviour — global-default code pending).
-      HIBERNATION_IDLE_MINUTES: "${HIBERNATION_IDLE_MINUTES:-}"
       # Plugin supply chain hardening (issue #768 / PR #775). Never set in production.
       PLUGIN_ALLOW_UNPINNED: "${PLUGIN_ALLOW_UNPINNED:-}"
       # Force ImagePull/ContainerCreate to request linux/amd64 manifests
@@ -152,24 +180,42 @@ services:
       # Override to "" or another platform when the templates start shipping
       # multi-arch (then this hardcoded amd64 becomes unnecessary).
       MOLECULE_IMAGE_PLATFORM: "${MOLECULE_IMAGE_PLATFORM:-linux/amd64}"
-      # GHCR auth for the workspace-images refresh endpoint
-      # (POST /admin/workspace-images/refresh). When set, the platform's
-      # Docker SDK ImagePull on private workspace-template-* images
-      # succeeds without per-host `docker login`. GHCR_USER is the GitHub
-      # username; GHCR_TOKEN is a fine-grained PAT with `read:packages`
-      # on the Molecule-AI org. Both unset → endpoint can only pull
-      # public images (current state for all 8 templates).
+      # Unset keeps the normal local clone-and-build path. Set this to a real
+      # registry prefix only for a registry-backed self-host; it also enables
+      # the explicit POST /admin/workspace-images/refresh maintenance endpoint.
+      MOLECULE_IMAGE_REGISTRY: "${MOLECULE_IMAGE_REGISTRY:-}"
+      # Legacy-named optional basic-auth inputs for that endpoint. They are
+      # sent to the host selected above; the current Gitea template images are
+      # anonymously pullable, so both normally remain unset.
       GHCR_USER: "${GHCR_USER:-}"
       GHCR_TOKEN: "${GHCR_TOKEN:-}"
-      # Auto-refresh workspace-template-* images. The watcher polls GHCR
-      # every 5 min; when a digest moves, it pulls and force-recreates any
-      # matching ws-* containers (existing /admin/workspace-images/refresh
-      # logic). Closes the runtime CD chain: merge → containers running
-      # new code, no operator step. Default ON for local dev because that's
-      # where the runtime → ws iteration loop is tightest. Set to "false"
-      # if you don't want the platform to mutate ws-* containers behind
-      # your back during a long-running test.
-      IMAGE_AUTO_REFRESH: "${IMAGE_AUTO_REFRESH:-true}"
+      # Langfuse tracing (optional, OFF unless keys are supplied).
+      #
+      # THIS FILE IS WHERE `langfuse-web` IS TRUE. The alias exists because the
+      # langfuse service above declares it on molecule-core-net, and it resolves
+      # in this topology and no other — on the k8s fleet there is no such
+      # Service in any namespace. So the container-network trace endpoint is
+      # named HERE rather than compiled into the provisioner as everyone's
+      # fallback: appendWorkspaceLangfuseEnv has no default host, precisely
+      # because a workspace on a substrate without this alias then retried an
+      # OTLP export against an unresolvable name forever (22,224 error lines in
+      # one tenant over 24h).
+      #
+      # The keys default to empty, so a plain `docker compose up` still boots
+      # untraced — pass real ones (or run scripts/dev-start.sh, which seeds the
+      # deterministic local pair) to turn tracing on.
+      MOLECULE_WORKSPACE_LANGFUSE_HOST: "${MOLECULE_WORKSPACE_LANGFUSE_HOST:-http://langfuse-web:3000}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
+      # The platform reader is on the Docker network; LANGFUSE_HOST in the
+      # host environment is the browser URL used by NEXTAUTH_URL above.
+      LANGFUSE_HOST: "http://langfuse-web:3000"
+      MOLECULE_OBJECT_STORE_BACKEND: "${MOLECULE_OBJECT_STORE_BACKEND:-minio}"
+      MOLECULE_OBJECT_STORE_REGION: "${MOLECULE_OBJECT_STORE_REGION:-us-east-1}"
+      MOLECULE_WORKSPACE_DATA_ENDPOINT: "${MOLECULE_WORKSPACE_DATA_ENDPOINT:-http://minio:9000}"
+      MOLECULE_WORKSPACE_DATA_BUCKET: "${MOLECULE_WORKSPACE_DATA_BUCKET:-molecule-workspace-data}"
+      MOLECULE_WORKSPACE_DATA_ACCESS_KEY_ID: "${MOLECULE_WORKSPACE_DATA_ACCESS_KEY_ID:-${MINIO_ROOT_USER:-molecule-dev-minio}}"
+      MOLECULE_WORKSPACE_DATA_SECRET_ACCESS_KEY: "${MOLECULE_WORKSPACE_DATA_SECRET_ACCESS_KEY:-${MINIO_ROOT_PASSWORD:-molecule-dev-minio-password}}"
     volumes:
       - ./workspace-configs-templates:/configs
       # NOTE: the empty host ./org-templates is intentionally NOT mounted over
@@ -186,10 +232,9 @@ services:
       # Per-role persona credentials (molecule-core#242 local surface).
       # Sourced at workspace creation time by org_import.go::loadPersonaEnvFile
       # when a workspace.yaml carries `role: <name>`. The host-side dir is
-      # populated by the operator-host bootstrap kit (28 dev-tree personas);
-      # /etc/molecule-bootstrap/personas is the in-container path the
-      # platform expects (matches the prod tenant-EC2 path so the same code
-      # works in both modes).
+      # populated from this machine's domain-based agent setup;
+      # /etc/molecule-bootstrap/personas is the legacy in-container path the
+      # platform still reads in local-compose mode.
       #
       # Read-only mount — workspace-server only reads, never writes here.
       # If the host dir is empty/missing the platform's loadPersonaEnvFile
@@ -204,25 +249,24 @@ services:
     healthcheck:
       # Plain GET — `--spider` would issue HEAD, which returns 404 because
       # /health is registered as GET only.
-      test: ["CMD-SHELL", "wget -qO /dev/null --tries=1 http://localhost:${PLATFORM_PORT:-8080}/health || exit 1"]
+      test: ["CMD-SHELL", "wget -qO /dev/null --tries=1 --timeout=2 http://127.0.0.1:${PLATFORM_PORT:-8080}/health || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 10
 
   # --- Canvas ---
   canvas:
-    # The publish-canvas-image CI workflow runs an ORDERED deploy (core#2226):
-    # build → push :staging-<sha> + :staging-latest → (after green main CI)
-    # re-point :latest to the verified :staging-<sha> by digest. So both tags
-    # below resolve to a CI-green, reproducible build, never a raw/red one.
+    # The publish-canvas-image CI workflow currently performs advisory candidate
+    # publication (internal#1038): it writes and verifies :staging-<sha>,
+    # :staging-latest, and :sha-<short-sha>. It deliberately leaves :latest and
+    # live targets untouched while the fail-closed publisher is soaked on main.
     #
-    # Reproducible deploy: pin CANVAS_IMAGE_TAG to the immutable per-commit tag
-    # the ordered deploy produced, e.g.
+    # Reproducible local/host rollout: pin CANVAS_IMAGE_TAG to the immutable
+    # per-commit tag the publication workflow produced, e.g.
     #   CANVAS_IMAGE_TAG=staging-<sha> docker compose pull canvas && docker compose up -d canvas
-    # This makes a tenant/host deploy reproducible (resolves the standing
-    # `TODO: pin canvas ECR image digest`). Unset it and the default `latest`
-    # is the prod-blessed tag the ordered deploy keeps pointed at the last
-    # green build — still deterministic vs. the old raw `:latest`.
+    # This makes a tenant/host rollout reproducible. Unset it and compose still
+    # selects the independently managed mutable `latest`; the candidate workflow
+    # neither updates that tag nor proves production is serving any digest.
     #
     # To pin by content digest instead of tag (fully immutable), resolve the
     # digest for a tag from our registry, e.g.
@@ -233,17 +277,21 @@ services:
     #
     # Registry: OUR OWN container registry (the Gitea registry). Pull auth is a
     # standard `docker login registry.moleculesai.app` with a Gitea PAT
-    # (GITEA_USER/GITEA_TOKEN) — no AWS/ECR credentials required. The image is
-    # overridable for a mirror via MOLECULE_CANVAS_IMAGE (mirrors the SSOT var
-    # the redeploy workflows already read); default is our registry.
+    # (GITEA_USER/GITEA_TOKEN). Local Compose keeps its established
+    # MOLECULE_CANVAS_IMAGE environment override; Gitea publishers/redeploys use
+    # the repository variable MOLECULE_CANVAS_APP_IMAGE. Both default to the
+    # same canonical registry path.
     # Local dev keeps working via the `build:` context below (docker compose build canvas).
     image: ${MOLECULE_CANVAS_IMAGE:-registry.moleculesai.app/molecule-ai/canvas}:${CANVAS_IMAGE_TAG:-latest}
+    logging: *default-logging
     build:
       context: ./canvas
       dockerfile: Dockerfile
       args:
         NEXT_PUBLIC_PLATFORM_URL: ${NEXT_PUBLIC_PLATFORM_URL:-http://localhost:${PLATFORM_PUBLISH_PORT:-8080}}
         NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:${PLATFORM_PUBLISH_PORT:-8080}/ws}
+        # Standalone/local compatibility only. This becomes public browser JS;
+        # never use a production tenant ADMIN_TOKEN as this build argument.
         NEXT_PUBLIC_ADMIN_TOKEN: ${ADMIN_TOKEN:-}
         # SHA surfaced at /api/buildinfo (core#2235). CI passes the real merge
         # SHA via the publish-canvas-image workflow build-args; local compose
@@ -281,10 +329,13 @@ services:
   # And use model names from infra/litellm_config.yml (e.g. "claude-opus-4-5",
   # "gpt-4o", "openrouter/deepseek-r1", "ollama/llama3.2").
   # Edit infra/litellm_config.yml to add/remove providers and models.
-  # digest-pinned 2026-05-10 (sha256:7c311546c25e7bb6e8cafede9fcd3d0d622ac636b5c9418befaa32e85dfb0186)
-  # Refresh: curl -sI https://ghcr.io/v2/berriai/litellm/manifests/main-latest (Docker-Content-Digest header)
+  # Re-pinned 2026-07-17: the 2026-05-10 pin used a wrong repo path
+  # (berriai/litellm/main-latest) and its digest had been garbage-collected
+  # upstream — unpullable on any fresh machine. main-latest is a moving tag, so
+  # this digest is a newer litellm than the old pin; refresh deliberately with:
+  # docker buildx imagetools inspect ghcr.io/berriai/litellm:main-latest
   litellm:
-    image: ghcr.io/berriai/litellm/main-latest@sha256:7c311546c25e7bb6e8cafede9fcd3d0d622ac636b5c9418befaa32e85dfb0186
+    image: ghcr.io/berriai/litellm:main-latest@sha256:177c71b596e3290798adec693528a4ed043fe47dbe219f5f71d2bc3750c85061
     profiles:
       - multi-provider
     ports:
@@ -315,10 +366,11 @@ services:
   #   docker compose exec ollama ollama pull qwen2.5-coder:7b
   # Then set MODEL_PROVIDER=ollama:llama3.2 in your workspace config.yaml
   # Workspace agents reach Ollama at http://ollama:11434 (internal Docker network).
-  # digest-pinned 2026-05-10 (sha256:90bd8ed1ad1853fbfb1ef5835f9d7a24fe890e05ace521e2d8d7a6f56bb667dd, linux/amd64)
-  # Refresh: curl -s https://hub.docker.com/v2/repositories/ollama/ollama/tags/latest | python3 -c "import json,sys; ..."
+  # Re-pinned 2026-07-17 (old pin was amd64-only). latest is a moving tag, so
+  # this is a newer ollama than the old pin; refresh deliberately with:
+  # docker buildx imagetools inspect ollama/ollama:latest
   ollama:
-    image: ollama/ollama@sha256:90bd8ed1ad1853fbfb1ef5835f9d7a24fe890e05ace521e2d8d7a6f56bb667dd
+    image: ollama/ollama:latest@sha256:6345fbc18bd73a1e16404be681dbc6fd291a027cab43ed541abe78c4c81051b0
     profiles:
       - local-models
     ports:
@@ -334,6 +386,27 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+
+  # Dozzle — lightweight real-time log viewer for EVERY container on the
+  # daemon: each ws-<id> workspace runtime, all infra, tenants. Reads the
+  # Docker socket read-only; no DB, no agents, no config. Single-tenant
+  # observability without a Loki/Grafana stack. UI: http://127.0.0.1:3110.
+  # No DOZZLE_FILTER on purpose — show everything so nothing is hidden.
+  dozzle:
+    image: amir20/dozzle:latest@sha256:bc1ee4ba8d66c7fc0d03823a78486165fb219809f79eaf54cecf3114d647ab14
+    container_name: molecule-dozzle
+    logging: *default-logging
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "127.0.0.1:${DOZZLE_PORT:-3110}:8080"
+    environment:
+      DOZZLE_NO_ANALYTICS: "true"
+      # Keep more scrollback than the default so a full boot sequence is visible.
+      DOZZLE_TAILSIZE: "1000"
+    networks:
+      - molecule-core-net
+    restart: unless-stopped
 
 networks:
   molecule-core-net:

@@ -62,7 +62,7 @@ func integrationDB_EnsureLookup(t *testing.T) *sql.DB {
 // TestIntegration_PlatformRootLookupEnumSafe proves four properties of the
 // production platform-root lookup against a real Postgres:
 //
-//  1. the OLD COALESCE(status, '') shape fails at parse time on this schema
+//  1. the OLD COALESCE(status, ”) shape fails at parse time on this schema
 //     (the 8cd393187 regression — this sub-check is what would have caught it);
 //  2. the production query with ZERO matching rows scans as sql.ErrNoRows,
 //     not a pq parse error;

@@ -18,9 +18,9 @@ import { RequestsInbox, type RequestRow } from "../RequestsInbox";
 import { showToast } from "@/components/Toaster";
 
 const { mockApiGet, mockApiPost, mockFetchSession, mockSubscribe } = vi.hoisted(() => ({
-  mockApiGet: vi.fn<(args: unknown[]) => Promise<unknown>>(),
-  mockApiPost: vi.fn<(args: unknown[]) => Promise<unknown>>(),
-  mockFetchSession: vi.fn<(args: unknown[]) => Promise<unknown>>(),
+  mockApiGet: vi.fn<(path: string) => Promise<unknown>>(),
+  mockApiPost: vi.fn<(path: string, body?: unknown) => Promise<unknown>>(),
+  mockFetchSession: vi.fn<() => Promise<unknown>>(),
   mockSubscribe: vi.fn(() => () => {}),
 }));
 

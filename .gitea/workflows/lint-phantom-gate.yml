@@ -1,4 +1,14 @@
-# lint-phantom-gate — Guard F (regression-prevention-guards.md §Guard F).
+# lint-phantom-gate — Guard F (regression-prevention-guards.md §Guard F),
+# plus Guard G (disabled PR emitters) and Guard S (skippable enforced gates).
+#
+# The three answer three different ways an ENFORCED required context stops
+# being a gate while the board still reads green:
+#   Guard F — its producer WORKFLOW is toggled off, so it never posts.
+#   Guard G — a DISABLED workflow still fires on PR events, posting statuses
+#             that cannot be rerun (wedge).
+#   Guard S — its producer JOB is gone, or the job can be `skipped` because
+#             something in its `needs:` closure carries a job-level `if:`.
+#             `["*"]` branch protection treats `skipped` as PASSING.
 #
 # The META-guard that guards the gates. A `.gitea/required-contexts.txt` entry
 # declared ENFORCED (merge-blocking) whose PRODUCER workflow is toggled off
@@ -54,8 +64,8 @@
 # (`--phantom-gate-lint`) with fail-before/pass-after unit tests in
 # .gitea/scripts/tests/test_phantom_gate_lint.py.
 #
-# IMPORTANT — Gitea parser quirk (feedback_gitea_workflow_dispatch_inputs_unsupported):
-# do NOT add an `inputs:` block to `workflow_dispatch:`.
+# IMPORTANT — repository flat-dispatch policy: do NOT add an `inputs:` block
+# to `workflow_dispatch:` without a coordinated policy/caller migration.
 
 name: lint-phantom-gate
 
@@ -64,13 +74,23 @@ on:
   # phantom in a PR diff: the enforced-contexts SSOT, any workflow file (a
   # rename/delete of a producer is a P2 phantom), the detector itself, and this
   # regression test. Under the `[*]` all-green BP a red here blocks the PR.
+  # PATHS FILTER REMOVED 2026-07-14.
+  #
+  # Guards F and G do not read the PR's diff — they read repo-GLOBAL state: the
+  # enforced-contexts SSOT and, critically, the Gitea Actions **workflow states**
+  # (active / disabled_manually), which are changed through the API or the web UI
+  # and therefore change WITHOUT ANY COMMIT AT ALL.
+  #
+  # A paths filter on a guard whose input is out-of-band state is a guard that
+  # cannot fire when it matters. Someone disables a workflow in the UI; every open
+  # PR is now wedgeable by an unrerunnable status; and this lint stays silent until
+  # somebody happens to touch a file under .gitea/. The condition it detects is
+  # global, so its trigger must be global.
+  #
+  # Cost is one fast Actions-API read per PR. That is the correct price for a gate
+  # that tells a PR it is about to be wedged BEFORE it is wedged.
   pull_request:
     types: [opened, synchronize, reopened]
-    paths:
-      - '.gitea/required-contexts.txt'
-      - '.gitea/workflows/**'
-      - '.gitea/scripts/ci-required-drift.py'
-      - '.gitea/scripts/tests/test_phantom_gate_lint.py'
   push:
     branches: [main]
   workflow_dispatch:
@@ -108,6 +128,31 @@ jobs:
       # succeeds.
       - name: Install PyYAML
         run: python -m pip install --quiet 'PyYAML==6.0.2'
+
+      # Guard S — runs FIRST and needs NO credentials.
+      #
+      # Guard F proves an ENFORCED context's producer WORKFLOW is active.
+      # Guard S proves the context can actually REACH A TERMINAL, NON-SKIPPED
+      # status: its producer JOB still exists, and no job in that job's
+      # transitive `needs:` closure carries a job-level `if:` (a false `if:`
+      # makes the job `skipped`, and Gitea does not start a dependent whose
+      # `needs:` was skipped — the skip propagates to the enforced context).
+      #
+      # Why that matters: branch protection here is
+      # `status_check_contexts: ["*"]`, which treats `skipped` as PASSING and
+      # cannot require a context that never posts. gitea-merge-queue.py is the
+      # only thing that fail-closes on `skipped` — and it performs a small
+      # minority of merges; everything merged through the UI/API is gated by
+      # `["*"]` alone. So a skippable required gate is a gate that enforces
+      # nothing on most merges.
+      #
+      # Placed BEFORE the Infisical fetch on purpose: Guard S reads only
+      # checked-in files, so an Infisical/KMS outage must not be able to stop
+      # it from running.
+      - name: Run Guard S — enforced gates must not be able to post `skipped`
+        env:
+          ENFORCED_CONTEXTS_FILE: .gitea/required-contexts.txt
+        run: python3 .gitea/scripts/ci-required-drift.py --skippable-gate-lint
       # KMS consolidation (mirrors ci-required-drift.yml / lint-required-no-paths.yml):
       # fetch the consolidated DRIFT_BOT_TOKEN from the Infisical SSOT (prod
       # /shared/drift-bot) via the CI machine identity. Reading the Actions API
@@ -149,3 +194,21 @@ jobs:
           REPO: ${{ github.repository }}
           ENFORCED_CONTEXTS_FILE: .gitea/required-contexts.txt
         run: python3 .gitea/scripts/ci-required-drift.py --phantom-gate-lint
+
+      # Guard G — the INVERSE of Guard F, and the one that actually wedges.
+      #
+      # Guard F: an ENFORCED context whose producer is disabled → required on
+      #          paper, silently unenforced. (Nothing blocks; protection is a lie.)
+      # Guard G: a DISABLED workflow that still fires on PR events → it keeps
+      #          posting statuses Gitea will not let you rerun
+      #          (400 "workflow is disabled"), so under the `[*]` branch
+      #          protection the PR is stuck with no API path out.
+      #
+      # Runs in the same job to reuse the DRIFT_BOT_TOKEN fetched above — the
+      # Actions API workflow-state read is the same call both guards need.
+      - name: Run Guard G — disabled workflows must not still fire on PR events
+        env:
+          GITEA_TOKEN: ${{ env.DRIFT_BOT_TOKEN }}
+          GITEA_HOST: git.moleculesai.app
+          REPO: ${{ github.repository }}
+        run: python3 .gitea/scripts/ci-required-drift.py --disabled-pr-emitter-lint

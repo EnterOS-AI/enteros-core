@@ -20,27 +20,67 @@ def load_module():
 
 
 def test_ci_profile_classifies_surfaces():
+    """The `ci` profile is a DENY-LIST: a lane runs unless the change is
+    PROVABLY INERT for it. It used to be an allow-list, and this test used to
+    assert the allow-list's central bug as correct behaviour (see the
+    `.gitea/` case at the bottom).
+
+    Inert set is deliberately tiny — INERT_PROSE = ("docs/", r".*\\.md$") — plus
+    per-lane exclusions:
+        platform = deny_list()                             # nothing else is inert
+        canvas   = deny_list("workspace-server/")
+        scripts  = deny_list("workspace-server/", "canvas/")
+        python   = ^workspace/                             # still an allow-list
+    An allow-list is vacuous-by-omission by construction: forget a path and the
+    gate silently does not run. A deny-list can only ever be wrong in the safe
+    direction (running a lane that need not have run).
+    """
     mod = load_module()
 
     assert mod.classify("ci", ["workspace-server/internal/handlers/a2a_proxy.go"]) == {
         "platform": True,
-        "canvas": False,
-        "python": False,
-        "scripts": False,
+        "canvas": False,   # canvas excludes workspace-server/
+        "python": False,   # ^workspace/ does NOT match "workspace-server/"
+        "scripts": False,  # scripts excludes workspace-server/
     }
+    # canvas -> platform is TRUE, and that is not an over-fire: the Go suite reads
+    # a canvas golden fixture (workspace-server/internal/handlers/
+    # external_connection_test.go), so a canvas edit really can red the Go lane.
     assert mod.classify("ci", ["canvas/src/app/page.tsx"]) == {
-        "platform": False,
+        "platform": True,
         "canvas": True,
         "python": False,
-        "scripts": False,
+        "scripts": False,  # scripts excludes canvas/
     }
     assert mod.classify("ci", ["tests/e2e/test_model_slug.sh"]) == {
-        "platform": False,
-        "canvas": False,
+        "platform": True,
+        "canvas": True,
         "python": False,
         "scripts": True,
     }
+    # ── C2 REGRESSION LOCK ────────────────────────────────────────────────
+    # This case previously asserted {platform: False, canvas: False, python:
+    # False, scripts: False} — i.e. "a PR touching ONLY the CI machinery
+    # triggers NOTHING" — written down as the expected result and kept green.
+    # That is finding C2: every heavy job then took its no-op arm and
+    # `CI / all-required` reported SUCCESS having run ZERO tests. The change
+    # most capable of breaking CI was asserted to run no CI, and the test suite
+    # was DEFENDING the hole. (`^scripts/` is anchored, so it never matched
+    # `.gitea/scripts/`; nothing in the old allow-list matched `.gitea/` at all.)
+    #
+    # README.md alone is inert — but a change is classified by its NON-inert
+    # members, so the ci.yml edit must light the lanes up.
     assert mod.classify("ci", [".gitea/workflows/ci.yml", "README.md"]) == {
+        "platform": True,
+        "canvas": True,
+        "python": False,
+        "scripts": True,
+    }
+    # NEGATIVE CONTROL for the deny-list itself. Without this, `deny_list()`
+    # could degenerate to `.*` — "always true" — and every assertion above would
+    # still pass while the profile had stopped discriminating entirely. A
+    # prose-only change must still be inert on EVERY lane.
+    assert mod.classify("ci", ["docs/adr/004-sdk-owns-adapter.md", "README.md"]) == {
         "platform": False,
         "canvas": False,
         "python": False,
@@ -184,10 +224,16 @@ def test_detect_deepens_base_ref_when_pr_merge_base_missing(monkeypatch):
     monkeypatch.setattr(mod, "deepen_base_ref", fake_deepen_base_ref)
     monkeypatch.setattr(mod, "changed_paths", fake_changed_paths)
 
+    # fake_changed_paths returns [".gitea/workflows/ci.yml"] — under the deny-list
+    # that lights up every lane for which a CI-machinery edit is not provably
+    # inert. This block used to expect all-False, which was C2 again: the very
+    # change that can break CI, asserted to run no CI. The point of THIS test is
+    # the deepen/merge-base call ORDER below; the classification just has to be
+    # the truthful one.
     assert mod.detect("ci", "pull_request", "base123", "", "main") == {
-        "platform": False,
-        "canvas": False,
-        "python": False,
-        "scripts": False,
+        "platform": True,
+        "canvas": True,
+        "python": False,   # ^workspace/ — still an allow-list, correctly unmatched
+        "scripts": True,
     }
     assert calls == [("deepen", "main"), ("changed", "True")]

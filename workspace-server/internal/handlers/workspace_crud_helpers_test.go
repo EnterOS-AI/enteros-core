@@ -122,8 +122,8 @@ func TestValidateWorkspaceDir_AcceptsPathsSimilarToSystemPaths(t *testing.T) {
 		"/binworkspace",
 		"/usrworkspace",
 		"/etx",    // typo of /etc but a different path
-		"/vartmp",  // /var/tmp is different from /var
-		"/usrr",    // typo of /usr but a different path
+		"/vartmp", // /var/tmp is different from /var
+		"/usrr",   // typo of /usr but a different path
 		"/workspace/etc",
 		"/workspace/var",
 		"/home/user/etc",

@@ -198,7 +198,7 @@ func TestListFiles_HostSideMirror_ListsConfigs(t *testing.T) {
 
 	base := t.TempDir()
 	seedHostSideMirror(t, base, wsID, map[string]string{
-		"config.yaml":         hostSideRealConfig,
+		"config.yaml":          hostSideRealConfig,
 		"prompts/concierge.md": "# persona",
 	})
 

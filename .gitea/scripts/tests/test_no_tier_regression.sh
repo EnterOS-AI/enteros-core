@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Anti-regression gate for #2403: fail if any SOP tier artifact reappears.
+# Anti-regression gate. Fails if any deleted SOP artifact reappears:
+#   - #2403: SOP *tier* artifacts (sop-tier-check/refire).
+#   - 2026-07-14: the whole SOP *review gate* (qa-review / security-review /
+#     sop-checklist and their scripts), removed per CTO directive.
 
 cd "$(dirname "$0")/../../.."
 
@@ -46,21 +49,43 @@ if grep -rI --exclude-dir='__pycache__' --exclude='test_no_tier_regression.sh' '
   fail=1
 fi
 
-# 7. qa-review and security-review must have labeled/unlabeled triggers (#2139)
-for f in .gitea/workflows/qa-review.yml .gitea/workflows/security-review.yml; do
-  if ! grep -q 'labeled, unlabeled' "$f"; then
-    echo "FAIL: $f missing labeled/unlabeled triggers (#2139)" >&2
+# 7. Deleted SOP review-gate workflows must stay deleted (2026-07-14).
+for f in .gitea/workflows/qa-review.yml \
+         .gitea/workflows/security-review.yml \
+         .gitea/workflows/sop-checklist.yml \
+         .gitea/workflows/review-check-tests.yml \
+         .gitea/workflows/review-refire-comments.yml; do
+  if [ -e "$f" ]; then
+    echo "FAIL: $f was re-added (SOP review gate removed 2026-07-14)" >&2
     fail=1
   fi
 done
 
-# 8. qa-review and security-review must NOT have review.state guard (#2159)
-for f in .gitea/workflows/qa-review.yml .gitea/workflows/security-review.yml; do
-  if grep -q 'github.event.review.state' "$f"; then
-    echo "FAIL: $f has review.state guard reappeared (#2159)" >&2
+# 8. Deleted SOP review-gate scripts/config must stay deleted (2026-07-14).
+for f in .gitea/scripts/review-check.sh \
+         .gitea/scripts/_review_check_filter.py \
+         .gitea/scripts/sop-checklist.py \
+         .gitea/scripts/review-refire-status.sh \
+         .gitea/sop-checklist-config.yaml; do
+  if [ -e "$f" ]; then
+    echo "FAIL: $f was re-added (SOP review gate removed 2026-07-14)" >&2
     fail=1
   fi
 done
+
+# 9. The core cron scheduler must stay retired (scheduler-as-trigger-plugin RFC
+#    P4, core#4399). ADR-005 guarantees core carries ZERO scheduler runtime code —
+#    firing is owned by the per-workspace kind:trigger plugin. If the deleted
+#    internal/scheduler package (the singleton cron loop + NativeSchedulerCheck)
+#    reappears, that architectural invariant has regressed.
+if [ -d workspace-server/internal/scheduler ]; then
+  echo "FAIL: workspace-server/internal/scheduler/ was re-added — core must carry ZERO scheduler runtime code (retired in core#4399; see ADR-005 + rfc-scheduler-as-trigger-plugin.md P4). Firing is owned by the kind:trigger plugin." >&2
+  fail=1
+fi
+if grep -rIn --include='*.go' --exclude='*_test.go' 'NativeSchedulerCheck' workspace-server/ >/dev/null 2>&1; then
+  echo "FAIL: NativeSchedulerCheck reappeared — the core-vs-daemon double-fire gate was removed with the loop (core#4399); the fire path is 100% plugin-owned." >&2
+  fail=1
+fi
 
 if [ "$fail" -eq 1 ]; then
   echo "TIER_REGRESSION_DETECTED" >&2

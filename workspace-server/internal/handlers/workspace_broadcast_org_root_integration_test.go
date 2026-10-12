@@ -9,7 +9,7 @@
 //   INTEGRATION_DB_URL="postgres://postgres:test@localhost:55432/molecule?sslmode=disable" \
 //     go test -tags=integration ./internal/handlers/ -run Integration_BroadcastOrgRoot -v
 //
-// CI: piggybacks on .github/workflows/handlers-postgres-integration.yml
+// CI: piggybacks on .gitea/workflows/handlers-postgres-integration.yml
 // (path-filter includes workspace-server/internal/handlers/**).
 //
 // Why this is NOT a sqlmock test

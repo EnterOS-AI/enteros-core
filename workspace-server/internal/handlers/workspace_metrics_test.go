@@ -47,12 +47,12 @@ func TestGetMetrics_HappyPath(t *testing.T) {
 	}
 
 	var resp struct {
-		InputTokens      int64  `json:"input_tokens"`
-		OutputTokens     int64  `json:"output_tokens"`
-		TotalCalls       int64  `json:"total_calls"`
-		EstimatedCost    string `json:"estimated_cost_usd"`
-		PeriodStart      string `json:"period_start"`
-		PeriodEnd        string `json:"period_end"`
+		InputTokens   int64  `json:"input_tokens"`
+		OutputTokens  int64  `json:"output_tokens"`
+		TotalCalls    int64  `json:"total_calls"`
+		EstimatedCost string `json:"estimated_cost_usd"`
+		PeriodStart   string `json:"period_start"`
+		PeriodEnd     string `json:"period_end"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("invalid JSON: %v\n%s", err, w.Body.String())
@@ -218,8 +218,8 @@ func TestUpsertTokenUsage_615_NormalValuesUnchanged(t *testing.T) {
 
 	mock.ExpectExec(`INSERT INTO workspace_token_usage`).
 		WithArgs("ws-1", sqlmock.AnyArg(),
-			int64(1500),      // input unchanged
-			int64(300),       // output unchanged
+			int64(1500),       // input unchanged
+			int64(300),        // output unchanged
 			sqlmock.AnyArg()). // cost
 		WillReturnResult(sqlmock.NewResult(0, 1))
 

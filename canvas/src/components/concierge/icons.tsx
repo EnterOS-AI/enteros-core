@@ -84,6 +84,13 @@ export const IcSchedule = (p: SVGProps<SVGSVGElement>) => (
   <svg viewBox="0 0 24 24" {...stroke} {...p}><rect x="3.5" y="4.5" width="17" height="16" rx="2.5" /><path d="M3.5 9h17M8 3v3M16 3v3" /></svg>
 );
 
+export const IcLogs = (p: SVGProps<SVGSVGElement>) => (
+  <svg viewBox="0 0 24 24" {...stroke} {...p}>
+    <rect x="3.5" y="3.5" width="17" height="17" rx="2" />
+    <path d="M7.5 8.5h9M7.5 12h9M7.5 15.5h5.5" />
+  </svg>
+);
+
 export const IcWorkspace = (p: SVGProps<SVGSVGElement>) => (
   <svg viewBox="0 0 24 24" {...stroke} {...p}><rect x="3.5" y="3.5" width="7" height="7" rx="1.5" /><rect x="13.5" y="13.5" width="7" height="7" rx="1.5" /><path d="M13.5 7h7M7 13.5v7" /></svg>
 );

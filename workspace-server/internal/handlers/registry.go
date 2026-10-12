@@ -11,17 +11,19 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/envx"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 )
 
 // isProvisionerHostPortURL reports whether u is a loopback URL with a port
@@ -56,13 +58,12 @@ type blockedRange struct {
 	label string
 }
 
-// saasMode reports whether this tenant platform is running in SaaS cross-EC2
-// mode, where workspaces live on sibling EC2s in the same VPC and register
-// themselves by their RFC-1918 VPC-private IP (typically 172.31.x.x on AWS
-// default VPCs). In that shape, the SSRF hardening that blocks RFC-1918
-// addresses would reject every legitimate workspace registration — the
-// control plane provisioned these instances, so their intra-VPC URLs are
-// trusted by construction.
+// saasMode reports whether this tenant platform is managed by the Molecule
+// control plane. Managed workspaces can register with provider-private
+// RFC-1918 addresses; applying the public-address-only SSRF blocklist would
+// reject those legitimate registrations. The control plane provisions and
+// records these workspace endpoints, so the managed path validates them under
+// its separate trust boundary.
 //
 // Resolution order:
 //  1. MOLECULE_DEPLOY_MODE set — explicit operator flag is authoritative.
@@ -104,36 +105,34 @@ var saasModeWarnUnknownOnce sync.Once
 // periodic A2A queue sweeper (#2930).
 type QueueDrainFunc func(ctx context.Context, workspaceID string, capacity int)
 
-// WarmupSendFunc delivers ONE benign A2A turn to a workspace's own agent.
-// Injected into RegistryHandler at router wiring time (same pattern as
-// QueueDrainFunc/ReconcileFunc) to avoid a handler→handler import cycle —
-// the router wires it to WorkspaceHandler.proxyA2ARequest. nil-safe: the
-// concierge warmup is skipped when unset (unit tests, CP/SaaS deployments
-// without a workspace handler).
-//
-// It is the platform-side trigger for the proven per-turn loaded_mcp_tools
-// capture: a de-baked kind=platform concierge reaches online but the
-// runtime's init-time MCP enumeration fails, so it never reports
-// loaded_mcp_tools — only the claude_sdk_executor per-turn capture (reading
-// the agent's live MCP on a real turn) reliably publishes them. The #3082
-// gate then degrades the idle concierge ~90s later. Sending one warmup turn
-// fires that capture so the next heartbeat carries loaded_mcp_tools (incl.
-// mcp__molecule-platform__provision_workspace) and the concierge HOLDS online
-// without any user message.
-//
-// Returns the HTTP status, the (ignored) response body, and an error. The
-// caller treats ANY result as best-effort — a non-2xx status or error never
-// affects the online/degraded decision.
-type WarmupSendFunc func(ctx context.Context, workspaceID string, body []byte, callerID string) (int, []byte, error)
-
 type RegistryHandler struct {
 	broadcaster *events.Broadcaster
 	drainQueue  QueueDrainFunc // nil-safe: Heartbeat skips drain when unset
+	// firstBootGreeter sends the concierge's proactive first chat message on
+	// the provisioning→online promotion (first_boot_greeting.go). nil-safe:
+	// the promotion skips it when unset (unit tests / unwired deployments).
+	firstBootGreeter func(workspaceID string, toolCount int)
 	// reconcilePlugins installs declared-but-missing plugins when a workspace
 	// transitions to online (RFC#2843 #32). nil-safe: Heartbeat skips the
 	// reconcile when unset (e.g. unit tests, CP/SaaS mode without a plugins
 	// handler). Wired by the router to PluginsHandler.ReconcileWorkspacePlugins.
 	reconcilePlugins ReconcileFunc
+	// restoreSchedules replays a removed predecessor's captured runtime schedule
+	// grid onto a freshly-online workspace (P4b volume-side org-re-import
+	// inheritance, core#4435). nil-safe: fireReconcileOnline skips it when unset
+	// (unit tests / deployments without a schedule handler). Wired by the router
+	// to ScheduleHandler.RestoreInheritedRuntimeSchedules.
+	restoreSchedules ReconcileFunc
+	// wakeSettler settles the wake-lifecycle intents a heartbeat has converged
+	// (the versioned-heartbeat GENERATION LOOP, PR-C). Called when a beat reports
+	// observed_generation >= the workspace's desired_generation. nil-safe: the
+	// convergence step is skipped when unset (unit tests / deployments without a
+	// workspace handler). Wired late by the router to
+	// WorkspaceHandler.MarkWakeSettled — same nil-safe hook pattern as
+	// SetFirstBootGreeter so RegistryHandler need not depend on WorkspaceHandler's
+	// construction order (both live in package handlers; the func field decouples
+	// the wiring, not an import cycle).
+	wakeSettler func(ctx context.Context, workspaceID string, observedGen int64) error
 	// mcpRecoveryLastFire rate-limits the RCA#2970 deadlock-break reconcile (#33).
 	// The gate fails on EVERY heartbeat until the management MCP lands, so without
 	// a throttle a concierge that cannot recover (e.g. a missing plugin-source
@@ -149,35 +148,6 @@ type RegistryHandler struct {
 	// holds within a process lifetime (acceptable — redeploys are not sub-minute,
 	// and one extra reconcile per redeploy on a stuck concierge is tolerable).
 	mcpRecoveryLastFire sync.Map
-
-	// warmupSend delivers ONE benign A2A turn to a concierge's own agent to
-	// trigger the proven per-turn loaded_mcp_tools capture (see WarmupSendFunc
-	// + fireConciergeWarmup). nil-safe: the warmup is skipped when unset. Wired
-	// by the router to WorkspaceHandler.proxyA2ARequest.
-	warmupSend WarmupSendFunc
-	// warmedConcierges throttles the concierge warmup per process. Keyed by
-	// workspace ID → time.Time of the last fire. core#3082 changed this from a
-	// strict one-shot to a time-throttle (re-fires every conciergeWarmupTimeout):
-	// under the verified-ready model the warmup DRIVES the warming→online flip, so
-	// a cold warmup turn that raced ahead of the MCP connect — or a transient
-	// warmup failure — MUST be retryable, or the concierge would sit warming until
-	// the 180s timeout force-fails it. Since each warmup POST is bounded at
-	// conciergeWarmupTimeout, two can't be in flight. A CP restart re-warms
-	// (acceptable — a fresh process has no live capture state).
-	warmedConcierges sync.Map
-	// warmedDelivered records concierges whose warmup turn was DELIVERED
-	// successfully (a 2xx from the agent) at least once this process lifetime.
-	// Keyed by workspace ID → true. Once set, fireConciergeWarmup STOPS
-	// re-firing: the warmup exists only to trigger ONE successful turn that runs
-	// the per-turn loaded_mcp_tools capture, so a second, third … fire after a
-	// clean delivery cannot help (an under-emitting loaded_mcp_tools producer,
-	// runtime#181, is not fixed by re-warming) and only spams the chat pane with
-	// a repeating readiness-probe row every conciergeWarmupTimeout — the demo
-	// leak. Real user turns remain the capture fallback and a CP restart clears
-	// this map (a fresh process re-warms once). A warmup that FAILED to deliver
-	// is NOT recorded, so the existing conciergeWarmupTimeout retry still
-	// self-heals a transient/cold miss.
-	warmedDelivered sync.Map
 }
 
 // mcpRecoveryCooldown bounds how often a single concierge's RCA#2970
@@ -197,6 +167,57 @@ func (h *RegistryHandler) SetQueueDrainFunc(f QueueDrainFunc) {
 	h.drainQueue = f
 }
 
+// SetFirstBootGreeter wires the concierge first-boot greeting hook
+// (first_boot_greeting.go) — fired on the provisioning→online promotion so
+// a freshly-onboarded platform agent opens the chat with a greeting instead
+// of an empty panel. Same late-wiring nil-safe pattern as the other hooks.
+func (h *RegistryHandler) SetFirstBootGreeter(f func(workspaceID string, toolCount int)) {
+	h.firstBootGreeter = f
+}
+
+// fireFirstBootGreeting invokes the greeting hook in its own goroutine (it
+// does DB + agent-turn work and must not add latency to the register/
+// heartbeat response). nil-safe for tests and deployments that don't wire it.
+func (h *RegistryHandler) fireFirstBootGreeting(workspaceID string, toolCount int) {
+	if h.firstBootGreeter == nil {
+		return
+	}
+	go h.firstBootGreeter(workspaceID, toolCount)
+}
+
+// SetWakeSettler wires the wake-lifecycle convergence hook — the settle side of
+// the versioned-heartbeat GENERATION LOOP (PR-C). Router wires this to
+// WorkspaceHandler.MarkWakeSettled after both handlers are constructed, keeping
+// RegistryHandler free of a construction-order dependency (same late-wiring
+// nil-safe pattern as SetFirstBootGreeter / SetQueueDrainFunc).
+func (h *RegistryHandler) SetWakeSettler(f func(ctx context.Context, workspaceID string, observedGen int64) error) {
+	h.wakeSettler = f
+}
+
+// fireWakeSettled runs the convergence settle for a heartbeat that reported an
+// observed_generation at/above the workspace's desired_generation. Synchronous
+// (a single UPDATE, negligible latency) but best-effort: a settle failure is
+// logged and swallowed so it never breaks the heartbeat's liveness ack. nil-safe
+// for tests / deployments that don't wire a workspace handler.
+func (h *RegistryHandler) fireWakeSettled(ctx context.Context, workspaceID string, observedGen int64) {
+	if h.wakeSettler == nil {
+		return
+	}
+	if err := h.wakeSettler(ctx, workspaceID, observedGen); err != nil {
+		log.Printf("Heartbeat: wake-settle failed for %s (observed_gen=%d): %v", workspaceID, observedGen, err)
+	}
+}
+
+// holdOnlineBroadcastForWarmingPlatform reports whether Register must NOT
+// announce WORKSPACE_ONLINE for this row: a platform concierge still held in
+// 'provisioning' by the core#3082 warming gate is not ready for callers —
+// announcing online flips the canvas to an interactive chat whose every send
+// bounces off the warming 503. The verified heartbeat flip is the sole
+// announcer for those rows.
+func holdOnlineBroadcastForWarmingPlatform(kind, status string) bool {
+	return kind == string(models.KindPlatform) && status == string(models.StatusProvisioning)
+}
+
 // SetReconcileFunc wires the post-online plugin reconcile hook (RFC#2843).
 // Router wires this to PluginsHandler.ReconcileWorkspacePlugins after both
 // handlers are constructed (same late-wiring pattern as SetQueueDrainFunc),
@@ -205,27 +226,36 @@ func (h *RegistryHandler) SetReconcileFunc(f ReconcileFunc) {
 	h.reconcilePlugins = f
 }
 
-// SetWarmupSendFunc wires the concierge warmup A2A sender. Router wires this
-// to WorkspaceHandler.proxyA2ARequest after both handlers are constructed
-// (same late-wiring pattern as SetQueueDrainFunc), keeping RegistryHandler
-// free of a workspace-handler import. nil-safe: the warmup is skipped when
-// unset.
-func (h *RegistryHandler) SetWarmupSendFunc(f WarmupSendFunc) {
-	h.warmupSend = f
+// SetRestoreSchedulesFunc wires the post-online runtime-schedule inheritance hook
+// (P4b volume-side org-re-import, core#4435). Router wires this to
+// ScheduleHandler.RestoreInheritedRuntimeSchedules after both handlers are
+// constructed (same late-wiring pattern as SetReconcileFunc), keeping
+// RegistryHandler free of a schedule-handler import.
+func (h *RegistryHandler) SetRestoreSchedulesFunc(f ReconcileFunc) {
+	h.restoreSchedules = f
 }
 
-// fireReconcileOnline fires the declared-plugin reconcile for a workspace that
-// has just transitioned to online. Fire-and-forget via globalGoAsync so the
-// heartbeat handler returns immediately; the reconcile owns its own deadline.
-// nil-safe + uses context.WithoutCancel because the heartbeat ctx expires when
-// the handler returns, well before a plugin clone+deliver completes.
+// fireReconcileOnline fires the transition-to-online hooks for a workspace:
+// the declared-plugin reconcile AND the P4b runtime-schedule inheritance restore
+// (core#4435). Fire-and-forget via globalGoAsync so the heartbeat handler returns
+// immediately; each hook owns its own deadline. Uses context.WithoutCancel
+// because the heartbeat ctx expires when the handler returns, well before a
+// plugin clone+deliver (or a schedule restore forward) completes.
+//
+// EACH hook runs in its OWN globalGoAsync so they are independent: globalGoAsync
+// recovers panics per goroutine, so a panic in the schedule restore cannot take
+// down the plugin reconcile (or vice-versa). Both are nil-safe.
 func (h *RegistryHandler) fireReconcileOnline(ctx context.Context, workspaceID string) {
-	if h.reconcilePlugins == nil {
-		return
-	}
 	rctx := context.WithoutCancel(ctx)
 	wsID := workspaceID
-	globalGoAsync(func() { h.reconcilePlugins(rctx, wsID) })
+	if h.reconcilePlugins != nil {
+		reconcile := h.reconcilePlugins
+		globalGoAsync(func() { reconcile(rctx, wsID) })
+	}
+	if h.restoreSchedules != nil {
+		restore := h.restoreSchedules
+		globalGoAsync(func() { restore(rctx, wsID) })
+	}
 }
 
 // fireReconcileMCPRecovery breaks the RCA#2970 management-MCP deadlock (#33).
@@ -274,157 +304,6 @@ func (h *RegistryHandler) fireReconcileMCPRecovery(ctx context.Context, workspac
 	rctx := context.WithoutCancel(ctx)
 	wsID := workspaceID
 	globalGoAsync(func() { h.reconcilePlugins(rctx, wsID) })
-}
-
-// conciergeWarmupCaller is the system caller identity for the platform-fired
-// warmup turn. The `system:` prefix bypasses workspace access control and the
-// can_delegate gate (see isSystemCaller / a2a_proxy.go), and is NOT treated as
-// a delegation — exactly right for a platform-initiated self-turn.
-const conciergeWarmupCaller = "system:concierge-warmup"
-
-// conciergeWarmupText is the benign message body of the warmup turn. It is a
-// no-op readiness check — the concierge needs only to RUN a turn (which fires
-// the per-turn loaded_mcp_tools capture); the content is immaterial. It is
-// stamped with conciergeWarmupSourceType so the chat-history reader classifies
-// the row as an internal self-message (system/notice) and it NEVER renders as a
-// blue user bubble — see conciergeWarmupSourceType.
-const conciergeWarmupText = "Platform readiness check — no action needed."
-
-// conciergeWarmupSourceType is the params.metadata.source_type marker stamped on
-// the warmup turn. It is a member of the SSOT self-source-type set
-// (messagestore.selfSourceTypes / canvas message-parser selfSourceTypes /
-// runtime _ROUTINE_SELF_SOURCE_TYPES), so the chat-history reader classifies the
-// warmup a2a_receive row Role="system" (SystemKind="notice") instead of the
-// blue user bubble it used to leak as (the readiness-probe was a heartbeat
-// internal, never a human turn). The value MUST stay in lock-step with the
-// "self-warmup" entry in those three registries.
-const conciergeWarmupSourceType = "self-warmup"
-
-// conciergeWarmupTimeout bounds the warmup A2A POST so the detached goroutine
-// can never leak. A cold first turn (model warmup + MCP enumeration) can take
-// tens of seconds; 60s is comfortably longer than that yet still bounded.
-const conciergeWarmupTimeout = 60 * time.Second
-
-// buildConciergeWarmupBody builds the A2A v0.3 message/send JSON-RPC body for
-// the warmup turn. Mirrors buildDelegateA2ABody (A2A v0.3 Part discriminator is
-// `kind`, not `type`; a `type`-keyed Part is dropped by the receiver's v0.3
-// validator). messageId is a fresh UUID so the turn is idempotent at the
-// runtime and never collides with a real message.
-func buildConciergeWarmupBody(workspaceID string) ([]byte, error) {
-	// UNIQUE messageId per fire (CR2 #14189). The in-process one-shot guard
-	// (warmedConcierges) RESETS on a CP restart, so a post-restart warmup
-	// legitimately re-fires. A DETERMINISTIC messageId would collide with the
-	// pre-restart fire and be DEDUPED downstream → the re-warmup no-ops → the
-	// concierge stays degraded (the exact failure this warmup exists to fix). A
-	// nonce suffix makes every fire a distinct, never-deduped turn, while the
-	// in-process guard still prevents repeat warmups within one CP lifetime.
-	warmupID := "concierge-warmup-" + workspaceID + "-" + uuid.New().String()
-	return json.Marshal(map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      warmupID,
-		"method":  "message/send",
-		"params": map[string]interface{}{
-			// source_type at the params.metadata sibling of message is the
-			// CANONICAL location the reader (messagestore.RequestSourceType)
-			// checks first, and the location proven to survive
-			// normalizeA2APayload + persistence (self-harvester rows on prod
-			// land here). Stamping it marks the warmup row internal so it is
-			// classified system/notice, never a user bubble.
-			"metadata": map[string]interface{}{"source_type": conciergeWarmupSourceType},
-			"message": map[string]interface{}{
-				"role":      "user",
-				"messageId": warmupID,
-				"parts":     []map[string]interface{}{{"kind": "text", "text": conciergeWarmupText}},
-				// Mirror source_type on the message.metadata fallback location
-				// too (RequestSourceType checks it second) so classification is
-				// robust regardless of which metadata slot a normalizer keeps.
-				"metadata": map[string]interface{}{"concierge_warmup": true, "source_type": conciergeWarmupSourceType},
-			},
-		},
-	})
-}
-
-// fireConciergeWarmup sends ONE benign A2A turn to a freshly-online platform
-// concierge to trigger the proven per-turn loaded_mcp_tools capture (core#3082
-// keystone). See WarmupSendFunc for the full rationale.
-//
-// Contract (this is the heartbeat path — fleet-wide, correctness is critical):
-//   - THROTTLED + IDEMPOTENT: at most once per conciergeWarmupTimeout per
-//     concierge per process. core#3082 made this retryable (was a strict
-//     one-shot) so the warming→online flip self-heals if a cold warmup turn
-//     raced ahead of the MCP connect or failed transiently. Since each POST is
-//     bounded at conciergeWarmupTimeout, two warmups can't be in flight. A
-//     process restart re-warms (a fresh process has no live capture state).
-//   - ASYNC / NON-BLOCKING: dispatched on a detached globalGoAsync goroutine so
-//     it never blocks or slows the Heartbeat handler response.
-//   - FAIL-SAFE: a send error (timeout, 4xx/5xx, anything) is logged loudly and
-//     ignored. It NEVER touches the online/degraded decision. The per-turn
-//     capture from a real user turn remains the fallback exactly as today.
-//   - BOUNDED: the POST runs under conciergeWarmupTimeout so the goroutine can't
-//     leak. context.WithoutCancel detaches from the heartbeat ctx (which expires
-//     when the handler returns, well before a cold first turn completes).
-//
-// nil-safe: skipped when warmupSend is unset or workspaceID is empty. The
-// caller is responsible for only invoking this for a kind=platform workspace
-// that has its model + management MCP server present (the #3082 gate passed).
-func (h *RegistryHandler) fireConciergeWarmup(ctx context.Context, workspaceID string) {
-	if h.warmupSend == nil || workspaceID == "" {
-		return
-	}
-	// Fire-once: a warmup already DELIVERED successfully this process lifetime is
-	// never re-fired. The one clean turn already ran the per-turn capture; more
-	// fires only repeat the readiness-probe row (the demo chat leak) without
-	// helping. See warmedDelivered. A CP restart clears the map → re-warms once.
-	if _, delivered := h.warmedDelivered.Load(workspaceID); delivered {
-		return
-	}
-	// Throttle: re-fire at most once per conciergeWarmupTimeout. The Load+Store
-	// is not strictly atomic, so two concurrent heartbeats could both fire one
-	// extra warmup — harmless (idempotent, bounded, fail-safe). Storing the
-	// timestamp BEFORE firing means a concurrent beat within the window sees the
-	// fresh stamp and skips.
-	now := time.Now()
-	if prev, ok := h.warmedConcierges.Load(workspaceID); ok {
-		if last, isTime := prev.(time.Time); isTime && now.Sub(last) < conciergeWarmupTimeout {
-			return // fired recently — let the in-flight / recent warmup converge
-		}
-	}
-	h.warmedConcierges.Store(workspaceID, now)
-	body, err := buildConciergeWarmupBody(workspaceID)
-	if err != nil {
-		// Marshalling a constant body cannot realistically fail; if it somehow
-		// does, clear the throttle stamp so a later heartbeat can retry, and bail.
-		log.Printf("Heartbeat: concierge warmup body marshal failed for %s: %v (clearing throttle stamp)", workspaceID, err)
-		h.warmedConcierges.Delete(workspaceID)
-		return
-	}
-	wsID := workspaceID
-	// Detach from the heartbeat ctx and apply a bounded timeout so the
-	// goroutine can't outlive the warmup turn.
-	send := h.warmupSend
-	globalGoAsync(func() {
-		warmupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), conciergeWarmupTimeout)
-		defer cancel()
-		log.Printf("Heartbeat: firing one-shot concierge warmup turn for platform agent %s (core#3082 loaded_mcp_tools capture)", wsID)
-		status, _, sErr := send(warmupCtx, wsID, body, conciergeWarmupCaller)
-		if sErr != nil {
-			// Best-effort: a warmup failure must NEVER affect status. The real
-			// user-turn capture remains the fallback. Log loudly so an operator
-			// can see whether the warmup path is healthy in the fleet.
-			log.Printf("Heartbeat: concierge warmup turn for %s failed (status=%d): %v — best-effort, status unaffected; per-turn capture on a real turn remains the fallback", wsID, status, sErr)
-			return
-		}
-		// Delivered cleanly (2xx). Record it so the warmup is not re-fired every
-		// conciergeWarmupTimeout — the single successful turn already drove the
-		// per-turn capture; further fires would only repeat the readiness-probe
-		// chat row. A non-2xx "delivery" (httpx does not raise on 4xx/5xx) means
-		// the agent was NOT woken, so leave warmedDelivered UNset and let the
-		// timeout retry fire again.
-		if status >= 200 && status < 300 {
-			h.warmedDelivered.Store(wsID, true)
-		}
-		log.Printf("Heartbeat: concierge warmup turn for %s delivered (status=%d) — per-turn loaded_mcp_tools capture should publish on the next heartbeat; warmup will not re-fire this process (fire-once)", wsID, status)
-	})
 }
 
 // validateAgentURL rejects URLs that could be used as SSRF vectors against
@@ -532,17 +411,42 @@ const errPlatformNotRoot = "a platform agent must be the org root (parent_id mus
 // fail-closed RCA#2970 intent (steady-state guarantee: sustained-missing DOES
 // degrade).
 //
-// 180s ≈ 9 heartbeats at the runtime's 20s cadence. Sized for the platform-side
-// warmup turn (fireConciergeWarmup), which fires on the SAME heartbeat that opens
-// this window: that warmup is a COLD first turn — model cold-start (~25-30s P95
-// for the platform-managed default) + async MCP connect + the turn itself — and
-// the loaded_mcp_tools capture only lands on the NEXT heartbeat after the turn
-// completes. 90s was borderline for that cold path (single-degrade-flap before
-// recovery, observed 2026-06-25 staging); 180s gives the cold warmup turn +
-// capture-bearing heartbeat comfortable headroom while still surfacing a genuine
-// sustained-missing regression within ~3 min (the fail-closed RCA#2970 intent is
-// preserved — sustained absence past the window still degrades).
+// 180s ≈ 9 heartbeats at the runtime's 20s cadence. EV2 RETIRED the platform-side
+// warmup turn (fireConciergeWarmup) this window used to be sized for; the
+// provisioning->online flip is now driven by the runtime's turn-independent
+// mcp_tools_ready event, which lands on a normal beat with no cold-turn latency.
+// This grace is KEPT as the steady-state flap absorber for the loaded_mcp_tools
+// under-emit window (runtime#181): the async MCP connect + the runtime's per-beat
+// tool-list observation can legitimately report an absent/partial list for a few
+// beats after the ready flip, and degrading on that single sample (then recovering
+// on the next) is the ~50/50 online<->degraded flap this window eliminates. 180s
+// still surfaces a genuine sustained-missing regression within ~3 min (the fail-
+// closed RCA#2970 intent is preserved — sustained absence past the window degrades).
 const managementMCPUnloadedGrace = 180 * time.Second
+
+// conciergeWarmupFailGrace bounds how long a kind=platform concierge may sit in
+// 'provisioning' (the warming display state) WITHOUT ever reaching verified-ready
+// before core surfaces an operator-visible fault (degraded) instead of holding
+// 'provisioning' forever.
+//
+// EV2 REGRESSION (#4449) this restores: #4449 removed the old wall-clock warm-FAIL
+// on the theory that the turn-independent mcp_tools_ready event always arrives
+// within seconds. But if the readiness probe never publishes mcp_tools_ready (the
+// probe is disabled via MOLECULE_MCP_READINESS_PROBE=off, or persistently fails to
+// spawn/handshake the management MCP) AND the per-turn loaded_mcp_tools producer
+// under-emits (runtime#181), NOTHING flips the box online and NOTHING degrades it —
+// it holds 'provisioning' indefinitely with no online, no degrade, and no operator
+// signal. This bound re-instates a SAFETY NET: a concierge that never reaches ready
+// within the window is marked degraded (recoverable — a later ready beat still
+// promotes it) with an operator-visible last_sample_error.
+//
+// This is NOT the retired fireConciergeWarmup synthetic-turn nudge (EV2's whole
+// point was to delete that): it is a pure wall-clock terminal on the warming hold,
+// no turn is injected. It is sized GENEROUSLY (well beyond the ~seconds a healthy
+// pre-baked concierge takes to publish mcp_tools_ready) so a merely-slow-but-healthy
+// warmup is never false-failed — the false-fail complaint that motivated #4449's
+// removal — while a genuinely-stuck box still surfaces within a few minutes.
+const conciergeWarmupFailGrace = 300 * time.Second
 
 // isPlatformRootViolation reports whether err is the DB rejecting a register
 // that tried to mark a non-root workspace as a platform agent (the
@@ -576,19 +480,28 @@ func validateAgentURL(rawURL string) error {
 	}
 	hostname := parsed.Hostname()
 
-	// Link-local / loopback / IPv6 metadata classes are blocked in every
-	// mode — they are never a legitimate agent URL and they cover the AWS/
-	// GCP/Azure IMDS endpoints. RFC-1918 ranges are conditionally blocked:
-	// in SaaS mode workspaces register with their VPC-private IP and the
-	// control plane is the source of truth for which instances exist, so
-	// allowing 10/8, 172.16/12, 192.168/16 is safe. In self-hosted mode
-	// we keep the strict blocklist — those deployments have no legitimate
-	// reason to accept private-range URLs from agents.
+	// Link-local / IPv6 metadata classes are blocked in every mode — they
+	// are never a legitimate agent URL and they cover the AWS/GCP/Azure
+	// IMDS endpoints. RFC-1918 ranges are conditionally blocked: in SaaS
+	// mode workspaces register with their VPC-private IP and the control
+	// plane is the source of truth for which instances exist, so allowing
+	// 10/8, 172.16/12, 192.168/16 is safe. In self-hosted mode we keep the
+	// strict blocklist — those deployments have no legitimate reason to
+	// accept private-range URLs from agents.
+	//
+	// Loopback is blocked in every mode EXCEPT MOLECULE_ENV=development
+	// (devModeAllowsLoopback — the same carve-out isSafeURL/safeDialer use,
+	// see ssrf.go): on a local dev host the provisioner itself assigns
+	// http://127.0.0.1:<hostport> advertise URLs, so rejecting them here
+	// only guarantees a boot-register 400 whose "recovery" is the heartbeat
+	// backfill storing the SAME loopback URL ~30s later — a delay plus a
+	// red NET/Register boot step, protecting nothing. This validator also
+	// already allows the literal hostname "localhost" (below), so blocking
+	// the address it aliases added no security in dev anyway. SaaS and
+	// self-hosted production keep loopback blocked.
 	blockedRanges := []blockedRange{
 		{"169.254.0.0/16", "link-local address (cloud metadata endpoint)"},
-		{"127.0.0.0/8", "loopback address"},
 		{"fe80::/10", "IPv6 link-local address (cloud metadata analogue)"},
-		{"::1/128", "IPv6 loopback address"},
 		// Always-blocked regardless of deploy mode: these ranges are never valid
 		// agent URLs in any deployment. TEST-NET (RFC-5737) are documentation-only
 		// ranges. CGNAT (RFC-6598) is never used for VPC subnets on any cloud
@@ -602,6 +515,12 @@ func validateAgentURL(rawURL string) error {
 		{"224.0.0.0/4", "IPv4 multicast address"},
 		{"fc00::/8", "IPv6 ULA non-routable prefix (fc00::/8)"},
 		{"2001:db8::/32", "IPv6 documentation address (RFC-3849 reserved)"},
+	}
+	if !devModeAllowsLoopback() {
+		blockedRanges = append(blockedRanges,
+			blockedRange{"127.0.0.0/8", "loopback address"},
+			blockedRange{"::1/128", "IPv6 loopback address"},
+		)
 	}
 	if !saasMode() {
 		blockedRanges = append(blockedRanges,
@@ -1123,11 +1042,14 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// status). status is a NOT-NULL enum — select it bare (never COALESCE to '',
 	// which Postgres rejects as an invalid enum literal and fails the scan).
 	//
-	// Guarded on h.reconcilePlugins != nil so the extra read only runs when the
-	// reconcile hook is actually wired (production router). Unit tests that don't
-	// wire a ReconcileFunc skip this query entirely (no mock churn).
+	// Read guarded on EITHER post-online hook being wired (plugin reconcile
+	// or first-boot greeting) so the query only runs when a consumer exists;
+	// unit tests that wire neither skip it entirely (no mock churn). The
+	// greeting must NOT ride on the reconcile wiring alone — a deployment
+	// that sets a greeter without a ReconcileFunc would otherwise silently
+	// never greet (prevStatusForReconcile would stay "" forever).
 	var prevStatusForReconcile string
-	if h.reconcilePlugins != nil {
+	if h.reconcilePlugins != nil || h.firstBootGreeter != nil {
 		if err := db.DB.QueryRowContext(ctx, `SELECT status FROM workspaces WHERE id = $1`, payload.ID).Scan(&prevStatusForReconcile); err != nil {
 			// sql.ErrNoRows on a brand-new workspace is expected (INSERT path);
 			// leave prevStatusForReconcile empty so we don't fire on first create
@@ -1287,12 +1209,41 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// Broadcast WORKSPACE_ONLINE — use the reconciled card so the canvas
 	// Agent Card view live-updates with the friendly name, matching what
 	// was just persisted (not the runtime's raw UUID-name card).
-	if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.ID, map[string]interface{}{
-		"url":           cachedURL,
-		"agent_card":    reconciledCard,
-		"delivery_mode": effectiveMode,
-	}); err != nil {
-		log.Printf("Registry broadcast error: %v", err)
+	//
+	// EXCEPT for a platform row still HELD in 'provisioning' (the core#3082
+	// warming gate): the register upsert deliberately does not flip those to
+	// online, but this broadcast used to announce ONLINE anyway — the canvas
+	// swapped the boot screen for the chat and let the user send into the
+	// warming gate's 503, ~10s before the agent could answer (2026-07-18
+	// fresh-onboarding repro). Hold the announcement; the verified heartbeat
+	// flip broadcasts WORKSPACE_ONLINE when the concierge is genuinely ready.
+	// Fail OPEN on a read error (legacy behavior: announce) — a missed hold
+	// is a cosmetic regression, a missed announcement strands the canvas.
+	holdOnline := false
+	var rowKindForBroadcast, rowStatusForBroadcast string
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(kind, 'workspace'), status::text FROM workspaces WHERE id = $1`, payload.ID,
+	).Scan(&rowKindForBroadcast, &rowStatusForBroadcast); err == nil {
+		holdOnline = holdOnlineBroadcastForWarmingPlatform(rowKindForBroadcast, rowStatusForBroadcast)
+	}
+	if holdOnline {
+		log.Printf("Registry: holding WORKSPACE_ONLINE broadcast for warming platform %s (verified heartbeat flip announces it, core#3082)", payload.ID)
+	} else {
+		if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.ID, map[string]interface{}{
+			"url":           cachedURL,
+			"agent_card":    reconciledCard,
+			"delivery_mode": effectiveMode,
+		}); err != nil {
+			log.Printf("Registry broadcast error: %v", err)
+		}
+		// First boot of an ORDINARY workspace (the concierge's greeting fires
+		// from its verified heartbeat flip instead): once genuinely online
+		// from provisioning, have the agent greet the user in its own voice.
+		// toolCount 0 — register carries no loaded_mcp_tools; the in-character
+		// turn doesn't need it and the fallback copy stays role-agnostic.
+		if prevStatusForReconcile == string(models.StatusProvisioning) {
+			h.fireFirstBootGreeting(payload.ID, 0)
+		}
 	}
 
 	// Phase 30.1: issue a workspace auth token on first registration.
@@ -1402,10 +1353,17 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	// prevStatus = "" on every heartbeat, so the prevStatus=='provisioning'
 	// reconcile trigger NEVER fired (the #32 regression returned). Select the
 	// column bare; it is never NULL.
+	//
+	// desired_generation is read on the SAME row so the heartbeat response can
+	// echo it down as resp["generation"] (the versioned-heartbeat GENERATION LOOP,
+	// PR-C). It MUST be emitted on every beat — including beats that carry no
+	// observed_generation — or a fresh runtime never learns the desired generation
+	// it is supposed to reconcile-and-echo, leaving the loop half-open.
 	var prevTask string
 	var prevSpend int64
 	var prevStatus string
-	if err := db.DB.QueryRowContext(ctx, `SELECT COALESCE(current_task, ''), COALESCE(monthly_spend, 0), status FROM workspaces WHERE id = $1`, payload.WorkspaceID).Scan(&prevTask, &prevSpend, &prevStatus); err != nil {
+	var desiredGen int64
+	if err := db.DB.QueryRowContext(ctx, `SELECT COALESCE(current_task, ''), COALESCE(monthly_spend, 0), status, desired_generation FROM workspaces WHERE id = $1`, payload.WorkspaceID).Scan(&prevTask, &prevSpend, &prevStatus, &desiredGen); err != nil {
 		log.Printf("registry heartbeat: prev_task query failed for workspace %s: %v", payload.WorkspaceID, err)
 	}
 
@@ -1450,6 +1408,24 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	// monthly_spend: updated when the agent reports a positive value (cumulative
 	// USD cents for the current month). Zero means "no update" — never write
 	// zero to avoid accidentally clearing a previously-reported spend value.
+	// RFC #4402 B2: honor the runtime's authoritative is_busy when it sends one,
+	// else fall back to the B1 derive from active_tasks. `COALESCE($busy, $4 > 0)`
+	// makes the fallback exact: payload.IsBusy is a *bool, so nil binds as SQL
+	// NULL and COALESCE picks the ($4 > 0) derive (behavior-identical to B1 for
+	// an older image that omits the field), while an explicit true/false is
+	// trusted verbatim — the self-healing successor to the active_tasks>0 proxy.
+	// The bind is the last positional arg in each branch.
+	//
+	// Test-only busy-inject seam (task #92): testBusyActiveTasksHook is nil in
+	// every shipped build (testbusy_disabled.go), so activeTasks is exactly
+	// payload.ActiveTasks and this is behaviour-identical to before. Under the
+	// e2e_busy_inject build tag it raises the persisted count to an injected
+	// floor so the ephemeral gate's 10b force-hibernate hits a genuinely busy
+	// workspace. See testbusy.go.
+	activeTasks := payload.ActiveTasks
+	if testBusyActiveTasksHook != nil {
+		activeTasks = testBusyActiveTasksHook(payload.WorkspaceID, activeTasks)
+	}
 	var err error
 	if payload.MonthlySpend > 0 {
 		_, err = db.DB.ExecContext(ctx, `
@@ -1461,6 +1437,7 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				uptime_seconds    = $5,
 				current_task      = $6,
 				monthly_spend     = $7,
+				is_busy           = COALESCE($8, ($4 > 0)),
 				-- core#3082: a kind=platform concierge is HELD in 'provisioning'
 				-- (the warming display state) and promoted to 'online' ONLY by the
 				-- verified-ready gate in evaluateStatus, which proves
@@ -1471,8 +1448,8 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				updated_at        = now()
 			WHERE id = $1 AND status != 'removed'
 		`, payload.WorkspaceID, payload.ErrorRate, payload.SampleError,
-			payload.ActiveTasks, payload.UptimeSeconds, payload.CurrentTask,
-			payload.MonthlySpend)
+			activeTasks, payload.UptimeSeconds, payload.CurrentTask,
+			payload.MonthlySpend, payload.IsBusy)
 	} else {
 		_, err = db.DB.ExecContext(ctx, `
 			UPDATE workspaces SET
@@ -1482,6 +1459,7 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				active_tasks      = $4,
 				uptime_seconds    = $5,
 				current_task      = $6,
+				is_busy           = COALESCE($7, ($4 > 0)),
 				-- core#3082: a kind=platform concierge is HELD in 'provisioning'
 				-- (the warming display state) and promoted to 'online' ONLY by the
 				-- verified-ready gate in evaluateStatus, which proves
@@ -1492,7 +1470,8 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				updated_at        = now()
 			WHERE id = $1 AND status != 'removed'
 		`, payload.WorkspaceID, payload.ErrorRate, payload.SampleError,
-			payload.ActiveTasks, payload.UptimeSeconds, payload.CurrentTask)
+			activeTasks, payload.UptimeSeconds, payload.CurrentTask,
+			payload.IsBusy)
 	}
 	if err != nil {
 		log.Printf("Heartbeat update error: %v", err)
@@ -1517,6 +1496,43 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 			`, loadedJSON, payload.WorkspaceID); persistErr != nil {
 				log.Printf("Heartbeat: failed to persist loaded_mcp_tools for %s: %v", payload.WorkspaceID, persistErr)
 			}
+		}
+
+		// core#5137: the raw inventory above is a PRODUCER self-report and, as
+		// captured on this fleet, can be 54 ids in a namespace the model never
+		// dispatches from. Publish the consumer-side corroboration NEXT TO it —
+		// same beat, before evaluateStatus reads the verdict — so a caller that
+		// reads the count also reads how much of it the dispatcher backs.
+		// Best-effort: never fails the heartbeat, never rewrites loaded_mcp_tools.
+		h.recordMCPSurfaceCorroboration(c, ctx, payload.WorkspaceID, payload.LoadedMCPTools)
+	}
+
+	// Versioned-heartbeat GENERATION LOOP (PR-C): persist the runtime's reported
+	// observed_generation and, once it has caught up to the desired generation,
+	// settle the converged wake intents.
+	//
+	// Gated on ObservedGeneration != nil so a runtime PREDATING the versioned-
+	// heartbeat contract (which sends no observed_generation) is a structural
+	// no-op — no write, no convergence claim. When present, the write is
+	// MONOTONIC via GREATEST(observed_generation, $observed): a stale or reordered
+	// beat carrying a lower value can never regress the column. Best-effort: a
+	// failure here is logged and must never break the heartbeat's liveness ack.
+	if payload.ObservedGeneration != nil {
+		if _, obsErr := db.DB.ExecContext(ctx, `
+			UPDATE workspaces SET
+				observed_generation = GREATEST(observed_generation, $1),
+				updated_at          = now()
+			WHERE id = $2 AND status != 'removed'
+		`, *payload.ObservedGeneration, payload.WorkspaceID); obsErr != nil {
+			log.Printf("Heartbeat: failed to persist observed_generation for %s: %v", payload.WorkspaceID, obsErr)
+		}
+
+		// CONVERGENCE: the runtime has reconciled at least up to desiredGen, so the
+		// delivered wake intents at/below the observed generation are done. Settling
+		// is delegated to the workspace handler's owner method via the nil-safe hook
+		// (MarkWakeSettled settles delivered intents with generation <= observed).
+		if *payload.ObservedGeneration >= desiredGen {
+			h.fireWakeSettled(ctx, payload.WorkspaceID, *payload.ObservedGeneration)
 		}
 	}
 
@@ -1652,6 +1668,14 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 
 	resp := gin.H{"status": "ok"}
 
+	// Versioned-heartbeat GENERATION LOOP (PR-C): hand the workspace's current
+	// desired-state generation down every beat (matches the SDK
+	// HeartbeatResponse.Generation json tag `generation`). The runtime echoes it
+	// back as request.observed_generation once reconciled, closing the loop. This
+	// is emitted unconditionally — a fresh runtime must learn a non-zero desired
+	// generation before it can ever report having converged to it.
+	resp["generation"] = desiredGen
+
 	// Deliver the platform_inbound_secret on every heartbeat. Mirrors
 	// the same field on /registry/register, but heartbeats are the
 	// only periodic platform↔workspace channel — register fires once
@@ -1681,6 +1705,835 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// HONEST-CLAIM CONTRACT for the platform concierge's provisioning→online flip.
+//
+// ⚠️ `online` DOES NOT MEAN `mcp__molecule-platform__provision_workspace` IS
+// CALLABLE. Every input the heartbeat has at the moment of the flip is a
+// RUNTIME SELF-REPORT:
+//
+//   - mcp_tools_ready  — the runtime's own MCPReadinessProber reporting that a
+//     `tools/list` SUCCEEDED. A list is not a call.
+//   - loaded_mcp_tools — the runtime's own list of tool identifiers it believes
+//     it loaded. Membership is PRESENCE, not callability.
+//   - (legacy) neither — a pre-#147 runtime is promoted on liveness alone.
+//
+// A concierge can therefore advertise the verb, be `online`, and produce
+// NOTHING on a real turn. That failure mode is real and has been reproduced:
+// 54 tools listed, the required verb among them, mcp_server_present=true, and
+// no work performed. The ONLY place callability is actually proven is the
+// deploy-time staging gate (Guard B, internal/staginge2e), which drives a REAL
+// A2A turn and fails when the verb is present-but-not-genuinely-callable.
+// There is NO run-time equivalent, so between deploys nothing re-checks it.
+//
+// Consumers that inherit the weaker claim (i.e. that treat `online` as
+// "ready to serve" and are wrong to). ADMITTERS — these put real work in
+// front of the concierge on the strength of the flip:
+//
+//   - a2a_proxy.go conciergeWarmingGate — lifts its 503 the instant the row
+//     leaves 'provisioning', admitting real user turns.
+//   - request_nudge_sweeper.go sweepQuery — selects `w.status = 'online'`
+//     and FIRES REAL TURNS at the row unprompted. Unlike the warming gate
+//     (which only stops waiting), this one originates traffic, so an
+//     over-claimed online produces nudges into a concierge that may do
+//     nothing with them.
+//   - a2a_queue.go sweepA2AQueue — selects w.status IN ('online','degraded')
+//     and drains each match's queued items in detached goroutines. Same
+//     RELEASE shape as the warming gate (turns already withheld are let go
+//     rather than newly created), which is why it belongs here and not in the
+//     passive list where an earlier draft filed it: work reaches the concierge
+//     because of the flip either way.
+//   - canvas ChatTab / MobileChat — enable the composer on online||degraded.
+//
+// So admitters come in two flavours — RELEASE (warming gate, queue drain:
+// stop withholding) and ORIGINATE (nudge sweeper: create new turns). Both
+// hand real work to a concierge on the strength of a self-report.
+//
+// PASSIVE readers (resolve/target on it, but neither originate nor release
+// work): discovery.go peer URL resolution, plugins_tracking.go fan-out.
+//
+// REPAIR SUPPRESSION — real, but NARROW. platform_agent_ensure.go
+// platformAgentHealthy makes 'online' the only "leave it alone" status, so an
+// over-claimed online no-ops the ensure decision. Tracing the callers bounds
+// this tightly, and an honest reading matters here more than most:
+//
+//   - EnsureSelfHostedPlatformAgent (the only AUTOMATIC caller) is ROW-ONLY —
+//     no ProvisionTrigger — and self-host-gated (MOLECULE_ORG_ID unset). What
+//     the no-op costs is the "repaired" path's org-token re-anchor and
+//     re-parent, not a container repair.
+//     (Verifiable at the CALL SITE, not just from that doc comment: it passes
+//     only SkipTombstoned, so ProvisionTrigger is nil and the flow cannot
+//     provision — see platform_agent_flow.go.)
+//   - MaybeProvisionPlatformAgentOnBoot, the actual container-level boot
+//     self-heal, SELECTs status but uses it ONLY for its log line — `status`
+//     appears at its declaration, its Scan, and that log, never as a branch
+//     input. Its decisions key on prov.IsRunning(), conciergeIdentityPresent,
+//     and platformAgentModelConfigured — none status-derived. ("IsRunning is
+//     the authoritative liveness check; status is the cheap one.")
+//   - The onboarding/Settings repair path (canvas configure.ts runEnsure)
+//     sends force:true, bypassing platformAgentHealthy entirely.
+//
+// So the residual window is: self-host boot re-anchor, plus any force-less
+// caller of POST /admin/org/platform-agent/ensure. NOT "an unservable
+// concierge never gets repaired". A change about not over-stating a signal
+// must not over-state its own blast radius.
+//
+// WHY THIS IS A DISCLOSURE AND NOT A GATE. Two DIFFERENT reasons, and they do
+// not cover the same consumers — conflating them is how a plausible-sounding
+// argument gets applied where it does not hold.
+//
+// (1) For the ADMITTERS, the reason is CIRCULARITY, and it is dispositive.
+// The only non-self-reported evidence the platform can observe is an INBOUND
+// management-API call authenticated by this concierge's own org token
+// (created_by "system:concierge:<id>", see resolveConciergeAdminCredential) —
+// i.e. a real provision_workspace invocation. That can only happen AFTER
+// traffic is admitted, and traffic is admitted by leaving 'provisioning'. You
+// cannot require proof-of-callability before admitting the traffic that
+// produces it. The alternative, having the platform drive a synthetic turn
+// that forces the verb, is the retired fireConciergeWarmup pattern and the
+// required verb is side-effecting (it creates a real workspace). Accepting a
+// runtime-reported `tools/call` result would just relocate the self-report.
+//
+// (2) For the REPAIR decision (platform_agent_ensure) there is NO such
+// circularity — whether to repair could be tightened independently of the
+// flip. What makes a gate wrong THERE, today, is different and simpler:
+// there is nothing honest to tighten it ON. Every label below is a
+// self-report, so keying a repair lever on one would arm a lever on a
+// self-report — precisely the mistake refused by declining to mint a
+// "callable" label. Fix the signal first, then the lever.
+//
+// THE LEVER, named here rather than by reference: platform_agent_ensure.go
+// platformAgentHealthy is the consumer to tighten once a non-self-reported
+// callability signal exists (tracked in core#5137). Naming it inline is
+// deliberate — an earlier draft said "named explicitly in the follow-up",
+// which pointed at an issue that did not name it and a merged PR body that
+// did. A dangling cross-reference is precisely the over-claim this contract
+// exists to prevent, so the claim now stands on its own text.
+//
+// ⚠️ Tightening does NOT mean widening platformAgentHealthy to
+// IN ('online','degraded'). That would leave MORE rows alone and suppress
+// MORE repair — the opposite of the intent. It means keying the
+// leave-it-alone decision on evidence that is not a self-report.
+//
+// So the flip stays where it is and STOPS CLAIMING what it has not verified:
+// it now records WHICH self-report authorised it (conciergeOnlineEvidence) in
+// place of the former unqualified `verified_ready: true`.
+//
+// ── UPDATE (core#5137): the deferred half — a CONSUMER-DERIVED signal ────────
+// The contract above says a "callable" label must wait for "a platform-OBSERVED
+// signal, not a cheaper self-report". That signal exists and core already
+// persists it; it just had no reader. See mcpSurfaceCorroboration below.
+// ────────────────────────────────────────────────────────────────────────────
+
+// ════════════════════════════════════════════════════════════════════════════
+// CONSUMER-DERIVED CALLABILITY CORROBORATION (core#5137)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// THE DEFECT THIS CLOSES — "54 loaded, zero callable".
+//
+// `loaded_mcp_tools` is produced by the runtime's out-of-band enumeration probe
+// (molecule-ai-workspace-runtime, molecule_runtime/loaded_mcp_tools_probe.py).
+// That probe spawns EACH declared server as its OWN stdio subprocess under a
+// PRIVATE client (its own clientInfo, "molecule-runtime-loaded-mcp-probe"),
+// drives
+//
+//	initialize -> notifications/initialized -> tools/list
+//
+// and normalises every returned tools[].name to `mcp__<server>__<tool>`
+// (_normalize_tool_id). The count it publishes therefore answers exactly one
+// question: "can a brand-new client spawn this server and read its schema list?"
+// It CAN ONLY EVER PROVE THE SERVER IS HEALTHY. It says nothing about the tool
+// surface the model was finally offered, because the model's surface is
+// assembled LATER, by the runtime, out of that inventory.
+//
+// ⚠️ NOT A WRONG-CONFIG BUG — an earlier draft of this comment claimed the probe
+// and the executor read DIFFERENT files on hermes. That is false and is
+// corrected here rather than deleted, because the wrong story would have sent
+// the next reader to the wrong repo. The hermes adapter OVERRIDES the
+// adapter_base default precisely so both sides read one file:
+// `enumerate_loaded_mcp_tools` -> `_read_hermes_mcp_servers` -> `config.yaml`,
+// and `mcp_settings_path` / `register_mcp_server_hook` resolve the SAME
+// `_hermes_config_path()`, kept "in LOCKSTEP … so a server the renderer writes
+// is byte-for-byte the file the adapter enumerates". Registration lands exactly
+// where the enumeration looks.
+//
+// THE TWO REAL CAUSES, both measured on the 2026-08-05 concierge:
+//
+//  1. TIERED DISCLOSURE DEFERRED THE SURFACE. hermes' tool_search replaces the
+//     individual MCP tools with three bridge tools and defers the real schemas.
+//     The runtime's own measurement:
+//     tool_search=off -> model-facing 120 (92 mcp__*), subset=True  CONVERGES
+//     tool_search=on  -> model-facing  28 ( 0 mcp__*), subset=False DIVERGES
+//     The server was healthy and its 54 tools were loaded; the model was
+//     offered none of them. The runtime template fixed this unconditionally on
+//     2026-08-06.
+//  2. A SPELLING SPLIT between the two layers — see mcpToolIDNamespace.
+//
+// The count never disagreed with the gate because the probe AND the gate's
+// membership test (conciergePlatformMCPProvisionWorkspaceTool) are both spelled
+// in the PROBE's naming convention, and neither looks at the assembled surface.
+// Two components deriving the same string from the same source always agree,
+// and their agreement is worth zero.
+//
+// WHERE THE AUTHORITATIVE RUNTIME-SIDE ANSWER NOW LIVES. The runtime has since
+// added the other half itself: `model_facing_tools` (what the model was actually
+// offered, post-assembly) and `loaded_not_model_facing` (its own set-difference,
+// folded through canonical_tool_id because only the runtime sees both
+// spellings). Both ride the heartbeat's identity-gate payload, and a NON-EMPTY
+// `loaded_not_model_facing` is the degraded signal core should gate on — the
+// runtime's comment says so explicitly: "Core gates on this; it needs no
+// spelling knowledge." Consuming that field is the correct next step and is NOT
+// done here (tracked as the follow-up below); this record is the INDEPENDENT
+// consumer-side cross-check of the same question, and does not replace it.
+//
+// THE SIGNAL, and why it is consumer-derived.
+//
+// Core already persists, per workspace, the tool ids the MODEL actually
+// dispatched — written by core's own turn-ingest path, not by any readiness
+// producer:
+//
+//   - activity_logs.tool_trace (migration 039) — extractToolTrace() lifts
+//     result.metadata.tool_trace off each A2A response as core ingests the turn.
+//   - activity_logs.summary on activity_type='agent_log' rows, which the
+//     executor's _report_tool_use writes as "<hammer> <tool>(...)" (the same
+//     marker messagestore.toolSummaryPrefix reconstructs turns from).
+//
+// Those strings are emitted by the DISPATCHER — the consumer of the tool surface
+// — and they cannot exist unless a tool was actually dispatched. No enumeration
+// probe, however healthy, can synthesise one. That is the difference in kind
+// from `loaded_mcp_tools`, which is an inventory the producer composed about
+// itself.
+//
+// HONEST LIMITS, stated so no reader over-reads the label. Core observes a
+// DISPATCH RECORD, transported on the runtime's A2A response; it does not
+// independently attest that the tool's side effects landed. Hence the label
+// prefix is `dispatch_observed:`, never `verified:` and never a bare `callable`.
+// It is strictly stronger than every `self_report:` value (it is impossible
+// without a real invocation) and strictly weaker than a platform-executed call.
+//
+// ⚠️ DIRECTION OF EFFECT — checked before writing, per the neighbouring
+// near-miss. This corroboration must NOT be added as a term of the promotion
+// predicate, in EITHER polarity:
+//
+//   - As a new DISJUNCT it would widen mcpSurfaceSelfReported and promote MORE
+//     rows on LESS evidence. Wrong direction.
+//   - As a new BLOCKER ("refuse online while contradicted") it would deny online
+//     to every concierge whose model dispatches only `mcp__molecule__*` — which,
+//     per the capture above, is the ENTIRE fleet. That is a fleet-wide denial
+//     cliff introduced by a signal whose producer has just been shown to be
+//     mis-namespaced. Also wrong direction.
+//
+// So it changes the LABEL and the REPORT, and nothing else. The set of
+// heartbeats that promote is byte-identical before and after this change; a
+// regression test pins that (TestMCPSurface_DoesNotMoveThePromotionPredicate).
+// Tightening the repair lever named in the contract above (platform_agent_ensure
+// platformAgentHealthy) becomes possible once this label has been observed in
+// the field — but that is a separate, evidence-first change.
+
+// mcpSurfaceVerdict is the corroboration outcome for one workspace's reported
+// MCP inventory, checked against the tool ids core has actually seen the model
+// dispatch. Like conciergeReadinessEvidence, every value carries its own
+// strength prefix so the string can never be mistaken for a stronger claim than
+// it is.
+type mcpSurfaceVerdict string
+
+const (
+	// verdictNoInventory — the runtime reported an EMPTY inventory. There is
+	// nothing to corroborate; this is not a failure, and it is not a pass.
+	verdictNoInventory mcpSurfaceVerdict = "unknown:no_inventory_reported"
+
+	// verdictNoDispatchRecord — core has never observed this workspace's model
+	// dispatch ANY mcp__ tool, so there is nothing to check the inventory
+	// against. ABSENCE IS NOT EVIDENCE: a freshly-provisioned concierge that
+	// no one has talked to lands here, and so does a genuinely broken one. A
+	// consumer must treat this as "not yet known", never as "fine".
+	verdictNoDispatchRecord mcpSurfaceVerdict = "unknown:no_dispatch_record"
+
+	// verdictNotYetExercised — the model DOES dispatch, but no namespace in the
+	// advertised inventory has ever been among the ids it dispatched.
+	//
+	// ⚠️ THIS IS NOT A FAULT FINDING, and the "unknown:" prefix is load-bearing.
+	// On this fleet it is the ORDINARY state of a perfectly healthy concierge:
+	// over 168h every recorded dispatch is the a2a sidecar (611 `mcp__molecule__*`
+	// lines) and there is not one management-MCP dispatch, because a concierge
+	// simply does not call provision_workspace in most turns. Absence of a
+	// dispatch says nothing whatever about whether the tool COULD be dispatched.
+	//
+	// An earlier revision spelled this state "contradicted:…" and logged it
+	// loudly as "the reported inventory is not callable as spelled". That was a
+	// label stronger than its evidence — the exact defect this whole record
+	// exists to correct, reproduced one layer up — and because it is the common
+	// case, the loud signal would have been mostly false and would have been
+	// learned as noise. See the CONTRADICTION note below for where that claim
+	// can honestly live.
+	verdictNotYetExercised mcpSurfaceVerdict = "unknown:advertised_not_yet_exercised"
+
+	// verdictCorroborated — at least one namespace the runtime advertises is a
+	// namespace core has actually seen the model dispatch from. The advertised
+	// surface and the model's surface are the same surface.
+	//
+	// STICKY (see classifyMCPSurface): this is an EXISTENCE claim about the
+	// workspace, not about the last N activity rows.
+	verdictCorroborated mcpSurfaceVerdict = "dispatch_observed:namespace_corroborated"
+)
+
+// ⚠️ WHY THERE IS NO "contradicted" VERDICT HERE.
+//
+// A verdict meaning "the model cannot reach the advertised tools" cannot be
+// derived from dispatch records AT ALL, in either quantity. Dispatch records are
+// EXISTENTIAL: an observed dispatch proves reachability, but no amount of
+// non-observation proves unreachability — the model may simply never have needed
+// the verb. Deriving a fault finding from that absence is exactly the inference
+// this file elsewhere refuses ("ABSENCE OF readiness_evidence IS NOT EVIDENCE OF
+// ABSENCE"), and shipping it here would have re-created the incident in a new
+// place.
+//
+// Contradiction requires comparing the inventory against the surface the model
+// was OFFERED, which is a different observation entirely and one core cannot
+// make. The runtime already makes it: `loaded_not_model_facing`, computed inside
+// the runtime because only the runtime sees both spellings, with NON-EMPTY as
+// the degraded signal. That is where a contradiction verdict belongs.
+//
+// DEFERRED, WITH THE MECHANISM NAMED (so this reads as a plan, not an
+// oversight). Two concrete facts block consuming it today:
+//  1. models.HeartbeatPayload has no `loaded_not_model_facing` field — core
+//     cannot receive it. Grep of core origin/main: zero occurrences anywhere.
+//  2. Nothing emits it yet. Over 168h of fleet logs the string appears zero
+//     times (the only `model_facing_tools` hits are Gitea HTTP request logs for
+//     the runtime's own test file, not runtime emissions), while the control
+//     `mcp_tools_ready` appears 475 times — so the query shape is sound and the
+//     zero is real absence, not a broken selector.
+//
+// The order is therefore: runtime ships the field -> core adds the payload
+// field -> core gates on NON-EMPTY. Arming a contradiction verdict before its
+// producer feeds it would be a signal armed ahead of its producer.
+
+// mcpSurfaceReport is what core publishes ALONGSIDE (never in place of) the
+// runtime's raw loaded_mcp_tools. loaded_mcp_tools keeps carrying exactly what
+// the runtime claimed — laundering a producer's claim is how a signal stops
+// being auditable — and this record says how much of that claim the consumer
+// side corroborates.
+type mcpSurfaceReport struct {
+	// ReportedCount is the size of the runtime's inventory: the "54".
+	ReportedCount int `json:"reported_count"`
+	// DispatchCorroboratedCount is how many of those ids sit in a namespace the
+	// model has actually dispatched from. THIS is the number a caller asking
+	// "what can the model call?" should read.
+	DispatchCorroboratedCount int `json:"dispatch_corroborated_count"`
+	// AdvertisedOnlyCount is the remainder: ReportedCount - corroborated.
+	AdvertisedOnlyCount int `json:"advertised_only_count"`
+	// ReportedNamespaces / DispatchedNamespaces are sorted and deduped so the
+	// mismatch is legible at a glance without re-deriving it.
+	ReportedNamespaces   []string `json:"reported_namespaces"`
+	DispatchedNamespaces []string `json:"dispatched_namespaces"`
+	// DispatchRecords is how many dispatch observations backed this verdict. 0
+	// means the verdict is one of the "unknown:" values by construction.
+	DispatchRecords int `json:"dispatch_records"`
+	// CorroboratedNamespaces is the MONOTONIC union of every namespace this
+	// workspace's model has ever been observed dispatching from — the sticky
+	// half (see classifyMCPSurface). It is what makes the verdict a fact about
+	// the workspace rather than about the last mcpDispatchLookbackRows rows.
+	CorroboratedNamespaces []string `json:"corroborated_namespaces"`
+	// FirstCorroboratedAt stamps when corroboration was FIRST reached, so a
+	// caller can see how old the sticky claim is instead of having to trust it
+	// as current. Nil until corroboration happens.
+	FirstCorroboratedAt *time.Time        `json:"first_corroborated_at,omitempty"`
+	Verdict             mcpSurfaceVerdict `json:"verdict"`
+	// ObservedAt is when THIS evaluation ran — the freshness of the windowed
+	// half, not of the sticky half (that is FirstCorroboratedAt).
+	ObservedAt time.Time `json:"observed_at"`
+}
+
+// mcpToolIDUnsafe is the transform hermes applies to every MCP name component
+// before registering it with the model (tools/mcp_tool.py
+// sanitize_mcp_name_component). It is reproduced here to MIRROR the runtime's
+// molecule_runtime/loaded_mcp_tools_probe.py canonical_tool_id, which is the
+// SSOT for this fold; the pattern is `[^A-Za-z0-9_]`.
+var mcpToolIDUnsafe = regexp.MustCompile(`[^A-Za-z0-9_]`)
+
+// mcpToolIDNamespace returns the CANONICAL `<server>` segment of an
+// `mcp__<server>__<tool>` dispatcher id, or "" when the string is not one.
+//
+// ⚠️ THE SPELLING SPLIT — why this folds instead of comparing raw.
+// The two sides of this comparison do not spell the server the same way. The
+// runtime's enumeration probe composes ids from the server name AS DECLARED, so
+// it emits `mcp__molecule-platform__provision_workspace` (hyphen). hermes
+// sanitises every name component with `re.sub(r"[^A-Za-z0-9_]", "_", …)` before
+// registering it, so the model is offered
+// `mcp__molecule_platform__provision_workspace` (underscore) — and that is the
+// only spelling the model can emit. Captured on this fleet in one line:
+//
+//	tools.mcp_tool: MCP server 'molecule-platform' (stdio): registered 54
+//	tool(s): mcp__molecule_platform__list_workspaces, …
+//
+// A raw string comparison between the reported inventory and the dispatch
+// record is therefore a CONSTANT FALSE on hermes — it would report a divergence
+// on every beat including a perfectly healthy one, which is exactly as useless
+// as the constant TRUE it replaces. The runtime repo wrote canonical_tool_id to
+// prevent precisely this and says so in its docstring; this function mirrors it.
+//
+// Parsed by explicit index rather than strings.Split so a tool name that itself
+// contains "__" (legal, and present in the wild) cannot shift the namespace: the
+// namespace is everything between the FIRST "mcp__" and the NEXT "__", and the
+// tool is the whole remainder. A trailing-but-empty tool ("mcp__x__") is not a
+// dispatchable id and returns "".
+//
+// The fold is applied to the namespace segment only, AFTER the "mcp__"/"__"
+// structure has been parsed off the raw string — folding first would rewrite the
+// separators themselves and make every id unparseable.
+func mcpToolIDNamespace(toolID string) string {
+	const prefix = "mcp__"
+	const sep = "__"
+	s := strings.TrimSpace(toolID)
+	if !strings.HasPrefix(s, prefix) {
+		return ""
+	}
+	rest := s[len(prefix):]
+	idx := strings.Index(rest, sep)
+	if idx <= 0 {
+		return "" // no separator, or an empty namespace ("mcp____tool")
+	}
+	if len(rest) <= idx+len(sep) {
+		return "" // "mcp__server__" with no tool segment
+	}
+	return mcpToolIDUnsafe.ReplaceAllString(rest[:idx], "_")
+}
+
+// mcpDispatchNamespacesFrom extracts the set of canonical dispatcher namespaces
+// from activity_logs.tool_trace documents: a JSON array of {"tool": "..."}
+// objects (or of bare strings, which older writers produced).
+//
+// ⚠️ TRUST BOUNDARY — why ONLY tool_trace, and not the agent_log "tool-use"
+// summaries. Both look like a record of a dispatch, but they are not equally
+// trustworthy:
+//
+//   - tool_trace is DISPATCHER-ONLY. extractToolTrace (a2a_proxy_helpers.go) is
+//     its sole writer; it lifts result.metadata.tool_trace off the A2A response
+//     as core ingests the turn. The workspace-facing ingest endpoint
+//     (ActivityHandler.Report, POST /workspaces/:id/activity) has NO tool_trace
+//     field at all, so a workspace cannot post one.
+//   - The agent_log summaries CAN be posted. That same endpoint accepts
+//     activity_type:"agent_log" with an arbitrary Summary from the
+//     authenticated workspace. A workspace could POST
+//     "<marker> mcp__molecule-platform__list_orgs(…)" having dispatched
+//     nothing and manufacture its own corroboration.
+//
+// That second path is the SAME trust boundary that produced loaded_mcp_tools —
+// the component under scrutiny attesting to itself. Reading it here would make
+// this record a laundered self-report wearing a dispatch_observed: label, which
+// is worse than no label. It is dropped rather than downgraded: a corroboration
+// signal with a forgeable arm has no honest strength to report.
+//
+// Everything unparseable is DROPPED, never guessed. A malformed trace must not
+// invent a namespace — an invented namespace would manufacture corroboration,
+// which is the precise failure this whole record exists to prevent.
+func mcpDispatchNamespacesFrom(toolTraces [][]byte) (map[string]struct{}, int) {
+	out := map[string]struct{}{}
+	records := 0
+
+	add := func(toolID string) {
+		if ns := mcpToolIDNamespace(toolID); ns != "" {
+			out[ns] = struct{}{}
+			records++
+		}
+	}
+
+	for _, raw := range toolTraces {
+		if len(raw) == 0 {
+			continue
+		}
+		var entries []json.RawMessage
+		if err := json.Unmarshal(raw, &entries); err != nil {
+			continue
+		}
+		for _, e := range entries {
+			var obj struct {
+				Tool string `json:"tool"`
+			}
+			if err := json.Unmarshal(e, &obj); err == nil && obj.Tool != "" {
+				add(obj.Tool)
+				continue
+			}
+			var s string
+			if err := json.Unmarshal(e, &s); err == nil && s != "" {
+				add(s)
+			}
+		}
+	}
+
+	return out, records
+}
+
+// classifyMCPSurface is the whole verdict, as a PURE function of (what the
+// runtime reported, what core observed the model dispatch). Pure so the
+// honesty contract is unit-testable without a DB and so the mutation test can
+// drive it directly in both directions.
+// ⚠️ STICKY vs WINDOWED — a decision, not an artifact of the query.
+//
+// The dispatch read is a WINDOW (the newest mcpDispatchLookbackRows rows). If the
+// verdict were computed from that window alone, a corroborated workspace would
+// silently revert as its platform dispatches aged out behind ordinary sidecar
+// chatter — the label oscillating on traffic MIX while nothing about the
+// workspace changed. A verdict that flaps on unrelated traffic is not a signal;
+// it is a thing operators learn to ignore.
+//
+// So the two halves are treated according to what each actually claims:
+//
+//   - CORROBORATION IS STICKY. "This workspace's model has dispatched from
+//     namespace X" is an EXISTENCE claim. Once true it is permanently true;
+//     ageing rows out of a window does not un-happen the dispatch. `prior` is
+//     the monotonic union carried forward from the last evaluation, and the
+//     union — not the window — decides corroboration.
+//   - NON-CORROBORATION IS WINDOWED. "Nothing has exercised these lately" is a
+//     statement about recent behaviour and is honestly re-derived every beat.
+//
+// THE LIMIT OF STICKINESS, stated so nobody over-reads it: a sticky
+// corroborated verdict means "was reachable at least once", NOT "is reachable
+// now". FirstCorroboratedAt is carried on the record precisely so the age of the
+// claim is visible instead of implied. This cannot mask a live regression,
+// because it never made a present-tense claim and because live regression is
+// already carried by other signals (mcp_tools_ready going false, the
+// mcp_unloaded_since grace, and — once consumed — the runtime's
+// loaded_not_model_facing).
+//
+// `prior` may be nil (first evaluation, or a record written before this field
+// existed); nil simply means the union starts empty.
+func classifyMCPSurface(reported []string, dispatched map[string]struct{}, dispatchRecords int, prior *mcpSurfaceReport, now time.Time) mcpSurfaceReport {
+	rep := mcpSurfaceReport{
+		ReportedCount:          len(reported),
+		ReportedNamespaces:     []string{},
+		DispatchedNamespaces:   []string{},
+		CorroboratedNamespaces: []string{},
+		DispatchRecords:        dispatchRecords,
+		ObservedAt:             now.UTC(),
+	}
+
+	// The monotonic union: everything ever dispatched, plus this window.
+	everDispatched := map[string]struct{}{}
+	if prior != nil {
+		for _, ns := range prior.CorroboratedNamespaces {
+			if ns != "" {
+				everDispatched[ns] = struct{}{}
+			}
+		}
+		rep.FirstCorroboratedAt = prior.FirstCorroboratedAt
+	}
+	for ns := range dispatched {
+		everDispatched[ns] = struct{}{}
+	}
+
+	seenReported := map[string]struct{}{}
+	for _, id := range reported {
+		ns := mcpToolIDNamespace(id)
+		if ns == "" {
+			// A reported entry that is not a dispatcher id can never be
+			// callable under ANY namespace, so it counts toward the total but
+			// contributes no namespace and is never corroborated.
+			continue
+		}
+		if _, ok := seenReported[ns]; !ok {
+			seenReported[ns] = struct{}{}
+			rep.ReportedNamespaces = append(rep.ReportedNamespaces, ns)
+		}
+		if _, ok := everDispatched[ns]; ok {
+			rep.DispatchCorroboratedCount++
+		}
+	}
+	rep.AdvertisedOnlyCount = rep.ReportedCount - rep.DispatchCorroboratedCount
+	for ns := range dispatched {
+		rep.DispatchedNamespaces = append(rep.DispatchedNamespaces, ns)
+	}
+	for ns := range everDispatched {
+		rep.CorroboratedNamespaces = append(rep.CorroboratedNamespaces, ns)
+	}
+	sort.Strings(rep.ReportedNamespaces)
+	sort.Strings(rep.DispatchedNamespaces)
+	sort.Strings(rep.CorroboratedNamespaces)
+
+	switch {
+	case rep.ReportedCount == 0:
+		rep.Verdict = verdictNoInventory
+	case rep.DispatchCorroboratedCount > 0:
+		rep.Verdict = verdictCorroborated
+		if rep.FirstCorroboratedAt == nil {
+			at := now.UTC()
+			rep.FirstCorroboratedAt = &at
+		}
+	case len(everDispatched) == 0:
+		// Nobody has talked to this workspace at all.
+		rep.Verdict = verdictNoDispatchRecord
+	default:
+		// The model dispatches; it just has not needed these tools. NOT a fault.
+		rep.Verdict = verdictNotYetExercised
+	}
+	return rep
+}
+
+// mcpSurfaceContextKey is where recordMCPSurfaceCorroboration parks this
+// request's verdict for evaluateStatus to read. Request-scoped on purpose: the
+// label must describe the beat being evaluated, not whatever a concurrent beat
+// most recently wrote to the row.
+const mcpSurfaceContextKey = "mcp_surface_verdict"
+
+// mcpSurfaceVerdictFromContext returns the verdict computed earlier in this
+// request, or "" when none was. It FAILS TO THE NEUTRAL VALUE — a missing or
+// unrecognised entry can mint neither corroboration nor contradiction, so a
+// corroboration outage degrades the label to the pre-existing self-report
+// wording rather than inventing a verdict.
+func mcpSurfaceVerdictFromContext(c *gin.Context) mcpSurfaceVerdict {
+	if c == nil {
+		return ""
+	}
+	v, ok := c.Get(mcpSurfaceContextKey)
+	if !ok {
+		return ""
+	}
+	s, ok := v.(mcpSurfaceVerdict)
+	if !ok {
+		return ""
+	}
+	switch s {
+	case verdictNoInventory, verdictNoDispatchRecord, verdictNotYetExercised, verdictCorroborated:
+		return s
+	default:
+		return ""
+	}
+}
+
+// mcpDispatchLookbackRows bounds the corroboration read. The question is
+// categorical ("has this workspace's model dispatched from namespace X
+// recently"), so the newest window is sufficient.
+const mcpDispatchLookbackRows = 200
+
+// recordMCPSurfaceCorroboration reads core's OWN dispatch record for this
+// workspace, classifies the runtime's reported inventory against it, and
+// persists the result to workspaces.mcp_surface.
+//
+// BEST-EFFORT BY CONTRACT: every failure path logs and returns without touching
+// the column, so a corroboration problem can never break the heartbeat's
+// liveness ack or the status machine. The previous value is left in place rather
+// than being overwritten with a weaker one — a transient DB error must not read
+// as "the evidence went away".
+//
+// Cost: exactly ONE extra SELECT per heartbeat that carries an inventory. The
+// runtime only publishes loaded_mcp_tools for kind=platform (its own
+// _is_platform_agent gate), so ordinary tenants never reach this at all.
+func (h *RegistryHandler) recordMCPSurfaceCorroboration(c *gin.Context, ctx context.Context, workspaceID string, reported []string) {
+	// Nothing to corroborate against an empty inventory, and the verdict is
+	// already determined (verdictNoInventory) whatever the dispatch record says.
+	// Short-circuit BEFORE the read so a runtime whose producer is dead does not
+	// pay for a query whose answer cannot change the outcome.
+	if len(reported) == 0 {
+		report := classifyMCPSurface(reported, nil, 0, nil, time.Now())
+		if c != nil {
+			c.Set(mcpSurfaceContextKey, report.Verdict)
+		}
+		if encoded, marshalErr := json.Marshal(report); marshalErr == nil {
+			if _, execErr := db.DB.ExecContext(ctx, `
+				UPDATE workspaces SET mcp_surface = $1::jsonb, updated_at = now()
+				 WHERE id = $2 AND status != 'removed'
+			`, encoded, workspaceID); execErr != nil {
+				log.Printf("Heartbeat: failed to persist mcp_surface for %s: %v", workspaceID, execErr)
+			}
+		}
+		return
+	}
+
+	// The prior record, for the STICKY half (see classifyMCPSurface). A
+	// single-row primary-key lookup; a miss or a malformed document simply
+	// starts the union empty, which can only ever WEAKEN the verdict — a read
+	// failure here must never be able to invent corroboration.
+	prior := h.priorMCPSurface(ctx, workspaceID)
+
+	// ONE index-served branch. tool_trace is the only unforgeable source (see
+	// mcpDispatchNamespacesFrom's trust-boundary note), and this predicate is
+	// served by the partial idx_activity_logs_ws_tooltrace_time added alongside
+	// the mcp_surface column. LIMITed, so the read stays O(1) per heartbeat
+	// regardless of how much history a tenant has accumulated.
+	rows, err := db.DB.QueryContext(ctx, `
+		SELECT COALESCE(tool_trace::text, '')
+		  FROM activity_logs
+		 WHERE workspace_id = $1 AND tool_trace IS NOT NULL
+		 ORDER BY created_at DESC
+		 LIMIT $2
+	`, workspaceID, mcpDispatchLookbackRows)
+	if err != nil {
+		log.Printf("Heartbeat: mcp_surface corroboration read failed for %s: %v — leaving the previous record untouched", workspaceID, err)
+		return
+	}
+	defer rows.Close()
+
+	var traces [][]byte
+	for rows.Next() {
+		var trace string
+		if scanErr := rows.Scan(&trace); scanErr != nil {
+			log.Printf("Heartbeat: mcp_surface corroboration scan failed for %s: %v", workspaceID, scanErr)
+			return
+		}
+		if trace != "" {
+			traces = append(traces, []byte(trace))
+		}
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		log.Printf("Heartbeat: mcp_surface corroboration iteration failed for %s: %v", workspaceID, rowsErr)
+		return
+	}
+
+	dispatched, records := mcpDispatchNamespacesFrom(traces)
+	report := classifyMCPSurface(reported, dispatched, records, prior, time.Now())
+
+	// Publish to the request BEFORE persisting: the label evaluateStatus emits
+	// describes what core observed on THIS beat, and a failure to write the
+	// column must not also silence the event label.
+	if c != nil {
+		c.Set(mcpSurfaceContextKey, report.Verdict)
+	}
+
+	encoded, marshalErr := json.Marshal(report)
+	if marshalErr != nil {
+		log.Printf("Heartbeat: failed to marshal mcp_surface for %s: %v", workspaceID, marshalErr)
+		return
+	}
+	if _, execErr := db.DB.ExecContext(ctx, `
+		UPDATE workspaces SET mcp_surface = $1::jsonb, updated_at = now()
+		 WHERE id = $2 AND status != 'removed'
+	`, encoded, workspaceID); execErr != nil {
+		log.Printf("Heartbeat: failed to persist mcp_surface for %s: %v", workspaceID, execErr)
+		return
+	}
+
+	// NO loud log here. The only state that would have justified one
+	// ("the model demonstrably cannot reach these") is not derivable from
+	// dispatch records — see the CONTRADICTION note above the verdict consts.
+	// A loud line on unknown:advertised_not_yet_exercised would fire on most
+	// healthy concierges and be learned as noise.
+}
+
+// priorMCPSurface reads the last-persisted mcp_surface document, or nil when
+// there is none / it cannot be read / it is malformed.
+//
+// FAILS TO nil BY DESIGN. nil starts the sticky union empty, which can only
+// weaken the verdict; there is no failure mode in which a bad read manufactures
+// corroboration.
+func (h *RegistryHandler) priorMCPSurface(ctx context.Context, workspaceID string) *mcpSurfaceReport {
+	var raw []byte
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(mcp_surface::text, '') FROM workspaces WHERE id = $1`,
+		workspaceID).Scan(&raw); err != nil {
+		return nil
+	}
+	if len(raw) == 0 {
+		return nil
+	}
+	var prior mcpSurfaceReport
+	if err := json.Unmarshal(raw, &prior); err != nil {
+		return nil
+	}
+	return &prior
+}
+
+// conciergeReadinessEvidence names the evidence that authorised a platform
+// concierge's promotion to online. Every value is deliberately prefixed with
+// its own strength so no reader can mistake it for proof of callability:
+// "self_report:" = the runtime said so about itself; "none:" = nothing was
+// checked at all. There is intentionally NO value meaning "callable" — nothing
+// at this point can produce one, and minting an unfed label would be a signal
+// armed ahead of its producer.
+//
+// ⚠️ ABSENCE OF `readiness_evidence` IS NOT EVIDENCE OF ABSENCE. This field is
+// emitted ONLY by the two kind=platform promotion arms in evaluateStatus.
+// EventWorkspaceOnline has OTHER producers (the generic non-platform recovery
+// branches, provisioning completion, restart/wake paths) that carry no such
+// field, and pre-existing rows in structure_events predate it entirely. A
+// consumer that sees the field missing may conclude NOTHING — it is "this
+// producer does not label" or "older event", NOT "no evidence was available".
+// Only a PRESENT value is meaningful, and only the value itself (never the
+// mere fact of labelling) says how strong the claim is. Widening the field to
+// every producer is the prerequisite for treating absence as informative;
+// until then, read it as optional-and-additive.
+type conciergeReadinessEvidence string
+
+const (
+	// evidenceSelfReportMCPToolsReady — the EV2 mcp_tools_ready heartbeat field
+	// was true. The runtime's own prober succeeded at tools/list. Preferred over
+	// the loaded_mcp_tools list because it is turn-independent and does not
+	// depend on the under-emitting per-turn producer (runtime#181) — but it is
+	// still the runtime describing itself, and a successful tools/list says
+	// nothing about whether a tools/call would do any work.
+	evidenceSelfReportMCPToolsReady conciergeReadinessEvidence = "self_report:mcp_tools_ready"
+
+	// evidenceSelfReportLoadedMCPTools — back-compat arm: the runtime did not
+	// publish mcp_tools_ready, but its self-reported loaded_mcp_tools list
+	// contained the required verb. Strictly weaker than the above: it is a
+	// membership test over a list the runtime composed.
+	evidenceSelfReportLoadedMCPTools conciergeReadinessEvidence = "self_report:loaded_mcp_tools"
+
+	// evidenceNoneLegacyRuntime — the pre-#147 fast path. mcp_server_present is
+	// nil, so the runtime cannot speak the readiness contract at all and is
+	// promoted on liveness alone. NO readiness evidence of any kind was
+	// examined; naming it keeps that visible on the wire instead of letting it
+	// masquerade as the same claim as the arms above.
+	evidenceNoneLegacyRuntime conciergeReadinessEvidence = "none:legacy_runtime_no_readiness_contract"
+
+	// evidenceDispatchObservedMCPSurface — core's OWN turn record shows this
+	// workspace's MODEL has actually dispatched from a namespace the runtime
+	// advertises (mcp_surface verdict = dispatch_observed:namespace_corroborated).
+	// This is the first value here that is NOT a self-report: it cannot exist
+	// unless a tool was really dispatched, and the string it is derived from was
+	// emitted by the dispatcher, not by a readiness producer.
+	//
+	// Still NOT spelled "callable". Core observed a dispatch RECORD, not a
+	// platform-executed call; the prefix says exactly that and nothing more.
+	evidenceDispatchObservedMCPSurface conciergeReadinessEvidence = "dispatch_observed:mcp_namespace_corroborated"
+)
+
+// conciergeOnlineEvidence names the single strongest self-report that
+// authorised a verified-arm promotion. Pure so the honesty contract is
+// unit-testable without a DB: the caller has already decided TO promote; this
+// only labels WHY, and must never collapse the two arms to one value — the
+// distinction is what tells an operator whether the reliable turn-independent
+// prober fired or only the under-emitting list producer did.
+//
+// Returns "" when neither input holds, which the verified arm never reaches
+// (it is guarded by mcpSurfaceSelfReported). An empty label on the wire would
+// therefore itself be a bug signal, not a silent default.
+//
+// core#5137: `surface` is the verdict computed for THIS beat by
+// recordMCPSurfaceCorroboration and read back from the request context in
+// evaluateStatus (mcpSurfaceVerdictFromContext) — request-scoped, not the
+// last-persisted column value, so a concurrent beat cannot label this one, and
+// no extra query is issued. It only ever changes the LABEL:
+//
+//   - corroborated   -> upgrade to the dispatch_observed: value, the only
+//     non-self-reported evidence available here.
+//   - unknown:* / "" -> unchanged. Absence of a dispatch record is NOT evidence
+//     of absence — neither a concierge nobody has talked to
+//     nor one whose turns simply never needed these tools
+//     has told us anything — so it must never weaken or
+//     strengthen the label. There is deliberately no
+//     DOWNGRADE arm: no verdict derivable here is negative
+//     evidence (see the CONTRADICTION note above).
+//
+// The promotion DECISION is made by the caller before this is called and is not
+// a function of `surface`; this only names WHY.
+func conciergeOnlineEvidence(mcpToolsReady, provisionToolLoaded bool, surface mcpSurfaceVerdict) conciergeReadinessEvidence {
+	base := conciergeReadinessEvidence("")
+	switch {
+	case mcpToolsReady:
+		base = evidenceSelfReportMCPToolsReady
+	case provisionToolLoaded:
+		base = evidenceSelfReportLoadedMCPTools
+	default:
+		return ""
+	}
+	switch surface {
+	case verdictCorroborated:
+		return evidenceDispatchObservedMCPSurface
+	default:
+		return base
+	}
+}
+
 func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.HeartbeatPayload) {
 	ctx := c.Request.Context()
 
@@ -1693,6 +2546,13 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	if err != nil {
 		return
 	}
+	// core#5137: the consumer-derived verdict computed earlier in THIS request by
+	// recordMCPSurfaceCorroboration. Read from the request context rather than
+	// re-queried: zero extra round-trips, and it is guaranteed to be the verdict
+	// for THIS beat rather than a racing one. Absent (register path, a runtime
+	// that published no inventory, or a corroboration read that failed) yields
+	// the neutral "" — which conciergeOnlineEvidence treats as "changes nothing".
+	mcpSurface := mcpSurfaceVerdictFromContext(c)
 	hasRecentRegisterFailure := lastRegisterFailure.Valid && time.Since(lastRegisterFailure.Time) < 5*time.Minute
 
 	// managementMCPUnloaded tracks whether THIS heartbeat observed the declared
@@ -1752,37 +2612,40 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 			return
 		}
 
-		// core#3082 VERIFIED-READY status management. For a kind=platform
-		// concierge, "online" MUST mean provision_workspace is callable. The
-		// closest by-construction signal available in the heartbeat is the tool
+		// core#3082 status management for a kind=platform concierge.
+		//
+		// ⚠️ CLAIM CORRECTION: this block used to assert that "online" MUST mean
+		// provision_workspace is CALLABLE. It does not and never did — see the
+		// HONEST-CLAIM CONTRACT above evaluateStatus. Both inputs below are
+		// runtime SELF-REPORTS; neither is a tools/call. What this block actually
+		// enforces is: the concierge ADVERTISES the required management surface
+		// (and is healthy) before it leaves the warming hold. Callability is
+		// proven only by Guard B at deploy time.
+		//
+		// The closest by-construction signal available in the heartbeat is the tool
 		// present in THIS heartbeat's loaded_mcp_tools — STRICTER than
 		// platformAgentManagementMCPLoaded (which reports not-missing when the
 		// management plugin row isn't declared yet, so it would false-flip to online
 		// before the plugin reconcile lands). A platform row is HELD in
 		// 'provisioning' (the warming display state) until a heartbeat proves the
-		// tool loaded; the warmup below fires the per-turn capture that produces that
-		// proof. This inverts the old "online-first, degrade-only-if-tools-never-load"
+		// tool loaded; EV2's mcp_tools_ready event (turn-independent) now produces
+		// that proof directly — no synthetic warmup turn needed. This inverts the
+		// old "online-first, degrade-only-if-tools-never-load"
 		// model that let an unverified concierge accept a user turn and hang (the
 		// principal's live test1).
 		//
-		// ⚠️ PRESENCE, NOT CALLABILITY — and the field is UNRELIABLE (runtime#181).
-		// loaded_mcp_tools is a PRESENCE signal, not a true callability probe, and a
-		// genuine inline probe (an actual provision_workspace call) is infeasible on
-		// the fleet-wide heartbeat path — it must stay fast / non-blocking, so the
-		// async warmup turn is the only "is it really callable?" driver we have. WORSE,
-		// runtime#181 reports the producer under-emits: loaded_mcp_tools comes back
-		// null/empty even when the tool IS loaded and deliverable (proven on staging).
-		// That means trusting PRESENCE alone risks the INVERSE failure of test1 — a
-		// healthy concierge held in 'provisioning' and then force-FAILED at the 180s
-		// warming bound while the tool is actually callable. Two safeguards keep that
-		// from hanging the fleet: (1) the legacy (mcp_server_present==nil) fast-path
-		// promotes a null-field runtime immediately; (2) the bounded warming timeout
-		// stops an infinite 'provisioning' hold. But for MODERN runtimes neither
-		// safeguard makes this gate RELIABLE — that requires fixing the producer.
-		// runtime#181 (wire/repair the loaded_mcp_tools producer so it emits the real
-		// loaded set) is a REQUIRED, BLOCKING companion fix: this gate must not reach
-		// prod ahead of it, or every modern concierge warms-then-fails. See the PR
-		// description for the explicit blocking-companion recommendation.
+		// ⚠️ loaded_mcp_tools is PRESENCE, NOT CALLABILITY — and UNRELIABLE (runtime#181
+		// reports the producer under-emits: the list comes back null/empty even when the
+		// tool IS loaded and deliverable, proven on staging). Trusting PRESENCE alone
+		// risks the INVERSE of test1 — a healthy concierge held in 'provisioning' while
+		// the tool is actually callable. EV2 fixes the driver: the runtime's
+		// MCPReadinessProber sets mcp_tools_ready=true directly on the FIRST successful
+		// tools/list (turn-independent — no synthetic warmup turn, and independent of the
+		// under-emitting loaded_mcp_tools producer), so the online-flip is driven by that
+		// reliable event (see mcpSurfaceSelfReported below). loaded_mcp_tools presence of
+		// provision_workspace remains a back-compat fallback for a runtime that emits the
+		// list but not yet the ready flag; the legacy (mcp_server_present==nil) fast-path
+		// still promotes a null-field runtime immediately.
 		provisionToolLoaded := false
 		for _, t := range payload.LoadedMCPTools {
 			if t == conciergePlatformMCPProvisionWorkspaceTool {
@@ -1790,6 +2653,33 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				break
 			}
 		}
+
+		// EV2 (SDK mcp_tools_ready): the POSITIVE, turn-independent readiness
+		// event. The runtime's MCPReadinessProber sets mcp_tools_ready=true on the
+		// FIRST successful tools/list — so it fires for codex/hermes WITHOUT a
+		// synthetic turn. TRUE is a sufficient online-flip trigger and REPLACES the
+		// wall-clock fireConciergeWarmup nudge (retired) that used to coax the
+		// per-turn loaded_mcp_tools capture. TRI-STATE (absent != false): nil =
+		// unknown / prober not yet succeeded, false = probed-not-ready, true =
+		// tools loaded. runtime#273 landed the negative half (launch_failure); this
+		// is the positive half.
+		mcpToolsReady := payload.MCPToolsReady != nil && *payload.MCPToolsReady
+
+		// mcpSurfaceSelfReported is the predicate for the provisioning->online
+		// flip: EITHER the EV2 tools-loaded heartbeat event (preferred —
+		// turn-independent, and the more reliable of the two) OR the legacy presence
+		// of the required provision_workspace tool in loaded_mcp_tools (back-compat
+		// for a runtime that emits the list but not yet the ready flag). The 180s
+		// managementMCPUnloadedGrace below is KEPT as the post-online flap
+		// absorber for the loaded_mcp_tools under-emit window (runtime#181).
+		//
+		// NAMED FOR WHAT IT IS (was: readyForOnline, described as "verified-ready"):
+		// both disjuncts are the runtime reporting on itself. This predicate proves
+		// the management surface is ADVERTISED, not that the verb does work. Do not
+		// widen it, and do not add a third disjunct that is another self-report —
+		// the fix for the missing callability proof is a platform-OBSERVED signal,
+		// not a cheaper self-report (see the contract above evaluateStatus).
+		mcpSurfaceSelfReported := mcpToolsReady || provisionToolLoaded
 
 		// recoverable lists the statuses a live heartbeat may legitimately promote
 		// to online. removed/paused/hibernated/hibernating are terminal or
@@ -1801,18 +2691,11 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 			currentStatus == string(models.StatusAwaitingAgent) ||
 			currentStatus == string(models.StatusDegraded)
 
-		// Fire the warmup whenever the tool is not yet proven loaded — it drives the
-		// per-turn loaded_mcp_tools capture that resolves the warming→online
-		// chicken-and-egg (and re-captures during any post-online #3082 grace gap).
-		// Scoped to online/recoverable states so a terminal row is never warmed.
-		// fireConciergeWarmup is throttled per process (re-fires every
-		// conciergeWarmupTimeout) so a cold warmup turn that raced ahead of the MCP
-		// connect — or a transient warmup failure — self-heals rather than stranding
-		// the concierge until the warming timeout; system:concierge-warmup is exempt
-		// from the dispatch warming-gate so it reaches the runtime while warming.
-		if !provisionToolLoaded && (currentStatus == string(models.StatusOnline) || recoverable) {
-			h.fireConciergeWarmup(ctx, payload.WorkspaceID)
-		}
+		// EV2: the wall-clock fireConciergeWarmup nudge is RETIRED. The per-turn
+		// loaded_mcp_tools capture no longer needs a synthetic turn to coax it —
+		// the runtime's turn-independent MCPReadinessProber reports mcp_tools_ready
+		// directly on the heartbeat, so the warming->online flip is driven by that
+		// real readiness event (mcpSurfaceSelfReported) instead of a 60s synthetic turn.
 
 		// nil mcp_server_present == a legacy runtime that can never report
 		// loaded_mcp_tools; applying the strict verified gate would strand it in
@@ -1852,27 +2735,49 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = $3::workspace_status`, models.StatusOnline, payload.WorkspaceID, currentStatus); err != nil {
 					log.Printf("Heartbeat: legacy platform %s %s->online failed: %v", payload.WorkspaceID, currentStatus, err)
 				}
-				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{"recovered_from": currentStatus})
+				// Label the legacy arm too: it promotes on LIVENESS ALONE (the runtime
+				// cannot speak the readiness contract), which is even weaker than the
+				// self-report arms. Emitting it unlabelled next to a labelled event
+				// would read as "no evidence recorded" rather than "no evidence taken".
+				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{"readiness_evidence": string(evidenceNoneLegacyRuntime), "recovered_from": currentStatus})
 				h.fireReconcileOnline(ctx, payload.WorkspaceID)
-			case provisionToolLoaded && !conciergeUnhealthy:
-				// VERIFIED-ready by construction: provision_workspace is callable, so
-				// promote and clear any warming stamp. The AND status=$currentStatus
-				// guard keeps the flip conditional so a racing Delete/pause is not
-				// overwritten.
+				// FIRST boots only (provisioning→online). Recovery promotions
+				// (offline/failed/degraded→online after an outage) must never
+				// greet — an unprompted "first boot" message weeks after
+				// onboarding reads as a haunted chat. The greeter's own
+				// empty-history gate stays as the second key.
+				if currentStatus == string(models.StatusProvisioning) {
+					h.fireFirstBootGreeting(payload.WorkspaceID, len(payload.LoadedMCPTools))
+				}
+			case mcpSurfaceSelfReported && !conciergeUnhealthy:
+				// SELF-REPORTED-ready: the EV2 mcp_tools_ready event (or, back-compat,
+				// provision_workspace present in loaded_mcp_tools) says the management
+				// MCP is loaded, so promote and clear any warming stamp. This is an
+				// ADVERTISEMENT of the surface, NOT proof the verb is callable — the
+				// evidence label below records which self-report authorised it so the
+				// event stream never again carries an unqualified "verified" claim.
+				// The AND status=$currentStatus guard keeps the flip conditional so a
+				// racing Delete/pause is not overwritten.
+				evidence := conciergeOnlineEvidence(mcpToolsReady, provisionToolLoaded, mcpSurface)
 				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2 AND status = $3::workspace_status`, models.StatusOnline, payload.WorkspaceID, currentStatus); err != nil {
 					log.Printf("Heartbeat: verified platform %s %s->online failed: %v", payload.WorkspaceID, currentStatus, err)
 				} else {
-					log.Printf("Heartbeat: platform %s VERIFIED-ready (provision_workspace loaded) %s->online (core#3082)", payload.WorkspaceID, currentStatus)
+					log.Printf("Heartbeat: platform %s SELF-REPORTED-ready evidence=%s (mcp_tools_ready=%v provision_workspace_loaded=%v) %s->online — surface ADVERTISED, callability NOT verified (EV2/core#3082)", payload.WorkspaceID, evidence, mcpToolsReady, provisionToolLoaded, currentStatus)
 				}
-				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{"verified_ready": true, "recovered_from": currentStatus})
+				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{"readiness_evidence": string(evidence), "recovered_from": currentStatus})
 				h.fireReconcileOnline(ctx, payload.WorkspaceID)
+				// FIRST boots only — see the legacy arm's comment above.
+				if currentStatus == string(models.StatusProvisioning) {
+					h.fireFirstBootGreeting(payload.WorkspaceID, len(payload.LoadedMCPTools))
+				}
 			case currentStatus == string(models.StatusProvisioning):
 				// WARMING / held. The concierge is held in 'provisioning' (its callers
 				// get the 503 warming-gate) — a DYNAMIC wait on the REAL signals, never a
 				// wall-clock. It leaves 'provisioning' only on a real signal:
 				//
 				//   * READY  → the verified-ready case above flips it online the instant a
-				//     heartbeat reports provision_workspace loaded AND the row is healthy.
+				//     heartbeat reports mcp_tools_ready=true (EV2) — or, back-compat,
+				//     provision_workspace loaded — AND the row is healthy.
 				//   * UNHEALTHY → held here (NOT promoted): the earlier switch cases fell
 				//     through because conciergeUnhealthy (runtime wedged / sustained
 				//     error_rate / recent register failure) blocked the verified promote
@@ -1883,17 +2788,28 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				//   * DEAD   → a concierge that STOPS heartbeating during warm-up is
 				//     terminated by the provision-timeout sweep (registry/
 				//     provisiontimeout.go) once updated_at goes stale — the real
-				//     "no longer alive" signal, and the ONLY terminal here.
+				//     "no longer alive" signal.
+				//   * STUCK  → a concierge that KEEPS heartbeating but never reaches
+				//     ready within conciergeWarmupFailGrace is surfaced as degraded
+				//     (the bounded warm-fail SAFETY NET below) — operator-visible,
+				//     still recoverable if a later beat reports ready.
 				//
-				// This DELETES the 180s managementMCPUnloadedGrace warm-up FAIL — an
-				// arbitrary cutoff that force-failed HEALTHY concierges whose management
-				// MCP was merely slow to connect (the flaky e2e-smoke STEP-4 failure). The
-				// slow path it was compensating for is eliminated at the source: the
-				// runtime image now PRE-BAKES @molecule-ai/mcp-server into the npm cache,
-				// so the concierge's `npx --prefer-offline` resolves the management MCP
-				// with ZERO network pull (loads in ~1s), and the runtime enumeration
-				// retries robustly on the real signal with dynamic backoff. mcp_unloaded_since
-				// is still stamped below, for observability only (no longer a fail trigger).
+				// #4449 replaced the old 180s managementMCPUnloadedGrace warm-FAIL with an
+				// UNBOUNDED hold, on the theory that the turn-independent mcp_tools_ready
+				// event always lands within seconds (the runtime image PRE-BAKES
+				// @molecule-ai/mcp-server so `npx --prefer-offline` loads the management MCP
+				// with zero network pull). That removed the flaky-e2e false-FAIL of
+				// HEALTHY-but-slow concierges — but it ALSO removed the only signal for a
+				// concierge that never reaches ready at all (readiness probe disabled via
+				// MOLECULE_MCP_READINESS_PROBE=off or persistently failing, AND
+				// loaded_mcp_tools under-emitting per runtime#181): that box held
+				// 'provisioning' FOREVER with no online, no degrade, no operator signal
+				// (EV2 REGRESSION #4449). The bounded warm-fail below RESTORES a safety net
+				// WITHOUT re-introducing fireConciergeWarmup's synthetic turn — it is a pure
+				// wall-clock terminal on the warming hold, sized GENEROUSLY
+				// (conciergeWarmupFailGrace) so a merely-slow healthy warmup is never
+				// false-failed. mcp_unloaded_since (stamped below) doubles as the warming-
+				// since clock this bound measures against.
 				now := time.Now()
 				firstUnloaded := mcpUnloadedSince
 				if !firstUnloaded.Valid {
@@ -1902,7 +2818,46 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 						log.Printf("Heartbeat: failed to stamp warming mcp_unloaded_since for %s: %v", payload.WorkspaceID, err)
 					}
 				}
-				log.Printf("Heartbeat: platform %s warming, holding provisioning (waiting on loaded_mcp_tools signal; unloaded for %s, provision_workspace_loaded=%v unhealthy=%v) (core#3082)", payload.WorkspaceID, now.Sub(firstUnloaded.Time).Truncate(time.Second), provisionToolLoaded, conciergeUnhealthy)
+				warmingFor := now.Sub(firstUnloaded.Time)
+				if warmingFor >= conciergeWarmupFailGrace {
+					// BOUNDED WARM-FAIL (EV2 regression #4449 safety net): the concierge
+					// has held 'provisioning' past the generous warmup window without ever
+					// reaching verified-ready. Surface it as degraded with an operator-
+					// visible reason instead of holding provisioning silently forever. NOT
+					// terminal: degraded is recoverable, so a later heartbeat that finally
+					// reports mcp_tools_ready=true still promotes it via the verified-ready
+					// case above. Conditional UPDATE (AND status='provisioning') so a racing
+					// Delete/promote is not overwritten.
+					msg := fmt.Sprintf("platform concierge never reached management-MCP readiness within %s of warming (mcp_tools_ready not published and loaded_mcp_tools did not carry provision_workspace); marking degraded (EV2 warm-fail safety net, core#3082/#4449)", conciergeWarmupFailGrace)
+					log.Printf("Heartbeat: workspace=%s transition=provisioning→degraded reason=warmup_never_ready warming_for=%s grace=%s mcp_tools_ready=%v provision_workspace_loaded=%v", payload.WorkspaceID, warmingFor.Truncate(time.Second), conciergeWarmupFailGrace, mcpToolsReady, provisionToolLoaded)
+					res, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'provisioning'`, models.StatusDegraded, msg, payload.WorkspaceID)
+					if err != nil {
+						log.Printf("Heartbeat: failed to warm-fail %s to degraded: %v", payload.WorkspaceID, err)
+						// Best-effort recovery still fires on a DB error (as it did
+						// pre-#4462, unconditionally): a transient write failure must not
+						// deny a genuinely-stuck box its config-regen chance ([7]). We only
+						// SKIP the degraded broadcast on the 0-rows race (below), not on an
+						// error where the row state is unknown.
+						h.fireReconcileMCPRecovery(ctx, payload.WorkspaceID)
+					} else if rows, _ := res.RowsAffected(); rows > 0 {
+						// Only signal if the guarded UPDATE actually degraded the row.
+						// The UPDATE is conditional (AND status='provisioning') so a racing
+						// promote/Delete leaves 0 rows — broadcasting EventWorkspaceDegraded
+						// + reconcile on a box another beat just promoted online is the
+						// cluster-3 regression (a spurious degraded flap on a healthy box).
+						h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
+							"warmup_never_ready": true,
+							"warming_for_secs":   int(warmingFor.Seconds()),
+							"sample_error":       msg,
+						})
+						// Try to regenerate the management MCP config so a subsequent beat can
+						// carry the required tool and recover the box (mirrors the post-online
+						// #3082 deadlock-break).
+						h.fireReconcileMCPRecovery(ctx, payload.WorkspaceID)
+					}
+				} else {
+					log.Printf("Heartbeat: platform %s warming, holding provisioning (waiting on mcp_tools_ready/loaded_mcp_tools signal; unloaded for %s of %s, mcp_tools_ready=%v provision_workspace_loaded=%v unhealthy=%v) (EV2/core#3082)", payload.WorkspaceID, warmingFor.Truncate(time.Second), conciergeWarmupFailGrace, mcpToolsReady, provisionToolLoaded, conciergeUnhealthy)
+				}
 			default:
 				// Modern runtime in failed/offline/awaiting_agent/degraded that is NOT
 				// promotable this beat — either the tool is not proven loaded OR the
@@ -1946,7 +2901,78 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		// intent: a genuinely-missing management MCP stays absent past the
 		// window and degrades, and stays degraded (the recovery branch below is
 		// gated on managementMCPUnloaded).
-		if payload.MCPServerPresent != nil && *payload.MCPServerPresent {
+		//
+		// EV2 RELIABLE-SIGNAL SHORT-CIRCUIT (fix for #4449 stuck-degrade / flap):
+		// mcp_tools_ready is now the RELIABLE readiness signal — the runtime's
+		// MCPReadinessProber sets it true ONLY when provision_workspace is verified
+		// loaded (the corrected runtime contract), turn-INDEPENDENTLY. So an ONLINE
+		// concierge that AFFIRMS mcp_tools_ready=true on this beat IS provision-ready
+		// by construction and must STAY ONLINE — even though the SEPARATE, UNDER-
+		// EMITTING per-turn loaded_mcp_tools producer (runtime#181) reports an
+		// empty/partial list on this beat. Degrading such a box on loaded_mcp_tools
+		// alone is exactly the #4449 defect: an online codex/hermes concierge whose
+		// loaded_mcp_tools under-emits degraded after the 180s grace and then flapped
+		// (mcpSurfaceSelfReported re-promoted it, only to degrade again) — an online<->degraded
+		// oscillation with intermittent unavailability. We therefore SKIP the
+		// loaded_mcp_tools degrade whenever mcp_tools_ready is affirmed, and clear any
+		// stale unloaded stamp. Genuine management-MCP LOSS is still caught hard by
+		// mcp_server_present going false (the fail-closed gate at the top), and the
+		// non-affirmed cases (mcp_tools_ready nil=legacy runtime / false=probed-not-
+		// ready) still fall through to the legacy loaded_mcp_tools grace gate below.
+		if payload.MCPServerPresent != nil && *payload.MCPServerPresent && mcpToolsReady {
+			// Reliable readiness affirmed → do NOT degrade on loaded_mcp_tools
+			// under-emission. Clear any outstanding unloaded stamp so a future
+			// genuine loss starts a fresh grace window rather than degrading instantly.
+			if mcpUnloadedSince.Valid {
+				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET mcp_unloaded_since = NULL, updated_at = now() WHERE id = $1 AND mcp_unloaded_since IS NOT NULL`, payload.WorkspaceID); err != nil {
+					log.Printf("Heartbeat: failed to clear mcp_unloaded_since for %s (mcp_tools_ready affirmed): %v", payload.WorkspaceID, err)
+				}
+			}
+			log.Printf("Heartbeat: platform %s online, mcp_tools_ready=true — staying online despite loaded_mcp_tools_count=%d (EV2 reliable-signal short-circuit, core#3082/#4449)", payload.WorkspaceID, len(payload.LoadedMCPTools))
+		} else if payload.MCPServerPresent != nil && *payload.MCPServerPresent && payload.MCPToolsReady != nil {
+			// EV2 LIVE-NEGATIVE degrade (fix for the #4457 sustained-absence hole):
+			// *payload.MCPToolsReady == false here (the affirmed-true case was handled
+			// above). Since runtime#326 the readiness prober re-probes continuously, so
+			// a false is a RELIABLE, turn-INDEPENDENT "provision_workspace not loaded"
+			// signal — unlike the under-emitting per-turn loaded_mcp_tools producer. We
+			// degrade on it directly (subject to the SAME managementMCPUnloadedGrace
+			// window that absorbs a transient warmup blip), which is what finally closes
+			// the hole a frozen sticky-true mcp_tools_ready used to leave open: an online
+			// concierge that loses the verb while its MCP server stays up is now caught
+			// here rather than staying online forever.
+			managementMCPUnloaded = true
+			now := time.Now()
+			firstUnloaded := mcpUnloadedSince
+			if !firstUnloaded.Valid {
+				firstUnloaded = sql.NullTime{Time: now, Valid: true}
+				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET mcp_unloaded_since = COALESCE(mcp_unloaded_since, now()), updated_at = now() WHERE id = $1`, payload.WorkspaceID); err != nil {
+					log.Printf("Heartbeat: failed to stamp mcp_unloaded_since for %s (mcp_tools_ready=false): %v", payload.WorkspaceID, err)
+				}
+			}
+			if now.Sub(firstUnloaded.Time) < managementMCPUnloadedGrace {
+				log.Printf("Heartbeat: platform %s reports mcp_tools_ready=false; within %s grace (not-ready for %s) — not degrading (EV2 live-signal, core#3082/#4457)", payload.WorkspaceID, managementMCPUnloadedGrace, now.Sub(firstUnloaded.Time).Truncate(time.Second))
+			} else {
+				msg := "platform agent management-MCP readiness probe reports provision_workspace not loaded past the grace window; marking degraded (EV2 live mcp_tools_ready=false, core#3082/#4457)"
+				log.Printf("Heartbeat: workspace=%s transition=%s→degraded reason=mcp_tools_ready_false not_ready_for=%s grace=%s", payload.WorkspaceID, currentStatus, now.Sub(firstUnloaded.Time).Truncate(time.Second), managementMCPUnloadedGrace)
+				res, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID)
+				if err != nil {
+					log.Printf("Heartbeat: failed to mark %s degraded (mcp_tools_ready=false): %v", payload.WorkspaceID, err)
+					// Best-effort recovery still fires on a DB error (parity with the
+					// warm-fail path, [7]); only the 0-rows race skips the signal.
+					h.fireReconcileMCPRecovery(ctx, payload.WorkspaceID)
+				} else if rows, _ := res.RowsAffected(); rows > 0 {
+					// Only signal if THIS beat actually degraded the row — a racing
+					// promote/Delete may have moved it off 'online' (0 rows), and a
+					// spurious degraded event + reconcile on a healthy box is the
+					// cluster-3 regression we are also fixing.
+					h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
+						"mcp_tools_ready_false": true,
+						"sample_error":          msg,
+					})
+					h.fireReconcileMCPRecovery(ctx, payload.WorkspaceID)
+				}
+			}
+		} else if payload.MCPServerPresent != nil && *payload.MCPServerPresent {
 			loaded := payload.LoadedMCPTools
 			var (
 				managementMissing bool
@@ -2013,8 +3039,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 					log.Printf("Heartbeat: %s (workspace=%s, unloaded for %s)", msg, payload.WorkspaceID, now.Sub(firstUnloaded.Time).Truncate(time.Second))
 					// Observability: emit the deciding inputs at this demote site (core#3082 / runtime#181 follow-up).
 					// Emit managementMCPUnloaded (true here, set at line 1701) — the
-				// tool-missing boolean (managementMissing) is already conveyed by
-				// the loaded_mcp_tools_count + absent_tools_list pair right above.
+					// tool-missing boolean (managementMissing) is already conveyed by
+					// the loaded_mcp_tools_count + absent_tools_list pair right above.
 					// (Consistency with lookup-error branch per CR2 #14695 / Researcher #14696 on #3334.)
 					log.Printf("Heartbeat: workspace=%s transition=%s\u2192degraded reason=management_mcp_missing loaded_mcp_tools_count=%d absent_tools_list=%v mcp_unloaded_for=%s grace=%s management_mcp_unloaded=%v", payload.WorkspaceID, currentStatus, len(payload.LoadedMCPTools), absentToolsList, now.Sub(firstUnloaded.Time).Truncate(time.Second), managementMCPUnloadedGrace, managementMCPUnloaded)
 					if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
@@ -2352,6 +3378,36 @@ func (h *RegistryHandler) UpdateCard(c *gin.Context) {
 // to the no-live-tokens state, so the re-open does not weaken the
 // C18 anti-hijack guarantee (an attacker still cannot bootstrap
 // while ANY live token exists).
+// registryTokenCheckFailClosedEnv makes an UNVERIFIABLE workspace-token check
+// refuse the request instead of admitting it. Default OFF — the behaviour is
+// implemented and tested here, but does not take effect until an operator
+// turns it on.
+//
+// # WHY THIS SHIPS DARK RATHER THAN ON
+//
+// Measured, not assumed: flipping this to default-on turns 74 additional
+// tests in this package red — the whole Heartbeat suite, UpdateCard,
+// RegisterHandler, and the hermetic concierge test. Not because the new
+// behaviour is wrong, but because those tests never mock the
+// token-existence probe at all; they pass today only because the probe
+// errors against sqlmock and the check ADMITS the request. The fail-open is
+// load-bearing across the suite.
+//
+// That is itself the finding: an auth check that ~80 tests can skip without
+// noticing is a check that has never really been exercised. Migrating them
+// (one mocked COUNT expectation each, mechanical but wide) is a separate,
+// reviewable change. Bundling it here would bury a 6-line security fix in an
+// 80-file diff.
+//
+// So: the fix is complete and pinned by its own negative controls below, and
+// the default flip is a follow-up whose scope is now a known number rather
+// than a guess.
+const registryTokenCheckFailClosedEnv = "MOLECULE_REGISTRY_TOKEN_CHECK_FAIL_CLOSED"
+
+func registryTokenCheckFailClosed() bool {
+	return envx.Bool(registryTokenCheckFailClosedEnv, false)
+}
+
 func (h *RegistryHandler) requireWorkspaceToken(
 	ctx gincontext, c *gin.Context, workspaceID string,
 ) error {
@@ -2360,13 +3416,56 @@ func (h *RegistryHandler) requireWorkspaceToken(
 	// the fresh, credential-less instance to present a bearer. core#1644.
 	hasLive, err := wsauth.HasLiveInstanceToken(ctx, db.DB, workspaceID)
 	if err != nil {
-		// DB error checking token existence — fail open so we don't take
-		// the whole heartbeat path down on a transient hiccup. Log loudly.
-		log.Printf("wsauth: HasLiveInstanceToken(%s) failed: %v — allowing request", workspaceID, err)
-		return nil
+		// "CANNOT TELL" IS NOT "NO CREDENTIAL REQUIRED".
+		//
+		// This used to fail OPEN — a DB error here admitted the request. That
+		// turned a transient datastore hiccup into a total auth bypass on
+		// /registry/*: an unauthenticated caller could stamp any workspace's
+		// row for exactly as long as the error persisted, and the only trace
+		// was one log line. It also compounded: the token-issuance branch in
+		// Register keys on the same failing query, so a workspace admitted
+		// this way ALSO minted no token, leaving it permanently in the
+		// bootstrap state that keeps the hole open.
+		//
+		// The two "no credential presented" cases are genuinely different and
+		// are now distinguished:
+		//
+		//   hasLive == false  → "no token YET". A real first-ever
+		//                       registration. Legitimate; still allowed,
+		//                       unchanged, immediately below.
+		//   err != nil        → "cannot tell". Refused.
+		//
+		// 503, deliberately, NOT 401. A 401 is terminal in the runtime's
+		// posture and would wedge the workspace "online but braindead" (see
+		// the core#2611 note below for the same hazard). 503 is what the
+		// runtime's register/heartbeat retry loop already treats as
+		// transient, so a genuine blip self-heals on the next attempt
+		// instead of requiring an operator.
+		//
+		// Consistency note: every OTHER datastore error in this handler
+		// already 500s. Fail-open here was the isolated exception, not the
+		// house rule — this brings the auth check in line with the code
+		// around it.
+		//
+		// Gated on MOLECULE_REGISTRY_TOKEN_CHECK_FAIL_CLOSED. Default OFF, so
+		// the shipped default is byte-identical to today; see the flag's
+		// declaration for the measured reason (74 tests depend on the
+		// fail-open) and for why the default flip is a follow-up.
+		if !registryTokenCheckFailClosed() {
+			log.Printf("wsauth: HasLiveInstanceToken(%s) failed: %v — allowing request (fail-closed not yet enabled)", workspaceID, err)
+			return nil
+		}
+		log.Printf("wsauth: HasLiveInstanceToken(%s) failed: %v — refusing (cannot verify)", workspaceID, err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":  "cannot verify workspace credentials",
+			"detail": "Token existence check failed. This is retryable.",
+		})
+		return errors.New("token existence check failed")
 	}
 	if !hasLive {
 		// Legacy / pre-upgrade workspace. Next register issues a token.
+		// UNCHANGED: this is the "no token yet" case, which is legitimate
+		// for a genuinely new workspace and must stay open.
 		return nil
 	}
 	token := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))

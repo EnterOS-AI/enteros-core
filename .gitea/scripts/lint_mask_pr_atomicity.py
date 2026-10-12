@@ -27,10 +27,9 @@ The lint operates on the YAML AST (PyYAML), not grep, per
 between job keys, or renames the `all-required` job, would still be
 detected because we walk the parsed structure.
 
-Why this works on Gitea 1.22.6
-------------------------------
-We don't use any 1.22.6-missing endpoints (no `/actions/runs/*`, no
-`branch_protections/*` — Tier 2f/g need those; Tier 2d does not). All
+Why this is runner-version independent
+--------------------------------------
+This lint does not call Actions-run or branch-protection endpoints. All
 required inputs come from the workflow `pull_request` event payload
 (BASE_SHA, HEAD_SHA, PR_BODY) and from local git via `git show`/`git log`.
 The auto-injected `GITHUB_TOKEN` is enough; we don't need

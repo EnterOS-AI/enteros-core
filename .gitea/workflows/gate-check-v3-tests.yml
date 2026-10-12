@@ -12,11 +12,18 @@ on:
     paths:
       - 'tools/gate-check-v3/**'
       - '.gitea/workflows/gate-check-v3-tests.yml'
-  pull_request:
-    branches: [main, staging]
-    paths:
-      - 'tools/gate-check-v3/**'
-      - '.gitea/workflows/gate-check-v3-tests.yml'
+  # `pull_request` REMOVED 2026-07-13 (task #97, Guard G).
+  #
+  # This workflow is `disabled_manually` alongside the gate-check-v3 gate it
+  # tests. Gitea fires PR events on a disabled workflow ANYWAY (disabling only
+  # blocks rerun/dispatch), so it kept posting a PR status that could never be
+  # rerun — `POST /actions/runs/<id>/rerun` answers 400 "workflow is disabled" —
+  # and under main's `['*']` branch protection an unclearable non-success status
+  # wedges the PR permanently.
+  #
+  # It still runs on push:[main, staging] and workflow_dispatch, so the tests are
+  # not lost; they simply stop being able to jam a PR. Restore this trigger only
+  # together with re-enabling the workflow.
   workflow_dispatch:
 
 concurrency:

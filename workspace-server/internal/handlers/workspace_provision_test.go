@@ -374,21 +374,21 @@ runtime_config:
 }
 
 // TestEnsureDefaultConfig_StampsDerivedProvider pins RFC#340 Fix A: a
-// canvas-created claude-code workspace with model "moonshot/kimi-k2.6" must
+// canvas-created claude-code workspace with model "minimax/MiniMax-M2.7" must
 // have the manifest-derived provider stamped into config.yaml at BOTH the top
 // level and under runtime_config, so the cp#329 config-bundle the adapter
 // reads no longer leaves the runtime to slash-split "moonshot/..." → an
 // unregistered provider="moonshot" (the original NOT_CONFIGURED boot). The
-// canonical manifest exact-id-matches "moonshot/kimi-k2.6" to provider=platform.
+// canonical manifest exact-id-matches "minimax/MiniMax-M2.7" to provider=platform.
 func TestEnsureDefaultConfig_StampsDerivedProvider(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 
-	files, err := handler.ensureDefaultConfig("ws-moonshot", models.CreateWorkspacePayload{
-		Name:    "Kimi Agent",
+	files, err := handler.ensureDefaultConfig("ws-platform-model", models.CreateWorkspacePayload{
+		Name:    "Platform Model Agent",
 		Tier:    2,
 		Runtime: "claude-code",
-		Model:   "moonshot/kimi-k2.6",
+		Model:   "minimax/MiniMax-M2.7",
 	})
 	if err != nil {
 		t.Fatalf("ensureDefaultConfig failed: %v", err)
@@ -412,8 +412,8 @@ func TestEnsureDefaultConfig_StampsDerivedProvider(t *testing.T) {
 		t.Errorf("runtime_config.provider = %q, want platform\n%s", parsed.RuntimeConfig.Provider, files["config.yaml"])
 	}
 	// The claude-code model normalization still strips the slash prefix.
-	if parsed.Model != "kimi-k2.6" {
-		t.Errorf("top-level model = %q, want kimi-k2.6\n%s", parsed.Model, files["config.yaml"])
+	if parsed.Model != "MiniMax-M2.7" {
+		t.Errorf("top-level model = %q, want MiniMax-M2.7\n%s", parsed.Model, files["config.yaml"])
 	}
 }
 
@@ -1652,6 +1652,15 @@ func (s *stubFailingCPProv) StopAndPrune(_ context.Context, _ string) error {
 	panic("stubFailingCPProv.StopAndPrune not expected on the provisionWorkspaceCP failure path")
 }
 
+// EnsureImage satisfies the core#5019 pull-before-stop seam. These stubs
+// predate it; answering "ready" keeps their pre-#5019 behaviour EXACTLY
+// (the guard allows, the restart proceeds) so this stub carries no opinion
+// about the new branch. Tests that exercise the DECLINE path use
+// prewarmCPProv in workspace_restart_pull_before_stop_test.go.
+func (s *stubFailingCPProv) EnsureImage(_ context.Context, _ provisioner.EnsureImageRequest) (provisioner.EnsureImageResult, error) {
+	return provisioner.EnsureImageResult{Status: "ready"}, nil
+}
+
 func (s *stubFailingCPProv) GetConsoleOutput(_ context.Context, _ string) (string, error) {
 	panic("stubFailingCPProv.GetConsoleOutput not expected on the provisionWorkspaceCP failure path")
 }
@@ -1720,7 +1729,7 @@ func TestProvisionWorkspaceCP_NoInternalErrorsInBroadcast(t *testing.T) {
 		// one. The slash form derives the platform provider so the workspace
 		// routes platform (proxy env set) and reaches the downstream path this
 		// test exercises (the colon form would derive BYOK and abort).
-		Model: "anthropic/claude-opus-4-7",
+		Model: "minimax/MiniMax-M2.7",
 	})
 
 	if cap.lastData == nil {
@@ -1882,8 +1891,8 @@ func (m *mockResolver) Fetch(_ context.Context, _, _ string) (string, error) {
 // TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed asserts that
 // when cpProv.Start succeeds but the DB UPDATE for instance_id fails on ALL
 // retry attempts, the handler marks the workspace failed WITHOUT terminating
-// the live EC2. The orphaned instance_id is recorded in the broadcast event
-// for operator reconciliation. Regression test for ticket #1.
+// the running provider compute. The orphaned instance_id is recorded in the
+// broadcast event for operator reconciliation. Regression test for ticket #1.
 func TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed(t *testing.T) {
 	// Shrink retry backoff so the test doesn't stall.
 	prevDelay := instanceIDPersistRetryBaseDelay
@@ -1938,14 +1947,14 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed(t *testing.T) {
 		// one. The slash form derives the platform provider so the workspace
 		// routes platform (proxy env set) and reaches the downstream path this
 		// test exercises (the colon form would derive BYOK and abort).
-		Model: "anthropic/claude-opus-4-7",
+		Model: "minimax/MiniMax-M2.7",
 	})
 
 	if cap.lastData == nil {
 		t.Fatal("expected RecordAndBroadcast to capture data on persist failure; got nothing")
 	}
-	if got := cap.lastData["error"]; got != "instance_id persist failed after retry — EC2 untracked" {
-		t.Errorf("broadcast error message = %q, want 'instance_id persist failed after retry — EC2 untracked'", got)
+	if got := cap.lastData["error"]; got != "instance_id persist failed after retry — provider compute untracked" {
+		t.Errorf("broadcast error message = %q, want 'instance_id persist failed after retry — provider compute untracked'", got)
 	}
 	if got := cap.lastData["instance_id"]; got != "i-12345" {
 		t.Errorf("broadcast instance_id = %v, want 'i-12345'", got)
@@ -2022,7 +2031,7 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_RetrySucceeds(t *testing.T) 
 		// one. The slash form derives the platform provider so the workspace
 		// routes platform (proxy env set) and reaches the downstream path this
 		// test exercises (the colon form would derive BYOK and abort).
-		Model: "anthropic/claude-opus-4-7",
+		Model: "minimax/MiniMax-M2.7",
 	})
 
 	// No failure broadcast should have fired.
@@ -2049,6 +2058,16 @@ func (s *stubInstanceIDPersistFailCPProv) Stop(_ context.Context, _ string) erro
 	return nil
 }
 func (s *stubInstanceIDPersistFailCPProv) StopAndPrune(_ context.Context, _ string) error { return nil }
+
+// EnsureImage satisfies the core#5019 pull-before-stop seam. These stubs
+// predate it; answering "ready" keeps their pre-#5019 behaviour EXACTLY
+// (the guard allows, the restart proceeds) so this stub carries no opinion
+// about the new branch. Tests that exercise the DECLINE path use
+// prewarmCPProv in workspace_restart_pull_before_stop_test.go.
+func (s *stubInstanceIDPersistFailCPProv) EnsureImage(_ context.Context, _ provisioner.EnsureImageRequest) (provisioner.EnsureImageResult, error) {
+	return provisioner.EnsureImageResult{Status: "ready"}, nil
+}
+
 func (s *stubInstanceIDPersistFailCPProv) GetConsoleOutput(_ context.Context, _ string) (string, error) {
 	return "", nil
 }

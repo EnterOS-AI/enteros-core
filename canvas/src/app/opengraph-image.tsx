@@ -7,7 +7,7 @@ import { ImageResponse } from "next/og";
 // churning a binary blob in git history.
 export const runtime = "edge";
 
-export const alt = "Molecule AI — the AI org chart canvas";
+export const alt = "Enter OS — the AI org chart canvas";
 export const size = { width: 1200, height: 630 };
 export const contentType = "image/png";
 
@@ -24,7 +24,7 @@ export default function OG() {
           justifyContent: "center",
           padding: "80px",
           background:
-            "linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 60%, #16213e 100%)",
+            "linear-gradient(135deg, #010120 0%, #05052a 60%, #0b0b38 100%)",
           color: "#ffffff",
           fontFamily: "system-ui, -apple-system, sans-serif",
         }}
@@ -32,13 +32,13 @@ export default function OG() {
         <div
           style={{
             fontSize: 28,
-            color: "#a3a3c2",
+            color: "#bdbbff",
             letterSpacing: "0.18em",
             textTransform: "uppercase",
             marginBottom: 24,
           }}
         >
-          Molecule AI
+          Enter OS
         </div>
         <div
           style={{
@@ -54,7 +54,7 @@ export default function OG() {
         <div
           style={{
             fontSize: 32,
-            color: "#c8c8d8",
+            color: "#a3a3c8",
             marginTop: 32,
             lineHeight: 1.3,
             maxWidth: 980,
@@ -69,7 +69,7 @@ export default function OG() {
             right: 80,
             bottom: 80,
             fontSize: 22,
-            color: "#7a7a96",
+            color: "#8888b0",
             display: "flex",
           }}
         >

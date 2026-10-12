@@ -2,8 +2,8 @@
 # ci-status.sh
 #
 # SSOT library for the governance status-emission logic shared by the
-# qa-review / security-review / secret-scan workflows. Extracted from the
-# inline workflow `run:` blocks so the load-bearing branches — internal-host
+# reserved-path-review / secret-scan workflows. Extracted from the inline
+# workflow `run:` blocks so the load-bearing branches — canonical-domain
 # derivation, CI_STATUS_TOKEN resolution (direct-secret-first, Infisical
 # fallback), review-status emission, and the secret-scan re-assert — are
 # unit-testable rather than untested inline YAML.
@@ -23,20 +23,18 @@ __CI_STATUS_SH_SOURCED=1
 
 # CF-1010 defense: git.moleculesai.app's Cloudflare WAF / Bot-Fight 403-bans a
 # blank/default User-Agent BEFORE the request reaches Gitea (the self-ban that
-# fails these gates closed). Pin a Cloudflare-accepted UA on every curl that
-# may traverse the public edge. Harmless on the internal-host path.
-CI_STATUS_UA='molecule-ci-gate/1.0 (+gitea-api)'
+# fails these gates closed). Pin the required accepted UA on every curl that
+# traverses the public edge.
+CI_STATUS_UA='curl/8.4.0'
 
 # derive_gitea_base — echo the Gitea base URL for API calls (no /api/v1 suffix;
-# the caller appends it). Prefers the runner-provided internal GITHUB_SERVER_URL
-# (e.g. http://molecule-gitea-local:3000 on the self-hosted local runners) so
-# the API calls hit Gitea directly on the internal docker network — bypassing
-# the public Cloudflare edge entirely (no DNS-hijack, no CF-1010 UA self-ban, no
-# single-tunnel 524 crawl SPOF). Falls back to the public host derived from
-# GITEA_HOST, then a literal default. Any trailing slash is trimmed so the
-# caller's "${base}/api/v1" never doubles up.
+# the caller appends it). Domain-only operations use the canonical public Gitea
+# endpoint and deliberately ignore ambient runner-provided server URLs. A
+# caller may still set GITEA_HOST explicitly (for isolated tests or another
+# Gitea deployment). Any trailing slash is trimmed so the caller's
+# "${base}/api/v1" never doubles up.
 derive_gitea_base() {
-  local base="${GITHUB_SERVER_URL:-https://${GITEA_HOST:-git.moleculesai.app}}"
+  local base="https://${GITEA_HOST:-git.moleculesai.app}"
   printf '%s' "${base%/}"
 }
 
@@ -48,16 +46,15 @@ derive_gitea_base() {
 # fail closed when the Infisical control-plane is unreachable from the runner.
 # FALLBACK is the Infisical SSOT (prod /shared/ci-status) over its public
 # Cloudflare hostname, fetched WITH the CF-accepted UA so CF-1010 cannot
-# edge-ban the request. This removes the hard dependency on key.moleculesai.app
-# that previously forced the compensating agent-mirror.
+# edge-ban the request.
 #
 # On success: masks the token, sets the global CI_STATUS_TOKEN, appends
 # `CI_STATUS_TOKEN=<tok>` to $GITHUB_ENV (when set, for cross-step consumption),
 # logs the source + length, and returns 0.
-# On empty: returns 1 after a `::error::` when REQUIRE=1 (default — fail-closed,
-# the qa/security contract); returns 0 with an empty CI_STATUS_TOKEN after a
-# `::warning::` when REQUIRE=0 (best-effort callers such as the secret-scan
-# re-assert / fork PRs with no secrets).
+# On empty: returns 1 after a `::error::` when REQUIRE=1 (default — the
+# fail-closed reserved-path-review emission contract); returns 0 with an empty
+# CI_STATUS_TOKEN after a `::warning::` when REQUIRE=0 (best-effort callers such
+# as the secret-scan re-assert / fork PRs with no secrets).
 #
 # Tunables (env): REQUIRE (default 1), INFISICAL_BASE_URL
 # (default https://key.moleculesai.app), CI_STATUS_CURL (curl binary; for tests).
@@ -107,13 +104,11 @@ resolve_ci_status_token() {
 # this explicitly POSTs it to flip the gate.
 #
 # Reads (env): CI_STATUS_TOKEN (resolved above), REPO, PR_NUMBER, EVAL_OUTCOME,
-# STATUS_CONTEXT (the exact BP context, e.g.
-# "qa-review / approved (pull_request_target)"). Derives the Gitea base
-# (internal-preferred, CF-UA-guarded), GETs the PR to resolve head.sha, maps
+# STATUS_CONTEXT (the exact BP context, e.g. "reserved-path-review /
+# reserved-path-review (pull_request_target)"). Derives the Gitea base
+# (canonical domain, CF-UA-guarded), GETs the PR to resolve head.sha, maps
 # EVAL_OUTCOME (success/other) to the posted state, and POSTs the status.
-# Returns non-zero on a GET/POST failure so the miss is LOUD (the prior qa-review
-# inline block silently ignored the POST code; this unifies both gates on the
-# stricter security-review behavior).
+# Returns non-zero on a GET/POST failure so the miss is LOUD.
 #
 # Tunables (env): CI_STATUS_CURL (curl binary; for tests).
 emit_review_status() {
@@ -190,7 +185,7 @@ emit_review_status() {
 #
 # Reads (env): CI_STATUS_TOKEN (resolved; empty on fork PRs → warn + skip), REPO,
 # EVENT_NAME, PR_HEAD_SHA / PUSH_SHA, CONTEXT_BASE (context WITHOUT the event
-# suffix), DESCRIPTION. Derives the Gitea base (internal-preferred, CF-UA-guarded).
+# suffix), DESCRIPTION. Derives the canonical Gitea base (CF-UA-guarded).
 #
 # Tunables (env): CI_STATUS_CURL (curl binary; for tests).
 reassert_commit_status() {

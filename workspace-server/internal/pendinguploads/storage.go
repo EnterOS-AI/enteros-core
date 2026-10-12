@@ -42,8 +42,8 @@ import (
 )
 
 // MaxFileBytes is the per-file size cap enforced by Put / PutBatch
-// before any DB round-trip. Mirrors workspace-side ingest
-// (workspace/internal_chat_uploads.py:CHAT_UPLOAD_MAX_FILE_BYTES) and
+// before any DB round-trip. Mirrors standalone-runtime ingest
+// (molecule_runtime/internal_chat_uploads.py:CHAT_UPLOAD_MAX_FILE_BYTES) and
 // push-mode chat upload cap (chat_files.go:chatUploadMaxBytes). Also
 // pinned at the DB level via the pending_uploads.size_bytes CHECK
 // constraint (currently <=104857600 per migration

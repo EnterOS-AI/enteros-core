@@ -77,7 +77,15 @@ func drainTestAsync() {
 // main HEAD 8026f020 (mc#975).
 func setupTestDB(t *testing.T) sqlmock.Sqlmock {
 	t.Helper()
-	mockDB, mock, err := sqlmock.New()
+	// Drain globalGoAsync stragglers from prior tests BEFORE swapping the
+	// global db.DB (see setupTestDBForQueueTests — same -race class).
+	waitGlobalAsyncForTest()
+	// The mock is reached through a serialising driver shim: go-sqlmock hands
+	// every pooled connection the same *sqlmock, so database/sql's per-connection
+	// lock does not protect it, and any handler that dispatches goroutines while
+	// its own request goroutine keeps issuing statements corrupts the expectation
+	// list under -race. See sqlmock_serialised_test.go.
+	mockDB, rawMockDB, mock, err := newSerialisedSqlmock()
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
 	}
@@ -113,6 +121,9 @@ func setupTestDB(t *testing.T) sqlmock.Sqlmock {
 		drainTestAsync()
 		db.DB = prevDB
 		mockDB.Close()
+		// rawMockDB owns the mock's entry in go-sqlmock's DSN pool; closing it
+		// last keeps that entry alive for as long as mockDB might still use it.
+		rawMockDB.Close()
 	})
 
 	// The wsauth.platform_inbound_secret cache (#189) is package-level
@@ -256,7 +267,7 @@ func TestHeartbeatHandler_Normal(t *testing.T) {
 
 	// Expect heartbeat UPDATE
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-123", 0.1, "", 2, 3600, "").
+		WithArgs("ws-123", 0.1, "", 2, 3600, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT
@@ -295,7 +306,7 @@ func TestHeartbeatHandler_Degraded(t *testing.T) {
 
 	// Expect heartbeat UPDATE
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-123", 0.8, "connection timeout", 0, 7200, "").
+		WithArgs("ws-123", 0.8, "connection timeout", 0, 7200, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT — currently online
@@ -343,7 +354,7 @@ func TestHeartbeatHandler_Recovery(t *testing.T) {
 
 	// Expect heartbeat UPDATE
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-123", 0.05, "", 1, 9000, "").
+		WithArgs("ws-123", 0.05, "", 1, 9000, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT — currently degraded
@@ -558,13 +569,16 @@ func TestWorkspaceList(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	rows := sqlmock.NewRows(columns).
 		AddRow("ws-1", "Agent One", "worker", 1, "online", []byte("null"), "http://localhost:8001",
 			nil, 0, 1, 0.0, "", 100, "", "claude-code", "", 10.0, 20.0, false, nil, int64(0), false, true, []byte(`{}`), "workspace", []byte(`[]`),
+			[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 		).
 		AddRow("ws-2", "Agent Two", "manager", 2, "provisioning", []byte("null"), "",
 			nil, 0, 1, 0.0, "", 0, "", "claude-code", "", 50.0, 60.0, false, nil, int64(0), false, true, []byte(`{}`), "workspace", []byte(`[]`),
+			[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 		)
 
 	mock.ExpectQuery("SELECT w.id, w.name").
@@ -635,7 +649,7 @@ func TestProxyA2A_JSONRPCWrapping(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-proxy/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	// Give the async LogActivity goroutine a moment to complete
 	time.Sleep(50 * time.Millisecond)
@@ -686,7 +700,7 @@ func TestProxyA2A_WorkspaceNotFound(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-missing/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("expected status 404, got %d: %s", w.Code, w.Body.String())
@@ -716,7 +730,7 @@ func TestProxyA2A_WorkspaceOffline(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-offline/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("expected status 503, got %d: %s", w.Code, w.Body.String())
@@ -742,7 +756,7 @@ func TestHeartbeatHandler_TaskChanged(t *testing.T) {
 
 	// Expect heartbeat UPDATE with new task
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-123", 0.0, "", 1, 1000, "new task").
+		WithArgs("ws-123", 0.0, "", 1, 1000, "new task", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT
@@ -928,7 +942,7 @@ func TestHeartbeatHandler_TaskUnchanged(t *testing.T) {
 
 	// Expect heartbeat UPDATE with same task
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-123", 0.0, "", 1, 500, "doing work").
+		WithArgs("ws-123", 0.0, "", 1, 500, "doing work", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT
@@ -971,7 +985,7 @@ func TestHeartbeatHandler_TaskCleared(t *testing.T) {
 
 	// Expect heartbeat UPDATE with empty task
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-123", 0.0, "", 0, 600, "").
+		WithArgs("ws-123", 0.0, "", 0, 600, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT
@@ -1032,7 +1046,7 @@ func TestHeartbeatHandler_AlwaysBroadcastsHeartbeat(t *testing.T) {
 		WithArgs("ws-123").
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("doing work", 0))
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-123", 0.0, "", 1, 500, "doing work").
+		WithArgs("ws-123", 0.0, "", 1, 500, "doing work", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id =").
 		WithArgs("ws-123").
@@ -1287,6 +1301,7 @@ func TestWorkspaceGet_CurrentTask(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("dddddddd-0004-0000-0000-000000000000").
@@ -1294,6 +1309,7 @@ func TestWorkspaceGet_CurrentTask(t *testing.T) {
 			"dddddddd-0004-0000-0000-000000000000", "Task Worker", "worker", 1, "online", []byte("null"), "http://localhost:9000",
 			nil, 2, 1, 0.0, "", 300, "Analyzing document", "claude-code", "", 10.0, 20.0, false,
 			nil, int64(0), false, true, []byte(`{}`), "workspace", []byte(`[]`),
+			[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 		))
 
 	w := httptest.NewRecorder()

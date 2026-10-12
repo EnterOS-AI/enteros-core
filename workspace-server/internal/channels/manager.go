@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/a2aresp"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 )
@@ -442,13 +443,15 @@ func (m *Manager) SendOutbound(ctx context.Context, channelID string, text strin
 		return fmt.Errorf("no adapter for %s", ch.ChannelType)
 	}
 
-	chatIDRaw, _ := ch.Config["chat_id"].(string)
-	if chatIDRaw == "" {
-		return fmt.Errorf("no chat_id configured for channel %s", channelID)
+	destinations, err := outboundDestinations(ch)
+	if err != nil {
+		return err
 	}
 
-	// Send to all configured chat IDs (comma-separated)
-	for _, cid := range splitChatIDs(chatIDRaw) {
+	// Telegram can fan out to comma-separated chat IDs. Slack Bot API uses
+	// channel_id. Discord, Lark, and Slack Incoming Webhooks encode their
+	// destination in webhook_url and therefore receive one empty destination.
+	for _, cid := range destinations {
 		if err := adapter.SendMessage(ctx, ch.Config, cid, text); err != nil {
 			log.Printf("Channels: outbound send to %s failed: %v", cid, err)
 		}
@@ -475,6 +478,24 @@ func (m *Manager) SendOutbound(ctx context.Context, channelID string, text strin
 	}
 
 	return nil
+}
+
+func outboundDestinations(ch ChannelRow) ([]string, error) {
+	raw, _ := ch.Config["chat_id"].(string)
+	if ch.ChannelType == "slack" {
+		raw, _ = ch.Config["channel_id"].(string)
+	}
+	if destinations := splitChatIDs(raw); len(destinations) > 0 {
+		return destinations, nil
+	}
+
+	if webhookURL, _ := ch.Config["webhook_url"].(string); webhookURL != "" {
+		switch ch.ChannelType {
+		case "discord", "lark", "slack":
+			return []string{""}, nil
+		}
+	}
+	return nil, fmt.Errorf("no outbound destination configured for channel %s", ch.ID)
 }
 
 // BroadcastToWorkspaceChannels sends a message to ALL enabled channels
@@ -508,7 +529,7 @@ func (m *Manager) BroadcastToWorkspaceChannels(ctx context.Context, workspaceID,
 		var channelID string
 		if rows.Scan(&channelID) == nil {
 			if sendErr := m.SendOutbound(ctx, channelID, text); sendErr != nil {
-				log.Printf("Channels: broadcast to %s failed: %v", channelID[:12], sendErr)
+				log.Printf("Channels: broadcast to %s failed: %v", truncID(channelID), sendErr)
 			}
 		}
 	}
@@ -623,42 +644,11 @@ func (m *Manager) extractReplyText(respBody []byte, statusCode int) string {
 	if statusCode < 200 || statusCode >= 300 {
 		return fmt.Sprintf("Error: agent returned HTTP %d", statusCode)
 	}
-
-	var resp map[string]interface{}
-	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return ""
-	}
-
-	// Try result.parts[].text (standard A2A response)
-	if result, ok := resp["result"].(map[string]interface{}); ok {
-		if parts, ok := result["parts"].([]interface{}); ok {
-			for _, p := range parts {
-				if part, ok := p.(map[string]interface{}); ok {
-					if text, ok := part["text"].(string); ok {
-						return text
-					}
-				}
-			}
-		}
-		// Try result.artifacts[].parts[].text
-		if artifacts, ok := result["artifacts"].([]interface{}); ok {
-			for _, a := range artifacts {
-				if artifact, ok := a.(map[string]interface{}); ok {
-					if parts, ok := artifact["parts"].([]interface{}); ok {
-						for _, p := range parts {
-							if part, ok := p.(map[string]interface{}); ok {
-								if text, ok := part["text"].(string); ok {
-									return text
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	return ""
+	// Delegate to the a2aresp SSOT for the full shape matrix. This copy
+	// previously handled only result.parts + result.artifacts and DROPPED the
+	// task status.message and nested message shapes — the same drift class that
+	// silently dropped the concierge greeting on the handlers path.
+	return a2aresp.Text(respBody)
 }
 
 func (m *Manager) loadHistory(ctx context.Context, key string) []map[string]string {

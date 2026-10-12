@@ -67,3 +67,62 @@ describe("BootSequenceScreen — ENTER OS key (#9)", () => {
     expect(onEnter).not.toHaveBeenCalled();
   });
 });
+
+describe("BootSequenceScreen — keycap states", () => {
+  const step = (
+    n: number,
+    key: string,
+    label: string,
+    status: "running" | "ok" | "failed",
+  ) => ({ step: n, total: 8, key, label, status });
+
+  it("displays a running step as done once a LATER step has reported (implicit completion)", () => {
+    // The provisioner deliberately never flips its own step 1 to ok
+    // (provisioner.go startWorkspace) — once the runtime's steps take over,
+    // step 1 must not breathe "running" under an almost-finished boot
+    // (2026-07-18 live-boot regression: PWR RUN while ONLINE was ok).
+    render(
+      <BootSequenceScreen
+        node={node({
+          status: "provisioning",
+          bootSteps: [
+            step(1, "PWR", "Provision compute", "running"),
+            step(5, "TOOL", "Enumerate tools", "ok"),
+          ],
+        })}
+      />,
+    );
+    expect(screen.getByLabelText("Provision compute: ok")).toBeTruthy();
+    expect(screen.getByLabelText("Enumerate tools: ok")).toBeTruthy();
+  });
+
+  it("keeps the HIGHEST reported step running (no implicit completion for the frontier)", () => {
+    render(
+      <BootSequenceScreen
+        node={node({
+          status: "provisioning",
+          bootSteps: [
+            step(1, "PWR", "Provision compute", "ok"),
+            step(2, "ID", "Load identity", "running"),
+          ],
+        })}
+      />,
+    );
+    expect(screen.getByLabelText("Load identity: run")).toBeTruthy();
+  });
+
+  it("never implicitly completes a FAILED step", () => {
+    render(
+      <BootSequenceScreen
+        node={node({
+          status: "provisioning",
+          bootSteps: [
+            step(3, "RT", "Start runtime", "failed"),
+            step(4, "MCP", "Management MCP", "running"),
+          ],
+        })}
+      />,
+    );
+    expect(screen.getByLabelText("Start runtime: error")).toBeTruthy();
+  });
+});

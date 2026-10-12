@@ -16,7 +16,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-
 // expectWorkspaceURLLookup programs the sqlmock to answer the SELECT that
 // TranscriptHandler.Get issues for `agent_card->>'url'`. Tests call this
 // instead of inserting real rows (we use sqlmock — there's no DB).
@@ -65,7 +64,7 @@ func TestTranscript_ProxyForwardsAndReturnsBody(t *testing.T) {
 	}))
 	defer stub.Close()
 
-	wsID := expectWorkspaceURLLookup(mock,stub.URL)
+	wsID := expectWorkspaceURLLookup(mock, stub.URL)
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -103,7 +102,7 @@ func TestTranscript_ProxyPropagatesAllowlistedQueryParams(t *testing.T) {
 	}))
 	defer stub.Close()
 
-	wsID := expectWorkspaceURLLookup(mock,stub.URL)
+	wsID := expectWorkspaceURLLookup(mock, stub.URL)
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: wsID}}
@@ -127,7 +126,7 @@ func TestTranscript_RejectsCloudMetadataIP(t *testing.T) {
 	setSSRFCheckForTest(true)
 	h := NewTranscriptHandler()
 
-	wsID := expectWorkspaceURLLookup(mock,"http://169.254.169.254/")
+	wsID := expectWorkspaceURLLookup(mock, "http://169.254.169.254/")
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -145,7 +144,7 @@ func TestTranscript_RejectsNonHTTPScheme(t *testing.T) {
 	setSSRFCheckForTest(true)
 	h := NewTranscriptHandler()
 
-	wsID := expectWorkspaceURLLookup(mock,"file:///etc/passwd")
+	wsID := expectWorkspaceURLLookup(mock, "file:///etc/passwd")
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -163,7 +162,7 @@ func TestTranscript_RejectsMetadataHostname(t *testing.T) {
 	setSSRFCheckForTest(true)
 	h := NewTranscriptHandler()
 
-	wsID := expectWorkspaceURLLookup(mock,"http://metadata.google.internal/computeMetadata/v1/")
+	wsID := expectWorkspaceURLLookup(mock, "http://metadata.google.internal/computeMetadata/v1/")
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -181,7 +180,7 @@ func TestTranscript_RejectsLinkLocalIPv6(t *testing.T) {
 	setSSRFCheckForTest(true)
 	h := NewTranscriptHandler()
 
-	wsID := expectWorkspaceURLLookup(mock,"http://[fe80::1]/")
+	wsID := expectWorkspaceURLLookup(mock, "http://[fe80::1]/")
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -216,7 +215,7 @@ func TestTranscript_UnreachableWorkspaceReturns502(t *testing.T) {
 	setupTestRedis(t)
 	h := NewTranscriptHandler()
 
-	wsID := expectWorkspaceURLLookup(mock,"http://127.0.0.1:1") // refused
+	wsID := expectWorkspaceURLLookup(mock, "http://127.0.0.1:1") // refused
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -238,7 +237,9 @@ func TestTranscript_UnreachableWorkspaceReturns502(t *testing.T) {
 // the handler runs; forwarding it to the workspace is correct and safe.
 //
 // Fix applied: after constructing the outbound request, the handler now calls
-//   req.Header.Set("Authorization", c.GetHeader("Authorization"))
+//
+//	req.Header.Set("Authorization", c.GetHeader("Authorization"))
+//
 // This test verifies the fix and acts as a regression guard.
 func TestTranscript_ForwardsAuthHeader(t *testing.T) {
 	mock := setupTestDB(t)
@@ -364,7 +365,7 @@ func TestTranscript_DisablesRedirects_DoesNotForwardAuthToRedirectTarget(t *test
 	}))
 	defer stub.Close()
 
-	wsID := expectWorkspaceURLLookup(mock,stub.URL)
+	wsID := expectWorkspaceURLLookup(mock, stub.URL)
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: wsID}}

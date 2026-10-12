@@ -50,5 +50,17 @@ func (h *WorkspaceHandler) RevokeAuthTokens(c *gin.Context) {
 		return
 	}
 	log.Printf("RevokeAuthTokens: revoked live auth tokens for workspace %s (migration cutover / admin)", id)
+
+	// Tamper-evident audit append. This endpoint revokes EVERY live bearer for
+	// a workspace, which is exactly the move an attacker makes before
+	// re-registering a workspace they control — it must be attributable.
+	// Idempotent no-ops are recorded too: "someone called revoke-all" is the
+	// security-relevant fact, independent of how many rows it touched.
+	RecordAuditEvent(c.Request.Context(), db.DB, auditEntryFromGin(c, id, AuditOpTokenRevoke, true, map[string]any{
+		"workspace_id": id,
+		"route":        "admin-revoke-all",
+		"scope":        "all-live-tokens",
+	}))
+
 	c.JSON(http.StatusOK, gin.H{"status": "revoked", "workspace_id": id})
 }

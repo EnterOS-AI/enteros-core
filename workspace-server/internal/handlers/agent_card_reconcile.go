@@ -24,7 +24,8 @@ func agentCardURL(card json.RawMessage) string {
 // agent-card identity gap.
 //
 // Root cause: the runtime builds its AgentCard from config.name
-// (workspace/main.py:198), and config.name is read from the
+// (molecule-ai-workspace-runtime/molecule_runtime/main.py), and config.name is
+// read from the
 // CP-regenerated /configs/config.yaml whose `name:` field is the raw
 // workspace UUID — NOT the friendly name the operator sees. The friendly
 // name IS captured: POST /workspaces and PATCH /workspaces/:id (the

@@ -284,10 +284,39 @@ jobs:
             | sort -u
           )
 
+          # FAIL CLOSED on an empty candidate set.
+          #
+          # This lint's only subject is "the set of Go files that touch a
+          # tenant-writer surface". If SURFACE_PATTERN matches nothing, the
+          # lint has lost sight of its subject: it cannot prove the absence
+          # of a repo-host-token write, it can only report that it looked
+          # nowhere. Passing here would make the PASS arm identical to what
+          # a BROKEN input (a moved/renamed/refactored package, a typo in
+          # SURFACE_PATTERN) produces — i.e. a vacuous gate.
+          #
+          # On main this scan finds 28 candidate files, so an empty set is
+          # never the normal state; it means the pattern has drifted from
+          # the code.
           if [ "${#CANDIDATES[@]}" -eq 0 ]; then
-            echo "OK No tenant-writer-surface files found in tree (unexpected, but not a lint failure)."
-            exit 0
+            echo "::error::Task #146 lint has lost sight of its subject: SURFACE_PATTERN matched ZERO Go files."
+            echo ""
+            echo "SURFACE_PATTERN: ${SURFACE_PATTERN}"
+            echo ""
+            echo "This lint proves 'no tenant-writer-surface file quotes a repo-host"
+            echo "token name'. With zero candidate files it has scanned NOTHING and"
+            echo "can prove nothing, so it fails closed rather than reporting a"
+            echo "vacuous PASS."
+            echo ""
+            echo "Remedy: the tenant-writer code has almost certainly moved, been"
+            echo "renamed, or been refactored. Update SURFACE_PATTERN in"
+            echo ".gitea/workflows/lint-forbidden-env-keys.yml so it once again"
+            echo "matches the code shapes that write into a tenant workspace"
+            echo "(env-var map writes, workspace_secrets/global_secrets DB rows,"
+            echo "container env, EC2 user-data, provision payloads)."
+            exit 1
           fi
+
+          echo "Tenant-writer-surface candidate files: ${#CANDIDATES[@]}"
 
           HITS=""
           for f in "${CANDIDATES[@]}"; do
@@ -326,7 +355,12 @@ jobs:
 
           if [ -n "$HITS" ]; then
             echo "::error::Task #146 lint: repo-host token name(s) quoted in a tenant-writer-surface file:"
-            printf "$HITS"
+            # printf '%b' — NOT printf "$HITS". HITS always begins with
+            # "--- <file> ---", which bare printf parses as an option
+            # terminator ("printf: --: invalid option"), so under `set -e`
+            # the step died at exit 2 and the operator never saw WHICH file
+            # or line tripped the lint. The RED arm fired but named nothing.
+            printf '%b' "$HITS"
             echo ""
             echo "These files reference a tenant-writer surface (workspace_secrets,"
             echo "seedAllowList, /settings/secrets, containerEnv, userData, etc.)"

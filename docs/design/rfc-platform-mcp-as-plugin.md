@@ -1,5 +1,10 @@
 # RFC: Deliver `molecule-platform-mcp` as an entitlement-gated MCP plugin
 
+> **Historical RFC snapshot.** Status statements and production observations
+> below were captured during the June 2026 design cycle. They do not override
+> current code, runtime packages, entitlement configuration, or deployment
+> workflows. Verify those sources before operating or documenting the feature.
+
 - **Status:** Proposed — ready for CTO sign-off (arch + entitlement change)
 - **Author:** devops-engineer (agent)
 - **Date:** 2026-06-18 (revised 2026-06-23 — runtime-agnostic / plugin-SSOT reframe per CTO review)

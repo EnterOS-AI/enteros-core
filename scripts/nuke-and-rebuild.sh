@@ -19,6 +19,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Pin the compose project like dev-start.sh does: without this, a checkout in
+# a differently-named directory creates a parallel <dir>-langfuse-1 that also
+# claims the langfuse-web alias on the shared molecule-core-net.
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-molecule-core}"
+export COMPOSE_PROJECT_NAME
 # Shared docker-teardown helpers (mol_purge_ws_objects) — same UUID-scoped,
 # xargs-free purge scripts/dev-start.sh --fresh uses.
 # shellcheck source=scripts/lib/docker-reset.sh
@@ -57,5 +62,8 @@ echo "=== REBUILD ==="
 docker compose -f "$ROOT/docker-compose.yml" up -d --build
 echo "  platform + canvas up"
 
-echo "=== POST-REBUILD SETUP ==="
-bash "$ROOT/scripts/post-rebuild-setup.sh"
+echo "=== RESET COMPLETE ==="
+echo "  Open http://127.0.0.1:3000 and complete the first-run flow."
+echo "  Add tenant credentials through Canvas Settings."
+echo "  Automation may use authenticated PUT /settings/secrets; do not write"
+echo "  global_secrets rows directly."

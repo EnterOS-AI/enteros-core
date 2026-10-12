@@ -2,8 +2,8 @@ package handlers
 
 // workspace_provision_shared.go — mode-agnostic provision-time
 // orchestration that BOTH provisionWorkspaceOpts (Docker) and
-// provisionWorkspaceCP (SaaS) call. Extracted because the original
-// per-mode functions had drifted: the SaaS path forgot to call
+// provisionWorkspaceCP (control-plane managed) call. Extracted because the
+// original per-mode functions had drifted: the managed path forgot to call
 // issueAndInjectInboundSecret, which produced silent-503 chat upload
 // errors for every prod workspace (RFC #2312 — discovered 2026-04-30).
 //
@@ -24,8 +24,8 @@ package handlers
 //   - Docker: empty-config-volume preflight + auto-recover via
 //     runtime template (#1858), then provisioner.Start with local
 //     Docker daemon, then WriteFilesToContainer for config volume.
-//   - SaaS: cpProv.Start which delegates EC2 launch to control plane,
-//     then persist returned instance_id, then defer .auth_token /
+//   - Managed: cpProv.Start delegates compute creation to the control plane's
+//     selected provider, persists the returned opaque instance_id, then defers .auth_token /
 //     .platform_inbound_secret delivery to the workspace's first
 //     /registry/register response (registry.go:344-362).
 //
@@ -42,6 +42,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
@@ -153,7 +154,8 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	//
 	// Defense-in-depth NOT removed: provisioner.buildContainerEnv still
 	// runs the forensic #145 silent-strip (lower-confidence late layer),
-	// and workspace/entrypoint.sh has Layer 2 inside the container. If a
+	// and each standalone template's entrypoint has Layer 2 inside the
+	// container. If a
 	// real operator-scope token slips into workspace_secrets some other
 	// way, the later layers (and the per-workspace SG, and the per-tenant
 	// VPC isolation) are still in force.
@@ -180,14 +182,14 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	// PR template-claude-code#30 + mc#1525 left open: the askpass binary
 	// + GIT_ASKPASS env are wired in-image, but until now no code path
 	// in workspace-server actually read the persona's git token from
-	// the operator-host bootstrap dir and exported it as
+	// the configured persona directory and exported it as
 	// GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD. Without this, the askpass
 	// helper invokes with an empty password env and git fails the
 	// auth challenge in ~500ms (live-verified for Dev-A/Dev-B
 	// 2026-05-18 ~23:55Z).
 	//
 	// Runs AFTER applyAgentGitIdentity so workspace_secrets named
-	// GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD (operator-supplied,
+	// GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD (user-supplied,
 	// loaded earlier by loadWorkspaceSecrets) win over the
 	// persona-file default. Uses payload.Role as the persona key —
 	// this matches the slug-form convention agent-dev-a /
@@ -242,15 +244,24 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 			Extra: map[string]interface{}{"error": msg, "code": "MISSING_PLATFORM_PROXY", "routing": "platform", "issue": "2162"},
 		}
 	}
-	applyRuntimeModelEnv(envVars, payload.Runtime, payload.Model)
+	// When the self-host platform-arm fallback substituted the model, the
+	// substitution — not payload.Model — must win applyRuntimeModelEnv's
+	// priority chain, or the container env resurrects the unusable
+	// platform-arm model the fallback just routed away from.
+	effectivePayloadModel := payload.Model
+	if llmRes.SubstitutedModel != "" {
+		effectivePayloadModel = llmRes.SubstitutedModel
+	}
+	applyRuntimeModelEnv(envVars, payload.Runtime, effectivePayloadModel)
 	if payload.Role != "" {
 		envVars["MOLECULE_AGENT_ROLE"] = payload.Role
 	}
-	// PARENT_ID is consumed by workspace/coordinator.py to track the
-	// parent-child relationship at runtime. Sourced from payload so
-	// every provision path that knows about a parent (currently:
-	// TeamHandler.Expand) injects it without having to thread env
-	// through provisioner.WorkspaceConfig manually.
+	// PARENT_ID is retained as a legacy environment compatibility field.
+	// Current checked-in runtimes do not consume it; authoritative hierarchy
+	// lives in workspaces.parent_id and is exposed through platform APIs.
+	// Keep sourcing the value from payload for older external images that may
+	// still expect the environment variable, without treating it as a current
+	// runtime coordination contract.
 	if payload.ParentID != nil && *payload.ParentID != "" {
 		envVars["PARENT_ID"] = *payload.ParentID
 	}
@@ -305,6 +316,35 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		}
 	}
 
+	// SELF-HOST TENANT-IDENTITY DEFAULTS (2026-07-19 operator decision): a
+	// template that hard-requires TENANT_* identity vars (seo-agent's
+	// TENANT_NAME/DOMAIN/TIMEZONE...) must NEVER fail first boot on a
+	// self-hosted stack over them. There is no SaaS tenant here — the
+	// operator IS the tenant — so generate branded placeholders ("Enter OS",
+	// system timezone) for any that are unset and boot; the operator refines
+	// them later via org-scope Secrets (which override these, since defaults
+	// only fill ABSENT keys). Pre-fix the concierge's create flow dead-ended
+	// in MISSING_REQUIRED_ENV and coped by queueing placeholder secret-write
+	// approvals for values that, on self-host, simply don't matter yet.
+	// Self-host signal: no CP proxy wired (same gate as the platform-arm
+	// model fallback). The RESTART path carries templatePath instead of
+	// in-memory configFiles (preflight #5 skips there for the same reason),
+	// so fall back to reading the template's config.yaml from disk — without
+	// this, a restart booted the workspace with NO tenant identity at all
+	// while a create filled it (observed 2026-07-19: online SEO agent with
+	// empty TENANT_* env).
+	if !PlatformManagedProxyConfigured() {
+		reqSrc := configFiles
+		if reqSrc == nil && templatePath != "" {
+			if b, rErr := os.ReadFile(filepath.Join(templatePath, "config.yaml")); rErr == nil {
+				reqSrc = map[string][]byte{"config.yaml": b}
+			}
+		}
+		if reqSrc != nil {
+			applySelfHostTenantDefaults(envVars, missingRequiredEnv(reqSrc, envVars))
+		}
+	}
+
 	// Preflight #5: refuse to launch when config.yaml declares required
 	// env vars that are not set. Skipped in SaaS mode when configFiles
 	// is nil (CP-mode's cfg is built without local config bytes — the
@@ -337,6 +377,45 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		log.Printf("Provisioner: ABORT workspace=%s — %s", workspaceID, abort.Msg)
 		return nil, abort
 	}
+
+	// The SCHEDULER is a BASE per-workspace ability, declared on every workspace at
+	// provision. The one molecule-scheduler plugin ships BOTH halves of
+	// self-scheduling — the firing trigger daemon AND the self-audience
+	// self-schedule MCP tool (plugin-mcp-audience-contract self-schedule v1). The
+	// tool CANNOT be declared on-demand the way the daemon alone was
+	// (ensureSchedulerPluginDeclared on schedule-create): you need the tool to
+	// create the first schedule. So every workspace gets it up front — which is also
+	// what the native-plugins registry already intends ("the scheduler is
+	// default-on-every-workspace"). The org-manage side stays on the concierge
+	// management MCP (install:concierge, org key) — never this every-workspace
+	// plugin. Non-fatal + idempotent (recordDeclaredPlugin upserts); placed AFTER
+	// every provision abort gate so a failed preflight records no orphan rows.
+	//
+	// Guarded by a DEFAULT-ON kill-switch (declareSchedulerPluginEnabled): the
+	// roll-out stays on by default — byte-identical to today — but the owner can
+	// HALT it in an emergency by setting MOLECULE_DECLARE_SCHEDULER_PLUGIN to a
+	// falsey value, without a code revert (the idle-digest half kept its flag, so
+	// the scheduler needs a symmetric switch).
+	if declareSchedulerPluginEnabled() {
+		if err := ensureSchedulerPluginDeclared(ctx, workspaceID); err != nil {
+			log.Printf("provision: declare scheduler plugin for %s (non-fatal): %v", workspaceID, err)
+		}
+	}
+
+	// RFC molecule-core#4413: declare the OTHER install:default native plugins
+	// (the idle-digest providers) on this workspace, from the SDK native-plugins
+	// registry SSOT. Placed AFTER every provision abort gate so a failed preflight
+	// records no orphan rows. Still FLAG-gated (default off) — the owner arms it
+	// during the fleet rollout once the runtime digest loaders are live. This path
+	// EXCLUDES the scheduler source (declareDefaultNativePlugins filters it out):
+	// the scheduler is owned by the ensureSchedulerPluginDeclared path above, which
+	// declares it under the const name SchedulerPluginName ("molecule-scheduler"),
+	// whereas this path derives its name from the source via PluginNameFromSource
+	// ("molecule-ai-plugin-scheduler") — declaring it here too would write a SECOND,
+	// differently-named workspace_declared_plugins row for one plugin (a duplicate
+	// boot-install), not the harmless idempotent no-op an earlier comment claimed.
+	// Non-fatal and idempotent — runs on every provision path (create/restart/resume).
+	declareDefaultNativePlugins(ctx, workspaceID)
 
 	cfg := h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, envVars, workspaceSecretKeys, pluginsPath)
 	cfg.ResetClaudeSession = resetClaudeSession
@@ -444,22 +523,105 @@ func (h *WorkspaceHandler) mintWorkspaceSecrets(ctx context.Context, workspaceID
 	h.issueAndInjectInboundSecret(ctx, workspaceID, cfg)
 }
 
+// provisionFailureWriteBudget is the TOTAL wall-clock markProvisionFailed may
+// spend recording a terminal verdict, across both of its legs. Matches the 10s
+// the other fresh-context failure paths use (logProvisionPanic, the no-backend
+// branch in provisionWorkspaceAuto).
+var provisionFailureWriteBudget = 10 * time.Second
+
+// provisionFailureRecordReserve is the slice of that budget the DURABLE WRITE is
+// guaranteed, no matter what the broadcast leg does.
+//
+// The two legs run in SERIES, so one shared budget lets the first consume all of
+// it — the identical hazard cpCreatePrewarmBudget guards for the pre-warm and
+// the provision POST, and the same answer applies. A broadcast fanning out to a
+// wedged subscriber must not be able to spend the write's time, because the
+// column is the durable record and the event is a notification the canvas can
+// also obtain by re-reading the row.
+var provisionFailureRecordReserve = 4 * time.Second
+
+// provisionFailureLegContext returns a bounded context for ONE leg of
+// markProvisionFailed, plus its cancel.
+//
+// It is ALWAYS detached from the caller, live caller or not. An earlier version
+// checked ctx.Err() once and passed a live caller straight through, which is a
+// check-then-USE race: the context is live at the check, dies during the
+// broadcast, and the UPDATE that follows is dropped by database/sql exactly as
+// if it had been dead all along. Deciding up front cannot close that window
+// because the decision and the write are not the same instant. Not deciding at
+// all does.
+//
+// The reason this matters more here than almost anywhere else: the failures with
+// the most specific reason to report are precisely the ones whose context is the
+// thing that failed. database/sql checks the context BEFORE it reaches the
+// driver, so a dead context means the row keeps status='provisioning' and
+// last_sample_error stays NULL — the operation destroys the evidence of itself,
+// and a ceiling with no verdict in the column is the same invisibility as a
+// constant message reached by another route.
+//
+// Immunity is paired with a BOUND, never granted alone: context.WithoutCancel
+// keeps request-scoped values while dropping the caller's expiry, and the fresh
+// WithTimeout puts the leg straight back under a deadline. Surviving a dead
+// deadline must not mean running with none — that would be a worse bug than the
+// one being fixed, on a shutting-down process.
+func provisionFailureLegContext(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), budget)
+}
+
 // markProvisionFailed is the standard "abort with message" path used
 // by both provision modes. Wraps the broadcast + DB update in one
 // call so the failure shape stays consistent across modes.
+//
+// ORDER IS DELIBERATE: the durable write goes FIRST, on its own reserved slice
+// of the budget, and the broadcast follows on the remainder. If only one of the
+// two can happen, it must be the write — the column is what a customer's card
+// and the gate both read, and the canvas can still learn of the failure by
+// re-reading the row, whereas nothing recovers a verdict that was never
+// persisted. Writing first also removes a small window in which the canvas was
+// told "failed" while a re-read still said "provisioning".
+//
+// Neither leg can be cancelled by the caller (see provisionFailureLegContext),
+// because the caller of this function is very often a context that has just
+// died — or is about to, mid-call.
 func (h *WorkspaceHandler) markProvisionFailed(ctx context.Context, workspaceID, msg string, extra map[string]interface{}) {
+	if err := ctx.Err(); err != nil {
+		log.Printf("markProvisionFailed: %s — caller context already failed (%v); recording the verdict on fresh contexts so the reason is not lost with it",
+			workspaceID, err)
+	}
 	if extra == nil {
 		extra = map[string]interface{}{"error": msg}
 	} else if _, hasErr := extra["error"]; !hasErr {
 		extra["error"] = msg
 	}
-	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisionFailed), workspaceID, extra)
-	if _, dbErr := db.DB.ExecContext(ctx,
-		`UPDATE workspaces SET status = $3, last_sample_error = $2, updated_at = now() WHERE id = $1`,
-		workspaceID, msg, models.StatusFailed); dbErr != nil {
-		// Non-fatal: the broadcast already fired, the operator sees the
-		// failure event in the canvas. The DB row stays at whatever
-		// status it had — provisioning event log is the source of truth.
-		log.Printf("markProvisionFailed: db update failed for %s: %v", workspaceID, dbErr)
+
+	// Leg 1 — the durable record, on its guaranteed reserve.
+	//
+	// `status != 'removed'`: removed is terminal. A provision that fails after a
+	// DELETE marked the row (the delete-vs-provision race, RC09) must not flip
+	// the deleted workspace back to a visible 'failed'.
+	writeCtx, cancelWrite := provisionFailureLegContext(ctx, provisionFailureRecordReserve)
+	_, dbErr := db.DB.ExecContext(writeCtx,
+		`UPDATE workspaces SET status = $3, last_sample_error = $2, updated_at = now() WHERE id = $1 AND status != 'removed'`,
+		workspaceID, msg, models.StatusFailed)
+	cancelWrite()
+	if dbErr != nil {
+		// LOUD: with the write ordered first and immune to the caller's
+		// cancellation, a failure here is a real database problem, not the
+		// context race this path used to lose to. The broadcast below is the
+		// remaining chance the operator learns anything at all.
+		log.Printf("markProvisionFailed: db update FAILED for %s (%v) — the workspace row does NOT carry the reason %q; the broadcast below is the only surviving record",
+			workspaceID, dbErr, msg)
+	}
+
+	// Leg 2 — the notification, on whatever the write did not need.
+	bcCtx, cancelBC := provisionFailureLegContext(ctx, provisionFailureWriteBudget-provisionFailureRecordReserve)
+	defer cancelBC()
+	if bcErr := h.broadcaster.RecordAndBroadcast(bcCtx, string(events.EventWorkspaceProvisionFailed), workspaceID, extra); bcErr != nil {
+		// Previously discarded. That made the ONE leg whose failure was
+		// invisible the same leg this function's own comment leaned on to claim
+		// the operator had been told. A claim resting on an unobserved outcome
+		// is exactly what this path had too much of already.
+		log.Printf("markProvisionFailed: provision-failure broadcast FAILED for %s: %v — the canvas was NOT notified; the workspace row above is the surviving record",
+			workspaceID, bcErr)
 	}
 }

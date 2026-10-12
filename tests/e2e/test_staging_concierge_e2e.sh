@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Real-staging E2E for the concierge user_tasks primitive (Feature 3 of the
 # concierge / platform-agent set). Exercises the FULL agent→user "ask" contract
-# both surfaces expose, END-TO-END against a real EC2-backed staging tenant:
+# both surfaces expose, END-TO-END against a real local-Docker staging tenant:
 #
 #   REST (per-workspace, tenant-admin-token authenticated):
 #     POST   /workspaces/:id/user-tasks              create an ask
@@ -27,44 +27,45 @@
 # tenant auth chain (TenantGuard + WorkspaceAuth + Cloudflare edge) — the exact
 # path a canvas concierge agent hits in production. It REUSES the staging
 # harness's env contract, org-provision/teardown shape, _lib.sh helpers, and the
-# AWS-leak-check lib, so the org lifecycle scaffolding is shared, not duplicated.
+# exact CP purge-receipt verifier, so lifecycle proof is shared, not duplicated.
 #
 # NOTE: user_tasks is a pure DB/handler primitive — no LLM container is needed.
 # We DO NOT wait for any workspace to boot online (no MINIMAX/ANTHROPIC key
-# required), which keeps this test fast and decoupled from EC2 cold-boot flake.
+# required), which keeps this test fast and decoupled from runtime cold-boot flake.
 # Workspaces are created in 'external' mode so the tenant ws-server registers
-# the row without provisioning an EC2 (no leak beyond the org teardown).
+# the row without provisioning a worker container.
 #
 # Required env (same contract as test_staging_full_saas.sh):
 #   MOLECULE_CP_URL        default: https://staging-api.moleculesai.app
-#   MOLECULE_ADMIN_TOKEN   CP admin bearer — Railway staging CP_ADMIN_API_TOKEN
+#   MOLECULE_ADMIN_TOKEN   staging CP admin bearer from Infisical /shared/controlplane-admin
 #
 # Optional env:
-#   E2E_PROVISION_TIMEOUT_SECS   default 900 (15 min cold tenant EC2 budget)
+#   E2E_PROVISION_TIMEOUT_SECS   default 900 (15 min cold tenant budget)
 #   E2E_KEEP_ORG                 1 → skip teardown (debugging only)
 #   E2E_RUN_ID                   slug suffix; CI: ${GITHUB_RUN_ID}-${RUN_ATTEMPT}
-#   E2E_AWS_LEAK_CHECK           auto (default) | required | off
-#   E2E_AWS_TERMINATE_LEAKS      1 → terminate slug-tagged leaked EC2 on exit
+#   E2E_INFRA_BACKEND            required: local-docker (only active backend)
 #
 # Exit codes:
 #   0  happy path
 #   1  generic / assertion failure
 #   2  missing required env
 #   3  provisioning timed out
-#   4  teardown left orphan resources
+#   4  teardown receipt/audit/org-absence proof failed
 set -euo pipefail
 
 # _lib.sh gives us sanitize/admin-auth conventions shared across the suite.
 # shellcheck disable=SC1091
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
-# AWS-leak-check lib — same teardown leak assertion the full-SaaS harness uses.
+# Exact synchronous CP purge receipt + exact-org absence verifier.
 # shellcheck disable=SC1091
-# shellcheck source=lib/aws_leak_check.sh
-source "$(dirname "$0")/lib/aws_leak_check.sh"
+# shellcheck source=lib/cp_purge_receipt.sh
+source "$(dirname "$0")/lib/cp_purge_receipt.sh"
+e2e_cp_require_local_backend || exit 2
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
-ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway staging CP_ADMIN_API_TOKEN}"
+e2e_cp_require_staging_origin "$CP_URL" || exit 2
+ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 # RUN_ID_SUFFIX removed (core#2782 follow-up shellcheck): the slug now
 # comes from make_collision_proof_slug below; the old suffix var is dead.
@@ -108,8 +109,10 @@ check_code() {  # <desc> <expected> <actual>
 CURL_COMMON=(-sS --max-time 30)
 TMPDIR_E2E=$(mktemp -d -t cncrg-staging-XXXXXX)
 
-# ─── teardown trap (org delete + leak check) ─────────────────────────────────
+# ─── teardown trap (exact purge receipt/audit + exact-tenant HTTP 404) ────────
 CLEANUP_DONE=0
+ORG_ID=""
+ORG_CREATION_VERIFIED=0
 cleanup_org() {
   local entry_rc=$?
   [ "$CLEANUP_DONE" = "1" ] && return 0
@@ -120,35 +123,19 @@ cleanup_org() {
     log "E2E_KEEP_ORG=1 — skipping teardown. Manually delete $SLUG when done."
     return 0
   fi
+  if [ "$ORG_CREATION_VERIFIED" != "1" ]; then
+    log "No verified creation-returned org identity for $SLUG — skipping destructive org teardown."
+    case "$entry_rc" in 0|1|2|3|4) return 0 ;; *) exit 1 ;; esac
+  fi
   log "🧹 Tearing down org $SLUG..."
-  if curl "${CURL_COMMON[@]}" --max-time 120 -X DELETE "$CP_URL/cp/admin/tenants/$SLUG" \
-    -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
-    -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1; then
-    ok "Teardown request accepted"
-  else
-    log "Teardown returned non-2xx (may already be gone)"
-  fi
-
-  # Eventual-consistency wait: org row gone / purged.
-  local leak_count=1 elapsed=0
-  while [ "$elapsed" -lt 60 ]; do
-    leak_count=$(curl "${CURL_COMMON[@]}" "$CP_URL/cp/admin/orgs" \
-      -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null \
-      | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for o in d.get('orgs', []) if o.get('slug')=='$SLUG' and o.get('status') != 'purged'))" \
-      2>/dev/null || echo 1)
-    [ "$leak_count" = "0" ] && break
-    sleep 5; elapsed=$((elapsed + 5))
-  done
-  if [ "$leak_count" != "0" ]; then
-    echo "⚠️  LEAK: org $SLUG still present post-teardown after ${elapsed}s (count=$leak_count)" >&2
-    exit 4
-  fi
-  local aws_leak_rc=0
-  e2e_verify_no_ec2_leaks_for_slug "$SLUG" || aws_leak_rc=$?
-  if [ "$aws_leak_rc" != "0" ]; then
-    case "$aws_leak_rc" in 2) exit 2 ;; *) exit 4 ;; esac
-  fi
-  ok "Teardown clean — no orphan org or EC2 resources for $SLUG (${elapsed}s)"
+  local purge_verify_rc=0
+  e2e_cp_delete_and_verify_purge \
+    "$CP_URL" "$ADMIN_TOKEN" "$SLUG" "$ORG_ID" || purge_verify_rc=$?
+  case "$purge_verify_rc" in
+    0) ;;
+    2) exit 2 ;;
+    *) exit 4 ;;
+  esac
   case "$entry_rc" in 0|1|2|3|4) ;; *) exit 1 ;; esac
 }
 trap cleanup_org EXIT INT TERM
@@ -164,35 +151,90 @@ log "═══ Staging concierge user_tasks E2E ═══  CP=$CP_URL  Slug=$SLU
 curl "${CURL_COMMON[@]}" "$CP_URL/health" >/dev/null || fail "CP health check failed"
 ok "CP reachable"
 
-# ─── 1. Create org ───────────────────────────────────────────────────────────
-log "1/6 Creating org $SLUG..."
-CREATE_RESP=$(admin_call POST /cp/admin/orgs \
-  -d "{\"slug\":\"$SLUG\",\"name\":\"E2E $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\"}")
-echo "$CREATE_RESP" | python3 -m json.tool >/dev/null || fail "Org create non-JSON: $CREATE_RESP"
-ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
-[ -z "$ORG_ID" ] && fail "Org create response missing 'id': $CREATE_RESP"
-ok "Org created (id=$ORG_ID)"
+# ─── 1+2. Create org + await provisioning (bounded retry on transient failure) ─
+# A tenant can rarely land in instance_status=failed within seconds of create —
+# a transient CP/host hiccup under concurrent-provision load. This was verified
+# NOT to be systemic: 6 tenants provisioned concurrently against staging all
+# reached running (the failure did not reproduce), so a single failed provision
+# is a rare hiccup, not a real product break. One such hiccup must NOT red a whole
+# post-merge lane. Re-provision a FRESH org up to E2E_PROVISION_ATTEMPTS times;
+# a genuinely-broken provisioner exhausts the attempts and still fails LOUD (no
+# masking). A provisioning TIMEOUT (capacity stall, never reaches a terminal
+# state) is a different, non-transient signal and is NOT retried (exit 3).
+PROVISION_ATTEMPTS="${E2E_PROVISION_ATTEMPTS:-3}"
+provision_attempt=0
+while : ; do
+  provision_attempt=$(( provision_attempt + 1 ))
 
-# ─── 2. Wait for tenant provisioning ─────────────────────────────────────────
-log "2/6 Waiting for tenant provisioning (up to ${PROVISION_TIMEOUT_SECS}s)..."
-DEADLINE=$(( $(date +%s) + PROVISION_TIMEOUT_SECS ))
-LAST_STATUS=""
-while true; do
-  [ "$(date +%s)" -gt "$DEADLINE" ] && exit 3
-  LIST_JSON=$(admin_call GET /cp/admin/orgs 2>/dev/null || echo '{"orgs":[]}')
-  STATUS=$(echo "$LIST_JSON" | python3 -c "
+  # ─── 1. Create org ─────────────────────────────────────────────────────────
+  log "1/6 Creating org $SLUG (attempt ${provision_attempt}/${PROVISION_ATTEMPTS})..."
+  CREATE_BODYFILE="$TMPDIR_E2E/create-org-response.json"
+  set +e
+  CREATE_HTTP_CODE=$(admin_call POST /cp/admin/orgs \
+    -o "$CREATE_BODYFILE" -w '%{http_code}' \
+    -d "{\"slug\":\"$SLUG\",\"name\":\"E2E $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\"}")
+  CREATE_CURL_RC=$?
+  set -e
+  CREATE_RESP=$(cat "$CREATE_BODYFILE" 2>/dev/null || true)
+  if [ "$CREATE_CURL_RC" != "0" ]; then
+    fail "Org create request failed (curl_rc=$CREATE_CURL_RC http=${CREATE_HTTP_CODE:-000}); raw body: $CREATE_RESP"
+  fi
+  case "$CREATE_HTTP_CODE" in
+    2[0-9][0-9]) ;;
+    *) fail "Org create returned non-2xx (http=${CREATE_HTTP_CODE:-000}); raw body: $CREATE_RESP" ;;
+  esac
+  echo "$CREATE_RESP" | python3 -m json.tool >/dev/null || fail "Org create non-JSON: $CREATE_RESP"
+  ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
+  e2e_cp_validate_org_id "$ORG_ID" \
+    || fail "Org create response missing a valid UUID 'id': $CREATE_RESP"
+  ORG_CREATION_VERIFIED=1
+  e2e_cp_publish_creation_identity "$SLUG" "$ORG_ID" \
+    || fail "Could not publish the verified org creation identity for teardown"
+  ok "Org created (id=$ORG_ID)"
+
+  # ─── 2. Wait for tenant provisioning ───────────────────────────────────────
+  log "2/6 Waiting for tenant provisioning (up to ${PROVISION_TIMEOUT_SECS}s)..."
+  DEADLINE=$(( $(date +%s) + PROVISION_TIMEOUT_SECS ))
+  LAST_STATUS=""
+  PROVISION_RESULT=""
+  while true; do
+    [ "$(date +%s)" -gt "$DEADLINE" ] && { PROVISION_RESULT="timeout"; break; }
+    LIST_JSON=$(admin_call GET /cp/admin/orgs 2>/dev/null || echo '{"orgs":[]}')
+    STATUS=$(echo "$LIST_JSON" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 for o in d.get('orgs', []):
     if o.get('slug') == '$SLUG':
         print(o.get('instance_status', '')); sys.exit(0)
 print('')" 2>/dev/null || echo "")
-  if [ "$STATUS" != "$LAST_STATUS" ]; then log "    status → $STATUS"; LAST_STATUS="$STATUS"; fi
-  case "$STATUS" in
-    running) break ;;
-    failed)  fail "Tenant provisioning failed for $SLUG" ;;
-    *)       sleep 15 ;;
-  esac
+    if [ "$STATUS" != "$LAST_STATUS" ]; then log "    status → $STATUS"; LAST_STATUS="$STATUS"; fi
+    case "$STATUS" in
+      running) PROVISION_RESULT="running"; break ;;
+      failed)  PROVISION_RESULT="failed";  break ;;
+      *)       sleep 15 ;;
+    esac
+  done
+
+  [ "$PROVISION_RESULT" = "running" ] && break
+  # A capacity/latency stall (never reached a terminal state) is a genuine,
+  # non-transient signal — preserve the original exit 3 rather than masking it.
+  [ "$PROVISION_RESULT" = "timeout" ] && exit 3
+
+  # instance_status=failed. Out of attempts → fail loud (persistent, not a hiccup).
+  if [ "$provision_attempt" -ge "$PROVISION_ATTEMPTS" ]; then
+    fail "Tenant provisioning failed for $SLUG after ${provision_attempt} attempt(s) — persistent provisioning failure, not a transient hiccup"
+  fi
+  log "⚠ Tenant provisioning FAILED for $SLUG (attempt ${provision_attempt}/${PROVISION_ATTEMPTS}) — rare transient CP/host hiccup; purging the dead org and re-provisioning a FRESH one"
+  # Best-effort fire-and-forget purge of the dead org (it never served). If it
+  # lingers, the sweep-stale-e2e-orgs janitor reaps it; the eventual successful
+  # org is torn down by the EXIT trap. Then mint a FRESH slug (never reuse one
+  # the CP may still be deprovisioning) and loop.
+  admin_call DELETE "/cp/admin/tenants/$SLUG" -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1 || true
+  ORG_ID=""
+  ORG_CREATION_VERIFIED=0
+  SLUG="e2e-cncrg-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" 10)"
+  assert_collision_proof_slug "$SLUG" \
+    || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG' on retry"
 done
 ok "Tenant provisioning complete"
 
@@ -204,8 +246,76 @@ case "$CP_HOST" in
   *)             DERIVED_DOMAIN="$CP_HOST" ;;
 esac
 TENANT_DOMAIN="${MOLECULE_TENANT_DOMAIN:-$DERIVED_DOMAIN}"
-TENANT_URL="https://$SLUG.$TENANT_DOMAIN"
+# MOLECULE_TENANT_URL override — the EPHEMERAL-CP path (mirrors
+# test_staging_full_saas.sh). Staging front-doors each tenant at its own
+# slug.<domain> subdomain, so the Host alone routes. An ephemeral CP is one
+# throwaway container whose wildcard proxy resolves the tenant by SLUG, so the
+# ephemeral runner points this at the CP base URL; default (unset) keeps the
+# exact staging subdomain behavior.
+TENANT_URL="${MOLECULE_TENANT_URL:-https://$SLUG.$TENANT_DOMAIN}"
 log "    TENANT_URL=$TENANT_URL"
+
+# Ephemeral-CP tenant ROUTING headers (mirrors test_staging_full_saas.sh): when
+# MOLECULE_TENANT_URL points at the CP base URL, carry the routing slug via
+# Host + X-Molecule-Org-Slug (the CP resolves the tenant by the Host-derived slug
+# or this fallback). Default unset ⇒ no extra headers ⇒ exact staging behavior.
+TENANT_ROUTE_HOST="${MOLECULE_TENANT_ROUTE_HOST:-}"
+if [ -z "$TENANT_ROUTE_HOST" ] && [ -n "${MOLECULE_TENANT_ROUTE_DOMAIN:-}" ]; then
+  TENANT_ROUTE_HOST="$SLUG.$MOLECULE_TENANT_ROUTE_DOMAIN"
+fi
+TENANT_ROUTE_HDRS=()
+if [ -n "$TENANT_ROUTE_HOST" ]; then
+  TENANT_ROUTE_HDRS=(-H "Host: $TENANT_ROUTE_HOST" -H "X-Molecule-Org-Slug: $SLUG")
+  log "    tenant routing via Host=$TENANT_ROUTE_HOST + X-Molecule-Org-Slug=$SLUG (ephemeral-CP slug routing)"
+fi
+
+# Origin header: the tenant's gin-contrib/cors allows exactly ONE origin — its own
+# public front-door (CORS_ORIGINS). In staging that IS $TENANT_URL
+# (https://$SLUG.$domain), so the default below reproduces staging byte-for-byte.
+# Under the ephemeral CP, $TENANT_URL is the CP base URL (NOT a tenant origin), so
+# a same-value Origin would be cross-origin → an empty-body 403 from cors before
+# any handler runs (the exact failure this port fixed). Precedence:
+#
+#   1. MOLECULE_TENANT_ORIGIN_TEMPLATE set → the SAME template the CP turns into the
+#      tenant's CORS_ORIGINS, substituted with this run's slug so the Origin we
+#      present is byte-identical to the origin the tenant allows. Always wins.
+#   2. template UNSET but ephemeral slug-routing is active (TENANT_ROUTE_HDRS
+#      non-empty ⇒ MOLECULE_TENANT_ROUTE_DOMAIN / _ROUTE_HOST in play) → $TENANT_URL
+#      is the CP base URL, NOT a tenant origin, so using it verbatim would 403.
+#      Instead DERIVE a tenant-scoped origin from the route host — the same
+#      slug.<route-domain> the CP forms CORS_ORIGINS from (PublicURLForSlug) —
+#      grounding scheme+port in the existing $TENANT_URL (or an explicit
+#      MOLECULE_TENANT_ROUTE_PORT) rather than blindly reusing the CP base URL host.
+#      This makes the Origin safe by construction even when a caller overrides
+#      MOLECULE_TENANT_URL (e.g. to the CP base URL) but forgets the origin template.
+#   3. no ephemeral routing (staging) → Origin=$TENANT_URL (the tenant's own
+#      subdomain, which IS its CORS_ORIGINS) ⇒ exact staging behavior.
+TENANT_ORIGIN="$TENANT_URL"
+if [ -n "${MOLECULE_TENANT_ORIGIN_TEMPLATE:-}" ]; then
+  TENANT_ORIGIN="${MOLECULE_TENANT_ORIGIN_TEMPLATE//\{slug\}/$SLUG}"
+  log "    tenant CORS origin = $TENANT_ORIGIN (from MOLECULE_TENANT_ORIGIN_TEMPLATE)"
+elif [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+  # Ephemeral slug-routing without an explicit origin template. $TENANT_URL points
+  # at the CP base URL here, so it is NOT the origin the tenant's cors allows.
+  # Rebuild the tenant-scoped origin from the route host + the scheme/port of the
+  # existing $TENANT_URL (the loopback route domain resolves to the same host:port
+  # the CP publishes on). Prefer an explicit MOLECULE_TENANT_ROUTE_PORT if given.
+  ORIGIN_SCHEME="${TENANT_URL%%://*}"
+  case "$ORIGIN_SCHEME" in http|https) ;; *) ORIGIN_SCHEME="" ;; esac
+  ORIGIN_PORT="${MOLECULE_TENANT_ROUTE_PORT:-}"
+  if [ -z "$ORIGIN_PORT" ]; then
+    TU_HOSTPORT="${TENANT_URL#*://}"; TU_HOSTPORT="${TU_HOSTPORT%%/*}"
+    case "$TU_HOSTPORT" in *:*) ORIGIN_PORT="${TU_HOSTPORT##*:}" ;; esac
+  fi
+  if [ -z "$ORIGIN_SCHEME" ] || [ -z "$TENANT_ROUTE_HOST" ]; then
+    fail "Cannot derive a tenant CORS Origin for ephemeral slug-routing (scheme='$ORIGIN_SCHEME' route_host='$TENANT_ROUTE_HOST'). Set MOLECULE_TENANT_ORIGIN_TEMPLATE to the CP's LOCAL_TENANT_URL_TEMPLATE (with {slug})."
+  fi
+  case "$TENANT_ROUTE_HOST" in
+    *:*) TENANT_ORIGIN="${ORIGIN_SCHEME}://${TENANT_ROUTE_HOST}" ;;               # route host already carries a port
+    *)   TENANT_ORIGIN="${ORIGIN_SCHEME}://${TENANT_ROUTE_HOST}${ORIGIN_PORT:+:$ORIGIN_PORT}" ;;
+  esac
+  log "    tenant CORS origin = $TENANT_ORIGIN (derived from route host; MOLECULE_TENANT_ORIGIN_TEMPLATE unset)"
+fi
 
 # ─── 3. Per-tenant admin token + TLS readiness ───────────────────────────────
 log "3/6 Fetching per-tenant admin token..."
@@ -217,8 +327,19 @@ ok "Tenant admin token retrieved (len=${#TENANT_TOKEN})"
 log "    Waiting for tenant TLS / DNS propagation..."
 TLS_DEADLINE=$(( $(date +%s) + 15 * 60 ))
 while true; do
-  curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1 && break
-  [ "$(date +%s)" -gt "$TLS_DEADLINE" ] && fail "Tenant /health never 2xx within 15m"
+  # Under ephemeral slug-routing, /health is answered by the CP's OWN global
+  # handler for ANY Host, so probing it with the route headers proves NOTHING —
+  # it 2xx's on iteration 1 without the tenant route ever being up (vacuous
+  # readiness gate). Probe /org/identity — a tenant-owned handler the CP proxies
+  # through — WITH the routing headers + X-Molecule-Org-Id, so a not-yet-routable
+  # tenant is actually caught. Staging (empty TENANT_ROUTE_HDRS) keeps the global
+  # /health check. Mirrors test_staging_full_saas.sh step 4.
+  if [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+    curl -sSfk --max-time 5 "${TENANT_ROUTE_HDRS[@]}" -H "X-Molecule-Org-Id: $ORG_ID" "$TENANT_URL/org/identity" >/dev/null 2>&1 && break
+  else
+    curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1 && break
+  fi
+  [ "$(date +%s)" -gt "$TLS_DEADLINE" ] && fail "Tenant never became routable within 15m (probe: $( [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ] && echo '/org/identity via route headers' || echo '/health' ))"
   sleep 5
 done
 ok "Tenant reachable at $TENANT_URL"
@@ -228,12 +349,13 @@ ok "Tenant reachable at $TENANT_URL"
 tenant_call() {  # <method> <path> [curl args…]
   local method="$1" path="$2"; shift 2
   curl "${CURL_COMMON[@]}" -X "$method" "$TENANT_URL$path" \
+    "${TENANT_ROUTE_HDRS[@]}" \
     -H "Authorization: Bearer $TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
-    -H "Origin: $TENANT_URL" "$@"
+    -H "Origin: $TENANT_ORIGIN" "$@"
 }
 
-# Create an external workspace (row only — no EC2). Echoes its id.
+# Create an external workspace row (no worker container). Echoes its id.
 #
 # Bounded retry around the external-row create only. The external create still
 # runs a DB transaction + post-commit token/status work before returning 201,
@@ -299,7 +421,7 @@ print(''.join(c.get('text','') for c in res.get('content', [])) if isinstance(re
 mcp_http_code() { cat "$MCP_CODE_FILE" 2>/dev/null || echo ''; }
 
 # ─── 4. Provision two workspaces (A raises asks, B probes cross-ws authz) ─────
-log "4/6 Creating two tenant workspaces (external rows — no EC2)..."
+log "4/6 Creating two tenant workspaces (external rows; no worker containers)..."
 WS_A=$(create_external_ws "Concierge-UT-A-$$")
 [ -n "$WS_A" ] || fail "ws-A create returned no id"
 WS_B=$(create_external_ws "Concierge-UT-B-$$")

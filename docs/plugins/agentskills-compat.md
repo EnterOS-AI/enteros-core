@@ -1,224 +1,81 @@
-# Molecule AI plugins and the agentskills.io standard
+# Plugin shapes and Agent Skills compatibility
 
-> **TL;DR** — every skill inside a Molecule AI plugin is a spec-compliant
-> [agentskills.io](https://agentskills.io) skill, which means the same
-> skill directory is installable in **Claude Code, Cursor, GitHub Copilot,
-> VS Code, OpenAI Codex, Gemini CLI, Amp, OpenCode, OpenHands, Letta,
-> Goose, Roo Code, Kiro, Factory, Ona, Junie**, and ~20 other agent
-> products that ship the standard today. Molecule AI adds a *plugin*
-> superset on top: a bundle of skills + rules + per-runtime adapters,
-> so the same plugin can orchestrate across a team of agents running on
-> different LLM runtimes.
+Molecule plugins are delivered to a workspace by the platform and interpreted
+inside the workspace by the installed `molecules-workspace-runtime` package.
+The runtime implementation is authoritative; this page describes the current
+file shapes without claiming compatibility for products Molecule does not test.
 
-## The two layers
+## Skills and rules
 
-```
-plugins/my-plugin/                        ← Molecule AI bundle (our layer)
-├── plugin.yaml                           ← Molecule AI manifest: name, version,
-│                                            runtimes, adapters, description
-├── rules/*.md                            ← Molecule AI-only: always-on prose
-│                                            appended to the runtime memory file
-├── skills/                               ← agentskills.io layer starts here
-│   ├── <skill-name-1>/
-│   │   ├── SKILL.md                      ← agentskills spec: frontmatter + body
-│   │   ├── scripts/                      ← optional, executable code
-│   │   ├── references/                   ← optional, deep-dive docs
-│   │   └── assets/                       ← optional, templates/data
-│   └── <skill-name-2>/
-│       └── SKILL.md
-└── adapters/                             ← Molecule AI-only: per-runtime installers
-    ├── claude_code.py
-    └── deepagents.py
+The built-in `AgentskillsAdaptor` understands this common shape:
+
+```text
+my-plugin/
+├── plugin.yaml                 optional platform metadata
+├── rules/*.md                  optional always-on instructions
+├── *.md                        optional root prompt fragments
+├── setup.sh                    optional setup hook
+└── skills/
+    └── my-skill/
+        ├── SKILL.md
+        ├── scripts/            optional
+        ├── references/         optional
+        └── assets/             optional
 ```
 
-The boundary is clean:
+It copies skills into `/configs/skills/<name>/` and appends rules and eligible
+root Markdown fragments to the runtime's configured memory file. README,
+CHANGELOG, LICENSE, and CONTRIBUTING files are not prompt fragments. Setup
+hooks run with known credential variables removed from their environment, but a
+plugin is still executable code and must be reviewed like any dependency.
 
-- **Everything under `skills/<name>/`** follows the spec. A skill-aware
-  tool that doesn't know what Molecule AI is can consume it as-is.
-- **Everything above `skills/`** is our superset — bundle metadata,
-  cross-runtime install logic, always-on rules.
+A standalone `SKILL.md` at the plugin root and a `skills/` tree are both
+recognized by current platform classification. The exact runtime-native
+activation behavior depends on the selected workspace runtime.
 
-## What the spec defines (and what we follow exactly)
+## Adapter resolution
 
-Per [agentskills.io/specification](https://agentskills.io/specification):
+For `(plugin name, workspace runtime)`, the runtime resolves adapters in this
+order:
 
-| Spec requirement | How Molecule AI enforces it |
-|---|---|
-| Skill is a directory with `SKILL.md` at the root | `skills/<name>/SKILL.md` |
-| Directory name matches frontmatter `name` | Enforced by `molecule_plugin validate` |
-| `name`: 1–64 chars, lowercase + hyphens, no consecutive or edge hyphens | Regex-validated |
-| `description`: 1–1024 chars, covers what+when | Length-validated |
-| `license`, `compatibility`, `metadata`, `allowed-tools` optional | Passed through unchanged |
-| `scripts/`, `references/`, `assets/` optional dirs | Skill loader reads all three |
-| Progressive disclosure (metadata → body → sub-files) | Claude Code reads it natively; other runtimes load via plugin adaptor |
+1. a curated adapter in `molecule_runtime/plugins_registry/<plugin>/<runtime>.py`;
+2. an adapter shipped by the plugin at `adapters/<runtime>.py`;
+3. `RawDropAdaptor`, which leaves files in place and returns a warning.
 
-## Where we extend the spec (bundle layer)
+An adapter module exports either an `Adaptor` class or
+`get_adaptor(plugin_name, runtime)`. The curated registry lives in the runtime
+Python package, not in this repository.
 
-The spec doesn't address bundling, cross-runtime installation, or
-always-on rules. That's what `plugin.yaml` adds:
+## MCP-server plugins
 
-```yaml
-# plugins/my-plugin/plugin.yaml
-name: my-plugin
-version: 1.0.0
-description: Bundle of related skills + rules for <use case>.
-author: your-name
-tags: [example]
+The built-in `MCPServerAdaptor` currently consumes a
+`settings-fragment.json` containing an `mcpServers` block and merges that block
+into the Claude-compatible `.claude/settings.json` layer. It delegates skills,
+rules, prompt fragments, and setup to `AgentskillsAdaptor`.
 
-# Declared supported workspace runtimes — each must have a matching
-# adapters/<runtime>.py file, or the install falls through to raw-drop.
-runtimes:
-  - claude_code
-  - deepagents
+Do not infer Codex, Gemini, Hermes, or another runtime's MCP config shape from
+this page. A plugin must ship or select an adapter that implements that
+runtime's current native configuration. On uninstall, the current MCP adapter
+does not remove merged MCP entries automatically because those entries may be
+shared or manually maintained.
 
-# Optional — these are document hints, not enforced by the spec.
-# The skills list is informational; the skill loader discovers everything
-# under skills/ regardless.
-skills:
-  - my-skill-a
-  - my-skill-b
+## Authoring guidance
 
-# Optional — always-on markdown files appended to the runtime memory file
-# (CLAUDE.md on Claude Code and DeepAgents). The spec has no always-on tier.
-rules:
-  - rules/conventions.md
-```
+- Keep each `skills/<name>/SKILL.md` valid for the Agent Skills convention if
+  portability matters.
+- Put Molecule-specific always-on instructions under `rules/`.
+- Ship `adapters/<runtime>.py` only when the built-in shape is insufficient.
+- Test install and uninstall on every runtime declared by the plugin.
+- Pin remote plugin sources; see [Plugin install sources](./sources.md).
 
-### Rules vs skills
+Current implementation authority:
 
-- **A skill** is activated on demand — the agent reads its `name` and
-  `description` at startup, then loads the body when the task matches.
-- **A rule** is always-on — its text is appended to the runtime's
-  memory file (CLAUDE.md) so the agent sees it on every turn.
+- runtime: `molecule_runtime/plugins_registry/` in the
+  `molecule-ai-workspace-runtime` repository;
+- platform delivery and classification:
+  `workspace-server/internal/handlers/plugins_*` in this repository.
 
-Rules are a Molecule AI-specific extension. If we ever need to represent a
-rule as a spec-compliant skill (e.g. for distribution to a non-Molecule AI
-tool), write it as a skill whose `description` explicitly says "apply
-continuously in this codebase" — the tool will decide whether to honor it.
-
-### Per-runtime adapters
-
-The spec leaves install semantics to the host tool. Molecule AI's plugin
-adapters (`plugins/<name>/adapters/<runtime>.py`) bridge the gap for
-runtimes that don't read `SKILL.md` natively. For most plugins the
-built-in `AgentskillsAdaptor` covers the common shape (copy skills to
-`/configs/skills/`, append rules to CLAUDE.md). See
-[plugins_registry](../../workspace/plugins_registry/__init__.py)
-for the resolution order.
-
-## MCP-server plugins (the plugin declaration is the SSOT)
-
-A plugin can also carry an **MCP server** rather than (or alongside) skills
-and rules. This is how privileged capabilities like the **management /
-platform MCP** reach an agent — see
-[`rfc-platform-mcp-as-plugin.md`](../design/rfc-platform-mcp-as-plugin.md).
-
-The model is the same two-layer split, applied to MCP:
-
-- **The plugin declaration is the single source of truth.** An agent's MCP
-  servers come from the plugins it declares (`config.yaml: plugins:`), **not**
-  from a separate, hand-maintained `mcp_servers:` list. There is one place an
-  MCP capability is named: the plugin.
-- **The plugin ships a runtime-agnostic MCP descriptor** — the logical server
-  definition (command/args/env, with secrets *referenced*, never embedded),
-  independent of any one runtime's config file format.
-- **A per-runtime shape adapter renders that descriptor into the runtime's
-  native MCP config.** Each runtime reads MCP servers from a different place,
-  so the adapter writes the descriptor into the right shape for the active
-  runtime:
-
-  | Runtime | Native MCP config the adapter renders into |
-  |---|---|
-  | claude-code | `.claude/settings.json` (`mcpServers` block) |
-  | codex | `~/.codex/config.toml` |
-  | gemini | `~/.gemini/settings.json` |
-  | hermes | `platforms.*` config stanza |
-
-  Because the descriptor is runtime-agnostic and the adapter is per-runtime,
-  the **same MCP plugin works across runtimes** — the agent is
-  runtime-switchable, and the plugin declaration doesn't change when the
-  runtime does.
-
-The exact adapter API (class names, function signatures, the registry
-resolution order) is owned by the workspace runtime and is being finalized
-there — **see the runtime implementation** rather than pinning specifics here.
-
-> Privileged MCP plugins (e.g. the org-admin management MCP) are
-> **entitlement-gated**: installable only on the org-root `kind=platform`
-> concierge, enforced server-side. See
-> [`rfc-platform-mcp-as-plugin.md`](../design/rfc-platform-mcp-as-plugin.md) §4.
-
-## Validator
-
-Run before publishing a plugin:
-
-```bash
-python -m molecule_plugin validate plugins/my-plugin
-```
-
-Checks:
-
-1. `plugin.yaml` parses and declares known runtimes.
-2. Every `skills/<name>/SKILL.md`:
-   - has valid frontmatter
-   - `name` matches the directory name
-   - `name` matches the spec regex (lowercase, hyphens, length)
-   - `description` is 1–1024 chars
-   - optional fields (`license`, `compatibility`, `metadata`,
-     `allowed-tools`) conform to spec types
-
-CI runs this against every first-party plugin on every PR, so spec drift
-is caught before merge.
-
-## Publishing a skill to agentskills-compatible tools
-
-Any `skills/<name>/` directory from a Molecule AI plugin is a valid standalone
-skill. To publish it for Cursor / Codex / Goose / etc. users:
-
-1. Copy `plugins/my-plugin/skills/<name>/` into a new repo.
-2. Validate: `python -m molecule_plugin validate .` (or `skills-ref validate`
-   from the upstream [agentskills/agentskills](https://github.com/agentskills/agentskills) repo).
-3. Publish the repo; users install according to their tool's docs.
-
-The skill will use default activation semantics in each tool. Molecule AI's
-plugin bundle (runtimes, adapters, rules) is not needed — it only matters
-if the skill is installed inside Molecule AI.
-
-## Hermes runtime compatibility (issue #852)
-
-As of 2026-04-18, `hermes` has been added to the `runtimes:` field in
-the five SKILL.md-only first-party plugins. agentskills.io v0.8.0
-confirmed that SKILL.md-only plugins are natively hermes-compatible via
-**raw-drop** (no adapter file required). Hook-based plugins remain
-`claude_code`-only — they rely on harness-level hooks that hermes does
-not expose.
-
-| Plugin | Before | After |
-|---|---|---|
-| `ecc` | `[claude_code, deepagents]` | `[claude_code, deepagents, hermes]` |
-| `superpowers` | `[claude_code, deepagents]` | `[claude_code, deepagents, hermes]` |
-| `molecule-dev` | `[claude_code, deepagents]` | `[claude_code, deepagents, hermes]` |
-| `molecule-skill-cron-learnings` | `[claude_code]` | `[claude_code, hermes]` |
-| `molecule-skill-update-docs` | `[claude_code]` | `[claude_code, hermes]` |
-
-Companion PRs:
-- [molecule-ai-plugin-ecc#2](https://git.moleculesai.app/molecule-ai/molecule-ai-plugin-ecc/pull/2)
-- [molecule-ai-plugin-superpowers#2](https://git.moleculesai.app/molecule-ai/molecule-ai-plugin-superpowers/pull/2)
-- [molecule-ai-plugin-molecule-dev#2](https://git.moleculesai.app/molecule-ai/molecule-ai-plugin-molecule-dev/pull/2)
-- [molecule-ai-plugin-molecule-skill-cron-learnings#2](https://git.moleculesai.app/molecule-ai/molecule-ai-plugin-molecule-skill-cron-learnings/pull/2)
-- [molecule-ai-plugin-molecule-skill-update-docs#2](https://git.moleculesai.app/molecule-ai/molecule-ai-plugin-molecule-skill-update-docs/pull/2)
-
-Security note: Security Auditor was offline at time of change. Self-assessed
-as non-security-impacting — adding `hermes` to a string list in `plugin.yaml`
-creates no new tool surface or execution path.
-
-## Why this matters strategically
-
-- **Zero-cost distribution.** Every skill we ship to Molecule AI users is
-  automatically installable in ~35 other agent products, no rewrite.
-- **We're visible in the spec ecosystem.** Our plugin directory becomes
-  discoverable alongside Anthropic's own example skills. If the spec
-  adds new fields, we inherit them for free.
-- **Our moat stays intact.** Multi-agent orchestration, A2A, per-runtime
-  adapters, and the visual canvas — none of this is in scope for the
-  spec and is unlikely to be. That's where Molecule AI differentiates.
+The platform-management entitlement model is described in
+[Platform MCP as a plugin](../design/rfc-platform-mcp-as-plugin.md); that RFC is
+design context, while the checked handlers and runtime package define shipped
+behavior.

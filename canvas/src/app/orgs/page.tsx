@@ -178,7 +178,7 @@ function Shell({
           {session ? <AccountBar session={session} /> : null}
           <h1 className="text-3xl font-bold text-ink">Your organizations</h1>
           <p className="mt-2 text-ink-mid">
-            Each org is an isolated Molecule workspace.
+            Each org is an isolated Enter OS workspace.
           </p>
           <div className="mt-8">{children}</div>
         </div>

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -151,7 +152,16 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 	// apply_template=true) and wiring it in. The volume will be rewritten from
 	// the template on container start, same as first-provision. Only if the
 	// recovery template itself is missing do we bail.
-	if srcErr := provisioner.ValidateConfigSource(templatePath, configFiles); srcErr != nil {
+	// Validate against the PREPARED cfg's ConfigFiles, not this function's
+	// parameters: prepareProvisionContext may have introduced in-memory config
+	// files the caller didn't supply — the concierge overlay composes the
+	// persona + runtime-native config.yaml exactly on the auto-restart path
+	// where the caller passes (templatePath="", configFiles=nil). Checking the
+	// stale parameters here made that path fall through to the #1858 volume
+	// probe and, on a fresh volume, rebuild cfg WITHOUT the composed files —
+	// the concierge booted as a generic runtime agent with no persona
+	// (2026-07-19: hermes-default "I'm Hermes" greeting, no Org Concierge).
+	if srcErr := provisioner.ValidateConfigSource(templatePath, cfg.ConfigFiles); srcErr != nil {
 		hasConfig, probeErr := h.provisioner.VolumeHasFile(ctx, workspaceID, "config.yaml")
 		if probeErr != nil {
 			log.Printf("Provisioner: config.yaml preflight probe failed for %s: %v (proceeding)", workspaceID, probeErr)
@@ -177,7 +187,10 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 							workspaceID, filepath.Base(runtimeTemplate))
 						templatePath = runtimeTemplate
 						// Rebuild cfg with the recovered template path so Start() sees it.
-						cfg = h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, prepared.EnvVars, prepared.Config.WorkspaceSecretKeys, prepared.PluginsPath)
+						// Keep the PREPARED in-memory config files (concierge overlay etc.)
+						// rather than the caller's parameter — see the ValidateConfigSource
+						// note above.
+						cfg = h.buildProvisionerConfig(ctx, workspaceID, templatePath, prepared.Config.ConfigFiles, payload, prepared.EnvVars, prepared.Config.WorkspaceSecretKeys, prepared.PluginsPath)
 						cfg.ResetClaudeSession = resetClaudeSession
 						recovered = true
 						break
@@ -207,6 +220,13 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 	h.mintWorkspaceSecrets(ctx, workspaceID, &cfg)
 
 	url, err := h.provisioner.Start(ctx, cfg)
+	if errors.Is(err, provisioner.ErrWorkspaceRemoved) {
+		// RC09: deleted while this provision was in flight. Start already tore
+		// down what it made; the row is 'removed' and must stay that way —
+		// markProvisionFailed would resurrect it as 'failed'.
+		log.Printf("Provisioner: workspace %s was deleted while provisioning — start abandoned: %v", workspaceID, err)
+		return
+	}
 	if err != nil {
 		// F1086 / #1206: persist a generic message so the canvas and
 		// GET /workspaces/:id expose something actionable without leaking
@@ -1196,7 +1216,8 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 		return
 	}
 
-	// Canonical model env vars — molecule-runtime's workspace/config.py
+	// Canonical model env vars — molecule-ai-workspace-runtime's
+	// molecule_runtime/config.py
 	// resolves the picked model as MOLECULE_MODEL > MODEL > (legacy)
 	// MODEL_PROVIDER (#280; the legacy env-var fallback in the Python
 	// runtime is independent of the workspace_secrets row rename — it
@@ -1221,6 +1242,15 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 		// slug prefix (minimax/…, anthropic/…, openai/…, etc.) when the
 		// provider isn't explicitly set.
 		envVars["HERMES_DEFAULT_MODEL"] = model
+		// The platform registry uses minimax:Model for BYOK; Hermes's
+		// provider/bridge input uses minimax/Model. Project only the native
+		// setting: MODEL and MOLECULE_MODEL must keep the canonical id so
+		// provider selection and billing still distinguish BYOK from platform.
+		// Without this, the custom-provider bridge forwards the colon prefix
+		// to MiniMax, which rejects it as an unknown model.
+		if strings.HasPrefix(model, "minimax:") {
+			envVars["HERMES_DEFAULT_MODEL"] = "minimax/" + strings.TrimPrefix(model, "minimax:")
+		}
 	}
 }
 
@@ -1315,6 +1345,13 @@ func effectiveModelForBilling(model string, envVars map[string]string) string {
 type platformLLMEnvResult struct {
 	RoutedToPlatform bool
 	HasUsableLLMCred bool
+	// SubstitutedModel is non-empty when the self-host platform-arm fallback
+	// replaced the requested model with the onboarding-selected one. The
+	// caller MUST feed this to applyRuntimeModelEnv in place of payload.Model
+	// — that function gives payload.Model top priority, so without the
+	// override it would resurrect the unusable platform-arm model in the
+	// container env right after the fallback rerouted billing.
+	SubstitutedModel string
 }
 
 // globalKeys is the provenance side-channel from loadWorkspaceSecrets: the set
@@ -1327,6 +1364,103 @@ type platformLLMEnvResult struct {
 // wrong upstream. May be nil (no global-origin keys / unknown provenance) — a
 // nil set strips nothing, preserving the pre-#728 behavior for callers that do
 // not thread provenance.
+// onboardingSelectedFallback resolves the self-host substitute for a
+// platform-arm model: the platform root's stored MODEL secret (the onboarding
+// setup-scene selection). The stored form is runtime-flavored (hermes stores
+// `minimax:MiniMax-M3`; claude-code stores the bare id), so each candidate
+// form (raw, after-colon, after-slash) is tried against THIS workspace's
+// runtime until one derives to a non-platform vendor arm WITH a usable
+// credential in scope (global or workspace). Returns ok=false when nothing
+// resolves — the caller keeps the historical fail-closed abort.
+// applySelfHostTenantDefaults fills MISSING TENANT_* identity vars with
+// self-host placeholders so a template's required_env can never dead-end a
+// first boot over tenant identity (there is no SaaS tenant on self-host —
+// the operator IS the tenant). Only vars in `missing` (i.e. currently unset
+// after org- and workspace-scope secrets merged) are touched, so real values
+// set at either scope always win. Non-TENANT_* missing vars are left alone —
+// those (API keys etc.) must still fail closed.
+func applySelfHostTenantDefaults(envVars map[string]string, missing []string) {
+	known := map[string]func() string{
+		"TENANT_NAME":        func() string { return "Enter OS" },
+		"TENANT_DOMAIN":      func() string { return "enteros.local" },
+		"TENANT_DOMAIN_APEX": func() string { return "enteros.local" },
+		"TENANT_DOMAIN_FULL": func() string { return "https://enteros.local" },
+		"TENANT_TIMEZONE":    systemTimezoneName,
+	}
+	for _, key := range missing {
+		if !strings.HasPrefix(key, "TENANT_") {
+			continue
+		}
+		if gen, ok := known[key]; ok {
+			envVars[key] = gen()
+		} else {
+			// Unknown TENANT_* requirement from a future template: a branded
+			// placeholder still beats a bricked first boot.
+			envVars[key] = "Enter OS"
+		}
+	}
+}
+
+// systemTimezoneName resolves the host's timezone for TENANT_TIMEZONE: the
+// TZ env when set, an IANA-looking time.Local name, else a fixed UTC±HH:MM
+// offset (Windows Go often reports time.Local as just "Local").
+func systemTimezoneName() string {
+	if tz := strings.TrimSpace(os.Getenv("TZ")); tz != "" {
+		return tz
+	}
+	if name := time.Local.String(); strings.Contains(name, "/") {
+		return name
+	}
+	_, offset := time.Now().Zone()
+	if offset == 0 {
+		return "UTC"
+	}
+	sign := "+"
+	if offset < 0 {
+		sign, offset = "-", -offset
+	}
+	return fmt.Sprintf("UTC%s%02d:%02d", sign, offset/3600, (offset%3600)/60)
+}
+
+// onboardingModelCandidates expands a stored onboarding model id into the
+// forms to try against a (possibly different) runtime's registry: the raw
+// stored value plus the bare id after a colon (hermes stores
+// `minimax:MiniMax-M3`) or slash. Pure — unit-tested directly.
+func onboardingModelCandidates(rootModel string) []string {
+	if rootModel == "" {
+		return nil
+	}
+	candidates := []string{rootModel}
+	if i := strings.IndexByte(rootModel, ':'); i >= 0 && i+1 < len(rootModel) {
+		candidates = append(candidates, rootModel[i+1:])
+	}
+	if i := strings.LastIndexByte(rootModel, '/'); i >= 0 && i+1 < len(rootModel) {
+		candidates = append(candidates, rootModel[i+1:])
+	}
+	return candidates
+}
+
+func onboardingSelectedFallback(ctx context.Context, manifest *providers.Manifest, runtime string, envVars map[string]string) (string, providers.Provider, bool) {
+	rootID := PlatformAgentID()
+	secrets, _, _, _ := loadWorkspaceSecrets(ctx, rootID)
+	rootModel := strings.TrimSpace(secrets["MODEL"])
+	if rootModel == "" {
+		return "", providers.Provider{}, false
+	}
+	authEnv := availableAuthEnvNames(envVars)
+	for _, cand := range onboardingModelCandidates(rootModel) {
+		p, err := manifest.DeriveProvider(runtime, cand, authEnv)
+		if err != nil || p.IsPlatform() {
+			continue
+		}
+		if !hasAnyPlatformManagedLLMKey(p, envVars) {
+			continue
+		}
+		return cand, p, true
+	}
+	return "", providers.Provider{}, false
+}
+
 func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, workspaceID, runtime, model string, globalKeys map[string]struct{}) platformLLMEnvResult {
 	// internal#718 P2-B: the platform-vs-byok decision now DERIVES the provider
 	// from (runtime, model) via the registry and keys off IsPlatform(derived) —
@@ -1361,6 +1495,7 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	var derivedProvider providers.Provider
 	routeToPlatform := false
 	resolvedProviderName := ""
+	substitutedModel := "" // set by the self-host platform-arm fallback below
 	if manifest, mErr := providerRegistry(); mErr == nil && manifest != nil {
 		if p, dErr := manifest.DeriveProvider(runtime, effectiveModel, availableAuthEnv); dErr == nil {
 			derivedProvider = p
@@ -1412,6 +1547,36 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 						derivedProvider = pp
 						break
 					}
+				}
+			}
+
+			// SELF-HOST PLATFORM-ARM FALLBACK (2026-07-19 operator decision):
+			// a model that resolves to the closed `platform` arm can NEVER run
+			// on a self-hosted stack — there is no CP proxy — so pre-fix the
+			// provision died on MISSING_PLATFORM_PROXY (the SaaS-tuned
+			// seo-agent template's `provider: platform` default did exactly
+			// this). Instead of the dead end, follow the ONBOARDING-SELECTED
+			// model: the platform root's stored MODEL (the setup-scene choice),
+			// re-derived against THIS workspace's runtime. Fires ONLY when
+			// platform-routed with no proxy wired — explicit BYOK selections
+			// and every SaaS path are untouched. If the onboarding selection
+			// can't be resolved (no root, underivable, no credential), the
+			// historical MISSING_PLATFORM_PROXY abort stands.
+			if routeToPlatform && !PlatformManagedProxyConfigured() {
+				if obModel, obProv, ok := onboardingSelectedFallback(ctx, manifest, runtime, envVars); ok {
+					log.Printf("workspace_provision: llm routing workspace=%s — model %q routes to the platform arm but no CP proxy is wired (self-host); following onboarding selection %q (provider=%s)",
+						workspaceID, effectiveModel, obModel, obProv.Name)
+					effectiveModel = obModel
+					derivedProvider = obProv
+					routeToPlatform = false
+					resolvedProviderName = obProv.Name
+					substitutedModel = obModel
+					// Publish the substituted model on BOTH names of the
+					// applyRuntimeModelEnv fallback chain so the runtime and
+					// every downstream reader see the effective model, not the
+					// unusable template default.
+					envVars["MODEL"] = obModel
+					envVars["MOLECULE_MODEL"] = obModel
 				}
 			}
 		} else {
@@ -1545,6 +1710,7 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 		return platformLLMEnvResult{
 			RoutedToPlatform: false,
 			HasUsableLLMCred: hasAnyPlatformManagedLLMKey(byokResolvedProvider, envVars),
+			SubstitutedModel: substitutedModel,
 		}
 	}
 	baseURL := firstNonEmptyEnv("MOLECULE_LLM_BASE_URL", "OPENAI_BASE_URL")
@@ -1902,13 +2068,37 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 	log.Printf("CPProvisioner: goroutine entered for %s (runtime=%s, mode=cp)", workspaceID, payload.Runtime)
 	defer h.logProvisionPanic(workspaceID, "cp")
 
-	ctx, cancel := context.WithTimeout(context.Background(), provisioner.ProvisionTimeout)
+	// CP-mode ctx bounds the pinned-image pre-flight + cpProv.Start. Derived
+	// from the CP provision budget (cpProvisionTimeout, floored at
+	// provisioner.CPProvisionCeiling), NOT the fixed 3-min
+	// provisioner.ProvisionTimeout: the control plane resolves the pin at
+	// provision time and may have to obtain a multi-GB image before it can
+	// answer, and a ctx shorter than the provision client's own budget cancels
+	// that pull mid-flight — the control plane logs `pull failed: context
+	// canceled` and the workspace is marked terminally failed. See
+	// cp_provision_budget.go. Mirrors the Docker-mode migration above.
+	budget := h.cpProvisionTimeout(payload.Runtime)
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
+	log.Printf("CPProvisioner: cp-mode provision ctx for %s bounded at %s (runtime=%s, provision-client budget=%s)",
+		workspaceID, budget, payload.Runtime, provisioner.CPProvisionCeiling())
 
 	prepared, abort := h.prepareProvisionContext(ctx, workspaceID, templatePath, configFiles, payload, false)
 	if prepared == nil {
 		log.Printf("CPProvisioner: prepare failed for %s: %s", workspaceID, abort.Msg)
 		h.markProvisionFailed(ctx, workspaceID, abort.Msg, abort.Extra)
+		return
+	}
+
+	// core#5019, create half: PULL BEFORE PROVISIONING. EnsureImage was wired
+	// only on the restart path; a fresh org's first workspace — the path a new
+	// customer takes, and the one the control plane labels
+	// stage=create_workspace in these failures — never asked. Ask now, so the
+	// provision that follows is a cache hit rather than the thing that has to
+	// wait for 6.89GB. A refusal the control plane MEANT fails here, fast and
+	// with a reason, instead of minutes later with none.
+	if reason := h.ensurePinnedImageBeforeProvision(ctx, workspaceID, payload, budget); reason != "" {
+		h.markProvisionFailed(ctx, workspaceID, reason, nil)
 		return
 	}
 
@@ -1920,22 +2110,27 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 
 	machineID, err := h.cpProv.Start(ctx, prepared.Config)
 	if err != nil {
-		// F1086 / #1206: CP errors can include machine type, AMI IDs, VPC
-		// paths — use generic message for broadcast and last_sample_error.
+		// F1086 / #1206 still holds: CP errors can include machine type, AMI
+		// IDs and VPC paths, and none of it may reach a tenant-visible column.
+		// What changed is HOW: the error is CLASSIFIED into one of a closed set
+		// of compile-time constants (cpProvisionFailureReason) instead of being
+		// collapsed to one. Publishing a single constant is why five weeks of
+		// post-promote image failures were invisible to the gate AND to the
+		// customer's canvas. The full error is logged here, exactly as before.
 		log.Printf("CPProvisioner: workspace start failed for %s: %v", workspaceID, err)
-		h.markProvisionFailed(ctx, workspaceID, "provisioning failed", nil)
+		h.markProvisionFailed(ctx, workspaceID, cpProvisionFailureReason(err), nil)
 		return
 	}
 
-	// Persist the backing instance id so later operations (terminal via
-	// EIC+SSH, live logs, debug introspection) can resolve workspace → EC2
-	// without re-asking CP on every request.
+	// Persist the opaque backing instance id so later operations (provider-
+	// specific terminal access, live logs, debug introspection) can resolve a
+	// workspace to its provider compute without re-asking CP on every request.
 	//
 	// Bounded retry with exponential backoff: a transient DB blip must not
 	// orphan a healthy running instance. If all retries fail, mark the
 	// workspace failed and record the instance_id in the broadcast event +
-	// last_sample_error so an operator/reaper can reconcile later. The live
-	// EC2 is NOT terminated — it may contain valuable state. (#1)
+	// last_sample_error so an operator/reaper can reconcile later. The running
+	// provider compute is NOT terminated — it may contain valuable state. (#1)
 	var persistErr error
 	delay := instanceIDPersistRetryBaseDelay
 	for attempt := 1; attempt <= instanceIDPersistRetryAttempts; attempt++ {
@@ -1954,10 +2149,10 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 		}
 	}
 	if persistErr != nil {
-		log.Printf("CPProvisioner: CRITICAL persist instance_id failed for %s after %d attempts: %v — EC2 instance %s is RUNNING but UNTRACKED. Operator must manually reconcile or remove the workspace to trigger orphan cleanup.", workspaceID, instanceIDPersistRetryAttempts, persistErr, machineID)
+		log.Printf("CPProvisioner: CRITICAL persist instance_id failed for %s after %d attempts: %v — provider instance %s is RUNNING but UNTRACKED. Operator must manually reconcile or remove the workspace to trigger orphan cleanup.", workspaceID, instanceIDPersistRetryAttempts, persistErr, machineID)
 		// Server-only log already captures the raw error above; broadcast gets
 		// safe fields only (no client-visible DB error). Security: RC 9378.
-		h.markProvisionFailed(ctx, workspaceID, "instance_id persist failed after retry — EC2 untracked", map[string]interface{}{
+		h.markProvisionFailed(ctx, workspaceID, "instance_id persist failed after retry — provider compute untracked", map[string]interface{}{
 			"instance_id": machineID,
 			"attempts":    instanceIDPersistRetryAttempts,
 		})

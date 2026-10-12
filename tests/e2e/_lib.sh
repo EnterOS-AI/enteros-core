@@ -19,17 +19,12 @@ e2e_extract_token() {
 
 # Populate a curl-args array with the platform admin bearer, IF one is set.
 #
-# AdminAuth (workspace-server/internal/middleware/wsauth_middleware.go:161)
-# fail-opens ONLY while ADMIN_TOKEN is unset AND no workspace token exists yet
-# (devmode.go:50). The e2e-api CI job now sets ADMIN_TOKEN on the platform and
-# exports the matching MOLECULE_ADMIN_TOKEN here, which flips fail-open OFF — so
-# every admin-gated route (GET/POST/DELETE /workspaces, /events, /bundles,
-# /org/import, …) now requires the EXACT ADMIN_TOKEN as bearer (Tier-2b rejects
-# workspace bearers, wsauth_middleware.go:250). Helpers that hit admin routes
-# (e2e_cleanup_all_workspaces, e2e_delete_workspace's default path) must send it.
-#
-# Guarded if-set so a bootstrap/dev platform with no admin token (fail-open)
-# still works with zero auth. Mirrors e2e_mint_workspace_token's admin_auth.
+# AdminAuth fails closed in every environment. The e2e-api CI job sets
+# ADMIN_TOKEN on the platform and exports the matching MOLECULE_ADMIN_TOKEN
+# here, so every admin-gated route (GET/POST/DELETE /workspaces, /events,
+# /bundles, /org/import, …) receives the exact admin bearer. When neither value
+# is set this helper returns an empty array; callers that require AdminAuth must
+# fail fast or deliberately supply another accepted credential.
 #
 # Usage:
 #   local admin_auth=(); e2e_admin_auth_args admin_auth
@@ -42,6 +37,96 @@ e2e_admin_auth_args() {
   else
     eval "$_outname=()"
   fi
+}
+
+# Read one literal KEY=value from a dotenv file without sourcing or evaluating
+# the file. This intentionally supports the simple optional `export` and
+# single/double-quoted shapes used by the repository while leaving command
+# substitutions as inert text.
+e2e_read_dotenv_value() {
+  local key="$1" env_file="$2" raw
+  case "$key" in
+    ""|*[!A-Za-z0-9_]*) return 2 ;;
+  esac
+  [ -f "$env_file" ] || return 1
+  raw=$(awk -v key="$key" '
+    BEGIN { pattern = "^[[:space:]]*(export[[:space:]]+)?" key "[[:space:]]*=" }
+    $0 ~ pattern {
+      line = $0
+      sub(pattern, "", line)
+      sub(/\r$/, "", line)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+      print line
+      exit
+    }
+  ' "$env_file")
+  [ -n "$raw" ] || return 1
+  case "$raw" in
+    \"*\") raw=${raw#\"}; raw=${raw%\"} ;;
+    \'*\') raw=${raw#\'}; raw=${raw%\'} ;;
+  esac
+  printf '%s' "$raw"
+}
+
+# Fail fast for suites that must bootstrap or mutate through AdminAuth. A fresh
+# install has no bearer-less bootstrap path; callers need an admin credential
+# (or must implement an explicit verified-session/org-token client instead).
+e2e_require_admin_token() {
+  e2e_load_local_admin_token
+  if [ -n "${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}" ]; then
+    return 0
+  fi
+  echo "e2e: set MOLECULE_ADMIN_TOKEN or ADMIN_TOKEN; AdminAuth fails closed" >&2
+  return 2
+}
+
+# Load the supported dev-start ADMIN_TOKEN from the repository .env when a
+# local E2E is launched from a fresh shell. Only the admin value crosses the
+# subshell boundary; provider credentials and other .env entries are not
+# imported into the harness process.
+e2e_load_local_admin_token() {
+  if [ -n "${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}" ]; then
+    return 0
+  fi
+  case "$BASE" in
+    http://localhost:*|http://127.0.0.1:*|http://\[::1\]:*) ;;
+    *) return 0 ;;
+  esac
+
+  local repo_root env_file loaded
+  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+  env_file="$repo_root/.env"
+  [ -f "$env_file" ] || return 0
+  loaded=$(e2e_read_dotenv_value ADMIN_TOKEN "$env_file" || true)
+  if [ -n "$loaded" ]; then
+    ADMIN_TOKEN="$loaded"
+    export ADMIN_TOKEN
+  fi
+}
+
+# Populate a curl-args array for a human-originated platform request. Prefer a
+# configured admin bearer. The combined-tenant Canvas same-origin fallback is
+# available only to explicitly opted-in local contract tests; ordinary shell
+# E2Es must provide a credential and fail fast when none is available.
+e2e_human_auth_args() {
+  local _outname="$1"
+  e2e_load_local_admin_token
+  local _bearer="${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}"
+  if [ -n "$_bearer" ]; then
+    eval "$_outname=(-H \"Authorization: Bearer \$_bearer\")"
+    return 0
+  fi
+  if [ "${E2E_ALLOW_SAME_ORIGIN_FALLBACK:-}" = "1" ]; then
+    case "$BASE" in
+      http://localhost:*|http://127.0.0.1:*|http://\[::1\]:*)
+        eval "$_outname=(-H \"Origin: \$BASE\")"
+        return 0
+        ;;
+    esac
+  fi
+  eval "$_outname=()"
+  echo "e2e_human_auth_args: set MOLECULE_ADMIN_TOKEN/ADMIN_TOKEN; auth fails closed" >&2
+  return 1
 }
 
 # Delete every workspace currently on the platform. Use at the top of a

@@ -155,7 +155,7 @@ SET name = 'CEO Assistant',
             jsonb_build_object('id','triage-loop','name','triage-loop','description','Run the CI/PR triage loop; fix-what-you-find','tags',jsonb_build_array('orchestration'),'examples',jsonb_build_array()),
             jsonb_build_object('id','review-routing','name','review-routing','description','Dispatch non-author reviewers via delegate_task','tags',jsonb_build_array('routing'),'examples',jsonb_build_array()),
             jsonb_build_object('id','canvas-relay','name','canvas-relay','description','Relay CTO canvas/Telegram messages to peers','tags',jsonb_build_array('relay'),'examples',jsonb_build_array()),
-            jsonb_build_object('id','ops','name','ops','description','Direct hands-on ops on operator host and Neon','tags',jsonb_build_array('ops','direct-action'),'examples',jsonb_build_array())
+            jsonb_build_object('id','ops','name','ops','description','Direct operations through domain APIs, Gitea Actions, and CI-on-merge workflows','tags',jsonb_build_array('ops','direct-action'),'examples',jsonb_build_array())
         ),
         'updated_at', now()::text
     ),

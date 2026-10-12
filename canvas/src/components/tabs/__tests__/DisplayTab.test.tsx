@@ -175,6 +175,49 @@ describe("DisplayTab", () => {
     expect(mockRFBConstructor.mock.calls[0][1]).not.toContain("token=");
   });
 
+  it("navigates the browser via the URL bar when the user holds control", async () => {
+    mockGet
+      .mockResolvedValueOnce({
+        available: true,
+        mode: "desktop-control",
+        protocol: "novnc",
+        width: 1920,
+        height: 1080,
+      })
+      .mockResolvedValueOnce({ controller: "none" });
+    mockPost.mockImplementation((path: string) => {
+      if (path.endsWith("/display/control/acquire")) {
+        return Promise.resolve({
+          controller: "user",
+          controlled_by: "admin-token",
+          expires_at: "2026-05-23T08:48:27Z",
+          session_url: "/workspaces/ws-display/display/session/websockify#token=signed",
+        });
+      }
+      return Promise.resolve(undefined); // /desktop/navigate returns 204
+    });
+
+    render(<DisplayTab workspaceId="ws-display" />);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Take control" })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Take control" }));
+
+    // The URL bar appears only once the user holds control + a stream is open.
+    const input = (await screen.findByLabelText("Desktop URL")) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "example.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Go" }));
+
+    // It posts to /desktop/navigate with the scheme-normalized URL and the
+    // control token extracted from the signed session URL (#token=signed).
+    await waitFor(() => {
+      expect(mockPost).toHaveBeenCalledWith("/workspaces/ws-display/desktop/navigate", {
+        url: "https://example.com",
+        token: "signed",
+      });
+    });
+  });
+
   it("forwards browser paste events into the noVNC clipboard", async () => {
     mockGet
       .mockResolvedValueOnce({

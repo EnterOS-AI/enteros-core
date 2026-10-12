@@ -2,6 +2,7 @@ import type { Node, Edge } from "@xyflow/react";
 import type { WorkspaceData } from "./socket";
 import type { WorkspaceNodeData } from "./canvas";
 import { WORKSPACE_KIND } from "@/lib/workspace-kind";
+import { bootStateFromWire } from "./boot-telemetry";
 
 /** Thrown when workspace parent chains contain a cycle. Catching this at
  *  load time lets the UI surface a degraded state instead of hanging. */
@@ -534,6 +535,12 @@ export function buildNodesAndEdges(
         position = childSlotInGrid(idx, siblings);
       }
     }
+    // "Enter OS" boot-telemetry replay: GET /workspaces attaches the
+    // server-observed BOOT_STEP history (`boot_steps`) for provisioning
+    // rows. Rebuilding keycaps + watchdog log here means a page reload or
+    // periodic rehydrate restores the boot screen instead of resetting it
+    // to "waiting for boot telemetry" mid-boot.
+    const bootState = bootStateFromWire(ws.boot_steps);
     const node: Node<WorkspaceNodeData> = {
       id: ws.id,
       type: "workspaceNode",
@@ -567,11 +574,27 @@ export function buildNodesAndEdges(
         // A2A delivery mode (task #227). Absent on older ws-server builds
         // — leave undefined so the chat UI's "?? 'push'" fallback applies.
         deliveryMode: ws.delivery_mode,
+        // Greeting-first UI readiness. Server reports whether the first-boot
+        // greeting has landed (greeted). On reload this seeds the node so an
+        // already-greeted online workspace renders "ready" immediately instead
+        // of flashing "warming". Absent on older builds → undefined → treated as
+        // greeted (no warming). We only surface warming for a workspace the
+        // server explicitly reports as online-but-not-yet-greeted.
+        greeted: ws.greeted,
         compute: ws.compute,
         // Org-level platform agent ('platform') vs ordinary workspace. The map
         // view hides the platform root (it's the undeletable org anchor) via
         // stripPlatformRootForMap; the shell home tree keeps it as ROOT.
         kind: ws.kind ?? WORKSPACE_KIND.Workspace,
+        ...(bootState
+          ? { bootSteps: bootState.bootSteps, bootLog: bootState.bootLog }
+          : {}),
+        // The generation rides along even when the replay is empty (a fresh
+        // WORKSPACE_PROVISIONING reset serves gen + no steps) — hydrate's
+        // merge/reset decision needs it either way.
+        ...(typeof ws.boot_generation === "string"
+          ? { bootGen: ws.boot_generation }
+          : {}),
       },
     };
     if (hasParent) {

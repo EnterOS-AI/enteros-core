@@ -2,6 +2,7 @@ package channels
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,7 @@ const (
 	telegramDiscoverTimeout = 5 // seconds — for getUpdates long-poll during discovery
 	telegramMaxMessageLen   = 4096
 	telegramTypingInterval  = 4 * time.Second // re-send typing every 4s during long agent calls
+	telegramMaxWebhookBody  = 1 << 20
 )
 
 var telegramTokenRegex = regexp.MustCompile(`^\d+:[A-Za-z0-9_-]{30,}$`)
@@ -39,9 +41,10 @@ type TelegramAdapter struct{}
 func (t *TelegramAdapter) Type() string        { return "telegram" }
 func (t *TelegramAdapter) DisplayName() string { return "Telegram" }
 
-// ConfigSchema — Telegram uses Bot API long-polling. The bot token comes
-// from @BotFather; chat_id is a comma-separated list discovered via the
-// "Detect Chats" UI flow (calls Bot.getUpdates).
+// ConfigSchema — Telegram uses Bot API long-polling by default. The bot token
+// comes from @BotFather; chat_id is discovered via Bot.getUpdates. Deployments
+// that enable Telegram webhook mode also configure the setWebhook secret_token
+// as webhook_secret so the public receiver can authenticate every update.
 func (t *TelegramAdapter) ConfigSchema() []ConfigField {
 	return []ConfigField{
 		{
@@ -60,6 +63,15 @@ func (t *TelegramAdapter) ConfigSchema() []ConfigField {
 			Required:    true,
 			Placeholder: "-100123456789, -100987654321",
 			Help:        "Comma-separated chat IDs. Use \"Detect Chats\" after adding the bot to groups or sending /start in DMs.",
+		},
+		{
+			Key:         "webhook_secret",
+			Label:       "Webhook Secret Token",
+			Type:        "password",
+			Required:    false,
+			Sensitive:   true,
+			Placeholder: "optional — required for webhook mode",
+			Help:        "The secret_token passed to Telegram setWebhook. Required only when receiving updates through POST /webhooks/telegram.",
 		},
 	}
 }
@@ -401,9 +413,18 @@ func (t *TelegramAdapter) SendTyping(config map[string]interface{}, chatID strin
 }
 
 func (t *TelegramAdapter) ParseWebhook(c *gin.Context, config map[string]interface{}) (*InboundMessage, error) {
-	body, err := io.ReadAll(c.Request.Body)
+	expectedSecret, _ := config["webhook_secret"].(string)
+	receivedSecret := c.GetHeader("X-Telegram-Bot-Api-Secret-Token")
+	if expectedSecret == "" || subtle.ConstantTimeCompare([]byte(receivedSecret), []byte(expectedSecret)) != 1 {
+		return nil, fmt.Errorf("telegram: webhook authentication failed")
+	}
+
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, telegramMaxWebhookBody+1))
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if len(body) > telegramMaxWebhookBody {
+		return nil, fmt.Errorf("telegram: webhook body exceeds %d bytes", telegramMaxWebhookBody)
 	}
 
 	var update tgbotapi.Update
@@ -454,6 +475,13 @@ func (t *TelegramAdapter) StartPolling(ctx context.Context, config map[string]in
 	token, _ := config["bot_token"].(string)
 	if token == "" {
 		return fmt.Errorf("bot_token not configured")
+	}
+	// Telegram does not allow getUpdates while a webhook is active. A
+	// configured webhook_secret selects webhook mode: the operator owns the
+	// setWebhook call, and the authenticated public receiver handles updates.
+	// In particular, do not call DeleteWebhook here or silently undo that setup.
+	if webhookSecret, _ := config["webhook_secret"].(string); webhookSecret != "" {
+		return nil
 	}
 
 	channelID, _ := config["_channel_id"].(string) // injected by manager

@@ -24,9 +24,10 @@ import (
 //
 // Sibling of TokenHandler (workspace-scoped); deliberately kept
 // separate because the admin surface is wider — an org token can
-// mint/revoke other org tokens, escalate workspace perms, etc. —
+// request/revoke other org tokens, manage workspace permissions, etc. —
 // and conflating them with workspace tokens makes revoke UX
-// confusing.
+// confusing. Bearer-authenticated mint requests are approval-gated;
+// verified human-session mints proceed directly.
 type OrgTokenHandler struct{}
 
 func NewOrgTokenHandler() *OrgTokenHandler {
@@ -140,8 +141,12 @@ func (h *OrgTokenHandler) Create(c *gin.Context) {
 
 	createdBy, orgID := orgTokenActor(c)
 
-		plaintext, id, err := orgtoken.IssueWithExpiry(c.Request.Context(), db.DB, req.Name, createdBy, orgID, req.ExpiresAt, orgtoken.AuditLogRequestContextFromGin(c))
+	plaintext, id, err := orgtoken.IssueWithExpiry(c.Request.Context(), db.DB, req.Name, createdBy, orgID, req.ExpiresAt, orgtoken.AuditLogRequestContextFromGin(c))
 	if err != nil {
+		if errors.Is(err, orgtoken.ErrPastExpiry) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "expires_at must be in the future"})
+			return
+		}
 		if errors.Is(err, orgtoken.ErrMintCeilingExceeded) {
 			c.JSON(http.StatusTooManyRequests, gin.H{"error": "org api token mint ceiling exceeded"})
 			return
@@ -262,13 +267,10 @@ func callerOrg(c *gin.Context) string {
 //     N entries scattered by unanchored orgs. Without this env var
 //     set, admin-token callers get "" (caller returns a controlled
 //     4xx, never passes "" into the UUID query).
-//   - Session callers: same as org-token callers (callerOrg). Today
-//     session callers have no org_token_id → callerOrg returns "" —
-//     these callers are blocked at the 4xx with a hint to set the
-//     platform workspace ID or use an org-token credential. Session
-//     paths through CP/UI are NOT expected to mint org tokens
-//     directly (the UI mints via the concierge, which is admin-token
-//     authenticated → covers via the admin-token branch above).
+//   - Verified-session callers: Create handles these before invoking this
+//     helper and intentionally skips the agent approval gate. Canvas mints
+//     directly with the verified browser session. This helper therefore has
+//     no session branch and must not be used to infer session mint behavior.
 //
 // CRITICAL (RCA on #2579): the previous code passed callerOrg(c)
 // directly to gateDestructive, which crashed with "invalid input

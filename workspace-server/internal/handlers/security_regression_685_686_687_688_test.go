@@ -45,7 +45,7 @@ func newEnrolledAuthDB(t *testing.T) (*sql.DB, sqlmock.Sqlmock) {
 }
 
 // newFreshInstallAuthDB returns a sqlmock DB where HasAnyLiveTokenGlobal
-// reports zero enrolled workspaces — the platform is in fail-open bootstrap mode.
+// reports zero enrolled workspaces. AdminAuth still fails closed in this state.
 func newFreshInstallAuthDB(t *testing.T) (*sql.DB, sqlmock.Sqlmock) {
 	t.Helper()
 	d, m, err := sqlmock.New()

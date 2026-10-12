@@ -22,20 +22,26 @@ type Workspace struct {
 	// org-level concierge (the platform agent) that sits at the org root and is
 	// the user's default A2A target. See migration
 	// 20260606000000_workspaces_kind + RFC docs/design/rfc-platform-agent.md.
-	Kind               string          `json:"kind" db:"kind"`
-	SourceBundleID     sql.NullString  `json:"source_bundle_id" db:"source_bundle_id"`
-	AgentCard          json.RawMessage `json:"agent_card" db:"agent_card"`
-	URL                sql.NullString  `json:"url" db:"url"`
-	ParentID           *string         `json:"parent_id" db:"parent_id"`
-	ForwardedTo        *string         `json:"forwarded_to" db:"forwarded_to"`
-	LastHeartbeatAt    *time.Time      `json:"last_heartbeat_at" db:"last_heartbeat_at"`
-	LastErrorRate      float64         `json:"last_error_rate" db:"last_error_rate"`
-	LastSampleError    sql.NullString  `json:"last_sample_error" db:"last_sample_error"`
-	ActiveTasks        int             `json:"active_tasks" db:"active_tasks"`
-	MaxConcurrentTasks int             `json:"max_concurrent_tasks" db:"max_concurrent_tasks"`
-	UptimeSeconds      int             `json:"uptime_seconds" db:"uptime_seconds"`
-	CreatedAt          time.Time       `json:"created_at" db:"created_at"`
-	UpdatedAt          time.Time       `json:"updated_at" db:"updated_at"`
+	Kind            string          `json:"kind" db:"kind"`
+	SourceBundleID  sql.NullString  `json:"source_bundle_id" db:"source_bundle_id"`
+	AgentCard       json.RawMessage `json:"agent_card" db:"agent_card"`
+	URL             sql.NullString  `json:"url" db:"url"`
+	ParentID        *string         `json:"parent_id" db:"parent_id"`
+	ForwardedTo     *string         `json:"forwarded_to" db:"forwarded_to"`
+	LastHeartbeatAt *time.Time      `json:"last_heartbeat_at" db:"last_heartbeat_at"`
+	LastErrorRate   float64         `json:"last_error_rate" db:"last_error_rate"`
+	LastSampleError sql.NullString  `json:"last_sample_error" db:"last_sample_error"`
+	ActiveTasks     int             `json:"active_tasks" db:"active_tasks"`
+	// IsBusy is the self-healing successor to ActiveTasks (RFC #4402): a boolean
+	// "is the agent in a turn right now" fed by the heartbeat. During the B1→B4
+	// migration it is written on every beat — either from the runtime's own
+	// is_busy (B2+) or derived from active_tasks>0 (older runtimes). Consumers
+	// cut over to it in B3.
+	IsBusy             bool      `json:"is_busy" db:"is_busy"`
+	MaxConcurrentTasks int       `json:"max_concurrent_tasks" db:"max_concurrent_tasks"`
+	UptimeSeconds      int       `json:"uptime_seconds" db:"uptime_seconds"`
+	CreatedAt          time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at" db:"updated_at"`
 	// DeliveryMode: "push" (synchronous to URL — default) or "poll" (logged
 	// to activity_logs, agent reads via GET /activity?since_id=). See
 	// migration 045 + RFC #2339.
@@ -110,18 +116,42 @@ type RegisterPayload struct {
 }
 
 type HeartbeatPayload struct {
-	WorkspaceID   string  `json:"workspace_id" binding:"required"`
-	ErrorRate     float64 `json:"error_rate"`
-	SampleError   string  `json:"sample_error"`
-	ActiveTasks   int     `json:"active_tasks"`
-	UptimeSeconds int     `json:"uptime_seconds"`
-	CurrentTask   string  `json:"current_task"`
+	WorkspaceID string  `json:"workspace_id" binding:"required"`
+	ErrorRate   float64 `json:"error_rate"`
+	SampleError string  `json:"sample_error"`
+	ActiveTasks int     `json:"active_tasks"`
+	// IsBusy is the runtime's authoritative turn-in-flight flag (RFC #4402 B2),
+	// the self-healing successor to active_tasks. A POINTER so the three states
+	// stay distinct: absent/nil (older image that doesn't send it → the handler
+	// DERIVES is_busy from active_tasks>0, behavior-identical to B1) vs an
+	// explicit true/false the handler TRUSTS over the derive (COALESCE in the
+	// heartbeat UPDATE). Optional in the SDK workspace-comms contract
+	// (`is_busy,omitempty`), so an old runtime simply omits it. B1 captured the
+	// column by deriving in SQL with no new bind arg; B2 adds this parsed field
+	// + the bump that puts is_busy in molcontracts.HeartbeatRequest.
+	IsBusy        *bool  `json:"is_busy,omitempty"`
+	UptimeSeconds int    `json:"uptime_seconds"`
+	CurrentTask   string `json:"current_task"`
 	// MonthlySpend is cumulative USD spend for the current calendar month,
 	// denominated in cents (e.g. 1500 = $15.00). Zero means "no update" —
 	// the heartbeat handler never writes zero to avoid accidentally clearing
 	// a previously-reported spend value. Any non-zero value is clamped to
 	// [0, maxMonthlySpend] before the DB write. (#615)
 	MonthlySpend int64 `json:"monthly_spend"`
+	// ObservedGeneration is the last desired-state wake-lifecycle generation the
+	// runtime has reconciled (k8s-style observedGeneration). POINTER for tri-state:
+	// absent/nil = a runtime predating the versioned-heartbeat contract → no
+	// convergence claim (treated as 0). The heartbeat handler compares it to the
+	// workspace's desired_generation to detect whether the runtime has applied the
+	// current wake-lifecycle intent (wiring is a follow-up; parsed here so the
+	// SDK contract and this producer struct stay in lockstep). Optional in the
+	// SDK workspace-comms contract (observed_generation,omitempty).
+	ObservedGeneration *int64 `json:"observed_generation,omitempty"`
+	// SchemaVersion is the heartbeat-envelope version the runtime speaks, so core
+	// can detect a runtime on an older/newer wire contract. Optional
+	// (schema_version,omitempty); absent from runtimes predating the
+	// versioned-heartbeat contract.
+	SchemaVersion *string `json:"schema_version,omitempty"`
 	// RuntimeState is a self-reported runtime health flag separate from
 	// "is the heartbeat task firing at all". The heartbeat task lives in
 	// its own asyncio task and keeps pinging even when the agent runtime
@@ -139,7 +169,8 @@ type HeartbeatPayload struct {
 	// RuntimeMetadata is the adapter-declared capability map + per-
 	// capability override values. The Python runtime builds this from
 	// BaseAdapter.capabilities() + per-hook methods (e.g.
-	// idle_timeout_override()) — see workspace/heartbeat.py:
+	// idle_timeout_override()) — see molecule-ai-workspace-runtime/
+	// molecule_runtime/heartbeat.py:
 	// _runtime_metadata_payload. Optional: missing means "use platform
 	// defaults for everything", matching pre-2026-04 behavior.
 	//
@@ -175,6 +206,27 @@ type HeartbeatPayload struct {
 	// Runtime needs a loaded_mcp_tools producer to make the deployed path
 	// healthy (tracked separately — see PR #3101 PM flag).
 	LoadedMCPTools []string `json:"loaded_mcp_tools,omitempty"`
+
+	// MCPToolsReady is the EV2 POSITIVE readiness signal: the runtime's
+	// MCPReadinessProber sets it true on the FIRST successful `tools/list`
+	// (turn-independent, so it fires for codex/hermes without a synthetic
+	// turn). Core flips a concierge provisioning->online on the first beat
+	// carrying true — replacing the wall-clock fireConciergeWarmup nudge that
+	// used to coax the per-turn loaded_mcp_tools capture. The 180s grace is
+	// KEPT as the flap absorber.
+	//
+	// POINTER so the three states stay distinct (absent != false): nil =
+	// unknown / probe not yet succeeded (older image, or before first
+	// success), false = probed-not-ready, true = tools loaded. Optional in the
+	// SDK workspace-comms contract (`mcp_tools_ready,omitempty`); runtime#273
+	// landed the NEGATIVE half (launch_failure) — this is the positive half.
+	MCPToolsReady *bool `json:"mcp_tools_ready,omitempty"`
+
+	// FirstReadyAt is the RFC3339 timestamp of the first tools/list success
+	// that set MCPToolsReady=true. Observability/latency only
+	// (provisioning->ready wall-clock); the online-flip MUST NOT gate on it.
+	// Absent until the first probe success. (EV2)
+	FirstReadyAt string `json:"first_ready_at,omitempty"`
 }
 
 // RuntimeMetadata is the adapter-declared capability + override block
@@ -182,8 +234,8 @@ type HeartbeatPayload struct {
 // added with `omitempty` without breaking older runtime versions.
 //
 // See project memory `project_runtime_native_pluggable.md` for the
-// principle and workspace/adapter_base.py:RuntimeCapabilities for the
-// Python source of truth.
+// principle and molecule-ai-workspace-runtime/molecule_runtime/
+// adapter_base.py:RuntimeCapabilities for the Python source of truth.
 type RuntimeMetadata struct {
 	// Capabilities maps capability name → "adapter owns it natively".
 	// Keys (heartbeat, scheduler, session, status_mgmt, retry,
@@ -220,6 +272,14 @@ type WorkspaceComputeDisplay struct {
 	Width    int    `json:"width,omitempty"`
 	Height   int    `json:"height,omitempty"`
 	Protocol string `json:"protocol,omitempty"`
+	// IdleTimeoutSeconds is the scale-to-zero threshold for the desktop
+	// sidecar: after this many seconds with no agent control-server activity
+	// (and no human VNC input), the desktop is torn down while its profile
+	// volume persists. 0 = use the deployment default. Desired config, so it
+	// lives in the compute jsonb; the CHURNING runtime lifecycle state
+	// (running/stopped, last_agent_activity_at, lease) lives in a side table
+	// off the hot workspaces row. See the design RFC §10, §12.
+	IdleTimeoutSeconds int `json:"idle_timeout_seconds,omitempty"`
 }
 
 type WorkspaceCompute struct {
@@ -232,10 +292,10 @@ type WorkspaceCompute struct {
 	// disk (wiped each recreate — privacy); "" = auto (desktop-control persists,
 	// others follow the org flag). Forwarded verbatim to CP's data_persistence.
 	DataPersistence string `json:"data_persistence,omitempty"`
-	// Provider is the CLOUD/compute backend for this workspace box (multi-provider
-	// RFC, per-workspace): ""/"aws" = default EC2; "hetzner"/"gcp" route to the
-	// CP WorkspaceProvisioner. Distinct from the LLM/model provider. Forwarded to
-	// CP /cp/workspaces/provision `provider`.
+	// Provider is the cloud/compute backend for this workspace box. Empty means
+	// the deployment-selected default; recognized explicit values currently
+	// include "aws", "hetzner", and "gcp". Distinct from the LLM/model provider
+	// and forwarded to CP /cp/workspaces/provision as `provider`.
 	Provider string `json:"provider,omitempty"`
 }
 
@@ -266,11 +326,22 @@ type CreateWorkspacePayload struct {
 	// workspace secrets at creation time.  Stored encrypted (same path as
 	// POST /workspaces/:id/secrets).  Nil/empty map is a no-op.
 	Secrets map[string]string `json:"secrets"`
+	// Plugins is an optional list of git-native plugin SOURCES to DECLARE for
+	// this workspace at create (workspace_declared_plugins → the post-online
+	// reconcile installs them). It is the API-level equivalent of a template's
+	// `plugins:` block for callers that don't own a template — same DB channel
+	// (seedTemplatePlugins → recordDeclaredPlugin), same idempotent ON CONFLICT
+	// upsert, and the SAME privileged-plugin kind-gate (the org-management MCP
+	// can never be declared here on a non-platform workspace). Empty is a no-op.
+	// NOTE: declaring via this DB channel is the durable path; injecting
+	// MOLECULE_DECLARED_PLUGINS via `secrets` does NOT survive, because provision
+	// recomputes that env from the declared-set SSOT and overwrites it.
+	Plugins []string `json:"plugins,omitempty"`
 	// MaxConcurrentTasks caps parallel A2A + cron dispatch. 0 means use
 	// DefaultMaxConcurrentTasks. Leaders typically set 3.
 	MaxConcurrentTasks int `json:"max_concurrent_tasks"`
-	// Compute is the product-facing per-workspace EC2 shape/display
-	// contract. Phase 1 uses instance_type + volume.root_gb and persists
+	// Compute is the product-facing per-workspace host shape/display
+	// contract. It uses instance_type + volume.root_gb and persists
 	// display for future desktop-control workspaces.
 	Compute WorkspaceCompute `json:"compute,omitempty"`
 	Canvas  struct {

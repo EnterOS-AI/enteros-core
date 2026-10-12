@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -32,7 +33,8 @@ import (
 // last alive" (correct behavior; the workspace will get the same
 // timeouts when it comes back).
 //
-// See workspace/adapter_base.py:idle_timeout_override and project
+// See molecule-ai-workspace-runtime/molecule_runtime/adapter_base.py:
+// idle_timeout_override and project
 // memory `project_runtime_native_pluggable.md`.
 var runtimeOverrides runtimeOverrideCache
 
@@ -113,7 +115,8 @@ func (c *runtimeOverrideCache) IdleTimeout(workspaceID string) (time.Duration, b
 //
 // The wire-name keys (heartbeat, scheduler, session, status_mgmt, retry,
 // activity_decoration, channel_dispatch) match RuntimeCapabilities.to_dict()
-// in workspace/adapter_base.py — keep in sync there.
+// in molecule-ai-workspace-runtime/molecule_runtime/adapter_base.py — keep in
+// sync there.
 func (c *runtimeOverrideCache) SetCapabilities(workspaceID string, caps map[string]bool) {
 	if workspaceID == "" {
 		return
@@ -144,6 +147,31 @@ func (c *runtimeOverrideCache) HasCapability(workspaceID, name string) bool {
 	}
 	e := c.loadEntry(workspaceID)
 	return e.capabilities[name]
+}
+
+// WorkspacesWithCapability returns the IDs of every workspace whose most
+// recent heartbeat declared native ownership of the named capability, in
+// stable (sorted) order. Fan-out consumers (the webhook cron-poke and the
+// admin schedule-health aggregate) use this to discover volume-native
+// scheduler workspaces — the cache is the only registry of capability
+// declarations (there is no DB column). Same staleness contract as
+// HasCapability: entries persist until platform restart, then repopulate
+// within a heartbeat cycle.
+func (c *runtimeOverrideCache) WorkspacesWithCapability(name string) []string {
+	if name == "" {
+		return nil
+	}
+	var ids []string
+	c.m.Range(func(k, v any) bool {
+		id, okID := k.(string)
+		e, okE := v.(runtimeOverrideEntry)
+		if okID && okE && e.capabilities[name] {
+			ids = append(ids, id)
+		}
+		return true
+	})
+	sort.Strings(ids)
+	return ids
 }
 
 // Reset clears the entire cache. Test-only; production code never

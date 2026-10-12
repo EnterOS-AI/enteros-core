@@ -39,7 +39,7 @@ func TestHandleA2ADispatchError_NativeSession_NowEnqueues(t *testing.T) {
 	// queue-failure does NOT carry native_session=true marker (that field
 	// was removed alongside the gate).
 	mock.ExpectQuery(`INSERT INTO a2a_queue`).
-		WithArgs("ws-native", nil, PriorityTask, "{}", "message/send", nil).
+		WithArgs("ws-native", nil, PriorityTask, "{}", "message/send", nil, nil).
 		WillReturnError(errTestQueueUnavailable)
 
 	_, _, perr := handler.handleA2ADispatchError(
@@ -81,7 +81,7 @@ func TestHandleA2ADispatchError_NoNativeSession_StillEnqueues(t *testing.T) {
 	defer runtimeOverrides.Reset()
 
 	mock.ExpectQuery(`INSERT INTO a2a_queue`).
-		WithArgs("ws-platform-queue", nil, PriorityTask, "{}", "message/send", nil).
+		WithArgs("ws-platform-queue", nil, PriorityTask, "{}", "message/send", nil, nil).
 		WillReturnError(errTestQueueUnavailable)
 
 	_, _, perr := handler.handleA2ADispatchError(

@@ -2,7 +2,7 @@
 """Lint SECRET_PATTERNS drift across known consumers of molecule-core's canonical.
 
 The canonical SECRET_PATTERNS array in
-.github/workflows/secret-scan.yml is mirrored by every other side
+.gitea/workflows/secret-scan.yml is mirrored by every other side
 that scans for credentials: the workspace-runtime's bundled
 pre-commit hook, the molecule-controlplane inlined copy, etc. The
 mirror is enforced socially today — when someone adds a new pattern
@@ -12,11 +12,13 @@ sides are supposed to be updated in lockstep.
 This script automates the check. Diffs the canonical's pattern set
 against each known public consumer and exits non-zero on any
 mismatch. Wired into a daily cron + on-push gate via
-.github/workflows/secret-pattern-drift.yml.
+.gitea/workflows/secret-pattern-drift.yml. The script remains under
+`.github/scripts/` only as a stable checked-in path used by that Gitea workflow;
+it does not imply GitHub CI is active.
 
 Private-repo consumers (currently molecule-controlplane's inlined
-copy) are out of scope here because the molecule-core workflow's
-GITHUB_TOKEN can't read other private repos in the org. They're
+copy) are out of scope here because molecule-core's workflow token cannot read
+other private repos in the org. They're
 expected to self-monitor via their own copy of this script — not a
 hard barrier, just a future expansion.
 """

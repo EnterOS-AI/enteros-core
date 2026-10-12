@@ -1,5 +1,11 @@
 # SaaS prod migration — 2026-04-19
 
+> **Historical cutover record.** Railway, AWS, EC2, GHCR, Vercel, GitHub, and
+> manual-host instructions below describe the April 2026 platform only. They
+> were superseded by the June 2026 off-AWS, Gitea, domain-only, CI-on-merge
+> rebuild. Do not use this file as a current runbook; see
+> [Current Technical Reference](molecule-technical-doc.md).
+
 Promoted staging → main on both `Molecule-AI/molecule-controlplane` and `Molecule-AI/molecule-core`. This note captures the prod cutover deltas so ops can cross-check against the running system.
 
 ## What changed

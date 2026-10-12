@@ -1,8 +1,10 @@
-"""Tests for `.gitea/scripts/lint-workflow-yaml.py` — Gitea-1.22.6-hostile shape lint.
+"""Tests for `.gitea/scripts/lint-workflow-yaml.py` repository policy.
 
-Hard-gate (Tier-2) lint that catches workflow YAML shapes Gitea 1.22.6
-silently rejects, so they never reach `main`. The six anti-patterns are
-documented in saved memory; this test suite is the structural enforcement.
+Hard-gate (Tier-2) lint that prevents workflow shapes this repository has not
+adopted from reaching `main`. Some fixtures preserve exact Gitea 1.22.6
+incident shapes as legacy compatibility evidence; they are not claims about
+the live server's current capabilities. The six anti-patterns are documented
+in saved memory; this test suite is the structural enforcement.
 
 Per-rule positive (anti-pattern present -> exit 1) + negative (clean -> exit 0)
 cases, plus a multi-file collision case and an aggregation case.
@@ -14,7 +16,7 @@ Dependencies: stdlib + PyYAML. No network.
 
 Cross-links:
 - feedback_gitea_workflow_dispatch_inputs_unsupported (rule 1)
-- internal task #81 (rule 2 — workflow_run unsupported)
+- internal task #81 (rule 2 — workflow_run repository migration)
 - feedback_workflow_name_with_slash_breaks_parsing (rule 3, if filed)
 - feedback_gitea_cross_repo_uses_blocked (rule 5)
 - feedback_act_runner_github_server_url (rule 6)
@@ -55,7 +57,7 @@ def _write(workflow_dir: Path, name: str, content: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Rule 1 — workflow_dispatch.inputs (Gitea 1.22.6 parser rejects)
+# Rule 1 — legacy flat-dispatch repository policy
 # ---------------------------------------------------------------------------
 
 WD_INPUTS_BAD = """
@@ -103,7 +105,7 @@ def test_rule1_workflow_dispatch_inputs_passes_when_absent(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Rule 2 — workflow_run event (not supported on Gitea 1.22.6)
+# Rule 2 — workflow_run not yet adopted by this repository
 # ---------------------------------------------------------------------------
 
 WF_RUN_BAD = """
@@ -248,7 +250,7 @@ def test_rule4_name_collision_passes_when_names_distinct(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Rule 5 — cross-repo `uses: org/repo/...@ref` (blocked on 1.22.6)
+# Rule 5 — cross-repo `uses: org/repo/...@ref` (blocked by repository policy)
 # ---------------------------------------------------------------------------
 
 CROSS_REPO_BAD = """
@@ -649,61 +651,91 @@ def _classify_ci_change(*paths: str) -> dict[str, bool]:
     }
 
 
-def test_ci_change_detector_workflow_only_edits_do_not_trigger_heavy_surfaces():
+def test_ci_change_detector_workflow_edits_DO_trigger_heavy_surfaces():
+    """C2 regression gate — this test used to assert the BUG.
+
+    Its previous name was `..._workflow_only_edits_do_not_trigger_heavy_surfaces`
+    and it asserted all-False for a workflow-only edit. That is precisely the
+    vacuous-gate hole: the `ci` profile's allow-list matched nothing under
+    `.gitea/` (`^scripts/` is anchored and does NOT match `.gitea/scripts/`), so
+    a PR touching only the CI machinery reported platform=false canvas=false
+    python=false scripts=false, every heavy job took its no-op arm, and
+    `CI / all-required` reported SUCCESS having run ZERO tests. The one thing CI
+    could not see change was CI itself — and this test blessed it.
+
+    The profile is now a DENY-list, so the CI machinery is visible to CI.
+    """
     assert _classify_ci_change(".gitea/workflows/ci.yml") == {
-        "platform": False,
-        "canvas": False,
-        "python": False,
-        "scripts": False,
+        "platform": True,
+        "canvas": True,
+        "python": False,   # `python` is ^workspace/ and gates no job (see detect-changes.py)
+        "scripts": True,
     }
     assert _classify_ci_change(".github/workflows/ci.yml") == {
-        "platform": False,
-        "canvas": False,
-        "python": False,
-        "scripts": False,
-    }
-
-
-def test_ci_change_detector_narrow_surface_edits_only_trigger_their_surface():
-    assert _classify_ci_change("workspace-server/internal/handlers/foo.go") == {
         "platform": True,
-        "canvas": False,
-        "python": False,
-        "scripts": False,
-    }
-    assert _classify_ci_change("canvas/app/page.tsx") == {
-        "platform": False,
         "canvas": True,
-        "python": False,
-        "scripts": False,
-    }
-    assert _classify_ci_change("workspace/a2a_mcp_server.py") == {
-        "platform": False,
-        "canvas": False,
-        "python": True,
-        "scripts": False,
-    }
-    assert _classify_ci_change("tests/e2e/test_model_slug.sh") == {
-        "platform": False,
-        "canvas": False,
         "python": False,
         "scripts": True,
     }
 
 
-def test_ci_change_detector_docs_and_meta_scripts_do_not_trigger_surfaces():
+def test_ci_change_detector_honours_each_lane_s_inert_set():
+    """A deny-list must still SKIP what is provably inert, or it is just
+    run-everything. Each claim below is a promise about what the job reads.
+    """
+    # Go lane: canvas/ is NOT inert for it — external_connection_test.go reads
+    # ../../../canvas/src/components/__tests__/__fixtures__/*.golden.json, so a
+    # canvas fixture edit can (and must) go red in `go test`.
+    assert _classify_ci_change("canvas/app/page.tsx")["platform"] is True
+
+    # canvas lane: its job is `npm ci && npm run build && vitest run` inside
+    # canvas/, and no canvas source reads outside canvas/ — so a Go-only change
+    # must NOT pay for it.
+    assert _classify_ci_change("workspace-server/internal/handlers/foo.go")["canvas"] is False
+
+    # shellcheck lane: reads no Go and no TS.
+    assert _classify_ci_change("workspace-server/internal/handlers/foo.go")["scripts"] is False
+    assert _classify_ci_change("canvas/app/page.tsx")["scripts"] is False
+
+    # ...but it does own the e2e/ops shell surface.
+    assert _classify_ci_change("tests/e2e/test_model_slug.sh")["scripts"] is True
+
+    # `python` stays the literal "the retired workspace/ tree came back" signal.
+    assert _classify_ci_change("workspace/a2a_mcp_server.py")["python"] is True
+    assert _classify_ci_change("workspace-server/internal/handlers/foo.go")["python"] is False
+
+
+def test_ci_change_detector_skips_prose_but_NOT_meta_scripts():
+    """Docs-only stays free; the CI machinery does not.
+
+    This test also used to assert the C2 bug — it required
+    `.gitea/scripts/lint-workflow-yaml.py` to trigger NOTHING. A change to the
+    linters, the merge queue, the required-contexts list or the change detector
+    itself is exactly the change most able to break CI, so it must run CI.
+    """
     assert _classify_ci_change("README.md") == {
         "platform": False,
         "canvas": False,
         "python": False,
         "scripts": False,
     }
-    assert _classify_ci_change(".gitea/scripts/lint-workflow-yaml.py") == {
+    assert _classify_ci_change("docs/architecture/adr-004.md") == {
         "platform": False,
         "canvas": False,
         "python": False,
         "scripts": False,
     }
+
+    # The CI machinery IS visible to CI now (C2).
+    for meta in (
+        ".gitea/scripts/lint-workflow-yaml.py",
+        ".gitea/scripts/detect-changes.py",
+        ".gitea/scripts/gitea-merge-queue.py",
+        ".gitea/required-contexts.txt",
+    ):
+        out = _classify_ci_change(meta)
+        assert out["platform"] is True, f"{meta} still invisible to the Go lane: {out}"
+        assert out["scripts"] is True, f"{meta} still invisible to the shell lane: {out}"
 
 
 def test_staging_tenant_cd_runtime_expectation_uses_controlplane_infisical_ssot():
@@ -764,6 +796,22 @@ def test_ci_canvas_nextjs_steps_are_path_scoped_on_all_events():
         assert "github.event_name != 'pull_request'" not in expr
 
 
+def test_ci_canvas_rejects_high_production_dependency_advisories():
+    doc = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
+    steps = doc["jobs"]["canvas-build"]["steps"]
+    commands = [step.get("run", "") for step in steps]
+
+    install = "npm ci --include=optional --prefer-offline"
+    audit = "npm audit --omit=dev --audit-level=high"
+    build = "npm run build"
+    assert commands.count(audit) == 1
+    assert commands.index(install) < commands.index(audit) < commands.index(build)
+
+    audit_step = steps[commands.index(audit)]
+    assert "needs.changes.outputs.canvas == 'true'" in audit_step.get("if", "")
+    assert audit_step.get("continue-on-error") is not True
+
+
 def test_ci_shellcheck_steps_are_path_scoped_on_all_events():
     doc = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
     shellcheck = doc["jobs"]["shellcheck"]
@@ -779,3 +827,90 @@ def test_ci_shellcheck_steps_are_path_scoped_on_all_events():
         expr = step.get("if", "")
         assert "needs.changes.outputs.scripts == 'true'" in expr
         assert "github.event_name != 'pull_request'" not in expr
+
+
+# ---------------------------------------------------------------------------
+# Rule 11 — duplicate mapping keys (Gitea refuses to schedule; safe_load does not)
+# ---------------------------------------------------------------------------
+DUP_ENV_BAD = textwrap.dedent(
+    """
+    name: dup env probe
+    on:
+      pull_request:
+        branches: [main]
+    jobs:
+      probe:
+        runs-on: ubuntu-latest
+        steps:
+          - name: two env blocks
+            env:
+              FIRST: a
+            env:
+              SECOND: b
+            run: echo hi
+    """
+).lstrip()
+
+DUP_ENV_OK = textwrap.dedent(
+    """
+    name: dup env probe
+    on:
+      pull_request:
+        branches: [main]
+    jobs:
+      probe:
+        runs-on: ubuntu-latest
+        steps:
+          - name: one env block
+            env:
+              FIRST: a
+              SECOND: b
+            run: echo hi
+    """
+).lstrip()
+
+
+def test_rule11_duplicate_key_is_fatal(tmp_path):
+    """The exact shape observed on local-provision-e2e.yml 2026-08-10: a second
+    `env:` on a step that already had one. Gitea would not schedule the file."""
+    _write(tmp_path, "dup.yml", DUP_ENV_BAD)
+    r = _run_lint(tmp_path)
+    assert r.returncode == 1, r.stdout
+    assert "duplicate mapping key 'env'" in r.stdout
+    # The message must point at a line so the fix is findable.
+    assert re.search(r"line=\d+", r.stdout), r.stdout
+
+
+def test_rule11_single_env_block_passes(tmp_path):
+    _write(tmp_path, "ok.yml", DUP_ENV_OK)
+    r = _run_lint(tmp_path)
+    assert r.returncode == 0, r.stdout
+
+
+def test_rule11_precondition_safe_load_accepts_the_duplicate():
+    """Pin WHY this rule needs its own loader.
+
+    If `yaml.safe_load` ever started rejecting duplicates, rule 11 would be
+    redundant. It does not: it accepts the file and keeps only the LAST
+    duplicate, silently discarding the first block's contents. That asymmetry
+    against Gitea's parser is the entire defect class.
+    """
+    doc = yaml.safe_load(DUP_ENV_BAD)
+    env = doc["jobs"]["probe"]["steps"][0]["env"]
+    assert env == {"SECOND": "b"}, env
+    assert "FIRST" not in env
+
+
+def test_rule11_scans_every_live_workflow_and_reports_the_count():
+    """Guard the count, so a future shrink in coverage is visible as a number
+    rather than as a quietly smaller scan."""
+    r = _run_lint(Path(".gitea/workflows"))
+    assert r.returncode == 0, r.stdout
+    m = re.search(r"(\d+) workflow file\(s\) checked", r.stdout)
+    assert m, r.stdout
+    n = int(m.group(1))
+    live = len(list(Path(".gitea/workflows").glob("*.yml"))) + len(
+        list(Path(".gitea/workflows").glob("*.yaml"))
+    )
+    assert n == live, f"lint scanned {n} but {live} workflow files exist"
+    assert n > 0, "a scan of zero files reports success identically to a full one"

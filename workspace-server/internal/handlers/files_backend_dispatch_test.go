@@ -12,9 +12,9 @@ package handlers
 // container-name instance_id falls through to the docker-exec / host path.
 
 import (
-	"errors"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"

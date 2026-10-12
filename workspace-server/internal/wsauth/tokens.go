@@ -264,8 +264,9 @@ func BearerTokenFromHeader(h string) string {
 }
 
 // HasAnyLiveTokenGlobal reports whether ANY workspace has at least one live
-// (non-revoked) token on file. Used by AdminAuth to decide whether to enforce
-// auth on global/admin routes — fresh installs with no tokens fail open.
+// (non-revoked) token on file. AdminAuth retains this query as a datastore
+// availability probe, but its result never opens a bearer-less route: fresh
+// installs fail closed and must bootstrap with ADMIN_TOKEN.
 func HasAnyLiveTokenGlobal(ctx context.Context, db *sql.DB) (bool, error) {
 	var n int
 	err := db.QueryRowContext(ctx, `

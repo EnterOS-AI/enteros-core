@@ -38,7 +38,7 @@ import (
 // (main.go) gets the same pluginResolver instance so it can share scheme
 // enumeration if a deployment registers extra schemes externally. A nil
 // pluginResolver is harmless: plgh still works with its built-in defaults.
-func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, hostStateDir string, bootTokens *provisioner.BootConfigTokenStore, wh *handlers.WorkspaceHandler, channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) *gin.Engine {
+func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, hostStateDir string, bootTokens *provisioner.BootConfigTokenStore, wh *handlers.WorkspaceHandler, greeter func(workspaceID string, toolCount int), channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) (*gin.Engine, *handlers.AdminPluginDriftHandler) {
 	r := gin.Default()
 
 	// Issue #179 — trust no reverse-proxy headers. Without this call Gin's
@@ -77,8 +77,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	r.Use(metrics.Middleware())
 
 	// Tenant guard — the public repo's only SaaS hook. When MOLECULE_ORG_ID is
-	// set (only by the private molecule-controlplane provisioner on tenant Fly
-	// Machines), rejects requests whose X-Molecule-Org-Id header doesn't match.
+	// set by the control plane on a managed tenant, rejects requests whose
+	// X-Molecule-Org-Id header doesn't match.
 	// Unset (self-hosted / dev / CI) → no-op. Registered after metrics so
 	// rejected requests still land on the 4xx counter.
 	r.Use(middleware.TenantGuard())
@@ -160,6 +160,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		}
 		c.JSON(200, gin.H{"subsystems": out})
 	})
+	registerNativeChannelCutoverInventoryRoute(r, db.DB)
 
 	// Prometheus metrics — exempt from rate limiter via separate registration
 	// (registered before Use(limiter) takes effect on this specific route — the
@@ -172,7 +173,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	r.GET("/workspaces/:id", wh.Get)
 
 	// C1 + C20: workspace list and life-cycle mutations gated behind AdminAuth.
-	// Fail-open when no tokens exist anywhere (fresh install / pre-Phase-30).
+	// Authentication fails closed in every environment, including fresh installs.
 	// Blocks:
 	//   C1   — unauthenticated GET /workspaces (workspace topology exposure)
 	//   C20  — unauthenticated DELETE /workspaces/:id (mass-deletion attack)
@@ -186,7 +187,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// broadcast_enabled or talk_to_user_enabled.
 		wsAdmin.PATCH("/workspaces/:id/abilities", handlers.PatchAbilities)
 		// Out-of-band bootstrap signal: CP's watcher POSTs here when it
-		// detects "RUNTIME CRASHED" in a workspace EC2 console output,
+		// detects "RUNTIME CRASHED" in a workspace provider boot log,
 		// so the canvas flips to failed in seconds instead of waiting
 		// for the 10-minute provision-timeout sweeper.
 		wsAdmin.POST("/admin/workspaces/:id/bootstrap-failed", wh.BootstrapFailed)
@@ -200,8 +201,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAdmin.POST("/admin/workspaces/:id/revoke-auth-tokens", wh.RevokeAuthTokens)
 		// Repoint a workspace's instance_id + compute.provider at the box on its
 		// NEW cloud after a cross-cloud migration cutover (#806). Without this the
-		// tenant's CP-instance reconciler keeps polling the stale (terminated) AWS
-		// instance_id, sees "offline", and self-heals by re-provisioning on AWS —
+		// tenant's CP-instance reconciler keeps polling the stale source-provider
+		// instance_id, sees "offline", and self-heals on the old provider —
 		// fighting the migration into a split-brain. Pure record repoint (no
 		// deprovision); the CP migrator calls it once the cutover is verified.
 		wsAdmin.POST("/admin/workspaces/:id/set-compute-instance", wh.SetComputeInstance)
@@ -224,7 +225,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAdmin.GET("/admin/llm/offered-models", handlers.ListOfferedModels)
 		// Proxy to CP's serial-console endpoint so the canvas's "View
 		// Logs" button can render the actual boot trace without handing
-		// the tenant AWS credentials. Admin-gated because console output
+		// the tenant provider credentials. Admin-gated because boot output
 		// can include user-data snippets we treat as semi-sensitive.
 		wsAdmin.GET("/workspaces/:id/console", wh.Console)
 		// Display sessions will eventually return short-lived proxied DCV
@@ -248,7 +249,10 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAdmin.POST("/admin/memories/import", adminMemH.Import)
 	}
 
-	// A2A proxy — registered outside the auth group; already enforces CanCommunicate access control.
+	// A2A proxy — registered outside the shared auth group because workspace and
+	// privileged Canvas callers use different credential contracts. ProxyA2A
+	// authenticates the public request itself, binds workspace bearer ownership,
+	// then applies CanCommunicate to workspace-to-workspace calls.
 	r.POST("/workspaces/:id/a2a", wh.ProxyA2A)
 
 	// core#3319: A2A inbound endpoint for external agents. Authenticates with the
@@ -263,9 +267,9 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	r.GET("/workspaces/:id/a2a/queue/:queue_id", wh.GetA2AQueueStatus)
 
 	// Auth-gated workspace sub-routes — ALL /workspaces/:id/* paths except /a2a.
-	// Fix A (Cycle 5): single WorkspaceAuth middleware blocks C2-C5, C7-C9, C12, C13
-	// by requiring a valid bearer token for any workspace that has one on file.
-	// Legacy workspaces (no token) are grandfathered to allow rolling upgrades.
+	// Fix A (Cycle 5): single fail-closed WorkspaceAuth middleware blocks
+	// C2-C5, C7-C9, C12, and C13 unless the caller presents a valid scoped
+	// credential or verified control-plane session.
 	wsAuth := r.Group("/workspaces/:id", middleware.WorkspaceAuth(db.DB))
 	{
 		// #680: PATCH /workspaces/:id moved under WorkspaceAuth (#680 IDOR fix).
@@ -290,6 +294,15 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// to 'hibernated'. The workspace auto-wakes on the next A2A message.
 		wsAuth.POST("/hibernate", wh.Hibernate)
 
+		// Test-only busy-inject (task #92). Compiled ONLY under the
+		// e2e_busy_inject build tag — a no-op stub in every shipped image
+		// (testbusy_disabled.go), so no route is registered and the path 404s in
+		// production. The tag-built throwaway tenant image the ephemeral CP gate
+		// uses gets POST /workspaces/:id/test-busy, which pins active_tasks so
+		// 10b force-hibernate deterministically hits a BUSY workspace without a
+		// real LLM turn. WorkspaceAuth (this group) is the request-time guard.
+		handlers.RegisterTestBusyRoutes(wsAuth)
+
 		// Broadcast — send a message to all non-removed workspaces in the org.
 		// Requires broadcast_enabled=true on the source workspace (checked
 		// inside the handler). WorkspaceAuth on wsAuth proves token ownership.
@@ -297,8 +310,9 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.POST("/broadcast", broadcastH.Broadcast)
 
 		// External-workspace credential lifecycle (issue #319 follow-up to
-		// the Create flow). Both endpoints reject runtime ≠ external with
-		// 400 — see external_rotate.go for the rationale.
+		// the Create flow). Both endpoints accept external-like BYO-compute
+		// runtimes and reject container-backed runtimes with 400 — see
+		// external_rotate.go for the rationale.
 		//
 		//   POST .../external/rotate     — mint fresh token, revoke prior,
 		//                                  return ExternalConnectionInfo
@@ -448,11 +462,25 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// #1870 Phase 1: wire the queue drain hook so Heartbeat can dispatch
 	// a queued A2A request when the workspace reports spare capacity.
 	rh.SetQueueDrainFunc(wh.DrainQueueForWorkspace)
-	// core#3082 keystone: wire the concierge warmup A2A sender so a freshly-
-	// online kind=platform concierge gets one benign turn that triggers the
-	// per-turn loaded_mcp_tools capture (holds it online without a user turn).
-	// Same exported-method late-wiring pattern as SetQueueDrainFunc above.
-	rh.SetWarmupSendFunc(wh.SendConciergeWarmupA2A)
+	// EV2: the concierge warmup A2A sender wiring was REMOVED — fireConciergeWarmup
+	// is retired. The provisioning->online flip is now driven by the runtime's
+	// turn-independent mcp_tools_ready heartbeat event, so no synthetic warmup turn
+	// (and thus no WorkspaceHandler warmup sender) is needed.
+	//
+	// First-boot greeting: on the provisioning→online transition (verified
+	// concierge flip / ordinary workspace's first register), drive a real
+	// agent turn so the agent greets the user in its own persona, delivered
+	// through the AgentMessageWriter SSOT (first_boot_greeting.go). A fresh
+	// onboarding lands in a chat where the agent has already spoken. The greeter
+	// is constructed in main.go (so the SAME instance also backs the wake re-drive
+	// re-emitter, wired there before the WakeRedriveSweeper starts) and handed in.
+	rh.SetFirstBootGreeter(greeter)
+	// Versioned-heartbeat GENERATION LOOP (PR-C): wire the convergence settle side
+	// so a beat reporting observed_generation >= desired_generation settles the
+	// converged wake intents. Same late-wiring nil-safe pattern as the greeter.
+	// (The RE-DRIVE side of the loop, PR-F, runs off a fleet-wide
+	// WakeRedriveSweeper wired in main.go — NOT the heartbeat path.)
+	rh.SetWakeSettler(wh.MarkWakeSettled)
 	r.POST("/registry/register", rh.Register)
 	r.POST("/registry/heartbeat", rh.Heartbeat)
 	r.POST("/registry/update-card", rh.UpdateCard)
@@ -541,6 +569,18 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		beh := handlers.NewBootEventHandler(broadcaster)
 		wsAuth.POST("/boot-event", beh.Report)
 
+		// Plugin boot-install report — SDK contract contracts/plugin-install-report.
+		// DELIBERATELY UNLIKE the boot-step feed directly above it on the two axes
+		// that made a fleet-wide failure unobservable (#4953): every workspace
+		// reports regardless of kind (boot_step_emit is concierge-gated "so an
+		// ordinary, non-concierge tenant boot doesn't spam the endpoint"), and the
+		// report is PERSISTED (a BOOT_STEP is BroadcastOnly — presentation only, so
+		// it answers nothing for an operator asking an hour later). One POST per
+		// boot, not per boot phase.
+		pirh := handlers.NewPluginInstallReportHandler()
+		wsAuth.POST("/plugin-install-report", pirh.Report)
+		wsAuth.GET("/plugin-install-report", pirh.Get)
+
 		// Config
 		cfgh := handlers.NewConfigHandler()
 		wsAuth.GET("/config", cfgh.Get)
@@ -548,16 +588,21 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 		// Schedules (cron tasks)
 		schedh := handlers.NewScheduleHandler()
+		// P4b (core#4435): wire the post-online runtime-schedule inheritance restore
+		// into the registry heartbeat handler, alongside the plugin reconcile
+		// (rh.SetReconcileFunc below). Wired here — not next to SetReconcileFunc —
+		// because schedh is scoped to this block; rh (declared above) is in scope.
+		rh.SetRestoreSchedulesFunc(schedh.RestoreInheritedRuntimeSchedules)
 		wsAuth.GET("/schedules", schedh.List)
 		wsAuth.POST("/schedules", schedh.Create)
 		wsAuth.PATCH("/schedules/:scheduleId", schedh.Update)
 		wsAuth.DELETE("/schedules/:scheduleId", schedh.Delete)
 		wsAuth.POST("/schedules/:scheduleId/run", schedh.RunNow)
 		wsAuth.GET("/schedules/:scheduleId/history", schedh.History)
-		// Schedule health — open to CanCommunicate peers (no workspace bearer token
-		// required) so peer agents can detect silent cron failures without admin auth.
-		// Auth is enforced inside the handler via X-Workspace-ID + CanCommunicate
-		// (mirrors the /workspaces/:id/a2a pattern). Issue #249.
+		// Schedule health — available to authenticated CanCommunicate peers so
+		// agents can detect silent cron failures without admin auth. The handler
+		// requires an explicit X-Workspace-ID plus that workspace's source-bound
+		// bearer; verified human credentials bypass hierarchy. Issue #249.
 		r.GET("/workspaces/:id/schedules/health", schedh.Health)
 
 		// Budget — per-workspace spend ceiling and current usage (#541).
@@ -604,6 +649,11 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 		// Secrets (auto-restart workspace after secret change)
 		sech := handlers.NewSecretsHandler(wh.RestartByID)
+		// Idle-digest mail counts (task #219 phase-2, D5): counts + overdue
+		// list over the platform ledgers; detail stays behind the
+		// communication MCP tools. Read-only, workspace-scoped.
+		mailh := handlers.NewMailSummaryHandler()
+		wsAuth.GET("/mail/summary", mailh.Summary)
 		wsAuth.GET("/secrets", sech.List)
 		// Phase 30.2 — decrypted values pull, token-gated. Canvas uses List
 		// (keys + metadata only); remote agents use Values to bootstrap env.
@@ -648,7 +698,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		//   C2: MCPRateLimiter caps tool calls at 120/min/token so a long-lived
 		//       opencode session cannot saturate the platform.
 		//   C3: commit_memory/recall_memory with scope=GLOBAL → permission error;
-		//       send_message_to_user excluded unless MOLECULE_MCP_ALLOW_SEND_MESSAGE=true.
+		//       send_message_to_user is included by default and excluded only where
+		//       the MOLECULE_MCP_ALLOW_SEND_MESSAGE kill-switch is set falsy.
 		mcpH := handlers.NewMCPHandler(db.DB, broadcaster, pushNotifier)
 		if memBundle != nil {
 			mcpH.WithMemoryV2(memBundle.Plugin, memBundle.Resolver)
@@ -658,9 +709,21 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.POST("/mcp", mcpRl.Middleware(), mcpH.Call)
 	}
 
+	// Desktop computer-use routes (design decision B): the authenticated seam
+	// the IN-CONTAINER agent desktop tool (a2a_tools_desktop.py, later a native
+	// kind:mcp plugin) calls — the platform layer is a gateway, NOT an MCP tool,
+	// so the agent surface stays plugin-extractable. screenshot = eyes (not
+	// lock-gated, §8); input = hands (gateway is fail-closed on the control
+	// lock -> 409 when a human holds control). wsAuth gates on the workspace
+	// bearer, same as the MCP endpoint.
+	wsAuth.GET("/desktop/screenshot", wh.DesktopScreenshot)
+	wsAuth.POST("/desktop/input", wh.DesktopInput)
+	wsAuth.POST("/desktop/navigate", wh.DesktopNavigate)
+	wsAuth.GET("/desktop/control", wh.DesktopControlStatus)
+
 	// Global secrets — /settings/secrets is the canonical path; /admin/secrets kept for backward compat.
-	// Fix (Cycle 7): protected by AdminAuth — any valid workspace bearer token grants access.
-	// Fail-open when no tokens exist (fresh install / pre-Phase-30 upgrade).
+	// Protected by strict AdminAuth: a missing or invalid bearer is rejected in
+	// every environment, including fresh installs, and datastore errors fail closed.
 	{
 		adminAuth := r.Group("", middleware.AdminAuth(db.DB))
 		sechGlobal := handlers.NewSecretsHandler(wh.RestartByID)
@@ -692,13 +755,11 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// Admin — cross-workspace schedule health monitoring (issue #618).
 	// Lets cron-audit agents and operators detect silent schedule failures
 	// across all workspaces without holding individual workspace bearer tokens.
-	// AdminAuth mirrors the /admin/liveness gate — fail-open on fresh install,
-	// strict bearer-only once any token exists.
+	// AdminAuth mirrors the /admin/liveness gate: strict bearer-only and
+	// fail-closed in every environment, including fresh installs.
 	{
 		asHealth := handlers.NewAdminSchedulesHealthHandler()
 		r.GET("/admin/schedules/health", middleware.AdminAuth(db.DB), asHealth.Health)
-		r.GET("/admin/schedules/orphans", middleware.AdminAuth(db.DB), asHealth.Orphans)
-		r.POST("/admin/schedules/reap-orphans", middleware.AdminAuth(db.DB), asHealth.ReapOrphans)
 	}
 
 	// Admin — stale a2a_queue cleanup (issue #1947). Marks queued items older
@@ -719,10 +780,24 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		r.GET("/admin/delegations/stats", middleware.AdminAuth(db.DB), adH.Stats)
 	}
 
-	// Admin — workspace template image refresh. Pulls latest images from GHCR
-	// and recreates running ws-* containers so they adopt the new image.
-	// Final step of the runtime CD chain — see docs/workspace-runtime-package.md.
-	// Operators (or post-publish automation) hit this after a runtime release.
+	// Admin — the FLEET read over plugin-install reports (#4981 §1). The
+	// migration's `workspace_plugin_install_reports_not_live` partial index was
+	// created to answer "which workspaces booted with no live plugins" and no
+	// handler issued that query, so the question still needed direct DB access.
+	//
+	// AdminAuth, NOT the wsAuth group the POST/GET pair live in: those are bound
+	// to :id by WorkspaceAuth so a workspace can only see its own report, and this
+	// route returns rows for workspaces the caller never names. Same gate as the
+	// sibling operator reads above.
+	{
+		apirH := handlers.NewAdminPluginInstallReportsHandler(db.DB)
+		r.GET("/admin/plugin-install-reports", middleware.AdminAuth(db.DB), apirH.List)
+	}
+
+	// Admin — explicit registry-backed, single-host workspace image maintenance.
+	// Pulls from the configured registry and can remove matching ws-* containers
+	// so the local provisioner recreates them later. This is not the managed
+	// runtime rollout path; control-plane image pins own managed launches.
 	// Reuses the provisioner's Docker client; no-op when prov is nil
 	// (test / non-Docker deploy).
 	if prov != nil {
@@ -743,18 +818,19 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// containers still run on a docker daemon this process can reach, so wire
 	// a client from that daemon when it answers a Ping. Without this the
 	// plugins handler's docker client was nil, findRunningContainer returned
-	// ErrNoBackend, and delivery fell back to the retired AWS EIC path →
+	// ErrNoBackend, and delivery fell back to the legacy AWS EIC path →
 	// 90-120s timeout → 502 on every local-docker tenant (blocked the
-	// Lark-channel live test and all plugin installs). A genuine cloud tenant
-	// has no local daemon → Ping fails → dockerCli stays nil → the AWS EIC
-	// path is unchanged for real "i-<hex>" instance ids. See
+	// Lark-channel live test and all plugin installs). A remote AWS tenant has no
+	// local daemon → Ping fails → dockerCli stays nil → the EIC fallback remains
+	// available only for real "i-<hex>" instance ids. Other providers require
+	// their provider-native delivery path; an opaque instance_id must not imply AWS. See
 	// provisioner.NewDockerClientIfReachable + files_backend_dispatch.go.
 	var dockerCli *client.Client
 	if prov != nil {
 		dockerCli = prov.DockerClient()
 	} else if cli, ok := provisioner.NewDockerClientIfReachable(context.Background()); ok {
 		dockerCli = cli
-		log.Printf("router: CP-provisioner mode with a reachable local docker daemon — wired docker client for local-docker plugin/template/terminal delivery (no AWS EIC)")
+		log.Printf("router: CP-provisioner mode with a reachable local docker daemon — wired docker client for local plugin/template/terminal delivery")
 	}
 
 	// Plugins — plgh must be initialized before the drift handler that uses it.
@@ -773,10 +849,10 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		).Scan(&runtime)
 		return runtime, err
 	}
-	// Instance-id lookup powers the SaaS dispatch in install/uninstall:
-	// when a workspace is on the EC2-per-workspace backend (instance_id
-	// non-NULL) and there's no local Docker container to exec into, the
-	// pipeline pushes the staged plugin tarball to that EC2 over EIC SSH.
+	// Instance-id lookup supplies the opaque provider identifier to the remote
+	// install/uninstall dispatcher. The current legacy EIC fallback accepts only
+	// AWS-shaped i-* identifiers; it must not infer AWS from an arbitrary non-null
+	// instance_id. Provider-native remote delivery is a separate backend concern.
 	// Empty result means the workspace lives on the local-Docker backend
 	// (or hasn't been provisioned yet) and the handler falls back to its
 	// original Docker path. Same pattern templates.go and terminal.go use.
@@ -819,8 +895,14 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 	// Admin — plugin version-subscription drift queue (core#123).
 	// List pending drift entries and apply approved updates.
+	//
+	// driftH is hoisted out of this block and RETURNED so cmd/server can run
+	// the deterministic queue drainer against the same handler
+	// (handlers.StartPluginDriftApplier, core#4977). Setup builds the handler
+	// graph; main owns goroutine lifecycles — the same split the drift
+	// sweeper already uses.
+	driftH := handlers.NewAdminPluginDriftHandler(plgh)
 	{
-		driftH := handlers.NewAdminPluginDriftHandler(plgh)
 		adminAuth := r.Group("", middleware.AdminAuth(db.DB))
 		adminAuth.GET("/admin/plugin-updates-pending", driftH.ListPending)
 		adminAuth.POST("/admin/plugin-updates/:id/apply", driftH.Apply)
@@ -889,6 +971,19 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	wsAuth.PUT("/files/*path", tmplh.WriteFile)
 	wsAuth.DELETE("/files/*path", tmplh.DeleteFile)
 
+	// Per-install plugin settings (layer 6). NOT served through /files/*path on
+	// purpose: that route's side effect is a workspace RESTART, while a settings
+	// edit wants the file changed and the daemon reloaded — no restart, no lost
+	// session. GET returns every key with the layer that supplied it; PATCH is
+	// compare-and-set on overrides_version so a concurrent edit is refused with
+	// 409 rather than silently lost.
+	wsAuth.GET("/plugin-settings/:plugin", tmplh.GetPluginSettings)
+	wsAuth.PATCH("/plugin-settings/:plugin", tmplh.PatchPluginSettings)
+	// The plugin's OWN declaration, read live off the workspace, so the tab can
+	// render a form for a plugin the frontend has never seen. ?format=example
+	// returns the generated .example as text.
+	wsAuth.GET("/plugin-settings/:plugin/declaration", tmplh.GetPluginDeclaration)
+
 	// CORE-served boot-config fetch (the FINAL, platform-agnostic config path —
 	// no R2, no CP). Registered OUTSIDE the WorkspaceAuth group: the runtime holds
 	// a one-time BOOT token (minted by CPProvisioner into MOLECULE_CONFIG_BOOT_TOKEN,
@@ -940,7 +1035,15 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 	// Org Templates
 	orgDir := findOrgDir(configsDir)
-	orgh := handlers.NewOrgHandler(wh, broadcaster, prov, channelMgr, configsDir, orgDir)
+	// M6 / FIX 0: same templateCacheDir the TemplatesHandler above uses, so an
+	// org node's `template:` resolves cache-first exactly like the
+	// workspace-name path already does. One cache, one SSOT.
+	orgh := handlers.NewOrgHandler(wh, broadcaster, prov, channelMgr, configsDir, orgDir).
+		WithTemplateCacheDir(templateCacheDir).
+		// Lets /org/import RE-DELIVER declared plugins[].config to workspaces
+		// that already exist. tmplh already carries the docker client the
+		// delivery primitive needs; org import depends only on the capability.
+		WithPluginSettingsDeliverer(tmplh)
 	// #686: GET /org/templates exposes the org template catalogue (names, roles,
 	// configured system prompts). AdminAuth-gate to match /org/import.
 	r.GET("/org/templates", middleware.AdminAuth(db.DB), orgh.ListTemplates)
@@ -1001,9 +1104,9 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	r.POST("/channels/discover", middleware.AdminAuth(db.DB), chh.Discover)
 	r.POST("/webhooks/:type", chh.Webhook)
 
-	// Audit — EU AI Act Annex III compliance endpoint (#594).
-	// Returns append-only HMAC-chained agent event log with optional inline
-	// chain verification when AUDIT_LEDGER_SALT is configured.
+	// Audit ledger read surface (#594). Returns stored HMAC-linked agent events
+	// with optional inline chain verification when AUDIT_LEDGER_SALT is set.
+	// Event production is a separate runtime responsibility.
 	audh := handlers.NewAuditHandler()
 	wsAuth.GET("/audit", audh.Query)
 
@@ -1045,7 +1148,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		r.NoRoute(canvasProxy)
 	}
 
-	return r
+	return r, driftH
 }
 
 func findPluginsDir(configsDir string) string {

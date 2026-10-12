@@ -42,7 +42,7 @@ func Test_loadWorkspaceEnv_workspaceEnvMerges(t *testing.T) {
 	vars := loadWorkspaceEnv(org, "myworkspace")
 	assert.Equal(t, "wsval", vars["WS_VAR"])
 	assert.Equal(t, "overridden", vars["SHARED"]) // workspace overrides org
-	assert.Equal(t, "orgonly", vars["ORG_ONLY"])   // org vars preserved
+	assert.Equal(t, "orgonly", vars["ORG_ONLY"])  // org vars preserved
 }
 
 func Test_loadWorkspaceEnv_emptyFilesDir(t *testing.T) {

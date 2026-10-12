@@ -3,16 +3,39 @@ name: E2E Ephemeral CP Happy Path
 # RFC "one pre-merge ephemeral gate" §04 — the one-scenario PROOF (GATING).
 #
 # Runs the CORE happy-path (test_staging_full_saas.sh) against a THROWAWAY CP it
-# spins up itself, with THIS PR's tenant image substituted in and the RELEASED
-# controlplane as the baseline — NO shared staging, NO post-merge dependency.
-# This validates the SDK-owned-happy-path model (the happy-path E2E is a
-# cross-boundary contract both repos run against an ephemeral CP).
+# spins up itself, with THIS PR's tenant image substituted in and a PINNED
+# controlplane commit as the baseline — NO shared staging, NO post-merge
+# dependency. This validates the intended cross-boundary happy-path contract;
+# moving that contract into the SDK so both repos consume one implementation is
+# still tracked separately (task #74).
 #
-# GATING as of 2026-07-13: the mc#4081 soak is complete (12 consecutive green
-# dind runs on main) and `continue-on-error` is gone — a red happy path BLOCKS.
-# It also ALWAYS fires (no paths filter), so it can be — and is — a required
-# context. What remains of the migration end-state: move the contract into the
-# SDK (task #74), wire both repos, then demote the post-merge E2E Staging jobs.
+# GATING as of 2026-07-13: `continue-on-error` is gone — a red happy path BLOCKS
+# (branch protection on main is status_check_contexts=['*'], so every POSTED
+# context must be success). It also ALWAYS fires (no paths filter).
+#
+# PRESENCE-REQUIRED as of #4363/#4381 (2026-07-14). Two independent checks
+# protect different failure modes:
+#
+#   BP ['*']            → a posted RED blocks.       Blind to a context that never posts.
+#   required-contexts   → a MISSING context blocks.  Enforced by the merge queue.
+#
+# The queue now evaluates branch-protection globs with Gitea semantics and
+# fails closed when a glob matches no posted contexts, so its subsequent
+# `.gitea/required-contexts.txt` check is reachable. This context sits above the
+# first `# pending-` marker there; narrowing `on:`, disabling/renaming the job,
+# or otherwise failing to post the context therefore holds the merge.
+#
+# Presence enforcement does not make the scenario deterministic. Task #99
+# tracks known flakiness (it has gone red on main since the flip, e.g.
+# 5593d7a43). Enforcement is deliberate anyway: a flaky red already blocked via
+# BP ['*'], so promotion adds no new exposure — it only closes the silent hole.
+# Fix the flake in #99; do not park the context to hide it.
+#
+# What remains of the migration end-state: move the contract into the SDK
+# (task #74), wire both repos, then demote the post-merge E2E Staging jobs
+# (task #86). Task #92's busy force-hibernate proof is still open: step 10b
+# currently proves force-hibernate only after the leaf is idle, so the demotion
+# is therefore NOT done.
 #
 # Reuses the CP repo's ephemeral spin-up plumbing (scripts/deploy/pr-ephemeral-cp.sh),
 # the shared harness the RFC generalizes.
@@ -60,25 +83,48 @@ concurrency:
   # unconvergeable (a ghost can red a genuine pass) and, at volume, serialized
   # every open PR into a multi-hour backlog on one slot.
   #
-  # cancel-in-progress is now safe (it was not before): a superseded run's
-  # entire topology is one `docker rm -fv` of its dind, so a cancel cannot
-  # leak a half-torn-down namespace. A new push supersedes its own older run
-  # instead of queueing behind it (the RFC's finding-#2 shape).
+  # cancel-in-progress is FALSE, as in harness-replays.yml and
+  # template-delivery-e2e.yml. It was true, on the claim that a cancel cannot
+  # leak because the run's topology is one `docker rm -fv` of its dind. It did
+  # leak: that rm is the `if: always()` "Teardown dind" step, and the deployed
+  # act_runner skips always() steps on a cancelled job. Every superseded run's
+  # dind kept running until the host's harness-reaper `docker rm -f`'d it ~2h
+  # later — no -v — stranding its ~8 GB /var/lib/docker volume (~1 TB on one
+  # runner host; 189 of 190 reaped dinds were cancelled runs). dind.sh now also
+  # reaps a dind whose job container is gone, but nothing here cancels a run in
+  # the first place: a newer push queues behind its own PR's run. Keying stays
+  # per-PR, so the cross-PR queue #4122 removed does not come back.
   group: e2e-ephemeral-happy-path-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
   # The controlplane BASELINE in the image-substitution matrix — a core PR tests
-  # its tenant against a stable CP. Built locally from the cloned CP main (below)
-  # using Dockerfile.dockerprov: the local-docker provisioner shells out to the
-  # `docker` CLI, which the distroless/static ROOT Dockerfile lacks. main == the
-  # released baseline, and building is self-contained (no dependency on a published
-  # tag — there is no controlplane:staging-latest).
+  # its tenant against a stable CP. Built locally from the pinned CP checkout
+  # below using Dockerfile.dockerprov: the local-docker provisioner shells out to the
+  # `docker` CLI, which the distroless/static ROOT Dockerfile lacks. The exact
+  # reviewed ref below is the baseline, and building is self-contained (no
+  # dependency on a published tag — there is no controlplane:staging-latest).
   CP_BASELINE_IMAGE: controlplane:baseline-dockerprov
 
+  # The controlplane tree the baseline image is built FROM, PINNED (task #116).
+  #
+  # This used to be a `git clone --depth 1` of the CP's moving `main`, which made
+  # a FOREIGN repo's HEAD a gate on core: any CP commit could red this — now
+  # ENFORCED — context on every open core PR at once, and no core author could see
+  # the cause in their own diff or revert it. With the context merge-queue-required,
+  # that is not a red, it is a FROZEN QUEUE.
+  #
+  # TO BUMP: `git ls-remote https://git.moleculesai.app/molecule-ai/molecule-controlplane.git refs/heads/main`
+  # and paste the SHA here, in its own PR, so the CP change is reviewed as what it
+  # is — a change to what gates core.
+  CP_EPHEMERAL_REF: 17b6988c37e63bc50a34fc916b97407c54c0f7d4
+
 jobs:
-  # bp-exempt: emits no merge-required context of its own; it only tells the
+  # Emits no context listed in required-contexts.txt — but it DOES post
+  # `E2E Ephemeral CP Happy Path / detect`, and under BP ['*'] every posted
+  # context blocks on red. There is no advisory tier here (proven in task #113:
+  # `continue-on-error` does not suppress the status). It only tells the
   # happy-path job whether the diff can possibly touch the happy path.
   detect:
     runs-on: docker-host
@@ -117,15 +163,16 @@ jobs:
     # its Postgres, and the provisioned tenant (same runner class as harness-replays).
     runs-on: docker-host
     #
-    # ── GATING as of 2026-07-13 (mc#4081 soak COMPLETE) ────────────────────────
-    # `continue-on-error: true` is GONE. It used to mean a RED happy path still
+    # ── GATING as of 2026-07-13 ────────────────────────────────────────────────
+    # The continue-on-error mask is GONE. It used to mean a RED happy path still
     # posted SUCCESS — the gate could observe the bug class it was built for, but
     # never stop it. A guard that cannot fail is not a guard.
     #
-    # The RFC §04 exit criterion was >=5 consecutive green dind runs. Actual: 12
-    # consecutive green on main (ed6209ac..8b35a673, 2026-07-11..13); the only
-    # non-green entries in that window are `not run` — commits whose diff missed
-    # the paths filter — not failures.
+    # The RFC §04 exit criterion was >=5 consecutive green dind runs, and the
+    # pre-flip soak cleared it. Do NOT read that as "this lane is stable": POST-flip
+    # it has gone red on main (5593d7a43, 2026-07-14), and task #99 tracks the
+    # nondeterminism. The honest state is: real gate, known flaky, flake tracked and
+    # being fixed at source — not masked, not parked.
     #
     # It ALWAYS FIRES. The `paths:` filter is gone (see the header): it was a bet
     # that we could enumerate everything able to break provisioning, and it was
@@ -145,14 +192,33 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      # Go toolchain for the ephemeral gate runner. This makes a go-staging-test
+      # lane RUNNABLE here (the shared harness in workspace-server/internal/staginge2e
+      # is now ephemeral-topology-aware via MOLECULE_TENANT_* + E2E_CP_ALLOW_EPHEMERAL_LOOPBACK).
+      # It only installs the toolchain — the journeys are wired into the runner in a
+      # downstream PR. Gated on the same happy/same-repo condition as the dind step so
+      # fork PRs and docs-only no-op arms don't pay for it. 'stable' matches every
+      # other Go lane in this repo (ci.yml, e2e-*.yml).
+      - name: Set up Go
+        if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 'stable'
+          # cache:false — the self-hosted fleet SSOTs GOCACHE/GOMODCACHE via
+          # bind-mounted /var/cache/ci-go-{build,mod}; setup-go's actions/cache
+          # untars OVER that mount ("File exists" → failed restore). Required by
+          # lint-setup-go-cache (core#2524). Introduced by #4525, fixed here.
+          cache: false
+
       # Per-job DISPOSABLE dind (tests/harness/dind.sh — the harness-replays
       # pattern, task#78): the WHOLE topology (PG, CP, tenants, workspaces,
       # image builds) lives inside a nested daemon and dies with one atomic
-      # `docker rm -fv`, even on cancel. This is the structural fix for the
+      # `docker rm -fv` (the Teardown step, or on cancel the dind's own owner
+      # watchdog). This is the structural fix for the
       # shared docker-host interference that killed the gate's first CI runs
       # (host-loopback docker-proxy dying mid-run with every container healthy;
-      # mc#4081) AND for cross-run tenant leaks (pr-ephemeral-cp.sh `down` only
-      # sweeps the leg network — per-org-net tenants leaked). dind.sh exports
+      # mc#4081) AND for cross-run tenant leaks (an early `down` implementation
+      # swept only the leg network, so per-org-net tenants leaked). dind.sh exports
       # DOCKER_HOST (all subsequent docker/build steps target the dind) and
       # BASE = the dind's pre-forwarded :8080, which becomes the caller-visible
       # CP URL (the runner passes it via CP_HOST_BASE_OVERRIDE, CP#1549).
@@ -190,6 +256,26 @@ jobs:
           }
           MINIMAX_API_KEY=$(read_secret MINIMAX_API_KEY %2Fshared%2Fcontrolplane)
           AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils)
+
+          # FAIL CLOSED on an empty secret VALUE, not just a failed login.
+          #
+          # `read_secret` prints "" when the key is absent, renamed, moved to another
+          # secretPath, or readable-but-empty — and curl -f does not fire, so the step
+          # used to SUCCEED with empty creds. Every step below was then gated on
+          # `env.AUTO_SYNC_TOKEN != ''`, so all of them SKIPPED, and the job posted
+          # SUCCESS having spun up nothing. A required context, green, zero coverage:
+          # exactly the vacuity this gate exists to delete, inside the gate itself.
+          # An Infisical rotation would have silently disarmed the whole lane.
+          #
+          # A gate that cannot observe its subject must not report success.
+          missing=""
+          [ -n "$MINIMAX_API_KEY" ]  || missing="$missing MINIMAX_API_KEY(/shared/controlplane)"
+          [ -n "$AUTO_SYNC_TOKEN" ]  || missing="$missing AUTO_SYNC_TOKEN(/shared/dev-utils)"
+          if [ -n "$missing" ]; then
+            echo "::error::Infisical returned an EMPTY value for:$missing — refusing to report success on a gate that cannot run. Check the key name/secretPath in the Infisical SSOT; do NOT re-add a skip-guard."
+            exit 1
+          fi
+
           echo "::add-mask::$MINIMAX_API_KEY"
           echo "::add-mask::$AUTO_SYNC_TOKEN"
           echo "MINIMAX_API_KEY=$MINIMAX_API_KEY" >> "$GITHUB_ENV"
@@ -197,23 +283,38 @@ jobs:
           echo "creds loaded (minimax len=${#MINIMAX_API_KEY}, sync len=${#AUTO_SYNC_TOKEN})"
 
       # The shared spin-up plumbing (RFC §04): pr-ephemeral-cp.sh lives in the CP
-      # repo today; clone it read-only. (When the harness is generalized this
-      # becomes a vendored/shared action, not a clone.)
-      - name: Clone controlplane for the ephemeral spin-up plumbing
-        if: (needs.detect.outputs.happy != 'false') && env.AUTO_SYNC_TOKEN != ''
+      # repo today; fetch it read-only AT THE PINNED SHA (see CP_EPHEMERAL_REF).
+      # (When the harness is generalized this becomes a vendored/shared action.)
+      #
+      # `fetch <sha>` rather than `clone`, so the pin is what comes down the wire —
+      # a shallow clone of `main` would drag main's tip across regardless of what we
+      # check out afterwards.
+      - name: Fetch controlplane at the PINNED ref (ephemeral spin-up plumbing)
+        if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
         run: |
           set -euo pipefail
           rm -rf .cp-ephemeral
-          git clone --depth 1 \
-            "https://oauth2:${AUTO_SYNC_TOKEN}@git.moleculesai.app/molecule-ai/molecule-controlplane.git" \
-            .cp-ephemeral
+          mkdir -p .cp-ephemeral
+          git -C .cp-ephemeral init -q
+          git -C .cp-ephemeral remote add origin \
+            "https://oauth2:${AUTO_SYNC_TOKEN}@git.moleculesai.app/molecule-ai/molecule-controlplane.git"
+          git -C .cp-ephemeral fetch -q --depth 1 origin "${CP_EPHEMERAL_REF}"
+          git -C .cp-ephemeral checkout -q FETCH_HEAD
+
+          # The pin is only a pin if we assert we landed on it.
+          GOT="$(git -C .cp-ephemeral rev-parse HEAD)"
+          [ "$GOT" = "${CP_EPHEMERAL_REF}" ] || {
+            echo "::error::controlplane checkout is ${GOT}, expected the pinned ${CP_EPHEMERAL_REF}. Refusing to build the CP baseline from an unpinned tree — that is how a foreign repo's HEAD silently becomes a gate on core."
+            exit 1
+          }
+
           chmod +x .cp-ephemeral/scripts/deploy/pr-ephemeral-cp.sh
-          echo "cloned pr-ephemeral-cp.sh"
+          echo "fetched pr-ephemeral-cp.sh at pinned CP ${CP_EPHEMERAL_REF}"
 
       # Pre-clone manifest deps so Dockerfile.tenant's COPY of .tenant-bundle-deps
       # resolves (identical to harness-replays' pre-clone).
       - name: Pre-clone manifest deps
-        if: (needs.detect.outputs.happy != 'false') && env.AUTO_SYNC_TOKEN != ''
+        if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
         env:
           MOLECULE_GITEA_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
         run: |
@@ -229,37 +330,43 @@ jobs:
 
       # Build THIS PR's tenant image (the UNDER-TEST side of the substitution).
       - name: Build PR tenant image
-        if: (needs.detect.outputs.happy != 'false') && env.AUTO_SYNC_TOKEN != ''
+        if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
+          # BUILD_TAGS=e2e_busy_inject compiles the TEST-ONLY busy-inject route
+          # (task #92) into THIS throwaway tenant image so 10b force-hibernate can
+          # deterministically hit a busy workspace. The tag exists nowhere else —
+          # no production/staging image is built with it, so the route is absent
+          # from every shipped binary (default BUILD_TAGS="" = today's image).
           docker build \
             -f workspace-server/Dockerfile.tenant \
             --build-arg GIT_SHA="${HEAD_SHA}" \
+            --build-arg BUILD_TAGS=e2e_busy_inject \
             -t "molecule-tenant:pr-${HEAD_SHA:0:8}" \
             .
           echo "TENANT_IMAGE=molecule-tenant:pr-${HEAD_SHA:0:8}" >> "$GITHUB_ENV"
 
-      # Build the CP baseline (the OTHER side of the substitution) from the cloned
-      # CP main using Dockerfile.dockerprov — the multi-stage image that ships the
+      # Build the CP baseline (the OTHER side of the substitution) from the pinned
+      # CP checkout using Dockerfile.dockerprov — the multi-stage image that ships the
       # `docker` CLI the local-docker tenant provisioner shells out to. The root
       # Dockerfile is distroless/static with NO docker CLI, so a CP built from it
-      # cannot provision tenants. main == the released baseline; self-contained (no
-      # published :staging-latest tag to depend on).
+      # cannot provision tenants. The reviewed CP_EPHEMERAL_REF is the baseline;
+      # this is self-contained (no published :staging-latest tag to depend on).
       - name: Build baseline controlplane image (Dockerfile.dockerprov)
-        if: (needs.detect.outputs.happy != 'false') && env.AUTO_SYNC_TOKEN != ''
+        if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
         run: |
           set -euo pipefail
           docker build \
             -f .cp-ephemeral/Dockerfile.dockerprov \
             -t "${CP_BASELINE_IMAGE}" \
             .cp-ephemeral
-          echo "built ${CP_BASELINE_IMAGE} from cloned CP main (Dockerfile.dockerprov)"
+          echo "built ${CP_BASELINE_IMAGE} from pinned CP ${CP_EPHEMERAL_REF} (Dockerfile.dockerprov)"
 
       # The proof: full-saas against the throwaway CP, zero staging creds.
       - name: Run core happy-path against an ephemeral CP
-        if: (needs.detect.outputs.happy != 'false') && env.AUTO_SYNC_TOKEN != ''
+        if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
         env:
           CP_IMAGE: ${{ env.CP_BASELINE_IMAGE }}
           TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
@@ -268,16 +375,72 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           E2E_RUNTIME: hermes
+          # Task #92: the tenant image above is built with -tags e2e_busy_inject,
+          # so 10b uses the deterministic test-busy inject route (no flaky real
+          # LLM turn) AND requires a genuinely busy workspace — a non-busy 10b is
+          # now a hard red, no more capture-first idle fallback.
+          E2E_BUSY_INJECT: "1"
+          E2E_HIBERNATE_FORCE_BUSY_REQUIRED: "1"
           # DIND mode — everything inside the disposable daemon; $BASE/$DOCKER_HOST
           # come from the "Start disposable dind" step via GITHUB_ENV.
           EPHEMERAL_DIND: "1"
-        run: bash tests/e2e/ephemeral_cp_happy_path.sh
+          # RFC #86 — pull the post-push staging lanes LEFT onto this per-PR gate,
+          # one at a time. `concierge_user_tasks` was first: it needs only the CP +
+          # API (external workspaces, no LLM/image), so it was the cheapest lane to
+          # move. The last three (workspace_requests, concierge_platform_agent,
+          # plugin_install_lifecycle) are the go-staging-test lanes — they shell out
+          # to the topology-aware Go harness (#4525) instead of a test_*.sh; the
+          # first two are DB/handler-level (secret-free), plugin_install_lifecycle
+          # really boots one workspace (the same real-workspace path the happy path
+          # already stands up). ADVISORY=1 is the global capture-first soak — every
+          # scenario RUNS every PR (non-vacuous); a failure of a still-soaking one
+          # does not block merge yet. GRADUATE a scenario by adding its key to
+          # E2E_EPHEMERAL_EXTRA_GATING below (NOT by flipping the global ADVISORY,
+          # which would promote the whole set at once) — a gating-listed scenario's
+          # failure fails this REQUIRED context even while the others soak. Retire
+          # the matching post-push job in e2e-staging-saas.yml once graduated. NOTE:
+          # the mgmt-MCP present+callable half of the concierge lane
+          # (TestPlatformAgentMgmtMCP_Staging) needs a real concierge boot and is
+          # intentionally deferred to the real-runtime matrix
+          # (E2E_EPHEMERAL_REAL_RUNTIME_MATRIX, default-off), not wired here.
+          E2E_EPHEMERAL_EXTRA_SCENARIOS: concierge_user_tasks,concierge_creates_workspace,external_runtime,reconciler_heals_terminated,peer_visibility,workspace_requests,concierge_platform_agent,plugin_install_lifecycle
+          E2E_EPHEMERAL_EXTRA_ADVISORY: "1"
+          # GRADUATED to merge-blocking (#4543 coverage-hole fix): peer_visibility
+          # (the literal MCP list_peers auth contract) and concierge_creates_workspace.
+          # #4543 retired their push staging lanes and moved the journeys here, but
+          # they ran under the global ADVISORY soak — so a regression to either merged
+          # GREEN. Listing them here fails THIS gate on their failure regardless of the
+          # soak; external_runtime + reconciler_heals_terminated stay advisory (not yet
+          # reliable — separate promotion once soaked green).
+          #
+          # concierge_platform_agent GRADUATED: it asserts the platform-agent install
+          # + identity + kind + discovery-peers authz, and has run on EVERY PR under the
+          # ADVISORY soak — so a regression to the concierge lane merged GREEN. That is
+          # exactly what happened: a concierge shipped with NO persona (its config
+          # declared prompt_files: [prompts/concierge.md] while the file was never
+          # materialized) and nothing pre-merge could block it.
+          #
+          # COVERAGE THIS STILL DOES NOT GIVE: this scenario is DB/handler state —
+          # "no boot". It never starts a runtime, builds a system prompt, registers an
+          # MCP, or makes a model call. The present+CALLABLE half
+          # (TestPlatformAgentMgmtMCP_Staging — a real concierge boot driven over A2A to
+          # actually RUN provision_workspace) still runs ONLY post-merge in
+          # staging-tenant-cd, because the real-runtime matrix it needs
+          # (E2E_EPHEMERAL_REAL_RUNTIME_MATRIX) is referenced in comments but was never
+          # implemented. Until it is, a concierge that boots without an identity can
+          # STILL merge green. Pinned by test_concierge_lane_is_merge_blocking.py.
+          E2E_EPHEMERAL_EXTRA_GATING: peer_visibility,concierge_creates_workspace,concierge_platform_agent
+        run: |
+          bash tests/e2e/ephemeral_cp_happy_path.sh
+          echo "GATE_ARM=proof" >> "$GITHUB_ENV"
 
-      # Atomic teardown: one rm destroys the entire nested topology (CP, PG,
-      # tenants, workspaces, volumes, networks, built images) — even after a
-      # cancel that skipped every other cleanup. Leaks structurally impossible.
+      # Atomic teardown: one `docker rm -fv` destroys the entire nested topology
+      # (CP, PG, tenants, workspaces, volumes, networks, built images). A
+      # cancelled job never reaches this step (act_runner skips always() steps
+      # on cancel); that dind reaps itself — and its volume — via dind.sh's
+      # owner watchdog once this job's container is gone.
       - name: Teardown dind
-        # always() so a cancelled/failed run still reaps its dind — but gated on
+        # always() so a failed run still reaps its dind — but gated on
         # the same non-fork condition as the start step (an ungated always()
         # step on the fork no-op path was exactly the template-delivery chdir
         # failure, core#4057).
@@ -286,11 +449,23 @@ jobs:
           DIND_NS: ${{ github.run_id }}-ephemeral
         run: bash tests/harness/dind.sh down
 
-      # Fork-PR fallback: no creds → loud skip, never a silent green.
-      - name: Fork PR — advisory skip (no e2e creds)
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true
+      # Fork PR + code diff: FAIL. A fork gets no e2e creds by design, so the gate
+      # cannot run — and a gate that cannot observe its subject must not report
+      # success. This step used to `::notice::` and exit 0, i.e. post GREEN on an
+      # ENFORCED context having proved nothing, with "the post-merge run covers it"
+      # as the excuse. Post-merge is exactly what this gate exists to stop relying
+      # on. Merging a fork PR now requires a maintainer to re-run it from a
+      # same-repo branch, which is the honest cost of not handing creds to
+      # PR-authored code.
+      #
+      # Gated on `happy != 'false'` so a DOCS-ONLY fork PR still takes the no-op
+      # green arm below rather than being failed for a diff that cannot break
+      # anything.
+      - name: Fork PR — cannot run the gate, so it cannot pass
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true && needs.detect.outputs.happy != 'false'
         run: |
-          echo "::notice::Fork PR — ephemeral-CP happy-path proof skipped (no e2e creds by design). The post-merge run covers it."
+          echo "::error::Fork PR — the ephemeral-CP happy path cannot run (a fork gets no e2e creds by design), so this REQUIRED context cannot honestly be green. Re-run this change from a same-repo branch to get coverage."
+          exit 1
 
       # The context MUST still be posted when we skip, or a docs-only PR would
       # sit at `pending` forever the moment this joins required-contexts.txt.
@@ -301,3 +476,27 @@ jobs:
           echo "Every changed path is inert (docs/** or *.md)."
           echo "The ephemeral happy-path topology cannot be affected by this diff, so it was not spun up."
           echo "This context is GREEN so the required check is satisfied without burning ~6min + a live LLM call."
+          echo "GATE_ARM=noop" >> "$GITHUB_ENV"
+      # THE CATCH-ALL. A job whose every step SKIPS still SUCCEEDS — and this
+      # context is a required one, so a green with no arm run is a silent hole.
+      # That is not hypothetical: the guard suite for this very file passed
+      # `5 OK` against a workflow whose proof step was `if: false`. Shape-matching
+      # step conditions cannot catch that; a runtime sentinel can.
+      #
+      # Exactly one arm must have run: `proof` (the gate) or `noop` (docs-only).
+      # The fork arm exits 1 and never reaches here.
+      #
+      # ORDERING IS LOAD-BEARING: this sentinel must be the LAST step — after
+      # every arm that can stamp GATE_ARM. It originally sat above the no-op
+      # arm, so every docs-only PR failed here before the arm could stamp
+      # (first hit: PR #4413, 2026-07-17). The guard test pins this order.
+      - name: Assert an arm actually ran (no silent green)
+        if: always() && !cancelled()
+        run: |
+          set -euo pipefail
+          ARM="${GATE_ARM:-}"
+          if [ -z "$ARM" ]; then
+            echo "::error::NO ARM RAN. Every step in this job skipped, so the job would have posted SUCCESS on a REQUIRED context having proved nothing. Some 'if:' condition is wrong — the gate did not run, and it did not honestly no-op either."
+            exit 1
+          fi
+          echo "arm=$ARM"

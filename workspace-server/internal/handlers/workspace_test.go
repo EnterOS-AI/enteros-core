@@ -32,6 +32,7 @@ func TestWorkspaceGet_Success(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("cccccccc-0001-0000-0000-000000000000").
@@ -40,6 +41,7 @@ func TestWorkspaceGet_Success(t *testing.T) {
 				"http://localhost:8001", nil, 2, 1, 0.05, "", 3600, "working", "claude-code",
 				"", 10.0, 20.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`["a2a","mcp__molecule-platform__provision_workspace"]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 
 	w := httptest.NewRecorder()
@@ -134,6 +136,7 @@ func TestWorkspaceGet_RemovedReturns410(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
@@ -142,6 +145,7 @@ func TestWorkspaceGet_RemovedReturns410(t *testing.T) {
 				"", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 	mock.ExpectQuery(`SELECT updated_at FROM workspaces`).
 		WithArgs(id).
@@ -171,8 +175,9 @@ func TestWorkspaceGet_RemovedReturns410(t *testing.T) {
 	if v, ok := resp["removed_at"]; !ok || v == nil {
 		t.Errorf("expected removed_at to be a real timestamp on the happy path, got: %v", v)
 	}
-	if _, ok := resp["hint"]; !ok {
-		t.Errorf("expected hint in 410 body, got: %v", resp)
+	const wantHint = "Create a replacement workspace in Canvas, then open Settings → Workspace Tokens → + New Token"
+	if resp["hint"] != wantHint {
+		t.Errorf("expected current Canvas recovery hint %q, got %v", wantHint, resp["hint"])
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -200,6 +205,7 @@ func TestWorkspaceGet_RemovedReturns410WithNullRemovedAtOnTimestampFetchFailure(
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
@@ -208,6 +214,7 @@ func TestWorkspaceGet_RemovedReturns410WithNullRemovedAtOnTimestampFetchFailure(
 				"", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 	// Simulate the row vanishing between the two queries.
 	mock.ExpectQuery(`SELECT updated_at FROM workspaces`).
@@ -265,6 +272,7 @@ func TestWorkspaceGet_RemovedWithIncludeQueryReturns200(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
@@ -273,6 +281,7 @@ func TestWorkspaceGet_RemovedWithIncludeQueryReturns200(t *testing.T) {
 				"", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 	// last_outbound_at follow-up query (existing path)
 	mock.ExpectQuery(`SELECT last_outbound_at FROM workspaces`).
@@ -932,6 +941,9 @@ func TestWorkspaceUpdate_MultipleFields(t *testing.T) {
 	mock.ExpectExec("UPDATE workspaces SET name").
 		WithArgs("cccccccc-0005-0000-0000-000000000000", "Updated Agent").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WithArgs("WORKSPACE_UPDATED", "cccccccc-0005-0000-0000-000000000000", `{"name":"Updated Agent"}`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("UPDATE workspaces SET role").
 		WithArgs("cccccccc-0005-0000-0000-000000000000", "manager").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -978,11 +990,11 @@ func TestWorkspaceUpdate_RuntimeField(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 	// The PATCH-runtime compat-check reads the RESOLVED model from the
 	// MODEL workspace_secret (SSOT), not the workspaces.model column.
-	// moonshot/kimi-k2.6 is registered for claude-code in the harness's
+	// minimax/MiniMax-M2.7 is registered for claude-code in the harness's
 	// provider registry, so validation passes and the UPDATE proceeds.
 	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs("cccccccc-0006-0000-0000-000000000000").
-		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("moonshot/kimi-k2.6"), 0))
+		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("minimax/MiniMax-M2.7"), 0))
 	// The runtime UPDATE now runs inside the atomic model-reset+runtime tx
 	// (no reset here, so the tx wraps only the UPDATE).
 	mock.ExpectBegin()
@@ -1134,9 +1146,6 @@ func TestWorkspaceDelete_CascadeWithChildren(t *testing.T) {
 	// Token revocation: once a workspace is gone its auth tokens are meaningless.
 	mock.ExpectExec("UPDATE workspace_auth_tokens SET revoked_at").
 		WillReturnResult(sqlmock.NewResult(0, 2))
-	// #1027: cascade-disable schedules for deleted workspaces.
-	mock.ExpectExec("UPDATE workspace_schedules SET enabled = false").
-		WillReturnResult(sqlmock.NewResult(0, 3))
 	// Broadcast for child WORKSPACE_REMOVED (fires during the descendant loop).
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -1167,201 +1176,6 @@ func TestWorkspaceDelete_CascadeWithChildren(t *testing.T) {
 		t.Errorf("expected cascade_deleted 1, got %v", resp["cascade_deleted"])
 	}
 
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet sqlmock expectations: %v", err)
-	}
-}
-
-// ==================== #1027: Cascade schedule disable on delete ====================
-
-// TestWorkspaceDelete_DisablesSchedules verifies that when a leaf workspace
-// (no children) is deleted, all its enabled schedules are set to enabled=false.
-func TestWorkspaceDelete_DisablesSchedules(t *testing.T) {
-	mock := setupTestDB(t)
-	setupTestRedis(t)
-	broadcaster := newTestBroadcaster()
-	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
-
-	wsID := "dddddddd-0001-0000-0000-000000000000"
-
-	expectWorkspaceDeleteLookup(mock, wsID, "Scheduled Workspace", 0, "running")
-
-	// No children
-	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
-		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}))
-
-	// CascadeDelete walks descendants unconditionally — 0-children case
-	// returns 0 rows here.
-	mock.ExpectQuery("WITH RECURSIVE descendants").
-		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}))
-
-	// Mark workspace as removed
-	mock.ExpectExec("UPDATE workspaces SET status =").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	// Canvas layouts cleanup
-	mock.ExpectExec("DELETE FROM canvas_layouts WHERE workspace_id = ANY").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	// Token revocation
-	mock.ExpectExec("UPDATE workspace_auth_tokens SET revoked_at").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	// #1027: schedule disable — expect exactly this UPDATE to fire
-	mock.ExpectExec("UPDATE workspace_schedules SET enabled = false").
-		WillReturnResult(sqlmock.NewResult(0, 2)) // 2 schedules disabled
-	// Broadcast WORKSPACE_REMOVED for the workspace itself
-	mock.ExpectExec("INSERT INTO structure_events").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Params = gin.Params{{Key: "id", Value: wsID}}
-	c.Request = httptest.NewRequest("DELETE", "/workspaces/"+wsID+"?confirm=true", nil)
-	c.Request.Header.Set("X-Confirm-Name", "Scheduled Workspace")
-
-	handler.Delete(c)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("expected status 200, got %d: %s", w.Code, w.Body.String())
-	}
-
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet sqlmock expectations: schedule disable UPDATE was not executed: %v", err)
-	}
-}
-
-// TestWorkspaceDelete_CascadeDisablesDescendantSchedules verifies that when
-// a parent workspace with children (and grandchildren) is deleted, ALL
-// descendant schedules are also disabled in a single batch UPDATE.
-func TestWorkspaceDelete_CascadeDisablesDescendantSchedules(t *testing.T) {
-	mock := setupTestDB(t)
-	setupTestRedis(t)
-	broadcaster := newTestBroadcaster()
-	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
-
-	parentID := "dddddddd-0002-0000-0000-000000000000"
-	childID := "dddddddd-0003-0000-0000-000000000000"
-	grandchildID := "dddddddd-0004-0000-0000-000000000000"
-
-	expectWorkspaceDeleteLookup(mock, parentID, "Parent Scheduled Workspace", 0, "running")
-
-	// Children query returns 1 direct child
-	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
-		WithArgs(parentID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}).
-			AddRow(childID, "Child"))
-
-	// Recursive CTE returns child + grandchild
-	mock.ExpectQuery("WITH RECURSIVE descendants").
-		WithArgs(parentID).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).
-			AddRow(childID).
-			AddRow(grandchildID))
-
-	// Mark all 3 as removed
-	mock.ExpectExec("UPDATE workspaces SET status =").
-		WillReturnResult(sqlmock.NewResult(0, 3))
-	// Canvas layouts
-	mock.ExpectExec("DELETE FROM canvas_layouts WHERE workspace_id = ANY").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	// Token revocation
-	mock.ExpectExec("UPDATE workspace_auth_tokens SET revoked_at").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	// #1027: schedule disable — covers parent + child + grandchild in one batch
-	mock.ExpectExec("UPDATE workspace_schedules SET enabled = false").
-		WillReturnResult(sqlmock.NewResult(0, 5)) // 5 total schedules across 3 workspaces
-	// Broadcast for child WORKSPACE_REMOVED
-	mock.ExpectExec("INSERT INTO structure_events").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	// Broadcast for grandchild WORKSPACE_REMOVED
-	mock.ExpectExec("INSERT INTO structure_events").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	// Broadcast for parent WORKSPACE_REMOVED
-	mock.ExpectExec("INSERT INTO structure_events").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Params = gin.Params{{Key: "id", Value: parentID}}
-	c.Request = httptest.NewRequest("DELETE", "/workspaces/"+parentID+"?confirm=true", nil)
-	c.Request.Header.Set("X-Confirm-Name", "Parent Scheduled Workspace")
-
-	handler.Delete(c)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("expected status 200, got %d: %s", w.Code, w.Body.String())
-	}
-
-	var resp map[string]interface{}
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to parse response: %v", err)
-	}
-	if resp["cascade_deleted"] != float64(2) {
-		t.Errorf("expected cascade_deleted 2, got %v", resp["cascade_deleted"])
-	}
-
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet sqlmock expectations: descendant schedules not disabled: %v", err)
-	}
-}
-
-// TestWorkspaceDelete_ScheduleDisableOnlyTargetsDeletedWorkspace verifies that
-// deleting workspace A does NOT disable workspace B's schedules. The schedule
-// disable UPDATE uses ANY($1::uuid[]) scoped to the deleted workspace IDs, so
-// sqlmock will fail if the wrong IDs are passed.
-func TestWorkspaceDelete_ScheduleDisableOnlyTargetsDeletedWorkspace(t *testing.T) {
-	mock := setupTestDB(t)
-	setupTestRedis(t)
-	broadcaster := newTestBroadcaster()
-	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
-
-	wsA := "dddddddd-0005-0000-0000-000000000000"
-	// wsB is "dddddddd-0006-0000-0000-000000000000" — NOT part of the delete
-
-	expectWorkspaceDeleteLookup(mock, wsA, "Workspace A", 0, "running")
-
-	// No children for workspace A
-	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
-		WithArgs(wsA).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}))
-
-	// CascadeDelete walks descendants unconditionally — 0-children case
-	// returns 0 rows here.
-	mock.ExpectQuery("WITH RECURSIVE descendants").
-		WithArgs(wsA).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}))
-
-	// Mark only workspace A as removed
-	mock.ExpectExec("UPDATE workspaces SET status =").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("DELETE FROM canvas_layouts WHERE workspace_id = ANY").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("UPDATE workspace_auth_tokens SET revoked_at").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	// Schedule disable fires only for wsA's IDs — sqlmock enforces query ordering
-	// so if the production code somehow included wsB it would be a different
-	// query argument and fail to match.
-	mock.ExpectExec("UPDATE workspace_schedules SET enabled = false").
-		WillReturnResult(sqlmock.NewResult(0, 0)) // wsA had no schedules
-	mock.ExpectExec("INSERT INTO structure_events").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Params = gin.Params{{Key: "id", Value: wsA}}
-	c.Request = httptest.NewRequest("DELETE", "/workspaces/"+wsA+"?confirm=true", nil)
-	c.Request.Header.Set("X-Confirm-Name", "Workspace A")
-
-	handler.Delete(c)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("expected status 200, got %d: %s", w.Code, w.Body.String())
-	}
-
-	// The key assertion: all expectations were met and no extra queries ran.
-	// If the production code had a bug that disabled ALL schedules (not just
-	// those belonging to the deleted workspace), sqlmock would detect the
-	// mismatch because the query text/args would differ.
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
@@ -1559,6 +1373,9 @@ func TestWorkspaceUpdate_CosmeticField_NoBearer_FailOpen_NoTokens(t *testing.T) 
 	mock.ExpectExec("UPDATE workspaces SET name").
 		WithArgs("cccccccc-000d-0000-0000-000000000000", "Cosmetic").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WithArgs("WORKSPACE_UPDATED", "cccccccc-000d-0000-0000-000000000000", `{"name":"Cosmetic"}`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1626,6 +1443,7 @@ func TestWorkspaceGet_FinancialFieldsStripped(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	// Populate with non-zero financial values to confirm they are stripped.
 	mock.ExpectQuery("SELECT w.id, w.name").
@@ -1635,6 +1453,7 @@ func TestWorkspaceGet_FinancialFieldsStripped(t *testing.T) {
 				"http://localhost:9001", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
 				int64(50000), int64(12500), false, true, []byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			)) // budget_limit=500 USD, spend=125 USD
 
 	w := httptest.NewRecorder()
@@ -1669,9 +1488,15 @@ func TestWorkspaceGet_FinancialFieldsStripped(t *testing.T) {
 }
 
 // TestWorkspaceGet_SensitiveFieldsStripped verifies that GET /workspaces/:id
-// does NOT expose current_task, last_sample_error, or workspace_dir. These
-// leak operational surveillance data and host paths to any caller with a
-// valid UUID. (#955)
+// does NOT expose current_task or workspace_dir. These leak operational
+// surveillance data and host paths to any caller with a valid UUID. (#955)
+//
+// last_sample_error was REMOVED from this strip set by molecule-core#5035: it
+// is the platform's own recorded reason for a failed provision, is already
+// published to the same clients via the WORKSPACE_PROVISION_FAILED broadcast
+// and via GET /workspaces, and stripping it here is what made a refused
+// provision indistinguishable from a silent one. See
+// TestWorkspaceGet_SurfacesLastSampleError for the positive assertion.
 func TestWorkspaceGet_SensitiveFieldsStripped(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
@@ -1685,6 +1510,7 @@ func TestWorkspaceGet_SensitiveFieldsStripped(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("cccccccc-0955-0000-0000-000000000000").
@@ -1698,6 +1524,7 @@ func TestWorkspaceGet_SensitiveFieldsStripped(t *testing.T) {
 				"/home/user/secret-projects/client-work",
 				0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 
 	w := httptest.NewRecorder()
@@ -1716,10 +1543,15 @@ func TestWorkspaceGet_SensitiveFieldsStripped(t *testing.T) {
 		t.Fatalf("failed to parse response: %v", err)
 	}
 
-	for _, field := range []string{"current_task", "last_sample_error", "workspace_dir"} {
+	for _, field := range []string{"current_task", "workspace_dir"} {
 		if _, present := resp[field]; present {
 			t.Errorf("%s must not appear in public GET response (got %v)", field, resp[field])
 		}
+	}
+	// #5035: the recorded failure reason IS returned — it is the only
+	// diagnosis surface a tenant has for a failed provision.
+	if got, present := resp["last_sample_error"]; !present || got != "panic: internal error at /secret/path.go:42" {
+		t.Errorf("last_sample_error must be surfaced on the public GET response (#5035), got %v (present=%v)", got, present)
 	}
 
 	// Sanity: discovery fields still present
@@ -1753,6 +1585,9 @@ func TestWorkspaceUpdate_BudgetLimitIgnored(t *testing.T) {
 	// name update is the only expected write
 	mock.ExpectExec("UPDATE workspaces SET name").
 		WithArgs("cccccccc-0011-0000-0000-000000000000", "Safe Name").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WithArgs("WORKSPACE_UPDATED", "cccccccc-0011-0000-0000-000000000000", `{"name":"Safe Name"}`).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
@@ -1831,7 +1666,7 @@ func TestWorkspaceCreate_TemplateDefaultsMissingRuntimeAndModel(t *testing.T) {
 tier: 2
 runtime: hermes
 runtime_config:
-  model: moonshot/kimi-k2.6
+  model: minimax/MiniMax-M2.7
 `)
 	if err := os.WriteFile(filepath.Join(templateDir, "config.yaml"), cfg, 0o644); err != nil {
 		t.Fatalf("write cfg: %v", err)
@@ -1888,7 +1723,7 @@ func TestWorkspaceCreate_TemplateDefaultsLegacyTopLevelModel(t *testing.T) {
 	cfg := []byte(`name: Legacy Agent
 tier: 1
 runtime: hermes
-model: moonshot/kimi-k2.5
+model: minimax/MiniMax-M2.7-highspeed
 `)
 	if err := os.WriteFile(filepath.Join(templateDir, "config.yaml"), cfg, 0o644); err != nil {
 		t.Fatalf("write cfg: %v", err)
@@ -1945,7 +1780,7 @@ func TestWorkspaceCreate_CallerModelOverridesTemplateDefault(t *testing.T) {
 	}
 	cfg := []byte(`runtime: hermes
 runtime_config:
-  model: moonshot/kimi-k2.6
+  model: minimax/MiniMax-M2.7
 `)
 	if err := os.WriteFile(filepath.Join(templateDir, "config.yaml"), cfg, 0o644); err != nil {
 		t.Fatalf("write cfg: %v", err)
@@ -1975,10 +1810,10 @@ runtime_config:
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	// Caller overrides with a different hermes-valid model — registry permits
-	// both moonshot/kimi-k2.5 and moonshot/kimi-k2.6 for hermes (P4 PR-1 native
-	// set). The template default would have been moonshot/kimi-k2.6; caller
+	// both minimax/MiniMax-M2.7-highspeed and minimax/MiniMax-M2.7 for hermes (the shared
+	// minimax platform family). The template default would have been minimax/MiniMax-M2.7; caller
 	// picks kimi-k2.5 explicitly to prove the override actually fires.
-	body := `{"name":"Custom Hermes","template":"hermes-template","model":"moonshot/kimi-k2.5"}`
+	body := `{"name":"Custom Hermes","template":"hermes-template","model":"minimax/MiniMax-M2.7-highspeed"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -2313,6 +2148,7 @@ func TestWorkspaceGet_Wedged_FreshHeartbeatStaleOutbound(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	// active_tasks=1 (busy), but the GET row carries only what
 	// scanWorkspaceRow scans (which does NOT include last_heartbeat_at).
@@ -2323,6 +2159,7 @@ func TestWorkspaceGet_Wedged_FreshHeartbeatStaleOutbound(t *testing.T) {
 				"", nil, 1, 1, 0.0, "", 60, "mid-turn", "claude-code",
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 	// Follow-up query for last_outbound_at (existing #817 path).
 	mock.ExpectQuery(`SELECT last_outbound_at FROM workspaces`).
@@ -2393,6 +2230,7 @@ func TestWorkspaceGet_Wedged_StaleHeartbeatStaleOutbound(t *testing.T) {
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
+		"mcp_surface",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
@@ -2401,6 +2239,7 @@ func TestWorkspaceGet_Wedged_StaleHeartbeatStaleOutbound(t *testing.T) {
 				"", nil, 1, 1, 0.0, "", 60, "stuck", "claude-code",
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
 			))
 	mock.ExpectQuery(`SELECT last_outbound_at FROM workspaces`).
 		WithArgs(id).

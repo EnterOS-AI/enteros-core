@@ -228,7 +228,8 @@ def test_is_red_no_statuses(wd_module):
 
 
 # --------------------------------------------------------------------------
-# Per-entry vendor-truth key (rev4) — see status-reaper rev4 sibling
+# Per-entry vendor-truth key (rev4) — was cross-referenced to the status-reaper
+# rev4 sibling, which was REMOVED in chore/delete-uninstalled-status-reaper
 #
 # Gitea 1.22.6 returns per-entry items in combined.statuses[] with key
 # `status`, not `state`. Pre-rev4 code only read `state` → failed[]
@@ -932,9 +933,9 @@ def test_require_runtime_env_exits_when_missing(wd_module, monkeypatch):
 # that string — 89% are written as 'Failing after Ns', indistinguishable
 # from real action_run.status=2 (Failure) at the commit_status layer.
 #
-# Gitea 1.22.6 has NO REST endpoint exposing action_run.status, so the
-# canonical filter (status=2 only) cannot run from a Gitea Actions
-# runner. The next-best signal is the HEAD-recheck: re-fetch HEAD SHA
+# At the time of the 1.22.6 incident there was no REST action-run endpoint, so
+# the canonical filter could not run from Actions. The compatibility path kept
+# here is the HEAD-recheck: re-fetch HEAD SHA
 # (or its combined status) right before filing. If HEAD moved on or
 # combined state recovered, the prior "red" was a transient
 # cancel-cascade and we skip-file.

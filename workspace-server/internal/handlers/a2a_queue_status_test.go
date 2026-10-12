@@ -32,6 +32,24 @@ func TestGetA2AQueueStatus_MissingIdentity(t *testing.T) {
 	}
 }
 
+func TestGetA2AQueueStatus_HeaderWithoutBearerRejected(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-target"}, {Key: "queue_id", Value: "queue-abc"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-target/a2a/queue/queue-abc", nil)
+	c.Request.Header.Set("X-Workspace-ID", "ws-forged")
+
+	handler.GetA2AQueueStatus(c)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("header-only queue caller: want 401, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // TestGetA2AQueueStatus_MissingRow_Retryable proves an authenticated caller
 // receives a 404 with retryable=true when the queue row doesn't exist, so a
 // client polling after a 202 knows to keep retrying.
@@ -52,7 +70,7 @@ func TestGetA2AQueueStatus_MissingRow_Retryable(t *testing.T) {
 	c.Request = httptest.NewRequest("GET", "/workspaces/ws-target/a2a/queue/"+queueID, nil)
 	c.Request.Header.Set("X-Workspace-ID", "ws-caller")
 
-	handler.GetA2AQueueStatus(c)
+	getA2AQueueStatusAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for missing row, got %d: %s", w.Code, w.Body.String())
@@ -83,7 +101,7 @@ func TestGetA2AQueueStatus_AuthMismatch(t *testing.T) {
 	c.Request = httptest.NewRequest("GET", "/workspaces/ws-target/a2a/queue/"+queueID, nil)
 	c.Request.Header.Set("X-Workspace-ID", "ws-attacker")
 
-	handler.GetA2AQueueStatus(c)
+	getA2AQueueStatusAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for auth mismatch, got %d: %s", w.Code, w.Body.String())
@@ -120,7 +138,7 @@ func TestGetA2AQueueStatus_TargetCallerCanRead(t *testing.T) {
 	c.Request = httptest.NewRequest("GET", "/workspaces/ws-target/a2a/queue/"+queueID, nil)
 	c.Request.Header.Set("X-Workspace-ID", "ws-target")
 
-	handler.GetA2AQueueStatus(c)
+	getA2AQueueStatusAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 for authorized caller, got %d: %s", w.Code, w.Body.String())
@@ -189,7 +207,7 @@ func TestQueueStatusByID_NULLResponseBodyScan(t *testing.T) {
 	mock := setupTestDB(t)
 	queueID := "queue-null-resp"
 
-	mock.ExpectQuery(`SELECT\s+q\.id,\s+q\.workspace_id,\s+q\.status,\s+q\.priority,\s+q\.attempts,\s+q\.last_error,\s+q\.enqueued_at::text,\s+q\.dispatched_at::text,\s+q\.completed_at::text,\s+q\.expires_at::text,\s+COALESCE\(\s+q\.response_body::text,\s+\(\s+SELECT al\.response_body::text\s+FROM activity_logs al\s+WHERE al\.method = 'delegate_result'\s+AND al\.target_id = q\.workspace_id\s+AND al\.workspace_id = q\.caller_id\s+AND al\.response_body->>'delegation_id' = \(q\.body->'params'->'message'->'metadata'->>'delegation_id'\)\s+LIMIT 1\s+\)\s+\)\s+FROM a2a_queue q\s+WHERE q\.id = \$1`).
+	mock.ExpectQuery(`SELECT\s+q\.id,\s+q\.workspace_id,\s+q\.status,\s+q\.priority,\s+q\.attempts,\s+q\.last_error,\s+q\.enqueued_at::text,\s+q\.dispatched_at::text,\s+q\.completed_at::text,\s+q\.expires_at::text,\s+COALESCE\(\s+q\.response_body::text,\s+\(\s+SELECT al\.response_body::text\s+FROM activity_logs al\s+WHERE al\.activity_type = 'delegation'\s+AND al\.method = 'delegate_result'\s+AND al\.target_id = q\.workspace_id\s+AND al\.workspace_id = q\.caller_id\s+AND al\.response_body->>'delegation_id' = \(q\.body->'params'->'message'->'metadata'->>'delegation_id'\)\s+ORDER BY al\.created_at DESC\s+LIMIT 1\s+\)\s+\)\s+FROM a2a_queue q\s+WHERE q\.id = \$1`).
 		WithArgs(queueID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "workspace_id", "status", "priority", "attempts",

@@ -8,7 +8,11 @@ name: Harness Replays
 #   - Dropped `environment:` blocks (Gitea has no environments).
 #   - Workflow-level env.GITHUB_SERVER_URL pinned per
 #     feedback_act_runner_github_server_url.
-#   - `continue-on-error: true` on each job (RFC §1 contract).
+#   - The original port added `continue-on-error: true` to each job (RFC §1
+#     contract). Both masks have since been REMOVED — `Harness Replays` was
+#     unmasked 2026-07-14 and `detect-changes` by #4521 — after each was proven
+#     green (see the per-job comments below). Neither job is advisory any more:
+#     both fail loud.
 #
 
 # Boots tests/harness (production-shape compose topology with TenantGuard,
@@ -90,15 +94,37 @@ jobs:
   # bp-exempt: change detector only; downstream Harness Replays is the meaningful gate.
   detect-changes:
     # mc#1529 follow-on: pin to `docker-host` so this lane lands on
-    # Linux operator-host runners (the only ones with a working
-    # docker.sock + `molecule-core-net`). The bare `ubuntu-latest`
+    # self-hosted Linux runners with a working docker.sock and
+    # `molecule-core-net`. The bare `ubuntu-latest`
     # label is also matched by hongming-pc-runner-* (Windows act_runner
     # v1.0.3), where the `docker compose ...` exec below fails. Mirror
     # of mc#1543; see internal#512 for class defect.
     runs-on: docker-host
-    # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
+    # UNMASKED by #4521 (was `continue-on-error: true`). This job is a DETECTOR
+    # whose empty outputs would silently no-op the whole replay suite if it ever
+    # rolled up green while broken — the worst shape for a mask. On failure the
+    # job leaves `outputs.run` / `outputs.debug` EMPTY, and every downstream step
+    # is gated on `needs.detect-changes.outputs.run == 'true'`, so a masked
+    # failure would let the "No-op pass" step declare the gate "satisfied without
+    # running". It therefore must be able to go red — hence no mask.
+    #
+    # Proven green before un-masking, step-level via the Gitea Actions API (the
+    # roll-up status proves nothing while masked): 15/15 most-recent runs, every
+    # step `success` (runs 497985, 498111, 498199, 498228, 498298, 498371,
+    # 498398, 498490, 498583, 498631, 498684, 498786, 498860, 499081), and still
+    # green on current main (e.g. runs 549755, 549577, 549460).
+    #
+    # HISTORY: this job stayed masked longer than it should have because the
+    # repo's OWN pre-flip gate (.gitea/scripts/lint_pre_flip_continue_on_error.py)
+    # could not SEE those runs and fail-closes on what it cannot see —
+    # line 426 fetches the un-paginated `/commits/{sha}/status` combined endpoint,
+    # which Gitea caps at 30 statuses while this repo posts 60 contexts per commit,
+    # so `Harness Replays / detect-changes (push)` sorted past the cap and the
+    # gate reported "no runs ... cannot verify flip" (task #106). The flip landed
+    # anyway once that lane was proven green out-of-band; the now-dead
+    # MASK_WAIVERS entry for this context has been pruned from
+    # lint_no_coe_on_required.py.
+    #
     outputs:
       run: ${{ steps.decide.outputs.run }}
       debug: ${{ steps.decide.outputs.debug }}
@@ -199,11 +225,28 @@ jobs:
     needs: detect-changes
     name: Harness Replays
     # mc#1529 follow-on: `docker compose ... ps/logs` against tenant-alpha/
-    # beta containers. Must run on operator-host Linux (docker-host).
+    # beta containers. Must run on the Linux docker-host lane.
     runs-on: docker-host
-    # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
+    # UNMASKED 2026-07-14 (was `continue-on-error: true`). This is THE replay
+    # gate — the whole reason this workflow exists is the #2398 TenantGuard
+    # regression that shipped because nobody ran the harness. With the mask on,
+    # a failing replay rolled up to `success` and the gate could not go red at
+    # all: it asserted nothing.
+    #
+    # Proven green before un-masking, at STEP level via the Gitea Actions API
+    # (the job's own roll-up status proves nothing while masked): the 14 most
+    # recent completed runs ALL executed the suite for real ("No-op pass" =
+    # skipped, i.e. detect-changes said run=true) with `Run all replays against
+    # the harness` = success. Corroborated by `Dump compose logs on failure`
+    # (`if: failure()`) being `skipped` in all 14 — failure() never became true,
+    # so no step failed. Runs 497985, 498111, 498199, 498228, 498298, 498371,
+    # 498398, 498490, 498583, 498631, 498684, 498786, 498860, 499081.
+    #
+    # The chronic non-hermetic reds this gate used to suffer (RCA 2026-07-12,
+    # run 477499: cross-wired containers, stale tenant image) were root-fixed by
+    # the per-job dind isolation (task #78) + per-PR concurrency keying (#4122)
+    # — see the `concurrency:` and "Start disposable dind" comments above. That
+    # fix is what makes un-masking safe now.
     timeout-minutes: 30
     steps:
       - name: No-op pass (paths filter excluded this commit)
@@ -246,9 +289,9 @@ jobs:
       # symptom, different root cause: staging still has the in-image
       # clone path, hits the auth error directly).
       #
-      # 2026-05-08 sub-finding (#192): the clone step ALSO fails when
-      # any referenced workspace-template repo is private and the
-      # AUTO_SYNC_TOKEN bearer (devops-engineer persona) lacks read
+      # 2026-05-08 historical sub-finding (#192): the clone step also failed
+      # when a referenced workspace-template repo was private and the
+      # AUTO_SYNC_TOKEN bearer lacked read
       # access. Root cause: 5 of 9 workspace-template repos
       # (openclaw, codex, crewai, deepagents, gemini-cli) had been
       # marked private with no team grant. Resolution: flipped them
@@ -258,14 +301,14 @@ jobs:
       # internal#102.
       #
       # Token shape matches publish-workspace-server-image.yml: AUTO_SYNC_TOKEN
-      # is the devops-engineer persona PAT, NOT the founder PAT (per
-      # `feedback_per_agent_gitea_identity_default`). clone-manifest.sh
+      # is a scoped automation credential, not the founder PAT.
+      # clone-manifest.sh
       # embeds it as basic-auth for the duration of the clones and strips
       # .git directories — the token never enters the resulting image.
       - name: Fetch AUTO_SYNC_TOKEN from Infisical SSOT
-        # Bot-token consolidation (secrets->kms). AUTO_SYNC_TOKEN (the
-        # devops-engineer persona PAT, used here as the cross-repo clone token
-        # for manifest deps) is now pulled from the Infisical SSOT at
+        # Secret-source consolidation (Infisical SSOT). AUTO_SYNC_TOKEN, used
+        # here as the cross-repo clone token for manifest deps, is pulled from
+        # the Infisical SSOT at
         # /shared/dev-utils::AUTO_SYNC_TOKEN (environment=prod) instead of the
         # duplicated `secrets.AUTO_SYNC_TOKEN` Gitea secret. Exported to
         # $GITHUB_ENV and consumed as env.* by "Pre-clone manifest deps" below.
@@ -332,24 +375,17 @@ jobs:
           echo "Cloned: ws=$ws_count org=$org_count plugins=$plugins_count"
 
       - name: Install Python deps for replays
-        # peer-discovery-404 (and future replays) eval Python against the
-        # running tenant — importing workspace/a2a_client.py pulls in
-        # httpx. tests/harness/requirements.txt holds just the HTTP-client
-        # surface to keep CI install fast (~3s) vs the full
-        # workspace/requirements.txt (~30s).
+        # Replays exercise both tenant wire behavior and selected helpers from
+        # the published workspace-runtime wheel. Keep replay-only public
+        # dependencies in tests/harness/requirements.txt rather than pointing
+        # back at the runtime repository's source tree.
         if: needs.detect-changes.outputs.run == 'true'
-        # molecule-ai-workspace-runtime lives ONLY on the Gitea package
-        # registry (it was removed from public PyPI to close the
-        # dependency-confusion shadow), so pip needs the Gitea index as an
-        # EXTRA index. A plain `pip install -r` reaches public PyPI only and
-        # fails "No matching distribution found for
-        # molecule-ai-workspace-runtime>=0.1.78 (from versions: none)" —
-        # which reds this gate on every PR + push. httpx still resolves from
-        # PyPI. Mirrors e2e-api.yml's "Install standalone runtime parser from
-        # Gitea registry" step (proven-green).
+        # The canonical molecules-workspace-runtime wheel is private while its
+        # dependencies are public. Install it through the split-index helper;
+        # never expose the private package name to --extra-index-url.
         run: |
-          pip install \
-            --extra-index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
+          bash scripts/install-workspace-runtime.sh
+          python3 -m pip install --index-url https://pypi.org/simple/ \
             -r tests/harness/requirements.txt
 
       - name: Start disposable dind (per-job isolation — task #78)

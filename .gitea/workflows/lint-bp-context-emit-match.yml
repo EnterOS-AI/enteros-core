@@ -14,8 +14,8 @@ name: lint-bp-context-emit-match
 #
 # Why this exists
 # ---------------
-# A BP-required context with no emitter blocks merges forever — Gitea
-# 1.22.6 treats absent-as-`pending`, NOT absent-as-`skipped`. The
+# A BP-required context with no emitter blocks merges forever: this repository's
+# protection gate treats an absent context as `pending`, not `skipped`. The
 # phantom-required-check class previously surfaced as
 # `feedback_phantom_required_check_after_gitea_migration` (a port
 # kept the GitHub context name after rename to Gitea, but no
@@ -38,8 +38,8 @@ name: lint-bp-context-emit-match
 #
 # Auth
 # ----
-# `GET /repos/.../branch_protections/{branch}` requires repo-admin
-# role on Gitea 1.22.6. We use DRIFT_BOT_TOKEN (same persona as
+# The token used for `GET /repos/.../branch_protections/{branch}` needs
+# repo-admin access. We use DRIFT_BOT_TOKEN (same persona as
 # ci-required-drift.yml — `internal#329` provisioning trail).
 # Graceful-degrade per Tier 2a contract: 403/404 → exit 0 with
 # ::error::.

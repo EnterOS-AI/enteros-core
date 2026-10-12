@@ -1,197 +1,172 @@
-# Social Channels Quickstart — Connect Your AI Agent to Discord or Telegram
+# Social Channels Quickstart — Discord and Telegram
 
-Your Molecule AI workspace can receive messages from and reply to Discord channels and Telegram chats — using the same A2A routing your canvas uses internally. This tutorial gets you from zero to a live slash-command bot in about ten minutes.
+Connect a workspace to Discord or Telegram using the same A2A path as Canvas.
+Channel changes hot-reload; no platform restart is required. A workspace can
+have one channel row per platform type, and a Telegram row can cover multiple
+chat IDs.
 
-> **What you get:** agents that respond to `/ask`, `/status`, and `/help` commands in Discord or Telegram. One channel per workspace. Hot-reload config — no restart required.
+| Platform | Inbound | Outbound |
+|---|---|---|
+| Discord | Ed25519-signed HTTP Interactions | Discord Incoming Webhook |
+| Telegram | Bot API long polling (default) or secret-token webhook | Bot API |
 
----
+## Discord
 
-## How the adapter system works
+### 1. Create the outbound webhook
 
-Both Discord and Telegram use the same `ChannelAdapter` interface under the hood. The workspace agent never knows which platform it's talking to — it receives plain text via A2A and replies the same way.
+In the target Discord channel, open **Channel Settings → Integrations →
+Webhooks**, create a webhook, and copy its URL:
 
-| Platform | Inbound method | Outbound method | Slash commands |
-|---|---|---|---|
-| **Discord** | Discord Interactions (webhook) | Incoming Webhook | ✅ via `/ask` |
-| **Telegram** | Long-polling | Bot API | ✅ via `/ask` |
+```text
+https://discord.com/api/webhooks/123456789/abcdefghijklmnop
+```
 
-New platforms add one adapter implementation. The REST API, Canvas UI, and MCP tools work automatically.
+The URL contains a credential. Do not paste it into logs or issues.
 
----
+### 2. Connect the workspace
 
-## Discord — Setup
+For outbound-only use, select **Discord** in Canvas → **Channels** and enter
+the webhook URL. For inbound commands, also enter:
 
-### Step 1 — Create a Discord webhook
+- **Discord Channel ID** (`chat_id`)
+- the Discord Application's hex-encoded **Interactions Public Key**
+  (`public_key`)
 
-1. Open your Discord server → **Channel Settings** → **Integrations** → **Webhooks**
-2. Click **New Webhook** → name it (e.g. "Molecule AI Agent")
-3. Copy the webhook URL — it looks like:
-   `https://discord.com/api/webhooks/123456789/abcdefghijklmnop`
+The equivalent API request is:
 
-The webhook URL encodes the channel and bot credentials. You don't need a separate bot account for outbound messages.
-
-### Step 2 — Connect via Canvas
-
-1. Open your workspace in Canvas → **Channels** tab → **+ Connect**
-2. Select **Discord**
-3. Paste the webhook URL
-4. Click **Connect**
-
-That's it. Your workspace can now send messages to that Discord channel.
-
-### Step 3 — Add inbound slash commands
-
-For Discord to route slash commands to your workspace:
-
-1. Go to the [Discord Developer Portal](https://discord.com/developers/applications)
-2. Create a new Application (or use an existing bot)
-3. Under **General Information**, copy the **Application ID** and **Public Key**
-4. Under **OAuth2** → **URL Generator**, add the scope: `bot`
-5. Visit the generated URL to add the bot to your server
-6. In your platform's Canvas → **Channels** → Discord channel → **Interactions Endpoint URL**:
-   - Set it to `https://your-platform.com/webhooks/discord`
-   - Discord requires HTTPS
-
-7. Register the bot's slash commands with Discord:
-   ```bash
-   curl -X POST "https://discord.com/api/v10/applications/${APP_ID}/commands" \
-     -H "Authorization: Bot ${BOT_TOKEN}" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "name": "ask",
-       "type": 1,
-       "description": "Ask the Molecule AI agent"
-     }'
-   ```
-
-### Step 4 — Verify
-
-Send `/ask what's our deployment status?` in your Discord channel. Your agent replies.
-
-If it doesn't respond, check:
-- The Interactions Endpoint URL is set correctly in Canvas
-- The bot is in the correct Discord server with permissions to read slash commands
-- Your platform URL is publicly accessible (Discord needs to POST to it)
-
----
-
-## Telegram — Setup
-
-### Step 1 — Create a Telegram bot
-
-1. Open a chat with [@BotFather](https://t.me/BotFather) on Telegram
-2. Send `/newbot`
-3. Follow the prompts — save the token (looks like `123456789:ABCdefGHI...`)
-
-### Step 2 — Disable group privacy (recommended)
-
-By default, Telegram bots only see slash commands and @mentions in groups. To let the bot see all messages (for a better experience):
-
-1. `@BotFather` → `/mybots` → select your bot
-2. **Bot Settings** → **Group Privacy** → **Turn off**
-3. Re-add the bot to your group (privacy changes only apply to new memberships)
-
-### Step 3 — Connect via Canvas
-
-1. Open your workspace in Canvas → **Channels** tab → **+ Connect**
-2. Select **Telegram**
-3. Paste the bot token from Step 1
-4. Click **Detect Chats** — this lists the chats the bot is currently in
-5. Select the chats to connect → **Connect**
-
-Or via API:
 ```bash
-curl -X POST https://your-platform.com/workspaces/${WORKSPACE_ID}/channels \
+curl -X POST "${PLATFORM_URL}/workspaces/${WORKSPACE_ID}/channels" \
   -H "Authorization: Bearer ${TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
-    "channel_type": "telegram",
+    "channel_type": "discord",
     "config": {
-      "bot_token": "123456789:ABCdefGHI..."
+      "webhook_url": "https://discord.com/api/webhooks/123456789/abcdefghijklmnop",
+      "chat_id": "123456789012345678",
+      "public_key": "YOUR_APPLICATION_ED25519_PUBLIC_KEY_HEX"
     },
     "allowed_users": []
   }'
 ```
 
-### Step 4 — Verify
+`webhook_url` is the only field required for outbound-only use.
 
-Send `/ask hello` to the bot in your Telegram chat. Your agent replies.
+### 3. Configure inbound Interactions
 
----
+Create a Discord Application, point its **Interactions Endpoint URL** at:
 
-## What your agents can do
+```text
+https://your-platform.example/webhooks/discord
+```
 
-Once connected, your workspace agent handles:
+Register the application commands you want through Discord's Developer Portal
+or API. Molecule AI does not create `/ask`, `/status`, or any other command.
+It forwards the name and options of a command that you registered.
 
-| Command | What it does |
-|---|---|
-| `/ask <question>` | Routes the question to the agent, replies in the same chat |
-| `/status` | Returns current agent status (idle / active tasks) |
-| `/help` | Lists available commands |
-| `/reset` | Clears conversation history (Telegram only) |
+The receiver verifies Discord's Ed25519 signature against the same channel row
+that later matches the payload's `channel_id`. Discord PING receives a type-1
+PONG. A valid command receives an immediate ephemeral type-4 acknowledgement;
+the agent's eventual reply is posted through the configured Incoming Webhook.
 
-Slash commands are the interface. The agent decides what to do. Your Discord server or Telegram chat is the front-end your team already uses.
+To verify, invoke a command you actually registered. You should first see the
+acknowledgement and then the agent reply in that channel.
 
----
+## Telegram
 
-## Multi-chat setup
+### 1. Create the bot
 
-A single workspace channel serves multiple chats. Add chat IDs via Canvas or API:
+Open [@BotFather](https://t.me/BotFather), run `/newbot`, and save the bot
+token. In groups, disable Group Privacy if the bot should receive ordinary
+messages, then remove and re-add it so the setting takes effect.
+
+### 2. Detect and connect chats
+
+In Canvas → **Channels**, select **Telegram**, enter the token, add the bot to
+the desired chats, and click **Detect Chats**. Select one or more chat IDs and
+connect the channel.
 
 ```bash
-# Via API — comma-separated chat IDs
-curl -X PATCH https://your-platform.com/workspaces/${WORKSPACE_ID}/channels/${CHANNEL_ID} \
+curl -X POST "${PLATFORM_URL}/workspaces/${WORKSPACE_ID}/channels" \
   -H "Authorization: Bearer ${TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
+    "channel_type": "telegram",
     "config": {
       "bot_token": "123456789:ABCdefGHI...",
-      "chat_id": "-100123456789, -100987654321"
-    }
+      "chat_id": "-100123456789"
+    },
+    "allowed_users": []
   }'
 ```
 
----
+Send an ordinary text message to verify the agent round trip. The adapter also
+registers four local bot commands:
+
+| Command | Implemented behavior |
+|---|---|
+| `/start` | Confirm that the bot is connected |
+| `/help` | Show the command list |
+| `/reset` | Clear this chat's Redis conversation history |
+| `/cancel` | Acknowledge a best-effort cancellation request; no hard-cancel plumbing exists |
+
+Other slash-prefixed text is not a built-in command; it is forwarded like any
+other message if Telegram delivers it.
+
+### Optional webhook mode
+
+Long polling is the default. To use Telegram webhooks, generate a `secret_token`,
+pass it to Telegram's `setWebhook`, and store the identical value as
+`config.webhook_secret`. Point Telegram at:
+
+```text
+https://your-platform.example/webhooks/telegram
+```
+
+The presence of `webhook_secret` disables long polling for that row. The
+receiver requires an exact constant-time match of the
+`X-Telegram-Bot-Api-Secret-Token` header. A row with no secret cannot receive
+requests through the public Telegram webhook route.
+
+## Multi-chat Telegram rows
+
+`chat_id` accepts a comma-separated list:
+
+```json
+{
+  "bot_token": "123456789:ABCdefGHI...",
+  "chat_id": "-100123456789, -100987654321"
+}
+```
+
+Inbound messages from any listed chat route to the same workspace. Outbound
+messages fan out to every configured chat ID.
 
 ## Sending outbound messages
 
-Agents can send messages to channels proactively — useful for notifications, summaries, or scheduled reports:
+Use the channel API with a real channel row ID:
 
-```python
-# In your agent code
-client.send_channel_message(
-    channel_id="ch_abc123",
-    text="Deployment complete. 47 tests passing."
-)
+```bash
+curl -X POST "${PLATFORM_URL}/workspaces/${WORKSPACE_ID}/channels/${CHANNEL_ID}/send" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Deployment complete."}'
 ```
 
-Or via MCP tool:
-```typescript
-send_channel_message({ workspace_id, channel_id, text })
-```
+## Security behavior
 
----
+- Discord Interactions use per-row Ed25519 verification; Discord webhook URLs
+  are never included in returned HTTP-client errors.
+- Telegram webhook mode uses Telegram's exact secret-token header; token-format
+  validation alone is not webhook authentication.
+- In production, `bot_token`, `webhook_secret`, and credential-bearing
+  `webhook_url` values are AES-256-GCM field-encrypted in `channel_config` and
+  redacted from list responses. Recoverable encryption is required because the
+  adapters use these credentials for outbound API calls.
+- `allowed_users` can restrict a channel to selected platform user or chat IDs.
 
-## Hot reload
+## Related
 
-Adding, updating, or removing a channel takes effect immediately — no platform restart required. Changes in Canvas → **Channels** tab are reflected within seconds.
-
----
-
-## Security notes
-
-- Discord webhook tokens are never logged. HTTP request errors surface as generic messages.
-- Telegram bot tokens are stored server-side (SHA-256 hash in DB) and shown once at creation.
-- Both adapters verify request signatures before processing (Discord: HMAC-SHA256, Telegram: token format validation).
-- Add `allowed_users` to restrict access to specific Discord users or Telegram chat IDs.
-
----
-
-## What's next
-
-- [Discord adapter launch post](/docs/blog/discord-adapter-launch) — the full product story
-- [Social channels architecture](/docs/agent-runtime/social-channels) — adapter interface, MCP tools, DB schema
-- [Telegram tutorial](/docs/tutorials/lark-feishu-channel) — Lark/Feishu adapter (same pattern)
-- [Remote agent tutorial](/docs/tutorials/register-remote-agent) — run your agent on a remote machine and connect it to a social channel
-
-*Molecule AI is open source. Discord adapter shipped in PR #656. Telegram adapter shipped in Phase 25.*
+- [Social channels reference](../agent-runtime/social-channels.md)
+- [Discord adapter implementation note](../blog/2026-04-21-discord-adapter/index.md)
+- [Lark / Feishu tutorial](lark-feishu-channel.md)
+- [Remote agent tutorial](register-remote-agent.md)

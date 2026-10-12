@@ -15,15 +15,15 @@
 // client UUID), so the id-keyed reconcile merge never collides them, and the
 // timestamps are >3s apart, so appendMessageDeduped's short (3s) window can't
 // collapse them either. Before the fix, BOTH copies rendered → the user saw the
-// greeting twice. The fix (commit 15032a31) added a 60s optimistic-collapse to
-// mergeReconciledMessages (useChatHistory.ts) that drops the optimistic/live
-// copy once its authoritative DB copy has arrived within the clock-skew window.
+// greeting twice. The current merge drops the optimistic/live twin once its
+// authoritative DB copy arrives by stable content identity with count-based
+// one-to-one matching; it does not depend on a clock-skew window.
 //
 // This guard DRIVES THE REAL merge logic (mergeReconciledMessages via the
 // useChatHistory hook's reconcile(), and the real appendMessageDeduped from
 // types.ts) — it is NOT a synthetic invariant checker. It:
-//   • PASSES on current main (with 15032a31): exactly ONE greeting renders, and
-//   • FAILS on the pre-15032a31 logic: TWO greetings render (locked in-file via
+//   • PASSES on current main: exactly ONE greeting renders, and
+//   • FAILS on the pre-dedup logic: TWO greetings render (locked in-file via
 //     a verbatim copy of the stale merge, and demonstrated empirically by
 //     swapping useChatHistory.ts back to its parent b6fbda16 — see the PR).
 //
@@ -110,8 +110,8 @@ describe("concierge slow-cold greeting: render-dup regression guard (REAL merge 
       await result.current.reconcile();
     });
 
-    // THE GUARD: exactly ONE greeting bubble renders. The 60s optimistic-collapse
-    // drops the live copy in favour of its authoritative DB copy.
+    // THE GUARD: exactly ONE greeting bubble renders. Window-free content
+    // identity drops the live twin in favour of its authoritative DB copy.
     expect(greetingCount(result.current.messages)).toBe(1);
     expect(result.current.messages).toHaveLength(1);
     expect(result.current.messages[0].id).toBe("4210:agent"); // the authoritative row survives
@@ -164,8 +164,8 @@ describe("concierge slow-cold greeting: render-dup regression guard (REAL merge 
 // ── The real appendMessageDeduped (types.ts): why the 3s window is not enough ──
 // Drives the exported dedupe helper directly to document its boundary: it only
 // collapses copies within ~3s of NOW, so a fast turn is covered but the slow
-// cold turn is NOT — which is exactly why the fix had to live in the reconcile
-// merge (60s gap window), not here. A fast-turn test would pass on the STALE
+// cold turn is NOT — which is exactly why the window-free fix had to live in
+// the reconcile merge, not here. A fast-turn test would pass on the STALE
 // bundle and miss the render-dup entirely.
 describe("appendMessageDeduped (types.ts) — 3s window covers a FAST turn only", () => {
   it("does NOT dedupe the slow-cold 30s-gap copy (the render-dup escapes here)", () => {
@@ -181,9 +181,8 @@ describe("appendMessageDeduped (types.ts) — 3s window covers a FAST turn only"
   });
 });
 
-// ── FAIL-BEFORE lock: the EXACT pre-15032a31 merge renders TWO greetings ───────
-// Verbatim copy of mergeReconciledMessages at parent commit b6fbda16 (BEFORE the
-// fix 15032a31 added the 60s optimistic-collapse). Kept ONLY as the documented
+// ── FAIL-BEFORE lock: the old id-only merge renders TWO greetings ──────────────
+// Verbatim copy of the pre-dedup merge. Kept ONLY as the documented
 // regression reference — product code is untouched. Applied to the SAME fixtures
 // the hook-driven guard above uses, the stale logic renders TWO greetings,
 // proving (1) the scenario genuinely triggers the bug and (2) the guard

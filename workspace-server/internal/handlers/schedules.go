@@ -1,7 +1,7 @@
 package handlers
 
 import (
-	"database/sql"
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -10,9 +10,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/cronspec"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/scheduler"
 )
 
 // ErrorResponse is returned for 4xx/5xx errors. (OpenAPI doc shape — used by swaggo.)
@@ -48,10 +47,43 @@ type HistoryEntry struct {
 	Request     json.RawMessage `json:"request" swaggertype:"object"`
 }
 
-type ScheduleHandler struct{}
+type ScheduleHandler struct {
+	// httpClient forwards volume-mode CRUD to the workspace runtime's
+	// /internal/schedules API. Broken out so tests can inject an
+	// httptest.Server-backed client. nil → lazily built with the SSRF-safe
+	// dialer (same guard as the chat-file / A2A forwards).
+	httpClient *http.Client
+}
 
 func NewScheduleHandler() *ScheduleHandler {
 	return &ScheduleHandler{}
+}
+
+// forwardClient returns the SSRF-safe client used for volume-mode forwards,
+// lazily constructing the default. The dialer re-applies isSafeURL at connect
+// time (DNS-rebind defence), matching chat_files/a2a_proxy.
+func (h *ScheduleHandler) forwardClient() *http.Client {
+	if h.httpClient != nil {
+		return h.httpClient
+	}
+	h.httpClient = &http.Client{
+		Timeout: scheduleForwardTimeout,
+		Transport: &http.Transport{
+			DialContext:         safeDialer().DialContext,
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
+	}
+	return h.httpClient
+}
+
+// computeNextRunSafe wraps cronspec.ComputeNextRun with the current time in the
+// schedule's timezone. Returned in UTC (cronspec's contract).
+func computeNextRunSafe(cronExpr, tz string) (time.Time, error) {
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return cronspec.ComputeNextRun(cronExpr, tz, time.Now().In(loc))
 }
 
 type ScheduleResponse struct {
@@ -83,41 +115,7 @@ type ScheduleResponse struct {
 //	@Router		/workspaces/{id}/schedules [get]
 //	@Security	BearerAuth && OrgSlugAuth
 func (h *ScheduleHandler) List(c *gin.Context) {
-	workspaceID := c.Param("id")
-	ctx := c.Request.Context()
-
-	rows, err := db.DB.QueryContext(ctx, `
-		SELECT id, workspace_id, name, cron_expr, timezone, prompt, enabled,
-		       last_run_at, next_run_at, run_count, last_status, last_error,
-		       source, created_at, updated_at
-		FROM workspace_schedules
-		WHERE workspace_id = $1
-		ORDER BY created_at ASC
-	`, workspaceID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query schedules"})
-		return
-	}
-	defer rows.Close()
-
-	schedules := make([]ScheduleResponse, 0)
-	for rows.Next() {
-		var s ScheduleResponse
-		if err := rows.Scan(
-			&s.ID, &s.WorkspaceID, &s.Name, &s.CronExpr, &s.Timezone,
-			&s.Prompt, &s.Enabled, &s.LastRunAt, &s.NextRunAt, &s.RunCount,
-			&s.LastStatus, &s.LastError, &s.Source, &s.CreatedAt, &s.UpdatedAt,
-		); err != nil {
-			log.Printf("Schedules.List: scan error: %v", err)
-			continue
-		}
-		schedules = append(schedules, s)
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("Schedules.List: rows error: %v", err)
-	}
-
-	c.JSON(http.StatusOK, schedules)
+	h.listVolume(c, c.Param("id"))
 }
 
 type CreateScheduleRequest struct {
@@ -159,45 +157,45 @@ func (h *ScheduleHandler) Create(c *gin.Context) {
 		body.Timezone = "UTC"
 	}
 
-	// Validate timezone
-	loc, err := time.LoadLocation(body.Timezone)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid timezone: " + body.Timezone})
+	// Fast-fail an invalid cron / timezone BEFORE the (up to 8s) synchronous arm
+	// and the volume forward — the retired DB path validated these core-side, and
+	// while the runtime store re-validates, doing it here avoids spending the arm +
+	// forward budget on input the runtime will only reject. Same SSOT validator.
+	if err := cronspec.Validate(body.CronExpr, body.Timezone); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Validate and compute next run
-	nextRun, err := scheduler.ComputeNextRun(body.CronExpr, body.Timezone, time.Now().In(loc))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
-		return
+	// Bound the whole arm+forward so a wedged runtime returns a retryable 503
+	// within the client budget rather than hanging.
+	createCtx, cancel := context.WithTimeout(ctx, createScheduleDeadline)
+	defer cancel()
+
+	// Per-workspace scheduler delivery (scheduler-as-trigger-plugin): a workspace
+	// that has a schedule must run the molecule-scheduler trigger daemon. DECLARE
+	// the plugin — the durable net (installs on the next boot/reconcile so
+	// scheduling survives a restart); bounded + detached so a client disconnect
+	// can't abort the must-persist upsert nor a slow write hang it. Non-fatal.
+	if err := ensureSchedulerPluginDeclaredBounded(createCtx, workspaceID); err != nil {
+		log.Printf("Schedules.Create: declare scheduler plugin for %s (non-fatal): %v", workspaceID, err)
 	}
 
-	enabled := true
-	if body.Enabled != nil {
-		enabled = *body.Enabled
+	// Resolve the workspace forward creds ONCE (SSOT) — shared by the arm and the
+	// create forward, so there is no duplicate workspaces.url query.
+	wsURL, secret, ok := resolveWorkspaceForwardCreds(c, createCtx, workspaceID, "schedules")
+	if !ok {
+		return // gin error already written (404/422/503); declaration persisted above
 	}
 
-	var id string
-	// source='runtime' marks this row as user-created (Canvas/API). The
-	// org/import path inserts with source='template' and only refreshes
-	// template-source rows on re-import (issue #24), so runtime rows survive.
-	err = db.DB.QueryRowContext(ctx, `
-		INSERT INTO workspace_schedules (workspace_id, name, cron_expr, timezone, prompt, enabled, next_run_at, source)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, 'runtime')
-		RETURNING id
-	`, workspaceID, body.Name, body.CronExpr, body.Timezone, body.Prompt, enabled, nextRun).Scan(&id)
-	if err != nil {
-		log.Printf("Schedules.Create: insert error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create schedule"})
-		return
-	}
+	// ARM the daemon SYNCHRONOUSLY before forwarding — a 2xx reload proves
+	// /internal/schedules is serving (it mounts before the reload route), closing
+	// the first-schedule race the retired DB path used to absorb. Non-fatal: a
+	// false return still forwards, and createVolume's transient retry + 503 cover a
+	// still-starting daemon.
+	armSchedulerReload(createCtx, workspaceID, wsURL, secret)
 
-	c.JSON(http.StatusCreated, gin.H{
-		"id":          id,
-		"status":      "created",
-		"next_run_at": nextRun,
-	})
+	// The runtime store re-validates cron + timezone + caps.
+	h.createVolume(c, createCtx, workspaceID, body, wsURL, secret)
 }
 
 type UpdateScheduleRequest struct {
@@ -227,8 +225,6 @@ type UpdateScheduleRequest struct {
 func (h *ScheduleHandler) Update(c *gin.Context) {
 	scheduleID := c.Param("scheduleId")
 	workspaceID := c.Param("id") // #113: bind to owning workspace to prevent IDOR
-	ctx := c.Request.Context()
-
 	var body UpdateScheduleRequest
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON"})
@@ -241,67 +237,25 @@ func (h *ScheduleHandler) Update(c *gin.Context) {
 		body.Prompt = &clean
 	}
 
-	// If cron_expr or timezone changed, revalidate and recompute next_run
-	var nextRunAt *time.Time
-	if body.CronExpr != nil || body.Timezone != nil {
-		var currentCron, currentTZ string
-		err := db.DB.QueryRowContext(ctx,
-			`SELECT cron_expr, timezone FROM workspace_schedules WHERE id = $1 AND workspace_id = $2`,
-			scheduleID, workspaceID,
-		).Scan(&currentCron, &currentTZ)
-		if err != nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "schedule not found"})
+	// Fast-fail an invalid cron / timezone on the provided fields (the retired DB
+	// path validated these core-side; the runtime re-validates on PATCH). Update
+	// is partial, so validate what's present: cron+tz together when both are given,
+	// else the timezone alone (an invalid IANA zone was the specific dropped check).
+	switch {
+	case body.CronExpr != nil && body.Timezone != nil:
+		if err := cronspec.Validate(*body.CronExpr, *body.Timezone); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		cronExpr := currentCron
-		if body.CronExpr != nil {
-			cronExpr = *body.CronExpr
-		}
-		tz := currentTZ
-		if body.Timezone != nil {
-			tz = *body.Timezone
-		}
-		loc, err := time.LoadLocation(tz)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid timezone: " + tz})
+	case body.Timezone != nil:
+		if _, err := time.LoadLocation(*body.Timezone); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid timezone: " + *body.Timezone})
 			return
 		}
-		nextRun, err := scheduler.ComputeNextRun(cronExpr, tz, time.Now().In(loc))
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
-			return
-		}
-		nextRunAt = &nextRun
 	}
 
-	result, err := db.DB.ExecContext(ctx, `
-		UPDATE workspace_schedules SET
-			name      = COALESCE($2, name),
-			cron_expr = COALESCE($3, cron_expr),
-			timezone  = COALESCE($4, timezone),
-			prompt    = COALESCE($5, prompt),
-			enabled   = COALESCE($6, enabled),
-			next_run_at = COALESCE($7, next_run_at),
-			updated_at = now()
-		WHERE id = $1 AND workspace_id = $8
-	`, scheduleID, body.Name, body.CronExpr, body.Timezone, body.Prompt, body.Enabled, nextRunAt, workspaceID)
-	if err != nil {
-		log.Printf("Schedules.Update: error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update schedule"})
-		return
-	}
-	n, err := result.RowsAffected()
-	if err != nil {
-		log.Printf("Schedules.Update: RowsAffected error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update schedule"})
-		return
-	}
-	if n == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "schedule not found"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"status": "updated"})
+	// scheduleID is the grid entry name in the volume model.
+	h.updateVolume(c, workspaceID, scheduleID, body)
 }
 
 // Delete removes a schedule.
@@ -319,27 +273,7 @@ func (h *ScheduleHandler) Update(c *gin.Context) {
 func (h *ScheduleHandler) Delete(c *gin.Context) {
 	scheduleID := c.Param("scheduleId")
 	workspaceID := c.Param("id") // #113: bind to owning workspace to prevent IDOR
-	ctx := c.Request.Context()
-
-	result, err := db.DB.ExecContext(ctx,
-		`DELETE FROM workspace_schedules WHERE id = $1 AND workspace_id = $2`,
-		scheduleID, workspaceID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete schedule"})
-		return
-	}
-	n, err := result.RowsAffected()
-	if err != nil {
-		log.Printf("Schedules.Delete: RowsAffected error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete schedule"})
-		return
-	}
-	if n == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "schedule not found"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
+	h.deleteVolume(c, workspaceID, scheduleID)
 }
 
 // RunNow manually fires a schedule immediately.
@@ -357,30 +291,10 @@ func (h *ScheduleHandler) Delete(c *gin.Context) {
 func (h *ScheduleHandler) RunNow(c *gin.Context) {
 	scheduleID := c.Param("scheduleId")
 	workspaceID := c.Param("id")
-	ctx := c.Request.Context()
-
-	var prompt string
-	err := db.DB.QueryRowContext(ctx,
-		`SELECT prompt FROM workspace_schedules WHERE id = $1 AND workspace_id = $2`,
-		scheduleID, workspaceID,
-	).Scan(&prompt)
-	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": "schedule not found"})
-		return
-	}
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read schedule"})
-		return
-	}
-
-	// The actual A2A fire is done by the caller via the proxy — we just
-	// return the prompt so the frontend can POST it to /workspaces/:id/a2a.
-	// This keeps the handler stateless and avoids circular deps on WorkspaceHandler.
-	c.JSON(http.StatusOK, gin.H{
-		"status":       "fired",
-		"workspace_id": workspaceID,
-		"prompt":       prompt,
-	})
+	// The trigger daemon fires the turn as a self-scheduler system turn
+	// (RFC §1.1) — the platform does not hand a prompt back for the client
+	// to fire. Response carries fired_by:"daemon" so Canvas skips /a2a.
+	h.runNowVolume(c, workspaceID, scheduleID)
 }
 
 // History returns recent runs for a schedule from activity_logs.
@@ -397,43 +311,10 @@ func (h *ScheduleHandler) RunNow(c *gin.Context) {
 func (h *ScheduleHandler) History(c *gin.Context) {
 	scheduleID := c.Param("scheduleId")
 	workspaceID := c.Param("id")
-	ctx := c.Request.Context()
-
-	// #152: include error_detail in history so UI can show why a run failed.
-	// activity_logs.error_detail is populated by scheduler.fireSchedule when
-	// the A2A proxy returns non-2xx or the update SQL reports an error.
-	rows, err := db.DB.QueryContext(ctx, `
-		SELECT created_at, duration_ms, status,
-		       COALESCE(error_detail, '') as error_detail,
-		       COALESCE(request_body::text, '{}') as request_body
-		FROM activity_logs
-		WHERE workspace_id = $1
-		  AND activity_type = 'cron_run'
-		  AND request_body->>'schedule_id' = $2
-		ORDER BY created_at DESC
-		LIMIT 20
-	`, workspaceID, scheduleID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query history"})
-		return
-	}
-	defer rows.Close()
-
-	entries := make([]HistoryEntry, 0)
-	for rows.Next() {
-		var e HistoryEntry
-		var reqStr string
-		if err := rows.Scan(&e.Timestamp, &e.DurationMs, &e.Status, &e.ErrorDetail, &reqStr); err != nil {
-			continue
-		}
-		e.Request = json.RawMessage(reqStr)
-		entries = append(entries, e)
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("ScheduleHistory: rows error: %v", err)
-	}
-
-	c.JSON(http.StatusOK, entries)
+	// scheduleID is the grid entry name in the volume model; the runtime's
+	// bounded run log is the source (P4b re-point — post-#4399 no core code
+	// writes cron_run rows for these workspaces).
+	h.historyVolume(c, workspaceID, scheduleID)
 }
 
 // ScheduleHealthResponse is the read-only health view of a schedule.
@@ -461,12 +342,12 @@ type ScheduleHealthResponse struct {
 //
 // Auth rules (mirrors the A2A proxy pattern):
 //   - X-Workspace-ID header is required to identify the caller.
-//   - If the caller workspace has any live tokens, the Authorization: Bearer
-//     header must carry that caller's own valid token (lazy-bootstrap: legacy
-//     workspaces with no tokens are grandfathered through).
+//   - The Authorization bearer must authenticate the caller workspace, or be
+//     a verified human admin/session credential. There is no tokenless legacy
+//     or self-call exception.
 //   - registry.CanCommunicate(callerID, workspaceID) must return true.
-//   - System callers (webhook:*, system:*, test:*) bypass token + access checks.
-//   - Self-calls (callerID == workspaceID) are always allowed.
+//   - System caller prefixes supplied through HTTP are rejected.
+//   - Self-calls skip hierarchy checks only after bearer authentication.
 //
 // Prompt and cron_expr are intentionally absent from the response.
 func (h *ScheduleHandler) Health(c *gin.Context) {
@@ -479,22 +360,21 @@ func (h *ScheduleHandler) Health(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "X-Workspace-ID header required"})
 		return
 	}
+	if isSystemCaller(callerID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "invalid caller ID"})
+		return
+	}
 
 	// Validate the caller's own bearer token (Phase 30.5 contract).
-	// Skip for system callers and self-calls, same as the A2A proxy.
 	// Post-RFC#637: canvas users may read schedule health too.
-	isCanvasUser := false
-	if !isSystemCaller(callerID) && callerID != workspaceID {
-		var err error
-		isCanvasUser, err = validateCallerToken(ctx, c, callerID)
-		if err != nil {
-			return // response already written with 401
-		}
+	isCanvasUser, err := validateCallerToken(ctx, c, callerID)
+	if err != nil {
+		return // response already written with 401
 	}
 
 	// CanCommunicate gate — only peers in the org hierarchy may read health.
 	// Canvas users (human operators) bypass this gate.
-	if callerID != workspaceID && !isSystemCaller(callerID) && !isCanvasUser {
+	if callerID != workspaceID && !isCanvasUser {
 		if !registry.CanCommunicate(callerID, workspaceID) {
 			log.Printf("ScheduleHealth: access denied %s → %s", callerID, workspaceID)
 			c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
@@ -502,34 +382,8 @@ func (h *ScheduleHandler) Health(c *gin.Context) {
 		}
 	}
 
-	rows, err := db.DB.QueryContext(ctx, `
-		SELECT id, name, enabled, last_run_at, next_run_at, run_count, last_status, last_error
-		FROM workspace_schedules
-		WHERE workspace_id = $1
-		ORDER BY created_at ASC
-	`, workspaceID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query schedules"})
-		return
-	}
-	defer rows.Close()
-
-	schedules := make([]ScheduleHealthResponse, 0)
-	for rows.Next() {
-		var s ScheduleHealthResponse
-		if err := rows.Scan(
-			&s.ID, &s.Name, &s.Enabled, &s.LastRunAt, &s.NextRunAt,
-			&s.RunCount, &s.LastStatus, &s.LastError,
-		); err != nil {
-			log.Printf("ScheduleHealth: scan error: %v", err)
-			continue
-		}
-		schedules = append(schedules, s)
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("ScheduleHealth: rows error: %v", err)
-	}
-
-	c.JSON(http.StatusOK, schedules)
+	// Serve health from the runtime grid + the trigger daemon's health file.
+	// Deliberately AFTER every auth gate above — the data source is the volume;
+	// the caller identity + CanCommunicate contract is unchanged.
+	h.healthVolume(c, workspaceID)
 }
-

@@ -1,7 +1,10 @@
 import type { Node, Edge } from "@xyflow/react";
 import type { WSMessage } from "./socket";
 import type { WorkspaceNodeData, BootStep } from "./canvas";
-import { extractResponseText, extractFilesFromTask } from "@/components/tabs/chat/message-parser";
+import { parseA2AResponse } from "@/components/tabs/chat/a2a-response";
+import { appendBootLog, mergeBootStep, parseBootStepWire } from "./boot-telemetry";
+import type { BootStepWire } from "./boot-telemetry";
+import { WS_EVENTS } from "@/lib/ws-events";
 
 // ---------------------------------------------------------------------------
 // Monotonically increasing counter used to assign grid positions.
@@ -91,12 +94,26 @@ export function handleCanvasEvent(
     edges: Edge[];
     selectedNodeId: string | null;
     agentMessages: Record<string, Array<{ id: string; content: string; timestamp: string; messageId?: string; attachments?: Array<{ name: string; uri: string; mimeType?: string; size?: number }> }>>;
+    /** Per-workspace count of mounted chat views. Gates whether an agent push is
+     *  buffered into `agentMessages` at all — see the store's `agentMessages`
+     *  doc comment for why an unconsumed queue is a duplicate waiting to happen. */
+    agentMessageConsumers: Record<string, number>;
   },
   set: (partial: Record<string, unknown>) => void,
 ): void {
   const { nodes, edges, selectedNodeId } = get();
 
   switch (msg.event) {
+    case WS_EVENTS.WorkspaceUpdated: {
+      const { name } = msg.payload;
+      if (typeof name !== "string" || !name.trim()) break;
+      set({
+        nodes: nodes.map((node) => node.id === msg.workspace_id
+          ? { ...node, data: { ...node.data, name } }
+          : node),
+      });
+      break;
+    }
     case "WORKSPACE_ONLINE": {
       const existing = nodes.find((n) => n.id === msg.workspace_id);
       const nodeName = existing?.data.name ?? (msg.payload.name as string) ?? "Workspace";
@@ -118,11 +135,18 @@ export function handleCanvasEvent(
           ? { ...e, className: "mol-deploy-edge-laser" }
           : e,
       );
+      // Greeting-first UI: a FIRST boot (provisioning→online) has not greeted
+      // yet, so mark greeted=false to render the "warming / composing greeting"
+      // state until the AGENT_MESSAGE greeting lands. A recovery flip (online
+      // after an outage — prior status not provisioning) does NOT re-greet, so
+      // it goes straight to ready. An already-greeted node stays greeted.
+      const wasProvisioning = existing.data.status === "provisioning";
+      const greetedNext = existing.data.greeted === true ? true : !wasProvisioning;
       set({
         edges: updatedEdges,
         nodes: nodes.map((n) =>
           n.id === msg.workspace_id
-            ? { ...n, data: { ...n.data, status: "online" } }
+            ? { ...n, data: { ...n.data, status: "online", greeted: greetedNext } }
             : n,
         ),
         liveAnnouncement: `${nodeName} is now online`,
@@ -197,11 +221,27 @@ export function handleCanvasEvent(
     case "WORKSPACE_PROVISIONING": {
       const exists = nodes.find((n) => n.id === msg.workspace_id);
       if (exists) {
-        // Restart — update existing node to provisioning
+        // Restart — update existing node to provisioning. bootSteps/bootLog
+        // are explicitly dropped: this event starts a NEW boot generation
+        // (the server resets its boot trace on the same event), and stale
+        // telemetry left here would render the previous boot's keycaps/log —
+        // including a spurious "Boot failed" banner — over the fresh boot,
+        // with the hydrate carry-over then preserving it on every rehydrate.
         set({
           nodes: nodes.map((n) =>
             n.id === msg.workspace_id
-              ? { ...n, data: { ...n.data, status: "provisioning", needsRestart: false, currentTask: "" } }
+              ? {
+                  ...n,
+                  data: {
+                    ...n.data,
+                    status: "provisioning",
+                    needsRestart: false,
+                    currentTask: "",
+                    bootSteps: undefined,
+                    bootLog: undefined,
+                    bootGen: undefined,
+                  },
+                }
               : n
           ),
         });
@@ -457,23 +497,53 @@ export function handleCanvasEvent(
       // Skip when both content and attachments are empty — pure-noise
       // event we don't want to render as a blank bubble.
       if (content || (attachments && attachments.length > 0)) {
-        const { agentMessages } = get();
+        const { agentMessages, agentMessageConsumers } = get();
+        // Buffer ONLY for a workspace that currently has a mounted chat view.
+        // With no consumer the entry would sit in the store until some chat
+        // view mounts later, and that view ALSO hydrates the persisted copy
+        // from GET /chat-history — the user then sees the message twice. The
+        // platform has already persisted it, so dropping here loses nothing.
+        // (The `greeted` node flag below is UNCONDITIONAL: it is node UI state,
+        // not a chat hand-off, and must flip whether or not anyone is looking.)
+        const hasConsumer = (agentMessageConsumers[msg.workspace_id] ?? 0) > 0;
         const existing = agentMessages[msg.workspace_id] || [];
         const messageId = typeof msg.payload.message_id === "string" ? msg.payload.message_id : undefined;
+        // Mark the node greeted: a real agent→user message means the agent has
+        // spoken, so the greeting-first UI can drop the "warming/composing"
+        // state and show full "ready". Only touch nodes when it actually flips
+        // (idempotent) to avoid needless React Flow re-renders. This is the live
+        // edge of the greeting-first UI decouple; reload hydrates greeted from
+        // the GET /workspaces snapshot instead.
+        const greetTarget = nodes.find((n) => n.id === msg.workspace_id);
+        const nodesPatch =
+          greetTarget && greetTarget.data.greeted !== true
+            ? {
+                nodes: nodes.map((n) =>
+                  n.id === msg.workspace_id
+                    ? { ...n, data: { ...n.data, greeted: true } }
+                    : n,
+                ),
+              }
+            : {};
         set({
-          agentMessages: {
-            ...agentMessages,
-            [msg.workspace_id]: [
-              ...existing,
-              {
-                id: crypto.randomUUID(),
-                content,
-                timestamp: new Date().toISOString(),
-                messageId,
-                ...(attachments && attachments.length > 0 ? { attachments } : {}),
-              },
-            ],
-          },
+          ...nodesPatch,
+          ...(hasConsumer
+            ? {
+                agentMessages: {
+                  ...agentMessages,
+                  [msg.workspace_id]: [
+                    ...existing,
+                    {
+                      id: crypto.randomUUID(),
+                      content,
+                      timestamp: new Date().toISOString(),
+                      messageId,
+                      ...(attachments && attachments.length > 0 ? { attachments } : {}),
+                    },
+                  ],
+                },
+              }
+            : {}),
         });
       }
       break;
@@ -511,37 +581,28 @@ export function handleCanvasEvent(
       // provisioning node lands, which is the graceful no-events fallback.
       const bootNode = nodes.find((n) => n.id === msg.workspace_id);
       if (!bootNode) break;
-      const rawStep = msg.payload.step;
-      const rawTotal = msg.payload.total;
-      const rawStatus = msg.payload.status;
-      // Defensive parse: a malformed broadcast (missing/out-of-range fields)
-      // must not corrupt the keycap layout. Reject anything that isn't a
-      // usable step rather than rendering a broken "0/8" or a blank keycap.
-      const step = typeof rawStep === "number" ? rawStep : NaN;
-      const total = typeof rawTotal === "number" ? rawTotal : NaN;
-      const key = typeof msg.payload.key === "string" ? msg.payload.key : "";
-      const label = typeof msg.payload.label === "string" ? msg.payload.label : "";
-      const status =
-        rawStatus === "running" || rawStatus === "ok" || rawStatus === "failed"
-          ? rawStatus
-          : null;
-      if (!Number.isFinite(step) || step < 1 || !Number.isFinite(total) || total < step || !key || !label || !status) {
-        break;
-      }
-      const message = typeof msg.payload.message === "string" ? msg.payload.message : undefined;
-      const incoming: BootStep = { step, total, key, label, status, message };
+      // Defensive parse — the SAME acceptance rule the GET /workspaces
+      // replay path uses (boot-telemetry.ts), so a reload can never
+      // reconstruct different state than the live session showed. A
+      // malformed broadcast is dropped rather than rendering a broken
+      // "0/8" or a blank keycap.
+      const parsed = parseBootStepWire(msg.payload as BootStepWire);
+      if (!parsed) break;
+      // Live events are stamped with the CLIENT clock; the log's display
+      // offsets clamp deltas across the clock boundary (boot-telemetry.ts),
+      // so mixing with server-stamped replayed lines cannot corrupt them.
+      const incoming: BootStep = { ...parsed, at: Date.now(), serverClock: false };
       set({
         nodes: nodes.map((n) => {
           if (n.id !== msg.workspace_id) return n;
           const prev = (n.data.bootSteps ?? []) as BootStep[];
-          // Latest status per `step` wins: a step goes running → ok/failed,
-          // so replace an existing entry at the same index in place (keeps
-          // keycap identity stable) rather than appending a duplicate.
-          const idx = prev.findIndex((s) => s.step === incoming.step);
-          const next = idx >= 0
-            ? prev.map((s, i) => (i === idx ? incoming : s))
-            : [...prev, incoming];
-          return { ...n, data: { ...n.data, bootSteps: next } };
+          // Watchdog log first (it needs the PRE-merge entry to detect
+          // whether this event's line is new), then merge latest-per-step
+          // for the keycaps. Both rules live in boot-telemetry.ts so the
+          // GET /workspaces replay path reconstructs identical state.
+          const bootLog = appendBootLog(n.data.bootLog ?? [], prev, incoming);
+          const next = mergeBootStep(prev, incoming);
+          return { ...n, data: { ...n.data, bootSteps: next, bootLog } };
         }),
       });
       break;
@@ -556,15 +617,19 @@ export function handleCanvasEvent(
       // which delivery path raced to completion first).
       const responseBody = msg.payload.response_body as Record<string, unknown> | undefined;
       if (responseBody) {
-        const text = extractResponseText(responseBody);
-        const attachments = extractFilesFromTask(
-          (responseBody.result ?? responseBody) as Record<string, unknown>,
-        );
+        const { text, attachments, pending, error } = parseA2AResponse(responseBody);
+        // Failures are handled by useChatSocket, never buffered as successful
+        // replies (which would clear the error banner and complete the send).
+        if (pending || error) break;
         if (text || attachments.length > 0) {
-          const { agentMessages } = get();
+          const { agentMessages, agentMessageConsumers } = get();
+          // Same live-hand-off rule as AGENT_MESSAGE above: no mounted chat
+          // view for this workspace => drop it, the persisted copy is
+          // authoritative and the next mount hydrates it.
+          const hasConsumer = (agentMessageConsumers[msg.workspace_id] ?? 0) > 0;
           const existing = agentMessages[msg.workspace_id] || [];
           const messageId = typeof msg.payload.message_id === "string" ? msg.payload.message_id : undefined;
-          set({
+          if (hasConsumer) set({
             agentMessages: {
               ...agentMessages,
               [msg.workspace_id]: [

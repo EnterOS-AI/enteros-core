@@ -4,11 +4,14 @@ name: Ops Scripts Tests
 # RFC internal#219 §1 sweep.
 #
 # Differences from the GitHub version:
-#   - Dropped `merge_group:` trigger (no Gitea merge queue).
+#   - Omitted GitHub's `merge_group:` trigger; this repository uses its
+#     serialized Gitea queue plus pull-request/push statuses.
 #   - on.paths references .gitea/workflows/test-ops-scripts.yml (this
 #     file) instead of the .github/ one.
 #   - Workflow-level env.GITHUB_SERVER_URL set.
-#   - `continue-on-error: true` on the job (RFC §1 contract).
+#   - (WAS: `continue-on-error: true` on the job, RFC §1 contract. REMOVED
+#     2026-07-14 — see the job comment below. This lane is the meta-gate; a mask
+#     on it made every OTHER gate unverifiable.)
 #
 # Runs the unittest suite for scripts/ on every PR + push that touches
 # anything under scripts/ or .gitea/scripts/. Kept separate from the main CI
@@ -16,7 +19,7 @@ name: Ops Scripts Tests
 # pipelines.
 #
 # Discovery layout: tests sit alongside the code they test (see
-# scripts/ops/test_sweep_cf_decide.py for the pattern; scripts/
+# scripts/ops/test_managed_flags_wiring.py for the pattern; scripts/
 # test_build_runtime_package.py for the rewriter coverage). The job
 # below runs `unittest discover` TWICE — once from `scripts/`, once
 # from `scripts/ops/` — because neither dir has an `__init__.py`, so
@@ -28,14 +31,86 @@ on:
     branches: [main, staging]
     paths:
       - 'scripts/**'
+      - 'docker-compose*.yml'
       - '.gitea/scripts/**'
-      - '.gitea/workflows/test-ops-scripts.yml'
+      # #4322: test_managed_flags_wiring.py asserts every workflow STEP rolling the
+      # staging fleet wires STAGING_TENANT_FLAGS in — so ALL workflow files must run it,
+      # else a PR deleting that env: line (the exact mutation the test catches) runs no
+      # guard. The `.gitea/workflows/**` glob covers that (and test-ops-scripts.yml +
+      # local-provision-e2e.yml).
+      # #4346: the ws-teardown guard also asserts on the e2e driver script, which is NOT
+      # under .gitea/workflows/, so it needs its own path — else a PR reverting the
+      # teardown to the sweep that deletes a concurrent run's live container runs no
+      # guard. A guard CI does not run on the files it guards is not a guard.
+      - '.gitea/workflows/**'
+      # #114: test_ephemeral_gate_is_enforced.py asserts the ephemeral-CP gate's
+      # context sits ABOVE the first `# pending-` marker (i.e. is merge-queue
+      # enforced, not merely documented). The mutation it exists to catch — moving
+      # that line back down into the parked half — touches ONLY this file, so
+      # without this path the guard would not run on the very diff it guards.
+      - '.gitea/required-contexts.txt'
+      # core#4977: test_check_onconflict_partial_index.py runs the ON CONFLICT /
+      # partial-index lint against the REAL workspace-server tree + migrations, so the
+      # mutation it exists to catch -- dropping a partial index's predicate from an ON
+      # CONFLICT clause, which Postgres rejects at RUNTIME while compiling, vetting and
+      # sqlmock-ing perfectly clean -- touches ONLY those paths. Without them the guard
+      # would not run on the very diff it guards, same reasoning as #4322/#4346 above.
+      # That exact bug shipped and reached a customer: every drift enqueue failed for
+      # the life of the feature and the queue sat empty. Suite is ~3s.
+      - 'workspace-server/**'
+      # The marketplace SSOT test guards this public stub as well as its own
+      # test file. A stub-only regression must therefore emit this gate.
+      - 'docs/design/rfc-marketplace-delivery.md'
+      - 'tests/e2e/test_local_provision_lifecycle_e2e.sh'
+      # Active staging guidance is linted by
+      # test_deploy_comment_accuracy.py; changes to either harness must run it.
+      - 'tests/e2e/test_staging_concierge_creates_workspace_e2e.sh'
+      - 'tests/e2e/test_staging_full_saas.sh'
+      # test_dind_self_reaping.py drives the per-job dind harness; a PR editing only
+      # the harness must still run the guard that pins its self-reaping.
+      - 'tests/harness/dind.sh'
   pull_request:
     branches: [main, staging]
     paths:
       - 'scripts/**'
+      - 'docker-compose*.yml'
       - '.gitea/scripts/**'
-      - '.gitea/workflows/test-ops-scripts.yml'
+      # #4322: test_managed_flags_wiring.py asserts every workflow STEP rolling the
+      # staging fleet wires STAGING_TENANT_FLAGS in — so ALL workflow files must run it,
+      # else a PR deleting that env: line (the exact mutation the test catches) runs no
+      # guard. The `.gitea/workflows/**` glob covers that (and test-ops-scripts.yml +
+      # local-provision-e2e.yml).
+      # #4346: the ws-teardown guard also asserts on the e2e driver script, which is NOT
+      # under .gitea/workflows/, so it needs its own path — else a PR reverting the
+      # teardown to the sweep that deletes a concurrent run's live container runs no
+      # guard. A guard CI does not run on the files it guards is not a guard.
+      - '.gitea/workflows/**'
+      # #114: test_ephemeral_gate_is_enforced.py asserts the ephemeral-CP gate's
+      # context sits ABOVE the first `# pending-` marker (i.e. is merge-queue
+      # enforced, not merely documented). The mutation it exists to catch — moving
+      # that line back down into the parked half — touches ONLY this file, so
+      # without this path the guard would not run on the very diff it guards.
+      - '.gitea/required-contexts.txt'
+      # core#4977: test_check_onconflict_partial_index.py runs the ON CONFLICT /
+      # partial-index lint against the REAL workspace-server tree + migrations, so the
+      # mutation it exists to catch -- dropping a partial index's predicate from an ON
+      # CONFLICT clause, which Postgres rejects at RUNTIME while compiling, vetting and
+      # sqlmock-ing perfectly clean -- touches ONLY those paths. Without them the guard
+      # would not run on the very diff it guards, same reasoning as #4322/#4346 above.
+      # That exact bug shipped and reached a customer: every drift enqueue failed for
+      # the life of the feature and the queue sat empty. Suite is ~3s.
+      - 'workspace-server/**'
+      # The marketplace SSOT test guards this public stub as well as its own
+      # test file. A stub-only regression must therefore emit this gate.
+      - 'docs/design/rfc-marketplace-delivery.md'
+      - 'tests/e2e/test_local_provision_lifecycle_e2e.sh'
+      # Active staging guidance is linted by
+      # test_deploy_comment_accuracy.py; changes to either harness must run it.
+      - 'tests/e2e/test_staging_concierge_creates_workspace_e2e.sh'
+      - 'tests/e2e/test_staging_full_saas.sh'
+      # test_dind_self_reaping.py drives the per-job dind harness; a PR editing only
+      # the harness must still run the guard that pins its self-reaping.
+      - 'tests/harness/dind.sh'
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
@@ -48,9 +123,33 @@ jobs:
   test:
     name: Ops scripts (unittest)
     runs-on: ubuntu-latest
-    # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
+    # continue-on-error REMOVED 2026-07-14. mc#3436 asked for exactly this:
+    # "pre-existing continue-on-error mask; root-fix and remove, do not renew
+    # silently."
+    #
+    # This is the META-GATE, and it was the most consequential mask in the repo.
+    # It is the ONLY PR lane that tests `.gitea/scripts/**` — 31 test files
+    # covering detect-changes.py, all-required-check.sh, ci-required-drift.py, the
+    # phantom-gate lint, the approval validator, and gitea-merge-queue.py itself:
+    # the machinery that enforces every OTHER gate. Masked, it could not fail.
+    #
+    # And it COMPOUNDED. The `ci` profile in detect-changes.py matches
+    #   ^workspace-server/  ^canvas/  ^workspace/  ^tests/e2e/  ^scripts/  ^infra/scripts/
+    # — none of which match `.gitea/` (note `^scripts/` is anchored and does NOT
+    # match `.gitea/scripts/`). So a PR touching ONLY the CI machinery makes every
+    # profile false, every heavy job takes its no-op arm, and `CI / all-required`
+    # reports SUCCESS having run zero tests. The one lane that DID cover those
+    # files was this one — and it was forbidden from going red.
+    #
+    # Net: the merge queue and the gate scripts were the one thing CI could not
+    # see change. That is how the other vacuous gates survived, including the
+    # canvas lane that was green-by-no-op for a month while failing 3/3
+    # (core#4321 / core#4323).
+    #
+    # Verified green BEFORE unmasking (a mask must never be removed from a red
+    # suite — that wedges the repo): `python -m pytest .gitea/scripts/tests -q`
+    # => 611 passed, 2 skipped, 75 subtests passed. Removing the mask blocks
+    # nothing that was passing; it only stops a future break sliding through.
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -107,6 +206,13 @@ jobs:
       - name: Run .gitea/scripts pytest suite
         run: python -m pytest .gitea/scripts/tests -q
 
+      - name: audit-force-merge pagination contract (network-free)
+        # This is a shell integration test, so pytest does not collect it.
+        # Its fake Gitea API reproduces the live server's limit=50 clamp and
+        # proves that status/file pagination continues to an explicit empty
+        # page while malformed or ambiguous status histories fail closed.
+        run: bash .gitea/scripts/tests/test_audit_force_merge.sh
+
       - name: all-required-check.sh fail-closed contract
         # Regression lock for molecule-core#656 / #2615. The CI / all-required
         # aggregation logic was extracted to .gitea/scripts/all-required-check.sh;
@@ -114,6 +220,13 @@ jobs:
         # contract (e.g. accepting skipped/failure as success, or re-inlining
         # the logic into ci.yml) fails CI.
         run: bash .gitea/scripts/tests/test_all_required_check.sh
+
+      - name: E2E HTTP diagnostic sanitizer contract
+        # This required context runs for the E2E/workflow path shape changed by
+        # the redaction PR. Keep the behavioral test here as well as in ci.yml
+        # so a path-classifier decision cannot leave credential diagnostics
+        # locally green but unexecuted on the pull request.
+        run: python3 tests/e2e/test_sanitize_http_body.py
 
       - name: clone-manifest.sh tolerant-bootstrap contract (network-free)
         # Regression lock for the strict/best-effort split in clone-manifest.sh:
@@ -144,3 +257,8 @@ jobs:
         # usable, so dev-start.sh must wait for that path before starting
         # Langfuse and must not print the ready banner until Langfuse HTTP works.
         run: bash scripts/test-dev-start-langfuse-readiness.sh
+
+      - name: dev-start.sh platform startup behavior
+        run: |
+          node --test scripts/test-dev-port.cjs
+          bash scripts/test-dev-start-platform.sh

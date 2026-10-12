@@ -3,7 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
-	"io"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -23,14 +23,11 @@ import (
 // workspace-scoped filtering (handler falls back to unfiltered list).
 type RuntimeLookup func(workspaceID string) (string, error)
 
-// InstanceIDLookup resolves a workspace's EC2 instance_id by ID. Empty
-// string means the workspace is not on the SaaS (EC2-per-workspace)
-// backend — i.e. either local-Docker or pre-provision. The handler uses
-// this to dispatch plugin install/uninstall to the EIC SSH path
-// (template_files_eic.go primitive) when a workspace runs on its own EC2
-// and there's no local Docker container to exec into. A nil lookup keeps
-// the handler on the local-Docker code path only — same shape as the
-// pre-fix behaviour.
+// InstanceIDLookup resolves a workspace's opaque provider instance_id by ID.
+// Empty means no provider id is available yet. Callers shape-route the value:
+// only AWS-shaped `i-*` ids may enter the legacy EIC SSH fallback, while local
+// Docker container names remain on Docker delivery. A nil lookup disables
+// provider-id dispatch and keeps the handler on its local path.
 type InstanceIDLookup func(workspaceID string) (string, error)
 
 // pluginSources is the contract PluginsHandler uses to talk to the
@@ -60,7 +57,7 @@ type PluginsHandler struct {
 	docker           *client.Client   // Docker client for container operations
 	restartFunc      func(string)     // auto-restart workspace after install/uninstall
 	runtimeLookup    RuntimeLookup    // workspace_id → runtime (optional)
-	instanceIDLookup InstanceIDLookup // workspace_id → EC2 instance_id (optional)
+	instanceIDLookup InstanceIDLookup // workspace_id → opaque provider instance_id (optional)
 	// sources narrowed from `*plugins.Registry` to the pluginSources
 	// interface (#1814) so tests can substitute a stub. Production
 	// callers still pass *plugins.Registry, which satisfies the
@@ -68,8 +65,16 @@ type PluginsHandler struct {
 	sources pluginSources
 	// deliverOverride lets tests substitute the container-delivery step of
 	// the post-online reconcile (RFC#2843) without standing up Docker or an
-	// EC2 instance. nil in production → the reconcile calls deliverToContainer.
+	// provider compute. nil in production → the reconcile calls deliverToContainer.
 	deliverOverride func(ctx context.Context, workspaceID string, r *stageResult) error
+	// stagingRoot is the parent directory resolveAndStage creates its
+	// per-install "molecule-plugin-fetch-*" dir under. Empty — the
+	// production default — is passed straight to os.MkdirTemp, which then
+	// uses the system temp dir exactly as before. Tests set it via
+	// WithStagingRoot so a staging-leak assertion can be absolute inside a
+	// directory the test exclusively owns, instead of a before/after delta
+	// over the shared os.TempDir() (core#4964).
+	stagingRoot string
 }
 
 // deliver dispatches the container-delivery step, honouring the test
@@ -85,7 +90,7 @@ func (h *PluginsHandler) deliver(ctx context.Context, workspaceID string, r *sta
 }
 
 // NewPluginsHandler constructs a PluginsHandler with the default source
-// registry (local + github resolvers). Deployments can add more schemes
+// registry (local, GitHub, and authenticated Gitea resolvers). Deployments can add more schemes
 // via WithSourceResolver before routes are wired — e.g. a private
 // enterprise registry or ClawHub. Logs the effective install limits
 // exactly once per process on first construction.
@@ -93,10 +98,13 @@ func NewPluginsHandler(pluginsDir string, docker *client.Client, restartFunc fun
 	sources := plugins.NewRegistry()
 	sources.Register(plugins.NewLocalResolver(pluginsDir))
 	sources.Register(plugins.NewGithubResolver())
-	// gitea:// resolves a (private) Gitea repo subpath with PAT auth —
-	// the channel declared plugins use post-boot (RFC#2843). Reads its PAT
-	// from MOLECULE_TEMPLATE_REPO_TOKEN at Fetch time (CP PR#850 places it
-	// on every tenant box).
+	// gitea:// resolves a (private) Gitea repo subpath — the channel
+	// declared plugins use post-boot (RFC#2843). molecule-core#4997: its
+	// credential is resolved PER HOST at Fetch time (MOLECULE_GIT_TOKENS →
+	// MOLECULE_GIT_TOKEN__<HOST> → MOLECULE_TEMPLATE_REPO_TOKEN), so a repo
+	// the CUSTOMER owns and keeps private is read with that org's OWN
+	// read-only credential rather than the platform-wide template PAT —
+	// which must not be extended to third-party private repos.
 	sources.Register(plugins.NewGiteaResolver())
 	logInstallLimitsOnce(os.Stderr)
 	return &PluginsHandler{
@@ -115,6 +123,16 @@ func (h *PluginsHandler) WithSourceResolver(resolver plugins.SourceResolver) *Pl
 	return h
 }
 
+// WithStagingRoot overrides the parent directory resolveAndStage stages
+// plugin fetches into. Production never calls it, leaving stagingRoot ""
+// so os.MkdirTemp keeps using the system temp dir; tests pass a
+// t.TempDir() so every molecule-plugin-fetch-* under it is theirs and a
+// leak assertion needs no ambient-state subtraction.
+func (h *PluginsHandler) WithStagingRoot(dir string) *PluginsHandler {
+	h.stagingRoot = dir
+	return h
+}
+
 // WithRuntimeLookup installs a workspace-runtime resolver. Used by the
 // router during wiring so tests don't need a real DB.
 func (h *PluginsHandler) WithRuntimeLookup(lookup RuntimeLookup) *PluginsHandler {
@@ -122,10 +140,10 @@ func (h *PluginsHandler) WithRuntimeLookup(lookup RuntimeLookup) *PluginsHandler
 	return h
 }
 
-// WithInstanceIDLookup installs a workspace → EC2 instance_id resolver.
+// WithInstanceIDLookup installs a workspace → opaque provider instance_id resolver.
 // Wired by the router so production hits a real DB; tests stub it. The
-// install/uninstall pipeline uses this to dispatch to the EIC SSH path
-// for SaaS workspaces (no local Docker container to exec into).
+// install/uninstall pipeline shape-routes AWS-shaped ids to the legacy EIC SSH
+// fallback and local container-name ids to Docker.
 func (h *PluginsHandler) WithInstanceIDLookup(lookup InstanceIDLookup) *PluginsHandler {
 	h.instanceIDLookup = lookup
 	return h
@@ -304,7 +322,25 @@ func (h *PluginsHandler) execInContainerAs(ctx context.Context, containerName, u
 		return "", err
 	}
 	defer resp.Close()
-	var stdout bytes.Buffer
-	stdcopy.StdCopy(&stdout, io.Discard, resp.Reader)
+	var stdout, stderr bytes.Buffer
+	stdcopy.StdCopy(&stdout, &stderr, resp.Reader)
+	// Surface the exit code. This helper's callers have ALWAYS assumed
+	// "non-zero exit → non-nil error" (atomicCopyToContainer branches its
+	// snapshot/rollback logic on it, and documents that contract) — but the
+	// pre-2026-07-19 implementation never inspected it, so every failed
+	// `test`/`mv`/`touch` looked like success. That masking let a plugin
+	// install whose tar extracted to garbage report "installed" while the
+	// box had nothing (the concierge-without-management-MCP incident).
+	inspect, ierr := h.docker.ContainerExecInspect(ctx, execID.ID)
+	if ierr != nil {
+		return strings.TrimSpace(stdout.String()), fmt.Errorf("exec inspect %v: %w", cmd, ierr)
+	}
+	if inspect.ExitCode != 0 {
+		errText := strings.TrimSpace(stderr.String())
+		if errText == "" {
+			errText = strings.TrimSpace(stdout.String())
+		}
+		return strings.TrimSpace(stdout.String()), fmt.Errorf("exec %v: exit %d: %s", cmd, inspect.ExitCode, errText)
+	}
 	return strings.TrimSpace(stdout.String()), nil
 }

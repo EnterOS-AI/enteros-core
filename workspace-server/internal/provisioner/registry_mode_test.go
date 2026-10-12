@@ -11,8 +11,7 @@ import (
 
 // TestResolve_LocalModeWhenRegistryUnset — the OSS-contributor default.
 // Issue #63: with MOLECULE_IMAGE_REGISTRY unset, the provisioner must
-// switch to the local-build path instead of trying to pull from a GHCR
-// org that's been suspended.
+// switch to the local-build path instead of depending on a remote registry.
 func TestResolve_LocalModeWhenRegistryUnset(t *testing.T) {
 	t.Setenv("MOLECULE_IMAGE_REGISTRY", "")
 	got := Resolve()
@@ -24,17 +23,17 @@ func TestResolve_LocalModeWhenRegistryUnset(t *testing.T) {
 	}
 }
 
-// TestResolve_SaaSModeWhenRegistrySet — production tenants set the var
-// to their ECR mirror; we must keep producing pull-style image refs.
+// TestResolve_SaaSModeWhenRegistrySet — registry-backed self-hosts set the
+// variable to their selected registry; we must keep producing pull-style refs.
 func TestResolve_SaaSModeWhenRegistrySet(t *testing.T) {
-	const ecr = "123456789012.dkr.ecr.us-east-2.amazonaws.com/molecule-ai"
-	t.Setenv("MOLECULE_IMAGE_REGISTRY", ecr)
+	const registry = "registry.example.com/molecule-ai"
+	t.Setenv("MOLECULE_IMAGE_REGISTRY", registry)
 	got := Resolve()
 	if got.Mode != RegistryModeSaaS {
 		t.Errorf("Mode = %q, want %q (set registry → saas)", got.Mode, RegistryModeSaaS)
 	}
-	if got.Prefix != ecr {
-		t.Errorf("Prefix = %q, want %q", got.Prefix, ecr)
+	if got.Prefix != registry {
+		t.Errorf("Prefix = %q, want %q", got.Prefix, registry)
 	}
 }
 
@@ -59,7 +58,7 @@ func TestResolve_GarbageURLStillSaaSMode(t *testing.T) {
 	for _, garbage := range []string{
 		"not-a-url",
 		"http://",
-		"ghcr.io/",
+		"registry.example.com/",
 		"   ",
 		"\thello\n",
 	} {
@@ -80,7 +79,7 @@ func TestRegistryPrefix_AlignedWithResolve(t *testing.T) {
 		env  string
 	}{
 		{"unset", ""},
-		{"ecr", "999999999999.dkr.ecr.us-east-2.amazonaws.com/molecule-ai"},
+		{"registry", "registry.example.com/molecule-ai"},
 		{"harbor", "harbor.example.com/molecule"},
 	}
 	for _, tc := range cases {
@@ -88,11 +87,9 @@ func TestRegistryPrefix_AlignedWithResolve(t *testing.T) {
 			t.Setenv("MOLECULE_IMAGE_REGISTRY", tc.env)
 			gotPrefix := RegistryPrefix()
 			gotResolve := Resolve().Prefix
-			// Note: with the new design, RegistryPrefix() unset returns
-			// the SaaS GHCR default (legacy back-compat) while
+			// RegistryPrefix() unset returns the published-image fallback while
 			// Resolve().Prefix returns the local-mode "molecule-local"
-			// hostname. They DIVERGE on the unset path by design — that
-			// divergence is what closes the GHCR-403 hole. Pin both so a
+			// hostname. They diverge on the unset path by design. Pin both so a
 			// future refactor can't accidentally re-couple them.
 			if tc.env == "" {
 				if gotPrefix != defaultRegistryPrefix {

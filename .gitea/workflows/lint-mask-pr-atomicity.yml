@@ -57,8 +57,8 @@ on:
     # `edited` is included because the rule depends on PR_BODY: a user
     # may add `Paired: #NNN` after first push to satisfy the lint. The
     # rerun on `edited` lets the PR turn green without an empty
-    # commit. Gitea 1.22.6 fires `edited` on body changes — verified
-    # via gitea-source/models/issues/pull_list.go::triggerNewPRWebhook.
+    # commit. The repository webhook contract includes `edited` for body
+    # changes; the original behavior was source-verified during the 1.22.6 era.
     paths:
       - '.gitea/workflows/ci.yml'
       - '.gitea/scripts/lint_mask_pr_atomicity.py'
@@ -68,9 +68,8 @@ on:
 env:
   # Belt-and-suspenders against the runner-default trap
   # (feedback_act_runner_github_server_url). Runners are configured
-  # with this env via /opt/molecule/runners/config.yaml, but pinning
-  # at the workflow level protects against a runner regenerated
-  # without the config file.
+  # with this env in runner configuration, but pinning it at the workflow
+  # level protects against a runner regenerated without that setting.
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 permissions:
@@ -89,12 +88,39 @@ jobs:
     name: lint-mask-pr-atomicity
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Phase 3 (RFC #219 §1): surface broken shapes without blocking
-    # PRs. Follow-up PR flips this to `false` once recent runs on main
-    # are confirmed clean (eat-our-own-dogfood discipline mirrors
-    # PR#673's same-shape comment). Tracking: mc#3436.
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
+    # UNMASKED 2026-09-03. Was `continue-on-error: true` under tracker mc#4959.
+    #
+    # The mask's only stated justification was the pre-flip catch-22 of mc#4344:
+    # this workflow is paths-filtered, so it never fires on a push to main, and
+    # lint_pre_flip_continue_on_error.py accepted main-PUSH run logs as the only
+    # proof that a flip is safe. That gate was fixed on 2026-07-20 by fb426286
+    # ("pre-flip gate paginates statuses + accepts PR evidence for paths-filtered
+    # workflows"), whose body names this workflow and mc#4344 and states it
+    # "unblocks core#4521 (mask-elimination)". The blocker was therefore already
+    # gone when mc#4959 renewed the mask on 2026-07-30; that renewal restated it
+    # without re-checking, and the same text had been carried forward through
+    # mc#774 -> mc#1982 -> mc#2654 -> mc#3436 -> mc#4344 -> mc#4959.
+    #
+    # Evidence behind the flip (governance review, 2026-09-03):
+    #   - 45 runs of this workflow in the sampled window (2026-08-10..2026-09-03).
+    #     The job is green in every completed run but one.
+    #   - The exception, run 652757 (PR #5168 @cb5265ff), is not a lint verdict:
+    #     that PR's ci.yml diff changes neither `continue-on-error` nor
+    #     `all-required.needs`, so both predicates are false and the script
+    #     returns 0. The job died in its own setup and its log has since been
+    #     garbage-collected.
+    #   - The mask was not suppressing what it was renewed to suppress. With it
+    #     in place, run 652757 still posted the commit status
+    #     `lint-mask-pr-atomicity / lint-mask-pr-atomicity (pull_request)
+    #     = failure`, exactly as `publish-canvas-image / Build & push canvas
+    #     image (push)` posted `failure` on 2026-07-18 (recorded in mc#4391).
+    #     Job-level continue-on-error does not suppress the posted context on
+    #     this Gitea, so the mask bought a 14-day renewal treadmill and no
+    #     actual masking.
+    #
+    # No tracker comment belongs here now: with no truthy `continue-on-error`,
+    # Tier 2e has nothing to require.
+    continue-on-error: false
     steps:
       - name: Check out PR head with full history (need base SHA blobs)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2

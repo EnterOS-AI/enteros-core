@@ -4,13 +4,12 @@
 # MOLECULE_IMAGE_REGISTRY) and recreate any running ws-* containers against the
 # new digest.
 #
-# This is the local-dev / single-host equivalent of step 5 of the runtime CD
-# chain (see docs/workspace-runtime-package.md). On a SaaS deployment the
-# host's deploy pipeline does the pull on every release; this script is
-# what to run on a local docker-compose host after a runtime release lands.
+# This is an explicit local / single-host maintenance tool. It is not called by
+# the managed release pipeline, does not change control-plane image pins, and
+# does not prove that an already-running managed workspace was upgraded.
 #
 # Usage:
-#   bash scripts/refresh-workspace-images.sh                     # pull all 8 + recreate running ws-*
+#   bash scripts/refresh-workspace-images.sh                     # pull all 4 + recreate running ws-*
 #   bash scripts/refresh-workspace-images.sh --runtime claude-code  # pull just one template
 #   bash scripts/refresh-workspace-images.sh --no-recreate          # pull only, leave containers
 #
@@ -40,9 +39,9 @@ RECREATE=true
 
 # Registry SSOT: default to OUR OWN container registry (the Gitea registry),
 # where every workspace-template-* image lives. Pull auth is the docker-host's
-# standard `docker login registry.moleculesai.app` (a Gitea PAT) — no AWS/ECR
-# credentials. Override with MOLECULE_IMAGE_REGISTRY to point at a mirror (e.g.
-# an ECR host), mirroring the CP/workspace-server RegistryPrefix() env contract.
+# standard `docker login registry.moleculesai.app` when private access is
+# required. Override with MOLECULE_IMAGE_REGISTRY for an operator-controlled
+# mirror.
 REGISTRY_PREFIX="${MOLECULE_IMAGE_REGISTRY:-registry.moleculesai.app/molecule-ai}"
 
 while [ $# -gt 0 ]; do

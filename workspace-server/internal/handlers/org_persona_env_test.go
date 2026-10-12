@@ -8,7 +8,7 @@ import (
 
 // TestLoadPersonaEnvFile_HappyPath: the standard case — a persona-shaped
 // env file exists at <root>/<role>/env and its KEY=VALUE pairs land in
-// the out map. Mirrors what the operator-host bootstrap kit ships:
+// the out map. Mirrors the persona environment files mounted by operators:
 // GITEA_USER, GITEA_TOKEN, GITEA_TOKEN_SCOPES, GITEA_USER_EMAIL,
 // GITEA_SSH_KEY_PATH.
 func TestLoadPersonaEnvFile_HappyPath(t *testing.T) {
@@ -287,7 +287,7 @@ func TestLoadPersonaTokenFile_EmptyToken(t *testing.T) {
 }
 
 // TestLoadPersonaTokenFile_TrimsWhitespace: tokens shipped from the
-// operator-host bootstrap kit may have a trailing newline (the
+// persona file may have a trailing newline (the
 // canonical `printf "%s\n" "$token" > token` shape). The fallback must
 // trim leading + trailing whitespace so the askpass helper emits the
 // raw token bytes — Gitea's PAT validator rejects tokens with embedded

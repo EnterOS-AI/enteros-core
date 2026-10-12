@@ -45,7 +45,7 @@ func TestProxyA2A_InvalidJSON(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-badjson/a2a", bytes.NewBufferString("not json"))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected status 400, got %d: %s", w.Code, w.Body.String())
@@ -99,7 +99,7 @@ func TestProxyA2A_AlreadyWrappedJSONRPC(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-wrapped/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	// Give the async LogActivity goroutine a moment
 	time.Sleep(50 * time.Millisecond)
@@ -157,7 +157,7 @@ func TestProxyA2A_DBLookupFallback(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-db-fallback/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	time.Sleep(50 * time.Millisecond)
 
@@ -194,7 +194,7 @@ func TestProxyA2A_DBLookupError(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-dberr/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("expected status 500, got %d: %s", w.Code, w.Body.String())
@@ -236,7 +236,7 @@ func TestProxyA2A_AgentReturnsError(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-agent-err/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	time.Sleep(50 * time.Millisecond)
 
@@ -298,7 +298,7 @@ func TestProxyA2A_Upstream502_TriggersContainerDeadCheck(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-tunnel-dead/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 	handler.waitAsyncForTest()
 
 	// Caller sees a structured 503 (NOT the upstream 502 which CF would mask).
@@ -354,7 +354,7 @@ func TestProxyA2A_Upstream502_AliveAgent_PropagatesAsIs(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-alive-502/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 	handler.waitAsyncForTest()
 
 	if w.Code != http.StatusBadGateway {
@@ -394,7 +394,7 @@ func TestProxyA2A_MessageIDInjected(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-msgid/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	time.Sleep(50 * time.Millisecond)
 
@@ -458,7 +458,7 @@ func TestProxyA2A_CallerIDPropagated(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Request.Header.Set("X-Workspace-ID", "ws-caller")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	time.Sleep(50 * time.Millisecond)
 
@@ -527,14 +527,14 @@ func TestProxyA2A_AccessDenied_DifferentParents(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Request.Header.Set("X-Workspace-ID", "ws-caller")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("expected 403, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
-func TestProxyA2A_AllowedSelf_SkipsAccessCheck(t *testing.T) {
+func TestProxyA2A_SelfCallWithoutBearerRejected(t *testing.T) {
 	mock := setupTestDB(t)
 	mr := setupTestRedis(t)
 	allowLoopbackForTest(t)
@@ -548,10 +548,6 @@ func TestProxyA2A_AllowedSelf_SkipsAccessCheck(t *testing.T) {
 	}))
 	defer agentServer.Close()
 	mr.Set(fmt.Sprintf("ws:%s:url", "ws-self"), agentServer.URL)
-	expectBudgetCheck(mock, "ws-self")
-
-	mock.ExpectExec("INSERT INTO activity_logs").WillReturnResult(sqlmock.NewResult(0, 1))
-
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "ws-self"}}
@@ -564,8 +560,11 @@ func TestProxyA2A_AllowedSelf_SkipsAccessCheck(t *testing.T) {
 	handler.ProxyA2A(c)
 	time.Sleep(50 * time.Millisecond)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("expected 200 for self-call, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for unauthenticated self-call, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -671,9 +670,13 @@ func TestProxyA2A_CallerIDDerivedFromBearer(t *testing.T) {
 	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", "ws-caller"))
 
-	// 2. validateCallerToken's HasAnyLiveToken / ValidateToken queries fall
-	//    through to fail-open (no expectations set) — same pattern as
-	//    TestProxyA2A_CallerIDPropagated.
+	// 2. The source-bound validation resolves the same token again and records
+	//    its use. No DB error or tokenless path is allowed to bypass auth.
+	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", "ws-caller"))
+	mock.ExpectExec(`UPDATE workspace_auth_tokens SET last_used_at`).
+		WithArgs("tok-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// 3. CanCommunicate — siblings under same parent
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id = ").
@@ -748,8 +751,20 @@ func TestProxyA2A_OrgTokenSkipsBearerDerive(t *testing.T) {
 	defer agentServer.Close()
 	mr.Set(fmt.Sprintf("ws:%s:url", "ws-target"), agentServer.URL)
 
-	// No WorkspaceFromToken expectation — the bearer-derive branch must NOT
-	// fire when org_token_id is set.
+	// A workspace lookup misses, then the org-token lookup succeeds.
+	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`SELECT id, prefix, org_id, expires_at FROM org_api_tokens`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "org_id", "expires_at"}).
+			AddRow("org-token-123", "org_tok_", "org-1", nil))
+	mock.ExpectExec(`UPDATE org_api_tokens SET last_used_at`).
+		WithArgs("org-token-123").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// #95 hole 2: the org token is bound to the target workspace's org root.
+	// ws-target's org root == the token's org_id → authorized.
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
+		WithArgs("ws-target").
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow("org-1"))
 	expectBudgetCheck(mock, "ws-target")
 
 	// Activity log INSERT with NULL source_id (canvas-class semantics).
@@ -777,12 +792,9 @@ func TestProxyA2A_OrgTokenSkipsBearerDerive(t *testing.T) {
 	}
 }
 
-// TestProxyA2A_BearerDeriveFailureFallsThrough verifies that if the bearer
-// is present but doesn't resolve (e.g. revoked, removed workspace), the
-// callerID stays empty and the request is treated as canvas-class — we
-// don't 401, we don't error; we just lose the source_id signal. Mirrors
-// the canvas-bypass shape so legacy/anonymous paths aren't broken.
-func TestProxyA2A_BearerDeriveFailureFallsThrough(t *testing.T) {
+// TestProxyA2A_InvalidBearerFailsClosed verifies that a revoked workspace
+// bearer cannot downgrade into anonymous canvas traffic.
+func TestProxyA2A_InvalidBearerFailsClosed(t *testing.T) {
 	mock := setupTestDB(t)
 	mr := setupTestRedis(t)
 	allowLoopbackForTest(t)
@@ -801,10 +813,8 @@ func TestProxyA2A_BearerDeriveFailureFallsThrough(t *testing.T) {
 	// callerID="".
 	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
 		WillReturnError(sql.ErrNoRows)
-
-	expectBudgetCheck(mock, "ws-target")
-	mock.ExpectExec("INSERT INTO activity_logs").
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT id, prefix, org_id, expires_at FROM org_api_tokens`).
+		WillReturnError(sql.ErrNoRows)
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -818,8 +828,8 @@ func TestProxyA2A_BearerDeriveFailureFallsThrough(t *testing.T) {
 	handler.ProxyA2A(c)
 	time.Sleep(50 * time.Millisecond)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("expected 200 (canvas-fallback), got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for invalid bearer, got %d: %s", w.Code, w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -1097,7 +1107,7 @@ func TestProxyA2A_BodyReadFailure_DeliveryConfirmed(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 	time.Sleep(50 * time.Millisecond)
 
 	// Expect 502 (couldn't deliver the response content to the caller)
@@ -1124,45 +1134,33 @@ func TestProxyA2A_BodyReadFailure_DeliveryConfirmed(t *testing.T) {
 
 // ==================== validateCallerToken — Phase 30.5 ====================
 
-// The A2A proxy validates the *caller's* token (not the target's) when the
-// caller is a workspace. Canvas (empty X-Workspace-ID), system callers
-// (webhook:/system:/test: prefixes), and self-calls all bypass.
+// Workspace callers always validate their own source-bound token. Human
+// callers are classified only from verified CP/admin/org credentials; there
+// is no tokenless legacy or self-call bypass.
 
-func TestValidateCallerToken_LegacyCallerGrandfathered(t *testing.T) {
-	mock := setupTestDB(t)
+func TestValidateCallerToken_TokenlessCallerRejected(t *testing.T) {
+	setupTestDB(t)
 	setupTestRedis(t)
-
-	// Caller has no live tokens → grandfather path → returns nil
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_auth_tokens`).
-		WithArgs("ws-legacy").
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("POST", "/workspaces/x/a2a", bytes.NewBufferString("{}"))
 
 	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-legacy")
-	if err != nil {
-		t.Errorf("legacy caller should grandfather through; got %v", err)
+	if err == nil {
+		t.Fatal("tokenless caller must be rejected")
 	}
 	if isCanvasUser {
 		t.Errorf("legacy caller should NOT be identified as canvas user")
 	}
-	if w.Code != 200 {
-		// gin default before c.JSON is 200; we want no error response written
-		if w.Body.Len() != 0 {
-			t.Errorf("legacy path should not write a response body; got %s", w.Body.String())
-		}
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("want 401, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
 func TestValidateCallerToken_MissingTokenWhenOnFile(t *testing.T) {
-	mock := setupTestDB(t)
+	setupTestDB(t)
 	setupTestRedis(t)
-
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_auth_tokens`).
-		WithArgs("ws-authed").
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1188,9 +1186,6 @@ func TestValidateCallerToken_InvalidToken(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_auth_tokens`).
-		WithArgs("ws-authed").
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
 		WillReturnError(sql.ErrNoRows)
 
@@ -1216,9 +1211,9 @@ func TestValidateCallerToken_ValidToken(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_auth_tokens`).
-		WithArgs("ws-authed").
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("t1", "ws-authed"))
 	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
 		WithArgs(sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("t1", "ws-authed"))
@@ -1248,9 +1243,6 @@ func TestValidateCallerToken_WrongWorkspaceBindingRejected(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_auth_tokens`).
-		WithArgs("ws-b-attacker").
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("t-a", "ws-a-owner"))
 
@@ -1315,10 +1307,17 @@ func TestValidateCallerToken_CanvasUser_OrgToken(t *testing.T) {
 	mock.ExpectExec(`UPDATE org_api_tokens SET last_used_at`).
 		WithArgs("orgtok-1").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// #95 hole 2: org token bound to the target workspace's org root. The
+	// target is c.Param("id") (the workspace whose queue/health is queried);
+	// its org root == the token org_id → authorized.
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
+		WithArgs("ws-target-org").
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow("org-1"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	req := httptest.NewRequest("POST", "/workspaces/x/a2a", bytes.NewBufferString("{}"))
+	c.Params = gin.Params{{Key: "id", Value: "ws-target-org"}}
+	req := httptest.NewRequest("POST", "/workspaces/ws-target-org/a2a", bytes.NewBufferString("{}"))
 	req.Header.Set("Authorization", "Bearer org-token-plaintext-xyz")
 	c.Request = req
 
@@ -2011,7 +2010,7 @@ func TestHandleA2ADispatchError_ContextDeadline(t *testing.T) {
 	// DeadlineExceeded → isUpstreamBusyError=true → EnqueueA2A attempted.
 	// Mock the INSERT INTO a2a_queue to fail so we fall through to 503.
 	mock.ExpectQuery(`INSERT INTO a2a_queue`).
-		WithArgs("ws-dl", nil, PriorityTask, "{}", "message/send", nil).
+		WithArgs("ws-dl", nil, PriorityTask, "{}", "message/send", nil, nil).
 		WillReturnError(fmt.Errorf("test: queue unavailable"))
 
 	_, _, perr := handler.handleA2ADispatchError(
@@ -2260,7 +2259,9 @@ func TestStopForRestart_SaaSPath_DispatchesViaCPProv(t *testing.T) {
 	cp := &fakeCPProv{}
 	handler.SetCPProvisioner(cp)
 
-	handler.stopForRestart(context.Background(), "ws-saas-restart")
+	if !handler.stopForRestart(context.Background(), "ws-saas-restart", models.CreateWorkspacePayload{Runtime: "claude-code"}) {
+		t.Fatal("stopForRestart must not decline when the CP confirms the pinned image")
+	}
 
 	if cp.StopCalls() != 1 {
 		t.Fatalf("expected cpProv.Stop to be called once on SaaS auto-restart; got %d", cp.StopCalls())
@@ -2281,7 +2282,7 @@ func TestStopForRestart_NoProvisioner_NoOp(t *testing.T) {
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 	// no provisioner, no cpProv, no DB expectations set on mock — any
 	// unexpected query/exec will produce a sqlmock error.
-	handler.stopForRestart(context.Background(), "ws-orphan")
+	handler.stopForRestart(context.Background(), "ws-orphan", models.CreateWorkspacePayload{Runtime: "claude-code"})
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("stopForRestart no-provisioner path should not touch DB: %v", err)
 	}
@@ -2303,7 +2304,7 @@ func TestStopForRestart_ClearsCachedURL(t *testing.T) {
 
 	// No provisioner wired: stopForRestart is a no-op backend-wise, but it
 	// must still invalidate Redis routing keys.
-	handler.stopForRestart(context.Background(), wsID)
+	handler.stopForRestart(context.Background(), wsID, models.CreateWorkspacePayload{Runtime: "claude-code"})
 
 	_, err := db.GetCachedURL(context.Background(), wsID)
 	if err == nil {
@@ -2371,6 +2372,16 @@ func (f *fakeCPProv) StopAndPrune(_ context.Context, _ string) error {
 	f.stopCalls++
 	return nil
 }
+
+// EnsureImage satisfies the core#5019 pull-before-stop seam. These stubs
+// predate it; answering "ready" keeps their pre-#5019 behaviour EXACTLY
+// (the guard allows, the restart proceeds) so this stub carries no opinion
+// about the new branch. Tests that exercise the DECLINE path use
+// prewarmCPProv in workspace_restart_pull_before_stop_test.go.
+func (f *fakeCPProv) EnsureImage(_ context.Context, _ provisioner.EnsureImageRequest) (provisioner.EnsureImageResult, error) {
+	return provisioner.EnsureImageResult{Status: "ready"}, nil
+}
+
 func (f *fakeCPProv) GetConsoleOutput(_ context.Context, _ string) (string, error) {
 	return "", nil
 }
@@ -2782,7 +2793,7 @@ func TestProxyA2A_PollMode_ShortCircuits_NoSSRF_NoDispatch(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	time.Sleep(50 * time.Millisecond)
 
@@ -3018,8 +3029,8 @@ func TestProxyA2A_PollMode_CanvasUserCallerID_PropagatesToActivityLog(t *testing
 // PR #1944's same-origin bypass would have classified this as a canvas user and
 // skipped CanCommunicate, granting cross-workspace A2A — a privilege
 // escalation. The safe fix must instead fall through to the standard
-// peer-token contract and CanCommunicate, which rejects the cross-hierarchy
-// call with 403. This test proves the escalation is closed.
+// peer-token contract, which rejects the unauthenticated claim with 401 before
+// hierarchy lookup. This test proves the escalation is closed.
 func TestProxyA2A_ForgedSameOrigin_CannotBypassCanCommunicate(t *testing.T) {
 	if os.Getenv("CANVAS_PROXY_URL") == "" {
 		cmd := exec.Command(os.Args[0], "-test.run=^TestProxyA2A_ForgedSameOrigin_CannotBypassCanCommunicate$", "-test.v")
@@ -3045,19 +3056,8 @@ func TestProxyA2A_ForgedSameOrigin_CannotBypassCanCommunicate(t *testing.T) {
 	const wsTarget = "ws-victim-target"
 	const wsForgedCaller = "ws-attacker-caller"
 
-	// validateCallerToken: not a genuine canvas user (no verified session, no
-	// admin/org token, and the dev same-origin fallback is disabled in SaaS).
-	// So it consults the peer-token contract: HasAnyLiveToken for the forged
-	// caller. Return 0 → tokenless legacy peer → grandfathered through token
-	// validation (isCanvasUser stays false). The request must then still be
-	// gated by CanCommunicate.
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_auth_tokens`).
-		WithArgs(wsForgedCaller).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
-
-	// CanCommunicate MUST run (the escalation guard) and DENY: caller and
-	// target sit under different parents.
-	mockCanCommunicate(mock, wsForgedCaller, wsTarget, false)
+	// No DB expectations: a missing credential is rejected before any caller or
+	// hierarchy lookup.
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -3077,16 +3077,15 @@ func TestProxyA2A_ForgedSameOrigin_CannotBypassCanCommunicate(t *testing.T) {
 
 	handler.ProxyA2A(c)
 
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("ESCALATION NOT CLOSED: forged same-origin + arbitrary X-Workspace-ID "+
-			"reached an unauthorized target with status %d (want 403): %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("forged same-origin + arbitrary X-Workspace-ID: got %d, want 401: %s", w.Code, w.Body.String())
 	}
 	var resp map[string]interface{}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("body not JSON: %v", err)
 	}
-	if !strings.Contains(fmt.Sprint(resp["error"]), "access denied") {
-		t.Errorf("expected an access-denied error from CanCommunicate, got %v", resp["error"])
+	if !strings.Contains(fmt.Sprint(resp["error"]), "auth token") {
+		t.Errorf("expected an authentication error, got %v", resp["error"])
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations — CanCommunicate must have been consulted: %v", err)
@@ -3133,7 +3132,7 @@ func TestProxyA2A_PushMode_NoShortCircuit(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	time.Sleep(50 * time.Millisecond)
 
@@ -3196,7 +3195,7 @@ func TestProxyA2A_PollMode_FailsClosedToPush(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	if w.Code == http.StatusOK {
 		var resp map[string]interface{}
@@ -3400,7 +3399,7 @@ func TestProxyA2A_CanvasCapAndQueue(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	start := time.Now()
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 	elapsed := time.Since(start)
 
 	if w.Code != http.StatusOK {
@@ -3551,7 +3550,7 @@ func TestProxyA2A_CanvasCapAndQueue_RuntimeKillSwitchDisabled(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	start := time.Now()
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 	elapsed := time.Since(start)
 
 	// 1. The HTTP response is the ACTUAL AGENT REPLY (not the queued
@@ -3627,7 +3626,7 @@ func TestProxyA2A_CanvasCapAndQueue_EndToEndContract(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	start := time.Now()
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 	elapsed := time.Since(start)
 
 	// 1. The HTTP response is the queued ack (not the agent reply).
@@ -3785,7 +3784,7 @@ func TestProxyA2A_MessageSend_CanDelegateFalse_Rejects(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Request.Header.Set("X-Workspace-ID", "ws-caller")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("expected 403 for can_delegate=false message/send, got %d: %s", w.Code, w.Body.String())
@@ -3837,7 +3836,7 @@ func TestProxyA2A_MessageSend_CanDelegateTrue_Proceeds(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Request.Header.Set("X-Workspace-ID", "ws-caller")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	// Not 403 (the gate's rejection code) — the poll-mode handler
 	// returns 200 {status:"queued"} after the gate passes. We don't
@@ -3880,7 +3879,7 @@ func TestProxyA2A_MessageSend_CanDelegateFalse_SelfCall_Allowed(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Request.Header.Set("X-Workspace-ID", "ws-self")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 	time.Sleep(50 * time.Millisecond)
 
 	if w.Code != http.StatusOK {
@@ -4034,7 +4033,7 @@ func TestProxyA2A_ExternalAgent_MissingInboundSecret_Rejected(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Request.Header.Set("Authorization", "Bearer admin-secret-3319")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("expected 503 when external workspace has no inbound secret, got %d: %s", w.Code, w.Body.String())
@@ -4144,7 +4143,7 @@ func TestProxyA2A_InboundAuth_ExternalVerifierSimulation(t *testing.T) {
 			c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/a2a", bytes.NewBufferString(`{"jsonrpc":"2.0","method":"message/send","params":{}}`))
 			c.Request.Header.Set("Content-Type", "application/json")
 
-			handler.ProxyA2A(c)
+			proxyA2AAuthenticatedForTest(handler, c)
 			if tc.wantStatus == http.StatusOK || tc.wantStatus == http.StatusForbidden {
 				handler.waitAsyncForTest()
 			}
@@ -4198,7 +4197,7 @@ func TestProxyA2A_InboundAuth_PublicWsPrefixHost_Rejected(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/a2a", bytes.NewBufferString(`{"jsonrpc":"2.0","method":"message/send","params":{}}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("expected 503 for public ws-* host without inbound secret, got %d: %s", w.Code, w.Body.String())
@@ -4249,7 +4248,7 @@ func TestProxyA2A_InboundAuth_InternalHost_Accepted(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/a2a", bytes.NewBufferString(`{"jsonrpc":"2.0","method":"message/send","params":{}}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 	handler.waitAsyncForTest()
 
 	if w.Code != http.StatusOK {

@@ -158,15 +158,15 @@ func TestSwitchProvider_RejectsBadProvider(t *testing.T) {
 // the rollback defer, any error / ctx-cancellation between pre-claim
 // and step 5 (committed) would strand the workspace in 'provisioning'
 // forever. The defer must:
-//   1. Be armed ONLY AFTER this request's pre-claim succeeds
-//      (CR2 #11493 ownership-ordering fix — a losing pre-claim must
-//      NOT arm the defer, otherwise the rollback UPDATE (gated on
-//      `status = 'provisioning'`) would clobber ANOTHER request's
-//      in-flight pre-claim to OUR priorStatus, stranding them).
-//   2. Revert status to priorStatus on any error path (commit-or-rollback).
-//   3. Use a fresh context (not the request ctx) so client
-//      disconnect mid-switch still cleans up.
-//   4. Set `committed = true` ONLY at the very end (after step 5).
+//  1. Be armed ONLY AFTER this request's pre-claim succeeds
+//     (CR2 #11493 ownership-ordering fix — a losing pre-claim must
+//     NOT arm the defer, otherwise the rollback UPDATE (gated on
+//     `status = 'provisioning'`) would clobber ANOTHER request's
+//     in-flight pre-claim to OUR priorStatus, stranding them).
+//  2. Revert status to priorStatus on any error path (commit-or-rollback).
+//  3. Use a fresh context (not the request ctx) so client
+//     disconnect mid-switch still cleans up.
+//  4. Set `committed = true` ONLY at the very end (after step 5).
 func TestSwitchProvider_PreClaimRollbackOnError(t *testing.T) {
 	wd, _ := os.Getwd()
 	src, err := os.ReadFile(filepath.Join(wd, "workspace_switch_provider.go"))

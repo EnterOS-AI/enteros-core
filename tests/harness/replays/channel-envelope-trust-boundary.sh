@@ -5,20 +5,19 @@
 # at both the envelope builder and the agent_card_url builder.
 #
 # Why this matters:
-#   - Unit tests in workspace/tests/ run against local source. They
-#     prove the fix works in source. They DO NOT prove the published
-#     wheel contains the fix.
-#   - The wheel rewriter (scripts/build_runtime_package.py) renames
-#     symbols + paths. Any rewrite drift could silently strip the
-#     guard from the shipped artifact.
+#   - Unit tests in the workspace-runtime repository prove the fix in that
+#     source tree. They do not prove the package currently installed here
+#     contains it.
+#   - The runtime repository's package builder can change imports and paths.
+#     Packaging drift could therefore omit the guard from the shipped artifact.
 #   - This replay imports from `molecule_runtime.a2a_mcp_server` (the
 #     wheel-rewritten path), exercises the actual published code, and
 #     asserts the envelope shape. If the wheel build ever ships without
 #     the guard, this fails — even if unit tests on local source pass.
 #
 # Phases:
-#   A. Confirm an installed molecule-runtime version that contains the
-#      #2481 fix (>= 0.1.78).
+#   A. Confirm an installed current runtime distribution that contains the
+#      #2481 fix (molecules-workspace-runtime >= 0.4.5).
 #   B. Call `_build_channel_notification` with peer_id="../../foo" and
 #      assert (1) meta["peer_id"] == "", (2) no agent_card_url field,
 #      (3) no peer_name/peer_role.
@@ -51,25 +50,31 @@ assert() {
 }
 
 # ─── Phase A: wheel version contains the fix ───────────────────────────
-echo "[replay] A. confirming installed molecule-ai-workspace-runtime contains #2481..."
-INSTALLED=$(pip3 show molecule-ai-workspace-runtime 2>/dev/null | awk -F': ' '/^Version:/ {print $2}')
+echo "[replay] A. confirming installed molecules-workspace-runtime contains #2481..."
+INSTALLED=$(pip3 show molecules-workspace-runtime 2>/dev/null | awk -F': ' '/^Version:/ {print $2}')
 if [ -z "$INSTALLED" ]; then
-    echo "[replay] FAIL A: molecule-ai-workspace-runtime not installed."
-    echo "         Install: pip3 install molecule-ai-workspace-runtime"
+    echo "[replay] FAIL A: molecules-workspace-runtime not installed."
+    echo "         Install from the repo root: bash scripts/install-workspace-runtime.sh"
     exit 2
 fi
 echo "[replay]   installed version: $INSTALLED"
 
-# 0.1.78 is the first published version after #2481 merged to staging.
-# Compare via Python distutils-style version sort (works across patch
-# bumps without sed-fragility).
+# 0.4.5 is the current canonical distribution baseline containing #2481.
+# Compare the numeric semantic-version core with the Python standard library;
+# the replay deliberately installs the runtime with --no-deps, so importing a
+# third-party version parser here would make the guard depend on ambient state.
 HAS_FIX=$(python3 -c "
-from packaging.version import parse
-print('yes' if parse('$INSTALLED') >= parse('0.1.78') else 'no')
+import re
+def core(value):
+    match = re.match(r'^(\\d+)\\.(\\d+)\\.(\\d+)', value)
+    if not match:
+        raise SystemExit(2)
+    return tuple(int(part) for part in match.groups())
+print('yes' if core('$INSTALLED') >= core('0.4.5') else 'no')
 " 2>/dev/null || echo "unknown")
 if [ "$HAS_FIX" != "yes" ]; then
-    echo "[replay] FAIL A: installed $INSTALLED < 0.1.78 (the version that shipped the #2481 fix)."
-    echo "         Upgrade: pip3 install --upgrade molecule-ai-workspace-runtime"
+    echo "[replay] FAIL A: installed $INSTALLED < 0.4.5 (current canonical baseline)."
+    echo "         Upgrade from the repo root: bash scripts/install-workspace-runtime.sh"
     exit 2
 fi
 echo "[replay]   ✓ contains #2481 trust-boundary fix"
@@ -77,9 +82,9 @@ echo "[replay]   ✓ contains #2481 trust-boundary fix"
 # ─── Phase B-E: in-process assertions against the installed wheel ──────
 # We don't need WORKSPACE_ID/PLATFORM_URL/MOLECULE_WORKSPACE_TOKEN to
 # import the module — the env validation only fires at console-script
-# entry. We use molecule_runtime.* (the wheel-rewritten import path)
-# rather than workspace.a2a_mcp_server (local source) so this exercises
-# the SHIPPED code.
+# entry. We import `molecule_runtime.*` from the installed distribution rather
+# than relying on any repository-local runtime source, so this exercises the
+# shipped code.
 echo ""
 echo "[replay] B-E. exercising _build_channel_notification + _agent_card_url_for from the installed wheel..."
 

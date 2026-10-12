@@ -1,5 +1,10 @@
 # SSH into Cloud Agent Workspaces via EC2 Instance Connect
 
+> **Historical tutorial (April 2026).** The EC2 Instance Connect path below is
+> retained for the former AWS topology and is not a current workspace-terminal
+> runbook. See [Workspace Terminal](../../infra/workspace-terminal.md) for the
+> current provider-boundary contract.
+
 EC2 Instance Connect Endpoint lets you open a shell in a CP-provisioned workspace — no SSH keys, no IP hunting, no security group configuration. The platform handles the EIC call under the hood; you just click Terminal.
 
 SSH access to a cloud agent workspace sounds like it should be simple. The instance exists in your AWS account, you have the `instance_id` — surely there's a direct path. There isn't, by default. Instance IPs change on restart, security groups need per-account rules, and long-lived SSH keys are a provenance problem the moment more than one person needs access.

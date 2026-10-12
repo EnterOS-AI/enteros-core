@@ -45,11 +45,14 @@ func InitPostgres(databaseURL string) error {
 // — those are intentional rollbacks, only to be run by operators manually
 // via psql when a real rollback is required.
 //
-// NOTE: this runner still re-applies every migration on every boot. That
-// works for idempotent `CREATE TABLE IF NOT EXISTS` + `ALTER TABLE ... IF NOT
-// EXISTS` statements but means non-idempotent DDL will fail on restart.
-// Migration authors must write idempotent SQL. A real schema_migrations
-// tracking table would be better; tracked as follow-up.
+// Applied filenames are recorded in schema_migrations IN THE SAME TRANSACTION
+// as the migration's own SQL, so an interrupted boot is always resumable — see
+// migration_transaction.go for the measurement that forced this and for the
+// three migrations that cannot be wrapped and are handled explicitly instead.
+//
+// This used to be two transactions, and the gap between them was the whole
+// defect: a tenant killed in it left the DDL applied and unrecorded, and every
+// later boot died on "relation already exists" with no way out.
 func RunMigrations(migrationsDir string) error {
 	// Create tracking table if it doesn't exist.
 	if _, err := DB.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -94,13 +97,12 @@ func RunMigrations(migrationsDir string) error {
 		if err != nil {
 			return fmt.Errorf("read %s: %w", f, err)
 		}
-		if _, err := DB.Exec(string(content)); err != nil {
-			return fmt.Errorf("exec %s: %w", base, err)
+		plan, err := planMigration(base, string(content))
+		if err != nil {
+			return err
 		}
-
-		// Record as applied.
-		if _, err := DB.Exec("INSERT INTO schema_migrations (filename) VALUES ($1)", base); err != nil {
-			return fmt.Errorf("record migration %s: %w", base, err)
+		if err := applyMigration(plan); err != nil {
+			return err
 		}
 		applied++
 	}

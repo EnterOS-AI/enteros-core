@@ -12,7 +12,7 @@
 
 services:
   runtime:
-    image: ${TEMPLATE_IMAGE:?TEMPLATE_IMAGE env required, e.g. ghcr.io/molecule-ai/workspace-template-hermes:latest}
+    image: ${TEMPLATE_IMAGE:?TEMPLATE_IMAGE env required, e.g. registry.moleculesai.app/molecule-ai/workspace-template-hermes:latest}
     # The runtime entrypoint (workspace/entrypoint.sh) refuses to start when
     # any operator-scope env var is present. We deliberately set no creds —
     # the canary doesn't invoke a real LLM provider (see TEST_NO_PROVIDER below).

@@ -35,10 +35,10 @@ func TestConciergeCreatesWorkspace_Hermetic(t *testing.T) {
 		// Base heartbeat UPDATE.
 		mock.ExpectQuery("SELECT COALESCE\\(current_task").
 			WithArgs("ws-concierge-ok").
-			WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+			WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 		mock.ExpectExec("UPDATE workspaces SET").
-			WithArgs("ws-concierge-ok", 0.0, "", 0, 60, "").
+			WithArgs("ws-concierge-ok", 0.0, "", 0, 60, "", nil).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
 		// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.
@@ -89,10 +89,10 @@ func TestConciergeCreatesWorkspace_Hermetic(t *testing.T) {
 
 		mock.ExpectQuery("SELECT COALESCE\\(current_task").
 			WithArgs("ws-concierge-missing").
-			WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+			WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 		mock.ExpectExec("UPDATE workspaces SET").
-			WithArgs("ws-concierge-missing", 0.0, "", 0, 60, "").
+			WithArgs("ws-concierge-missing", 0.0, "", 0, 60, "", nil).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
 		// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.
@@ -221,6 +221,7 @@ func TestConciergeCreatesWorkspace_Hermetic(t *testing.T) {
 			"budget_limit", "monthly_spend",
 			"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 			"loaded_mcp_tools",
+			"mcp_surface",
 		}
 		mock.ExpectQuery("SELECT w.id, w.name").
 			WithArgs(wsID).
@@ -229,7 +230,8 @@ func TestConciergeCreatesWorkspace_Hermetic(t *testing.T) {
 					"http://localhost:8001", nil, 0, 1, 0.0, "", 60, "", "claude-code",
 					"", 0.0, 0.0, false,
 					nil, 0, false, true, []byte(`{}`), "workspace",
-					[]byte(`["a2a","`+conciergePlatformMCPProvisionWorkspaceTool+`"]`)))
+					[]byte(`["a2a","`+conciergePlatformMCPProvisionWorkspaceTool+`"]`),
+					[]byte(nil))) // core#5137 mcp_surface: NULL = core has not classified this row
 
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)

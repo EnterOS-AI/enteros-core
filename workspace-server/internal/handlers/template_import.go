@@ -258,10 +258,19 @@ func (h *TemplatesHandler) ReplaceFiles(c *gin.Context) {
 			return
 		}
 
-		// Auto-generate config.yaml if not provided
+		// Auto-generate config.yaml if not provided.
+		// The probe must distinguish "file absent" (regenerate) from "exec
+		// infrastructure failed" (do NOT touch the file): with exec exit codes
+		// now surfaced, a bare `test -f` errors on BOTH, and regenerating on a
+		// transient Docker error would clobber the workspace's real config
+		// with a default (wrong tier/model) and restart onto it. The && echo
+		// form exits 0 either way, so a non-nil err means the exec itself
+		// failed — fail safe by skipping regeneration.
 		if _, exists := body.Files["config.yaml"]; !exists {
-			// Check if config.yaml exists in container
-			if _, err := h.execInContainer(ctx, containerName, []string{"test", "-f", "/configs/config.yaml"}); err != nil {
+			out, err := h.execInContainer(ctx, containerName, []string{
+				"sh", "-c", "test -f /configs/config.yaml && echo yes || echo no",
+			})
+			if err == nil && strings.TrimSpace(out) == "no" {
 				tier := 3
 				if h.wh != nil {
 					tier = h.wh.DefaultTier()

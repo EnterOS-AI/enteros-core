@@ -1,7 +1,12 @@
 services:
-  # digest-pinned 2026-05-10 (sha256:4941ef97aaa2633ce9808f7766f8b8d746dd039ce8c51ca6da185c3dc63ab579, linux/amd64)
+  # Digest-pinned 2026-07-17. All pins in this file are MULTI-ARCH manifest-list
+  # digests (amd64 + arm64) — never platform-specific image digests, which break
+  # Apple Silicon / arm64 hosts (redis-cli segfaults under qemu, ClickHouse
+  # aborts). Refresh with: docker buildx imagetools inspect <name>:<tag>
+  # and take the top-level "Digest:" (the index), keeping the :tag in the ref
+  # as documentation — the digest is what Docker resolves.
   postgres:
-    image: postgres@sha256:4941ef97aaa2633ce9808f7766f8b8d746dd039ce8c51ca6da185c3dc63ab579
+    image: postgres:16.13@sha256:5d143123fdf80462d1778cd4f24b9f7ca13c87174bca19141fb194c5a1ebca59
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-dev}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev}
@@ -25,7 +30,7 @@ services:
       retries: 10
 
   langfuse-db-init:
-    image: postgres@sha256:4941ef97aaa2633ce9808f7766f8b8d746dd039ce8c51ca6da185c3dc63ab579
+    image: postgres:16.13@sha256:5d143123fdf80462d1778cd4f24b9f7ca13c87174bca19141fb194c5a1ebca59
     depends_on:
       postgres:
         condition: service_healthy
@@ -46,9 +51,8 @@ services:
           psql -h postgres -U "$${POSTGRES_USER}" -d postgres -c "CREATE DATABASE langfuse"
         fi
 
-  # digest-pinned 2026-05-10 (sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7, linux/amd64)
   redis:
-    image: redis@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
+    image: redis:7.4.9@sha256:a8f08480e1f88f2647fed492d1178c06abb0d0c1fbf02c682a61e2f483fb3954
     command: ["redis-server", "--notify-keyspace-events", "KEA"]
     ports:
       - "127.0.0.1:${MOLECULE_REDIS_HOST_PORT:-6379}:6379"
@@ -67,9 +71,16 @@ services:
   # MinIO is S3-compatible, path-style, and stands in for the per-tenant
   # platform-proxy backend used by workspace snapshot/restore and migration
   # work. The workspace box never receives these credentials.
-  # digest-pinned 2026-07-09 (manifest-list sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e)
   minio:
-    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    # minio/minio and minio/mc stopped being anonymously pullable (Docker Hub
+    # 404/401, quay 401 — core#5208). Chainguard publishes free multi-arch
+    # builds; only the floating tags are public, so pin by index digest.
+    image: cgr.dev/chainguard/minio:latest@sha256:e7ca559d9f7c0b5f24f5f669bb92f40f3ca88d56273b808bf3a7c116c17d2ffa
+    # The Chainguard image runs as uid 65532, but existing `miniodata` volumes
+    # were written by the old root-running minio/minio image. Run as root so
+    # those volumes keep working (otherwise: "file access denied ... Unable to
+    # initialize backend" crash-loop).
+    user: "0:0"
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-molecule-dev-minio}
@@ -86,10 +97,11 @@ services:
   # One-shot bucket bootstrap. Kept behind a profile so the normal compose `up`
   # does not leave an exited helper container; infra/scripts/setup.sh runs it
   # after MinIO is reachable.
-  # digest-pinned 2026-07-09 (manifest-list sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727)
   minio-init:
     profiles: ["tools"]
-    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    # The -dev variant carries /bin/sh, which the bootstrap script below needs
+    # (the plain minio-client image is shell-less).
+    image: cgr.dev/chainguard/minio-client:latest-dev@sha256:fc78c525b3227e4d256ed1fc285ee08976688c7ac870f3daed73469d5da750ba
     depends_on:
       - minio
     environment:
@@ -101,14 +113,19 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
+        tries=0
         until mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}" >/dev/null 2>&1; do
+          tries=$$((tries + 1))
+          if [ "$$tries" -ge 60 ]; then
+            echo "minio-init: MinIO not reachable after 60s — check 'docker compose logs minio'" >&2
+            exit 1
+          fi
           sleep 1
         done
         mc mb --ignore-existing "local/$${MOLECULE_WORKSPACE_DATA_BUCKET}" >/dev/null
 
-  # digest-pinned 2026-05-10 (sha256:5b296e0ba1da74efea3143c773ddd60245f249fb7c72eb1d866c2d6ebc759fbe, linux/amd64)
   langfuse-clickhouse:
-    image: clickhouse/clickhouse-server@sha256:5b296e0ba1da74efea3143c773ddd60245f249fb7c72eb1d866c2d6ebc759fbe
+    image: clickhouse/clickhouse-server:24.10.2.80@sha256:3381aed826313cb9395830b30a5dc487a5a62f7054f012a2130f55e68100d0ad
     environment:
       CLICKHOUSE_DB: langfuse
       CLICKHOUSE_USER: langfuse

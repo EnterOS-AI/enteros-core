@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { api } from "@/lib/api";
+import { createWorkspaceWithRetry } from "@/lib/workspaceCreateRetry";
 import { useCanvasStore } from "@/store/canvas";
 import { OrgTemplatesSection } from "./TemplatePalette";
 import { isUserVisibleWorkspaceTemplate, type Template } from "@/lib/deploy-preflight";
@@ -61,7 +62,7 @@ export function EmptyState() {
     setBlankCreating(true);
     setBlankError(null);
     try {
-      const ws = await api.post<{ id: string }>("/workspaces", {
+      const ws = await createWorkspaceWithRetry<{ id: string }>({
         name: "My First Agent",
         canvas: firstDeployCoords(),
       });
@@ -94,7 +95,7 @@ export function EmptyState() {
         </div>
 
         <p className="text-[10px] font-semibold uppercase tracking-[0.28em] text-sky-400/80 mb-2">
-          Welcome to Molecule AI
+          Welcome to Enter OS
         </p>
         <h2 className="text-xl font-semibold text-ink mb-1">
           Deploy your first agent

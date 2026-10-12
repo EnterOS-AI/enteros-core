@@ -105,7 +105,8 @@ describe("TermsGate — pending state → modal", () => {
     await waitFor(() => screen.getByRole("dialog"));
     expect(screen.getByText(/Terms of Service/i)).toBeTruthy();
     expect(screen.getByText(/Privacy Policy/i)).toBeTruthy();
-    expect(screen.getByText(/AWS us-east-2/i)).toBeTruthy();
+    expect(screen.getByText(/configured infrastructure providers and regions/i)).toBeTruthy();
+    expect(screen.queryByText(/AWS us-east-2/i)).toBeNull();
   });
 
   it("the I agree button is present", async () => {

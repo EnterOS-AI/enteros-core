@@ -53,6 +53,8 @@
 set -euo pipefail
 
 source "$(dirname "$0")/_lib.sh"  # sets BASE default + admin-auth + cleanup helpers
+# shellcheck source=lib/a2a_queue_guard.sh
+source "$(dirname "$0")/lib/a2a_queue_guard.sh"
 
 # ---- config -----------------------------------------------------------------
 ADMIN_TOKEN="${ADMIN_TOKEN:-${MOLECULE_ADMIN_TOKEN:-}}"
@@ -90,6 +92,43 @@ RUNTIME="claude-code"
 # unreachable. This keeps the test correct without an annual sha bump.
 CACHE_REPO="molecule-local/workspace-template-${RUNTIME}"
 GITEA_BRANCH_API="${GITEA_BRANCH_API:-https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-ai-workspace-template-${RUNTIME}/branches/main}"
+
+# ---- core#5031: private tag namespace --------------------------------------
+# Every component of the cache tag above (runtime, template HEAD sha, arch) is
+# derived from the WORLD, so two concurrent jobs on one Docker daemon compute
+# the SAME name. That is fine for the provisioner, which writes the genuine
+# template there; it is NOT fine for this script, which writes a STUB. On
+# core#5030 the schedules e2e restored the tag to the real image while this
+# script was still using it, and the required lifecycle gate failed with
+# "Invalid API key" — an assertion that points at secrets, not at CI.
+#
+# MOLECULE_LOCAL_IMAGE_ISOLATION is the SINGLE source for the private suffix:
+# provisioner/local_image_isolation.go appends the same `--<token>` to both the
+# sha-pinned tag and `:latest`, so the platform we start resolves exactly what
+# we tag and no other job can name it. Unset (local dev) everything below is
+# byte-identical to before.
+LOCAL_IMAGE_ISOLATION="${MOLECULE_LOCAL_IMAGE_ISOLATION:-}"
+ISOLATION_SUFFIX=""
+if [ -n "$LOCAL_IMAGE_ISOLATION" ]; then
+  # Same rule as LocalImageIsolation() in Go. Fail CLOSED: a token the platform
+  # will reject must not silently degrade this script back onto the shared tag,
+  # because then the run believes it is isolated and is not.
+  case "$LOCAL_IMAGE_ISOLATION" in
+    [a-z0-9]*[!a-z0-9._-]*|[!a-z0-9]*)
+      echo "ERROR: MOLECULE_LOCAL_IMAGE_ISOLATION=$LOCAL_IMAGE_ISOLATION is not usable in a Docker tag" >&2
+      echo "       (must start with [a-z0-9]; only lower-case letters, digits, '.', '_', '-')" >&2
+      exit 2
+      ;;
+  esac
+  if [ "${#LOCAL_IMAGE_ISOLATION}" -gt 48 ]; then
+    echo "ERROR: MOLECULE_LOCAL_IMAGE_ISOLATION is ${#LOCAL_IMAGE_ISOLATION} chars; max 48" >&2
+    exit 2
+  fi
+  ISOLATION_SUFFIX="--${LOCAL_IMAGE_ISOLATION}"
+fi
+# The intermediate build tag is a third shared name — both e2e scripts build to
+# `molecule-local/stub-runtime:latest`. Isolate it too.
+STUB_IMAGE="molecule-local/stub-runtime:latest${ISOLATION_SUFFIX}"
 # Model + credential choice — three coupled constraints from workspace-server:
 #   * Create rejects a model NOT registered for the runtime
 #     (UNREGISTERED_MODEL_FOR_RUNTIME, provider-registry SSOT).
@@ -107,7 +146,7 @@ GITEA_BRANCH_API="${GITEA_BRANCH_API:-https://git.moleculesai.app/api/v1/repos/m
 LIFECYCLE_MODEL="${LIFECYCLE_MODEL:-claude-opus-4-7}"
 LIFECYCLE_LLM_KEY="${LIFECYCLE_LLM_KEY:-ANTHROPIC_API_KEY}"
 LIFECYCLE_LLM_VALUE="${LIFECYCLE_LLM_VALUE:-sk-ant-e2e-stub-dummy-not-a-real-key}"
-LATEST_TAG="${CACHE_REPO}:latest"
+LATEST_TAG="${CACHE_REPO}:latest${ISOLATION_SUFFIX}"
 
 # ---- LIFECYCLE_LLM: real-LLM round-trip mode -------------------------------
 # Default "" = the existing behaviour (stub or LLM-less real image).
@@ -286,9 +325,20 @@ cleanup() {
       "$(workspace_volume_name "$WSID")" >/dev/null 2>&1 || true
     echo "cleaned workspace $WSID + $(container_name "$WSID") container/volumes"
   fi
-  # Restore the cache tag to whatever it pointed at before we retagged it, so a
-  # stub run doesn't leave the real claude-code tag aliased to the stub.
-  if [ -n "$ORIG_CACHE_IMAGE_ID" ]; then
+  if [ -n "$ISOLATION_SUFFIX" ]; then
+    # core#5031: the tags are OURS. Nothing to restore — there is no previous
+    # image behind a name only this run ever wrote — so drop them instead.
+    # Deleting is what makes the isolation safe to repeat: an untagged private
+    # name cannot accumulate on the shared daemon, and `docker rmi` of a tag
+    # that another run never resolves cannot interfere with it.
+    for t in "$CACHE_TAG" "$LATEST_TAG" "$STUB_IMAGE"; do
+      [ -n "$t" ] && docker rmi "$t" >/dev/null 2>&1 || true
+    done
+    echo "dropped our private image tags (isolation=$LOCAL_IMAGE_ISOLATION)"
+  elif [ -n "$ORIG_CACHE_IMAGE_ID" ]; then
+    # No isolation (local developer run): restore the cache tag to whatever it
+    # pointed at before we retagged it, so a stub run doesn't leave the real
+    # claude-code tag aliased to the stub.
     docker tag "$ORIG_CACHE_IMAGE_ID" "$CACHE_TAG" >/dev/null 2>&1 || true
     echo "restored $CACHE_TAG -> ${ORIG_CACHE_IMAGE_ID:0:19}"
   fi
@@ -341,8 +391,12 @@ except Exception:
   else
     CACHE_ARCH_SUFFIX="$(go env GOARCH)"
   fi
-  CACHE_TAG="${CACHE_REPO}:${CACHE_SHA}-${CACHE_ARCH_SUFFIX}"
+  CACHE_TAG="${CACHE_REPO}:${CACHE_SHA}-${CACHE_ARCH_SUFFIX}${ISOLATION_SUFFIX}"
   echo "Resolved provisioner cache tag: $CACHE_TAG (gitea HEAD sha)"
+fi
+if [ -n "$ISOLATION_SUFFIX" ]; then
+  echo "core#5031: this run owns a PRIVATE image namespace (MOLECULE_LOCAL_IMAGE_ISOLATION=$LOCAL_IMAGE_ISOLATION);"
+  echo "           no concurrent job can resolve or restore these tags."
 fi
 
 # Record what the cache tag points at NOW (if anything) so cleanup can restore.
@@ -355,11 +409,11 @@ if [ "$LIFECYCLE_PROVISIONER_BUILDS" = "1" ]; then
   pass "provisioner-builds mode: leaving image resolution to RegistryModeLocal (real template build)"
 elif [ "$USING_STUB" -eq 1 ]; then
   echo "Building stub image from $STUB_DIR ..."
-  if ! docker build --platform=linux/amd64 -t molecule-local/stub-runtime:latest "$STUB_DIR" >/tmp/stub_build.log 2>&1; then
+  if ! docker build --platform=linux/amd64 -t "$STUB_IMAGE" "$STUB_DIR" >/tmp/stub_build.log 2>&1; then
     echo "FAIL: stub image build failed"; tail -20 /tmp/stub_build.log; exit 1
   fi
   pass "stub image built"
-  TARGET_IMAGE="molecule-local/stub-runtime:latest"
+  TARGET_IMAGE="$STUB_IMAGE"
   # Point BOTH the sha-pinned cache tag and :latest at the stub so the
   # provisioner's RegistryModeLocal cache-check (dockerHasTag) resolves to it
   # instead of cloning+building the template.
@@ -409,6 +463,38 @@ JSON
 )
 RESP=$(admin_curl -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d "$CREATE_BODY")
 WSID=$(ws_field "$RESP" "id")
+
+# RECORD WHAT WE OWN, THE MOMENT WE OWN IT.
+#
+# This runs on a SHARED docker-host daemon, concurrently with other PRs' runs of this
+# same workflow (the concurrency group is per-SHA, so it serialises a SHA against
+# itself and nothing else). The teardown therefore has to know which ws-* containers
+# are OURS.
+#
+# It used to infer that by exclusion: snapshot the ws-* containers at job start, then
+# delete anything not in that snapshot. But "not in my baseline" is not "mine" — a run
+# that starts AFTER ours creates containers that are, by construction, absent from our
+# baseline. So our teardown would find another run's LIVE workspace, classify it as our
+# own leak, and `docker rm -f` it. That is #4346, and it took down a real run: the
+# victim's container simply stopped existing mid-restart, with no error anywhere in its
+# provisioning path (last_sample_error=<none>, container_running=<none>) — which is
+# indistinguishable from a platform bug and reads exactly like a flake.
+#
+# The POST above has already told us the id, and the container is named ws-<id>. So we
+# know precisely what we own. Positive identity, recorded here rather than inferred
+# later. The id lands in the manifest BEFORE the container exists, so a crash at any
+# point after this line still leaves us able to clean up exactly our own container and
+# nobody else's.
+#
+# (If the runner itself is SIGKILLed before teardown runs, nothing here executes at
+# all — that is what the age-guarded sweep-stale-ws-orphans.yml janitor is for. That is
+# the right layer for it: it is time-based, so it cannot delete a container that is
+# still in use.)
+if [ -n "${E2E_WS_MANIFEST:-}" ] && [ -n "$WSID" ]; then
+  echo "$WSID" >> "$E2E_WS_MANIFEST"
+  echo "recorded owned workspace in manifest: $WSID"
+fi
+
 if [ -z "$WSID" ]; then
   fail "create returned no workspace id" "$RESP"
   echo "=== Results: $PASS passed, $((FAIL+1)) failed ==="
@@ -558,6 +644,34 @@ if [ -n "$WS_URL_AFTER" ]; then
 else
   fail "workspace URL is empty after reaching online" "registry row has no url"
 fi
+
+# Provisioning-phase boot telemetry (PR #4460): the platform's provisioner
+# must emit step-1 "PWR / Provision compute" telemetry while provisioning —
+# the cmd/server wiring logs each emission as "boot-telemetry: ...". Without
+# this the canvas watchdog is silent for the entire provisioning phase (a
+# first-boot image build is 5+ minutes of "waiting for boot telemetry").
+# BOOT_STEP itself is broadcast-only, so the log line is the only durable
+# evidence the main-loop wiring fired; the canvas-side rendering is guarded
+# separately by canvas/e2e/boot-regression.spec.ts. PLATFORM_LOG defaults to
+# where the CI workflow writes it; override for local runs.
+PLATFORM_LOG="${PLATFORM_LOG:-workspace-server/platform.log}"
+if [ -f "$PLATFORM_LOG" ]; then
+  if grep -q "boot-telemetry: workspace=${WSID} step=1/8 key=PWR status=running" "$PLATFORM_LOG"; then
+    pass "provisioning boot telemetry fired for ws-${WSID} (main-loop wiring connected)"
+  else
+    fail "no boot-telemetry log line for ws-${WSID}" \
+      "SetBootStepEmitter wiring in cmd/server did not fire during provisioning — canvas watchdog would be silent all provisioning phase"
+  fi
+else
+  # Local convenience only: CI always has the workflow-written log. Refuse to
+  # silently vacuum the assertion away unless the operator opts out.
+  if [ -n "${SKIP_BOOT_TELEMETRY_LOG_ASSERT:-}" ]; then
+    echo "SKIP: boot-telemetry log assertion (PLATFORM_LOG=$PLATFORM_LOG not found; opt-out set)"
+  else
+    fail "platform log not found at $PLATFORM_LOG" \
+      "set PLATFORM_LOG to the platform's log file, or SKIP_BOOT_TELEMETRY_LOG_ASSERT=1 for ad-hoc local runs"
+  fi
+fi
 URL_HOST_AFTER="${WS_URL_AFTER#http://}"
 URL_HOST_AFTER="${URL_HOST_AFTER#https://}"
 URL_HOST_AFTER="${URL_HOST_AFTER%%:*}"
@@ -653,9 +767,9 @@ echo ""
 # Step 4 — RESTART-SURVIVAL (the assertion that would have caught the bug).
 # ----------------------------------------------------------------------------
 echo "--- Step 4: restart-survival (POST /workspaces/$WSID/restart) ---"
-# Re-mint the workspace bearer: every (re)provision rotates the workspace token
-# (issueAndInjectToken -> RevokeAllForWorkspace + IssueToken), so the Step-2
-# token is now stale. /restart is WorkspaceAuth-gated, so mint a fresh one.
+# Mint an explicit API-kind workspace bearer for restart and the A2A checks
+# below. Provisioning rotates only runtime-held instance tokens; this caller-held
+# API token survives the restart and remains valid for send + queue polling.
 WTOKEN=$(e2e_mint_workspace_token "$WSID" || true)
 if [ -z "$WTOKEN" ]; then
   fail "could not mint fresh workspace token for restart"
@@ -762,6 +876,8 @@ A2A_TMP=$(mktemp)
 set +e
 A2A_CODE=$(curl -s -o "$A2A_TMP" -w '%{http_code}' --max-time "$A2A_CEIL" \
   -X POST "$BASE/workspaces/$WSID/a2a" \
+  -H "Authorization: Bearer $WTOKEN" \
+  -H "X-Workspace-ID: $WSID" \
   -H "Content-Type: application/json" \
   -d "$A2A_BODY")
 A2A_RC=$?
@@ -793,14 +909,10 @@ try:
 except Exception:
   print('false')" 2>/dev/null || echo "false")
 if [ "$A2A_QUEUED" = "true" ]; then
-  A2A_QID=$(printf '%s' "$A2A" | python3 -c "
-import sys,json
-try:
-  print(json.load(sys.stdin).get('queue_id',''))
-except Exception:
-  print('')" 2>/dev/null || echo "")
-  if [ -z "$A2A_QID" ]; then
-    infra_skip_advisory "a2a-queued-no-queue-id" "initial POST was queued but returned no queue_id"
+  A2A_QID=$(printf '%s' "$A2A" | a2a_queue_id_from_response 2>/dev/null || echo "")
+  if ! require_a2a_queue_id "$A2A_QID"; then
+    echo "=== Results: $PASS passed, $FAIL failed ==="
+    exit 1
   fi
   echo "  A2A queued (queue_id=$A2A_QID); polling durable result..."
   A2A_POLL_TMP=$(mktemp)
@@ -810,6 +922,7 @@ except Exception:
     : >"$A2A_POLL_TMP"
     set +e
     curl -s -o "$A2A_POLL_TMP" -w '%{http_code}' --max-time 30 \
+      -H "Authorization: Bearer $WTOKEN" \
       -H "X-Workspace-ID: $WSID" \
       "$BASE/workspaces/$WSID/a2a/queue/$A2A_QID" >/dev/null 2>&1
     set -e

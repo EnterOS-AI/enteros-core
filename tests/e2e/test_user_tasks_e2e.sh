@@ -24,8 +24,7 @@
 #   BASE                  platform base URL (default http://localhost:8080)
 #   ADMIN_TOKEN /         platform admin bearer; MOLECULE_ADMIN_TOKEN wins.
 #   MOLECULE_ADMIN_TOKEN  Sent on AdminAuth routes (create/delete ws,
-#                         /user-tasks/pending). Fail-open dev platform with
-#                         no admin token still works (helpers send nothing).
+#                         /user-tasks/pending). Required: dev also fails closed.
 set -euo pipefail
 
 source "$(dirname "$0")/_lib.sh"  # sets BASE default + admin-auth helpers
@@ -77,6 +76,7 @@ check_code() {
 }
 
 # Admin bearer for AdminAuth routes (create/delete workspace, pending feed).
+e2e_require_admin_token
 ADMIN_AUTH=()
 e2e_admin_auth_args ADMIN_AUTH
 acurl() { curl -s ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} "$@"; }

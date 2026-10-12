@@ -53,7 +53,7 @@ function makeAttachment(name: string, size?: number): ChatAttachment {
 beforeEach(() => {
   // Reset to known-good state for each test.
   mockIsPlatformAttachment.mockReturnValue(true);
-  mockResolveAttachmentHref.mockReturnValue(
+  mockResolveAttachmentHref.mockImplementation(
     (id: string, uri: string) => `https://api.moleculesai.app/attachments/${uri}`,
   );
 });
@@ -65,21 +65,13 @@ afterEach(() => {
 // ─── Fetch mock helpers ───────────────────────────────────────────────────────
 
 function mockFetchOk(body: string, contentType = "image/png") {
-  const blob = new Blob([body], { type: contentType });
-  global.fetch = vi.fn(() =>
-    Promise.resolve({
-      ok: true,
-      status: 200,
-      blob: () => Promise.resolve(blob),
-      headers: new Map([["content-type", contentType]]),
-    }) as unknown as Response,
-  );
+  global.fetch = vi.fn(async () => new Response(body, {
+    headers: { "content-type": contentType },
+  }));
 }
 
 function mockFetchError() {
-  global.fetch = vi.fn(() =>
-    Promise.resolve({ ok: false, status: 500 }) as unknown as Response,
-  );
+  global.fetch = vi.fn(async () => new Response(null, { status: 500 }));
 }
 
 // ─── Loading / idle state ─────────────────────────────────────────────────────

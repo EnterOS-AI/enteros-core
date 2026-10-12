@@ -39,6 +39,16 @@
 #   redeploy-staging-fleet.sh --tag  staging-<sha>     # roll onto TENANT_IMAGE:tag
 #   redeploy-staging-fleet.sh --dry-run                # discover + plan only
 #   redeploy-staging-fleet.sh --cp-env staging         # (default) env label filter
+#   redeploy-staging-fleet.sh --only <name-substring>  # roll ONLY matching tenant(s)
+#   redeploy-staging-fleet.sh --exclude a,b            # never touch these slugs (k8s arm)
+#   redeploy-staging-fleet.sh --allow-empty            # ASSERT an empty fleet is expected
+#
+# SUBSTRATE DISPATCH: this script rolls the DOCKER substrate itself and dispatches
+# the KUBERNETES substrate to scripts/deploy/redeploy-tenant-fleet-k8s.sh, which
+# enumerates targets from the control plane by substrate. The k8s arm runs when a
+# census source (CP_DATABASE_URL or SUBSTRATE_CENSUS_CMD) is configured. Finding
+# zero docker tenants with NO k8s arm dispatched is now a hard ERROR rather than a
+# silent "nothing to roll" exit 0 — see the empty-fleet gate below.
 #
 # Env overrides (no-hardcoding):
 #   TENANT_IMAGE       registry.moleculesai.app/molecule-ai/molecule-tenant
@@ -58,6 +68,78 @@
 # removes a named volume; each swap is health-gated + self-rolls-back; --dry-run
 # performs zero mutations. STAGING scoped by default (cp-env=staging).
 set -euo pipefail
+
+# ── Managed rollout flags (declarative + reversible) ─────────────────────────
+# Staging tenant env is inherited BY COPY (swap_tenant re-applies the running
+# container's Config.Env). A flag set by hand would be STICKY FOREVER — copied
+# into every future redeploy with no way to unset it. So the keys below are the
+# SINGLE SOURCE OF TRUTH: stripped from the inherited env and re-applied ONLY from
+# $TENANT_FLAGS. Removing a flag from TENANT_FLAGS turns it OFF on the next roll.
+# Add a key here the moment a flag needs to be rollable, NOT when someone wants it on.
+MANAGED_FLAG_KEYS=(
+  DELEGATION_LEDGER_WRITE
+  DELEGATION_RESULT_INBOX_PUSH
+)
+
+# apply_managed_flags <envfile>: strip every managed key from the inherited env,
+# then append exactly what TENANT_FLAGS asks for.
+apply_managed_flags() {
+  local envfile="$1"
+  local key rc
+  for key in "${MANAGED_FLAG_KEYS[@]}"; do
+    # FAIL CLOSED. `grep -v` exits 1 when it prints NO lines — which happens for a
+    # real envfile that contains nothing but this one key. Written as
+    # `grep -v ... > tmp && mv`, that skips the mv, leaves the stale flag in place,
+    # and STILL returns 0: the strip silently no-ops in exactly the case it matters,
+    # and the container rolls with the flag it was supposed to have lost. The same
+    # swallow hid any genuine error (a failed redirect: ENOSPC, read-only tmpdir).
+    #
+    # So: 0 = matched, 1 = matched nothing (both fine, and the .tmp is authoritative
+    # either way), >=2 = a real grep error, which must abort the roll.
+    set +e
+    grep -vE "^${key}=" "$envfile" > "${envfile}.tmp"
+    rc=$?
+    set -e
+    if [ "$rc" -ge 2 ]; then
+      rm -f "${envfile}.tmp"
+      echo "::error::apply_managed_flags: grep failed (rc=$rc) stripping '$key' from $envfile" >&2
+      return 1
+    fi
+    if ! mv "${envfile}.tmp" "$envfile"; then
+      rm -f "${envfile}.tmp"
+      echo "::error::apply_managed_flags: could not rewrite $envfile while stripping '$key'" >&2
+      return 1
+    fi
+  done
+  local kv
+  for kv in $TENANT_FLAGS; do
+    case "$kv" in
+      *=*) ;;
+      *) echo "::error::TENANT_FLAGS entry '$kv' is not KEY=VALUE" >&2; return 1 ;;
+    esac
+    key="${kv%%=*}"
+    # Refuse to set anything not declared managed: an unmanaged key would be
+    # sticky (never stripped), i.e. exactly the irreversibility this exists to
+    # prevent. Fail loudly rather than quietly create a one-way door.
+    local ok=0 m
+    for m in "${MANAGED_FLAG_KEYS[@]}"; do [ "$m" = "$key" ] && ok=1; done
+    if [ "$ok" -ne 1 ]; then
+      echo "::error::TENANT_FLAGS key '$key' is not in MANAGED_FLAG_KEYS — it would be" >&2
+      echo "::error::copied into every future redeploy with no way to unset it. Declare it first." >&2
+      return 1
+    fi
+    echo "$kv" >> "$envfile"
+  done
+
+  # SAY WHAT WAS ROLLED. Without this line the staging CD log gives no way to tell
+  # which flag state the fleet actually came up with — and "the burn-in silently
+  # ended two merges ago" is precisely the failure this mechanism must not have.
+  if [ -n "$TENANT_FLAGS" ]; then
+    echo "  managed flags: [$TENANT_FLAGS] (all other managed keys stripped)"
+  else
+    echo "  managed flags: none set — every managed key stripped (${MANAGED_FLAG_KEYS[*]})"
+  fi
+}
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 
 TENANT_IMAGE="${TENANT_IMAGE:-registry.moleculesai.app/molecule-ai/molecule-tenant}"
@@ -66,8 +148,34 @@ CANVAS_APP_IMAGE="${CANVAS_APP_IMAGE:-registry.moleculesai.app/molecule-ai/canva
 # workflow's PROD_CANVAS_APP_CONTAINER. Left empty so the fleet roll never
 # clobbers the central staging-app container.
 STAGING_CANVAS_APP_CONTAINER="${STAGING_CANVAS_APP_CONTAINER:-}"
+# ── Brand prefix set (Enter OS rebrand, internal#1089) ───────────────────────
+# Resource NAMES on a host may carry EITHER brand generation's prefix: legacy
+# "mol" (mol-ws-rtstate-<id>, mol-tenant-<slug>) and "enteros" (the future SDK
+# ResourcePrefix; "mol" stays in LegacyResourcePrefixes()). Every name matcher
+# in this script MUST be derived from this ONE list — never a scattered
+# hardcoded alternation — so the SDK-side prefix flip cannot blind the fleet
+# scripts to one generation of resources. Tenant DISCOVERY is label-driven
+# (molecule.local-tenant / molecule.cp-env) and therefore prefix-agnostic;
+# only the rtstate session-volume guard matches names.
+BRAND_PREFIXES="${BRAND_PREFIXES:-mol enteros}"
+# shellcheck disable=SC2086  # word-splitting of BRAND_PREFIXES is intended
+_BRAND_ALT="$(printf '%s\n' $BRAND_PREFIXES | paste -sd'|' -)"
+# Session (rtstate) volume names: <prefix>-ws-rtstate-<id>, both generations.
+RTSTATE_VOL_RE="^(${_BRAND_ALT})-ws-rtstate-"
 CP_ENV="staging"
 IMAGE="" ; TAG="" ; DRY_RUN=0
+# ONLY: optional substring — when set, restricts the roll to tenant containers
+# whose name contains it. Lets an operator re-roll a single tenant (e.g. one that
+# failed its gate) and bounds blast radius for a targeted canary, without ever
+# touching the rest of the fleet. Empty (default) = the whole cp-env fleet.
+ONLY=""
+# ALLOW_EMPTY: the ONLY way this script may exit 0 having rolled nothing. See the
+# empty-fleet gate below — an accidental empty target set is the defect, an
+# operator ASSERTING the fleet is empty is a legitimate (and now explicit) claim.
+ALLOW_EMPTY=0
+# EXCLUDE: comma-separated tenant slugs/substrings never to touch, on either
+# substrate. Passed through to the k8s roller.
+EXCLUDE="${EXCLUDE_SLUGS:-}"
 
 usage() { sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 while [ "$#" -gt 0 ]; do
@@ -75,11 +183,39 @@ while [ "$#" -gt 0 ]; do
     --image)   IMAGE="$2"; shift 2;;
     --tag)     TAG="$2";   shift 2;;
     --cp-env)  CP_ENV="$2"; shift 2;;
+    --only)    ONLY="$2"; shift 2;;
+    --exclude) EXCLUDE="$2"; shift 2;;
     --dry-run) DRY_RUN=1; shift;;
+    --allow-empty) ALLOW_EMPTY=1; shift;;
     -h|--help) usage 0;;
     *) echo "unknown arg: $1" >&2; usage 2;;
   esac
 done
+
+# TENANT_FLAGS is the SINGLE SOURCE OF TRUTH for the managed keys: this script
+# STRIPS every managed key from the inherited tenant env and re-applies only what
+# TENANT_FLAGS names. A caller that simply FORGETS to pass it does NOT get "the old
+# behaviour" — it silently turns those flags OFF across the whole fleet, ending an
+# in-flight burn-in with no log line. Empty is fine ("all managed flags dark", the
+# safe default); UNSET is not. The requirement lives HERE, at the one place every
+# caller passes through, because a grep-the-workflows lint cannot close it (one file
+# can invoke the script twice and mention TENANT_FLAGS once). Skipped for --dry-run,
+# which performs zero mutations by contract, and placed below arg parsing so --help
+# still prints help.
+if [ "$DRY_RUN" != "1" ] && [ -z "${TENANT_FLAGS+x}" ]; then
+  echo "::error::TENANT_FLAGS is not set. This script strips every managed rollout" >&2
+  echo "::error::flag (${MANAGED_FLAG_KEYS[*]}) from the inherited tenant env and" >&2
+  echo "::error::re-applies only what TENANT_FLAGS declares — so running without it" >&2
+  echo "::error::would silently turn those flags OFF on every tenant." >&2
+  echo "::error::" >&2
+  echo "::error::  flags dark (the default):  TENANT_FLAGS=\"\" bash $0 ..." >&2
+  echo "::error::  turn one on:               TENANT_FLAGS=\"DELEGATION_LEDGER_WRITE=1\" bash $0 ..." >&2
+  echo "::error::" >&2
+  echo "::error::In CI: set STAGING_TENANT_FLAGS in env: and pass" >&2
+  echo "::error::TENANT_FLAGS=\"\${STAGING_TENANT_FLAGS-}\" on the command line." >&2
+  exit 1
+fi
+TENANT_FLAGS="${TENANT_FLAGS:-}"   # --dry-run may legitimately reach here unset
 log() { printf '>> [fleet] %s\n' "$*" >&2; }
 
 # Resolve the target image ref (either an explicit --image, or TENANT_IMAGE:tag).
@@ -107,12 +243,31 @@ if [ "$DRY_RUN" = "0" ]; then
     docker pull "$IMAGE" >/dev/null 2>&1 || log "WARN: docker pull $IMAGE failed; using locally-present image if any"
   fi
 fi
-if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-  if [ "$DRY_RUN" = "1" ]; then
-    log "WARN(dry-run): target image $IMAGE not present locally — a real run would pull it"
+# IMAGE_LOCAL: does the docker daemon have the target image? Only the DOCKER arm
+# needs it — the k8s arm's kubelets pull from the registry themselves. So this is
+# recorded now and enforced later, once discovery has established whether there
+# is any docker-substrate tenant to roll at all. Enforcing it here would make a
+# k8s-only control plane unrollable for a reason that does not apply to it.
+IMAGE_LOCAL=1
+docker image inspect "$IMAGE" >/dev/null 2>&1 || IMAGE_LOCAL=0
+if [ "$IMAGE_LOCAL" = "0" ]; then
+  log "NOTE: target image $IMAGE is not present on this docker daemon (fatal only if a docker-substrate tenant must be rolled)"
+fi
+
+# Candidate-identity fallback: if no expected git_sha was supplied or derivable
+# from a staging-<sha> tag — e.g. a PRODUCTION roll of the moving :latest tag,
+# which carries no sha in its name — read it from the target image's OCI revision
+# label. This lets the health gate assert the ROLLED container is genuinely
+# running THIS candidate (not a stale image a silently-failed swap left behind)
+# for ANY tag, not just staging-<sha>. Absent label => liveness-only (logged).
+if [ -z "$EXPECTED_BUILD_SHA" ] && docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  _rev="$(docker image inspect "$IMAGE" \
+            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$_rev" ] && [ "$_rev" != "<novalue>" ] && [ "$_rev" != "<no value>" ]; then
+    EXPECTED_BUILD_SHA="$_rev"
+    log "expected git_sha derived from image OCI revision label = ${EXPECTED_BUILD_SHA}"
   else
-    echo "::error::tenant image $IMAGE not available locally or in registry" >&2
-    exit 1
+    log "target image carries no org.opencontainers.image.revision label — health gate is LIVENESS-ONLY (cannot verify candidate identity)"
   fi
 fi
 
@@ -122,16 +277,104 @@ mapfile -t TENANTS < <(docker ps \
   --filter "label=molecule.cp-env=${CP_ENV}" \
   --format '{{.Names}}' | sort)
 
+# Optional --only substring narrowing (targeted re-roll / bounded canary).
+if [ -n "$ONLY" ]; then
+  mapfile -t TENANTS < <(printf '%s\n' "${TENANTS[@]}" | grep -F "$ONLY" || true)
+  log "--only '${ONLY}' selected ${#TENANTS[@]} of the ${CP_ENV} fleet"
+fi
+
 if [ "${#TENANTS[@]}" -eq 0 ]; then
-  log "no running ${CP_ENV} tenant platform containers found — nothing to roll"
+  log "no running ${CP_ENV} tenant platform containers found${ONLY:+ matching --only '$ONLY'}"
 else
-  log "tenants to roll (${#TENANTS[@]}): ${TENANTS[*]}"
+  log "docker-substrate tenants to roll (${#TENANTS[@]}): ${TENANTS[*]}"
+fi
+
+# ── Substrate dispatch (k8s arm) ─────────────────────────────────────────────
+# This script rolls the LOCAL-DOCKER substrate only: its whole discovery is
+# `docker ps --filter label=molecule.local-tenant=1`. On a control plane whose
+# tenants live on the `k8s` substrate that filter matches ZERO containers — and
+# this script used to log "nothing to roll" and exit 0, reporting a green fleet
+# roll that moved nothing while every tenant pod stayed on its provisioning-time
+# image. Promoting a runtime image pin then only affected FRESH provisions.
+#
+# So the k8s fleet gets rolled by its own SSOT script, dispatched from here (the
+# documented fleet-roll entry point) so no caller has to learn a second command.
+# The k8s roller enumerates from the CONTROL PLANE by substrate — it does not
+# assume, and it has its own non-vacuous gate.
+K8S_ROLLER="$(dirname "$0")/redeploy-tenant-fleet-k8s.sh"
+K8S_DISPATCH=0
+if [ -n "${SUBSTRATE_CENSUS_CMD:-}${CP_DATABASE_URL:-}" ] && [ -f "$K8S_ROLLER" ]; then
+  K8S_DISPATCH=1
+  log "substrate census source configured — the k8s arm WILL run (${K8S_ROLLER})"
+else
+  log "no substrate census source (CP_DATABASE_URL / SUBSTRATE_CENSUS_CMD unset) — k8s arm NOT dispatched"
+fi
+
+k8s_arm() {
+  local extra=("$@")
+  local args=()
+  # Target pass-through, most specific first. K8S_TENANT_DIGEST is the prod form:
+  # runtime_image_pins stores a bare digest, and the k8s roller re-pins each
+  # workload to <its own repo>@<digest> so it never has to know which registry a
+  # given cluster can actually pull from. Falling back to --tag (not the already
+  # -resolved $IMAGE) matters: the k8s roller derives EXPECTED_BUILD_SHA from a
+  # <env>-<sha> tag, and handing it a tag-qualified $IMAGE instead would throw
+  # that identity away and leave it with nothing to verify against.
+  if [ -n "${K8S_TENANT_DIGEST:-}" ]; then
+    args+=( --digest "$K8S_TENANT_DIGEST" )
+  elif [ -n "$TAG" ]; then
+    args+=( --tag "$TAG" )
+  else
+    args+=( --image "$IMAGE" )
+  fi
+  [ -z "$ONLY" ]    || args+=( --only "$ONLY" )
+  [ -z "$EXCLUDE" ] || args+=( --exclude "$EXCLUDE" )
+  [ "$ALLOW_EMPTY" != "1" ] || args+=( --allow-empty )
+  log "== dispatching k8s arm: $(basename "$K8S_ROLLER") ${args[*]} ${extra[*]} =="
+  bash "$K8S_ROLLER" "${args[@]}" "${extra[@]}"
+}
+
+# ── EMPTY-FLEET GATE (the vacuous-pass fix) ──────────────────────────────────
+# Reached BEFORE any mutation. A run that finds no docker tenants AND has no k8s
+# arm to fall back on has nothing it could possibly roll — reporting success for
+# that is exactly the defect this gate exists to make impossible. It is only
+# acceptable as an explicit operator assertion (--allow-empty).
+if [ "${#TENANTS[@]}" -eq 0 ] && [ "$K8S_DISPATCH" != "1" ]; then
+  if [ "$ALLOW_EMPTY" = "1" ]; then
+    log "0 docker tenants and no k8s arm — accepted because --allow-empty was passed explicitly"
+  else
+    echo "::error::0 ${CP_ENV} tenant containers found on the docker substrate, and no k8s arm was" >&2
+    echo "::error::dispatched (CP_DATABASE_URL / SUBSTRATE_CENSUS_CMD unset). This run would roll" >&2
+    echo "::error::NOTHING and still exit 0 — a vacuous pass that tells an operator the fleet is on" >&2
+    echo "::error::the new image when no running tenant moved." >&2
+    echo "::error::" >&2
+    echo "::error::  * If this control plane's tenants are on the k8s substrate, wire CP_DATABASE_URL" >&2
+    echo "::error::    (or SUBSTRATE_CENSUS_CMD) so the k8s arm can enumerate and roll them." >&2
+    echo "::error::  * If an empty fleet is genuinely expected here, say so: --allow-empty." >&2
+    [ -z "$ONLY" ] || echo "::error::  * a --only '${ONLY}' filter is active and may have excluded everything." >&2
+    exit 1
+  fi
 fi
 
 # Snapshot the session-bearing rtstate volumes BEFORE the roll so we can assert
 # the fleet swap left every one intact (session-preservation regression guard).
-mapfile -t RTSTATE_BEFORE < <(docker volume ls --format '{{.Name}}' | grep -E '^mol-ws-rtstate-' | sort || true)
-log "session (rtstate) volumes present before roll: ${#RTSTATE_BEFORE[@]}"
+# The remote deploy path reaches the daemon through docker-socket-proxy, which
+# DENIES the volume API (VOLUMES=0 — deliberately, since the swap issues no volume
+# op and the volume-delete surface is a crown jewel). A denied `docker volume ls`
+# returns a 403 that would otherwise read as "zero volumes" and make the
+# before/after guard report a HOLLOW pass. Detect the denial via the command's
+# exit status and mark the guard UNAVAILABLE rather than falsely green — on that
+# path session safety rests on the design invariant that this script recreates
+# only STATELESS mol-tenant-* containers and never touches a volume.
+RTSTATE_GUARD=1
+RTSTATE_BEFORE=()
+if volout="$(docker volume ls --format '{{.Name}}' 2>/dev/null)"; then
+  mapfile -t RTSTATE_BEFORE < <(printf '%s\n' "$volout" | grep -E "$RTSTATE_VOL_RE" | sort || true)
+  log "session (rtstate) volumes present before roll: ${#RTSTATE_BEFORE[@]}"
+else
+  RTSTATE_GUARD=0
+  log "NOTE: volume API unavailable on this daemon (docker-socket-proxy denies VOLUMES) — rtstate before/after guard DISABLED; session safety rests on the stateless-container-only swap invariant (no volume op is ever issued)"
+fi
 
 if [ "$DRY_RUN" = "1" ]; then
   log "DRY-RUN: would roll ${#TENANTS[@]} tenant(s) onto ${IMAGE} (canary-first, health-gated)"
@@ -140,6 +383,9 @@ if [ "$DRY_RUN" = "1" ]; then
     printf '   - %-46s %s -> %s\n' "$t" "$cur" "$IMAGE" >&2
   done
   log "DRY-RUN: session volumes that would be PRESERVED (untouched): ${#RTSTATE_BEFORE[@]}"
+  if [ "$K8S_DISPATCH" = "1" ]; then
+    k8s_arm --dry-run || { echo "::error::k8s arm dry-run failed" >&2; exit 1; }
+  fi
   log "DRY-RUN complete — zero mutations performed"
   exit 0
 fi
@@ -162,16 +408,82 @@ json_git_sha() {
   sed -n 's/.*"git_sha"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
 }
 
-# health_gate <container>: probe the tenant's published :8080 /buildinfo through
-# the host loopback. Returns 0 when it answers and, for staging-<sha> rolls,
-# reports the candidate git_sha.
+# health_gate <container>: probe the tenant's /buildinfo DAEMON-SIDE — a throwaway
+# curl container in the TENANT's own network namespace hits localhost:8080. This
+# is host-agnostic: it works identically whether this script runs ON the tenant
+# host or drives a remote DOCKER_HOST over the mesh. The old form curled
+# 127.0.0.1:<published-port> on the runner host, which only worked when the runner
+# WAS the tenant host — so a deploy from any other box passed a hollow check (or,
+# with the port loopback-bound, could not reach the tenant at all). The internal
+# port (8080) is stable, so we no longer need `docker port` to resolve a mapping.
+PROBE_IMAGE="${PROBE_IMAGE:-curlimages/curl:8.11.1}"
+
+# ensure_probe_image: pull the daemon-side probe sidecar ONCE, up front, so the
+# health gate never depends on registry reachability DURING a roll. Without this,
+# the first `docker run` inside health_gate would auto-pull; a transient Docker
+# Hub blip would then read as "tenant unhealthy" and roll back a container that is
+# actually fine — the worst possible failure mode (a good deploy self-reverts on a
+# network hiccup). Pulling here fails the WHOLE run loudly BEFORE any tenant is
+# touched, which is the safe direction. The gate then runs with --pull=never so it
+# makes ZERO network calls.
+ensure_probe_image() {
+  if docker image inspect "$PROBE_IMAGE" >/dev/null 2>&1; then
+    log "probe image present: ${PROBE_IMAGE}"; return 0
+  fi
+  log "pulling daemon-side probe image ${PROBE_IMAGE} ..."
+  if docker pull "$PROBE_IMAGE" >/dev/null 2>&1; then
+    log "probe image pulled: ${PROBE_IMAGE}"; return 0
+  fi
+  echo "::error::probe image ${PROBE_IMAGE} unavailable — needed for the daemon-side health gate; refusing to roll (set PROBE_IMAGE to a locally-present image)" >&2
+  return 1
+}
+
+# probe_http <container> <url> [max_time]: hit <url> from inside <container>'s OWN
+# network namespace via a throwaway curl sidecar, run DETACHED, then read the
+# result via `docker wait` (exit code) + `docker logs` (body). Echoes the response
+# body on stdout and returns curl's exit code.
+#
+# WHY DETACHED + logs, not an attached `docker run` that captures stdout?
+# The remote deploy path reaches the daemon through docker-socket-proxy over the
+# mesh, and an ATTACHED run streams the container's stdout over a HIJACKED
+# bidirectional connection that the proxy does NOT relay — so an attached probe
+# returns an EMPTY body every time even though curl succeeded inside the container
+# (proven on staging: exit 0, zero bytes). An empty body reads as "unhealthy" and
+# would roll back a perfectly good tenant on EVERY remote roll. `docker wait` and
+# `docker logs` are ordinary request/response calls the proxy relays fine, so the
+# detached form is the one that actually works host-agnostically. Robustness:
+#   * --pull=never: image pre-pulled by ensure_probe_image; the gate makes zero
+#     registry calls, so a network blip can't masquerade as an unhealthy tenant.
+#   * --connect-timeout bounds each attempt even if the tenant is wedged.
+#   * the probe container is labelled + force-removed so it never leaks.
+probe_http() {
+  local container="$1" url="$2" maxt="${3:-5}" cid rc
+  cid="$(docker run -d --pull=never --label molecule.ephemeral-probe=1 \
+           --network "container:${container}" "$PROBE_IMAGE" \
+           -fsS --connect-timeout 3 --max-time "$maxt" "$url" 2>/dev/null)" || return 125
+  rc="$(docker wait "$cid" 2>/dev/null || echo 1)"
+  docker logs "$cid" 2>/dev/null
+  docker rm -f "$cid" >/dev/null 2>&1 || true
+  case "$rc" in ''|*[!0-9]*) rc=1;; esac
+  return "$rc"
+}
+
+# health_gate <container>: gate on /buildinfo DAEMON-SIDE via probe_http.
+# Robustness properties layered on top of probe_http's transport-correctness:
+#   * State.Running short-circuit: a container that exited immediately can never be
+#     probed; detect it directly instead of burning the whole retry budget on a
+#     netns that will never answer, and report it distinctly.
+#   * requires both curl-exit==0 AND a non-empty body before accepting.
 health_gate() {
-  local name="$1" port body got last=""
-  port="$(docker port "$name" 8080/tcp 2>/dev/null | head -1 | sed 's/.*://')"
-  [ -n "$port" ] || return 1
+  local name="$1" body got last="" state rc
   for _ in $(seq 1 "$HEALTH_GATE_ATTEMPTS"); do
-    body="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/buildinfo" 2>/dev/null || true)"
-    if [ -n "$body" ]; then
+    state="$(docker inspect "$name" --format '{{.State.Running}}' 2>/dev/null || echo '?')"
+    if [ "$state" != "true" ]; then
+      last="not-running(${state})"
+      sleep "$HEALTH_GATE_SLEEP_SECS"; continue
+    fi
+    body="$(probe_http "$name" "http://localhost:8080/buildinfo")"; rc=$?
+    if [ "$rc" = 0 ] && [ -n "$body" ]; then
       got="$(printf '%s' "$body" | json_git_sha | head -1)"
       last="$got"
       if [ -z "$EXPECTED_BUILD_SHA" ]; then
@@ -186,6 +498,8 @@ health_gate() {
   done
   if [ -n "$EXPECTED_BUILD_SHA" ]; then
     echo "::error::$name /buildinfo git_sha=${last:-<empty>} did not match expected ${EXPECTED_BUILD_SHA}" >&2
+  else
+    echo "::error::$name did not answer /buildinfo daemon-side after ${HEALTH_GATE_ATTEMPTS} attempts (last=${last:-<empty>})" >&2
   fi
   return 1
 }
@@ -201,6 +515,10 @@ swap_tenant() {
   envfile="$(mktemp)"
   docker inspect "$name" --format '{{range .Config.Env}}{{println .}}{{end}}' \
     | grep -vE '^(PATH|NODE_VERSION|YARN_VERSION)=' > "$envfile"
+  # Strip every managed rollout flag from the inherited env and re-apply exactly
+  # what TENANT_FLAGS declares — so a flag is never sticky and a rollback rolls it
+  # back. Aborts the roll BEFORE any container is touched on a bad/undeclared flag.
+  apply_managed_flags "$envfile" || return 1
   local labelargs=() hostargs=()
   while IFS= read -r l; do [ -n "$l" ] && labelargs+=( --label "$l" ); done \
     < <(docker inspect "$name" --format '{{range $k,$v := .Config.Labels}}{{$k}}={{$v}}{{println}}{{end}}' \
@@ -238,7 +556,20 @@ swap_tenant() {
   return 0
 }
 
+# Docker-arm preflights, enforced only when there is actually a docker-substrate
+# tenant to roll (see IMAGE_LOCAL above). Both abort BEFORE any mutation.
 FAILED=0
+if [ "${#TENANTS[@]}" -gt 0 ]; then
+  if [ "$IMAGE_LOCAL" = "0" ]; then
+    echo "::error::tenant image $IMAGE not available locally or in registry, but ${#TENANTS[@]} docker-substrate tenant(s) must be rolled onto it" >&2
+    exit 1
+  fi
+  # Pre-flight the daemon-side probe image BEFORE mutating any tenant, so a probe
+  # infra problem aborts with zero changes rather than rolling back a healthy
+  # container mid-fleet.
+  ensure_probe_image || exit 1
+fi
+
 FIRST=1
 for t in "${TENANTS[@]}"; do
   if [ "$FIRST" = 1 ]; then
@@ -285,7 +616,10 @@ if [ -n "${STAGING_CANVAS_APP_CONTAINER}" ] \
          --restart unless-stopped --env-file "$cenv" \
          -p "${pbind:-3101}:3000" "$CIMG" >/dev/null 2>/tmp/cvrun.err; then
       sleep 5
-      if curl -fsS --max-time 8 "http://127.0.0.1:${pbind:-3101}/" >/dev/null 2>&1; then
+      # Daemon-side probe (see probe_http): hit the canvas in its OWN netns on its
+      # internal port 3000, not the runner host's published port — host-agnostic,
+      # works over a remote DOCKER_HOST via the detached run + docker-logs path.
+      if probe_http "$cvc" "http://localhost:3000/" 8 >/dev/null; then
         docker rm "${cvc}-redeploy-bak" >/dev/null 2>&1 || true
         log "  ✓ ${cvc} rolled to ${CIMG}"
       else
@@ -312,16 +646,41 @@ fi
 
 # Session-preservation assertion: every rtstate volume that existed before the
 # roll must still exist after it (the fleet swap must never destroy a session).
-mapfile -t RTSTATE_AFTER < <(docker volume ls --format '{{.Name}}' | grep -E '^mol-ws-rtstate-' | sort || true)
-LOST=0
-for v in "${RTSTATE_BEFORE[@]}"; do
-  printf '%s\n' "${RTSTATE_AFTER[@]}" | grep -qxF "$v" || { echo "::error::session volume $v was REMOVED by the fleet roll (session-preservation VIOLATED)" >&2; LOST=1; }
-done
-[ "$LOST" = 0 ] && log "session-preservation OK: all ${#RTSTATE_BEFORE[@]} rtstate volume(s) intact after roll"
-[ "$LOST" = 0 ] || FAILED=1
+# Skipped when the volume API is unavailable (remote proxy path) — see the BEFORE
+# snapshot note; the swap touched only stateless mol-tenant-* containers by
+# construction, so nothing could have removed a volume.
+if [ "$RTSTATE_GUARD" = 1 ]; then
+  mapfile -t RTSTATE_AFTER < <(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -E "$RTSTATE_VOL_RE" | sort || true)
+  LOST=0
+  for v in "${RTSTATE_BEFORE[@]}"; do
+    printf '%s\n' "${RTSTATE_AFTER[@]}" | grep -qxF "$v" || { echo "::error::session volume $v was REMOVED by the fleet roll (session-preservation VIOLATED)" >&2; LOST=1; }
+  done
+  [ "$LOST" = 0 ] && log "session-preservation OK: all ${#RTSTATE_BEFORE[@]} rtstate volume(s) intact after roll"
+  [ "$LOST" = 0 ] || FAILED=1
+else
+  log "session-preservation volume-diff guard SKIPPED (volume API denied on this daemon); swap recreated only stateless mol-tenant-* containers by construction"
+fi
+
+# ── k8s arm (real roll) ──────────────────────────────────────────────────────
+# Runs after the docker fleet so a failing docker canary aborts before a second
+# substrate is touched. The k8s roller owns its own verification and its own
+# non-vacuous gate; its exit status is folded in here verbatim.
+K8S_ROLLED_NOTE="k8s arm not dispatched"
+if [ "$K8S_DISPATCH" = "1" ]; then
+  if k8s_arm; then
+    K8S_ROLLED_NOTE="k8s arm OK"
+  else
+    echo "::error::k8s arm FAILED — the kubernetes tenant fleet is NOT on ${IMAGE}" >&2
+    K8S_ROLLED_NOTE="k8s arm FAILED"
+    FAILED=1
+  fi
+fi
 
 if [ "$FAILED" != 0 ]; then
-  echo "::error::staging fleet redeploy had at least one failure (see log above)" >&2
+  echo "::error::staging fleet redeploy had at least one failure (see log above; ${K8S_ROLLED_NOTE})" >&2
   exit 1
 fi
-log "staging fleet + shared canvas app redeploy complete (image=${IMAGE}, tenants=${#TENANTS[@]})"
+# Success phrase kept VERBATIM: .gitea/scripts/tests/test_redeploy_staging_fleet_candidate_guard.py
+# asserts this exact substring as the marker that the health-gated path ran to
+# completion. The substrate detail is appended, not substituted.
+log "staging fleet + shared canvas app redeploy complete (image=${IMAGE}, docker tenants=${#TENANTS[@]}, ${K8S_ROLLED_NOTE})"
