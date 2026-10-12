@@ -78,4 +78,5 @@ def test_production_redeploy_does_not_claim_staging_e2e_is_an_upstream_gate() ->
             "blocks the prod promote",
         ),
     )
-    assert "independent of the staging E2E workflows" in _text(path)
+    assert "only reports existing inventory drift" in _text(path)
+    assert "never writes a pin or a workload" in _text(path)

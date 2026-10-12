@@ -1303,6 +1303,9 @@ jobs:
             scripts/deploy/probe-enteros-buildinfo.sh \
             scripts/deploy/tests/test-probe-enteros-buildinfo.sh \
             scripts/deploy/redeploy-tenant-fleet-k8s.sh \
+            scripts/deploy/rollback-production-release.sh \
+            scripts/deploy/resolve-k8s-fleet-census.sh \
+            scripts/deploy/fleet-drift-audit.sh \
             scripts/deploy/tests/test-k8s-fleet-roller.sh \
             scripts/deploy/require-deploy-toolchain.sh \
             scripts/deploy/tests/test-require-deploy-toolchain.sh

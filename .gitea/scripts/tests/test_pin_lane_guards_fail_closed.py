@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -70,6 +71,9 @@ def _run_guard(script: str, env_overrides: dict[str, str]) -> subprocess.Complet
     with tempfile.TemporaryDirectory() as tmp:
         env = {
             "PATH": os.environ.get("PATH", ""),
+            # setup-python's hosted toolcache needs its shared-library path.
+            # Keep runtime dependencies while excluding inherited credentials.
+            "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", ""),
             "HOME": tmp,
             "GITHUB_OUTPUT": os.path.join(tmp, "gh_output"),
             "GITHUB_STEP_SUMMARY": os.path.join(tmp, "gh_summary"),
@@ -178,15 +182,15 @@ def test_sdk_pin_bump_targets_the_dispatched_ref():
 # promote-prod-tenant-pin
 # --------------------------------------------------------------------------
 
-def test_promote_prod_plan_fails_when_cp_token_absent():
-    plan = _step_named(_load(PROMOTE_PROD), "Plan — current pin vs target")
-    proc = _run_guard(plan["run"], {"CP_ADMIN_API_TOKEN": "", "TAG": "staging-deadbee", "TENANT_IMAGE": "example/img", "CP_BASE_URL": "http://127.0.0.1:1"})
+def test_promote_prod_plan_fails_when_cp_credentials_are_absent():
+    plan = _step_named(_load(PROMOTE_PROD), "Plan current pin")
+    proc = _run_guard(plan["run"], {
+        "DEPLOY_PYTHON3": sys.executable, "TENANT_IMAGE": "example/img",
+        "PROD_CP_BASE_URLS": "prod=https://prod.example=prod",
+    })
     combined = proc.stdout + proc.stderr
-    assert proc.returncode != 0, (
-        "the prod plan step exited 0 without reading the live pin — a plan that "
-        f"planned nothing must not be green. output:\n{combined}"
-    )
-    assert "CP_ADMIN_API_TOKEN" in combined
+    assert proc.returncode != 0, combined
+    assert "infisical" in combined.lower()
     assert "::error::" in combined
 
 
@@ -199,7 +203,7 @@ def test_promote_prod_apply_stays_double_gated():
     arming variable.
     """
     doc = _load(PROMOTE_PROD)
-    apply_step = _step_named(doc, "Apply — promote BOTH SSOTs")
+    apply_step = _step_named(doc, "Apply production pins")
     assert apply_step.get("if") == "${{ steps.mode.outputs.apply == '1' }}"
 
     mode = _step_named(doc, "Decide plan vs apply")

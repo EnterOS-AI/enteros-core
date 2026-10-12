@@ -254,7 +254,7 @@ def test_default_digest_source_is_still_docker(tmp_path: Path):
         "#!/bin/sh\n"
         f'if [ "$1" = "pull" ]; then : > "{pulled}"; exit 0; fi\n'
         f'if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [ -f "{pulled}" ]; '
-        f'then echo "{digest}"; exit 0; fi\n'
+        f"then echo '[\"registry.test/molecule-tenant@{digest}\"]'; exit 0; fi\n"
         "exit 1\n",
         encoding="utf-8",
     )

@@ -206,10 +206,11 @@ say "5. fleet-drift-audit: drift is REPORTED, and an exclusion must be EARNED"
 reset_state
 arun() { # arun <expect_rc> <needle|-> <label> <exclude>
   local exp="$1" needle="$2" label="$3" exc="${4:-}"
+  shift 4
   local out rc=0
   out="$(KUBECTL="$tmp/bin/kubectl" SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
          K8S_ROLLER="$K8S_ROLLER" CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
-         bash "$AUDITOR" --digest "$D_NEW" --exclude "$exc" 2>&1)" || rc=$?
+         bash "$AUDITOR" --digest "$D_NEW" --exclude "$exc" "$@" 2>&1)" || rc=$?
   if [ "$rc" != "$exp" ]; then bad "$label — exit $rc, expected $exp" "$out"; return; fi
   if [ "$needle" != "-" ] && ! printf '%s' "$out" | grep -qF -- "$needle"; then
     bad "$label — output missing '$needle'" "$out"; return
@@ -218,7 +219,8 @@ arun() { # arun <expect_rc> <needle|-> <label> <exclude>
 }
 arun 0 "::warning::fleet drift: org ghost" "drift is named as a warning even when excluded" "ghost"
 arun 0 "::warning::fleet drift: org ghost" "drift is named as a warning when NOT excluded" ""
-arun 0 "WILL fail on it" "unexcluded drift is announced as a coming roll failure" ""
+arun 0 "not a release target" "inventory drift does not block release targets" ""
+arun 1 "inventory drift: 1 tenant record" "strict inventory audit stays red independently of release" "" --strict
 arun 1 "are NOT drifted: alpha" "excluding a HEALTHY tenant is REFUSED" "alpha"
 arun 1 "are NOT drifted" "excluding a tenant that does not exist at all is REFUSED" "no-such-org"
 
@@ -255,13 +257,14 @@ PYEOF
 PY="$(command -v python3 || command -v python)"
 rrun() { # rrun <expect_rc> <needle> <label> <reader-mode>
   local exp="$1" needle="$2" label="$3" mode="$4"
+  shift 4
   mk_reader "$mode"
   local out rc=0
   out="$(KUBECTL="$tmp/bin/kubectl" DEPLOY_PYTHON3="$PY" \
          INFISICAL_READER="$tmp/bin/reader.py" \
          CP_CENSUS_NAMESPACE=controlplane-staging CP_CENSUS_DB_POD=db-0 \
          CP_CENSUS_DB_USER=cps CP_CENSUS_DB_NAME=cp_staging \
-         bash "$RESOLVER" --env-out "$tmp/work/out.env" --work-dir "$tmp/work" 2>&1)" || rc=$?
+         bash "$RESOLVER" --env-out "$tmp/work/out.env" --work-dir "$tmp/work" "$@" 2>&1)" || rc=$?
   if [ "$rc" != "$exp" ]; then bad "$label — exit $rc, expected $exp" "$out"; return; fi
   if [ "$needle" != "-" ] && ! printf '%s' "$out" | grep -qF -- "$needle"; then
     bad "$label — output missing '$needle'" "$out"; return
@@ -289,12 +292,14 @@ done
 reset_state
 : > "$K8RT/census.tsv"
 rrun 1 "returned ZERO rows" "a census with no rows is a broken query, not an empty fleet" good
+rrun 0 "rows=0 k8s=0" "production can explicitly accept a readable empty census" good --allow-empty
 reset_state
 printf '%s\n' "dockerorg	dddddddd-0000-4000-8000-0000000000dd	docker	mol-x" > "$K8RT/census.tsv"
 rrun 1 "NONE on the k8s substrate" "a census with no k8s row refuses rather than rolling nothing" good
 reset_state
 touch "$K8RT/census.fail"
 rrun 1 "census FAILED" "a census that errors names all four coordinates" good
+rrun 1 "census FAILED" "allow-empty cannot hide a failed census read" good --allow-empty
 
 # ─────────────────────────────────────────────────────────────────────────────
 say "7. the lane never asserts an empty fleet"
