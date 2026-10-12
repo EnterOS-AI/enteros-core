@@ -347,6 +347,12 @@ scheduler_backstop_refusal() {
   printf '%s' "Scheduler: $1='$2' is not a usable backstop. It must be a positive integer STRICTLY GREATER than the delivery ABSOLUTE CANCEL BOUND this run configures on the workspace ($(e2e_trigger_delivery_cap_secs)s, injected at provision as MOLECULE_TRIGGER_DELIVERY_ABSOLUTE_CAP_SECONDS + MOLECULE_MAX_TURN_SECONDS). To move it, set E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS (floor 60) — that moves the injected caps AND these backstops together. Do NOT go looking for a daemon-side MOLECULE_TRIGGER_DELIVERY_WATCHDOG_SECONDS to retune: scheduler v0.2.2 retired it and v0.2.3's watchdog is activity-aware, so this bound is one the harness SETS, not one it mirrors. The backstop is a never-hit safety net, never a budget: at or below the cancel bound it expires while a wedged fire is still being re-queued for its retry, so the wait can never observe the recovery and reports 'the daemon is still inside its own budget' as a red — the 360s-vs-600s inversion lib/trigger_daemon_wait.sh exists to prevent. Raise it, or unset it to take the derived 3x default."
 }
 
+# Defined before the first HTTP diagnostic (org creation below). Bash executes
+# top to bottom and does not make a later function definition available early.
+sanitize_http_body() {
+  python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/redact_secrets.py" --max-chars 4000 || printf '%s' '<redaction failed>'
+}
+
 # Collision-proof slug construction (core#2782) — runs AFTER log/fail/ok
 # are defined so the assert below can call `fail` on mismatch.
 # Self-check: fail loud at harness startup if a future refactor
@@ -667,9 +673,9 @@ CREATE_RESP="$(cat "$CREATE_BODYFILE")"
 # the explicit -o bodyfile + -w '%{http_code}' above, the body
 # is always on disk for logging regardless of HTTP status.
 if [ "$CURL_RC" -ne 0 ] || [ "$CREATE_HTTP_CODE" -lt 200 ] || [ "$CREATE_HTTP_CODE" -ge 300 ]; then
-  log "❌ Org create failed (curl_rc=$CURL_RC http=$CREATE_HTTP_CODE slug_len=${#SLUG}); raw response body:"
+  log "❌ Org create failed (curl_rc=$CURL_RC http=$CREATE_HTTP_CODE slug_len=${#SLUG}); sanitized response body:"
   log "--- BEGIN CREATE RESPONSE ---"
-  log "$CREATE_RESP"
+  log "$(printf '%s' "$CREATE_RESP" | sanitize_http_body)"
   log "--- END CREATE RESPONSE ---"
   if [ "${#SLUG}" -gt 32 ]; then
     fail "Org create returned non-2xx AND slug is ${#SLUG} chars (over the CP's 32-char cap). The slug helper's assertion should have caught this; check collision-proof-slug.sh's run_id_budget math."
@@ -677,7 +683,7 @@ if [ "$CURL_RC" -ne 0 ] || [ "$CREATE_HTTP_CODE" -lt 200 ] || [ "$CREATE_HTTP_CO
   fail "Org create returned non-2xx (http=$CREATE_HTTP_CODE) — see body above. Common causes: 409=slug collision (a prior run left a stale org; the slug helper should prevent this — check E2E_RUN_ID propagation), 400=slug too long (should be caught by the 32-char cap assertion), 401=ADMIN_TOKEN not set or expired, 422=schema mismatch (check the -d payload matches the CP's expected shape)."
 fi
 if [ -z "$CREATE_RESP" ] || ! echo "$CREATE_RESP" | python3 -m json.tool >/dev/null 2>&1; then
-  log "❌ Org create returned non-JSON; raw body: $CREATE_RESP"
+  log "❌ Org create returned non-JSON; sanitized body: $(printf '%s' "$CREATE_RESP" | sanitize_http_body)"
   fail "Org create returned non-JSON (see body above)"
 fi
 # Capture org_id for tenant-guard header on every subsequent tenant call.
@@ -685,7 +691,7 @@ fi
 # tenant-guard middleware returns 404 to avoid leaking tenant existence.
 ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
 if ! e2e_cp_validate_org_id "$ORG_ID"; then
-  log "❌ Org create response missing 'id'; raw body: $CREATE_RESP"
+  log "❌ Org create response missing 'id'; sanitized body: $(printf '%s' "$CREATE_RESP" | sanitize_http_body)"
   fail "Org create response missing a valid UUID 'id' (see body above)"
 fi
 ORG_CREATION_VERIFIED=1
@@ -867,17 +873,6 @@ tenant_call() {
     -H "X-Molecule-Org-Id: $ORG_ID" \
     "${TENANT_ROUTE_HDRS[@]}" \
     "$@"
-}
-
-sanitize_http_body() {
-  python3 -c '
-import re, sys
-s = sys.stdin.read()
-s = re.sub(r"(?i)(Authorization:\s*Bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[redacted]", s)
-s = re.sub(r"(?i)(\"(?:auth_token|access_token|refresh_token|token|api_key|secret|password)\"\s*:\s*\")[^\"]+\"", r"\1[redacted]\"", s)
-s = re.sub(r"(?i)((?:auth_token|access_token|refresh_token|api_key|secret|password)=)[^&\s]+", r"\1[redacted]", s)
-print(s[:4000])
-'
 }
 
 # create_workspace_post — `POST /workspaces` with a bounded retry over the
@@ -1667,13 +1662,13 @@ for wid in "${WS_TO_CHECK[@]}"; do
       # tenant. Config-write coverage for this backend is provided by the
       # container reading /configs/config.yaml directly via bind-mount at
       # boot (asserted by online+routable step 7). SKIP this ONE sub-step.
-      log "    ⏭️  $wid Files API PUT config.yaml container-write hard-check SKIPPED (local-Docker socket-less tenant; docker-not-available): PUT returned $PUT_CODE (curl_rc=$PUT_CURL_RC). The docker-exec fallback needs a socket the tenant lacks by design (#206). Body: $PUT_BODY_OUT"
+      log "    ⏭️  $wid Files API PUT config.yaml container-write hard-check SKIPPED (local-Docker socket-less tenant; docker-not-available): PUT returned $PUT_CODE (curl_rc=$PUT_CURL_RC). The docker-exec fallback needs a socket the tenant lacks by design (#206). Body: $(printf '%s' "$PUT_BODY_OUT" | sanitize_http_body)"
       continue
     else
       # 000 (unreachable) or 5xx-without-marker or any 4xx → a real outage /
       # regression, NOT a backend-shape mismatch. Hard-fail so this gate
       # keeps catching what it exists to catch on local-Docker.
-      fail "Workspace $wid Files API PUT config.yaml returned $PUT_CODE (curl_rc=$PUT_CURL_RC; local-Docker backend, NOT the docker-not-available socket-less signal): $PUT_BODY_OUT — a 000 means CP/tenant unreachable; a 5xx without 'docker not available' is a genuine config-write regression; a 4xx is an auth/route/validation regression. This is a real failure, not a backend-shape mismatch."
+      fail "Workspace $wid Files API PUT config.yaml returned $PUT_CODE (curl_rc=$PUT_CURL_RC; local-Docker backend, NOT the docker-not-available socket-less signal): $(printf '%s' "$PUT_BODY_OUT" | sanitize_http_body) — a 000 means CP/tenant unreachable; a 5xx without 'docker not available' is a genuine config-write regression; a 4xx is an auth/route/validation regression. This is a real failure, not a backend-shape mismatch."
     fi
   fi
   # This remains PUT-only until local-Docker read/write paths share the same
@@ -2027,8 +2022,9 @@ parts = d.get('result', {}).get('parts', [])
 print(parts[0].get('text', '') if parts else '')
 " 2>/dev/null || echo "")
 if [ -z "$AGENT_TEXT" ]; then
-  fail "A2A returned no text. Raw: $A2A_RESP"
+  fail "A2A returned no text. Sanitized: $(printf '%s' "$A2A_RESP" | sanitize_http_body)"
 fi
+AGENT_TEXT_SAFE=$(printf '%s' "$AGENT_TEXT" | sanitize_http_body)
 
 # Specific error-class checks — each pattern caught a real P0 bug on
 # 2026-04-23 that a generic "error|exception" check missed or misreported:
@@ -2044,26 +2040,26 @@ fi
 # Fail LOUD with the specific pattern so CI log + alert channel makes the
 # regression unambiguous.
 if echo "$AGENT_TEXT" | grep -qF "[hermes-agent error 401]"; then
-  fail "A2A — REGRESSION: hermes gateway auth broken (API_SERVER_KEY not in runtime env). See template-hermes#12. Raw: $AGENT_TEXT"
+  fail "A2A — REGRESSION: hermes gateway auth broken (API_SERVER_KEY not in runtime env). See template-hermes#12. Sanitized: $AGENT_TEXT_SAFE"
 fi
 if echo "$AGENT_TEXT" | grep -qF "hermes-agent unreachable"; then
-  fail "A2A — REGRESSION: hermes gateway process down. Check /var/log/hermes-gateway.log in the workspace runtime. Raw: $AGENT_TEXT"
+  fail "A2A — REGRESSION: hermes gateway process down. Check /var/log/hermes-gateway.log in the workspace runtime. Sanitized: $AGENT_TEXT_SAFE"
 fi
 if echo "$AGENT_TEXT" | grep -qF "model_not_found"; then
-  fail "A2A — REGRESSION: model slug passed through with provider prefix. See template-hermes#13. Raw: $AGENT_TEXT"
+  fail "A2A — REGRESSION: model slug passed through with provider prefix. See template-hermes#13. Sanitized: $AGENT_TEXT_SAFE"
 fi
 if echo "$AGENT_TEXT" | grep -qF "Encrypted content is not supported"; then
-  fail "A2A — REGRESSION: hermes custom provider hit /v1/responses instead of chat_completions. Config.yaml should declare api_mode: chat_completions. See template-hermes#14. Raw: $AGENT_TEXT"
+  fail "A2A — REGRESSION: hermes custom provider hit /v1/responses instead of chat_completions. Config.yaml should declare api_mode: chat_completions. See template-hermes#14. Sanitized: $AGENT_TEXT_SAFE"
 fi
 if echo "$AGENT_TEXT" | grep -qF "Unknown provider"; then
-  fail "A2A — REGRESSION: install.sh set PROVIDER to a value not in hermes's registry. Run 'hermes doctor' on the workspace to see valid values. Raw: $AGENT_TEXT"
+  fail "A2A — REGRESSION: install.sh set PROVIDER to a value not in hermes's registry. Run 'hermes doctor' on the workspace to see valid values. Sanitized: $AGENT_TEXT_SAFE"
 fi
 # "Invalid API key" — the comment block lists this as a CP #238 race
 # (tenant auth chain) signal but the grep was missing. Caller-side
 # 401's containing this exact phrase don't match the generic
 # "error|exception" catch-all below, so they'd slip through.
 if echo "$AGENT_TEXT" | grep -qF "Invalid API key"; then
-  fail "A2A — REGRESSION: tenant auth chain returned 'Invalid API key'. Likely CP boot-event 401 race (CP #238) or stale OPENAI_API_KEY in the runtime env. Raw: $AGENT_TEXT"
+  fail "A2A — REGRESSION: tenant auth chain returned 'Invalid API key'. Likely CP boot-event 401 race (CP #238) or stale OPENAI_API_KEY in the runtime env. Sanitized: $AGENT_TEXT_SAFE"
 fi
 # Provider quota exhausted — distinguish from a platform regression so
 # the canary alert names the operator action directly instead of falling
@@ -2073,7 +2069,7 @@ fi
 # with a provider-side 429, that is a billing event on the configured
 # OpenAI key, not a platform regression. Tracked in #2578.
 if echo "$AGENT_TEXT" | grep -qiE "exceeded your current quota|insufficient_quota"; then
-  fail "A2A — PROVIDER QUOTA EXHAUSTED (NOT a platform regression). Operator action: top up MOLECULE_STAGING_OPENAI_API_KEY billing or rotate to a higher-quota org at Settings → Secrets and Variables → Actions. Tracked in #2578. Raw: $AGENT_TEXT"
+  fail "A2A — PROVIDER QUOTA EXHAUSTED (NOT a platform regression). Operator action: top up MOLECULE_STAGING_OPENAI_API_KEY billing or rotate to a higher-quota org at Settings → Secrets and Variables → Actions. Tracked in #2578. Sanitized: $AGENT_TEXT_SAFE"
 fi
 # Empty-completion class — the agent runtime reached the LLM and got a
 # 2xx back, but the assistant turn carried NO text part (empty content,
@@ -2091,7 +2087,7 @@ fi
 # identical across the then-scheduled main synthetic and PR runs (so it was an
 # environmental backend regression, not PR-introduced).
 if echo "$AGENT_TEXT" | grep -qiF "message contained no text content"; then
-  fail "A2A — EMPTY COMPLETION (backend regression, NOT a platform/workspace-server bug). The configured model (MODEL_SLUG=${MODEL_SLUG:-?}) returned a 2xx completion with no text part; the runtime surfaced 'message contained no text content.'. Operator action: check the staging LLM backend / proxy for the canary model (the claude-code MiniMax-BYOK default is the BARE registered id MiniMax-M2.7 — the colon minimax:MiniMax-M2.7 is UNREGISTERED on claude-code, internal#718) — empty assistant turns, not an auth/quota/boot fault. Raw: $AGENT_TEXT"
+  fail "A2A — EMPTY COMPLETION (backend regression, NOT a platform/workspace-server bug). The configured model (MODEL_SLUG=${MODEL_SLUG:-?}) returned a 2xx completion with no text part; the runtime surfaced 'message contained no text content.'. Operator action: check the staging LLM backend / proxy for the canary model (the claude-code MiniMax-BYOK default is the BARE registered id MiniMax-M2.7 — the colon minimax:MiniMax-M2.7 is UNREGISTERED on claude-code, internal#718) — empty assistant turns, not an auth/quota/boot fault. Sanitized: $AGENT_TEXT_SAFE"
 fi
 # Generic catch-all — falls through if none of the known regressions hit.
 # _ResultError is the claude-code runtime surfacing an LLM/backend/runtime
@@ -2100,11 +2096,10 @@ fi
 # logs. The suite still fails; this is diagnostics-only.
 if echo "$AGENT_TEXT" | grep -qiF "_ResultError"; then
   diagnose_staging_result_error "$PARENT_ID" "$A2A_RESP" "A2A parent _ResultError"
-  _redacted_agent_text=$(printf '%s' "$AGENT_TEXT" | redact_secrets)
-  fail "A2A — STAGING LLM/BACKEND/RUNTIME FAILURE (_ResultError). The canary agent surfaced its LLM/backend/runtime error as a text payload. See the diagnostic burst above for the full A2A response, workspace state, and recent activity logs (including any upstream HTTP status/body the runtime reported). Raw (redacted): ${_redacted_agent_text:0:500}"
+  fail "A2A — STAGING LLM/BACKEND/RUNTIME FAILURE (_ResultError). The canary agent surfaced its LLM/backend/runtime error as a text payload. See the diagnostic burst above for the full A2A response, workspace state, and recent activity logs (including any upstream HTTP status/body the runtime reported). Sanitized: ${AGENT_TEXT_SAFE:0:500}"
 fi
 if echo "$AGENT_TEXT" | grep -qiE "error|exception"; then
-  fail "A2A returned an error-shaped response: $AGENT_TEXT"
+  fail "A2A returned an error-shaped response: $AGENT_TEXT_SAFE"
 fi
 
 # Content assertion — the prompt asks the model to reply with exactly "PONG".
@@ -2112,10 +2107,10 @@ fi
 # that echoes the prompt back or returns truncated context won't. Normalize
 # to uppercase before matching to tolerate "pong" / "Pong".
 if ! echo "$AGENT_TEXT" | tr '[:lower:]' '[:upper:]' | grep -qF "PONG"; then
-  fail "A2A reply didn't contain expected PONG token. Real: $AGENT_TEXT"
+  fail "A2A reply didn't contain expected PONG token. Sanitized: $AGENT_TEXT_SAFE"
 fi
 
-ok "A2A parent round-trip succeeded: \"${AGENT_TEXT:0:80}\""
+ok "A2A parent round-trip succeeded: \"${AGENT_TEXT_SAFE:0:80}\""
 
 # ─── 8b. Real-completion known-answer round-trip (CORE GATE, #1994) ────
 # The existing PONG check + generic error grep above already do a lot, but
@@ -2467,7 +2462,7 @@ print(len(d if isinstance(d, list) else d.get('events', [])))" "$ACTIVITY_TMP" 2
   # 2. read back, capture version
   EDIT_GET=$(tenant_call GET "/workspaces/$PARENT_ID/memory/$EDIT_KEY")
   EDIT_VER=$(echo "$EDIT_GET" | python3 -c "import json,sys; print(json.load(sys.stdin)['version'])" 2>/dev/null || echo "")
-  [ -z "$EDIT_VER" ] && fail "memory KV GET missing version field. Body: ${EDIT_GET:0:200}"
+  [ -z "$EDIT_VER" ] && fail "memory KV GET missing version field. Body: $(printf '%s' "$EDIT_GET" | sanitize_http_body | head -c 200)"
 
   # 3. conditional update with matching version
   tenant_call POST "/workspaces/$PARENT_ID/memory" \
@@ -2478,7 +2473,7 @@ print(len(d if isinstance(d, list) else d.get('events', [])))" "$ACTIVITY_TMP" 2
   # 4. value flipped + version incremented?
   EDIT_GET2=$(tenant_call GET "/workspaces/$PARENT_ID/memory/$EDIT_KEY")
   EDIT_VAL2=$(echo "$EDIT_GET2" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'].get('step'))" 2>/dev/null || echo "")
-  [ "$EDIT_VAL2" = "2" ] || fail "memory KV Edit did not persist new value. Body: ${EDIT_GET2:0:200}"
+  [ "$EDIT_VAL2" = "2" ] || fail "memory KV Edit did not persist new value. Body: $(printf '%s' "$EDIT_GET2" | sanitize_http_body | head -c 200)"
 
   # 5. stale-version POST must 409 — pin the optimistic-lock contract.
   #
@@ -2498,7 +2493,7 @@ print(len(d if isinstance(d, list) else d.get('events', [])))" "$ACTIVITY_TMP" 2
     -o /tmp/memory_stale_resp.txt -w "%{http_code}" >/tmp/memory_stale_code.txt 2>/dev/null
   set -e
   EDIT_STALE_CODE=$(cat /tmp/memory_stale_code.txt 2>/dev/null || echo "000")
-  [ "$EDIT_STALE_CODE" = "409" ] || fail "memory KV stale Edit must 409 (optimistic-lock). Got '$EDIT_STALE_CODE': $(cat /tmp/memory_stale_resp.txt 2>/dev/null | head -c 200)"
+  [ "$EDIT_STALE_CODE" = "409" ] || fail "memory KV stale Edit must 409 (optimistic-lock). Got '$EDIT_STALE_CODE': $(cat /tmp/memory_stale_resp.txt 2>/dev/null | sanitize_http_body | head -c 200)"
 
   # cleanup
   tenant_call DELETE "/workspaces/$PARENT_ID/memory/$EDIT_KEY" >/dev/null 2>&1 || true
@@ -2657,8 +2652,9 @@ try:
 except Exception:
     print('')
 " 2>/dev/null || echo "")
-  [ -z "$DELEG_TEXT" ] && fail "Delegation returned no text. Raw: ${DELEG_RESP:0:200}"
-  ok "Delegation proxy works (child responded: \"${DELEG_TEXT:0:60}\")"
+  [ -z "$DELEG_TEXT" ] && fail "Delegation returned no text. Sanitized: $(printf '%s' "$DELEG_RESP" | sanitize_http_body | head -c 200)"
+  DELEG_TEXT_SAFE=$(printf '%s' "$DELEG_TEXT" | sanitize_http_body)
+  ok "Delegation proxy works (child responded: \"${DELEG_TEXT_SAFE:0:60}\")"
 
   # FAIL-CLOSED via bounded readiness-POLL (was soft-logged false-green).
   # The activity pipeline is async, so an immediate single read can miss the
@@ -2791,7 +2787,7 @@ if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
   # ── pause → paused ──
   PAUSE_RESP=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/pause" 2>/dev/null || echo '{}')
   PAUSE_STATUS=$(echo "$PAUSE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
-  [ "$PAUSE_STATUS" = "paused" ] || fail "Pause: POST /pause returned status='$PAUSE_STATUS' (expected 'paused'). Body: ${PAUSE_RESP:0:200}"
+  [ "$PAUSE_STATUS" = "paused" ] || fail "Pause: POST /pause returned status='$PAUSE_STATUS' (expected 'paused'). Body: $(printf '%s' "$PAUSE_RESP" | sanitize_http_body | head -c 200)"
   # Poll the DB-backed status — the response body could lie; the GET proves the row.
   wait_status "paused" 120 "pause" || fail "Pause: workspace $LIFECYCLE_WS never settled at status=paused (DB row) — Pause handler / CP stop regression (workspace_restart.go Pause)."
   ok "    pause → paused (DB-verified)"
@@ -2799,7 +2795,7 @@ if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
   # ── resume → provisioning → online ──
   RESUME_RESP=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/resume" 2>/dev/null || echo '{}')
   RESUME_STATUS=$(echo "$RESUME_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
-  [ "$RESUME_STATUS" = "provisioning" ] || fail "Resume: POST /resume returned status='$RESUME_STATUS' (expected 'provisioning'). Body: ${RESUME_RESP:0:200}"
+  [ "$RESUME_STATUS" = "provisioning" ] || fail "Resume: POST /resume returned status='$RESUME_STATUS' (expected 'provisioning'). Body: $(printf '%s' "$RESUME_RESP" | sanitize_http_body | head -c 200)"
   # Resume re-provisions from the preserved config volume; reuse the same
   # online+routable readiness boundary the initial boot used; CP re-provision +
   # heartbeat recovery can still take minutes.
@@ -2987,7 +2983,7 @@ print(json.dumps({
     #     an idle-only test can never reach it.
     HIB_RESP=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/hibernate?force=true" 2>/dev/null || echo '{}')
     HIB_STATUS=$(echo "$HIB_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
-    [ "$HIB_STATUS" = "hibernated" ] || fail "Hibernate(busy,force): POST /hibernate?force=true returned status='$HIB_STATUS' (expected 'hibernated'). Body: ${HIB_RESP:0:200}"
+    [ "$HIB_STATUS" = "hibernated" ] || fail "Hibernate(busy,force): POST /hibernate?force=true returned status='$HIB_STATUS' (expected 'hibernated'). Body: $(printf '%s' "$HIB_RESP" | sanitize_http_body | head -c 200)"
     wait_status "hibernated" 120 "hibernate-force-busy" || fail "Hibernate(busy,force): workspace $LIFECYCLE_WS never settled at status=hibernated (DB row) after force on a BUSY workspace — core#4293 regression: force must drop the active_tasks=0 claim predicate, terminate the in-flight task, and stop the container, not no-op to a lying 200."
     ok "    force hibernate on BUSY ws → hibernated (DB-verified; core#4293 covered)"
     # Release any injected busy hold now that the force-on-busy assertions passed,
@@ -3006,7 +3002,7 @@ print(json.dumps({
     log "    WARN[task#92 soak]: could not establish active_tasks>0 within the bound (runtime busy-report timing, or the agent did not run the sleep turn). Falling back to IDLE force-hibernate — this run does NOT cover the force-on-busy class (core#4293)."
     HIB_RESP=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/hibernate?force=true" 2>/dev/null || echo '{}')
     HIB_STATUS=$(echo "$HIB_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
-    [ "$HIB_STATUS" = "hibernated" ] || fail "Hibernate(idle fallback): POST /hibernate?force=true returned status='$HIB_STATUS' (expected 'hibernated'). Body: ${HIB_RESP:0:200}"
+    [ "$HIB_STATUS" = "hibernated" ] || fail "Hibernate(idle fallback): POST /hibernate?force=true returned status='$HIB_STATUS' (expected 'hibernated'). Body: $(printf '%s' "$HIB_RESP" | sanitize_http_body | head -c 200)"
     # Even the idle path polls the DB row — the 200 alone was the #4292 lie.
     wait_status "hibernated" 120 "hibernate" || fail "Hibernate(idle fallback): workspace $LIFECYCLE_WS never settled at status=hibernated (DB row) even though POST /hibernate?force=true answered '$HIB_STATUS' — suspect a no-op hibernate (atomic claim matched no row) before suspecting the container stop."
     ok "    hibernate → hibernated (DB-verified; idle fallback, force-on-busy NOT covered this run)"
