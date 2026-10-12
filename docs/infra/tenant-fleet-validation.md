@@ -23,15 +23,25 @@ get/list/watch/patch, Pods list and `pods/proxy` get. The proxy can reach only
 pods that the tenant NetworkPolicy lets the API server reach, and a `/buildinfo`
 read that cannot connect fails verification.
 
-Those grants are RoleBindings in an explicit list of tenant namespaces. There is
-no cluster-wide grant and no policy that generates grants per namespace. Before
-touching a tenant, the roller asks `kubectl auth can-i patch deployments -n
-<ns>`. A plain "no" is reported as `skipped-out-of-scope`. An error, or a "no"
-with a reason, fails the tenant. A run fails if no tenant was in scope. It also
-fails unless every namespace in `REQUIRED_TENANT_NAMESPACES` ends rolled with
-each serving pod's `/buildinfo` verified (in `--dry-run`, planned). The default
-is the staging canary, `enteros-staging-canary-k8s`, and the production lane
-sets it empty.
+In staging those grants are RoleBindings in an explicit list of tenant
+namespaces. There is no cluster-wide grant and no policy that generates grants
+per namespace. The staging lane declares that list in `ROLLER_SCOPE_NAMESPACES`.
+Only a declared scope can skip anything. A tenant outside it is reported as
+`skipped-out-of-scope`, and nothing is called in its namespace.
+
+Every tenant inside the declared scope must first pass `kubectl auth can-i patch
+deployments -n <ns>`, and so must every tenant when no scope is declared, as in
+production. Anything but a clean "yes" fails the tenant, because a deleted
+namespace and a missing binding both answer "no".
+
+A run fails if no tenant was in scope. It also fails unless every namespace in
+`REQUIRED_TENANT_NAMESPACES`, and every declared scope entry, ends rolled and
+verified (in `--dry-run`, planned). Verified means through `/buildinfo` when a
+git sha is known. When none is known, it means the imageID digest of every
+serving pod, which is what a revert to a pin recorded without a sha relies on.
+The default required namespace is the staging canary,
+`enteros-staging-canary-k8s`. The production lane requires none and declares no
+scope.
 
 Run the local regression suites with Bash:
 

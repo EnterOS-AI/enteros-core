@@ -527,6 +527,11 @@ jobs:
           # empty. The roller's other anti-vacuity gates (found:0, no tenant in
           # scope, eligible-but-none-rolled) still apply.
           export REQUIRED_TENANT_NAMESPACES=
+          # And production declares NO scope, so no tenant can ever be skipped.
+          # Every tenant must pass `auth can-i`, and a "no" FAILS. A tenant whose
+          # namespace was deleted, or whose binding is missing, stays red here
+          # instead of reading as "out of scope".
+          unset ROLLER_SCOPE_NAMESPACES
 
           # 2>&1 IS LOAD-BEARING, AND ITS ABSENCE WAS A SHIPPING DEFECT.
           #

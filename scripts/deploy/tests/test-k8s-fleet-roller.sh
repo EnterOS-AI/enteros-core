@@ -62,6 +62,9 @@ cat > "$tmp/bin/kubectl" <<'FAKE'
 #   cani.fail      optional; `auth can-i` itself errors (API unreachable)
 #   cani.reason    optional; `auth can-i` answers "no - <this reason>" (an RBAC
 #                  evaluation error, i.e. a broken binding)
+#   cani.stderr    optional; `auth can-i` writes this to stderr and then answers
+#                  as usual (yes or no). kubectl's resource-resolution fallback
+#                  looks like this.
 #   proxy.fail     optional; the API server cannot reach the pod (pods/proxy 503)
 #   calls.log      every invocation, one line: "ns=<ns> <args...>"
 #   buildinfo.log  every pod whose /buildinfo was requested through pods/proxy
@@ -94,6 +97,7 @@ done
 if [ "${1:-}" = "auth" ] && [ "${2:-}" = "can-i" ]; then
   [ ! -f "$K8RT/cani.fail" ] || { echo "error: You must be logged in to the server (Unauthorized)" >&2; exit 1; }
   [ ! -f "$K8RT/cani.reason" ] || { printf 'no - %s\n' "$(cat "$K8RT/cani.reason")"; exit 1; }
+  [ ! -f "$K8RT/cani.stderr" ] || cat "$K8RT/cani.stderr" >&2
   if has_role "$ns"; then echo yes; exit 0; fi
   echo no; exit 1
 fi
@@ -188,6 +192,9 @@ export PATH="$tmp/bin:$PATH"
 # required). The required-namespace cases further down unset it, to test the
 # DEFAULT rather than just the parameter, or set it on purpose.
 export REQUIRED_TENANT_NAMESPACES=""
+# No declared scope unless a case declares one: production's shape, in which
+# nothing is ever skipped.
+unset ROLLER_SCOPE_NAMESPACES
 CANARY_NS="enteros-staging-canary-k8s"
 ORG_K="c0c0c0c0-0000-4000-8000-0000000000c0"
 
@@ -197,7 +204,7 @@ row() { local IFS=$'\t'; printf '%s\n' "$*"; }
 reset_state() {
   : > "$K8RT/set-image.log"; : > "$K8RT/calls.log"; : > "$K8RT/buildinfo.log"
   rm -f "$K8RT/rollout.fail" "$K8RT/pods.after" "$K8RT/proxy.fail" \
-        "$K8RT/scope-ns" "$K8RT/nolist-ns" "$K8RT/cani.fail" "$K8RT/cani.reason"
+        "$K8RT/scope-ns" "$K8RT/nolist-ns" "$K8RT/cani.fail" "$K8RT/cani.reason" "$K8RT/cani.stderr"
   # alpha: 1 replica, serving the OLD digest. zero: 0 replicas, no pods.
   printf '%s\n' \
     "ns-alpha	enteros-tenant	1	$ORG_A	$REPO@$D_OLD" \
@@ -453,31 +460,114 @@ SHA_BAD="feedface0123456789abcdef0123456789abcdef"
 # UNSET, i.e. under the roller's own default.
 default_required() { unset REQUIRED_TENANT_NAMESPACES; check "$@"; export REQUIRED_TENANT_NAMESPACES=""; }
 
-echo "== scope: only the namespaces this credential is bound in are rolled =="
-# The roller's RBAC is RoleBindings in an explicit list of tenant namespaces;
-# scope-ns is that list. Here it holds the canary only.
+# with_scope <ns-list> <check args...>: one check with ROLLER_SCOPE_NAMESPACES
+# DECLARED as <ns-list> and REQUIRED_TENANT_NAMESPACES unset (the roller's own
+# default), which is the staging lane's shape.
+with_scope() {
+  local s="$1"; shift
+  export ROLLER_SCOPE_NAMESPACES="$s"; unset REQUIRED_TENANT_NAMESPACES
+  check "$@"
+  unset ROLLER_SCOPE_NAMESPACES; export REQUIRED_TENANT_NAMESPACES=""
+}
+# no_calls_into <label> <ns>: not one kubectl call went into <ns>.
+no_calls_into() {
+  local hits; hits="$(grep "^ns=$2 " "$K8RT/calls.log" || true)"
+  if [ -z "$hits" ]; then echo "ok: $1"; PASS=$((PASS+1)); return; fi
+  echo "FAIL: $1"; printf '%s\n' "$hits" | sed 's/^/    /'; FAILED=$((FAILED+1))
+}
+
+echo "== scope: skipping is OPT-IN, through a DECLARED ROLLER_SCOPE_NAMESPACES =="
+# The staging lane: its credential holds a RoleBinding in the canary only
+# (scope-ns), and the lane DECLARES that list.
 reset_state; canary_fixture; after_new "$SHA_OK"
 printf '%s\n' "$CANARY_NS" > "$K8RT/scope-ns"
-default_required "a tenant outside the credential's scope is skipped and reported, not failed" 0 \
+with_scope "$CANARY_NS" "a tenant outside the DECLARED scope is skipped and reported, not failed" 0 \
   "skipped-out-of-scope" "$CENSUS_AK" --tag staging-0badc0de
 saw "the SUMMARY counts it as out of scope, not as a failure" \
   "found=2 in_scope=1 out_of_scope=1 eligible=1 rolled=1 skipped=0 failed=0"
-saw "the in-scope canary (the default required namespace) was rolled and verified" \
+saw "the declared, required canary was rolled and verified" \
   "required namespace '$CANARY_NS' was rolled and every serving pod's /buildinfo verified"
-other="$(grep '^ns=ns-alpha ' "$K8RT/calls.log" | grep -v ' auth can-i patch deployments$' || true)"
-if [ -z "$other" ] && grep -qx 'ns=ns-alpha auth can-i patch deployments' "$K8RT/calls.log"; then
-  echo "ok: the out-of-scope namespace was asked the scope question and nothing else"; PASS=$((PASS+1))
-else
-  echo "FAIL: the out-of-scope namespace saw calls beyond 'auth can-i'"; printf '%s\n' "$other" | sed 's/^/    /'; FAILED=$((FAILED+1))
-fi
+no_calls_into "the skipped namespace was not touched at all, not even by auth can-i" ns-alpha
 logged "the canary's /buildinfo was read through the pod proxy" \
   "get --raw /api/v1/namespaces/$CANARY_NS/pods/enteros-tenant-k:8080/proxy/buildinfo"
 
+reset_state; canary_fixture; after_new "$SHA_OK"
+: > "$K8RT/scope-ns"   # the declared namespace's RoleBinding is missing
+with_scope "$CANARY_NS" "inside the declared scope, an auth can-i 'no' (missing RoleBinding) FAILS, never skips" 1 \
+  "FAIL:scope-check" "$CENSUS_AK" --tag staging-0badc0de
+saw "...and says the binding must exist" "is IN the declared ROLLER_SCOPE_NAMESPACES"
+
+reset_state; canary_fixture; after_new "$SHA_OK"
+with_scope "$CANARY_NS ns-alpha" "every DECLARED scope entry must be rolled and verified too" 1 \
+  "required namespace 'ns-alpha' is not in this run" "$CENSUS_K" --tag staging-0badc0de
+
+reset_state; canary_fixture
+export ROLLER_SCOPE_NAMESPACES="ns-nowhere"
+check "a declared scope that matches no tenant FAILS as vacuous" 1 \
+  "NONE is inside this credential's scope" "$CENSUS_AK" --digest "$D_NEW"
+saw "...every tenant reported skipped" "found=2 in_scope=0 out_of_scope=2"
+export ROLLER_SCOPE_NAMESPACES=""
+check "a DECLARED but EMPTY scope is refused up front" 2 "set but EMPTY" "$CENSUS_AK" --digest "$D_NEW"
+unset ROLLER_SCOPE_NAMESPACES
+with_scope "ns-alpha" "a required namespace outside the declared scope is refused up front" 2 \
+  "is outside ROLLER_SCOPE_NAMESPACES" "$CENSUS_AK" --digest "$D_NEW"
+if [ ! -s "$K8RT/set-image.log" ]; then echo "ok: ...and nothing was mutated"; PASS=$((PASS+1))
+else echo "FAIL: a refused scope still issued set image"; FAILED=$((FAILED+1)); fi
+
+echo "== with NO declared scope (production's shape), nothing is ever skipped =="
+# The 2026-10-11 production census, replayed (redeploy-tenants-on-main run
+# 770669, job 1086175; slugs anonymised): 9 k8s orgs, 4 with live namespaces and
+# 5 whose namespaces were DELETED (one recorded with an empty instance_id, so
+# its namespace comes from the slug fallback). The production credential's RBAC
+# follows namespace existence: a generated RoleBinding in each LIVE tenant
+# namespace. So `auth can-i patch` answers "no" for the 5, and reading that
+# "no" as "out of scope" turned the frozen production plan green over real
+# drift. It must stay red.
+replay_fixture() {
+  local i
+  : > "$K8RT/deploys"; : > "$K8RT/pods"; : > "$K8RT/scope-ns"
+  CENSUS_PROD="printf '"
+  for i in 1 2 3 4; do
+    row "enteros-live-$i" enteros-tenant 1 "1111111$i-0000-4000-8000-00000000000$i" "$REPO@$D_OLD" >> "$K8RT/deploys"
+    row "enteros-live-$i" "enteros-tenant-$i" "1111111$i-0000-4000-8000-00000000000$i" "$REPO@$D_OLD" >> "$K8RT/pods"
+    printf '%s\n' "enteros-live-$i" >> "$K8RT/scope-ns"
+    CENSUS_PROD="${CENSUS_PROD}live-$i\\t1111111$i-0000-4000-8000-00000000000$i\\tk8s\\tenteros-live-$i\\n"
+  done
+  for i in 1 2 3 4; do
+    CENSUS_PROD="${CENSUS_PROD}gone-$i\\t2222222$i-0000-4000-8000-00000000000$i\\tk8s\\tenteros-gone-$i\\n"
+  done
+  CENSUS_PROD="${CENSUS_PROD}gone-5\\t22222225-0000-4000-8000-000000000005\\tk8s\\t\\n'"
+}
+reset_state; replay_fixture
+check "replay: the 5 orgs whose namespaces were deleted FAIL the production plan" 1 \
+  "FAIL:scope-check" "$CENSUS_PROD" --digest "$D_NEW" --dry-run
+saw "...all five are failures and none is skipped" \
+  "found=9 in_scope=4 out_of_scope=0 eligible=4 rolled=0 skipped=0 failed=5"
+n="$(grep -cE '^gone-[1-5] +enteros-gone-[1-5] +- +- +FAIL:scope-check$' <<< "$LAST_OUT" || true)"
+if [ "$n" = "5" ] && ! grep -q 'skipped-out-of-scope' <<< "$LAST_OUT"; then
+  echo "ok: ...each deleted namespace is a FAIL:scope-check row, including the slug-derived one"; PASS=$((PASS+1))
+else
+  echo "FAIL: expected 5 FAIL:scope-check rows and no skip, got ${n}"; FAILED=$((FAILED+1))
+fi
+reset_state; replay_fixture; rm -f "$K8RT/scope-ns"   # CONTROL: a cluster-wide grant
+check "replay CONTROL: with a cluster-wide grant the same five are FAIL:no-workload" 1 \
+  "FAIL:no-workload" "$CENSUS_PROD" --digest "$D_NEW" --dry-run
+saw "...the same five, and the same verdict" \
+  "found=9 in_scope=9 out_of_scope=0 eligible=4 rolled=0 skipped=0 failed=5"
+
+reset_state; canary_fixture; after_new "$SHA_OK"
+printf '%s\n' ns-alpha > "$K8RT/scope-ns"   # a LIVE tenant whose binding is missing
+check "a live tenant whose binding is missing FAILS a real roll" 1 \
+  "FAIL:scope-check" "$CENSUS_AK" --tag staging-0badc0de
+saw "...counted as a failure, not as out of scope" \
+  "found=2 in_scope=1 out_of_scope=0 eligible=1 rolled=1 skipped=0 failed=1"
+
 reset_state; canary_fixture
 : > "$K8RT/scope-ns"   # bound nowhere
-check "a run with NO tenant in scope FAILS as vacuous, however many it skipped" 1 \
+check "a run with NO tenant in scope FAILS as vacuous" 1 \
   "NONE is inside this credential's scope" "$CENSUS_AK" --digest "$D_NEW"
-saw "...and still reports every tenant it skipped" "found=2 in_scope=0 out_of_scope=2"
+saw "...each tenant a scope-check failure, none skipped" \
+  "found=2 in_scope=0 out_of_scope=0 eligible=0 rolled=0 skipped=0 failed=2"
 if [ ! -s "$K8RT/set-image.log" ]; then echo "ok: ...and mutated nothing"; PASS=$((PASS+1))
 else echo "FAIL: a vacuous run issued set image"; FAILED=$((FAILED+1)); fi
 check "the vacuous-scope gate holds in --dry-run too" 1 \
@@ -487,15 +577,24 @@ check "the vacuous-scope gate holds in --dry-run too" 1 \
 check "--allow-empty does not waive the vacuous-scope gate" 1 \
   "NONE is inside this credential's scope" "$CENSUS_AK" --digest "$D_NEW" --allow-empty
 
+echo "== anything but a clean 'yes' from auth can-i fails =="
 reset_state; touch "$K8RT/cani.fail"
-check "an 'auth can-i' ERROR fails closed as FAIL:scope-check, never as out of scope" 1 \
+check "an 'auth can-i' ERROR fails closed as FAIL:scope-check" 1 \
   "FAIL:scope-check" "$CENSUS_A" --digest "$D_NEW"
 reset_state
 printf '%s' 'RBAC: role.rbac.authorization.k8s.io "tenant-fleet-roller" not found' > "$K8RT/cani.reason"
 check "a 'no' carrying an RBAC evaluation error (a broken binding) fails closed too" 1 \
   "FAIL:scope-check" "$CENSUS_A" --digest "$D_NEW"
+reset_state
+printf '%s\n' "Warning: the server doesn't have a resource type \"deployments\"" > "$K8RT/cani.stderr"
+check "auth can-i writing to stderr FAILS even when it answers 'yes'" 1 \
+  "FAIL:scope-check" "$CENSUS_A" --digest "$D_NEW"
+saw "...and the stderr is shown" "the server doesn't have a resource type"
+: > "$K8RT/scope-ns"
+check "...and a 'no' with stderr is a failure too, never a skip" 1 \
+  "FAIL:scope-check" "$CENSUS_A" --digest "$D_NEW"
 
-echo "== a REQUIRED namespace (default: the staging canary) must be rolled AND /buildinfo-verified =="
+echo "== a REQUIRED namespace (default: the staging canary) must be rolled AND verified =="
 reset_state; after_new "$SHA_OK"
 default_required "the canary missing from the census FAILS the run" 1 \
   "required namespace '$CANARY_NS' is not in this run" "$CENSUS_A" --tag staging-0badc0de
@@ -508,15 +607,25 @@ reset_state; canary_fixture
   row "$CANARY_NS" enteros-tenant-k "$ORG_K" "$REPO@$D_NEW" "" "" "" "$SHA_BAD"
 } > "$K8RT/pods.after"
 default_required "the canary's /buildinfo reporting another git_sha FAILS the run" 1 \
-  "required namespace '$CANARY_NS' was not rolled and /buildinfo-verified" "$CENSUS_AK" --tag staging-0badc0de
+  "required namespace '$CANARY_NS' was not rolled and verified" "$CENSUS_AK" --tag staging-0badc0de
 
 reset_state; canary_fixture; after_new "$SHA_OK"; touch "$K8RT/proxy.fail"
-default_required "the canary's pod proxy being unreachable FAILS the run" 1 \
-  "required namespace '$CANARY_NS' was not rolled and /buildinfo-verified" "$CENSUS_K" --tag staging-0badc0de
+default_required "the canary's pod proxy being unreachable FAILS the run (a KNOWN sha must be confirmed)" 1 \
+  "required namespace '$CANARY_NS' was not rolled and verified" "$CENSUS_K" --tag staging-0badc0de
 
+# NO git sha known (a revert to a pin recorded without one): the digest of every
+# serving pod is the verification, and the run says so instead of failing a
+# rollback that verifiably landed. This relaxes missing METADATA only: the two
+# cases above, where a sha IS known, still fail.
 reset_state; canary_fixture; after_new "$SHA_OK"
-default_required "a canary rolled by digest alone, its /buildinfo never checked, FAILS the run" 1 \
-  "rolled, but its /buildinfo was never checked" "$CENSUS_AK" --digest "$D_NEW"
+default_required "with NO git sha known, a canary verified by its imageID digest passes, with a warning" 0 \
+  "::warning::required namespace '$CANARY_NS' was rolled and verified by the imageID digest" \
+  "$CENSUS_AK" --digest "$D_NEW"
+reset_state; canary_fixture
+row ns-alpha enteros-tenant-abc "$ORG_A" "$REPO@$D_NEW" > "$K8RT/pods.after"
+row "$CANARY_NS" enteros-tenant-k "$ORG_K" "$REPO@$D_OLD" >> "$K8RT/pods.after"
+default_required "...but a canary still on the OLD digest FAILS it" 1 \
+  "staging-canary-k8s is FAIL:digest-mismatch" "$CENSUS_AK" --digest "$D_NEW"
 
 reset_state
 row "$CANARY_NS" enteros-tenant 0 "$ORG_K" "$REPO@$D_OLD" >> "$K8RT/deploys"
@@ -526,8 +635,8 @@ default_required "a canary scaled to zero FAILS the run" 1 \
 
 reset_state; canary_fixture; after_new "$SHA_OK"
 printf '%s\n' ns-alpha > "$K8RT/scope-ns"   # the canary's RoleBinding is missing
-default_required "a canary outside the credential's scope FAILS the run" 1 \
-  "staging-canary-k8s is skipped-out-of-scope" "$CENSUS_AK" --tag staging-0badc0de
+default_required "a canary the credential cannot roll FAILS the run" 1 \
+  "staging-canary-k8s is FAIL:scope-check" "$CENSUS_AK" --tag staging-0badc0de
 
 reset_state
 default_required "--allow-empty does not waive a required namespace" 1 \
@@ -538,9 +647,10 @@ default_required "--dry-run: a planned canary satisfies the requirement" 0 \
   "required namespace '$CANARY_NS' is planned" "$CENSUS_AK" --digest "$D_NEW" --dry-run
 default_required "--dry-run: a canary missing from the census still FAILS" 1 \
   "required namespace '$CANARY_NS' is not in this run" "$CENSUS_A" --digest "$D_NEW" --dry-run
-printf '%s\n' ns-alpha > "$K8RT/scope-ns"   # present in the census, but not plannable
-default_required "--dry-run: a canary that is present but not planned (out of scope) FAILS" 1 \
-  "staging-canary-k8s is skipped-out-of-scope" "$CENSUS_AK" --digest "$D_NEW" --dry-run
+reset_state
+row "$CANARY_NS" enteros-tenant 0 "$ORG_K" "$REPO@$D_OLD" >> "$K8RT/deploys"   # present, not plannable
+default_required "--dry-run: a canary that is present but not planned (scaled to zero) FAILS" 1 \
+  "staging-canary-k8s is SKIP:scaled-to-zero" "$CENSUS_AK" --digest "$D_NEW" --dry-run
 
 reset_state; after_new "$SHA_OK"
 export REQUIRED_TENANT_NAMESPACES="ns-alpha"

@@ -261,6 +261,18 @@ jobs:
       # Whatever is set here is not taken on trust — fleet-drift-audit.sh refuses
       # any entry that is not measurably drifted at that moment.
       STAGING_FLEET_EXCLUDE_SLUGS: ${{ vars.STAGING_FLEET_EXCLUDE_SLUGS }}
+      # THE K8S ROLLER'S DECLARED SCOPE: the tenant namespaces its credential
+      # holds RoleBindings in. The roller skips every other tenant without a
+      # single call into its namespace, and it must roll AND verify each of
+      # these. A missing or broken binding inside the list FAILS; it is never
+      # skipped. Keep it identical to the roller identity's RoleBinding list and
+      # to REQUIRED_TENANT_NAMESPACES (the roller refuses a required namespace
+      # outside the scope). These are literals, not repo vars: an undefined var
+      # arrives empty, and an empty scope is refused. Every step in this job
+      # inherits them: the drift audit, and the roll through
+      # redeploy-staging-fleet.sh.
+      ROLLER_SCOPE_NAMESPACES: enteros-staging-canary-k8s
+      REQUIRED_TENANT_NAMESPACES: enteros-staging-canary-k8s
     # RAN-SENTINEL. This job's `result` is read as a verdict by rollback-pin, so
     # it must also publish evidence that its body actually EXECUTED. See
     # scripts/deploy/ran-sentinel.sh for the full rationale (Gitea PickTask
@@ -745,6 +757,10 @@ jobs:
       CP_STAGING_DB_USER: ${{ vars.CP_STAGING_DB_USER || 'cps' }}
       CP_STAGING_DB_NAME: ${{ vars.CP_STAGING_DB_NAME || 'cp_staging' }}
       STAGING_FLEET_EXCLUDE_SLUGS: ${{ vars.STAGING_FLEET_EXCLUDE_SLUGS }}
+      # Same declared scope as redeploy-fleet (see there). The revert rolls the
+      # same tenants the forward roll did, under the same credential.
+      ROLLER_SCOPE_NAMESPACES: enteros-staging-canary-k8s
+      REQUIRED_TENANT_NAMESPACES: enteros-staging-canary-k8s
     # RAN-SENTINEL. rollback-pin is EQUALLY exposed: task 885373 was itself a
     # phantom, so a genuinely-failed candidate stayed pinned because its
     # rollback was never delivered. Nothing downstream `needs:` this job, so the

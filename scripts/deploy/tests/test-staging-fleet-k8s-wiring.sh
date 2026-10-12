@@ -302,31 +302,34 @@ drun 1 "k8s arm FAILED" "a revert whose pods report ANOTHER git_sha still FAILS"
       CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
       bash "$DOCKER_ROLLER" --image "$REPO@$D_NEW"
 
-say "2c. the staging scope: only RoleBinding'd namespaces are rolled"
+# The staging lane's DECLARED scope, exactly as staging-tenant-cd.yml sets it
+# on both redeploy-fleet and rollback-pin (section 7 pins those values).
+LANE_SCOPE=(ROLLER_SCOPE_NAMESPACES="$CANARY_NS" REQUIRED_TENANT_NAMESPACES="$CANARY_NS")
+
+say "2c. the staging scope is DECLARED: only its namespaces are rolled"
 # The roller's RBAC is RoleBindings in an explicit list of staging tenant
-# namespaces (today: the canary only). Every other tenant must be skipped and
-# reported, never failed and never touched.
+# namespaces (today: the canary only), and the lane declares that list. Every
+# other tenant is skipped and reported, never failed and never touched.
 reset_state
 after_new
 printf '%s\n' "$CANARY_NS" > "$K8RT/scope-ns"
-drun 0 "skipped-out-of-scope" "a tenant outside the roller's scope is skipped and reported; the canary still rolls" \
-  env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" \
+drun 0 "skipped-out-of-scope" "a tenant outside the declared scope is skipped and reported; the canary still rolls" \
+  env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" "${LANE_SCOPE[@]}" \
       SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
       K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
       FAKE_BUILDINFO_SHA="0badc0de0123456789abcdef0123456789abcdef" \
       CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
       bash "$DOCKER_ROLLER" --tag staging-0badc0de
-other="$(grep '^ns=ns-alpha ' "$K8RT/calls.log" | grep -v ' auth can-i patch deployments$' || true)"
-logged "the out-of-scope namespace was asked the scope question" "ns=ns-alpha auth can-i patch deployments"
-if [ -z "$other" ]; then ok "...and nothing else was called in it"
-else bad "the out-of-scope namespace saw calls beyond 'auth can-i'" "$other"; fi
+hits="$(grep '^ns=ns-alpha ' "$K8RT/calls.log" || true)"
+if [ -z "$hits" ]; then ok "the skipped namespace was not touched at all, not even by auth can-i"
+else bad "the skipped namespace saw kubectl calls" "$hits"; fi
 
 say "2d. the staging canary is REQUIRED: a roll that does not verify it FAILS"
 reset_state
 after_new
 grep -v '^staging-canary-k8s' "$K8RT/census.tsv" > "$K8RT/census.tmp"; mv "$K8RT/census.tmp" "$K8RT/census.tsv"
 drun 1 "required namespace '$CANARY_NS' is not in this run" "the canary missing from the census FAILS the staging roll" \
-  env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" \
+  env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" "${LANE_SCOPE[@]}" \
       SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
       K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
       FAKE_BUILDINFO_SHA="0badc0de0123456789abcdef0123456789abcdef" \
@@ -335,13 +338,39 @@ drun 1 "required namespace '$CANARY_NS' is not in this run" "the canary missing 
 reset_state
 after_new
 printf '%s\n' ns-alpha > "$K8RT/scope-ns"   # the canary's RoleBinding is missing
-drun 1 "staging-canary-k8s is skipped-out-of-scope" "a canary outside the roller's scope FAILS the staging roll" \
-  env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" \
+drun 1 "staging-canary-k8s is FAIL:scope-check" "a canary whose RoleBinding is missing FAILS the staging roll" \
+  env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" "${LANE_SCOPE[@]}" \
       SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
       K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
       FAKE_BUILDINFO_SHA="0badc0de0123456789abcdef0123456789abcdef" \
       CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
       bash "$DOCKER_ROLLER" --tag staging-0badc0de
+
+say "2e. a REVERT to a pin with NO git sha is verified by digest, not failed"
+# rollback-pin's else-branch: `redeploy-staging-fleet.sh --image <old image>`,
+# with no EXPECTED_BUILD_SHA because the old pin recorded none. With no sha to
+# check /buildinfo against, the imageID digest of every serving pod is the
+# verification. Failing here, after the fleet verifiably went back, would report
+# a good rollback as a failed one.
+reset_state
+after_new
+printf '%s\n' "$CANARY_NS" > "$K8RT/scope-ns"
+drun 0 "verified by the imageID digest" "a no-sha revert verifies the canary by digest and succeeds, with a warning" \
+  env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" "${LANE_SCOPE[@]}" \
+      SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
+      K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
+      CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
+      bash "$DOCKER_ROLLER" --image "$REPO@$D_NEW"
+reset_state
+row ns-alpha enteros-tenant-abc "$ORG_A" "$REPO@$D_NEW" > "$K8RT/pods.after"
+row "$CANARY_NS" enteros-tenant-k "$ORG_K" "$REPO@$D_OLD" >> "$K8RT/pods.after"
+printf '%s\n' "$CANARY_NS" > "$K8RT/scope-ns"
+drun 1 "FAIL:digest-mismatch" "...but a no-sha revert whose canary did NOT move still FAILS" \
+  env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" "${LANE_SCOPE[@]}" \
+      SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
+      K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
+      CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
+      bash "$DOCKER_ROLLER" --image "$REPO@$D_NEW"
 
 say "3. a genuinely FAILED k8s roll still fails the whole roll"
 reset_state
@@ -480,6 +509,36 @@ if [ -f "$WF" ]; then
   fi
 else
   bad "staging-tenant-cd.yml not found at $WF" ""
+fi
+
+say "8. the staging lane DECLARES its scope; production declares none"
+# Skipping is opt-in. Staging declares the roller's RoleBinding list on BOTH jobs
+# that run the roller (redeploy-fleet, rollback-pin), identical to
+# REQUIRED_TENANT_NAMESPACES. Production must never declare one: there a
+# deleted namespace or a missing binding has to FAIL, and must not read as
+# "out of scope".
+if [ -f "$WF" ]; then
+  nscope="$(grep -cE '^[[:space:]]+ROLLER_SCOPE_NAMESPACES: enteros-staging-canary-k8s$' "$WF" || true)"
+  nreq="$(grep -cE '^[[:space:]]+REQUIRED_TENANT_NAMESPACES: enteros-staging-canary-k8s$' "$WF" || true)"
+  others="$(grep -E '^[[:space:]]+(ROLLER_SCOPE|REQUIRED_TENANT)_NAMESPACES:' "$WF" | grep -vE ': enteros-staging-canary-k8s$' || true)"
+  if [ "$nscope" = "2" ] && [ "$nreq" = "2" ] && [ -z "$others" ]; then
+    ok "redeploy-fleet and rollback-pin both declare ROLLER_SCOPE_NAMESPACES = REQUIRED_TENANT_NAMESPACES = the canary"
+  else
+    bad "staging-tenant-cd.yml must declare ROLLER_SCOPE_NAMESPACES and REQUIRED_TENANT_NAMESPACES = enteros-staging-canary-k8s on both roller jobs (scope=${nscope}, required=${nreq})" "$others"
+  fi
+fi
+PWF="$here/../../../.gitea/workflows/redeploy-tenants-on-main.yml"
+if [ -f "$PWF" ]; then
+  live="$(sed 's/^[[:space:]]*//' "$PWF" | grep -v '^#' || true)"
+  if grep -qx 'unset ROLLER_SCOPE_NAMESPACES' <<< "$live" \
+     && ! grep -qE '(^|[^_A-Z])ROLLER_SCOPE_NAMESPACES[:=]' <<< "$live"; then
+    ok "the production lane unsets ROLLER_SCOPE_NAMESPACES and never declares one"
+  else
+    bad "redeploy-tenants-on-main.yml must unset ROLLER_SCOPE_NAMESPACES and must not declare it" \
+        "$(grep -n 'ROLLER_SCOPE_NAMESPACES' "$PWF" || true)"
+  fi
+else
+  bad "redeploy-tenants-on-main.yml not found at $PWF" ""
 fi
 
 echo
