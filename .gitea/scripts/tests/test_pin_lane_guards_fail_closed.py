@@ -71,6 +71,9 @@ def _run_guard(script: str, env_overrides: dict[str, str]) -> subprocess.Complet
     with tempfile.TemporaryDirectory() as tmp:
         env = {
             "PATH": os.environ.get("PATH", ""),
+            # setup-python's hosted toolcache needs its shared-library path.
+            # Keep runtime dependencies while excluding inherited credentials.
+            "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", ""),
             "HOME": tmp,
             "GITHUB_OUTPUT": os.path.join(tmp, "gh_output"),
             "GITHUB_STEP_SUMMARY": os.path.join(tmp, "gh_summary"),
