@@ -21,6 +21,24 @@ Some files retain explicitly dormant compatibility jobs for a retired provider.
 A dormant job or historical comment is not evidence that the provider is active.
 Read the actual trigger and `if:` expressions before reporting coverage.
 
+## Chat browser isolation
+
+`e2e-chat.yml` starts Chromium in a Docker bridge network namespace, using
+`start-playwright-server.sh`. The installed Playwright version selects the
+matching browser image and protocol package. The browser connects through
+`PLAYWRIGHT_WS_ENDPOINT`; Playwright forwards only loopback destinations to the
+test client. Canvas, the platform, and per-test HTTP/WebSocket servers therefore
+keep their existing URLs, origins, CSP, and authentication behavior.
+
+This isolates Chromium from other jobs creating and deleting host interfaces,
+which caused `ERR_NETWORK_CHANGED` bursts against static assets (core#5106).
+The job still fails on any static-asset network error, with zero test retries.
+Server startup failure is fatal; it never falls back to a host-network browser.
+The browser container uses a per-run name, is removed in `always()` cleanup,
+and is covered by the existing two-hour stale-container sweep.
+
+Local Playwright runs need no container unless `PLAYWRIGHT_WS_ENDPOINT` is set.
+
 ## Required-check rule
 
 A check can be protected only if it emits a terminal result for every relevant
