@@ -70,7 +70,7 @@ const E2E_PROVIDER = process.env.E2E_PROVIDER || "molecules-server";
 // niche runtime that can't come online. Env-overridable so the SSOT default can
 // drive it (E2E_RUNTIME/E2E_MODEL, same knobs as the lifecycle e2e).
 const E2E_WS_RUNTIME = process.env.E2E_RUNTIME || "claude-code";
-const E2E_WS_MODEL = process.env.E2E_MODEL || "minimax/MiniMax-M2.7";
+const E2E_WS_MODEL = process.env.E2E_MODEL || "minimax/MiniMax-M3";
 const E2E_WS_PROVIDER = process.env.E2E_WS_PROVIDER || "platform";
 const E2E_WS_TIER = Number(process.env.E2E_TIER || "1");
 

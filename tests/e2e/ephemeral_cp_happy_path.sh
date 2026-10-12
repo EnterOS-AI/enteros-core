@@ -216,7 +216,7 @@ pull_via_host() {
 #   (a) all three workspace-template images are published to
 #       registry.moleculesai.app/molecule-ai and pull the same way the hermes one
 #       already does in CI (digest-pinned below), and
-#   (b) all three runtimes carry `minimax/MiniMax-M2.7` in their platform arm
+#   (b) all three runtimes carry `minimax/MiniMax-M3` in their platform arm
 #       (workspace-server/internal/providers/gen/registry_gen.go), and the
 #       platform provider is anthropic-compat authed by the CP-injected
 #       MOLECULE_LLM_USAGE_TOKEN — so the CP's single MINIMAX_API_KEY serves the
@@ -533,7 +533,7 @@ load_state() {
 # staging lanes be retired instead of merely duplicated. Override with
 # E2E_MODE=smoke for a fast local loop.
 # workspace provisioned with NO tenant key, model = the hermes default
-# minimax/MiniMax-M2.7 (SLASH form = PLATFORM-managed per CTO task#83; the
+# minimax/MiniMax-M3 (SLASH form = PLATFORM-managed per CTO task#83; the
 # CP LLM proxy bills, required_env=[]), completion flows workspace → tenant
 # proxy env → THIS ephemeral CP's /cp/internal/llm proxy → api.minimax.io with
 # the CP's own MINIMAX_API_KEY (injected via the boot-env). The BYOK matrix is
@@ -584,7 +584,7 @@ run_scenario() {
   # send_message_to_user and the message lands in the AgentMessageWriter notify
   # ground-truth. It CO-GATES on E2E_SCHEDULER_CHECK=on (the fire machinery) AND a
   # real tool-calling LLM. This lane's real-LLM arm is the platform path below
-  # (E2E_LLM_PATH=platform → CP-proxied minimax/MiniMax-M2.7), so 10g runs HARD
+  # (E2E_LLM_PATH=platform → CP-proxied minimax/MiniMax-M3), so 10g runs HARD
   # per-PR here; a keyless/mock arm SKIPs it (never reds). The FIRE half (10d)
   # stays hard on every arm. Set E2E_SCHEDULE_DELIVER_CHECK=off to disable JUST
   # the deliver leg without disabling the fire gate.
@@ -693,7 +693,7 @@ run_scenario_concierge_user_tasks() {
 # container/LLM — the cheapest lane), this boots REAL tenant + member containers
 # and runs REAL LLM turns. The ephemeral CP already boots real workspaces + real
 # A2A/MiniMax completions in its own happy path (child workspace + delegation
-# matrix, model = the hermes default minimax/MiniMax-M2.7 PLATFORM-managed via
+# matrix, model = the hermes default minimax/MiniMax-M3 PLATFORM-managed via
 # THIS CP's /cp/internal/llm proxy + MINIMAX_API_KEY), so the infra fully
 # supports it. Mirrors e2e-staging-saas.yml job
 # `e2e-staging-concierge-creates-workspace`.
@@ -812,7 +812,7 @@ run_scenario_reconciler_heals_terminated() {
 #     real-boot coverage the staging peer-visibility job carries and the reason
 #     the matrix flag exists. It works on the ephemeral CP because seed_workspace_image
 #     pre-seeds every matrix runtime's template image and E2E_MODEL_SLUG pins the
-#     platform model to `minimax/MiniMax-M2.7` — the ONE vendor the ephemeral CP is
+#     platform model to `minimax/MiniMax-M3` — the ONE vendor the ephemeral CP is
 #     keyed for (MINIMAX_API_KEY) and a registered platform model for all three
 #     runtimes — OVERRIDING the staging default (pv_platform_model_for_runtime →
 #     anthropic/moonshot), which the ephemeral CP's LLM proxy is NOT keyed to serve.
@@ -826,7 +826,7 @@ run_scenario_peer_visibility() {
   local mode; mode="$(pv_provision_mode)"
   if [ "$mode" = "managed" ]; then
     local rts; rts="$(matrix_runtimes)"
-    echo "[proof][extra] peer_visibility (literal MCP list_peers, REAL managed-boot matrix=[${rts}], model=${E2E_MODEL_SLUG:-minimax/MiniMax-M2.7}) against the ephemeral CP..." >&2
+    echo "[proof][extra] peer_visibility (literal MCP list_peers, REAL managed-boot matrix=[${rts}], model=${E2E_MODEL_SLUG:-minimax/MiniMax-M3}) against the ephemeral CP..." >&2
     # Managed real-boot: E2E_MODEL_SLUG pins the model to the ephemeral CP's one
     # keyed vendor (overriding pv_platform_model_for_runtime's staging
     # anthropic/moonshot defaults). Timeout is the REAL cold-boot budget — three
@@ -839,7 +839,7 @@ run_scenario_peer_visibility() {
     E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
     PV_PROVISION_MODE=managed \
     PV_RUNTIMES="$rts" \
-    E2E_MODEL_SLUG="${E2E_MODEL_SLUG:-minimax/MiniMax-M2.7}" \
+    E2E_MODEL_SLUG="${E2E_MODEL_SLUG:-minimax/MiniMax-M3}" \
     E2E_PROVISION_TIMEOUT_SECS="${E2E_PV_PROVISION_TIMEOUT_SECS:-900}" \
     E2E_RUN_ID="${PR_NUMBER:-0}-${HEAD_SHA:-local0000}-pv" \
       bash "$HERE/test_peer_visibility_mcp_staging.sh"
