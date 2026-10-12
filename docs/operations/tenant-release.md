@@ -32,6 +32,9 @@ single dispatch:
 While frozen or unarmed, the same action produces a read-only plan. Merging code
 never deploys production. A retry reconciles the boot secret and retries the
 fleet even when the database pin already matches the candidate.
+The image publisher does not dispatch production operations. Its legacy
+`:latest` alias identifies a CI-green build; production uses the qualified
+digest and does not deploy from that alias.
 
 This driver supports the current Kubernetes production fleet and one production
 control-plane database. It refuses a different substrate or multiple production

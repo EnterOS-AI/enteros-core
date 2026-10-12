@@ -155,6 +155,12 @@ def test_production_writes_are_manual_and_bound_to_the_staging_digest():
 
 
 def test_production_inventory_and_live_pin_audits_are_independent_of_code_ci():
+    publisher = workflow("publish-workspace-server-image.yml")
+    for job in publisher["jobs"].values():
+        for step in job["steps"]:
+            # An indirect dispatch from the publisher would restore the
+            # push-to-production coupling despite a dispatch-only trigger.
+            assert "/dispatches" not in step.get("run", "")
     inventory = workflow("redeploy-tenants-on-main.yml")
     assert set(inventory.get("on", inventory.get(True))) == {"workflow_dispatch"}
     body = "\n".join(s.get("run", "") for s in inventory["jobs"]["redeploy-k8s"]["steps"])

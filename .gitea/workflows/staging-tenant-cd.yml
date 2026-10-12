@@ -47,9 +47,9 @@ name: staging-tenant-cd
 #   script also asserts every rtstate volume is intact after the roll). The
 #   CP-driven restart path is separately session-safe via controlplane #1118.
 #
-# STAGING ONLY. Production is untouched: redeploy-tenants-on-main.yml (:latest,
-# PROD_AUTO_DEPLOY_DISABLED-gated) owns the prod fleet, and this pipeline never
-# writes the prod pin nor the :latest tag.
+# STAGING ONLY. promote-prod-tenant-pin.yml owns the manual production release
+# and accepts only this pipeline's successfully qualified immutable artifact.
+# This pipeline never writes the production pin or the :latest alias.
 #
 # The image/pin/tenant-roll jobs use docker-host. Runtime readiness uses the
 # dedicated local-deploy runner because that runner's mTLS Docker endpoint is
@@ -192,10 +192,8 @@ jobs:
 
   # ── WHY THIS IS ONE JOB AND NOT TWO ────────────────────────────────────────
   #
-  # The production lane (redeploy-tenants-on-main.yml) splits its docker arm and
-  # its k8s arm into SEPARATE jobs, and says why: "a docker arm that legitimately
-  # matches zero containers cannot mask a k8s arm that failed". That split is not
-  # available here, and the reason is the anti-vacuity guard rather than taste.
+  # Staging may span both substrates. A docker arm with zero containers must
+  # not hide a failed Kubernetes rollout or count as a deployment by itself.
   #
   # Measured on the staging control plane (2026-08-12): 11 orgs, k8s=11,
   # docker=0. A docker-only job would therefore discover zero containers, have no
