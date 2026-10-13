@@ -248,7 +248,7 @@ fi
 #
 # The backstop exceeding "the watchdog" was true against a number nobody
 # enforced: 600 mirrored MOLECULE_TRIGGER_DELIVERY_WATCHDOG_SECONDS, retired at
-# scheduler v0.2.2, while the pinned v0.2.3 abandons an unattributable delivery
+# scheduler v0.2.2, while the pinned scheduler (v0.2.3 onward) abandons an unattributable delivery
 # at 3600. Rather than grow the backstop to 10800 inside a 75-minute job, the
 # harness now WRITES the bound onto the workspace. These pin that contract.
 cap_env=$(trigger_daemon_delivery_cap_env)

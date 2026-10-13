@@ -44,7 +44,7 @@
 # gains exactly one entry per FINISHED delivery attempt, and every terminal path
 # in scheduler.py writes one — `_commit` for fired / unknown / deferred / error,
 # and `check_watchdog`'s `_record_history` for a cancellation, each with a
-# machine-readable `cause`. Read at v0.2.3 (see
+# machine-readable `cause`. Read at v0.2.4 (see
 # `trigger_daemon_scheduler_version_validated`), there is no path that finishes
 # an attempt without appending. That makes the log a TRUE forward-progress
 # signal for the delivery lane specifically:
@@ -406,8 +406,9 @@ trigger_daemon_stale_secs() {
 #
 # WHAT THIS NUMBER IS at the PINNED scheduler, and what it is NOT. There is no
 # daemon-side `MOLECULE_TRIGGER_DELIVERY_WATCHDOG_SECONDS` to mirror: v0.2.2
-# retired it, and core pins v0.2.3 (workspace-server/internal/handlers/
-# plugin_registry_test.go). v0.2.3's watchdog is ACTIVITY-AWARE — each tick it
+# retired it, and core pins v0.2.4 (workspace-server/internal/handlers/
+# plugin_registry_test.go). Its watchdog, unchanged since v0.2.3, is
+# ACTIVITY-AWARE — each tick it
 # reads the runtime's turn-lease snapshot and `classify_delivery_liveness`
 # returns one of four dispositions:
 #
@@ -596,7 +597,7 @@ trigger_daemon_progress_stall_secs() {
 # unit test compares this against core's live pin and REDS on a bump, forcing a
 # re-read rather than letting the derivation rot in place.
 trigger_daemon_scheduler_version_validated() {
-  printf '%s' 'v0.2.3'
+  printf '%s' 'v0.2.4'
 }
 
 # The backstop is a never-hit safety net, so it must EXCEED the delivery cancel
