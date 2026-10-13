@@ -33,7 +33,7 @@
     {"name": "hermes", "repo": "molecule-ai/molecule-ai-workspace-template-hermes", "ref": "61398532d6fcbc8381d223b093a8ddb50e3fe9ca"},
     {"name": "openclaw", "repo": "molecule-ai/molecule-ai-workspace-template-openclaw", "ref": "140c771a50dca850999f4962432eb793f0cd707e"},
     {"name": "codex", "repo": "molecule-ai/molecule-ai-workspace-template-codex", "ref": "070447a0afdf66ae6f2bb166ac3e2b2884456951"},
-    {"name": "seo-agent", "repo": "molecule-ai/molecule-ai-workspace-template-seo-agent", "ref": "c1208d72eae931a4fb1358386e209c9d9fe97522", "runtime": "hermes", "private": true}
+    {"name": "seo-agent", "repo": "molecule-ai/molecule-ai-workspace-template-seo-agent", "ref": "3236bfd2f908db22d8311db427ded905b3f6bb6f", "runtime": "hermes", "private": true}
   ],
   "org_templates": [
     {"name": "mini-company", "repo": "molecule-ai/molecule-ai-org-template-mini-company", "ref": "33088ca03a5dca5f4ebd7c3014254a81a81faeed"},
