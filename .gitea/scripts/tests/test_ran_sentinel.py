@@ -131,7 +131,6 @@ def _fake_repo(tmp: Path) -> Path:
     # would make this suite fail for reasons that have nothing to do with
     # sentinels.
     for name, body in (
-        ("require-local-deploy-daemon.sh", "exit 0\n"),
         ("require-deploy-toolchain.sh", 'printf "KUBECTL=/bin/true\\nDEPLOY_PYTHON3=/bin/true\\n"\n'),
         (
             "resolve-k8s-fleet-census.sh",

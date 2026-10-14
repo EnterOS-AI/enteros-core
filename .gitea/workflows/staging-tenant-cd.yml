@@ -1,18 +1,18 @@
 name: staging-tenant-cd
 
-# Gated CONTINUOUS DEPLOY of the local-docker STAGING tenant fleet.
+# Gated CONTINUOUS DEPLOY of the STAGING tenant fleet (k8s substrate).
 #
 # The deploy half of the tenant auto-update loop, mirroring the control-plane's
 # own gated pipeline (molecule-controlplane/.gitea/workflows/
 # local-cp-deploy-pipeline.yml), which likewise triggers on push to `main`. The
 # operator model is TRUNK-BASED: every `main` merge is the staging candidate, so
 # a push to `main` that changes the tenant image sources flows through a
-# STRUCTURALLY-GATED, explicit local-Docker provider-boundary job chain:
+# STRUCTURALLY-GATED job chain:
 #
 #   await-image -> advance-pin -> redeploy-fleet -------------> e2e-smoke
 #                              \-> runtime-image-readiness ----/     ^
 #                                      ^                            HARD GATE (real staging A2A-serve e2e)
-#                                      exact promoted runtime digests ready on provisioner daemon
+#                                      exact promoted runtime digests served by the registry
 #
 # THE LOOP (build half + deploy half)
 #   publish-workspace-server-image.yml  (BUILD)  — already triggers on push:[main]
@@ -31,31 +31,31 @@ name: staging-tenant-cd
 #
 # WHY STRUCTURALLY GATED (un-bypassable)
 #   e2e-smoke `needs:` BOTH redeploy-fleet and runtime-image-readiness; each
-#   needs advance-pin, which needs await-image. The readiness sibling targets
-#   exactly the `local-deploy` daemon selected by runner configuration and only
-#   prepares its image cache from CP-owned read projections. It does NOT
-#   deploy/reload the control-plane host; that provider-specific infrastructure
-#   work remains outside tenant-image CI. If anything after advance-pin fails or
+#   needs advance-pin, which needs await-image. The readiness sibling reads
+#   CP-owned projections and proves the registry serves every promoted runtime
+#   digest. It does NOT deploy/reload the control-plane host; that
+#   provider-specific infrastructure work remains outside tenant-image CI. If
+#   anything after advance-pin fails or
 #   is skipped, rollback-pin restores the old pin and rerolls the staging tenant
 #   fleet back to that old image. There is no continue-on-error on any gating job.
 #
 # SESSION PRESERVATION
-#   redeploy-fleet delegates to scripts/deploy/redeploy-staging-fleet.sh, which
-#   rolls ONLY the STATELESS mol-tenant-* platform containers (cp-env=staging);
-#   the session-bearing mol-ws-* agent container + its mol-ws-rtstate-* volume
-#   are never touched, so the concierge session survives BY CONSTRUCTION (the
-#   script also asserts every rtstate volume is intact after the roll). The
-#   CP-driven restart path is separately session-safe via controlplane #1118.
+#   redeploy-fleet delegates to scripts/deploy/redeploy-staging-fleet.sh
+#   --k8s-only, which re-pins only each tenant's platform Deployment to the
+#   candidate digest; workspace pods are separate workloads and are never
+#   touched. The CP-driven restart path is separately session-safe via
+#   controlplane #1118.
 #
 # STAGING ONLY. promote-prod-tenant-pin.yml owns the manual production release
 # and accepts only this pipeline's successfully qualified immutable artifact.
 # This pipeline never writes the production pin or the :latest alias.
 #
-# The image/pin/tenant-roll jobs use docker-host. Runtime readiness uses the
-# dedicated local-deploy runner because that runner's mTLS Docker endpoint is
-# the daemon the local-Docker workspace provisioner mutates; the script consumes
-# only deployed CP HTTPS projections, never CP source. e2e-smoke runs on a Go
-# runner and hits staging over HTTPS exactly like the existing
+# The image/pin jobs use docker-host. The fleet roll, its rollback and runtime
+# readiness use the dedicated local-deploy runner, which has kubectl and the
+# cluster route. No job contacts a Docker daemon for the fleet: both control
+# planes run PROVISIONER_BACKEND=k8s, and the Docker host this lane used to
+# fingerprint (molecule-local-host) is retired. e2e-smoke runs on a Go runner
+# and hits staging over HTTPS exactly like the existing
 # e2e-workspace-lifecycle.yml staging job it reuses.
 
 on:
@@ -75,7 +75,6 @@ on:
       - 'scripts/deploy/redeploy-staging-fleet.sh'
       - 'scripts/deploy/advance-staging-tenant-pin.sh'
       - 'scripts/deploy/prepare-staging-runtime-images.sh'
-      - 'scripts/deploy/require-local-deploy-daemon.sh'
   # Repository policy keeps dispatch flat (enforced by lint-workflow-yaml).
   # Operator overrides are read from repo/org
   # VARS instead: STAGING_TENANT_CD_IMAGE_TAG (roll to a specific tag) and
@@ -190,38 +189,17 @@ jobs:
           TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE }}
         run: bash scripts/deploy/advance-staging-tenant-pin.sh --tag "${{ needs.await-image.outputs.tag }}"
 
-  # ── WHY THIS IS ONE JOB AND NOT TWO ────────────────────────────────────────
+  # ── k8s ONLY ───────────────────────────────────────────────────────────────
   #
-  # Staging may span both substrates. A docker arm with zero containers must
-  # not hide a failed Kubernetes rollout or count as a deployment by itself.
-  #
-  # Measured on the staging control plane (2026-08-12): 11 orgs, k8s=11,
-  # docker=0. A docker-only job would therefore discover zero containers, have no
-  # k8s arm to fall back on, and redeploy-staging-fleet.sh would — correctly —
-  # refuse with "this run would roll NOTHING and still exit 0". The only two ways
-  # to make such a job pass are `--allow-empty` and weakening the guard, and this
-  # lane is precisely the one that reported `tenants=0 … success` for twelve
-  # days. Both are disqualifying.
-  #
-  # So the two substrates stay in ONE process, which is what the script's own
-  # substrate dispatch was built for: redeploy-staging-fleet.sh rolls the docker
-  # substrate itself and dispatches the k8s substrate to
-  # redeploy-tenant-fleet-k8s.sh, folding that roller's exit status in VERBATIM.
-  # A docker arm matching zero containers still cannot mask a failed k8s arm —
-  # the folding is what guarantees it, and it is unit-tested.
-  #
-  # ── AND WHY IT MOVED OFF `docker-host` ─────────────────────────────────────
-  #
-  # `docker-host` is the act_runner pool on robot-1/robot-2, OUTSIDE k3s. It has
-  # no kubectl and no route to the cluster, so the k8s arm cannot run there at
-  # all. It is also not the daemon staging tenants live on: the daemon the live
-  # staging local-Docker provisioner actually mutates is the one reached from
-  # `local-deploy`, which scripts/deploy/require-local-deploy-daemon.sh
-  # fingerprints by asserting mTLS equality plus the presence of the staging CP
-  # container on molecule-net. The docker arm is not being dropped — it is being
-  # pointed at the daemon it was always supposed to enumerate, and it runs the
-  # same shared swap script it always did. `local-deploy` is also where the
-  # production k8s arm runs, for the same kubectl reason.
+  # Both control planes provision on k8s (PROVISIONER_BACKEND=k8s; census on
+  # 2026-10-14: staging k8s=1, prod k8s=9, docker=0), and the Docker host this
+  # job used to fingerprint and enumerate (molecule-local-host) is retired. The
+  # roll runs redeploy-staging-fleet.sh --k8s-only: it never contacts a Docker
+  # daemon, and it folds the k8s roller's exit status in verbatim, so a failed
+  # rollout still fails the job. A census row on any other substrate stops the
+  # job before the first mutation instead of leaving that tenant behind on the
+  # old image. It runs on `local-deploy` because that runner has kubectl and
+  # the cluster route; `docker-host` has neither.
   # bp-exempt: post-merge staging CD job; gated by this workflow's needs/rollback chain, not PR branch protection.
   redeploy-fleet:
     name: redeploy-fleet (roll staging tenants, session-preserving)
@@ -283,15 +261,6 @@ jobs:
           printf 'token=ran-sentinel/v1 %s begin run=%s\n' "$RAN_SENTINEL_JOB" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
           echo "ran-sentinel BEGIN emitted for $RAN_SENTINEL_JOB (run $GITHUB_RUN_ID)"
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      # Same daemon fingerprint runtime-image-readiness runs, for the same
-      # reason: this job now MUTATES containers on the local-deploy endpoint, and
-      # the docker arm's target set is whatever that daemon reports. Proving the
-      # endpoint identity before the first mutation is what makes "0 docker
-      # tenants" a fact about staging rather than a fact about which daemon
-      # answered.
-      - name: Verify the exact local-deploy Docker daemon
-        run: bash scripts/deploy/require-local-deploy-daemon.sh
 
       # The roller and the auditor must EXIST before anything claims to have run
       # them. Checked explicitly rather than left to `bash <missing>`, and
@@ -378,6 +347,18 @@ jobs:
           cat "$out" >> "$GITHUB_ENV"
           printf 'census wiring published:\n%s\n' "$(cut -d= -f1 "$out")"
 
+      - name: Refuse a census with a tenant this lane cannot roll
+        run: |
+          set -euo pipefail
+          if [ ! -s "${FLEET_CENSUS_TSV-}" ]; then
+            echo "::error::FLEET_CENSUS_TSV is unset or empty at this step; the census resolution step above must have been removed, reordered, or failed to publish."
+            exit 1
+          fi
+          if awk -F '\t' '$3 != "k8s" { printf "::error::tenant %s is on substrate %s; this lane rolls only k8s tenants and would leave it on the old image\n", $1, $3; found = 1 } END { exit !found }' "$FLEET_CENSUS_TSV"; then
+            exit 1
+          fi
+          echo "census: every tenant is on the k8s substrate"
+
       # DRIFT IS REPORTED BEFORE IT IS EXCLUDED, AND AN EXCLUSION MUST BE EARNED.
       # This runs the shipped roller in --dry-run with NO exclusions, so the
       # classification comes from the roller itself, names every drifted org as a
@@ -423,8 +404,7 @@ jobs:
           # Interpolated into `env:` (a VALUE), never into the `run:` body: a
           # ${{ }} expansion inside run: is spliced in as SHELL CODE, so a var value
           # of `x"; touch /tmp/PWNED; echo "` would execute on this runner — and this
-          # job holds a live mTLS endpoint to the staging tenant daemon and a
-          # cluster credential.
+          # job holds a cluster credential.
           STAGING_TENANT_FLAGS: ${{ vars.STAGING_TENANT_FLAGS }}
         # `${STAGING_TENANT_FLAGS-}` — the shell, not the templater, supplies the
         # default. An undefined repo var may arrive as an OMITTED env entry rather
@@ -435,13 +415,10 @@ jobs:
         # for.
         run: |
           set -euo pipefail
-          # SUBSTRATE_CENSUS_CMD reaches here through $GITHUB_ENV. Asserted
-          # explicitly because its ABSENCE is the whole defect this PR fixes: the
-          # script's own refusal then reads "0 staging tenant containers found …
-          # and no k8s arm was dispatched", which is true but points at the fleet
-          # rather than at the wiring that failed to arm it.
+          # SUBSTRATE_CENSUS_CMD reaches here through $GITHUB_ENV. Asserted here
+          # so its absence names the wiring that failed rather than the fleet.
           if [ -z "${SUBSTRATE_CENSUS_CMD-}" ]; then
-            echo "::error::SUBSTRATE_CENSUS_CMD is unset at the roll step, so redeploy-staging-fleet.sh would run its DOCKER arm only — and on a control plane whose tenants are all on k8s that is a roll of nothing. The census resolution step above must have been removed, reordered, or failed to publish."
+            echo "::error::SUBSTRATE_CENSUS_CMD is unset at the roll step, so the k8s arm cannot enumerate the fleet. The census resolution step above must have been removed, reordered, or failed to publish."
             exit 1
           fi
           # --allow-empty is deliberately NOT passed, here or anywhere in this
@@ -449,7 +426,7 @@ jobs:
           # assertion, and the census resolver has already proven this one is not
           # empty.
           TENANT_FLAGS="${STAGING_TENANT_FLAGS-}" \
-            bash scripts/deploy/redeploy-staging-fleet.sh --tag "${{ needs.await-image.outputs.tag }}"
+            bash scripts/deploy/redeploy-staging-fleet.sh --k8s-only --tag "${{ needs.await-image.outputs.tag }}"
       # LAST step, under `if: always()`. `always()` is REQUIRED, not incidental:
       # a job that ran and genuinely FAILED must still emit END, or its own
       # failure would look like a phantom and suppress the rollback it is owed.
@@ -471,12 +448,10 @@ jobs:
 
   # bp-exempt: post-merge staging CD hard gate; enforced by e2e needs + rollback, not PR branch protection.
   runtime-image-readiness:
-    name: runtime-image-readiness (exact promoted digests on provisioner daemon)
+    name: runtime-image-readiness (exact promoted digests served by the registry)
     needs: [advance-pin]
-    # This is the runner whose operator-configured mTLS endpoint reaches the
-    # daemon used by the staging local-Docker provisioner. The checked-in guard
-    # proves endpoint equality + mTLS + the staging CP's molecule-net
-    # attachment before any pull.
+    # Staging workspaces are k8s pods pulled by kubelet from the registry, so
+    # readiness is the registry serving every promoted digest byte-for-byte.
     runs-on: local-deploy
     timeout-minutes: 30
     # RAN-SENTINEL — see redeploy-fleet above and scripts/deploy/ran-sentinel.sh.
@@ -497,9 +472,7 @@ jobs:
           printf 'token=ran-sentinel/v1 %s begin run=%s\n' "$RAN_SENTINEL_JOB" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
           echo "ran-sentinel BEGIN emitted for $RAN_SENTINEL_JOB (run $GITHUB_RUN_ID)"
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Verify the exact local-deploy Docker daemon
-        run: bash scripts/deploy/require-local-deploy-daemon.sh
-      - name: Pre-pull and RepoDigest-verify every promoted pinnable runtime
+      - name: Verify the registry serves every promoted pinnable runtime digest
         env:
           CP_BASE_URL: https://staging-api.moleculesai.app
           INFISICAL_BASE: https://key.moleculesai.app
@@ -507,6 +480,8 @@ jobs:
           INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+          REG_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
+          REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
         run: bash scripts/deploy/prepare-staging-runtime-images.sh
       - name: ran-sentinel END (proves this job's body ran to completion)
         id: ran_end
@@ -727,12 +702,11 @@ jobs:
     # after advance-pin must restore the old pin and reroll staging tenants back
     # onto it. Green fleet roll + e2e is the only no-op path.
     if: always()
-    # Follows redeploy-fleet onto `local-deploy`, and for the same two reasons: a
-    # revert that cannot reach the staging tenant daemon rolls no docker tenant,
-    # and a revert with no kubectl rolls no k8s tenant. A rollback that can only
-    # undo the PIN and not the FLEET leaves the running tenants on the failed
-    # candidate while the control plane says otherwise — the exact split-brain
-    # this job exists to close.
+    # Follows redeploy-fleet onto `local-deploy`, for the same reason: a revert
+    # with no kubectl rolls no k8s tenant. A rollback that can only undo the PIN
+    # and not the FLEET leaves the running tenants on the failed candidate while
+    # the control plane says otherwise — the exact split-brain this job exists
+    # to close.
     runs-on: local-deploy
     timeout-minutes: 30
     env:
@@ -878,18 +852,10 @@ jobs:
           fi
 
           # ── The k8s arm of the REVERT ─────────────────────────────────────
-          # Same daemon fingerprint and same census wiring as the forward roll,
-          # resolved HERE rather than in preceding steps for the reason above.
-          # `rc=` and not a bare call throughout: this step runs under `-e`, and
-          # a bare invocation would abort before the diagnostic below could name
-          # what went wrong.
-          rc=0
-          bash scripts/deploy/require-local-deploy-daemon.sh || rc=$?
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::the staging PIN has been reverted to $OLD_IMAGE, but the local-deploy daemon fingerprint FAILED (exit ${rc}) — this job will not mutate containers on a daemon it cannot identify. The running tenants are still on the failed candidate; this needs an operator."
-            exit "$rc"
-          fi
-
+          # Same census wiring as the forward roll, resolved HERE rather than in
+          # preceding steps for the reason above. `rc=` and not a bare call
+          # throughout: this step runs under `-e`, and a bare invocation would
+          # abort before the diagnostic below could name what went wrong.
           rc=0
           tc="$(bash scripts/deploy/require-deploy-toolchain.sh \
             'DEPLOY_PYTHON3:python3:python3:--version' \
@@ -922,7 +888,7 @@ jobs:
           # a digest rather than $OLD_IMAGE, whose registry host the tenant
           # workloads do not pull from. Empty means advance-pin found no prior
           # pin: there is then no k8s target to revert TO, which must be said out
-          # loud rather than silently rolling only the docker arm.
+          # loud.
           if [ -z "${OLD_DIGEST-}" ]; then
             echo "::error::advance-pin exposed no old_digest, so the k8s tenant fleet has no digest to revert to. The pin is back on $OLD_IMAGE but the running k8s tenants are NOT. Operator attention needed."
             exit 1
@@ -938,9 +904,9 @@ jobs:
           [ -z "$EXCLUDE_SLUGS" ] || echo "::warning::the revert honours EXCLUDE_SLUGS='${EXCLUDE_SLUGS}' without re-auditing it; those tenants are NOT rolled back and stay on whatever they are running."
 
           if [ -n "$OLD_GIT_SHA" ]; then
-            EXPECTED_BUILD_SHA="$OLD_GIT_SHA" bash scripts/deploy/redeploy-staging-fleet.sh --image "$OLD_IMAGE"
+            EXPECTED_BUILD_SHA="$OLD_GIT_SHA" bash scripts/deploy/redeploy-staging-fleet.sh --k8s-only --image "$OLD_IMAGE"
           else
-            bash scripts/deploy/redeploy-staging-fleet.sh --image "$OLD_IMAGE"
+            bash scripts/deploy/redeploy-staging-fleet.sh --k8s-only --image "$OLD_IMAGE"
           fi
       - name: ran-sentinel END (proves this job's body ran to completion)
         id: ran_end

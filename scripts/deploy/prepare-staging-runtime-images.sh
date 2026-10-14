@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Pre-E2E readiness for promoted workspace runtime images on the exact daemon
-# used by staging's local-Docker provisioner. The control plane owns both input
-# projections: /cp/runtimes identifies the pinnable set and the admin pin list
-# supplies each registry-resolved immutable image_ref. This consumer never
+# Pre-E2E readiness for promoted workspace runtime images: the registry must
+# serve every pinnable runtime's promoted immutable image_ref, with manifest
+# bytes that hash to the promoted digest. Staging workspaces are k8s pods whose
+# kubelets pull from that registry, so an unserved digest is a provision that
+# fails part-way through the E2E instead of here. The control plane owns both
+# input projections: /cp/runtimes identifies the pinnable set and the admin pin
+# list supplies each registry-resolved immutable image_ref. This consumer never
 # rebuilds registry policy or carries a second runtime allowlist.
 set -euo pipefail
 
@@ -24,31 +27,36 @@ require_positive_int() {
 CP_BASE_URL="${CP_BASE_URL:-https://staging-api.moleculesai.app}"
 INFISICAL_BASE="${INFISICAL_BASE:-https://key.moleculesai.app}"
 INFISICAL_ENV="${INFISICAL_ENV:-staging}"
-READINESS_TIMEOUT="${RUNTIME_IMAGE_READINESS_TIMEOUT_SECONDS:-1200}"
-PULL_TIMEOUT="${RUNTIME_IMAGE_PULL_TIMEOUT_SECONDS:-600}"
-PULL_ATTEMPTS="${RUNTIME_IMAGE_PULL_ATTEMPTS:-2}"
-RETRY_DELAY="${RUNTIME_IMAGE_PULL_RETRY_DELAY_SECONDS:-5}"
-# How much of a failed `docker pull`'s output to echo. The useful part (the
-# error) is at the END of the stream, so we tail rather than head. Bounded so a
-# pathological pull cannot flood the job log.
-PULL_LOG_TAIL_LINES="${RUNTIME_IMAGE_PULL_LOG_TAIL_LINES:-40}"
+READINESS_TIMEOUT="${RUNTIME_IMAGE_READINESS_TIMEOUT_SECONDS:-600}"
+REQUEST_TIMEOUT="${RUNTIME_IMAGE_REQUEST_TIMEOUT_SECONDS:-30}"
+REQUEST_ATTEMPTS="${RUNTIME_IMAGE_REQUEST_ATTEMPTS:-3}"
+RETRY_DELAY="${RUNTIME_IMAGE_REQUEST_RETRY_DELAY_SECONDS:-5}"
+# The registry credential is sent only to this host. A CP-projected image_ref
+# naming any other host fails the plan before the first registry request.
+REGISTRY_HOST="${RUNTIME_IMAGE_REGISTRY_HOST:-registry.moleculesai.app}"
+MANIFEST_ACCEPT="application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"
+MAX_MANIFEST_BYTES=5242880
 
-for name in CP_BASE_URL INFISICAL_BASE INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET INFISICAL_PROJECT_ID; do
+for name in CP_BASE_URL INFISICAL_BASE INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET INFISICAL_PROJECT_ID REG_USER REG_TOKEN; do
   [[ -n "${!name:-}" ]] || fail "$name is required"
 done
 [[ "$INFISICAL_ENV" == "staging" ]] || fail "INFISICAL_ENV must be exactly staging"
 infisical_client_id="$INFISICAL_CLIENT_ID"
 infisical_client_secret="$INFISICAL_CLIENT_SECRET"
 infisical_project_id="$INFISICAL_PROJECT_ID"
-unset INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET INFISICAL_PROJECT_ID
-# Resolve paths only after exported credentials are gone so even this first
-# subprocess cannot inherit the universal-auth identity.
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+reg_user="$REG_USER"
+reg_token="$REG_TOKEN"
+unset INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET INFISICAL_PROJECT_ID REG_USER REG_TOKEN
 [[ "$infisical_project_id" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] \
   || fail "INFISICAL_PROJECT_ID must be a lowercase UUID"
 case "$infisical_client_id$infisical_client_secret" in
   *$'\n'*|*$'\r'*|*$'\t'*|*'"'*|*$'\\'*) fail "Infisical client credentials contain invalid JSON control characters" ;;
 esac
+case "$reg_user$reg_token" in
+  *$'\n'*|*$'\r'*|*$'\t'*|*'"'*|*$'\\'*) fail "registry credentials contain invalid control/config characters" ;;
+esac
+case "$reg_user" in *:*) fail "REG_USER must not contain ':'" ;; esac
+[[ "$REGISTRY_HOST" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || fail "RUNTIME_IMAGE_REGISTRY_HOST must be a bare host name"
 
 validate_https_origin() {
   local name="$1" value="${2%/}" origin
@@ -63,13 +71,12 @@ CP_BASE_URL="$(validate_https_origin CP_BASE_URL "$CP_BASE_URL")"
 INFISICAL_BASE="$(validate_https_origin INFISICAL_BASE "$INFISICAL_BASE")"
 
 require_positive_int RUNTIME_IMAGE_READINESS_TIMEOUT_SECONDS "$READINESS_TIMEOUT"
-require_positive_int RUNTIME_IMAGE_PULL_TIMEOUT_SECONDS "$PULL_TIMEOUT"
-require_positive_int RUNTIME_IMAGE_PULL_ATTEMPTS "$PULL_ATTEMPTS"
-require_positive_int RUNTIME_IMAGE_PULL_LOG_TAIL_LINES "$PULL_LOG_TAIL_LINES"
+require_positive_int RUNTIME_IMAGE_REQUEST_TIMEOUT_SECONDS "$REQUEST_TIMEOUT"
+require_positive_int RUNTIME_IMAGE_REQUEST_ATTEMPTS "$REQUEST_ATTEMPTS"
 case "$RETRY_DELAY" in
-  ''|*[!0-9]*) fail "RUNTIME_IMAGE_PULL_RETRY_DELAY_SECONDS must be a non-negative integer" ;;
+  ''|*[!0-9]*) fail "RUNTIME_IMAGE_REQUEST_RETRY_DELAY_SECONDS must be a non-negative integer" ;;
 esac
-for command_name in curl node docker timeout; do
+for command_name in curl node; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command is unavailable: $command_name"
 done
 
@@ -91,11 +98,6 @@ json_required_string() {
     }
   ' "$field_path"
 }
-
-# Source, rather than merely execute, so every pull/inspect below reuses the
-# exact endpoint and mTLS pins that the read-only fingerprint validated.
-# shellcheck source=./require-local-deploy-daemon.sh
-source "$here/require-local-deploy-daemon.sh"
 
 tmp_dir="$(mktemp -d)"
 cleanup() { rm -rf "$tmp_dir"; }
@@ -158,7 +160,7 @@ esac
   || fail "could not read promoted runtime-image pins from staging"
 unset cp_token
 
-# Build and validate the complete CP-owned plan before the first Docker pull.
+# Build and validate the complete CP-owned plan before the first registry request.
 # Every pinnable runtime must have exactly one global pin and a resolved ref.
 # shellcheck disable=SC2016 # Node template literals must not expand in Bash.
 if ! node -e '
@@ -200,7 +202,7 @@ if ! node -e '
   }
   process.stdout.write(rows.map((row) => row.join("\t")).join("\n") + "\n");
 ' "$catalog_json" "$pins_json" > "$plan_tsv"; then
-  fail "runtime catalog/pin plan is incomplete or invalid; refusing a partial pre-pull"
+  fail "runtime catalog/pin plan is incomplete or invalid; refusing a partial readiness check"
 fi
 
 : > "$validated_tsv"
@@ -218,105 +220,75 @@ while IFS=$'\t' read -r runtime image_name digest image_ref; do
 done < "$plan_tsv"
 [[ "$image_count" -gt 0 ]] || fail "validated readiness plan is empty"
 
-# exact_repo_digest_present reports whether the daemon ALREADY carries the exact
-# immutable image_ref among the image's RepoDigests. This is byte-for-byte the
-# same assertion the post-pull verification below makes — see the `grep -Fx`
-# after the pull loop.
-exact_repo_digest_present() {
-  local ref="$1" digests
-  digests="$(timeout --foreground --signal=TERM --kill-after=10s 30s \
-    docker "${DOCKER_PIN_ARGS[@]}" image inspect \
-    --format '{{range .RepoDigests}}{{println .}}{{end}}' "$ref" 2>/dev/null)" || return 1
-  grep -Fx -- "$ref" <<< "$digests" >/dev/null
+while IFS=$'\t' read -r runtime image_ref; do
+  [[ "${image_ref%%/*}" == "$REGISTRY_HOST" ]] \
+    || fail "image_ref for runtime $runtime is not on $REGISTRY_HOST; refusing to send the registry credential to another host"
+done < "$validated_tsv"
+
+manifest_body="$tmp_dir/manifest.body"
+manifest_headers="$tmp_dir/manifest.headers"
+curl_err="$tmp_dir/curl.err"
+
+# fetch_manifest <image_ref>: prints the HTTP status ("000" on a transport
+# failure). The credential travels in curl's stdin config, never in argv, and
+# redirects are not followed so it cannot be replayed to another origin.
+fetch_manifest() {
+  local path="${1#*/}"
+  local repository="${path%@*}" digest="${path##*@}"
+  {
+    printf 'silent\nshow-error\nmax-time = %s\nmax-filesize = %s\n' "$REQUEST_TIMEOUT" "$MAX_MANIFEST_BYTES"
+    printf 'header = "User-Agent: curl/8.4.0"\n'
+    printf 'header = "Accept: %s"\n' "$MANIFEST_ACCEPT"
+    printf 'user = "%s:%s"\n' "$reg_user" "$reg_token"
+    printf 'output = "%s"\n' "$manifest_body"
+    printf 'dump-header = "%s"\n' "$manifest_headers"
+    printf 'write-out = "%%{http_code}"\n'
+  } | curl --disable --config - "https://$REGISTRY_HOST/v2/$repository/manifests/$digest" 2>"$curl_err"
 }
 
-# Lives inside tmp_dir so the EXISTING `trap cleanup EXIT INT TERM` (set above,
-# alongside the credential-bearing catalog/pin fixtures) reaps it. Do NOT give
-# this its own trap — bash replaces handlers rather than chaining them, so a
-# second `trap ... EXIT` would silently disarm that cleanup and leak tmp_dir.
-pull_log="$tmp_dir/docker-pull.log"
+sha256_file() {
+  node -e '
+    "use strict";
+    const fs = require("fs");
+    const hash = require("crypto").createHash("sha256");
+    process.stdout.write(hash.update(fs.readFileSync(process.argv[1])).digest("hex"));
+  ' "$1"
+}
 
 while IFS=$'\t' read -r runtime image_ref; do
-  pulled=0
+  digest="${image_ref##*@}"
   attempt=1
-
-  # core#5065 — skip the pull when the post-condition already holds.
-  #
-  # This gate's contract is "the exact promoted RepoDigest is present on the
-  # provisioner daemon". The pull was only ever the MEANS of reaching that
-  # post-condition; the `grep -Fx` verification below is the contract itself.
-  # So when the exact RepoDigest is already on the daemon there is nothing left
-  # for a pull to establish, and re-pulling only adds a dependency on the
-  # transport.
-  #
-  # That dependency is what broke main. registry.moleculesai.app is a Cloudflare
-  # tunnel back to the home-PC origin (<2.5MB/s, HTTP Range not honoured, so a
-  # stalled layer restarts at byte 0). The hermes template's 1.438GB layer never
-  # converged: run 620363 / job 916973 on commit dd1841976 burned both bounded
-  # attempts (~240s each, ~410MB and ~360MB transferred) and failed the job —
-  # while `docker image inspect` on that very daemon already listed the exact
-  # ref, and a container started from it cleanly. e2e-smoke `needs:` this job,
-  # so it was SKIPPED, and deploy-production is gated on e2e-smoke.
-  #
-  # Digest-pinned refs make this safe: the ref is content-addressed, so a local
-  # RepoDigest match cannot be stale or wrong by construction. A genuinely new
-  # promoted digest is still absent, still pulled, and still fails closed.
-  if exact_repo_digest_present "$image_ref"; then
-    echo ">> [runtime-image-readiness] present runtime=$runtime exact_repo_digest already on daemon — skipping redundant pull ref=$image_ref"
-    pulled=1
-  fi
-
-  while [[ "$pulled" -eq 0 && "$attempt" -le "$PULL_ATTEMPTS" ]]; do
+  status=""
+  while :; do
     remaining=$((deadline - $(date +%s)))
-    [[ "$remaining" -gt 0 ]] || fail "global ${READINESS_TIMEOUT}s budget exhausted before runtime $runtime became ready"
-    attempt_budget="$PULL_TIMEOUT"
-    [[ "$attempt_budget" -le "$remaining" ]] || attempt_budget="$remaining"
-    echo ">> [runtime-image-readiness] pull runtime=$runtime attempt=$attempt/$PULL_ATTEMPTS budget=${attempt_budget}s ref=$image_ref"
-    set +e
-    # Redirect to a file rather than inheriting the runner's pty. Attached to a
-    # tty, `docker pull` renders per-layer progress with ANSI cursor moves and
-    # NO newlines, so an entire multi-GB pull arrives as ONE log line. Gitea
-    # truncates a log line at 64 KiB — job 916973's two pull lines were both
-    # exactly 65565 bytes — which silently discarded docker's actual error
-    # message at the end of the stream. The job could therefore only ever report
-    # `rc=1`, making every pull failure look identical and undiagnosable.
-    # Redirected, docker emits plain newline-delimited progress and the real
-    # error survives; we echo the tail below so it lands in the log.
-    timeout --foreground --signal=TERM --kill-after=10s "${attempt_budget}s" \
-      docker "${DOCKER_PIN_ARGS[@]}" pull "$image_ref" > "$pull_log" 2>&1
-    pull_rc=$?
-    set -e
-    if [[ "$pull_rc" -eq 0 ]]; then pulled=1; break; fi
-    # rc=124 is `timeout` killing the pull at the attempt budget; anything else
-    # is docker's own exit. Both want the tail.
-    echo "-- [runtime-image-readiness] docker pull output for runtime=$runtime (rc=$pull_rc, last ${PULL_LOG_TAIL_LINES} lines):" >&2
-    tail -n "$PULL_LOG_TAIL_LINES" "$pull_log" >&2 || true
-    echo "-- [runtime-image-readiness] end docker pull output for runtime=$runtime" >&2
-    if [[ "$attempt" -lt "$PULL_ATTEMPTS" ]]; then
-      echo "::warning::runtime image readiness: pull failed for runtime=$runtime rc=$pull_rc; retrying within the global budget" >&2
-      if [[ "$RETRY_DELAY" -ne 0 ]]; then
-        remaining=$((deadline - $(date +%s)))
-        [[ "$remaining" -gt "$RETRY_DELAY" ]] \
-          || fail "retry delay would exhaust the global ${READINESS_TIMEOUT}s budget before runtime $runtime"
-        sleep "$RETRY_DELAY"
-      fi
-    fi
+    [[ "$remaining" -gt 0 ]] || fail "global ${READINESS_TIMEOUT}s budget exhausted before runtime $runtime was verified"
+    rm -f "$manifest_body" "$manifest_headers"
+    status="$(fetch_manifest "$image_ref")" || true
+    case "$status" in
+      200|404|401|403) break ;;
+    esac
+    [[ "$attempt" -lt "$REQUEST_ATTEMPTS" ]] \
+      || fail "registry did not answer for runtime $runtime after $REQUEST_ATTEMPTS bounded attempt(s) (last HTTP ${status:-000}: $(head -c 300 "$curl_err" 2>/dev/null)): $image_ref"
+    echo "::warning::runtime image readiness: registry answered HTTP ${status:-000} for runtime=$runtime; retrying within the global budget" >&2
+    remaining=$((deadline - $(date +%s)))
+    [[ "$remaining" -gt "$RETRY_DELAY" ]] \
+      || fail "retry delay would exhaust the global ${READINESS_TIMEOUT}s budget before runtime $runtime"
+    sleep "$RETRY_DELAY"
     attempt=$((attempt + 1))
   done
-  [[ "$pulled" -eq 1 ]] || fail "docker pull failed for runtime $runtime after $PULL_ATTEMPTS bounded attempt(s): $image_ref"
-
-  remaining=$((deadline - $(date +%s)))
-  [[ "$remaining" -gt 0 ]] || fail "global ${READINESS_TIMEOUT}s budget exhausted before RepoDigest verification for runtime $runtime"
-  inspect_budget=30
-  [[ "$inspect_budget" -le "$remaining" ]] || inspect_budget="$remaining"
-  if ! repo_digests="$(timeout --foreground --signal=TERM --kill-after=10s "${inspect_budget}s" \
-    docker "${DOCKER_PIN_ARGS[@]}" image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image_ref" 2>/dev/null)"; then
-    fail "bounded docker image inspect failed after pulling runtime $runtime"
-  fi
-  grep -Fx -- "$image_ref" <<< "$repo_digests" >/dev/null \
-    || fail "exact RepoDigest verification failed for runtime $runtime after pull: expected $image_ref"
-  echo ">> [runtime-image-readiness] verified runtime=$runtime exact_repo_digest=$image_ref"
+  case "$status" in
+    404) fail "registry does not serve the promoted digest for runtime $runtime: $image_ref" ;;
+    401|403) fail "registry refused the configured credential (HTTP $status) for runtime $runtime" ;;
+  esac
+  [[ -s "$manifest_body" ]] || fail "registry returned an empty manifest for runtime $runtime"
+  body_digest="sha256:$(sha256_file "$manifest_body")"
+  [[ "$body_digest" == "$digest" ]] \
+    || fail "registry manifest for runtime $runtime hashes to $body_digest, not the promoted $digest"
+  advertised="$(grep -i '^docker-content-digest:' "$manifest_headers" | tail -n 1 | tr -d '\r' | sed 's/^[^:]*:[[:space:]]*//' | tr 'A-F' 'a-f')" || advertised=""
+  [[ "$advertised" == "$digest" ]] \
+    || fail "registry advertised Docker-Content-Digest '${advertised:-<none>}' for runtime $runtime, expected $digest"
+  echo ">> [runtime-image-readiness] verified runtime=$runtime served_digest=$image_ref"
 done < "$validated_tsv"
 
 elapsed=$(( $(date +%s) - started ))
-echo "runtime image readiness PASS: $image_count exact digest(s) pulled + RepoDigest-verified on local-deploy in ${elapsed}s"
+echo "runtime image readiness PASS: $image_count exact digest(s) served by $REGISTRY_HOST in ${elapsed}s"
