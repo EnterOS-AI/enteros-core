@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Pre-E2E readiness for promoted workspace runtime images: the registry must
 # serve every pinnable runtime's promoted immutable image_ref, with manifest
-# bytes that hash to the promoted digest. Staging workspaces are k8s pods whose
+# bytes that hash to the promoted digest, every child manifest likewise, and
+# every config and layer blob they reference. Staging workspaces are k8s pods whose
 # kubelets pull from that registry, so an unserved digest is a provision that
 # fails part-way through the E2E instead of here. The control plane owns both
 # input projections: /cp/runtimes identifies the pinnable set and the admin pin
@@ -225,25 +226,65 @@ while IFS=$'\t' read -r runtime image_ref; do
     || fail "image_ref for runtime $runtime is not on $REGISTRY_HOST; refusing to send the registry credential to another host"
 done < "$validated_tsv"
 
-manifest_body="$tmp_dir/manifest.body"
-manifest_headers="$tmp_dir/manifest.headers"
+reply_body="$tmp_dir/reply.body"
+reply_headers="$tmp_dir/reply.headers"
 curl_err="$tmp_dir/curl.err"
+reply_status=""
 
-# fetch_manifest <image_ref>: prints the HTTP status ("000" on a transport
-# failure). The credential travels in curl's stdin config, never in argv, and
-# redirects are not followed so it cannot be replayed to another origin.
-fetch_manifest() {
-  local path="${1#*/}"
-  local repository="${path%@*}" digest="${path##*@}"
-  {
-    printf 'silent\nshow-error\nmax-time = %s\nmax-filesize = %s\n' "$REQUEST_TIMEOUT" "$MAX_MANIFEST_BYTES"
-    printf 'header = "User-Agent: curl/8.4.0"\n'
-    printf 'header = "Accept: %s"\n' "$MANIFEST_ACCEPT"
-    printf 'user = "%s:%s"\n' "$reg_user" "$reg_token"
-    printf 'output = "%s"\n' "$manifest_body"
-    printf 'dump-header = "%s"\n' "$manifest_headers"
-    printf 'write-out = "%%{http_code}"\n'
-  } | curl --disable --config - "https://$REGISTRY_HOST/v2/$repository/manifests/$digest" 2>"$curl_err"
+# registry_request <GET|HEAD> <v2-path> <label>: sets reply_status to a
+# definitive answer (200/401/403/404). Transport failures and every other
+# status are retried within the attempt bound and the global budget; a curl
+# failure is never read as a status, because a stalled or truncated body still
+# prints the 200 it started with. The credential travels in curl's stdin
+# config, never in argv, and redirects are not followed so it cannot be
+# replayed to another origin.
+registry_request() {
+  local method="$1" path="$2" label="$3" attempt=1 rc remaining
+  while :; do
+    remaining=$((deadline - $(date +%s)))
+    [[ "$remaining" -gt 0 ]] || fail "global ${READINESS_TIMEOUT}s budget exhausted before $label was verified"
+    rm -f "$reply_body" "$reply_headers"
+    rc=0
+    reply_status="$({
+      printf 'silent\nshow-error\nmax-time = %s\n' "$REQUEST_TIMEOUT"
+      # A HEAD reply carries the blob's own Content-Length, which the manifest
+      # size bound must not apply to.
+      if [[ "$method" == HEAD ]]; then
+        printf 'head\n'
+      else
+        printf 'max-filesize = %s\n' "$MAX_MANIFEST_BYTES"
+      fi
+      printf 'header = "User-Agent: curl/8.4.0"\n'
+      printf 'header = "Accept: %s"\n' "$MANIFEST_ACCEPT"
+      printf 'user = "%s:%s"\n' "$reg_user" "$reg_token"
+      printf 'output = "%s"\n' "$reply_body"
+      printf 'dump-header = "%s"\n' "$reply_headers"
+      printf 'write-out = "%%{http_code}"\n'
+    } | curl --disable --config - "https://$REGISTRY_HOST/v2/$path" 2>"$curl_err")" || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      case "$reply_status" in 200|401|403|404) return 0 ;; esac
+    elif [[ "$rc" -eq 63 ]] || grep -q 'Maximum file size exceeded' "$curl_err" 2>/dev/null; then
+      # curl reports the bound as exit 63 or, in some builds, 56.
+      fail "registry response for $label exceeds the ${MAX_MANIFEST_BYTES}-byte manifest bound"
+    fi
+    [[ "$attempt" -lt "$REQUEST_ATTEMPTS" ]] \
+      || fail "registry did not answer for $label after $REQUEST_ATTEMPTS bounded attempt(s) (last HTTP ${reply_status:-000}, curl exit $rc: $(head -c 300 "$curl_err" 2>/dev/null))"
+    echo "::warning::runtime image readiness: registry answered HTTP ${reply_status:-000} (curl exit $rc) for $label; retrying within the global budget" >&2
+    remaining=$((deadline - $(date +%s)))
+    [[ "$remaining" -gt "$RETRY_DELAY" ]] \
+      || fail "retry delay would exhaust the global ${READINESS_TIMEOUT}s budget before $label"
+    sleep "$RETRY_DELAY"
+    attempt=$((attempt + 1))
+  done
+}
+
+require_found() {
+  local label="$1" what="$2"
+  case "$reply_status" in
+    200) ;;
+    404) fail "registry does not serve $what for $label" ;;
+    *) fail "registry refused the configured credential (HTTP $reply_status) for $label" ;;
+  esac
 }
 
 sha256_file() {
@@ -255,40 +296,78 @@ sha256_file() {
   ' "$1"
 }
 
-while IFS=$'\t' read -r runtime image_ref; do
-  digest="${image_ref##*@}"
-  attempt=1
-  status=""
-  while :; do
-    remaining=$((deadline - $(date +%s)))
-    [[ "$remaining" -gt 0 ]] || fail "global ${READINESS_TIMEOUT}s budget exhausted before runtime $runtime was verified"
-    rm -f "$manifest_body" "$manifest_headers"
-    status="$(fetch_manifest "$image_ref")" || true
-    case "$status" in
-      200|404|401|403) break ;;
-    esac
-    [[ "$attempt" -lt "$REQUEST_ATTEMPTS" ]] \
-      || fail "registry did not answer for runtime $runtime after $REQUEST_ATTEMPTS bounded attempt(s) (last HTTP ${status:-000}: $(head -c 300 "$curl_err" 2>/dev/null)): $image_ref"
-    echo "::warning::runtime image readiness: registry answered HTTP ${status:-000} for runtime=$runtime; retrying within the global budget" >&2
-    remaining=$((deadline - $(date +%s)))
-    [[ "$remaining" -gt "$RETRY_DELAY" ]] \
-      || fail "retry delay would exhaust the global ${READINESS_TIMEOUT}s budget before runtime $runtime"
-    sleep "$RETRY_DELAY"
-    attempt=$((attempt + 1))
-  done
-  case "$status" in
-    404) fail "registry does not serve the promoted digest for runtime $runtime: $image_ref" ;;
-    401|403) fail "registry refused the configured credential (HTTP $status) for runtime $runtime" ;;
-  esac
-  [[ -s "$manifest_body" ]] || fail "registry returned an empty manifest for runtime $runtime"
-  body_digest="sha256:$(sha256_file "$manifest_body")"
+# Prints "manifest <digest>" for each child of an index / manifest list and
+# "blob <digest>" for the config and every layer of an image manifest. Exits
+# non-zero on any other shape, so an unrecognised document cannot pass with
+# nothing checked beneath it.
+manifest_references() {
+  node -e '
+    "use strict";
+    const DIGEST = /^sha256:[a-f0-9]{64}$/;
+    const out = [];
+    const need = (d) => { if (typeof d !== "string" || !DIGEST.test(d)) process.exit(1); return d; };
+    let doc;
+    try { doc = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); } catch (_) { process.exit(1); }
+    if (Array.isArray(doc?.manifests)) {
+      if (doc.manifests.length === 0) process.exit(1);
+      for (const m of doc.manifests) out.push("manifest " + need(m?.digest));
+    } else if (doc?.config && Array.isArray(doc?.layers)) {
+      out.push("blob " + need(doc.config.digest));
+      for (const l of doc.layers) out.push("blob " + need(l?.digest));
+    } else {
+      process.exit(1);
+    }
+    process.stdout.write(out.join("\n") + "\n");
+  ' "$1"
+}
+
+# verify_manifest <repository> <digest> <label> <refs-out>: the manifest must
+# be served, hash to <digest>, and be advertised as <digest>. Its references
+# are appended to <refs-out>.
+verify_manifest() {
+  local repository="$1" digest="$2" label="$3" refs_out="$4" body_digest advertised
+  registry_request GET "$repository/manifests/$digest" "$label"
+  require_found "$label" "manifest $digest"
+  [[ -s "$reply_body" ]] || fail "registry returned an empty manifest $digest for $label"
+  body_digest="sha256:$(sha256_file "$reply_body")"
   [[ "$body_digest" == "$digest" ]] \
-    || fail "registry manifest for runtime $runtime hashes to $body_digest, not the promoted $digest"
-  advertised="$(grep -i '^docker-content-digest:' "$manifest_headers" | tail -n 1 | tr -d '\r' | sed 's/^[^:]*:[[:space:]]*//' | tr 'A-F' 'a-f')" || advertised=""
+    || fail "registry manifest $digest for $label hashes to $body_digest"
+  advertised="$(grep -i '^docker-content-digest:' "$reply_headers" | tail -n 1 | tr -d '\r' | sed 's/^[^:]*:[[:space:]]*//' | tr 'A-F' 'a-f')" || advertised=""
   [[ "$advertised" == "$digest" ]] \
-    || fail "registry advertised Docker-Content-Digest '${advertised:-<none>}' for runtime $runtime, expected $digest"
-  echo ">> [runtime-image-readiness] verified runtime=$runtime served_digest=$image_ref"
+    || fail "registry advertised Docker-Content-Digest '${advertised:-<none>}' for manifest $digest of $label"
+  manifest_references "$reply_body" >> "$refs_out" \
+    || fail "manifest $digest for $label is not an image manifest or index with valid digests"
+}
+
+while IFS=$'\t' read -r runtime image_ref; do
+  path="${image_ref#*/}"
+  repository="${path%@*}"
+  digest="${path##*@}"
+  label="runtime $runtime"
+  top_refs="$tmp_dir/refs.top"
+  image_refs="$tmp_dir/refs.image"
+  : > "$top_refs"
+  : > "$image_refs"
+  verify_manifest "$repository" "$digest" "$label" "$top_refs"
+  manifest_count=1
+  if grep -q '^manifest ' "$top_refs"; then
+    grep -q '^blob ' "$top_refs" && fail "manifest $digest for $label mixes child manifests and blobs"
+    while read -r _ child; do
+      verify_manifest "$repository" "$child" "$label" "$image_refs"
+      manifest_count=$((manifest_count + 1))
+    done < "$top_refs"
+    grep -q '^manifest ' "$image_refs" && fail "a child manifest of $digest for $label is itself an index"
+  else
+    cp "$top_refs" "$image_refs"
+  fi
+  blob_count=0
+  while read -r _ blob; do
+    registry_request HEAD "$repository/blobs/$blob" "$label"
+    require_found "$label" "blob $blob"
+    blob_count=$((blob_count + 1))
+  done < <(sort -u "$image_refs")
+  echo ">> [runtime-image-readiness] verified runtime=$runtime manifests=$manifest_count blobs=$blob_count ref=$image_ref"
 done < "$validated_tsv"
 
 elapsed=$(( $(date +%s) - started ))
-echo "runtime image readiness PASS: $image_count exact digest(s) served by $REGISTRY_HOST in ${elapsed}s"
+echo "runtime image readiness PASS: $image_count exact digest(s) served by $REGISTRY_HOST, every manifest and blob present, in ${elapsed}s"

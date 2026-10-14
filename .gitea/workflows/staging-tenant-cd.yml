@@ -451,7 +451,8 @@ jobs:
     name: runtime-image-readiness (exact promoted digests served by the registry)
     needs: [advance-pin]
     # Staging workspaces are k8s pods pulled by kubelet from the registry, so
-    # readiness is the registry serving every promoted digest byte-for-byte.
+    # readiness is the registry serving every promoted digest (hash-verified
+    # manifests) and every blob those manifests reference.
     runs-on: local-deploy
     timeout-minutes: 30
     # RAN-SENTINEL — see redeploy-fleet above and scripts/deploy/ran-sentinel.sh.

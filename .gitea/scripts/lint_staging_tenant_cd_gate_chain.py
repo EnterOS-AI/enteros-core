@@ -10,7 +10,8 @@ The gated staging tenant CD lives at .gitea/workflows/staging-tenant-cd.yml:
 It is enforced INTRA-workflow by Gitea `needs:` (a red upstream job skips every
 downstream job). The pin advances before the k8s staging fleet rolls to the
 candidate image. In parallel, runtime-image-readiness proves the registry
-serves every promoted pinnable runtime digest byte-for-byte; e2e-smoke cannot
+serves every promoted pinnable runtime digest (manifest bytes hash-verified)
+and every child manifest and blob it references; e2e-smoke cannot
 start until both paths are green, so its first workspace provision cannot fail
 on a digest the registry does not have.
 rollback-pin must always run and restore the old pin + fleet image whenever any
