@@ -266,6 +266,8 @@ There are two distinct memory surfaces:
 | `PUT` | `/workspaces/:id/secrets` | Upsert workspace secret |
 | `DELETE` | `/workspaces/:id/secrets/:key` | Delete workspace secret |
 | `GET` | `/workspaces/:id/model` | Get workspace model override |
+| `GET` | `/workspaces/:id/continuous` | Get the workspace's "24/7" switch (`continuous`, `source`) |
+| `PUT` | `/workspaces/:id/continuous` | Set it: `{"continuous": false}` stops the idle self-wake; restarts on change |
 
 Important detail: `GET /workspaces/:id/secrets` does **not** return values. It returns key metadata plus a `scope` field so the frontend can distinguish inherited globals from workspace overrides.
 

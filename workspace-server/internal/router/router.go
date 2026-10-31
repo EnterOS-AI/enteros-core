@@ -663,6 +663,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.DELETE("/secrets/:key", sech.Delete)
 		wsAuth.GET("/model", sech.GetModel)
 		wsAuth.PUT("/model", sech.SetModel)
+		wsAuth.GET("/continuous", sech.GetContinuous)
+		wsAuth.PUT("/continuous", sech.SetContinuous)
 		// internal#718 P4 closure: /provider endpoint is retired —
 		// the LLM_PROVIDER workspace_secret no longer exists and the
 		// provider is derived from (runtime, model) via the registry

@@ -35,6 +35,7 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | GET/POST/PUT | /workspaces/:id/secrets | secrets.go (POST/PUT auto-restarts workspace) |
 | DELETE | /workspaces/:id/secrets/:key | secrets.go (DELETE auto-restarts workspace) |
 | GET | /workspaces/:id/model | secrets.go |
+| GET/PUT | /workspaces/:id/continuous | workspace_continuous.go — the "24/7" switch `{continuous: bool}`; off writes `MOLECULE_CONTINUOUS=false` (no idle self-wake). A change auto-restarts the workspace; an unchanged PUT does not |
 | GET | /settings/secrets | secrets.go — list global secrets (keys only, values masked) |
 | PUT/POST | /settings/secrets | secrets.go — set a global secret `{key, value}`; auto-restarts every non-paused/non-removed/non-external workspace that does not shadow the key with a workspace-level override |
 | DELETE | /settings/secrets/:key | secrets.go — delete a global secret; same auto-restart fan-out as PUT/POST |
