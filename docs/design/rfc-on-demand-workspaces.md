@@ -41,8 +41,8 @@ Size of a call:
 | Driver | Mechanism | Source |
 |---|---|---|
 | Idle digest | Fires `idle_fire_after_seconds` = 300 s after a turn whenever the digest has changed. There is no backoff and no daily cap. The prompt says to keep "pulling the next item until the backlog AND your long-term goals are exhausted", and a standing goal never is. `MOLECULE_IDLE_FIRE_SECONDS` has a floor of 1, so it has no "off" value. | runtime `idle_digest/contract.py:166`, `:236`, `:285`; `idle_digest/controller.py` `tick()` |
-| Delegation echo | The heartbeat re-injected every inbound peer request as a "delegation result" and told a child to delegate a summary back to its parent. Example: jrs seo-agent, 10:19–12:37 on 10-30, got 15 requests from its parent and 17 such self-wakes. | runtime `heartbeat.py` `_check_activity_delegations`; fixed in runtime#422 |
-| One session for every trigger | hermes keys every turn on `workspace:<id>`: chat, peer requests, schedule ticks and self-wakes alike. A tick therefore resumes the day's history, and the session resets only after 1440 idle minutes. | template-hermes `executor.py:2571`, `:510` |
+| Delegation echo | The heartbeat re-injected every inbound peer request as a "delegation result" and told a child to delegate a summary back to its parent. Example: jrs seo-agent, 10:19–12:37 on 10-30, got 15 requests from its parent and 17 such self-wakes. | runtime `heartbeat.py` `_check_activity_delegations`; removed in runtime#422 |
+| One session for every trigger | hermes keys every turn on `workspace:<id>`: chat, peer requests, schedule ticks and self-wakes alike. A tick therefore resumes all earlier history. With `HERMES_SESSION_RESET_MODE` unset, the default, the session never resets; the opt-in `daily` mode resets at 04:00 and `idle` after 1440 idle minutes. | template-hermes `executor.py:2571`, `:505`, `:541`, `:509-510` |
 | Restart turns | Each restart injects a restart-context turn. jrs seo-agent restarted 5 times between 10:36 and 11:50 on 10-30. | activity feed |
 
 ## 4. Design
@@ -56,12 +56,13 @@ Size of a call:
   3. **One session per run.** The hermes `_derive_chat_id` returns a per-run key for scheduled fires (`source_type=self-scheduler`) and for peer requests, so each run starts from the fixed overhead instead of the day's history. Canvas chat keeps `workspace:<id>`. A unit that spans several runs carries its state in files or the repo, as DineCall SEO already does.
   4. **Bounded runs.** The existing turn cap (`MOLECULE_MAX_TURN_SECONDS`) bounds each run.
   5. **No self-made schedules.** Schedule-creating and schedule-enabling tools refuse when the turn's `source_type` starts with `self-`. On 10-30 the jrs concierge created and enabled `zh-guardrail-r4-unit` on its worker during a self-directed turn.
+  6. **The agent is told.** The idle digest is what re-surfaces `task_add` and `goal_set` work, so with the switch off the system prompt says that nothing brings queued work back by itself (runtime#423, `prompt.ON_DEMAND_PROMPT`).
 - **Core:** `GET`/`PUT /workspaces/:id/continuous` `{"continuous": false}`, modeled on `SetModel` (`workspace-server/internal/handlers/secrets.go`):
-  - stored as the `workspace_secrets` row `MOLECULE_CONTINUOUS`;
-  - injected into the pod env at provision like `MODEL`, with a restart on change;
+  - stored as the `workspace_secrets` row `MOLECULE_CONTINUOUS`. Provision layers workspace rows over `global_secrets` (`loadWorkspaceSecrets`), so a global row of that key sets the tenant default and a workspace row overrides it;
+  - injected into the pod env at provision like `MODEL`. A change restarts the workspace through `RestartByIDAfterMutation`, because `RestartByID` drops a call made within 60 s of the previous restart. The generic secret write's guards apply: the org's platform root and a workspace writing its own switch are not restarted (core#2573) and pick the change up at their next restart, and an admin-token write to the platform root is refused (core#2566);
   - not approval-gated, because it is not a credential.
 - **Canvas:** a "Runs 24/7" toggle next to the model picker.
-- **Which workspaces turn it off:** concierges and every worker driven by schedules or delegation. A concierge with the switch off still answers chat at once; it just never wakes itself. Only an agent meant to work its own backlog with no schedule needs the switch on.
+- **Which workspaces turn it off:** concierges and every worker driven by schedules or delegation. A concierge with the switch off still answers chat at once; it just never wakes itself. The platform-root concierge is not restarted automatically, so restart it to apply the switch. Only an agent meant to work its own backlog with no schedule needs the switch on.
 
 ### 4.2 Sleep and wake
 
@@ -86,7 +87,7 @@ What changes:
 ## 5. Rollout
 
 1. **runtime#422** (the echo fix). It covers every workspace once the runtime release reaches the fleet image.
-2. **runtime#423 plus the core and canvas switch.** Turn it off on concierges and on schedule- or delegation-driven workers.
+2. **runtime#423 plus the core and canvas switch.** The switch acts only on an image whose runtime includes #423; on an older image a `PUT` restarts the workspace and changes nothing. Turn it off on concierges and on schedule- or delegation-driven workers.
 3. **Per-run hermes sessions**, behind the switch.
 4. **Sleep/wake.**
 5. **Light executor.**
@@ -95,6 +96,7 @@ Measure each step with the 24 h soak: LLM calls per workspace per day, plus the 
 
 ## 6. Risks
 
+- **Lost delegation results on hermes.** hermes reads a delegation result only from the heartbeat's wake, and a wake skipped by the 60 s cooldown or a failed wake `POST` is never resent (runtime#424). With the switch off no idle wake notices. Fix it before turning delegating workspaces off.
 - **Per-run sessions drop the chat history between runs.** Work that spans runs must persist its state. This applies only when the switch is off.
 - **Cold starts.** `/workspace` is not persisted, so a worker that clones and builds pays that cost on every wake.
 - **Missed schedules** if `wake_at` is wrong. The daemon's catch-up on boot is the backstop.
