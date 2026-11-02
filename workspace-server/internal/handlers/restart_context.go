@@ -381,6 +381,10 @@ func waitForFreshHeartbeat(ctx context.Context, workspaceID string, restartStart
 	return false
 }
 
+// restartContextSourceType is the source_type every restart-context snapshot
+// carries; the queue is searched by it (dropQueuedRestartContext).
+const restartContextSourceType = "self-restart-context"
+
 // buildRestartA2APayload wraps the rendered context string in the
 // JSON-RPC 2.0 / A2A message/send shape that the proxy already knows
 // how to normalize. Returns the marshalled body ready for ProxyA2ARequest.
@@ -404,7 +408,7 @@ func buildRestartA2APayload(workspaceID, text string, wakeIdempotencyKey ...stri
 				// renders as a system notice, never a blue user bubble —
 				// required since the durable-enqueue path routes this
 				// through the ordinary ingest persist.
-				"source_type":     "self-restart-context",
+				"source_type":     restartContextSourceType,
 				"layer":           1,
 				"restart_context": true,
 			},
@@ -485,6 +489,12 @@ func (h *WorkspaceHandler) sendRestartContext(workspaceID string, data restartCo
 		return
 	}
 
+	// A snapshot an earlier restart left queued is stale once this one is
+	// delivered; left in place, the drain would hand it over afterwards.
+	if err := dropQueuedRestartContext(ctx, workspaceID); err != nil {
+		log.Printf("restart-context: dropping queued snapshots for %s failed: %v", workspaceID, err)
+	}
+
 	// "system:restart-context" prefix flags this as a trusted
 	// non-workspace caller — bypasses CanCommunicate and the
 	// caller-token check in a2a_proxy.go.
@@ -538,13 +548,28 @@ func (h *WorkspaceHandler) enqueueRestartContext(ctx context.Context, workspaceI
 	qCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer cancel()
 	expires := time.Now().Add(restartContextQueueTTL)
+
+	// At most one snapshot pending per workspace (core#5241). One still waiting
+	// is stale now and is replaced by this one; one being delivered right now is
+	// left to finish, and this one is not queued next to it. A failed read falls
+	// through to the keyed enqueue below.
+	if err := dropQueuedRestartContext(qCtx, workspaceID); err != nil {
+		log.Printf("restart-context: dropping queued snapshots for %s failed: %v", workspaceID, err)
+	}
+	if delivering, err := restartContextBeingDelivered(qCtx, workspaceID); err != nil {
+		log.Printf("restart-context: in-flight snapshot check for %s failed: %v", workspaceID, err)
+	} else if delivering {
+		log.Printf("restart-context: %s for %s — a snapshot is being delivered already; not queueing a second", why, workspaceID)
+		return
+	}
+
 	// Keyed per WORKSPACE, not per restart: rapid consecutive restarts (e.g.
 	// image-build failures then success) must collapse to ONE queued context
 	// snapshot — three restarts on 2026-07-19 delivered three stacked wake
-	// messages into the same session. EnqueueA2A's active-row conflict keeps
-	// the first pending snapshot; content staleness across a few minutes is
-	// harmless (the message is a generic "you restarted" nudge). The wake owner's
-	// key (when wired) is likewise per-workspace, so this dedup is unchanged.
+	// messages into the same session. The step above keeps the NEWEST one; the
+	// key's active-row conflict remains the backstop for two enqueues racing.
+	// The wake owner's key (when wired) is likewise per-workspace, so this
+	// dedup is unchanged.
 	idem := "restart-context-" + workspaceID
 	if key != "" {
 		idem = key
@@ -564,4 +589,35 @@ func (h *WorkspaceHandler) enqueueRestartContext(ctx context.Context, workspaceI
 	// delivered right after a successful enqueue). Uses the same detached qCtx.
 	h.markRestartWakeDelivered(qCtx, workspaceID, key)
 	log.Printf("restart-context: %s for %s — queued for heartbeat drain (ttl=%s)", why, workspaceID, restartContextQueueTTL)
+}
+
+// dropQueuedRestartContext drops every restart-context snapshot still waiting in
+// workspaceID's queue. It matches on source_type, not the idempotency key: a
+// snapshot the drain handed to a busy target is re-queued by enqueueBusyA2A
+// under its messageId, which the per-workspace key no longer collides with.
+func dropQueuedRestartContext(ctx context.Context, workspaceID string) error {
+	_, err := db.DB.ExecContext(ctx, `
+		UPDATE a2a_queue
+		   SET status = 'dropped',
+		       last_error = 'superseded: a newer restart-context snapshot replaced it'
+		 WHERE workspace_id = $1
+		   AND status = 'queued'
+		   AND body #>> '{params,message,metadata,source_type}' = $2`,
+		workspaceID, restartContextSourceType)
+	return err
+}
+
+// restartContextBeingDelivered reports whether the drain is handing a
+// restart-context snapshot to workspaceID right now.
+func restartContextBeingDelivered(ctx context.Context, workspaceID string) (bool, error) {
+	var delivering bool
+	err := db.DB.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM a2a_queue
+			 WHERE workspace_id = $1
+			   AND status = 'dispatched'
+			   AND body #>> '{params,message,metadata,source_type}' = $2
+		)`,
+		workspaceID, restartContextSourceType).Scan(&delivering)
+	return delivering, err
 }

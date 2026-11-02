@@ -53,6 +53,18 @@ type restartState struct {
 	// dropped so a probe firing during the EC2-pending window can't
 	// re-trigger a fresh full cycle on the just-launched instance.
 	restartStartedAt time.Time
+
+	// Crash-loop breaker (auto_restart_breaker.go): when the automatic
+	// restarts counted against it started, oldest first, and whether it has
+	// tripped. Only a manual restart clears either.
+	autoRestarts       []time.Time
+	autoRestartsHalted bool
+
+	// Post-restart queue hold (restart_queue_hold.go): when an automatic
+	// restart last stopped the container (zero = no hold), and the heartbeat
+	// at which the drain first saw its replacement ready (zero = not yet).
+	queueHeldSince      time.Time
+	queueReadyHeartbeat time.Time
 }
 
 // restartStates is a per-workspace map of *restartState. Each workspace gets
@@ -454,6 +466,9 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	// Capture restart-context data BEFORE provisionWorkspaceOpts flips
 	// last_heartbeat_at with the new session. Issue #19 Layer 1.
 	restartData := loadRestartContextData(ctx, id)
+
+	// The owner has taken over: automatic restarts get their full budget back.
+	resetAutoRestarts(id)
 
 	// Dispatch through the SoT restart dispatcher. RestartWorkspaceAutoOpts
 	// owns "which backend for stop" + "which backend for provision" and
@@ -1017,15 +1032,15 @@ func (h *WorkspaceHandler) RestartByID(workspaceID string) {
 //
 // It intentionally bypasses RestartByID's self-fire debounce while preserving
 // coalescing and the provision gate. Probe/reactive callers must keep using
-// RestartByID so container-health self-fire loops still drop inside the
-// debounce window.
+// the debounced path (AutoRestartByID) so container-health self-fire loops
+// still drop inside the debounce window.
 func (h *WorkspaceHandler) RestartByIDAfterMutation(workspaceID string) {
 	h.restartByID(workspaceID, false)
 }
 
 func (h *WorkspaceHandler) restartByID(workspaceID string, useSelfFireDebounce bool) {
 	restartByIDWithCycle(workspaceID, h.HasProvisioner(), useSelfFireDebounce, func() {
-		h.runRestartCycle(workspaceID)
+		h.runRestartCycle(workspaceID, "")
 	})
 }
 
@@ -1523,7 +1538,10 @@ func (h *WorkspaceHandler) workspaceIsRunning(ctx context.Context, workspaceID s
 // closes the second class of race (manual + programmatic, or two
 // distinct programmatic entry points firing near-simultaneously) that
 // the pending-flag didn't cover.
-func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
+//
+// autoTrigger is non-empty when this cycle is an automatic crash-recovery
+// restart (AutoRestartByID); only those count against the crash-loop breaker.
+func (h *WorkspaceHandler) runRestartCycle(workspaceID, autoTrigger string) {
 	ctx := context.Background()
 
 	// Per-workspace restart/provision gate. The same gate is acquired
@@ -1589,6 +1607,13 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 		}
 	}
 
+	// Counted only here, past every filter above, so a restart that was going
+	// to be skipped (external, dormant, paused parent, warming) never counts.
+	if autoTrigger != "" && autoRestartBudget(workspaceID, time.Now(), true) {
+		h.haltAutoRestarts(workspaceID, autoTrigger)
+		return
+	}
+
 	// If still provisioning, brief wait so container exists for Stop()
 	if status == "provisioning" {
 		log.Printf("Auto-restart: interrupting provisioning for %s (%s)", wsName, workspaceID)
@@ -1628,6 +1653,13 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 			wsName, workspaceID, dbRuntime, dbTemplate)
 		h.markRestartDeclined(ctx, workspaceID, wsName, dbRuntime, dbTemplate)
 		return
+	}
+
+	// An automatic restart replaces a container that failed by itself, and the
+	// replacement may fail the same way: queued turns wait until it has stayed
+	// up (restart_queue_hold.go).
+	if autoTrigger != "" {
+		armRestartQueueHold(workspaceID)
 	}
 
 	if _, err := db.DB.ExecContext(ctx,
@@ -1913,8 +1945,8 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 		// to be online, which is exactly what the liveness/health sweeps hunt.
 		// StartHealthSweep and StartLivenessMonitor (neither gated on prov, so
 		// both run in CP/SaaS) and StartCPInstanceReconciler all call
-		// onWorkspaceOffline, which ends in `go wh.RestartByID(workspaceID)` —
-		// and RestartByID's dormant-state guard skips 'paused'/'hibernated' but
+		// onWorkspaceOffline, which ends in `go wh.AutoRestartByID(...)` — and
+		// the restart cycle's dormant-state guard skips 'paused'/'hibernated' but
 		// NOT 'online', so it proceeds. The platform therefore AUTO-REPROVISIONS
 		// the workspace within a sweep interval. The user asked for a pause and
 		// gets a running workspace back; that is a self-healing outcome rather
