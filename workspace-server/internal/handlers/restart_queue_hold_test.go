@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -174,14 +175,7 @@ func runRestartThroughStop(t *testing.T, wsID string, restart func(h *WorkspaceH
 	h := NewWorkspaceHandler(&capturingEmitter{}, nil, "http://localhost:8080", t.TempDir())
 	h.provisioner = stub
 	waitForHandlerAsyncBeforeDBCleanup(t, h)
-
-	mock.ExpectQuery(`SELECT name, status, tier, COALESCE\(runtime, 'claude-code'\)`).
-		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"name", "status", "tier", "runtime", "template", "kind"}).
-			AddRow("Crashy", "offline", 1, "hermes", "", "workspace"))
-	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id =`).
-		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+	expectRestartableRow(mock, wsID, "offline")
 
 	restart(h)
 	h.waitAsyncForTest()
@@ -225,6 +219,45 @@ func TestResetAutoRestarts_DropsTheQueueHold(t *testing.T) {
 
 	if heldSince := holdArmedAt(wsID); !heldSince.IsZero() {
 		t.Fatal("a manual restart left the automatic restart's queue hold in place")
+	}
+}
+
+// After an automatic restart the restart-context snapshot waits in the held
+// queue with everything else, instead of being pushed into the new container
+// the moment it reports online.
+func TestSendRestartContext_QueuesTheSnapshotWhileTheQueueIsHeld(t *testing.T) {
+	const wsID = "hold-restart-context"
+	isolateRestartState(t, wsID)
+	mock := setupTestDB(t)
+	logs := captureLog(t)
+	armRestartQueueHold(wsID)
+	wantKey := "restart-context-" + wsID
+
+	mock.ExpectExec(dropQueuedRestartContextSQL).
+		WithArgs(wsID, restartContextSourceType).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(restartContextDeliveringSQL).
+		WithArgs(wsID, restartContextSourceType).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("UPDATE a2a_queue").
+		WithArgs(wsID, wantKey).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("INSERT INTO a2a_queue").
+		WithArgs(wsID, nil, 90, sqlmock.AnyArg(), "message/send", wantKey, sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("q-held"))
+	mock.ExpectQuery("SELECT COUNT").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	h := &WorkspaceHandler{}
+	h.sendRestartContext(wsID, restartContextData{RestartAt: time.Now()})
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("the snapshot was not queued: %v", err)
+	}
+	// Without the hold check the snapshot is queued too — but only after the
+	// 30s online wait times out, and with that reason.
+	if !strings.Contains(logs.String(), "post-restart queue hold") {
+		t.Fatalf("the snapshot did not wait for the held queue; log:\n%s", logs.String())
 	}
 }
 

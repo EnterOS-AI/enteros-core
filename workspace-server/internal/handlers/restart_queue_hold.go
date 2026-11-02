@@ -14,10 +14,11 @@ package handlers
 //
 // Only an automatic restart arms the hold (runRestartCycle, once the failed
 // container has been stopped): that is the restart whose replacement has a
-// reason to fail again. Manual and mutation restarts, first boots and wakes —
-// and every drain that is not inside a hold — keep the existing behaviour,
-// settling ceiling included. A manual restart also drops a hold an automatic
-// one left behind (resetAutoRestarts).
+// reason to fail again. Its restart-context snapshot waits in the held queue
+// too, instead of being pushed (sendRestartContext). Manual and mutation
+// restarts, first boots and wakes — and every drain that is not inside a hold —
+// keep the existing behaviour, settling ceiling included. A deliberate recovery
+// also drops a hold an automatic restart left behind (resetAutoRestarts).
 
 import (
 	"context"
@@ -49,6 +50,19 @@ func armRestartQueueHold(workspaceID string) {
 	state.queueHeldSince = time.Now()
 	state.queueReadyHeartbeat = time.Time{}
 	state.mu.Unlock()
+}
+
+// restartQueueHeld reports whether workspaceID's queue is held for the container
+// its last automatic restart brought up.
+func restartQueueHeld(workspaceID string) bool {
+	sv, ok := restartStates.Load(workspaceID)
+	if !ok {
+		return false
+	}
+	state := sv.(*restartState)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return !state.queueHeldSince.IsZero()
 }
 
 // holdQueueAfterRestart reports whether the drain must leave workspaceID's

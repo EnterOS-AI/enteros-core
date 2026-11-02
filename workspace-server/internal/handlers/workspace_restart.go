@@ -55,8 +55,8 @@ type restartState struct {
 	restartStartedAt time.Time
 
 	// Crash-loop breaker (auto_restart_breaker.go): when the automatic
-	// restarts counted against it started, oldest first, and whether it has
-	// tripped. Only a manual restart clears either.
+	// restarts counted against it stopped the container, oldest first, and
+	// whether it has tripped. Only resetAutoRestarts clears either.
 	autoRestarts       []time.Time
 	autoRestartsHalted bool
 
@@ -1607,9 +1607,10 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID, autoTrigger string) {
 		}
 	}
 
-	// Counted only here, past every filter above, so a restart that was going
-	// to be skipped (external, dormant, paused parent, warming) never counts.
-	if autoTrigger != "" && autoRestartBudget(workspaceID, time.Now(), true) {
+	// Checked past every filter above, so a restart that was going to be
+	// skipped (external, dormant, paused parent, warming) never trips it, and
+	// before anything below touches the container.
+	if autoTrigger != "" && autoRestartHalted(workspaceID, time.Now()) {
 		h.haltAutoRestarts(workspaceID, autoTrigger)
 		return
 	}
@@ -1655,10 +1656,12 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID, autoTrigger string) {
 		return
 	}
 
-	// An automatic restart replaces a container that failed by itself, and the
-	// replacement may fail the same way: queued turns wait until it has stayed
-	// up (restart_queue_hold.go).
+	// An automatic restart counts against the crash-loop breaker only now that
+	// it has stopped the failed container — a declined one, above, left it as
+	// it was. Its replacement may fail the same way, so queued turns wait until
+	// it has stayed up (restart_queue_hold.go).
 	if autoTrigger != "" {
+		recordAutoRestart(workspaceID, time.Now())
 		armRestartQueueHold(workspaceID)
 	}
 
@@ -2274,6 +2277,7 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 		// telling them the canvas may be stale, not a 500 implying nothing
 		// happened.
 		resumedCount++
+		resetAutoRestarts(ws.id) // a deliberate recovery: full automatic-restart budget again
 		if err := h.broadcaster.RecordAndBroadcast(opCtx, string(events.EventWorkspaceProvisioning), ws.id, map[string]interface{}{
 			"name": ws.name, "tier": ws.tier, "runtime": ws.runtime, "template": ws.template,
 		}); err != nil {

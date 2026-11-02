@@ -6,6 +6,7 @@ package handlers
 // no limit on how often an automatic path may restart the same workspace.
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -42,10 +43,26 @@ func fillAutoRestarts(t *testing.T, wsID string, n int) {
 	t.Helper()
 	now := time.Now()
 	for i := 0; i < n; i++ {
-		if autoRestartBudget(wsID, now.Add(-time.Duration(n-i)*time.Minute), true) {
-			t.Fatalf("setup: automatic restart %d of %d was refused", i+1, n)
-		}
+		recordAutoRestart(wsID, now.Add(-time.Duration(n-i)*time.Minute))
 	}
+}
+
+// tripBreaker fills wsID's window and lets the breaker trip on it.
+func tripBreaker(t *testing.T, wsID string) {
+	t.Helper()
+	fillAutoRestarts(t, wsID, autoRestartLimit)
+	if !autoRestartHalted(wsID, time.Now()) {
+		t.Fatal("setup: the breaker should have tripped")
+	}
+}
+
+// setRestartStartedAt moves the self-fire debounce's clock for wsID.
+func setRestartStartedAt(wsID string, at time.Time) {
+	sv, _ := restartStates.LoadOrStore(wsID, &restartState{})
+	state := sv.(*restartState)
+	state.mu.Lock()
+	state.restartStartedAt = at
+	state.mu.Unlock()
 }
 
 func isolateRestartState(t *testing.T, wsID string) {
@@ -54,36 +71,50 @@ func isolateRestartState(t *testing.T, wsID string) {
 	t.Cleanup(func() { resetRestartStatesFor(wsID) })
 }
 
-func TestAutoRestartBudget_TripsAtTheLimitAndStaysTrippedUntilReset(t *testing.T) {
+// expectRestartableRow mocks the restart cycle's lookup of a crashed workspace
+// and its parent check, the two reads every cycle makes before it acts.
+func expectRestartableRow(mock sqlmock.Sqlmock, wsID, status string) {
+	mock.ExpectQuery(`SELECT name, status, tier, COALESCE\(runtime, 'claude-code'\)`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "status", "tier", "runtime", "template", "kind"}).
+			AddRow("Crashy", status, 1, "hermes", "", "workspace"))
+	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id =`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+}
+
+func TestAutoRestartHalted_TripsAtTheLimitAndStaysTrippedUntilReset(t *testing.T) {
 	const wsID = "crash-loop-budget"
 	isolateRestartState(t, wsID)
 
 	t0 := time.Now()
 	for i := 0; i < autoRestartLimit; i++ {
-		if autoRestartBudget(wsID, t0.Add(time.Duration(i)*5*time.Minute), true) {
+		at := t0.Add(time.Duration(i) * 5 * time.Minute)
+		if autoRestartHalted(wsID, at) {
 			t.Fatalf("automatic restart %d of %d was refused", i+1, autoRestartLimit)
 		}
+		recordAutoRestart(wsID, at)
 	}
-	if !autoRestartBudget(wsID, t0.Add(15*time.Minute), false) {
+	if !autoRestartHalted(wsID, t0.Add(15*time.Minute)) {
 		t.Fatalf("a restart after %d automatic restarts within %s was allowed", autoRestartLimit, autoRestartWindow)
 	}
 	// Time alone must not re-arm automatic restarts: the counted restarts have
 	// aged out of the window here, and the workspace is still the one that kept
 	// dying.
-	if !autoRestartBudget(wsID, t0.Add(3*autoRestartWindow), true) {
-		t.Fatal("the breaker released on its own; only a manual restart may reset it")
+	if !autoRestartHalted(wsID, t0.Add(3*autoRestartWindow)) {
+		t.Fatal("the breaker released on its own; only a deliberate recovery may reset it")
 	}
 
 	resetAutoRestarts(wsID)
 	if n, halted := breakerState(wsID); n != 0 || halted {
 		t.Fatalf("after reset: %d counted restarts, halted=%v; want 0, false", n, halted)
 	}
-	if autoRestartBudget(wsID, t0.Add(3*autoRestartWindow), true) {
-		t.Fatal("the first automatic restart after a manual reset was refused")
+	if autoRestartHalted(wsID, t0.Add(3*autoRestartWindow)) {
+		t.Fatal("the first automatic restart after a reset was refused")
 	}
 }
 
-func TestAutoRestartBudget_RestartsOutsideTheWindowDoNotCount(t *testing.T) {
+func TestAutoRestartHalted_RestartsOutsideTheWindowDoNotCount(t *testing.T) {
 	const wsID = "crash-loop-window"
 	isolateRestartState(t, wsID)
 
@@ -99,19 +130,24 @@ func TestAutoRestartBudget_RestartsOutsideTheWindowDoNotCount(t *testing.T) {
 		{33 * time.Minute, true},
 	}
 	for _, s := range steps {
-		if got := autoRestartBudget(wsID, t0.Add(s.at), true); got != s.refused {
+		at := t0.Add(s.at)
+		got := autoRestartHalted(wsID, at)
+		if got != s.refused {
 			t.Fatalf("automatic restart at t+%s: refused=%v, want %v", s.at, got, s.refused)
+		}
+		if !got {
+			recordAutoRestart(wsID, at)
 		}
 	}
 }
 
-func TestAutoRestartBudget_CheckingDoesNotCount(t *testing.T) {
+func TestAutoRestartHalted_CheckingDoesNotCount(t *testing.T) {
 	const wsID = "crash-loop-check-only"
 	isolateRestartState(t, wsID)
 
 	now := time.Now()
 	for i := 0; i < 2*autoRestartLimit; i++ {
-		if autoRestartBudget(wsID, now, false) {
+		if autoRestartHalted(wsID, now) {
 			t.Fatalf("check %d refused a workspace that has never been restarted", i+1)
 		}
 	}
@@ -202,41 +238,88 @@ func TestAutoRestartByID_AlreadyFailedIsNotAnnouncedAgain(t *testing.T) {
 	}
 }
 
-// One death, several probes: the first starts a cycle, the rest land in its
-// self-fire debounce. Only the cycle counts — and it counts even though the
-// restart then declined (pinned image unavailable), because it did reach the
-// point of acting on the container.
-func TestAutoRestartByID_CountsTheCycleNotTheProbes(t *testing.T) {
-	const wsID = "crash-loop-count"
+// A probe the self-fire debounce is about to drop reports the restart already
+// under way. With the window full it must still not trip the breaker — that
+// would fail and latch a workspace whose latest replacement may be healthy.
+func TestAutoRestartByID_ProbeInsideTheDebounceDoesNotTripTheBreaker(t *testing.T) {
+	const wsID = "crash-loop-debounced-probe"
+	isolateRestartState(t, wsID)
+	_ = setupTestDB(t)
+	emitter := &capturingEmitter{}
+	h := NewWorkspaceHandler(emitter, nil, "http://localhost:8080", t.TempDir())
+	h.provisioner = &preflightLocalProv{}
+	fillAutoRestarts(t, wsID, autoRestartLimit)
+	setRestartStartedAt(wsID, time.Now()) // the third restart's cycle just started
+
+	h.AutoRestartByID(wsID, "a2a-dead-container")
+
+	if _, halted := breakerState(wsID); halted {
+		t.Fatal("a probe the debounce dropped tripped the breaker")
+	}
+	if len(emitter.events) != 0 {
+		t.Fatalf("a dropped probe produced events: %+v", emitter.events)
+	}
+}
+
+// The incident the reviewer described: the pod is down and the image check
+// fails for a few minutes, so every automatic restart declines before it
+// stops anything. None of those may count — the next automatic restart after
+// the outage must still run.
+func TestAutoRestartByID_DeclinedRestartsDoNotCount(t *testing.T) {
+	const wsID = "crash-loop-declined"
 	isolateRestartState(t, wsID)
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	stub := &prewarmCPProv{ensureErr: fmt.Errorf("%w: test", provisioner.ErrEnsureImagePermanent)}
-	h := NewWorkspaceHandler(&capturingEmitter{}, nil, "http://localhost:8080", t.TempDir())
+	emitter := &capturingEmitter{}
+	h := NewWorkspaceHandler(emitter, nil, "http://localhost:8080", t.TempDir())
 	h.SetCPProvisioner(stub)
 	waitForHandlerAsyncBeforeDBCleanup(t, h)
 
-	mock.ExpectQuery(`SELECT name, status, tier, COALESCE\(runtime, 'claude-code'\)`).
-		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"name", "status", "tier", "runtime", "template", "kind"}).
-			AddRow("Crashy", "offline", 1, "hermes", "", "workspace"))
-	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id =`).
-		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
-
-	for i := 0; i < 3; i++ {
-		h.AutoRestartByID(wsID, "a2a-dead-container")
+	const attempts = autoRestartLimit + 1
+	for i := 0; i < attempts; i++ {
+		expectRestartableRow(mock, wsID, "offline")
+		setRestartStartedAt(wsID, time.Time{}) // minutes apart, outside the self-fire debounce
+		h.AutoRestartByID(wsID, "cp-instance-reconciler")
+		h.waitAsyncForTest()
 	}
-	h.waitAsyncForTest()
 
-	if n, halted := breakerState(wsID); n != 1 || halted {
-		t.Fatalf("counted %d automatic restarts (halted=%v) for one cycle; want 1, false", n, halted)
+	if n, halted := breakerState(wsID); n != 0 || halted {
+		t.Fatalf("declined restarts counted: %d counted, halted=%v; want 0, false", n, halted)
 	}
-	if len(stub.calls) != 1 || stub.calls[0] != "EnsureImage" {
-		t.Fatalf("CP calls = %v; want exactly one restart cycle, declined before any stop", stub.calls)
+	if len(stub.calls) != attempts {
+		t.Fatalf("CP calls = %v; want %d declined restart cycles, the last one not refused", stub.calls, attempts)
+	}
+	for _, c := range stub.calls {
+		if c != "EnsureImage" {
+			t.Fatalf("a declined restart touched the container: CP calls %v", stub.calls)
+		}
+	}
+	for _, ev := range emitter.events {
+		if p, _ := ev.payload.(map[string]interface{}); p["source"] == "auto_restart_crash_loop" {
+			t.Fatalf("the breaker failed a workspace whose restarts were only ever declined: %+v", ev)
+		}
+	}
+	if !holdArmedAt(wsID).IsZero() {
+		t.Fatal("a declined restart held the queue; the container it would hold for was never replaced")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet: %v", err)
+	}
+}
+
+// One death, several probes: the first starts a cycle that replaces the
+// container, the rest land in its self-fire debounce. That is one restart.
+func TestAutoRestartByID_CountsOneRestartPerReplacedContainer(t *testing.T) {
+	const wsID = "crash-loop-count"
+	isolateRestartState(t, wsID)
+	runRestartThroughStop(t, wsID, func(h *WorkspaceHandler) {
+		for i := 0; i < 3; i++ {
+			h.AutoRestartByID(wsID, "a2a-dead-container")
+		}
+	})
+	if n, halted := breakerState(wsID); n != 1 || halted {
+		t.Fatalf("counted %d automatic restarts (halted=%v) for one replaced container; want 1, false", n, halted)
 	}
 }
 
@@ -259,7 +342,7 @@ func TestRunRestartCycle_SkippedRestartNeverReachesTheBreaker(t *testing.T) {
 	h.runRestartCycle(wsID, "liveness-monitor")
 
 	if _, halted := breakerState(wsID); halted {
-		t.Fatal("a restart the cycle skips was counted against the breaker")
+		t.Fatal("a restart the cycle skips reached the breaker")
 	}
 	if len(emitter.events) != 0 {
 		t.Fatalf("a skipped restart produced events: %+v", emitter.events)
@@ -277,26 +360,19 @@ func TestRunRestartCycle_FullWindowHaltsBeforeTouchingTheContainer(t *testing.T)
 	isolateRestartState(t, wsID)
 	mock := setupTestDB(t)
 	emitter := &capturingEmitter{}
-	stub := &preflightLocalProv{} // Stop panics: reaching it fails the test
 	h := NewWorkspaceHandler(emitter, nil, "http://localhost:8080", t.TempDir())
-	h.provisioner = stub
+	h.provisioner = &preflightLocalProv{} // Stop panics: reaching it fails the test
 	fillAutoRestarts(t, wsID, autoRestartLimit)
 
-	mock.ExpectQuery(`SELECT name, status, tier, COALESCE\(runtime, 'claude-code'\)`).
-		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"name", "status", "tier", "runtime", "template", "kind"}).
-			AddRow("Crashy", "online", 1, "hermes", "", "workspace"))
-	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id =`).
-		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+	expectRestartableRow(mock, wsID, "online")
 	mock.ExpectExec(crashLoopFailSQL).
 		WithArgs(wsID, models.StatusFailed, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	h.runRestartCycle(wsID, "cp-instance-reconciler")
 
-	if _, halted := breakerState(wsID); !halted {
-		t.Fatal("the cycle ran a fourth automatic restart inside the window")
+	if n, halted := breakerState(wsID); !halted || n != autoRestartLimit {
+		t.Fatalf("after a refused fourth restart: %d counted, halted=%v; want %d, true", n, halted, autoRestartLimit)
 	}
 	if len(emitter.events) != 1 || emitter.events[0].eventType != string(events.EventWorkspaceProvisionFailed) {
 		t.Fatalf("events = %+v; want one %s", emitter.events, events.EventWorkspaceProvisionFailed)
@@ -317,10 +393,7 @@ func TestRestartHandler_ManualRestartResetsTheBreakerAndStillRuns(t *testing.T) 
 	h := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 	h.SetCPProvisioner(stub)
 	waitForHandlerAsyncBeforeDBCleanup(t, h)
-	fillAutoRestarts(t, wsID, autoRestartLimit)
-	if !autoRestartBudget(wsID, time.Now(), false) {
-		t.Fatal("setup: the breaker should have tripped")
-	}
+	tripBreaker(t, wsID)
 
 	mock.ExpectQuery("SELECT status, name, tier, COALESCE").
 		WithArgs(wsID).
@@ -355,10 +428,7 @@ func TestAdminRestart_ResetsTheBreaker(t *testing.T) {
 	const wsID = "crash-loop-admin"
 	isolateRestartState(t, wsID)
 	h, mock := setupBootstrapHandler(t)
-	fillAutoRestarts(t, wsID, autoRestartLimit)
-	if !autoRestartBudget(wsID, time.Now(), false) {
-		t.Fatal("setup: the breaker should have tripped")
-	}
+	tripBreaker(t, wsID)
 
 	mock.ExpectQuery(`SELECT 1 FROM workspaces WHERE id = \$1`).
 		WithArgs(wsID).
@@ -376,5 +446,82 @@ func TestAdminRestart_ResetsTheBreaker(t *testing.T) {
 	}
 	if n, halted := breakerState(wsID); n != 0 || halted {
 		t.Fatalf("after an admin restart: %d counted restarts, halted=%v; want 0, false", n, halted)
+	}
+}
+
+// The concierge repair button is the other deliberate recovery of a
+// workspace the breaker gave up on.
+func TestTriggerPlatformProvision_ResetsTheBreaker(t *testing.T) {
+	const wsID = "crash-loop-concierge-repair"
+	isolateRestartState(t, wsID)
+	h := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	var provisioned []string
+	h.provisionTriggerOverride = func(id string) { provisioned = append(provisioned, id) }
+	tripBreaker(t, wsID)
+
+	h.triggerPlatformProvision(wsID)
+
+	if n, halted := breakerState(wsID); n != 0 || halted {
+		t.Fatalf("after a concierge repair: %d counted restarts, halted=%v; want 0, false", n, halted)
+	}
+	if len(provisioned) != 1 || provisioned[0] != wsID {
+		t.Fatalf("the repair did not provision the concierge: %v", provisioned)
+	}
+}
+
+// So is resuming a paused workspace.
+func TestResumeHandler_ResetsTheBreaker(t *testing.T) {
+	const wsID = "crash-loop-resume"
+	isolateRestartState(t, wsID)
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	h := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	h.SetCPProvisioner(&fakeCPProv{})
+	waitForHandlerAsyncBeforeDBCleanup(t, h)
+	tripBreaker(t, wsID)
+
+	mock.ExpectQuery("SELECT name, tier, COALESCE").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "tier", "runtime", "template"}).
+			AddRow("Crashy", 1, "hermes", ""))
+	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}))
+	mock.ExpectQuery("WITH RECURSIVE descendants").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "tier", "runtime", "template"}))
+	mock.ExpectExec(resumeClaimSQL).
+		WithArgs(models.StatusProvisioning, wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WithArgs(string(events.EventWorkspaceProvisioning), wsID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT COALESCE\(compute`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow("{}"))
+	mock.ExpectQuery(`SELECT COALESCE\(template`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"template"}).AddRow(""))
+	// The async provision that follows is incidental here and left unmocked.
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodPost, "/workspaces/"+wsID+"/resume", nil)
+	h.Resume(c)
+	h.waitAsyncForTest()
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("resume answered %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil || resp["resumed_count"] != float64(1) {
+		t.Fatalf("resume response = %s; want resumed_count 1", w.Body.String())
+	}
+	if n, halted := breakerState(wsID); n != 0 || halted {
+		t.Fatalf("after a resume: %d counted restarts, halted=%v; want 0, false", n, halted)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
 	}
 }

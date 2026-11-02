@@ -447,6 +447,14 @@ func (h *WorkspaceHandler) sendRestartContext(workspaceID string, data restartCo
 	ctx, cancel := context.WithTimeout(context.Background(), restartContextOnlineTimeout+30*time.Second)
 	defer cancel()
 
+	// After an automatic restart the queue is held until the new container has
+	// stayed up (restart_queue_hold.go). The snapshot waits in it, first in line,
+	// rather than being pushed into a container that may not.
+	if restartQueueHeld(workspaceID) {
+		h.enqueueRestartContext(ctx, workspaceID, data, "post-restart queue hold", wakeKey)
+		return
+	}
+
 	if !waitForWorkspaceOnline(ctx, workspaceID, restartContextOnlineTimeout) {
 		// Do NOT drop: a first boot that builds a runtime image takes many
 		// minutes (10m+ observed), far past any reasonable inline wait, and a

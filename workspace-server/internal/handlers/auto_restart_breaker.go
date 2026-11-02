@@ -11,8 +11,12 @@ package handlers
 // lasted. After autoRestartLimit automatic restarts inside autoRestartWindow
 // the breaker trips: the workspace is marked failed with the reason, which the
 // canvas shows on the node and in its Events tab, and no automatic path
-// restarts it again until it is restarted by hand (Restart / AdminRestart reset
-// the breaker).
+// restarts it again until someone acts on it (resetAutoRestarts).
+//
+// Only a restart that stopped the failed container counts. One declined at the
+// pinned-image check left the container as it was; counting it would let a few
+// minutes of image outage trip the breaker, and keep the workspace down after
+// the image is back.
 //
 // The count and the trip live in process memory, on restartState, next to the
 // debounce and coalescing state they extend. The verdict is durable — status
@@ -50,7 +54,9 @@ func (h *WorkspaceHandler) AutoRestartByID(workspaceID, trigger string) {
 	if !h.HasProvisioner() {
 		return
 	}
-	if autoRestartBudget(workspaceID, time.Now(), false) {
+	// A probe inside the self-fire debounce reports a restart that is already
+	// under way: RestartByID drops it, so it must not trip the breaker either.
+	if !shouldDebounceRestart(workspaceID) && autoRestartHalted(workspaceID, time.Now()) {
 		h.haltAutoRestarts(workspaceID, trigger)
 		return
 	}
@@ -73,11 +79,10 @@ func autoRestartCycle(trigger string, run func(autoTrigger string)) func() {
 	}
 }
 
-// autoRestartBudget reports whether the breaker has halted automatic restarts
-// of workspaceID, tripping it once autoRestartLimit of them started inside
-// autoRestartWindow. With count set, a restart it lets through is recorded —
-// runRestartCycle counts, once the restart is past its own skip checks.
-func autoRestartBudget(workspaceID string, now time.Time, count bool) (halted bool) {
+// autoRestartHalted reports whether the breaker refuses an automatic restart of
+// workspaceID, tripping it once autoRestartLimit restarts were counted inside
+// autoRestartWindow.
+func autoRestartHalted(workspaceID string, now time.Time) bool {
 	sv, _ := restartStates.LoadOrStore(workspaceID, &restartState{})
 	state := sv.(*restartState)
 	state.mu.Lock()
@@ -90,19 +95,32 @@ func autoRestartBudget(workspaceID string, now time.Time, count bool) (halted bo
 		}
 	}
 	state.autoRestarts = recent
-	if state.autoRestartsHalted || len(recent) >= autoRestartLimit {
+	if len(recent) >= autoRestartLimit {
 		state.autoRestartsHalted = true
-		return true
 	}
-	if count {
-		state.autoRestarts = append(state.autoRestarts, now)
-	}
-	return false
+	return state.autoRestartsHalted
+}
+
+// recordAutoRestart counts an automatic restart that has stopped the failed
+// container. It never refuses: the container is already gone, and refusing
+// now would leave the workspace with none.
+func recordAutoRestart(workspaceID string, now time.Time) {
+	sv, _ := restartStates.LoadOrStore(workspaceID, &restartState{})
+	state := sv.(*restartState)
+	state.mu.Lock()
+	state.autoRestarts = append(state.autoRestarts, now)
+	state.mu.Unlock()
 }
 
 // resetAutoRestarts puts a workspace back to how a manual restart behaved before
 // any automatic one: the full automatic-restart budget, and no queue hold left
 // over from the last automatic restart.
+//
+// Only deliberate operator recoveries call it: Restart, AdminRestart, Resume and
+// the concierge repair button. Restarts the platform issues for other reasons —
+// plugin reconcile on every transition to online, file and secret writes an
+// agent can make, Wake on an incoming message — leave it alone: one of those on
+// every boot would otherwise keep a crash loop from ever tripping it.
 func resetAutoRestarts(workspaceID string) {
 	sv, ok := restartStates.Load(workspaceID)
 	if !ok {
