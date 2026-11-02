@@ -267,15 +267,16 @@ pv_provision_mode() {
 # (equivalently `docker buildx imagetools inspect ...:latest`, the template repo's
 #  Build&push `pushed ...@sha256:...` log line, or a registry v2 manifest HEAD).
 # Each pin is overridable via WORKSPACE_TEMPLATE_<RT>_REF (RT upper, '-'→'_').
-#   hermes      = runtime 0.4.31 / mcp-server 1.9.3 (sha-4dad193) — UNCHANGED;
-#                 the happy-path's input, do NOT retag it on this task.
+#   hermes      = runtime 0.4.94 / mcp-server 1.9.6 (template main cd04575),
+#                 re-pinned 2026-11-02: the sha-4dad193 digest (runtime 0.4.31)
+#                 now returns 404 from the registry, so every run failed its pull.
 #   openclaw    = workspace-template-openclaw:latest resolved 2026-07-20.
 #   claude-code = workspace-template-claude-code:latest resolved 2026-07-20.
 resolve_template_ref() {
   local rt="$1"
   local registry="${MOLECULE_IMAGE_REGISTRY:-registry.moleculesai.app/molecule-ai}"
   case "$rt" in
-    hermes)      printf '%s' "${WORKSPACE_TEMPLATE_HERMES_REF:-${registry}/workspace-template-hermes@sha256:8aab6b48f2af15c3dd1056a5d1f5e7a61fb9a8a66aa7aca5b51cf2d2702215f9}" ;;
+    hermes)      printf '%s' "${WORKSPACE_TEMPLATE_HERMES_REF:-${registry}/workspace-template-hermes@sha256:3f4681d880b3ee9a1d3e78e0a668609452ab15fa3e4a2c4e635a2b70be16715d}" ;;
     openclaw)    printf '%s' "${WORKSPACE_TEMPLATE_OPENCLAW_REF:-${registry}/workspace-template-openclaw@sha256:24085f9895af728b7166f9f7908cf4a6b825a4c98abdeb0c1462daa8a5838715}" ;;
     claude-code) printf '%s' "${WORKSPACE_TEMPLATE_CLAUDE_CODE_REF:-${registry}/workspace-template-claude-code@sha256:50b8068739f35fd3c7404afe7b8336f5057285b12e73b69e62ccd5c6dcc6ddab}" ;;
     *)
@@ -562,8 +563,8 @@ run_scenario() {
   # E2E_SCHEDULER_CHECK and E2E_DIGEST_PLUGIN_CHECK default ON: the precondition
   # that used to keep steps 10d/10e dark — a provisioned runtime image without the
   # 0.4.9 bits — was verified CLEARED on 2026-07-16. The gate provisions the
-  # DIGEST-PINNED workspace-template-hermes @sha256:8aab6b48… (sha-4dad193 = runtime
-  # 0.4.31; see seed_workspace_image). That tree carries all four legs both steps
+  # DIGEST-PINNED workspace-template-hermes @sha256:3f4681d8… (cd04575 = runtime
+  # 0.4.94; see seed_workspace_image). That tree carries all four legs both steps
   # need: the kind:trigger scaffold, declared-plugin boot-install
   # (MOLECULE_DECLARED_PLUGINS), the digest-provider plugin loader, and the
   # vendored native-plugins registry TRUST source (runtime#310).
@@ -592,14 +593,14 @@ run_scenario() {
   # E2E_SELF_SCHEDULE_CHECK defaults ON (10f), like 10d/10e above — it is a native
   # plugin, gated by default. Step 10f deterministically drives the audience:self
   # create_schedule TOOL via a docker-exec self-mode mcp-server
-  # (@molecule-ai/mcp-server 1.9.3) and asserts it lands on the OWN grid + fires
+  # (@molecule-ai/mcp-server 1.9.6) and asserts it lands on the OWN grid + fires
   # (org-key/foreign-id neg controls). Its JOINED precondition was VERIFIED CLEARED
   # 2026-07-18 and is now DIGEST-PINNED (seed_workspace_image): the gate provisions
-  # workspace-template-hermes @sha256:8aab6b48… (sha-4dad193 = runtime 0.4.31), which
+  # workspace-template-hermes @sha256:3f4681d8… (cd04575 = runtime 0.4.94), which
   # carries runtime#328's self-audience injector (_inject_self_env) + #329 hardening
   # (force MOLECULE_WORKSPACE_TOKEN_FILE, inject WORKSPACE_ID) + #330/#333's prebake of
-  # mcp-server 1.9.3 (self-mode X-Molecule-Org-Id tenant routing) via
-  # scripts/prebake-mgmt-mcp.sh + platform_agent_identity.py PINNED_VERSION=1.9.3 /
+  # mcp-server 1.9.6 (self-mode X-Molecule-Org-Id tenant routing) via
+  # scripts/prebake-mgmt-mcp.sh + platform_agent_identity.py MANAGEMENT_MCP_PINNED_VERSION=1.9.6 /
   # COMPATIBLE_RANGE=^1.8.0, so `npx --prefer-offline` resolves offline in the
   # no-network gate. The injector fires on audience:self alone (the plugin's
   # runtimes:[claude_code] is not consulted on the render path), so the self entry
@@ -635,7 +636,7 @@ run_scenario() {
   E2E_DIGEST_PLUGIN_SOURCE="${E2E_DIGEST_PLUGIN_SOURCE:-gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0}" \
   E2E_SELF_SCHEDULE_CHECK="${E2E_SELF_SCHEDULE_CHECK:-on}" \
   E2E_SELF_SCHEDULE_PLUGIN_SOURCE="${E2E_SELF_SCHEDULE_PLUGIN_SOURCE:-gitea://molecule-ai/molecule-ai-plugin-schedule-self#v0.1.2}" \
-  E2E_SELF_SCHEDULE_MCP_SPEC="${E2E_SELF_SCHEDULE_MCP_SPEC:-@molecule-ai/mcp-server@1.9.3}" \
+  E2E_SELF_SCHEDULE_MCP_SPEC="${E2E_SELF_SCHEDULE_MCP_SPEC:-@molecule-ai/mcp-server@1.9.6}" \
     bash "$HERE/test_staging_full_saas.sh"
 }
 
