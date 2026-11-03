@@ -3873,7 +3873,8 @@ if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
   if [ "${E2E_SCHEDULER_CHECK:-}" != "on" ]; then
     fail "E2E_SELF_SCHEDULE_CHECK=on requires E2E_SCHEDULER_CHECK=on — the scheduler trigger daemon (10d) fires the self-created schedule. Enable both together."
   fi
-  _SS_TIMEOUT_SECS="${E2E_SELF_SCHEDULE_TIMEOUT_SECS:-360}"
+  # E2E_SELF_SCHEDULE_TIMEOUT_SECS overrides LEG B's fire BACKSTOP (10f.B.4),
+  # held to the same bar as E2E_SCHEDULER_TIMEOUT_SECS.
   _SS_POLL_SECS="${E2E_SELF_SCHEDULE_POLL_SECS:-10}"
   _SS_CAP_TIMEOUT_SECS="${E2E_SELF_SCHEDULE_CAP_TIMEOUT_SECS:-120}"
   _SS_CREATE_TIMEOUT_SECS="${E2E_SELF_SCHEDULE_CREATE_TIMEOUT_SECS:-120}"
@@ -4312,13 +4313,39 @@ print(rid)
     fi
 
     # ── 10f.B.4 the explicit-id self-created schedule FIRES (reuse 10d) ──
-    log "    LEG B: polling fire evidence for '$_SS_SN' for up to ${_SS_TIMEOUT_SECS}s (reuses 10d's log/history verification; poll=${_SS_POLL_SECS}s)."
-    if idle_digest_wait "$_SS_TIMEOUT_SECS" "$_SS_POLL_SECS" self_schedule_fire_probe "$_SS_SN"; then
-      ok "    LEG B: self-created schedule '$_SS_SN' autonomously FIRED (evidence: $_SS_FIRED)"
-    else
-      self_schedule_diagnostics
-      fail "LEG B: self-created schedule '$_SS_SN' never fired within ${_SS_TIMEOUT_SECS}s — it landed on the grid but the trigger daemon never delivered a self-scheduled turn (scheduler co-gate / trigger-lane leg)."
-    fi
+    # The same signal-driven wait as 10d and 10g, not a fixed 360s: the daemon
+    # delivers one schedule at a time and a delivery lasts as long as its turn,
+    # up to the per-turn cap, so a window under that cap can expire while
+    # another schedule's turn still holds the delivery worker (run 816408: no
+    # history entry for 5 minutes, while the parent made no LLM call and hermes
+    # still reported a live run).
+    _SS_STALE_SECS=$(e2e_scheduler_stale_secs "$_SS_POLL_SECS")
+    _SS_STALL_SECS=$(e2e_scheduler_stall_secs "$_SS_POLL_SECS") \
+      || fail "LEG B: the delivery-stall window could not be derived (the probe cron did not parse), so the wedged-delivery signal would be unarmed for this leg."
+    _SS_FIRE_OVERRIDE="${E2E_SELF_SCHEDULE_TIMEOUT_SECS:-${E2E_SCHEDULER_TIMEOUT_SECS:-}}"
+    _SS_BACKSTOP_SECS=$(e2e_scheduler_backstop_secs "$_SS_FIRE_OVERRIDE") \
+      || fail "$(scheduler_backstop_refusal E2E_SELF_SCHEDULE_TIMEOUT_SECS "$_SS_FIRE_OVERRIDE")"
+    log "    LEG B: waiting for '$_SS_SN' to fire — pass on fire evidence, FAIL FAST if ${_SS_SELF_CID}'s last_tick goes stale (>${_SS_STALE_SECS}s) or its attempt log stops advancing (>${_SS_STALL_SECS}s), backstop ${_SS_BACKSTOP_SECS}s (poll=${_SS_POLL_SECS}s; reuses 10d's log/history verification)."
+    _ss_fire_rc=0
+    trigger_daemon_wait "$_SS_SELF_CID" "$_SS_BACKSTOP_SECS" "$_SS_POLL_SECS" "$_SS_STALE_SECS" "$_SS_STALL_SECS" self_schedule_fire_probe "$_SS_SN" || _ss_fire_rc=$?
+    scheduler_progress_report "10f fire"
+    case "$_ss_fire_rc" in
+      0)
+        ok "    LEG B: self-created schedule '$_SS_SN' autonomously FIRED (evidence: $_SS_FIRED)"
+        ;;
+      2)
+        self_schedule_diagnostics
+        fail "LEG B: the trigger daemon on $_SS_SELF_CID STOPPED TICKING (last_tick ${TRIGGER_DAEMON_LAST_AGE:-unknown}s old, > ${_SS_STALE_SECS}s) while '$_SS_SN' sits on its own grid — the tick loop is wedged; waiting longer cannot help."
+        ;;
+      4)
+        self_schedule_diagnostics
+        fail "LEG B: the trigger daemon's DELIVERY LANE on $_SS_SELF_CID is wedged — it ticks (last_tick ${TRIGGER_DAEMON_LAST_AGE:-unknown}s old) but schedule-history.json gained no entry for ${TRIGGER_DAEMON_PROGRESS_AGE:-unknown}s (> ${_SS_STALL_SECS}s), longer than a delivery can last under the per-turn cap."
+        ;;
+      *)
+        self_schedule_diagnostics
+        fail "LEG B: self-created schedule '$_SS_SN' never fired within the ${_SS_BACKSTOP_SECS}s backstop while the daemon kept ticking and delivering — it landed on the grid but the trigger daemon never delivered a self-scheduled turn (scheduler co-gate / trigger-lane leg)."
+        ;;
+    esac
 
     # ── 10f.B.5 NEG CONTROL: FOREIGN workspace_id rejected + never arrives ──
     _SS_FWS="${CHILD_ID:-00000000-0000-4000-8000-0000000ff0f0}"

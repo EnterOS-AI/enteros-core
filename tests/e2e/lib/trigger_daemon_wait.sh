@@ -713,7 +713,7 @@ trigger_daemon_backstop_resolve() {
 # THE ONE BOUND THIS LEDGER DOES NOT MODEL is the CI job timeout, and it is
 # named here rather than left off the list, because "a bound nobody enumerated"
 # is how the 210 survived. `.gitea/workflows/e2e-ephemeral-happy-path.yml` sets
-# `timeout-minutes: 75` (4500s), which is the true outermost layer: if it were
+# `timeout-minutes: 100` (6000s), which is the true outermost layer: if it were
 # ever below the 1800s backstop, the backstop would be unreachable and every
 # derived number below it would be decoration.
 #
@@ -723,7 +723,7 @@ trigger_daemon_backstop_resolve() {
 #
 #   tests/e2e/ephemeral_cp_happy_path.sh   `bash "$HERE/test_staging_full_saas.sh"`
 #     — the ONE CI lane, run by .gitea/workflows/e2e-ephemeral-happy-path.yml
-#       at `timeout-minutes: 75`.
+#       at `timeout-minutes: 100`.
 #   tests/e2e/STAGING_SAAS_E2E.md          `bash tests/e2e/test_staging_full_saas.sh`
 #     — the manual runbook, run by a human at a terminal, with NO timeout at all.
 #
@@ -735,10 +735,13 @@ trigger_daemon_backstop_resolve() {
 # CI-vs-human, and it is a stronger reason.)
 #
 # The inequality that holds today: at most ONE backstop is reachable per run
-# (every leg `fail`s rather than continuing, so reaching a later backstop means
-# the earlier legs returned on their signal in seconds), so worst case is 1800s
-# of backstop inside 4500s of job. Anyone shortening `timeout-minutes` below ~2x
-# the backstop must revisit this.
+# (every leg `fail`s rather than continuing), so worst case is 1800s of backstop
+# inside 6000s of job. Legs that pass do not all pass in seconds any more: on the
+# hermes image since template-hermes #397 a tick that lands while the agent works
+# is dropped and a message waits out the turn ahead, so several legs can each
+# spend minutes on their signal in one run (816408: 10g delivered after 27 min).
+# That, not the backstop, is why the job budget moved from 75 to 100. Anyone
+# shortening `timeout-minutes` must revisit this.
 #
 # Read at the validated scheduler pin; the runtime constant is
 # molecule_runtime/turn_lease.py `_DEFAULT_IDLE_CAP_SECONDS`.
