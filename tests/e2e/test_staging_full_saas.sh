@@ -115,9 +115,10 @@
 #                                cap this lane injects with the scheduler check
 #                                (600s at defaults), plus the settle window, plus
 #                                two 90s turns = 910s; 310s without the scheduler
-#                                check. It bounds both the POST and the queue
-#                                poll in a2a_send_or_poll_queue, and is the
-#                                default of E2E_DELEG_A2A_TIMEOUT_SECS.
+#                                check. It bounds the POST, the queue poll and
+#                                the wait for a push-async reply (core#5245) in
+#                                a2a_send_or_poll_queue, and is the default of
+#                                E2E_DELEG_A2A_TIMEOUT_SECS.
 #   E2E_DELEG_A2A_TIMEOUT_SECS   per-attempt curl budget for the DELEGATION
 #                                A2A POST (section 10), default
 #                                E2E_A2A_BUSY_WAIT_SECS. `message/send` is
@@ -1777,11 +1778,73 @@ except Exception:
   printf '%s' "$txt" | grep -qiE "Interrupting current task|respond to your message shortly"
 }
 
+# The canvas cap-and-queue ack (core#5245). A canvas send whose reply outlives
+# the proxy's synchronous budget (a2a_proxy.go canvasA2ASyncBudget, 90 s) is
+# answered {"status":"queued","delivery_mode":"push-async"} with no queue_id:
+# nothing to poll in the A2A queue, the dispatch finishes detached. That is
+# what a send gets when it reaches the hermes executor mid-turn (it holds the
+# message until the turn ahead has ended) without the platform having queued
+# it first.
+a2a_is_push_async_ack() {
+  printf '%s' "$1" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(d,dict) and d.get('delivery_mode')=='push-async' and not d.get('queue_id') else 1)" 2>/dev/null
+}
+
+# One look for the reply to a push-async send. The detached dispatch ends in
+# logA2ASuccess, which stamps the agent's JSON-RPC reply onto the message's
+# a2a_receive row (the row the ingest wrote when the send arrived, upserted on
+# messageId) before it broadcasts the reply. The update leaves the row where
+# the ingest put it, under everything the turn ahead logged since, so the look
+# is by type with a wide limit. A row with this messageId and no reply yet (the
+# ingest, or an earlier attempt that failed) is not an answer. Prints the reply
+# and returns 0 once it is there; returns 1 while it is not.
+a2a_push_async_reply() {
+  local ws_id="$1" mid="$2" tmp code found=1
+  tmp=$(mktemp -t a2a_push.XXXXXX)
+  code=$(tenant_call GET "/workspaces/$ws_id/activity?type=a2a_receive&limit=200" \
+    --max-time 30 -o "$tmp" -w '%{http_code}' 2>/dev/null) || code=000
+  if echo "$code" | grep -Eq '^2[0-9][0-9]$'; then
+    if MID="$mid" python3 -c '
+import json, os, sys
+mid = os.environ["MID"]
+try:
+    rows = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+if isinstance(rows, dict):
+    rows = rows.get("events", [])
+for r in (rows if isinstance(rows, list) else []):
+    if not isinstance(r, dict) or r.get("activity_type") != "a2a_receive":
+        continue
+    req = r.get("request_body")
+    params = req.get("params") if isinstance(req, dict) else None
+    msg = params.get("message") if isinstance(params, dict) else None
+    if not isinstance(msg, dict) or msg.get("messageId") != mid:
+        continue
+    rb = r.get("response_body")
+    if isinstance(rb, dict) and ("result" in rb or "error" in rb):
+        print(json.dumps(rb))
+        sys.exit(0)
+sys.exit(1)
+' "$tmp"; then
+      found=0
+    fi
+  fi
+  rm -f "$tmp"
+  return "$found"
+}
+
 a2a_send_or_poll_queue() {
   local ws_id="$1"; shift
   local payload="$1"; shift
   local label="$1"
   local tmp qid resp code rc attempt poll_attempt poll_tmp poll_started poll_deadline
+  local mid push_started push_deadline push_polls
   local a2a_gateway_error_seen=0 last_qstatus="" queue_poll_count=0
   local interrupt_ack_count=0 max_interrupt_ack=6 interrupt_ack_backoff=12
   tmp=$(mktemp -t a2a_poll.XXXXXX)
@@ -1934,6 +1997,51 @@ except Exception:
         if [ -n "$qid" ]; then
           echo "    $label A2A queued (queue_id=$qid); switching to poll" >&2
           continue
+        fi
+        if a2a_is_push_async_ack "$resp"; then
+          # The send is accepted and its reply lands on the activity log, so
+          # wait for it there rather than re-send (core#5245).
+          mid=$(printf '%s' "$payload" | python3 -c "
+import json,sys
+try:
+    print(json.load(sys.stdin)['params']['message']['messageId'])
+except Exception:
+    print('')" 2>/dev/null || echo "")
+          if [ -z "$mid" ]; then
+            rm -f "$tmp"
+            fail "$label got a push-async ack, and its payload has no params.message.messageId to find the reply by"
+          fi
+          echo "    $label A2A push-async ack (no queue_id; the reply outlived the proxy's synchronous budget) — waiting for it on the activity row of messageId=$mid" >&2
+          push_started=$(date +%s)
+          push_deadline=$((push_started + A2A_BUSY_WAIT_SECS))
+          push_polls=0
+          resp=""
+          while [ "$(date +%s)" -lt "$push_deadline" ]; do
+            push_polls=$((push_polls + 1))
+            if resp=$(a2a_push_async_reply "$ws_id" "$mid"); then
+              break
+            fi
+            resp=""
+            echo "    $label push-async poll $push_polls ($(( $(date +%s) - push_started ))s/${A2A_BUSY_WAIT_SECS}s): no reply on the activity row yet — backing off 5s" >&2
+            sleep 5
+          done
+          if [ -z "$resp" ]; then
+            rm -f "$tmp"
+            fail "$label push-async reply never reached the activity log within ${A2A_BUSY_WAIT_SECS}s (messageId=$mid)"
+          fi
+          echo "    $label push-async reply on the activity row after $(( $(date +%s) - push_started ))s ($push_polls polls)" >&2
+          if a2a_is_interrupt_ack "$resp"; then
+            interrupt_ack_count=$((interrupt_ack_count + 1))
+            if [ "$interrupt_ack_count" -le "$max_interrupt_ack" ]; then
+              echo "    $label interrupt-ack via the push-async reply (agent mid-task) — re-sending for the real reply (${interrupt_ack_count}/${max_interrupt_ack}), backing off ${interrupt_ack_backoff}s" >&2
+              sleep "$interrupt_ack_backoff"
+              continue
+            fi
+            rm -f "$tmp"
+            fail "$label agent never produced a real reply after ${interrupt_ack_count} interrupt-acknowledgement(s) (last via a push-async reply): $(printf '%s' "$resp" | sanitize_http_body | head -c 300)"
+          fi
+          code=200
+          break
         fi
       elif a2a_is_interrupt_ack "$resp"; then
         # Synchronous interrupt-ack (agent was mid-turn). The message WAS
