@@ -188,14 +188,7 @@ jobs:
     # adds a child workspace, two more live LLM completions and two re-provisions.
     # 75 is what the staging BYOK lane it replaces already budgets. A too-tight
     # timeout would surface as a timeout, not as the honest failure underneath.
-    # 100, not 75, since the hermes image moved to template-hermes #397's
-    # executor: a message waits until the turn ahead of it ends (up to the 600s
-    # per-turn cap this lane injects), so several legs each spend minutes on
-    # their signal in one run. On the cd04575 pin a scheduled tick that landed
-    # while the agent worked was also dropped (816408: step 8 waited 10 min,
-    # 10g's delivery 27 min, and the job was 45 min in when 10f began); the
-    # 616205e pin queues it instead (template-hermes #408).
-    timeout-minutes: 100
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
