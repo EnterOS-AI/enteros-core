@@ -95,23 +95,29 @@
 #                                E2E_SCHEDULE_DELIVER_FIRE_TIMEOUT_SECS and
 #                                E2E_SCHEDULE_DELIVER_TIMEOUT_SECS take
 #                                precedence for 10g and are held to the same bar.
-#   E2E_A2A_BUSY_WAIT_SECS       default 360. How long a message may wait for its
-#                                reply when it reaches an agent that is already
-#                                in a turn. Since template-hermes #397 (prod
-#                                2026-10-29) the hermes executor gives the gateway
-#                                one message per chat: a later message waits for
-#                                the turn ahead of it, and if that turn ends with
-#                                nothing sent under its id (a silent reply to a
-#                                platform wake such as restart-context), for the
-#                                executor's settle window as well: 130s, from the
-#                                template's HERMES_AGENT_NOTIFY_INTERVAL of 60
-#                                (2 x 60 + 10). The old image interrupted the turn
-#                                ahead and answered at once with "⚡ Interrupting
-#                                current task"; that ack is gone. 360 covers a
-#                                restart, the turn ahead, the settle window and
-#                                the message's own turn. It bounds both the POST
-#                                and the queue poll in a2a_send_or_poll_queue,
-#                                and is the default of E2E_DELEG_A2A_TIMEOUT_SECS.
+#   E2E_A2A_BUSY_WAIT_SECS       How long a message may wait for its reply when it
+#                                reaches an agent that is already in a turn.
+#                                Since template-hermes #397 (prod 2026-10-29) the
+#                                hermes executor gives the gateway one message per
+#                                chat: a later message waits for the turn ahead
+#                                of it, which after step 7c's restart is the
+#                                platform's restart-context wake, and which may
+#                                be a long autonomous task (ephemeral run 816363:
+#                                still working at teardown, almost 6 minutes
+#                                in). If that turn ends
+#                                with nothing sent under its id (a silent reply),
+#                                the executor also holds the chat for its settle
+#                                window: 130s, from the template's
+#                                HERMES_AGENT_NOTIFY_INTERVAL of 60 (2 x 60 + 10).
+#                                The old image interrupted the turn ahead and
+#                                answered at once with "⚡ Interrupting current
+#                                task"; that ack is gone. Default: the per-turn
+#                                cap this lane injects with the scheduler check
+#                                (600s at defaults), plus the settle window, plus
+#                                two 90s turns = 910s; 310s without the scheduler
+#                                check. It bounds both the POST and the queue
+#                                poll in a2a_send_or_poll_queue, and is the
+#                                default of E2E_DELEG_A2A_TIMEOUT_SECS.
 #   E2E_DELEG_A2A_TIMEOUT_SECS   per-attempt curl budget for the DELEGATION
 #                                A2A POST (section 10), default
 #                                E2E_A2A_BUSY_WAIT_SECS. `message/send` is
@@ -186,10 +192,6 @@ ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:-}"
 RUNTIME="${E2E_RUNTIME:-hermes}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-3600}"
-A2A_BUSY_WAIT_SECS="${E2E_A2A_BUSY_WAIT_SECS:-360}"
-case "$A2A_BUSY_WAIT_SECS" in
-  ''|*[!0-9]*|0) echo "E2E_A2A_BUSY_WAIT_SECS must be a positive integer (got: $A2A_BUSY_WAIT_SECS)" >&2; exit 2 ;;
-esac
 # RUN_ID_SUFFIX removed (core#2782 follow-up shellcheck): the slug now comes
 # from make_collision_proof_slug below; the old suffix var is dead.
 MODE="${E2E_MODE:-full}"
@@ -292,6 +294,30 @@ e2e_scheduler_backstop_secs() {
   TRIGGER_DAEMON_WATCHDOG_SECS="$(e2e_trigger_delivery_cap_secs)" \
     trigger_daemon_backstop_resolve "${1:-}"
 }
+
+# How long a message may wait for its reply at an agent already in a turn (see
+# E2E_A2A_BUSY_WAIT_SECS in the header). With the scheduler check on, the turn
+# ahead is bounded by the per-turn cap this lane injects (the same number as the
+# delivery cancel bound above), so the budget follows it: the cap, the hermes
+# executor's settle window for a turn that ends silently just short of it, and
+# two turns (the restart before that turn plus the cap's /stop, and the
+# message's own). Without it, nothing caps the turn ahead below the runtime's
+# 3600s default, which no gate can wait out, so the budget covers a short turn
+# ahead and the settle window only.
+A2A_HERMES_SETTLE_SECS=130  # 2 x the template's HERMES_AGENT_NOTIFY_INTERVAL (60) + 10
+A2A_TURN_SECS=90            # one cold agent turn
+if [ -n "${E2E_A2A_BUSY_WAIT_SECS:-}" ]; then
+  A2A_BUSY_WAIT_SECS="$E2E_A2A_BUSY_WAIT_SECS"
+elif [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
+  _a2a_turn_cap=$(e2e_trigger_delivery_cap_secs) \
+    || fail "A2A busy budget: the per-turn cap could not be derived (the probe cron did not parse)."
+  A2A_BUSY_WAIT_SECS=$((_a2a_turn_cap + A2A_HERMES_SETTLE_SECS + 2 * A2A_TURN_SECS))
+else
+  A2A_BUSY_WAIT_SECS=$((A2A_HERMES_SETTLE_SECS + 2 * A2A_TURN_SECS))
+fi
+case "$A2A_BUSY_WAIT_SECS" in
+  ''|*[!0-9]*|0) fail "E2E_A2A_BUSY_WAIT_SECS must be a positive integer (got: $A2A_BUSY_WAIT_SECS)" ;;
+esac
 
 # ─── the anti-vacuous-pass report for the delivery-stall detector ────────────
 #
@@ -2649,7 +2675,7 @@ except Exception:
     # window, if it ended silently) plus the child's own turn, so the budget is
     # A2A_BUSY_WAIT_SECS, not one cold turn. The old image answered at once with
     # an interrupt-ack, which this step accepted as the child's reply.
-    DELEG_CODE=$(curl "${CURL_COMMON[@]}" --max-time "${E2E_DELEG_A2A_TIMEOUT_SECS:-${A2A_BUSY_WAIT_SECS:-360}}" \
+    DELEG_CODE=$(curl "${CURL_COMMON[@]}" --max-time "${E2E_DELEG_A2A_TIMEOUT_SECS:-${A2A_BUSY_WAIT_SECS:-90}}" \
       -X POST "$TENANT_URL/workspaces/$CHILD_ID/a2a" \
       -H "Authorization: Bearer $PARENT_WS_TOKEN" \
       -H "X-Molecule-Org-Id: $ORG_ID" \
