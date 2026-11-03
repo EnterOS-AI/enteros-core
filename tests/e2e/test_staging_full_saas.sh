@@ -109,9 +109,9 @@
 #                                ahead and answered at once with "⚡ Interrupting
 #                                current task"; that ack is gone. 360 covers a
 #                                restart, the turn ahead, the settle window and
-#                                the message's own turn. It bounds the queue poll
-#                                in a2a_send_or_poll_queue and is the default of
-#                                E2E_DELEG_A2A_TIMEOUT_SECS.
+#                                the message's own turn. It bounds both the POST
+#                                and the queue poll in a2a_send_or_poll_queue,
+#                                and is the default of E2E_DELEG_A2A_TIMEOUT_SECS.
 #   E2E_DELEG_A2A_TIMEOUT_SECS   per-attempt curl budget for the DELEGATION
 #                                A2A POST (section 10), default
 #                                E2E_A2A_BUSY_WAIT_SECS. `message/send` is
@@ -1870,11 +1870,14 @@ except Exception:
       fail "$label queue poll timed out waiting for $qid to complete (${A2A_BUSY_WAIT_SECS}s, last status=${last_qstatus:-<empty>})"
     fi
 
-    # Initial POST (or retry before we have a queue_id).
+    # Initial POST (or retry before we have a queue_id). Not every send to a
+    # busy agent is queued by the platform: one that reaches the hermes executor
+    # mid-turn is held there and answered synchronously after the turn ahead
+    # (and its settle window), so this POST gets the same budget as the poll.
     : >"$tmp"
     set +e
     code=$(tenant_call POST "/workspaces/$ws_id/a2a" \
-      --max-time 90 \
+      --max-time "$A2A_BUSY_WAIT_SECS" \
       -H "Content-Type: application/json" \
       -H "X-Workspace-ID: $ws_id" \
       -d "$payload" \
@@ -2041,9 +2044,10 @@ print(json.dumps({
 # endpoint, ships the first prompt, waits for first token. With MiniMax
 # (which is the canary default since #2710) cold-call latency
 # routinely exceeds 30s on the first request after workspace boot.
-# 90s gives ~3x headroom over observed cold-call P95 (~25-30s).
-# Subsequent A2A turns hit the same workspace and are sub-second, so
-# this only widens the window for step 8/11 of the canary's first turn.
+# 90s gave ~3x headroom over observed cold-call P95 (~25-30s). The
+# budget is now A2A_BUSY_WAIT_SECS: after step 7c's restart the parent's
+# first turn is the platform's restart-context wake, and the PONG waits
+# behind it (see the header). An idle agent still answers in seconds.
 # core#2437 part B: send A2A and, if the agent is busy/starting, poll the
 # queue status endpoint until the durable result is available.
 A2A_RESP=$(a2a_send_or_poll_queue "$PARENT_ID" "$A2A_PAYLOAD" "A2A parent")
