@@ -267,16 +267,19 @@ pv_provision_mode() {
 # (equivalently `docker buildx imagetools inspect ...:latest`, the template repo's
 #  Build&push `pushed ...@sha256:...` log line, or a registry v2 manifest HEAD).
 # Each pin is overridable via WORKSPACE_TEMPLATE_<RT>_REF (RT upper, '-'→'_').
-#   hermes      = runtime 0.4.94 / mcp-server 1.9.6 (template main cd04575),
+#   hermes      = runtime 0.4.94 / mcp-server 1.9.6 (template main 616205e),
 #                 re-pinned 2026-11-02: the sha-4dad193 digest (runtime 0.4.31)
 #                 now returns 404 from the registry, so every run failed its pull.
+#                 616205e (2026-11-03) drops a scheduler fire only when the same
+#                 schedule is already queued or running (template-hermes #408);
+#                 cd04575 dropped every fire that landed mid-turn (#407).
 #   openclaw    = workspace-template-openclaw:latest resolved 2026-07-20.
 #   claude-code = workspace-template-claude-code:latest resolved 2026-07-20.
 resolve_template_ref() {
   local rt="$1"
   local registry="${MOLECULE_IMAGE_REGISTRY:-registry.moleculesai.app/molecule-ai}"
   case "$rt" in
-    hermes)      printf '%s' "${WORKSPACE_TEMPLATE_HERMES_REF:-${registry}/workspace-template-hermes@sha256:3f4681d880b3ee9a1d3e78e0a668609452ab15fa3e4a2c4e635a2b70be16715d}" ;;
+    hermes)      printf '%s' "${WORKSPACE_TEMPLATE_HERMES_REF:-${registry}/workspace-template-hermes@sha256:00b628d1e6a62b82de64100fc576565f00a07b219294c5b68ec7e655dbf52d6d}" ;;
     openclaw)    printf '%s' "${WORKSPACE_TEMPLATE_OPENCLAW_REF:-${registry}/workspace-template-openclaw@sha256:24085f9895af728b7166f9f7908cf4a6b825a4c98abdeb0c1462daa8a5838715}" ;;
     claude-code) printf '%s' "${WORKSPACE_TEMPLATE_CLAUDE_CODE_REF:-${registry}/workspace-template-claude-code@sha256:50b8068739f35fd3c7404afe7b8336f5057285b12e73b69e62ccd5c6dcc6ddab}" ;;
     *)
@@ -563,7 +566,7 @@ run_scenario() {
   # E2E_SCHEDULER_CHECK and E2E_DIGEST_PLUGIN_CHECK default ON: the precondition
   # that used to keep steps 10d/10e dark — a provisioned runtime image without the
   # 0.4.9 bits — was verified CLEARED on 2026-07-16. The gate provisions the
-  # DIGEST-PINNED workspace-template-hermes @sha256:3f4681d8… (cd04575 = runtime
+  # DIGEST-PINNED workspace-template-hermes @sha256:00b628d1… (616205e = runtime
   # 0.4.94; see seed_workspace_image). That tree carries all four legs both steps
   # need: the kind:trigger scaffold, declared-plugin boot-install
   # (MOLECULE_DECLARED_PLUGINS), the digest-provider plugin loader, and the
@@ -596,7 +599,7 @@ run_scenario() {
   # (@molecule-ai/mcp-server 1.9.6) and asserts it lands on the OWN grid + fires
   # (org-key/foreign-id neg controls). Its JOINED precondition was VERIFIED CLEARED
   # 2026-07-18 and is now DIGEST-PINNED (seed_workspace_image): the gate provisions
-  # workspace-template-hermes @sha256:3f4681d8… (cd04575 = runtime 0.4.94), which
+  # workspace-template-hermes @sha256:00b628d1… (616205e = runtime 0.4.94), which
   # carries runtime#328's self-audience injector (_inject_self_env) + #329 hardening
   # (force MOLECULE_WORKSPACE_TOKEN_FILE, inject WORKSPACE_ID) + #330/#333's prebake of
   # mcp-server 1.9.6 (self-mode X-Molecule-Org-Id tenant routing) via
