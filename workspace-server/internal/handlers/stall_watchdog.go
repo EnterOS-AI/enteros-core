@@ -125,8 +125,8 @@ type StallWatchdog struct {
 	enqueue stallEnqueueFunc
 
 	// restart fires a soft-restart (existing-volume) for a workspace id.
-	// Production wiring passes WorkspaceHandler.RestartByID; tests inject a
-	// recorder. nil restart = restart stage disabled (probe-only), logged.
+	// Production wiring passes WorkspaceHandler.AutoRestartByID; tests inject
+	// a recorder. nil restart = restart stage disabled (probe-only), logged.
 	restart func(workspaceID string)
 
 	// decideWake / markWakeDelivered route the probe through the wake-lifecycle
@@ -160,7 +160,7 @@ func (s *StallWatchdog) SetWakeHooks(
 // long-running process picks them up via restart, not mid-flight (mirrors
 // NewRequestNudgeSweeper / NewDelegationSweeper).
 //
-// restartFunc is the in-process soft-restart (WorkspaceHandler.RestartByID).
+// restartFunc is the in-process soft-restart (WorkspaceHandler.AutoRestartByID).
 func NewStallWatchdog(handle *sql.DB, restartFunc func(string)) *StallWatchdog {
 	if handle == nil {
 		handle = db.DB

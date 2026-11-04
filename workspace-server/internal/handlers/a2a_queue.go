@@ -725,6 +725,10 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 		log.Printf("A2AQueue drain: workspace %s has a restart-context boot turn in flight — deferring drain to the next heartbeat", workspaceID)
 		return
 	}
+	if holdQueueAfterRestart(ctx, workspaceID) {
+		log.Printf("A2AQueue drain: workspace %s was restarted and has not stayed ready for %s yet — holding its queue", workspaceID, restartQueueHoldGrace)
+		return
+	}
 	// The agent URL is CONSTANT for this workspace across the whole drain call, so
 	// evict+resolve it exactly ONCE (finding [8]) — lazily, on the first dequeued
 	// item, so an empty queue does no DB read and the resolve keeps its original

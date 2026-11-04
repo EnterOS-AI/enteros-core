@@ -8,12 +8,12 @@ The gated staging tenant CD lives at .gitea/workflows/staging-tenant-cd.yml:
                               -> runtime-image-readiness ------>
 
 It is enforced INTRA-workflow by Gitea `needs:` (a red upstream job skips every
-downstream job). The pin advances before the local-docker staging fleet rolls to
-the candidate image. In parallel, runtime-image-readiness pre-pulls every
-promoted pinnable runtime digest on the exact local-deploy daemon; e2e-smoke
-cannot start until both paths are green, so its first workspace provision never
-spends the control plane's 90-second request budget on a 700MiB-1.3GiB cold
-pull.
+downstream job). The pin advances before the k8s staging fleet rolls to the
+candidate image. In parallel, runtime-image-readiness proves the registry
+serves every promoted pinnable runtime digest (manifest bytes hash-verified)
+and every child manifest and blob it references; e2e-smoke cannot
+start until both paths are green, so its first workspace provision cannot fail
+on a digest the registry does not have.
 rollback-pin must always run and restore the old pin + fleet image whenever any
 candidate-path job fails or is skipped. CP-host redeploys are provider-owned and
 must not be wired into this tenant-image CI path. That gate runs on
@@ -40,16 +40,16 @@ This lint is that mechanical guard. It fails the build if anyone:
      would let a downstream `needs:`-dependent job run despite a real failure;
      OR
   5. moves or weakens runtime-image-readiness: it must run the canonical
-     checkout -> local-deploy guard -> readiness consumer shape on exactly the
-     `local-deploy` runner with staging/Infisical inputs, with no workflow/job
-     execution overrides that can redirect or neutralize that shape; OR
+     checkout -> readiness consumer shape on exactly the `local-deploy` runner
+     with staging/Infisical/registry inputs, with no workflow/job execution
+     overrides that can redirect or neutralize that shape; OR
   6. reintroduces provider-specific CP deploy wiring (Railway CLI/tokens or the
      legacy reload-cp-candidate job) into this tenant-image CI path. Preparing
      the selected provider's runtime cache is not a CP deploy/reload.
 
 The dependency checks are behavior-based (they parse the YAML `needs:` graph).
-The one daemon-mutating readiness job is intentionally name- and shape-pinned so
-the rollback result mapping and exact local-deploy boundary cannot drift.
+The readiness job is intentionally name- and shape-pinned so the rollback
+result mapping and its credential inputs cannot drift.
 
 SSOT: the gate shape lives in staging-tenant-cd.yml. This lint encodes the
 contract; if the gate is ever intentionally restructured, update both. Mirrors
@@ -68,7 +68,6 @@ except ImportError:
 DEFAULT_WORKFLOW = ".gitea/workflows/staging-tenant-cd.yml"
 PINNED_CHECKOUT_ACTION = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
 READINESS_JOB = "runtime-image-readiness"
-READINESS_GUARD_COMMAND = "bash scripts/deploy/require-local-deploy-daemon.sh"
 READINESS_ACTION_COMMAND = "bash scripts/deploy/prepare-staging-runtime-images.sh"
 READINESS_ACTION_ENV = {
     "CP_BASE_URL": "https://staging-api.moleculesai.app",
@@ -77,6 +76,8 @@ READINESS_ACTION_ENV = {
     "INFISICAL_CLIENT_ID": "${{ secrets.INFISICAL_CI_CLIENT_ID }}",
     "INFISICAL_CLIENT_SECRET": "${{ secrets.INFISICAL_CI_CLIENT_SECRET }}",
     "INFISICAL_PROJECT_ID": "${{ secrets.INFISICAL_CI_PROJECT_ID }}",
+    "REG_USER": "${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}",
+    "REG_TOKEN": "${{ secrets.MOLECULE_REGISTRY_TOKEN }}",
 }
 READINESS_JOB_ALLOWED_KEYS = {
     "name",
@@ -86,7 +87,7 @@ READINESS_JOB_ALLOWED_KEYS = {
     "steps",
     # `outputs` carries the ran-sentinel out of the job. It is a pure read of
     # two step outputs (shape-pinned by check_ran_sentinel) and cannot redirect
-    # or neutralize the daemon guard the way env/defaults/if/container can.
+    # or neutralize the readiness action the way env/defaults/if/container can.
     "outputs",
 }
 
@@ -438,8 +439,8 @@ def main():
                 f"runs after failed or skipped candidate-path jobs."
             )
 
-    # 4. Runtime readiness is a deliberately narrow cross-provider boundary:
-    # read CP projections, then mutate only the exact local-deploy daemon cache.
+    # 4. Runtime readiness is a deliberately narrow boundary: read CP
+    # projections, then send the registry credential only to the registry.
     readiness = jobs.get(READINESS_JOB)
     if isinstance(readiness, dict):
         extra_job_keys = sorted(set(readiness) - READINESS_JOB_ALLOWED_KEYS)
@@ -447,7 +448,7 @@ def main():
             fails.append(
                 f"`{READINESS_JOB}` execution schema has forbidden key(s) "
                 f"{extra_job_keys} in {workflow}; job-level env/defaults/if/"
-                f"container/strategy can redirect or neutralize the daemon guard."
+                f"container/strategy can redirect or neutralize the readiness action."
             )
         if runner_labels_of(readiness) != ["local-deploy"]:
             fails.append(
@@ -457,20 +458,19 @@ def main():
         if readiness.get("timeout-minutes") != 30:
             fails.append(
                 f"`{READINESS_JOB}` timeout-minutes must be exactly 30 in "
-                f"{workflow} (20-minute script budget plus runner overhead)."
+                f"{workflow} (10-minute script budget plus runner overhead)."
             )
         steps = steps_of(readiness)
-        # ran-sentinel BEGIN and END bracket the canonical three. They are
-        # shape-checked by check_ran_sentinel() below; here we only strip them so
-        # the daemon-boundary shape stays pinned exactly as before.
-        if len(steps) != 5:
+        # ran-sentinel BEGIN and END bracket the canonical two. They are
+        # shape-checked by check_ran_sentinel() below; here we only strip them.
+        if len(steps) != 4:
             fails.append(
                 f"`{READINESS_JOB}` must have exactly ran-sentinel BEGIN, "
-                f"checkout, daemon guard, readiness action, and ran-sentinel END "
-                f"steps in {workflow}."
+                f"checkout, readiness action, and ran-sentinel END steps in "
+                f"{workflow}."
             )
         else:
-            checkout, guard, action = steps[1:4]
+            checkout, action = steps[1:3]
             if (
                 not isinstance(checkout, dict)
                 or checkout.get("uses") != PINNED_CHECKOUT_ACTION
@@ -479,15 +479,6 @@ def main():
                 fails.append(
                     f"`{READINESS_JOB}` must start with the pinned, unredirected "
                     f"checkout action in {workflow}."
-                )
-            if (
-                not isinstance(guard, dict)
-                or run_command_of(guard) != READINESS_GUARD_COMMAND
-                or set(guard) - {"name", "run"}
-            ):
-                fails.append(
-                    f"`{READINESS_JOB}` must run `{READINESS_GUARD_COMMAND}` "
-                    f"unconditionally after checkout in {workflow}."
                 )
             if (
                 not isinstance(action, dict)
@@ -501,7 +492,8 @@ def main():
             elif action.get("env") != READINESS_ACTION_ENV:
                 fails.append(
                     f"`{READINESS_JOB}` readiness action env must be the exact "
-                    f"staging CP + Infisical SSOT mapping in {workflow}."
+                    f"staging CP + Infisical SSOT + registry credential mapping "
+                    f"in {workflow}."
                 )
 
         for field in ("shell", "working-directory"):
@@ -509,7 +501,7 @@ def main():
                 fails.append(
                     f"workflow-level `defaults.run.{field}` is forbidden in "
                     f"{workflow}; it can redirect or replace execution of the "
-                    f"local-deploy daemon guard."
+                    f"readiness action."
                 )
         forbidden_env = sorted(
             set(env_of(workflow_doc)).intersection(FORBIDDEN_WORKFLOW_ENV_KEYS)
@@ -517,8 +509,8 @@ def main():
         if forbidden_env:
             fails.append(
                 f"workflow-level env has forbidden execution/endpoint key(s) "
-                f"{forbidden_env} in {workflow}; trusted Docker endpoint values "
-                f"must come only from local-deploy runner configuration."
+                f"{forbidden_env} in {workflow}; these must never be set at "
+                f"workflow scope."
             )
 
     # 5. e2e-smoke must bind the expected candidate SHA before the staging e2e.
@@ -561,9 +553,7 @@ def main():
                     f"(Gitea Quirk #10 / mc#1982). Remove the key."
                 )
 
-    # 8. Tenant-image CI must not deploy/reload the CP host. The explicit
-    # local-Docker cache preparation above is a provider boundary, not a CP
-    # deployment adapter.
+    # 8. Tenant-image CI must not deploy/reload the CP host.
     for jk in FORBIDDEN_JOB_KEYS:
         if jk in jobs:
             fails.append(

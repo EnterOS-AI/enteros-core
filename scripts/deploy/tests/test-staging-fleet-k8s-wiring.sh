@@ -180,6 +180,48 @@ else
   bad "set image did not use the workload's existing repo" "$(cat "$K8RT/set-image.log")"
 fi
 
+say "2b. --k8s-only rolls the k8s fleet without ever contacting Docker"
+# The deploy runner has no reachable Docker endpoint, so ANY docker invocation
+# on this path is a hard failure there. A poisoned docker earlier in PATH makes
+# one a hard failure here too.
+mkdir -p "$tmp/poison"
+cat > "$tmp/poison/docker" <<'POISON'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8RT/docker.log"
+exit 98
+POISON
+chmod +x "$tmp/poison/docker"
+reset_state
+: > "$K8RT/docker.log"
+printf '%s\n' "ns-alpha	enteros-tenant-abc	$ORG_A	$REPO@$D_NEW" > "$K8RT/pods.after"
+drun 0 "k8s arm OK" "--k8s-only + census wired + healthy fleet => rolled" \
+  env PATH="$tmp/poison:$PATH" TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" \
+      SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
+      K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
+      CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
+      bash "$DOCKER_ROLLER" --k8s-only --tag staging-0badc0de
+if [ -s "$K8RT/docker.log" ]; then
+  bad "--k8s-only invoked docker" "$(cat "$K8RT/docker.log")"
+else
+  ok "--k8s-only made zero docker invocations"
+fi
+reset_state
+touch "$K8RT/rollout.fail"
+drun 1 "k8s arm FAILED" "--k8s-only still fails a rollout that never completes" \
+  env PATH="$tmp/poison:$PATH" TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" \
+      SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
+      K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
+      CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
+      bash "$DOCKER_ROLLER" --k8s-only --tag staging-0badc0de
+reset_state
+drun 1 "needs the k8s roller and a substrate census source" "--k8s-only without a census source is REFUSED" \
+  env -u SUBSTRATE_CENSUS_CMD -u CP_DATABASE_URL PATH="$tmp/poison:$PATH" TENANT_FLAGS="" \
+      bash "$DOCKER_ROLLER" --k8s-only --tag staging-0badc0de
+drun 1 "never contacts" "--k8s-only refuses a Docker canvas container it would silently skip" \
+  env PATH="$tmp/poison:$PATH" TENANT_FLAGS="" STAGING_CANVAS_APP_CONTAINER=shared-canvas \
+      SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
+      bash "$DOCKER_ROLLER" --k8s-only --tag staging-0badc0de
+
 say "3. a genuinely FAILED k8s roll still fails the whole roll"
 reset_state
 touch "$K8RT/rollout.fail"
