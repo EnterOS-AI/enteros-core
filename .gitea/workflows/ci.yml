@@ -530,8 +530,12 @@ jobs:
           # Import paths and counts contain no spaces and IgnoredGoFiles are
           # comma-joined, so whitespace splitting is unambiguous here.
           go list -f '{{.ImportPath}} {{len .TestGoFiles}} {{len .XTestGoFiles}} {{join .IgnoredGoFiles ","}}' ./... > /tmp/go-packages.txt
-          go test -json -timeout 10m -coverprofile=coverage.out ./... > "$LOG" 2>/tmp/test-all.err
-          test_exit=$?
+          # The runner starts this step as `bash -e`, and `set -uo pipefail` does not undo
+          # that, so a bare failing `go test` would end the step HERE: no stderr group, no
+          # per-package render, no ::error:: line, just "exitcode 1" (molecule-core#5256).
+          # `|| test_exit=$?` keeps go's own status without depending on the shell default.
+          test_exit=0
+          go test -json -timeout 10m -coverprofile=coverage.out ./... > "$LOG" 2>/tmp/test-all.err || test_exit=$?
           if [ -s /tmp/test-all.err ]; then
             echo "::group::go test stderr (build/toolchain errors appear here, not in the JSON)"
             cat /tmp/test-all.err
