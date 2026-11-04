@@ -1839,6 +1839,41 @@ sys.exit(1)
   return "$found"
 }
 
+# The state of this messageId's a2a_receive row, for the failure message when no
+# reply arrives: "status=<s> error=<detail>" (a failed dispatch is status=error,
+# from logA2AFailure), or "no row".
+a2a_push_async_row_state() {
+  local ws_id="$1" mid="$2" tmp code
+  tmp=$(mktemp -t a2a_push.XXXXXX)
+  code=$(tenant_call GET "/workspaces/$ws_id/activity?type=a2a_receive&limit=200" \
+    --max-time 30 -o "$tmp" -w '%{http_code}' 2>/dev/null) || code=000
+  if echo "$code" | grep -Eq '^2[0-9][0-9]$'; then
+    MID="$mid" python3 -c '
+import json, os, sys
+mid = os.environ["MID"]
+try:
+    rows = json.load(open(sys.argv[1]))
+except Exception:
+    print("unreadable activity feed"); sys.exit(0)
+if isinstance(rows, dict):
+    rows = rows.get("events", [])
+for r in (rows if isinstance(rows, list) else []):
+    if not isinstance(r, dict) or r.get("activity_type") != "a2a_receive":
+        continue
+    req = r.get("request_body")
+    params = req.get("params") if isinstance(req, dict) else None
+    msg = params.get("message") if isinstance(params, dict) else None
+    if isinstance(msg, dict) and msg.get("messageId") == mid:
+        print("status=%s error=%s" % (r.get("status"), str(r.get("error_detail") or "-")[:200]))
+        sys.exit(0)
+print("no row")
+' "$tmp" 2>/dev/null || echo "unreadable activity feed"
+  else
+    echo "activity read HTTP $code"
+  fi
+  rm -f "$tmp"
+}
+
 a2a_send_or_poll_queue() {
   local ws_id="$1"; shift
   local payload="$1"; shift
@@ -2027,13 +2062,21 @@ except Exception:
           done
           if [ -z "$resp" ]; then
             rm -f "$tmp"
-            fail "$label push-async reply never reached the activity log within ${A2A_BUSY_WAIT_SECS}s (messageId=$mid)"
+            fail "$label push-async reply never reached the activity log within ${A2A_BUSY_WAIT_SECS}s (messageId=$mid; its row: $(a2a_push_async_row_state "$ws_id" "$mid"))"
           fi
           echo "    $label push-async reply on the activity row after $(( $(date +%s) - push_started ))s ($push_polls polls)" >&2
           if a2a_is_interrupt_ack "$resp"; then
             interrupt_ack_count=$((interrupt_ack_count + 1))
             if [ "$interrupt_ack_count" -le "$max_interrupt_ack" ]; then
               echo "    $label interrupt-ack via the push-async reply (agent mid-task) — re-sending for the real reply (${interrupt_ack_count}/${max_interrupt_ack}), backing off ${interrupt_ack_backoff}s" >&2
+              # The re-send needs its own messageId: the row upsert keeps the
+              # first response_body for a messageId, so a reused one would find
+              # this same ack again on the next push-async wait.
+              payload=$(printf '%s' "$payload" | python3 -c "
+import json,sys,uuid
+d=json.load(sys.stdin)
+d['params']['message']['messageId']=str(uuid.uuid4())
+print(json.dumps(d))" 2>/dev/null || printf '%s' "$payload")
               sleep "$interrupt_ack_backoff"
               continue
             fi
