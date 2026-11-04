@@ -663,6 +663,11 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.DELETE("/secrets/:key", sech.Delete)
 		wsAuth.GET("/model", sech.GetModel)
 		wsAuth.PUT("/model", sech.SetModel)
+		// The 24/7 switch. Its restart is an explicit mutation, so it bypasses
+		// RestartByID's self-fire debounce (which would drop it silently).
+		conth := handlers.NewContinuousHandler(wh.RestartByIDAfterMutation)
+		wsAuth.GET("/continuous", conth.Get)
+		wsAuth.PUT("/continuous", conth.Set)
 		// internal#718 P4 closure: /provider endpoint is retired —
 		// the LLM_PROVIDER workspace_secret no longer exists and the
 		// provider is derived from (runtime, model) via the registry

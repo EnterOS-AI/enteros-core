@@ -266,6 +266,8 @@ There are two distinct memory surfaces:
 | `PUT` | `/workspaces/:id/secrets` | Upsert workspace secret |
 | `DELETE` | `/workspaces/:id/secrets/:key` | Delete workspace secret |
 | `GET` | `/workspaces/:id/model` | Get workspace model override |
+| `GET` | `/workspaces/:id/continuous` | Get the workspace's "24/7" switch as its next provision applies it: `continuous`, and `source` = `workspace_secrets`, `global_secrets` or `default` |
+| `PUT` | `/workspaces/:id/continuous` | Set it: `{"continuous": false}` stops the idle self-wake. A change restarts the workspace (`restart: "started"`), except the platform root and a workspace setting its own switch (`restart: "skipped"`; restart it to apply). Admin-token writes to the platform root get 403 |
 
 Important detail: `GET /workspaces/:id/secrets` does **not** return values. It returns key metadata plus a `scope` field so the frontend can distinguish inherited globals from workspace overrides.
 
