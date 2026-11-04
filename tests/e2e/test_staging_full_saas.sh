@@ -95,17 +95,41 @@
 #                                E2E_SCHEDULE_DELIVER_FIRE_TIMEOUT_SECS and
 #                                E2E_SCHEDULE_DELIVER_TIMEOUT_SECS take
 #                                precedence for 10g and are held to the same bar.
+#   E2E_A2A_BUSY_WAIT_SECS       How long a message may wait for its reply when it
+#                                reaches an agent that is already in a turn.
+#                                Since template-hermes #397 (prod 2026-10-29) the
+#                                hermes executor gives the gateway one message per
+#                                chat: a later message waits for the turn ahead
+#                                of it, which after step 7c's restart is the
+#                                platform's restart-context wake, and which may
+#                                be a long autonomous task (ephemeral run 816363:
+#                                still working at teardown, almost 6 minutes
+#                                in). If that turn ends
+#                                with nothing sent under its id (a silent reply),
+#                                the executor also holds the chat for its settle
+#                                window: 130s, from the template's
+#                                HERMES_AGENT_NOTIFY_INTERVAL of 60 (2 x 60 + 10).
+#                                The old image interrupted the turn ahead and
+#                                answered at once with "⚡ Interrupting current
+#                                task"; that ack is gone. Default: the per-turn
+#                                cap this lane injects with the scheduler check
+#                                (600s at defaults), plus the settle window, plus
+#                                two 90s turns = 910s; 310s without the scheduler
+#                                check. It bounds both the POST and the queue
+#                                poll in a2a_send_or_poll_queue, and is the
+#                                default of E2E_DELEG_A2A_TIMEOUT_SECS.
 #   E2E_DELEG_A2A_TIMEOUT_SECS   per-attempt curl budget for the DELEGATION
-#                                A2A POST (section 10), default 90 — matching
-#                                a2a_send_or_poll_queue's budget for the PARENT
-#                                leg. `message/send` is SYNCHRONOUS, so that
-#                                POST waits out a full cold agent turn on a
-#                                just-created child workspace. It overrides
-#                                CURL_COMMON's generic --max-time 30, which is
-#                                not enough: cold-call latency routinely exceeds
-#                                30s on the first request after workspace boot,
-#                                and inheriting it took the REQUIRED ephemeral
-#                                lane red twice on 2026-07-30 with
+#                                A2A POST (section 10), default
+#                                E2E_A2A_BUSY_WAIT_SECS. `message/send` is
+#                                SYNCHRONOUS, so that POST waits out the child's
+#                                own turn, and any turn the child is still in
+#                                (the restart-context wake after step 7c) plus
+#                                its settle window. It overrides CURL_COMMON's
+#                                generic --max-time 30, which is not enough:
+#                                cold-call latency routinely exceeds 30s on the
+#                                first request after workspace boot, and
+#                                inheriting it took the REQUIRED ephemeral lane
+#                                red twice on 2026-07-30 with
 #                                curl_rc=28 / http=000.
 #   E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS
 #                                default 600, floored at 60. The delivery
@@ -270,6 +294,30 @@ e2e_scheduler_backstop_secs() {
   TRIGGER_DAEMON_WATCHDOG_SECS="$(e2e_trigger_delivery_cap_secs)" \
     trigger_daemon_backstop_resolve "${1:-}"
 }
+
+# How long a message may wait for its reply at an agent already in a turn (see
+# E2E_A2A_BUSY_WAIT_SECS in the header). With the scheduler check on, the turn
+# ahead is bounded by the per-turn cap this lane injects (the same number as the
+# delivery cancel bound above), so the budget follows it: the cap, the hermes
+# executor's settle window for a turn that ends silently just short of it, and
+# two turns (the restart before that turn plus the cap's /stop, and the
+# message's own). Without it, nothing caps the turn ahead below the runtime's
+# 3600s default, which no gate can wait out, so the budget covers a short turn
+# ahead and the settle window only.
+A2A_HERMES_SETTLE_SECS=130  # 2 x the template's HERMES_AGENT_NOTIFY_INTERVAL (60) + 10
+A2A_TURN_SECS=90            # one cold agent turn
+if [ -n "${E2E_A2A_BUSY_WAIT_SECS:-}" ]; then
+  A2A_BUSY_WAIT_SECS="$E2E_A2A_BUSY_WAIT_SECS"
+elif [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
+  _a2a_turn_cap=$(e2e_trigger_delivery_cap_secs) \
+    || fail "A2A busy budget: the per-turn cap could not be derived (the probe cron did not parse)."
+  A2A_BUSY_WAIT_SECS=$((_a2a_turn_cap + A2A_HERMES_SETTLE_SECS + 2 * A2A_TURN_SECS))
+else
+  A2A_BUSY_WAIT_SECS=$((A2A_HERMES_SETTLE_SECS + 2 * A2A_TURN_SECS))
+fi
+case "$A2A_BUSY_WAIT_SECS" in
+  ''|*[!0-9]*|0) fail "E2E_A2A_BUSY_WAIT_SECS must be a positive integer (got: $A2A_BUSY_WAIT_SECS)" ;;
+esac
 
 # ─── the anti-vacuous-pass report for the delivery-stall detector ────────────
 #
@@ -1685,8 +1733,9 @@ wait_workspaces_online_routable "7d/11 Waiting for workspace(s) to recover routi
 # ─── A2A send with 202-queued poll helper (core#2437 part B) ───────────
 # Sends POST /workspaces/:id/a2a. If the agent is busy/starting and returns
 # a 2xx with queued:true + queue_id, poll GetA2AQueueStatus until the durable
-# result is available. Handles curl rc 28 / http 000 / 404 retryable while the
-# queue row is still materializing, and transient 502/503/504 cold-start.
+# result is available, for up to A2A_BUSY_WAIT_SECS. Handles curl rc 28 / http
+# 000 / 404 retryable while the queue row is still materializing, and transient
+# 502/503/504 cold-start.
 # Prints the final A2A JSON-RPC response body to stdout; logs to stderr.
 #
 # Detect the runtime's synchronous interrupt-acknowledgement. When an A2A
@@ -1701,6 +1750,12 @@ wait_workspaces_online_routable "7d/11 Waiting for workspace(s) to recover routi
 # a2a_proxy_helpers.go and passes straight through to the caller. The ack is
 # benign (message accepted), NOT an error payload, so the caller must re-send
 # to collect the real reply rather than assert content against the ack.
+#
+# The hermes template stopped doing this with #397 (production since
+# 2026-10-29): its executor holds a message that lands mid-turn until the turn
+# ahead has ended, then answers it from its own turn, so the queued item stays
+# `dispatched` for longer instead of completing with the ack. The re-send stays
+# for an agent that still acks.
 a2a_is_interrupt_ack() {
   local body="$1" txt
   txt=$(printf '%s' "$body" | python3 -c "
@@ -1726,7 +1781,7 @@ a2a_send_or_poll_queue() {
   local ws_id="$1"; shift
   local payload="$1"; shift
   local label="$1"
-  local tmp qid resp code rc attempt poll_attempt poll_tmp
+  local tmp qid resp code rc attempt poll_attempt poll_tmp poll_started poll_deadline
   local a2a_gateway_error_seen=0 last_qstatus="" queue_poll_count=0
   local interrupt_ack_count=0 max_interrupt_ack=6 interrupt_ack_backoff=12
   tmp=$(mktemp -t a2a_poll.XXXXXX)
@@ -1736,7 +1791,11 @@ a2a_send_or_poll_queue() {
     if [ -n "$qid" ]; then
       # We have a queue_id — poll GetA2AQueueStatus for the durable result.
       poll_tmp=$(mktemp -t a2a_qpoll.XXXXXX)
-      for poll_attempt in $(seq 1 30); do
+      poll_started=$(date +%s)
+      poll_deadline=$((poll_started + A2A_BUSY_WAIT_SECS))
+      poll_attempt=0
+      while [ "$(date +%s)" -lt "$poll_deadline" ]; do
+        poll_attempt=$((poll_attempt + 1))
         : >"$poll_tmp"
         set +e
         code=$(tenant_call GET "/workspaces/$ws_id/a2a/queue/$qid" \
@@ -1751,7 +1810,7 @@ a2a_send_or_poll_queue() {
         resp=$(cat "$poll_tmp" 2>/dev/null || echo "")
 
         if [ "$rc" != "0" ] || [ "$code" = "000" ] || [ "$code" = "404" ]; then
-          echo "    $label queue poll attempt $poll_attempt/30: curl_rc=$rc http=$code — retryable, backing off 2s" >&2
+          echo "    $label queue poll attempt $poll_attempt ($(( $(date +%s) - poll_started ))s/${A2A_BUSY_WAIT_SECS}s): curl_rc=$rc http=$code — retryable, backing off 2s" >&2
           sleep 2
           continue
         fi
@@ -1808,7 +1867,7 @@ except Exception:
           queued|dispatched|in_progress|"")
             last_qstatus="$qstatus"
             queue_poll_count=$((queue_poll_count + 1))
-            echo "    $label queue poll attempt $poll_attempt/30 status=$qstatus — backing off 2s" >&2
+            echo "    $label queue poll attempt $poll_attempt ($(( $(date +%s) - poll_started ))s/${A2A_BUSY_WAIT_SECS}s) status=$qstatus — backing off 2s" >&2
             sleep 2
             ;;
           *)
@@ -1818,30 +1877,33 @@ except Exception:
         esac
       done
       rm -f "$poll_tmp"
-      # Ran out of queue poll attempts.
+      # Out of queue poll budget (A2A_BUSY_WAIT_SECS).
       # core#2917: if a gateway-edge error preceded a queued task that never
       # drained, treat it as a transient A2A-layer infra-skip rather than a
       # workspace-code failure. The flag is only set for edge signals (Bad
       # Gateway/Gateway Timeout/error-code 502/504/no healthy upstream), never
       # for agent-origin signals that could mask a real regression.
       # Verified signature: 502/503/504 on an initial POST, queue_id assigned,
-      # then 30/30 polls stuck in queued/dispatched/in_progress/empty.
+      # then every poll in the budget stuck in queued/dispatched/in_progress/empty.
       case "$last_qstatus" in
         queued|dispatched|in_progress|"")
           if [ "$a2a_gateway_error_seen" = "1" ] && [ -n "$qid" ]; then
             rm -f "$tmp"
-            infra_skip "a2a-queue-timeout" "queue_id=$qid poll_count=${queue_poll_count}/30 last_status=${last_qstatus:-<empty>}"
+            infra_skip "a2a-queue-timeout" "queue_id=$qid poll_count=${queue_poll_count} budget=${A2A_BUSY_WAIT_SECS}s last_status=${last_qstatus:-<empty>}"
           fi
           ;;
       esac
-      fail "$label queue poll timed out waiting for $qid to complete"
+      fail "$label queue poll timed out waiting for $qid to complete (${A2A_BUSY_WAIT_SECS}s, last status=${last_qstatus:-<empty>})"
     fi
 
-    # Initial POST (or retry before we have a queue_id).
+    # Initial POST (or retry before we have a queue_id). Not every send to a
+    # busy agent is queued by the platform: one that reaches the hermes executor
+    # mid-turn is held there and answered synchronously after the turn ahead
+    # (and its settle window), so this POST gets the same budget as the poll.
     : >"$tmp"
     set +e
     code=$(tenant_call POST "/workspaces/$ws_id/a2a" \
-      --max-time 90 \
+      --max-time "$A2A_BUSY_WAIT_SECS" \
       -H "Content-Type: application/json" \
       -H "X-Workspace-ID: $ws_id" \
       -d "$payload" \
@@ -2008,9 +2070,10 @@ print(json.dumps({
 # endpoint, ships the first prompt, waits for first token. With MiniMax
 # (which is the canary default since #2710) cold-call latency
 # routinely exceeds 30s on the first request after workspace boot.
-# 90s gives ~3x headroom over observed cold-call P95 (~25-30s).
-# Subsequent A2A turns hit the same workspace and are sub-second, so
-# this only widens the window for step 8/11 of the canary's first turn.
+# 90s gave ~3x headroom over observed cold-call P95 (~25-30s). The
+# budget is now A2A_BUSY_WAIT_SECS: after step 7c's restart the parent's
+# first turn is the platform's restart-context wake, and the PONG waits
+# behind it (see the header). An idle agent still answers in seconds.
 # core#2437 part B: send A2A and, if the agent is busy/starting, poll the
 # queue status endpoint until the durable result is available.
 A2A_RESP=$(a2a_send_or_poll_queue "$PARENT_ID" "$A2A_PAYLOAD" "A2A parent")
@@ -2574,6 +2637,7 @@ except Exception:
   fi
 
   DELEG_TMP=$(mktemp -t deleg_a2a.XXXXXX)
+  DELEG_STARTED=$(date +%s)
   for DELEG_ATTEMPT in $(seq 1 12); do
     : >"$DELEG_TMP"
     set +e
@@ -2581,8 +2645,8 @@ except Exception:
     # workspace, not as the tenant admin. Must still send X-Molecule-Org-Id
     # or TenantGuard 404s — previously missing, caused section 10 to
     # fail rc=22 despite everything upstream being correct (2026-04-21).
-    # Override CURL_COMMON's --max-time 30 for THIS call only, matching the
-    # budget a2a_send_or_poll_queue uses for the PARENT leg (--max-time 90).
+    # Override CURL_COMMON's --max-time 30 for THIS call only (the effective
+    # budget is pinned at >= 90 by tests/e2e/test_deleg_a2a_timeout_unit.sh).
     #
     # `message/send` is SYNCHRONOUS: the response carries the child's finished
     # reply, which this step then reads as result.parts[0].text. So this POST
@@ -2605,7 +2669,13 @@ except Exception:
     # mid-turn — so re-POSTing risks double-delivering the delegation. This is
     # the same reasoning lib/workspace_create_retry.sh encodes as
     # "curl timeout 28 → no retry" for the non-idempotent create.
-    DELEG_CODE=$(curl "${CURL_COMMON[@]}" --max-time "${E2E_DELEG_A2A_TIMEOUT_SECS:-90}" \
+    #
+    # The child may still be in its restart-context turn from step 7c, and the
+    # hermes executor answers this POST only after that turn (and its settle
+    # window, if it ended silently) plus the child's own turn, so the budget is
+    # A2A_BUSY_WAIT_SECS, not one cold turn. The old image answered at once with
+    # an interrupt-ack, which this step accepted as the child's reply.
+    DELEG_CODE=$(curl "${CURL_COMMON[@]}" --max-time "${E2E_DELEG_A2A_TIMEOUT_SECS:-${A2A_BUSY_WAIT_SECS:-90}}" \
       -X POST "$TENANT_URL/workspaces/$CHILD_ID/a2a" \
       -H "Authorization: Bearer $PARENT_WS_TOKEN" \
       -H "X-Molecule-Org-Id: $ORG_ID" \
@@ -2654,7 +2724,7 @@ except Exception:
 " 2>/dev/null || echo "")
   [ -z "$DELEG_TEXT" ] && fail "Delegation returned no text. Sanitized: $(printf '%s' "$DELEG_RESP" | sanitize_http_body | head -c 200)"
   DELEG_TEXT_SAFE=$(printf '%s' "$DELEG_TEXT" | sanitize_http_body)
-  ok "Delegation proxy works (child responded: \"${DELEG_TEXT_SAFE:0:60}\")"
+  ok "Delegation proxy works (child responded after $(( $(date +%s) - DELEG_STARTED ))s: \"${DELEG_TEXT_SAFE:0:60}\")"
 
   # FAIL-CLOSED via bounded readiness-POLL (was soft-logged false-green).
   # The activity pipeline is async, so an immediate single read can miss the
@@ -3772,7 +3842,7 @@ fi
 #
 # Deterministic (no LLM): from the gate host we `docker exec -i` into the OWN mol-ws
 # container and pipe a two-line JSON-RPC stream (initialize, then tools/call
-# create_schedule) into `npx --prefer-offline @molecule-ai/mcp-server@1.9.3 -e
+# create_schedule) into `npx --prefer-offline @molecule-ai/mcp-server@1.9.6 -e
 # MOLECULE_MCP_MODE=self`, capturing stdout — mirroring test_mcp_stdio_staging.sh.
 # create_schedule lives ONLY on the Node self-mode stdio surface (NOT core's Go MCP
 # HTTP bridge), so this is the sole path that exercises the real tool with no agent
@@ -3793,7 +3863,7 @@ fi
 #     admin/org token so the 401 leg cannot false-pass.
 #
 # Dark until preconditions confirmed (default OFF): needs a workspace-template pin
-# carrying runtime#328's self-audience injector AND a prebaked mcp-server 1.9.3 (so
+# carrying runtime#328's self-audience injector AND a prebaked mcp-server 1.9.6 (so
 # `npx --prefer-offline` resolves offline in the no-network gate). Its fail arms are
 # REACHABLE (each leg has a distinct hard failure with diagnostics). It registers NO
 # live_milestone (LIVE_MILESTONES is a closed SSOT — adding one trips the drift gate).
@@ -3803,12 +3873,13 @@ if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
   if [ "${E2E_SCHEDULER_CHECK:-}" != "on" ]; then
     fail "E2E_SELF_SCHEDULE_CHECK=on requires E2E_SCHEDULER_CHECK=on — the scheduler trigger daemon (10d) fires the self-created schedule. Enable both together."
   fi
-  _SS_TIMEOUT_SECS="${E2E_SELF_SCHEDULE_TIMEOUT_SECS:-360}"
+  # E2E_SELF_SCHEDULE_TIMEOUT_SECS overrides LEG B's fire BACKSTOP (10f.B.4),
+  # held to the same bar as E2E_SCHEDULER_TIMEOUT_SECS.
   _SS_POLL_SECS="${E2E_SELF_SCHEDULE_POLL_SECS:-10}"
   _SS_CAP_TIMEOUT_SECS="${E2E_SELF_SCHEDULE_CAP_TIMEOUT_SECS:-120}"
   _SS_CREATE_TIMEOUT_SECS="${E2E_SELF_SCHEDULE_CREATE_TIMEOUT_SECS:-120}"
   _SS_SETTLE_SECS="${E2E_SELF_SCHEDULE_SETTLE_SECS:-30}"
-  _SS_MCP_SPEC="${E2E_SELF_SCHEDULE_MCP_SPEC:-@molecule-ai/mcp-server@1.9.3}"
+  _SS_MCP_SPEC="${E2E_SELF_SCHEDULE_MCP_SPEC:-@molecule-ai/mcp-server@1.9.6}"
   # Run-unique names (distinct from 10d's e2e-fire-* to avoid a ScheduleStore
   # name-collision 409 + grid-provenance ambiguity). Bounded, cron-safe.
   _SS_SN="e2e-self-fire-${E2E_RUN_ID:-local}"
@@ -4242,13 +4313,39 @@ print(rid)
     fi
 
     # ── 10f.B.4 the explicit-id self-created schedule FIRES (reuse 10d) ──
-    log "    LEG B: polling fire evidence for '$_SS_SN' for up to ${_SS_TIMEOUT_SECS}s (reuses 10d's log/history verification; poll=${_SS_POLL_SECS}s)."
-    if idle_digest_wait "$_SS_TIMEOUT_SECS" "$_SS_POLL_SECS" self_schedule_fire_probe "$_SS_SN"; then
-      ok "    LEG B: self-created schedule '$_SS_SN' autonomously FIRED (evidence: $_SS_FIRED)"
-    else
-      self_schedule_diagnostics
-      fail "LEG B: self-created schedule '$_SS_SN' never fired within ${_SS_TIMEOUT_SECS}s — it landed on the grid but the trigger daemon never delivered a self-scheduled turn (scheduler co-gate / trigger-lane leg)."
-    fi
+    # The same signal-driven wait as 10d and 10g, not a fixed 360s: the daemon
+    # delivers one schedule at a time and a delivery lasts as long as its turn,
+    # up to the per-turn cap, so a window under that cap can expire while
+    # another schedule's turn still holds the delivery worker (run 816408: no
+    # history entry for 5 minutes, while the parent made no LLM call and hermes
+    # still reported a live run).
+    _SS_STALE_SECS=$(e2e_scheduler_stale_secs "$_SS_POLL_SECS")
+    _SS_STALL_SECS=$(e2e_scheduler_stall_secs "$_SS_POLL_SECS") \
+      || fail "LEG B: the delivery-stall window could not be derived (the probe cron did not parse), so the wedged-delivery signal would be unarmed for this leg."
+    _SS_FIRE_OVERRIDE="${E2E_SELF_SCHEDULE_TIMEOUT_SECS:-${E2E_SCHEDULER_TIMEOUT_SECS:-}}"
+    _SS_BACKSTOP_SECS=$(e2e_scheduler_backstop_secs "$_SS_FIRE_OVERRIDE") \
+      || fail "$(scheduler_backstop_refusal E2E_SELF_SCHEDULE_TIMEOUT_SECS "$_SS_FIRE_OVERRIDE")"
+    log "    LEG B: waiting for '$_SS_SN' to fire — pass on fire evidence, FAIL FAST if ${_SS_SELF_CID}'s last_tick goes stale (>${_SS_STALE_SECS}s) or its attempt log stops advancing (>${_SS_STALL_SECS}s), backstop ${_SS_BACKSTOP_SECS}s (poll=${_SS_POLL_SECS}s; reuses 10d's log/history verification)."
+    _ss_fire_rc=0
+    trigger_daemon_wait "$_SS_SELF_CID" "$_SS_BACKSTOP_SECS" "$_SS_POLL_SECS" "$_SS_STALE_SECS" "$_SS_STALL_SECS" self_schedule_fire_probe "$_SS_SN" || _ss_fire_rc=$?
+    scheduler_progress_report "10f fire"
+    case "$_ss_fire_rc" in
+      0)
+        ok "    LEG B: self-created schedule '$_SS_SN' autonomously FIRED (evidence: $_SS_FIRED)"
+        ;;
+      2)
+        self_schedule_diagnostics
+        fail "LEG B: the trigger daemon on $_SS_SELF_CID STOPPED TICKING (last_tick ${TRIGGER_DAEMON_LAST_AGE:-unknown}s old, > ${_SS_STALE_SECS}s) while '$_SS_SN' sits on its own grid — the tick loop is wedged; waiting longer cannot help."
+        ;;
+      4)
+        self_schedule_diagnostics
+        fail "LEG B: the trigger daemon's DELIVERY LANE on $_SS_SELF_CID is wedged — it ticks (last_tick ${TRIGGER_DAEMON_LAST_AGE:-unknown}s old) but schedule-history.json gained no entry for ${TRIGGER_DAEMON_PROGRESS_AGE:-unknown}s (> ${_SS_STALL_SECS}s), longer than a delivery can last under the per-turn cap."
+        ;;
+      *)
+        self_schedule_diagnostics
+        fail "LEG B: self-created schedule '$_SS_SN' never fired within the ${_SS_BACKSTOP_SECS}s backstop while the daemon kept ticking and delivering — it landed on the grid but the trigger daemon never delivered a self-scheduled turn (scheduler co-gate / trigger-lane leg)."
+        ;;
+    esac
 
     # ── 10f.B.5 NEG CONTROL: FOREIGN workspace_id rejected + never arrives ──
     _SS_FWS="${CHILD_ID:-00000000-0000-4000-8000-0000000ff0f0}"
