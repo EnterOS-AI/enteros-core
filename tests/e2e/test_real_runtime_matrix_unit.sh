@@ -37,7 +37,7 @@ eq() {
 
 # The exact hermes digest the happy path provisions with. If this test ever needs
 # editing to match, that is the signal a matrix change touched the happy-path input.
-HERMES_PIN="registry.moleculesai.app/molecule-ai/workspace-template-hermes@sha256:8aab6b48f2af15c3dd1056a5d1f5e7a61fb9a8a66aa7aca5b51cf2d2702215f9"
+HERMES_PIN="registry.moleculesai.app/molecule-ai/workspace-template-hermes@sha256:00b628d1e6a62b82de64100fc576565f00a07b219294c5b68ec7e655dbf52d6d"
 OPENCLAW_PIN="registry.moleculesai.app/molecule-ai/workspace-template-openclaw@sha256:24085f9895af728b7166f9f7908cf4a6b825a4c98abdeb0c1462daa8a5838715"
 CLAUDE_PIN="registry.moleculesai.app/molecule-ai/workspace-template-claude-code@sha256:50b8068739f35fd3c7404afe7b8336f5057285b12e73b69e62ccd5c6dcc6ddab"
 
