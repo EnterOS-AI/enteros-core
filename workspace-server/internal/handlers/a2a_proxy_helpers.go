@@ -537,7 +537,7 @@ func (h *WorkspaceHandler) hasRecentHeartbeat(ctx context.Context, workspaceID s
 // The status guard excludes 'paused'/'hibernated' (not just 'removed'/
 // 'provisioning'): a deliberately-parked workspace's container is EXPECTED to
 // be stopped, so a probe that finds it dead must NOT flip it to 'offline' (nor
-// fire the RestartByID below). Without this, a probe against a dormant
+// fire the restart below). Without this, a probe against a dormant
 // workspace could clobber its lifecycle status — the same dormant-state-must-
 // be-inviolable rule the liveness monitor (registry/liveness.go) and the
 // Register upsert already enforce (core#2332 pause_resume / hibernate_wake).
@@ -554,7 +554,7 @@ func (h *WorkspaceHandler) declareContainerDead(ctx context.Context, workspaceID
 	// before its provisioner gate, so an untracked detached goroutine
 	// races setupTestDB's t.Cleanup db.DB restore. Matches the already-
 	// correct site at a2a_proxy.go:648.
-	h.goAsync(func() { h.RestartByID(workspaceID) })
+	h.goAsync(func() { h.AutoRestartByID(workspaceID, "a2a-dead-container") })
 	return true
 }
 
@@ -648,7 +648,7 @@ func (h *WorkspaceHandler) preflightContainerHealth(ctx context.Context, workspa
 	// Tracked via goAsync (see maybeMarkContainerDead): preflight's
 	// detached restart must be drainable so it doesn't race the global
 	// db.DB swap in test cleanup.
-	h.goAsync(func() { h.RestartByID(workspaceID) })
+	h.goAsync(func() { h.AutoRestartByID(workspaceID, "a2a-preflight") })
 	return &proxyA2AError{
 		Status: http.StatusServiceUnavailable,
 		Response: gin.H{

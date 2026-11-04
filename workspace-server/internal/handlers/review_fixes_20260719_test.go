@@ -91,6 +91,14 @@ func TestEnqueueRestartContext_PriorityAndIdempotency(t *testing.T) {
 	// collapse to one queued snapshot, not stack one message per attempt.
 	wantKey := "restart-context-ws-42"
 
+	// One snapshot pending per workspace (core#5241): queued ones are dropped
+	// and nothing is being delivered, so this one is queued.
+	mock.ExpectExec(dropQueuedRestartContextSQL).
+		WithArgs("ws-42", restartContextSourceType).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(restartContextDeliveringSQL).
+		WithArgs("ws-42", restartContextSourceType).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 	// Supersede-expired sweep for the same key, then the keyed INSERT.
 	mock.ExpectExec("UPDATE a2a_queue").
 		WithArgs("ws-42", wantKey).
