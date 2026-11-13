@@ -1155,8 +1155,10 @@ func logActivityExec(ctx context.Context, exec activityExecutor, broadcaster eve
 	// (idx_activity_logs_msg_id is partial); rows without message_id keep
 	// the original always-INSERT behavior.
 	// Enter OS Light (C3b): a row written by a Light run's request carries the
-	// run id. The run variant is used ONLY then, so the statement every other
-	// write issues is byte-identical to before.
+	// run id. The run variants are used ONLY then, so the statement every other
+	// write issues is byte-identical to before. A row of the run's own
+	// workspace leaves last_activity_at alone (it is the agent's own activity);
+	// the peer-side row of a run's A2A is the peer's activity and stamps it.
 	args := []interface{}{params.WorkspaceID, params.ActivityType, params.SourceID, params.TargetID,
 		params.Method, params.Summary, reqStr, respStr, traceStr,
 		params.DurationMs, params.Status, params.ErrorDetail,
@@ -1164,6 +1166,9 @@ func logActivityExec(ctx context.Context, exec activityExecutor, broadcaster eve
 	stmt := activityInsertSQL
 	if runID := activityRunID(ctx, params.WorkspaceID, params.SourceID); runID != "" {
 		stmt = activityInsertWithRunSQL
+		if activityRunOwnsRow(ctx, params.WorkspaceID) {
+			stmt = activityInsertRunOwnSQL
+		}
 		args = append(args, runID)
 	}
 	if _, err := exec.ExecContext(ctx, stmt, args...); err != nil {
@@ -1274,8 +1279,35 @@ const activityInsertSQL = `
 
 // activityInsertWithRunSQL is activityInsertSQL for a row a Light run wrote
 // (C3b): it also stores run_id ($14), and a message_id conflict keeps the run
-// id the row already had.
+// id the row already had. Used for the peer-side row of a run's A2A, which is
+// the peer's activity and stamps its last_activity_at.
 var activityInsertWithRunSQL = activityRunVariant(activityInsertSQL)
+
+// activityInsertRunOwnSQL is activityInsertWithRunSQL for a row of the run's
+// own workspace: the row is stored, but workspaces.last_activity_at is left
+// alone. That column stays the agent's own activity (a message to it, its
+// reply, its tool calls), which the Light auto-park window, a park's busy
+// check and the stall watchdog read; a run of the agent's last park may still
+// be going while the agent is open (review 21720 R-1).
+var activityInsertRunOwnSQL = activityRunOwnVariant(activityInsertWithRunSQL)
+
+// activityRunOwnVariant drops the last_activity_at stamp from a run variant.
+// The INSERT in its WITH clause still runs: Postgres executes a data-modifying
+// CTE whether or not the main statement reads it.
+func activityRunOwnVariant(base string) string {
+	const stamp = "UPDATE workspaces SET last_activity_at = now() WHERE id = $1"
+	if strings.Count(base, stamp) != 1 {
+		panic("activityRunOwnVariant: the activity insert changed shape; update the run variants")
+	}
+	return strings.Replace(base, stamp, "SELECT 1", 1)
+}
+
+// activityRunOwnsRow reports whether the request's Light run belongs to
+// workspaceID: the row is the run's own, not the peer-side row of its A2A.
+func activityRunOwnsRow(ctx context.Context, workspaceID string) bool {
+	_, runWorkspace, ok := middleware.LightRunFromContext(ctx)
+	return ok && runWorkspace == workspaceID
+}
 
 func activityRunVariant(base string) string {
 	for _, r := range []struct{ old, new string }{

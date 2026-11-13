@@ -297,8 +297,8 @@ deleted meanwhile; core deletes whatever the park wrote to the control plane.
 
 **After the 202.** If the agent turns out to be working (a task that started
 around the claim: its heartbeat still reports the task while `parking`, and any
-activity the agent itself writes after the claim counts; rows written by its
-runs, which carry a `run_id`, do not), the park is undone before the pod is
+activity of its own after the claim counts, such as a reply or a tool call; what
+its runs write does not), the park is undone before the pod is
 stopped: the agent goes back to `open` and `last_error` is `LIGHT_AGENT_BUSY`. If stopping
 the pod or resuming the CronJobs fails, the agent stays `parking`, `last_error`
 says why (`LIGHT_PARK_INCOMPLETE`, or the control plane's code such as
@@ -562,10 +562,12 @@ A monitor in core, every 30 s:
 
 - **Auto-park.** An `open` agent that is online, idle (no task, not busy),
   open for 30 minutes (`LIGHT_AUTO_PARK_IDLE_MINUTES`) and without activity of
-  its own for as long (rows written by its runs, which carry a `run_id`, do not
-  count) is parked, so schedules cannot stay paused by mistake. Auto-park keeps core's
-  schedule suspensions. A refused auto-park records its code in `last_error`
-  and is not retried for 10 minutes.
+  its own for as long is parked. Its own activity is a message to it, its reply
+  (the clock restarts when it finishes a turn, however long the turn took) and
+  its tool calls; what its runs write does not count. Auto-park exists so
+  schedules cannot stay paused by mistake, and it keeps core's schedule
+  suspensions. A refused auto-park records its code in `last_error` and is not
+  retried for 10 minutes.
 - **Refresh.** A change that would restart a parked agent (a secret, its
   model, a plugin), including one made while a park is under way, queues a
   `refresh`. Core opens the agent, and parks it again once it is online, idle

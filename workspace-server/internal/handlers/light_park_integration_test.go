@@ -295,7 +295,7 @@ func TestIntegration_LightPark_TaskAroundTheClaimUndoesThePark(t *testing.T) {
 		ctx := context.Background()
 		ws := seedLightWorkspace(t, conn, "test-light-activity", "online", "parking")
 		lightExec(t, conn, `UPDATE workspaces SET light_state_at = now() - interval '5 seconds' WHERE id = $1`, ws)
-		lightActivityRow(t, conn, ws, "", 0)
+		lightLogActivity(t, ws, "")
 		wh := lightIntegrationHandler(t, &fakeLightAPI{})
 		var stops int32
 		wh.stopFnOverride = func(context.Context, string) { atomic.AddInt32(&stops, 1) }
@@ -726,5 +726,82 @@ func TestIntegration_LightMonitor_PausedRefreshOpensReleaseTheirSlots(t *testing
 		if st, _ := lightRowStatus(t, conn, id); st != "paused" {
 			t.Errorf("%s: status = %s, want it left paused", name, st)
 		}
+	}
+}
+
+// P9: the idle window counts the agent's reply. An owner's message is ingested
+// as an activity row and the agent's reply completes that same row in place
+// (the insert's message_id conflict), so the row keeps the message's
+// created_at; last_activity_at moves to the reply. After a 40-minute turn the
+// agent must not be an auto-park candidate the moment it replies (review 21720
+// R-1).
+func TestIntegration_LightMonitor_AReplyRestartsTheIdleWindow(t *testing.T) {
+	conn := integrationDB_Light(t)
+	setupTestRedis(t)
+	ctx := context.Background()
+	ws := seedLightWorkspace(t, conn, "test-light-long-turn", "online", "open")
+	lightExec(t, conn, `UPDATE workspaces SET light_opened_by = 'owner', light_state_at = now() - interval '45 minutes' WHERE id = $1`, ws)
+	summary := "owner message"
+	// The owner's message arrived 40 minutes ago, and nothing since ...
+	LogActivity(ctx, nil, ActivityParams{WorkspaceID: ws, ActivityType: "a2a_receive", Summary: &summary, Status: "ok", MessageId: "msg-long-turn"})
+	lightExec(t, conn, `UPDATE activity_logs SET created_at = now() - interval '40 minutes' WHERE workspace_id = $1 AND message_id = 'msg-long-turn'`, ws)
+	lightExec(t, conn, `UPDATE workspaces SET last_activity_at = now() - interval '40 minutes' WHERE id = $1`, ws)
+	candidate := func() bool {
+		t.Helper()
+		rows, err := lightAutoParkCandidates(ctx, 30*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, ok := lightIDSet(rows)[ws]
+		return ok
+	}
+	if !candidate() {
+		t.Fatal("setup: an agent idle for 40 minutes is a candidate")
+	}
+	// ... and the agent's reply completes the same row now.
+	LogActivity(ctx, nil, ActivityParams{WorkspaceID: ws, ActivityType: "a2a_receive", Summary: &summary, Status: "ok", MessageId: "msg-long-turn",
+		ResponseBody: map[string]string{"text": "done"}})
+	var rowsForMsg int
+	if err := conn.QueryRow(`SELECT count(*) FROM activity_logs WHERE workspace_id = $1 AND message_id = 'msg-long-turn'`, ws).Scan(&rowsForMsg); err != nil || rowsForMsg != 1 {
+		t.Fatalf("setup: rows for the message = %d (%v), want the one row the reply completed", rowsForMsg, err)
+	}
+	if candidate() {
+		t.Error("the agent replied just now, yet it is an auto-park candidate: the window must run from its reply")
+	}
+}
+
+// Who stamps last_activity_at: an untagged write (the agent's own activity)
+// and the peer-side row of a run's A2A (the peer received a message) do; a
+// run's own rows, under the agent's id, do not (review 21720 R-1).
+func TestIntegration_LightRunActivity_StampsOnlyThePeersLastActivity(t *testing.T) {
+	conn := integrationDB_Light(t)
+	ctx := context.Background()
+	agent := seedLightWorkspace(t, conn, "test-light-run-writer", "hibernated", "parked")
+	peer := seedLightWorkspace(t, conn, "test-light-run-peer", "online", "")
+	lastActivity := func(id string) sql.NullTime {
+		t.Helper()
+		var at sql.NullTime
+		if err := conn.QueryRow(`SELECT last_activity_at FROM workspaces WHERE id = $1`, id).Scan(&at); err != nil {
+			t.Fatal(err)
+		}
+		return at
+	}
+	runCtx := middleware.WithLightRun(ctx, "light-x-aaaaaaaa-29384756", agent)
+	summary := "run activity"
+	LogActivity(runCtx, nil, ActivityParams{WorkspaceID: agent, ActivityType: "agent_log", SourceID: &agent, Summary: &summary, Status: "ok"})
+	LogActivity(runCtx, nil, ActivityParams{WorkspaceID: peer, ActivityType: "a2a_receive", SourceID: &agent, TargetID: &peer, Summary: &summary, Status: "ok"})
+	var tagged int
+	if err := conn.QueryRow(`SELECT count(*) FROM activity_logs WHERE run_id = 'light-x-aaaaaaaa-29384756' AND workspace_id = ANY($1::uuid[])`, "{"+agent+","+peer+"}").Scan(&tagged); err != nil || tagged != 2 {
+		t.Fatalf("setup: tagged rows = %d (%v), want both rows stored with the run id", tagged, err)
+	}
+	if at := lastActivity(agent); at.Valid {
+		t.Errorf("the run's own row stamped the agent's last_activity_at (%v)", at.Time)
+	}
+	if at := lastActivity(peer); !at.Valid {
+		t.Error("the peer-side row of the run's A2A did not stamp the peer's last_activity_at")
+	}
+	LogActivity(ctx, nil, ActivityParams{WorkspaceID: agent, ActivityType: "agent_log", SourceID: &agent, Summary: &summary, Status: "ok"})
+	if at := lastActivity(agent); !at.Valid {
+		t.Error("the agent's own row did not stamp its last_activity_at")
 	}
 }

@@ -465,9 +465,11 @@ const lightQuietWindowSQL = `CASE WHEN workspaces.light_opened_by = 'refresh' TH
 
 // lightAutoParkCandidates lists open Light agents to park now: online, idle
 // (no task, not busy), no Light failure in the last 10 minutes, and neither
-// opened nor active within the quiet window. Only the agent's own activity
-// counts: rows its runs write carry a run_id (review 21719 O-A). Agents without
-// a recorded failure come first. Rows are (id, opened_by).
+// opened nor active within the quiet window. Activity is the agent's own,
+// last_activity_at: a message to it, its reply (which completes the
+// message's row in place), its tool calls. Its runs' rows never stamp it
+// (activityInsertRunOwnSQL; reviews 21719 O-A, 21720 R-1). Agents without a
+// recorded failure come first. Rows are (id, opened_by).
 func lightAutoParkCandidates(ctx context.Context, idle time.Duration) ([][]string, error) {
 	return queryLightIDs(ctx, `
 		SELECT id, COALESCE(light_opened_by, 'owner')
@@ -475,10 +477,7 @@ func lightAutoParkCandidates(ctx context.Context, idle time.Duration) ([][]strin
 		WHERE light_state = 'open' AND status IN ('online', 'degraded')
 		  AND COALESCE(active_tasks, 0) = 0 AND NOT COALESCE(is_busy, false)
 		  AND `+lightErrorBackoffSQL+`
-		  AND light_state_at < now() - `+lightQuietWindowSQL+`
-		  AND NOT EXISTS (SELECT 1 FROM activity_logs a
-		                  WHERE a.workspace_id = workspaces.id AND a.run_id IS NULL
-		                    AND a.created_at >= now() - `+lightQuietWindowSQL+`)
+		  AND GREATEST(COALESCE(last_activity_at, light_state_at), light_state_at) < now() - `+lightQuietWindowSQL+`
 		ORDER BY light_last_error_at NULLS FIRST, light_state_at
 		LIMIT $2`, int(idle/time.Minute), lightSweepLimit, int(lightRefreshQuiet/time.Second))
 }

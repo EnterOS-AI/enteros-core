@@ -27,7 +27,7 @@ const (
 	lightClaimParkingSQL    = `UPDATE workspaces\s+SET light_state = 'parking', light_state_at = now\(\), updated_at = now\(\),\s+light_park_trigger = \$2,\s+light_park_watermark = \(SELECT COALESCE\(MAX\(a\.id\), 0\) FROM light_pending_actions a\s+WHERE a\.workspace_id = \$1 AND a\.kind = \$3 AND a\.applied_at IS NULL\)\s+WHERE id = \$1 AND light_state = 'open'\s+RETURNING light_park_watermark`
 	lightPendingTokenSQL    = `UPDATE workspaces w SET light_pending_token_id = \$2\s+FROM workspaces prev\s+WHERE w\.id = \$1 AND prev\.id = \$1\s+RETURNING prev\.light_pending_token_id`
 	lightDropPendingSQL     = `UPDATE workspaces SET light_pending_token_id = NULL WHERE id = \$1 AND light_pending_token_id = \$2`
-	lightBusySQL            = `SELECT COALESCE\(w\.active_tasks, 0\) > 0 OR COALESCE\(w\.is_busy, false\)\s+OR EXISTS \(SELECT 1 FROM activity_logs a\s+WHERE a\.workspace_id = w\.id AND a\.run_id IS NULL AND a\.created_at > w\.light_state_at\)\s+FROM workspaces w WHERE w\.id = \$1`
+	lightBusySQL            = `SELECT COALESCE\(active_tasks, 0\) > 0 OR COALESCE\(is_busy, false\)\s+OR COALESCE\(last_activity_at > light_state_at, false\)\s+FROM workspaces WHERE id = \$1`
 	lightCommitSQL          = `SELECT w\.status, w\.light_run_token_id, w\.light_retired_token_id,[\s\S]*FOR UPDATE OF w`
 	lightClearParkErrorSQL  = `UPDATE workspaces SET light_last_error = NULL, light_last_error_at = NULL\s+WHERE id = \$1 AND light_last_error IS NOT NULL AND NOT \(COALESCE\(light_last_error->>'code', ''\) = ANY\(\$2\)\)`
 	lightClearOpenMarkerSQL = `UPDATE workspaces SET light_last_error = NULL, light_last_error_at = NULL\s+WHERE id = \$1 AND light_state = 'parked' AND light_last_error->>'code' = \$2`

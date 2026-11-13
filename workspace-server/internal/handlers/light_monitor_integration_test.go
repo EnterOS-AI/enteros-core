@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/middleware"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 )
@@ -28,16 +29,16 @@ func lightExec(t *testing.T, conn *sql.DB, query string, args ...interface{}) {
 	}
 }
 
-// lightActivityRow writes one activity row of ws, secsAgo seconds old: the
-// agent's own (runID "") or one of its runs'.
-func lightActivityRow(t *testing.T, conn *sql.DB, ws, runID string, secsAgo int) {
+// lightLogActivity writes one activity row of ws through LogActivity, the
+// way the agent does, or the way one of its runs does when runID is set.
+func lightLogActivity(t *testing.T, ws, runID string) {
 	t.Helper()
-	var run interface{}
+	ctx := context.Background()
 	if runID != "" {
-		run = runID
+		ctx = middleware.WithLightRun(ctx, runID, ws)
 	}
-	lightExec(t, conn, `INSERT INTO activity_logs (workspace_id, activity_type, summary, run_id, created_at)
-		VALUES ($1, 'agent_log', 'test activity', $2, now() - make_interval(secs => $3))`, ws, run, secsAgo)
+	summary := "test activity"
+	LogActivity(ctx, nil, ActivityParams{WorkspaceID: ws, ActivityType: "agent_log", SourceID: &ws, Summary: &summary, Status: "ok"})
 }
 
 func lightIDSet(rows [][]string) map[string]string {
@@ -73,18 +74,21 @@ func TestIntegration_LightMonitor_AutoParkPredicate(t *testing.T) {
 	lightExec(t, conn, `UPDATE workspaces SET active_tasks = 1 WHERE id = $1`, busy)
 	// A runtime that reports is_busy without active_tasks (RFC #4402 B2).
 	lightExec(t, conn, `UPDATE workspaces SET active_tasks = 0, is_busy = true WHERE id = $1`, busyFlag)
-	lightActivityRow(t, conn, recent, "", 5*60)
+	lightExec(t, conn, `UPDATE workspaces SET last_activity_at = now() - interval '5 minutes' WHERE id = $1`, recent)
 	// A refresh-opened agent parks once quiet for a minute (not the idle
 	// window): not while it has just come up, nor right after activity.
 	lightExec(t, conn, `UPDATE workspaces SET light_opened_by = 'refresh', light_state_at = now() - interval '2 minutes' WHERE id = $1`, refresh)
-	lightExec(t, conn, `UPDATE workspaces SET light_opened_by = 'refresh', light_state_at = now() - interval '10 seconds' WHERE id = $1`, refreshNow)
+	// Opened by the refresh 10 s ago, after activity of 5 minutes ago: the
+	// window runs from the later of the two.
+	lightExec(t, conn, `UPDATE workspaces SET light_opened_by = 'refresh', light_state_at = now() - interval '10 seconds', last_activity_at = now() - interval '5 minutes' WHERE id = $1`, refreshNow)
 	lightExec(t, conn, `UPDATE workspaces SET light_opened_by = 'refresh', light_state_at = now() - interval '5 minutes' WHERE id = $1`, refreshActive)
-	lightActivityRow(t, conn, refreshActive, "", 10)
+	lightLogActivity(t, refreshActive, "")
 	// Only the agent's own activity counts: a run of its last park, still
-	// going, writes rows under its id that carry the run id (review 21719 O-A).
-	lightActivityRow(t, conn, runOnly, "light-x-aaaaaaaa-29384756", 60)
+	// going, writes rows under its id that carry the run id and never stamp
+	// last_activity_at (reviews 21719 O-A, 21720 R-1).
+	lightLogActivity(t, runOnly, "light-x-aaaaaaaa-29384756")
 	lightExec(t, conn, `UPDATE workspaces SET light_opened_by = 'refresh', light_state_at = now() - interval '5 minutes' WHERE id = $1`, refreshRun)
-	lightActivityRow(t, conn, refreshRun, "light-x-aaaaaaaa-29384756", 5)
+	lightLogActivity(t, refreshRun, "light-x-aaaaaaaa-29384756")
 	lightExec(t, conn, `UPDATE workspaces SET light_last_error = '{"code":"X","message":"y"}', light_last_error_at = now() - interval '1 minute' WHERE id = $1`, failed)
 
 	rows, err := lightAutoParkCandidates(context.Background(), 30*time.Minute)

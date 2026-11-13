@@ -61,9 +61,9 @@ resource friendly.
   the runtime (up to 8 MiB), render (a schedule core suspended goes out
   `enabled:false` unless the owner parks or its definition changed), mint a
   run token and record it as pending, C4 `PUT`, commit the token, store the
-  set; then, unless the agent reports a task or wrote activity of its own
-  since the claim (its runs' rows carry a `run_id` and do not count; then the
-  park is undone with `LIGHT_AGENT_BUSY`), hibernate it through the
+  set; then, unless the agent reports a task or shows activity of its own
+  since the claim (`last_activity_at`, which a run's own rows never stamp; then
+  the park is undone with `LIGHT_AGENT_BUSY`), hibernate it through the
   ordinary path and C4 `resume`, retried while the control plane answers
   `LIGHT_AGENT_AWAKE` (the pod's 30 s grace). A refusal after the claim and
   before the pod stops returns to `open`. A heartbeat of a `parking` agent is
@@ -107,7 +107,8 @@ made while parked) needs an applier, not a schema change.
 Every 30 s: finish or continue interrupted parks and opens (a continued park
 keeps its trigger and watermark), park again failed refresh opens, resume the
 CronJobs of an interrupted open; auto-park an open agent idle for 30 minutes
-(its runs' activity does not count); open at most two parked agents with
+(`last_activity_at`: a message, the reply that completes it, tool calls; a
+run's own rows never stamp it); open at most two parked agents with
 queued work at a time (a refresh open that failed or that the owner paused
 holds no slot); delete the Light
 objects a workspace delete could not. Every 5 minutes, ten agents a tick: read

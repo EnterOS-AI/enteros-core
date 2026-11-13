@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -25,6 +26,7 @@ func runCtx() context.Context {
 
 func TestLogActivityTagsTheRunsOwnRows(t *testing.T) {
 	mock := setupTestDB(t)
+	rec := recordSQL(t)
 	mock.ExpectExec(`INSERT INTO activity_logs \(workspace_id, activity_type, source_id, target_id, method, summary, request_body, response_body, tool_trace, duration_ms, status, error_detail, message_id, run_id\)\s+VALUES \(\$1, \$2, \$3, \$4, \$5, \$6, \$7::jsonb, \$8::jsonb, \$9::jsonb, \$10, \$11, \$12, \$13, \$14\)[\s\S]*run_id        = COALESCE\(activity_logs\.run_id, EXCLUDED\.run_id\)`).
 		WithArgs(lightTestWS, "agent_log", lightTestWS, nil, nil, "tool use", nil, nil, nil, nil, "ok", nil, nil, lightTestRunID).
 		WillReturnResult(sqlmock.NewResult(1, 1))
@@ -34,6 +36,12 @@ func TestLogActivityTagsTheRunsOwnRows(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("logActivityExec: %v", err)
 	}
+	// The run's own row leaves the agent's last_activity_at alone: that is the
+	// agent's own activity, which auto-park and a park's busy check read
+	// (review 21720 R-1).
+	if got := rec(); len(got) != 1 || strings.Contains(got[0], "last_activity_at") {
+		t.Errorf("statements = %v, want the insert alone, without the last_activity_at stamp", got)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet: %v", err)
 	}
@@ -41,6 +49,7 @@ func TestLogActivityTagsTheRunsOwnRows(t *testing.T) {
 
 func TestLogActivityTagsThePeerRowOfARunsA2A(t *testing.T) {
 	mock := setupTestDB(t)
+	rec := recordSQL(t)
 	peer := "00000000-0000-0000-0000-0000000000aa"
 	mock.ExpectExec(`message_id, run_id\)`).
 		WithArgs(peer, "a2a_receive", lightTestWS, peer, nil, nil, nil, nil, nil, nil, "ok", nil, nil, lightTestRunID).
@@ -50,6 +59,10 @@ func TestLogActivityTagsThePeerRowOfARunsA2A(t *testing.T) {
 		WorkspaceID: peer, ActivityType: "a2a_receive", SourceID: strPtr(lightTestWS), TargetID: strPtr(peer), Status: "ok",
 	}); err != nil {
 		t.Fatalf("logActivityExec: %v", err)
+	}
+	// A message from a run is the peer's activity: its last_activity_at moves.
+	if got := rec(); len(got) != 1 || !strings.Contains(got[0], "UPDATE workspaces SET last_activity_at = now() WHERE id = $1") {
+		t.Errorf("statements = %v, want the insert with the peer's last_activity_at stamp", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet: %v", err)

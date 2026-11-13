@@ -611,19 +611,19 @@ func readLightRow(ctx context.Context, workspaceID string) (state, status string
 
 // lightAgentBusy reports whether a 'parking' agent is doing something: a task
 // its heartbeats report (they still record active_tasks and is_busy while
-// 'parking'), or an activity row the agent itself wrote since the parking
-// claim. A message can no longer reach it once 'parking' is claimed, so such a
-// row comes from a turn that was already running (its tool calls, its log).
-// Rows of its runs do not count (they carry a run_id; a run pod writes under
-// the agent's id): a run of the last park may still be going while the agent
-// is open (review 21719 O-A).
+// 'parking'), or activity of its own since the parking claim
+// (last_activity_at). A message can no longer reach it once 'parking' is
+// claimed, so such activity comes from a turn that was already running (its
+// reply, its tool calls). Its runs' activity does not count: a run's rows
+// never stamp last_activity_at (activityInsertRunOwnSQL), and a run of the
+// last park may still be going while the agent is open (reviews 21719 O-A,
+// 21720 R-1).
 func lightAgentBusy(ctx context.Context, workspaceID string) (bool, error) {
 	var busy bool
 	err := db.DB.QueryRowContext(ctx, `
-		SELECT COALESCE(w.active_tasks, 0) > 0 OR COALESCE(w.is_busy, false)
-		       OR EXISTS (SELECT 1 FROM activity_logs a
-		                  WHERE a.workspace_id = w.id AND a.run_id IS NULL AND a.created_at > w.light_state_at)
-		FROM workspaces w WHERE w.id = $1`, workspaceID,
+		SELECT COALESCE(active_tasks, 0) > 0 OR COALESCE(is_busy, false)
+		       OR COALESCE(last_activity_at > light_state_at, false)
+		FROM workspaces WHERE id = $1`, workspaceID,
 	).Scan(&busy)
 	return busy, err
 }
