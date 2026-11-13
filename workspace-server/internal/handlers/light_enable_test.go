@@ -300,6 +300,9 @@ func TestLightManagementRefusesTheWorkspaceItself(t *testing.T) {
 	routes := map[string]func(*LightHandler) func(*gin.Context){
 		"enable":  func(h *LightHandler) func(*gin.Context) { return h.Enable },
 		"disable": func(h *LightHandler) func(*gin.Context) { return h.Disable },
+		"park":    func(h *LightHandler) func(*gin.Context) { return h.Park },
+		"open":    func(h *LightHandler) func(*gin.Context) { return h.Open },
+		"run":     func(h *LightHandler) func(*gin.Context) { return h.RunNow },
 	}
 	// The identity WorkspaceAuth proved and recorded (any token of the
 	// workspace, a run token included), and the X-Workspace-ID header.
@@ -359,7 +362,7 @@ func TestLightRoutesRejectANonCanonicalID(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
 	lh, _ := newLightTestHandler(t, &fakeLightAPI{})
-	for _, handle := range []func(*gin.Context){lh.Enable, lh.Disable, lh.Get, lh.ListRuns, lh.ReportRun} {
+	for _, handle := range []func(*gin.Context){lh.Enable, lh.Disable, lh.Get, lh.ListRuns, lh.ReportRun, lh.Park, lh.Open, lh.RunNow} {
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
 		c.Params = gin.Params{{Key: "id", Value: "ws-1"}}

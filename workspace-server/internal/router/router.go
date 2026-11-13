@@ -307,6 +307,9 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.GET("/light", lh.Get)
 		wsAuth.POST("/light/enable", lh.Enable)
 		wsAuth.POST("/light/disable", lh.Disable)
+		wsAuth.POST("/light/park", lh.Park)
+		wsAuth.POST("/light/open", lh.Open)
+		wsAuth.POST("/light/run", lh.RunNow)
 		wsAuth.GET("/light/runs", lh.ListRuns)
 		wsAuth.POST("/light/runs", lh.ReportRun)
 

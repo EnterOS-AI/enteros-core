@@ -111,6 +111,9 @@ var reviewedLightWakeSites = map[string]reviewedWakeSite{
 	// is open (enable) or no longer Light (disable): both are outside parking/parked.
 	"handlers/light_handlers.go|WorkspaceHandler.applyLightEnvChange|WakeWorkspace":            {1, "Light enable/disable, light_state open or NULL"},
 	"handlers/light_handlers.go|WorkspaceHandler.applyLightEnvChange|RestartByIDAfterMutation": {1, "Light enable/disable, light_state open or NULL"},
+	// Light's own wake: open pauses the CronJobs, claims 'opening' (which the
+	// wake predicate allows) and only then wakes.
+	"handlers/light_park.go|WorkspaceHandler.openLight|WakeWorkspace": {1, "Light open, after the pause, light_state opening"},
 	// The wiring packages hand method values on; each is reached only through
 	// a closure above.
 	"router/router.go|Setup|RestartByID":              {2, "secrets handlers (workspace, global) → runRestartCycle predicates + refresh"},

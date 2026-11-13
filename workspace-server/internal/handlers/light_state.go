@@ -10,8 +10,8 @@ package handlers
 // guards only decide what the caller is told.
 //
 // TRANSITIONS. Every light_state change is one guarded UPDATE (the from-set in
-// the WHERE, setLightState) that stamps light_state_at; the caller broadcasts
-// WORKSPACE_UPDATED with the new state and logs one line.
+// the WHERE, setLightState) that stamps light_state_at, broadcasts
+// WORKSPACE_UPDATED with the new state and logs one line (lightTransition).
 
 import (
 	"context"
@@ -26,6 +26,7 @@ import (
 	"github.com/lib/pq"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 )
 
@@ -44,14 +45,37 @@ func readLightState(ctx context.Context, workspaceID string) (string, error) {
 	return state, err
 }
 
-// lightRefusal is a Light guard's answer: the status and body the caller gets.
+// lightRefusal is a Light guard's (or a failed Light step's) answer: the status
+// and body the caller gets, and a Retry-After for a 503.
 type lightRefusal struct {
-	Status int
-	Body   gin.H
+	Status     int
+	Body       gin.H
+	RetryAfter string
 }
 
 func (r *lightRefusal) write(c *gin.Context) {
+	if r.RetryAfter != "" {
+		c.Header("Retry-After", r.RetryAfter)
+	}
 	c.AbortWithStatusJSON(r.Status, r.Body)
+}
+
+// code is the refusal's error code ("" when it has none).
+func (r *lightRefusal) code() string {
+	if r == nil {
+		return ""
+	}
+	s, _ := r.Body["code"].(string)
+	return s
+}
+
+// newLightRefusal builds a refusal in core's error shape plus extras.
+func newLightRefusal(status int, code, message string, extra gin.H) *lightRefusal {
+	body := gin.H{"error": message, "code": code}
+	for k, v := range extra {
+		body[k] = v
+	}
+	return &lightRefusal{Status: status, Body: body}
 }
 
 // lightParkedRefusal is the 409 for a workspace in a wake-blocking state, nil
@@ -134,6 +158,57 @@ func setLightState(ctx context.Context, exec activityExecutor, workspaceID strin
 		return false, err
 	}
 	return n > 0, nil
+}
+
+// lightTransition is setLightState plus the broadcast and the log line every
+// transition emits.
+func (h *WorkspaceHandler) lightTransition(ctx context.Context, workspaceID, op string, trig lightTrigger, from []string, to string) (bool, error) {
+	changed, err := setLightState(ctx, db.DB, workspaceID, from, to)
+	result := "ok"
+	switch {
+	case err != nil:
+		result = "error"
+	case !changed:
+		result = "not-in-state"
+	}
+	log.Printf("light op=%s ws=%s from=%v to=%q trigger=%s result=%s", op, workspaceID, from, to, trig, result)
+	if err == nil && changed {
+		h.broadcastLightState(workspaceID, to)
+	}
+	return changed, err
+}
+
+// broadcastLightState tells the canvas the agent's new light_state ("" = not
+// a Light agent) through WORKSPACE_UPDATED: no new event type.
+func (h *WorkspaceHandler) broadcastLightState(workspaceID, state string) {
+	if h == nil || h.broadcaster == nil {
+		return
+	}
+	var v interface{}
+	if state != "" {
+		v = state
+	}
+	h.broadcaster.BroadcastOnly(workspaceID, string(events.EventWorkspaceUpdated), map[string]interface{}{"light_state": v})
+}
+
+// recordLightError stores the last background Light failure for GET /light.
+func recordLightError(ctx context.Context, workspaceID, code, message string) {
+	if _, err := db.DB.ExecContext(ctx, `
+		UPDATE workspaces
+		SET light_last_error = jsonb_build_object('code', $2::text, 'message', $3::text), light_last_error_at = now()
+		WHERE id = $1`, workspaceID, code, message); err != nil {
+		log.Printf("light: recording error %s for %s failed: %v", code, workspaceID, err)
+	}
+}
+
+// clearLightError forgets the last background failure once a park or open
+// completed.
+func clearLightError(ctx context.Context, workspaceID string) {
+	if _, err := db.DB.ExecContext(ctx, `
+		UPDATE workspaces SET light_last_error = NULL, light_last_error_at = NULL
+		WHERE id = $1 AND light_last_error IS NOT NULL`, workspaceID); err != nil {
+		log.Printf("light: clearing the last error of %s failed: %v", workspaceID, err)
+	}
 }
 
 // Pending-action kinds. A pending action is work queued for a parked agent:

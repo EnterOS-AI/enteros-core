@@ -170,6 +170,9 @@ type WorkspaceHandler struct {
 	// endpoints then answer 501 LIGHT_UNSUPPORTED. main.go wires it from the
 	// CP provisioner via SetLightAPI.
 	lightAPI provisioner.LightAPI
+	// lightScheduleReader is a test seam for the park's read of the agent's
+	// schedule grid; nil = the schedules proxy (light_park.go).
+	lightScheduleReader func(ctx context.Context, workspaceID string) ([]volumeEntry, error)
 }
 
 // SetLightAPI wires the control plane's Light routes (C4). Called once from

@@ -13,6 +13,9 @@ func TestLightRoutesAreRegisteredUnderWorkspaceAuth(t *testing.T) {
 		"GET /workspaces/:id/light",
 		"POST /workspaces/:id/light/enable",
 		"POST /workspaces/:id/light/disable",
+		"POST /workspaces/:id/light/park",
+		"POST /workspaces/:id/light/open",
+		"POST /workspaces/:id/light/run",
 		"GET /workspaces/:id/light/runs",
 		"POST /workspaces/:id/light/runs",
 	} {
