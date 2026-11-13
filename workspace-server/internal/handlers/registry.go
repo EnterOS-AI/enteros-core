@@ -1342,6 +1342,12 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	// cache — and is answered 409. Its pod is being (or has been) stopped; a run
 	// pod never heartbeats. The UPDATEs below carry the predicate too.
 	if ref := lightWakeRefusal(ctx, payload.WorkspaceID, "heartbeat"); ref != nil {
+		if ref.code() == "LIGHT_AGENT_PARKING" {
+			// A park is in flight and the pod is still up: record whether it is
+			// busy, and nothing else, so the park sees a turn that started around
+			// its claim and is undone instead of stopping the agent mid-turn.
+			recordLightParkingBusy(ctx, payload.WorkspaceID, payload.ActiveTasks, payload.IsBusy)
+		}
 		ref.write(c)
 		return
 	}

@@ -22,13 +22,29 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 )
 
-const lightLoadSQL = `SELECT name, status, COALESCE\(runtime, 'claude-code'\), COALESCE\(kind, 'workspace'\),\s+COALESCE\(light_state, ''\), COALESCE\(active_tasks, 0\), light_run_token_id, light_retired_token_id\s+FROM workspaces WHERE id = \$1 AND status != 'removed'`
+const lightLoadSQL = `SELECT name, status, COALESCE\(runtime, 'claude-code'\), COALESCE\(kind, 'workspace'\),\s+COALESCE\(light_state, ''\), COALESCE\(active_tasks, 0\), light_run_token_id, light_retired_token_id,\s+COALESCE\(is_busy, false\), light_state_at, COALESCE\(light_park_trigger, ''\),\s+COALESCE\(light_park_watermark, 0\), light_pending_token_id\s+FROM workspaces WHERE id = \$1 AND status != 'removed'`
+
+// lightLoadExtra is the part-2 columns of a scripted loadLightWorkspace row.
+type lightLoadExtra struct {
+	isBusy         bool
+	stateAt        interface{}
+	parkTrigger    string
+	parkWatermark  int64
+	pendingTokenID interface{}
+}
 
 // expectLightLoad scripts loadLightWorkspace.
 func expectLightLoad(mock sqlmock.Sqlmock, status, runtime, kind, lightState string, activeTasks int, runToken, retiredToken interface{}) {
+	expectLightLoadWith(mock, status, runtime, kind, lightState, activeTasks, runToken, retiredToken, lightLoadExtra{})
+}
+
+// expectLightLoadWith scripts loadLightWorkspace with the part-2 columns.
+func expectLightLoadWith(mock sqlmock.Sqlmock, status, runtime, kind, lightState string, activeTasks int, runToken, retiredToken interface{}, x lightLoadExtra) {
 	mock.ExpectQuery(lightLoadSQL).WithArgs(lightTestWS).
-		WillReturnRows(sqlmock.NewRows([]string{"name", "status", "runtime", "kind", "light_state", "active_tasks", "light_run_token_id", "light_retired_token_id"}).
-			AddRow("Light agent", status, runtime, kind, lightState, activeTasks, runToken, retiredToken))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "status", "runtime", "kind", "light_state", "active_tasks", "light_run_token_id", "light_retired_token_id",
+			"is_busy", "light_state_at", "light_park_trigger", "light_park_watermark", "light_pending_token_id"}).
+			AddRow("Light agent", status, runtime, kind, lightState, activeTasks, runToken, retiredToken,
+				x.isBusy, x.stateAt, x.parkTrigger, x.parkWatermark, x.pendingTokenID))
 }
 
 const lightSecretReadSQL = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = \$2`
@@ -430,6 +446,26 @@ func TestLightDisableDeletesCPObjectsThenEverythingElse(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet: %v", err)
+	}
+}
+
+// A run token a park minted but never recorded (it was interrupted before its
+// commit) is revoked by disable with the others (review 21718 N1).
+func TestLightDisableRevokesAnUnrecordedParkToken(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	api := &fakeLightAPI{}
+	lh, _ := newLightTestHandler(t, api)
+	expectLightLoadWith(mock, "hibernated", "hermes", "workspace", "parking", 0, "tok-current", nil, lightLoadExtra{pendingTokenID: "tok-pending"})
+	expectLightDisableWrites(mock, []string{"tok-current", "tok-pending"}, `{"present":false}`, func(mock sqlmock.Sqlmock) {
+		mock.ExpectExec(lightDeleteSecretSQL).WithArgs(lightTestWS, "MOLECULE_CONTINUOUS").WillReturnResult(sqlmock.NewResult(0, 1))
+	})
+	w := lightCall(lh.Disable, http.MethodPost, "/", "", nil)
+	if w.Code != http.StatusOK || lightBody(t, w)["status"] != "disabled" {
+		t.Fatalf("disable = %d %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet (the pending token is revoked with the others): %v", err)
 	}
 }
 

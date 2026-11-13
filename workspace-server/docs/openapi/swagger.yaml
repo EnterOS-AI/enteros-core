@@ -761,7 +761,8 @@ paths:
     post:
       description: Pauses the agent's CronJobs (runs that had not started yet are
         cancelled), then wakes its pod for chat. Answers 202; light_state goes opening
-        → open once the pod is up. A failed pause leaves the agent parked.
+        → open once the pod is up. A failed pause leaves the agent parked. Also recovers
+        a park stuck in parking for three minutes.
       parameters:
       - description: Workspace ID
         in: path
@@ -772,7 +773,7 @@ paths:
       - application/json
       responses:
         "200":
-          description: already open or opening
+          description: already open or opening (the owner takes it over)
           schema:
             additionalProperties: true
             type: object
@@ -781,8 +782,18 @@ paths:
           schema:
             additionalProperties: true
             type: object
+        "400":
+          description: LIGHT_BAD_REQUEST
+          schema:
+            additionalProperties: true
+            type: object
         "403":
           description: LIGHT_SELF_FORBIDDEN
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: WORKSPACE_NOT_FOUND, LIGHT_TENANT_NOT_FOUND
           schema:
             additionalProperties: true
             type: object
@@ -791,8 +802,18 @@ paths:
           schema:
             additionalProperties: true
             type: object
+        "500":
+          description: LIGHT_FAILED
+          schema:
+            additionalProperties: true
+            type: object
         "501":
           description: LIGHT_UNSUPPORTED
+          schema:
+            additionalProperties: true
+            type: object
+        "502":
+          description: LIGHT_FAILED
           schema:
             additionalProperties: true
             type: object
@@ -811,7 +832,8 @@ paths:
       description: Hands the agent's schedules to the control plane as CronJobs, stops
         its pod and resumes the CronJobs. Answers 202 once the CronJobs are written;
         light_state goes parking → parked in the background (poll GET /workspaces/{id}/light).
-        A refusal leaves the agent open.
+        A refusal before the parking claim changes nothing; one after it returns the
+        agent to open and records last_error.
       parameters:
       - description: Workspace ID
         in: path
@@ -831,8 +853,18 @@ paths:
           schema:
             additionalProperties: true
             type: object
+        "400":
+          description: LIGHT_BAD_REQUEST
+          schema:
+            additionalProperties: true
+            type: object
         "403":
           description: LIGHT_SELF_FORBIDDEN
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: WORKSPACE_NOT_FOUND, LIGHT_TENANT_NOT_FOUND
           schema:
             additionalProperties: true
             type: object
@@ -852,13 +884,18 @@ paths:
           schema:
             additionalProperties: true
             type: object
+        "500":
+          description: LIGHT_FAILED
+          schema:
+            additionalProperties: true
+            type: object
         "501":
           description: LIGHT_UNSUPPORTED
           schema:
             additionalProperties: true
             type: object
         "502":
-          description: LIGHT_SCHEDULES_UNREADABLE
+          description: LIGHT_SCHEDULES_UNREADABLE, LIGHT_FAILED
           schema:
             additionalProperties: true
             type: object
@@ -903,7 +940,7 @@ paths:
             additionalProperties: true
             type: object
         "404":
-          description: LIGHT_SCHEDULE_NOT_FOUND
+          description: WORKSPACE_NOT_FOUND, LIGHT_SCHEDULE_NOT_FOUND, LIGHT_TENANT_NOT_FOUND
           schema:
             additionalProperties: true
             type: object
@@ -918,8 +955,18 @@ paths:
           schema:
             additionalProperties: true
             type: object
+        "500":
+          description: LIGHT_FAILED
+          schema:
+            additionalProperties: true
+            type: object
         "501":
           description: LIGHT_UNSUPPORTED
+          schema:
+            additionalProperties: true
+            type: object
+        "502":
+          description: LIGHT_FAILED
           schema:
             additionalProperties: true
             type: object

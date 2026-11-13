@@ -211,6 +211,75 @@ func clearLightError(ctx context.Context, workspaceID string) {
 	}
 }
 
+// Error codes that are also markers the monitor acts on.
+const (
+	// lightCodeOpenIncomplete: an open paused the CronJobs and has not claimed
+	// 'opening' yet. Left behind by an interrupted open; the monitor resumes
+	// the CronJobs of a parked agent that carries it (review 21718 O3).
+	lightCodeOpenIncomplete = "LIGHT_OPEN_INCOMPLETE"
+	// lightCodeRefreshOpenFailed: a refresh open did not bring the agent up;
+	// it was parked again on its previous snapshot. Kept across that park's
+	// resume, so the refresh back-off applies (review 21718 R4).
+	lightCodeRefreshOpenFailed = "LIGHT_REFRESH_OPEN_FAILED"
+	// lightCodeActionFailed: a queued action's applier failed during a refresh
+	// cycle. Kept across the park that ends the cycle, so the back-off spaces
+	// the retries (review 21718 N7).
+	lightCodeActionFailed = "LIGHT_ACTION_FAILED"
+)
+
+// lightParkKeptErrors are the errors a completed park keeps: their timestamp
+// is the refresh back-off of the cycle that recorded them.
+var lightParkKeptErrors = []string{lightCodeRefreshOpenFailed, lightCodeActionFailed}
+
+// markLightOpenIncomplete records the open marker before an open pauses the
+// CronJobs. Unlike recordLightError it reports a failure: an open must not
+// pause what nothing would resume.
+func markLightOpenIncomplete(ctx context.Context, workspaceID string) error {
+	_, err := db.DB.ExecContext(ctx, `
+		UPDATE workspaces
+		SET light_last_error = jsonb_build_object('code', $2::text, 'message', $3::text), light_last_error_at = now()
+		WHERE id = $1`, workspaceID, lightCodeOpenIncomplete, lightOpenIncompleteMessage)
+	return err
+}
+
+// recordLightErrorKeepingOpenMarker is recordLightError, except over the open
+// marker: the monitor needs it to resume the schedules an open left paused.
+func recordLightErrorKeepingOpenMarker(ctx context.Context, workspaceID, code, message string) {
+	if _, err := db.DB.ExecContext(ctx, `
+		UPDATE workspaces
+		SET light_last_error = jsonb_build_object('code', $2::text, 'message', $3::text), light_last_error_at = now()
+		WHERE id = $1 AND COALESCE(light_last_error->>'code', '') <> $4`,
+		workspaceID, code, message, lightCodeOpenIncomplete); err != nil {
+		log.Printf("light: recording error %s for %s failed: %v", code, workspaceID, err)
+	}
+}
+
+// recordLightParkingBusy is the one write a heartbeat of a 'parking' agent
+// makes: whether it is busy (active_tasks, is_busy as the main heartbeat
+// derives it), only while its pod is still up. The park's busy check and its
+// hibernate claim (active_tasks = 0) then see a turn that started around the
+// claim (review 21718 R3). Nothing that wakes, routes or revives the agent is
+// written; heartbeats of a parked agent write nothing at all.
+func recordLightParkingBusy(ctx context.Context, workspaceID string, activeTasks int, isBusy *bool) {
+	if _, err := db.DB.ExecContext(ctx, `
+		UPDATE workspaces SET active_tasks = $2, is_busy = COALESCE($3, ($2 > 0))
+		WHERE id = $1 AND light_state = 'parking' AND status IN ('online', 'degraded')`,
+		workspaceID, activeTasks, isBusy); err != nil {
+		log.Printf("light: recording the busy state of parking %s failed: %v", workspaceID, err)
+	}
+}
+
+// clearLightParkError is clearLightError after a park reached 'parked': it
+// keeps lightParkKeptErrors, whose timestamp is the refresh back-off.
+func clearLightParkError(ctx context.Context, workspaceID string) {
+	if _, err := db.DB.ExecContext(ctx, `
+		UPDATE workspaces SET light_last_error = NULL, light_last_error_at = NULL
+		WHERE id = $1 AND light_last_error IS NOT NULL AND NOT (COALESCE(light_last_error->>'code', '') = ANY($2))`,
+		workspaceID, pq.Array(lightParkKeptErrors)); err != nil {
+		log.Printf("light: clearing the last error of %s failed: %v", workspaceID, err)
+	}
+}
+
 // Pending-action kinds. A pending action is work queued for a parked agent:
 // the Light monitor opens the agent, applies each action once it is online and
 // idle, and parks it again. 'refresh' needs nothing applied beyond the open
@@ -239,12 +308,17 @@ func queueLightAction(ctx context.Context, workspaceID, kind, source string, pay
 		INSERT INTO light_pending_actions (workspace_id, kind, payload, source)
 		VALUES ($1, $2, $3::jsonb, $4)`
 	if dedupe {
+		// While a park is in flight, an action is never merged into a row at or
+		// below the park's watermark: the park marks those applied, and this
+		// change may postdate its env snapshot (review 21718 R1).
 		query = `
 		INSERT INTO light_pending_actions (workspace_id, kind, payload, source)
 		SELECT $1, $2, $3::jsonb, $4
 		WHERE NOT EXISTS (
-			SELECT 1 FROM light_pending_actions
-			WHERE workspace_id = $1 AND kind = $2 AND applied_at IS NULL AND payload = $3::jsonb)`
+			SELECT 1 FROM light_pending_actions a
+			WHERE a.workspace_id = $1 AND a.kind = $2 AND a.applied_at IS NULL AND a.payload = $3::jsonb
+			  AND a.id > COALESCE((SELECT w.light_park_watermark FROM workspaces w
+			                       WHERE w.id = $1 AND w.light_state = 'parking'), 0))`
 	}
 	res, err := db.DB.ExecContext(ctx, query, workspaceID, kind, string(raw), source)
 	if err != nil {

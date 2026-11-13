@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 
@@ -34,7 +35,7 @@ const (
 
 const lightIDsQuery = `SELECT id FROM workspaces WHERE id = ANY\(\$1::uuid\[\]\) AND light_state IS NOT NULL`
 
-const lightClearAfterDelete = `UPDATE workspaces\s+SET light_state = NULL, light_state_at = now\(\), light_opened_by = NULL,\s+light_run_token_id = NULL, light_retired_token_id = NULL\s+WHERE id = \$1`
+const lightClearAfterDelete = `UPDATE workspaces\s+SET light_state = NULL, light_state_at = now\(\), light_opened_by = NULL,\s+light_run_token_id = NULL, light_retired_token_id = NULL, light_pending_token_id = NULL,\s+light_park_trigger = NULL, light_park_watermark = NULL\s+WHERE id = \$1`
 
 // cascadeDeleteWithLight runs CascadeDelete(root) over root+child; script adds
 // the Light expectations after the descendant walk and the removed-mark.
@@ -142,5 +143,68 @@ func TestCascadeDeleteOnATenantWithoutLightSupportSkipsTheCall(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet: %v", err)
+	}
+}
+
+// A workspace delete waits for a Light operation on the agent (a park's PUT in
+// flight) before deleting its Light objects, so the park cannot write them
+// back behind the delete; once lightDeleteLockWait has passed it deletes
+// without the lock (review 21718 O4).
+func TestCascadeDeleteWaitsForALightOperationOnTheAgent(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		holdFor     time.Duration
+		wait        time.Duration
+		afterUnlock bool // the Light delete comes after the operation released the lock
+	}{
+		{"released in time", 200 * time.Millisecond, 10 * time.Second, true},
+		{"held past the wait", 2 * time.Second, 100 * time.Millisecond, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := lightDeleteLockWait
+			lightDeleteLockWait = tc.wait
+			t.Cleanup(func() { lightDeleteLockWait = prev })
+			mock := setupTestDB(t)
+			setupTestRedis(t)
+			mock.ExpectQuery(`WITH RECURSIVE descendants AS`).WithArgs(lightDeleteRoot).
+				WillReturnRows(sqlmock.NewRows([]string{"id"}))
+			mock.ExpectExec(`UPDATE workspaces SET status = \$1, updated_at = now\(\) WHERE id = ANY`).
+				WillReturnResult(sqlmock.NewResult(0, 1))
+			mock.ExpectQuery(lightIDsQuery).WithArgs(pqArrayArg{lightDeleteRoot}).
+				WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(lightDeleteRoot))
+			mock.ExpectExec(lightClearAfterDelete).WithArgs(lightDeleteRoot).WillReturnResult(sqlmock.NewResult(0, 1))
+
+			h := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+			prov := &inflightRecordingProv{}
+			h.provisioner = prov
+			h.SetLightAPI(orderedLightAPI{fakeLightAPI: &fakeLightAPI{}, prov: prov})
+
+			lock := lightOpLock(lightDeleteRoot)
+			lock.Lock()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				time.Sleep(tc.holdFor)
+				prov.record("light-unlock")
+				lock.Unlock()
+			}()
+			if _, _, err := h.CascadeDelete(context.Background(), lightDeleteRoot, false); err != nil {
+				t.Fatalf("CascadeDelete: %v", err)
+			}
+			<-done
+			prov.mu.Lock()
+			calls := strings.Join(prov.calls, " ")
+			prov.mu.Unlock()
+			unlockAt, deleteAt := strings.Index(calls, "light-unlock"), strings.Index(calls, "light-delete:"+lightDeleteRoot)
+			if deleteAt < 0 {
+				t.Fatalf("calls = %s, want the Light objects deleted", calls)
+			}
+			if tc.afterUnlock != (unlockAt < deleteAt) {
+				t.Errorf("calls = %s (unlock@%d delete@%d)", calls, unlockAt, deleteAt)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet: %v", err)
+			}
+		})
 	}
 }

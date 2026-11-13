@@ -103,3 +103,42 @@ func TestLightMigration_DownRemovesEverythingUpAdds(t *testing.T) {
 		}
 	}
 }
+
+// 20261113130000_light_park (Enter OS Light part 2) is held to the same rules.
+func TestLightParkMigration_IsAdditiveAndDownRemovesIt(t *testing.T) {
+	const base = "20261113130000_light_park"
+	read := func(suffix string) string {
+		b, err := os.ReadFile(filepath.Join("../../migrations", base+suffix))
+		if err != nil {
+			t.Fatalf("read %s%s: %v", base, suffix, err)
+		}
+		return string(b)
+	}
+	up := strings.ToUpper(maskNonCode(read(".up.sql")))
+	down := strings.ToUpper(maskNonCode(read(".down.sql")))
+	for _, col := range []string{"LIGHT_PARK_TRIGGER", "LIGHT_PARK_WATERMARK", "LIGHT_PENDING_TOKEN_ID"} {
+		if !strings.Contains(up, "ADD COLUMN IF NOT EXISTS "+col+" ") {
+			t.Errorf("up migration lacks column %s", col)
+		}
+		if !strings.Contains(down, "DROP COLUMN IF EXISTS "+col+";") {
+			t.Errorf("down migration does not drop column %s", col)
+		}
+	}
+	for _, m := range regexp.MustCompile(`ADD COLUMN (\w+)`).FindAllStringSubmatch(up, -1) {
+		if !strings.Contains(m[0], "IF") {
+			t.Errorf("unguarded statement %q", m[0])
+		}
+	}
+	for _, forbidden := range []string{"DROP ", "DELETE FROM", "TRUNCATE", "CONCURRENTLY", "BEGIN", "COMMIT", "UPDATE "} {
+		if strings.Contains(up, forbidden) {
+			t.Errorf("up migration must be additive and runner-wrapped; found %q", forbidden)
+		}
+	}
+	p, err := planMigration(base+".up.sql", read(".up.sql"))
+	if err != nil {
+		t.Fatalf("planMigration: %v", err)
+	}
+	if !p.Wrappable {
+		t.Fatalf("not wrappable because %s", p.NotWrappableBecause)
+	}
+}

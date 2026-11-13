@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -67,6 +68,14 @@ type lightWorkspaceRow struct {
 	ActiveTasks    int
 	RunTokenID     sql.NullString
 	RetiredTokenID sql.NullString
+	// Part 2: the busy flag the park checks, how long the state has held, and
+	// what a park in flight recorded (its trigger, watermark and unrecorded
+	// run token).
+	IsBusy         bool
+	StateAt        sql.NullTime
+	ParkTrigger    string
+	ParkWatermark  int64
+	PendingTokenID sql.NullString
 }
 
 // loadLightWorkspace reads a non-removed workspace; sql.ErrNoRows when absent.
@@ -74,9 +83,12 @@ func loadLightWorkspace(ctx context.Context, workspaceID string) (lightWorkspace
 	var r lightWorkspaceRow
 	err := db.DB.QueryRowContext(ctx, `
 		SELECT name, status, COALESCE(runtime, 'claude-code'), COALESCE(kind, 'workspace'),
-		       COALESCE(light_state, ''), COALESCE(active_tasks, 0), light_run_token_id, light_retired_token_id
+		       COALESCE(light_state, ''), COALESCE(active_tasks, 0), light_run_token_id, light_retired_token_id,
+		       COALESCE(is_busy, false), light_state_at, COALESCE(light_park_trigger, ''),
+		       COALESCE(light_park_watermark, 0), light_pending_token_id
 		FROM workspaces WHERE id = $1 AND status != 'removed'`, workspaceID,
-	).Scan(&r.Name, &r.Status, &r.Runtime, &r.Kind, &r.LightState, &r.ActiveTasks, &r.RunTokenID, &r.RetiredTokenID)
+	).Scan(&r.Name, &r.Status, &r.Runtime, &r.Kind, &r.LightState, &r.ActiveTasks, &r.RunTokenID, &r.RetiredTokenID,
+		&r.IsBusy, &r.StateAt, &r.ParkTrigger, &r.ParkWatermark, &r.PendingTokenID)
 	return r, err
 }
 
@@ -520,6 +532,11 @@ func (h *WorkspaceHandler) deleteLightForCascade(ctx context.Context, ids []stri
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
+			// Under the agent's Light lock when it can be had in time, so a park
+			// cannot write objects behind the delete (the park also re-deletes
+			// when it finds the workspace removed; review 21718 O4).
+			unlock := lockLightForDelete(dctx, id)
+			defer unlock()
 			if _, err := h.deleteLightObjects(dctx, id); err != nil {
 				log.Printf("CascadeDelete %s: deleting its Light objects failed: %v — the row keeps light_state", id, err)
 				mu.Lock()
@@ -534,13 +551,36 @@ func (h *WorkspaceHandler) deleteLightForCascade(ctx context.Context, ids []stri
 	return errs
 }
 
+// lightDeleteLockWait bounds how long a workspace delete waits for a Light
+// operation on the agent to finish before deleting without the lock.
+var lightDeleteLockWait = 10 * time.Second
+
+// lockLightForDelete takes the agent's Light lock, waiting up to
+// lightDeleteLockWait; the returned func releases it (a no-op when the wait
+// ran out and the delete goes ahead without it).
+func lockLightForDelete(ctx context.Context, workspaceID string) (unlock func()) {
+	lock := lightOpLock(workspaceID)
+	deadline := time.Now().Add(lightDeleteLockWait)
+	for {
+		if lock.TryLock() {
+			return lock.Unlock
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			log.Printf("CascadeDelete %s: a Light operation still holds the agent; deleting its Light objects without the lock", workspaceID)
+			return func() {}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // clearLightColumnsAfterDelete forgets a deleted workspace's Light state once
 // its control-plane objects are gone (its tokens were revoked by the delete).
 func clearLightColumnsAfterDelete(ctx context.Context, workspaceID string) {
 	if _, err := db.DB.ExecContext(ctx, `
 		UPDATE workspaces
 		SET light_state = NULL, light_state_at = now(), light_opened_by = NULL,
-		    light_run_token_id = NULL, light_retired_token_id = NULL
+		    light_run_token_id = NULL, light_retired_token_id = NULL, light_pending_token_id = NULL,
+		    light_park_trigger = NULL, light_park_watermark = NULL
 		WHERE id = $1`, workspaceID); err != nil {
 		log.Printf("light: clearing the Light columns of deleted %s failed: %v (its Light objects are gone)", workspaceID, err)
 	}
@@ -568,7 +608,7 @@ func (h *WorkspaceHandler) disableLight(ctx context.Context, workspaceID string,
 		return deleted, err
 	}
 	var tokens []string
-	for _, t := range []sql.NullString{row.RunTokenID, row.RetiredTokenID} {
+	for _, t := range []sql.NullString{row.RunTokenID, row.RetiredTokenID, row.PendingTokenID} {
 		if t.Valid && t.String != "" {
 			tokens = append(tokens, t.String)
 		}
@@ -592,6 +632,7 @@ func (h *WorkspaceHandler) disableLight(ctx context.Context, workspaceID string,
 		UPDATE workspaces
 		SET light_state = NULL, light_state_at = now(), light_opened_by = NULL,
 		    light_run_token_id = NULL, light_retired_token_id = NULL, light_continuous_before = NULL,
+		    light_pending_token_id = NULL, light_park_trigger = NULL, light_park_watermark = NULL,
 		    light_last_error = NULL, light_last_error_at = NULL, updated_at = now()
 		WHERE id = $1`, workspaceID); err != nil {
 		return deleted, err
@@ -673,18 +714,21 @@ type lightParkScheduleView struct {
 // Park handles POST /workspaces/:id/light/park.
 //
 //	@Summary	Park a Light agent
-//	@Description	Hands the agent's schedules to the control plane as CronJobs, stops its pod and resumes the CronJobs. Answers 202 once the CronJobs are written; light_state goes parking → parked in the background (poll GET /workspaces/{id}/light). A refusal leaves the agent open.
+//	@Description	Hands the agent's schedules to the control plane as CronJobs, stops its pod and resumes the CronJobs. Answers 202 once the CronJobs are written; light_state goes parking → parked in the background (poll GET /workspaces/{id}/light). A refusal before the parking claim changes nothing; one after it returns the agent to open and records last_error.
 //	@Tags		light
 //	@Produce	json
 //	@Param		id	path		string	true	"Workspace ID"
 //	@Success	202	{object}	map[string]interface{}	"{\"light_state\":\"parking\",\"schedules\":[...],\"removed\":[...]}"
 //	@Success	200	{object}	map[string]interface{}	"already parked"
+//	@Failure	400	{object}	map[string]interface{}	"LIGHT_BAD_REQUEST"
 //	@Failure	403	{object}	map[string]interface{}	"LIGHT_SELF_FORBIDDEN"
+//	@Failure	404	{object}	map[string]interface{}	"WORKSPACE_NOT_FOUND, LIGHT_TENANT_NOT_FOUND"
 //	@Failure	409	{object}	map[string]interface{}	"LIGHT_NOT_ENABLED, LIGHT_AGENT_NOT_AWAKE, LIGHT_AGENT_BUSY, LIGHT_RESTART_REQUIRED, LIGHT_ENV_UNSUPPORTED, LIGHT_TRANSITION_IN_PROGRESS"
 //	@Failure	413	{object}	map[string]interface{}	"LIGHT_TOO_LARGE"
 //	@Failure	422	{object}	map[string]interface{}	"LIGHT_INVALID, LIGHT_RUNTIME_UNSUPPORTED"
+//	@Failure	500	{object}	map[string]interface{}	"LIGHT_FAILED"
 //	@Failure	501	{object}	map[string]interface{}	"LIGHT_UNSUPPORTED"
-//	@Failure	502	{object}	map[string]interface{}	"LIGHT_SCHEDULES_UNREADABLE"
+//	@Failure	502	{object}	map[string]interface{}	"LIGHT_SCHEDULES_UNREADABLE, LIGHT_FAILED"
 //	@Failure	503	{object}	map[string]interface{}	"LIGHT_BACKEND_UNAVAILABLE"
 //	@Router		/workspaces/{id}/light/park [post]
 //	@Security	BearerAuth
@@ -700,21 +744,28 @@ func (h *LightHandler) Park(c *gin.Context) {
 			"another Light operation on this agent is in progress; retry shortly", nil)
 		return
 	}
+	// Released on every way out (a panic included) unless the background
+	// finish took it over.
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			lock.Unlock()
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), lightTransitionTimeout)
 	res, ref := h.wh.parkLight(ctx, c, id, lightTriggerOwner)
 	cancel()
 	if ref != nil {
-		lock.Unlock()
 		log.Printf("light op=park ws=%s status=%d code=%s", id, ref.Status, ref.code())
 		ref.write(c)
 		return
 	}
 	if res.Unchanged {
-		lock.Unlock()
 		c.JSON(http.StatusOK, gin.H{"status": "unchanged", "light_state": models.LightParked})
 		return
 	}
 	// The pod stop and the resume run after the answer, still under the lock.
+	handedOff = true
 	h.wh.goAsync(func() {
 		defer lock.Unlock()
 		fctx, fcancel := context.WithTimeout(context.Background(), lightTransitionTimeout)
@@ -746,15 +797,19 @@ func (h *LightHandler) Park(c *gin.Context) {
 // Open handles POST /workspaces/:id/light/open.
 //
 //	@Summary	Open a parked Light agent
-//	@Description	Pauses the agent's CronJobs (runs that had not started yet are cancelled), then wakes its pod for chat. Answers 202; light_state goes opening → open once the pod is up. A failed pause leaves the agent parked.
+//	@Description	Pauses the agent's CronJobs (runs that had not started yet are cancelled), then wakes its pod for chat. Answers 202; light_state goes opening → open once the pod is up. A failed pause leaves the agent parked. Also recovers a park stuck in parking for three minutes.
 //	@Tags		light
 //	@Produce	json
 //	@Param		id	path		string	true	"Workspace ID"
 //	@Success	202	{object}	map[string]interface{}	"{\"light_state\":\"opening\",\"cancelled\":[...]}"
-//	@Success	200	{object}	map[string]interface{}	"already open or opening"
+//	@Success	200	{object}	map[string]interface{}	"already open or opening (the owner takes it over)"
+//	@Failure	400	{object}	map[string]interface{}	"LIGHT_BAD_REQUEST"
 //	@Failure	403	{object}	map[string]interface{}	"LIGHT_SELF_FORBIDDEN"
+//	@Failure	404	{object}	map[string]interface{}	"WORKSPACE_NOT_FOUND, LIGHT_TENANT_NOT_FOUND"
 //	@Failure	409	{object}	map[string]interface{}	"LIGHT_NOT_ENABLED, LIGHT_TRANSITION_IN_PROGRESS"
+//	@Failure	500	{object}	map[string]interface{}	"LIGHT_FAILED"
 //	@Failure	501	{object}	map[string]interface{}	"LIGHT_UNSUPPORTED"
+//	@Failure	502	{object}	map[string]interface{}	"LIGHT_FAILED"
 //	@Failure	503	{object}	map[string]interface{}	"LIGHT_BACKEND_UNAVAILABLE"
 //	@Router		/workspaces/{id}/light/open [post]
 //	@Security	BearerAuth
@@ -795,7 +850,9 @@ func (h *LightHandler) Open(c *gin.Context) {
 //	@Success	201	{object}	map[string]interface{}	"{\"run_id\":\"light-...\"}"
 //	@Failure	400	{object}	map[string]interface{}	"LIGHT_BAD_REQUEST"
 //	@Failure	403	{object}	map[string]interface{}	"LIGHT_SELF_FORBIDDEN"
-//	@Failure	404	{object}	map[string]interface{}	"LIGHT_SCHEDULE_NOT_FOUND"
+//	@Failure	404	{object}	map[string]interface{}	"WORKSPACE_NOT_FOUND, LIGHT_SCHEDULE_NOT_FOUND, LIGHT_TENANT_NOT_FOUND"
+//	@Failure	500	{object}	map[string]interface{}	"LIGHT_FAILED"
+//	@Failure	502	{object}	map[string]interface{}	"LIGHT_FAILED"
 //	@Failure	409	{object}	map[string]interface{}	"LIGHT_NOT_PARKED, LIGHT_RUN_ACTIVE, LIGHT_RUN_EXISTS, LIGHT_AGENT_AWAKE, LIGHT_TENANT_SUSPENDED"
 //	@Failure	422	{object}	map[string]interface{}	"LIGHT_INVALID"
 //	@Failure	501	{object}	map[string]interface{}	"LIGHT_UNSUPPORTED"
@@ -813,7 +870,14 @@ func (h *LightHandler) RunNow(c *gin.Context) {
 	}
 	dec := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&body); err != nil {
+	err := dec.Decode(&body)
+	if err == nil {
+		// One object and nothing after it, as the control plane requires.
+		if extra := dec.Decode(&struct{}{}); extra != io.EOF {
+			err = errors.New("trailing data after the JSON object")
+		}
+	}
+	if err != nil {
 		lightCode(c, op, id, http.StatusBadRequest, "LIGHT_BAD_REQUEST", `the body must be {"schedule": "<name>"}`, nil)
 		return
 	}

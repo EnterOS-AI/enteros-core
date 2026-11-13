@@ -572,7 +572,7 @@
                         "BearerAuth": []
                     }
                 ],
-                "description": "Pauses the agent's CronJobs (runs that had not started yet are cancelled), then wakes its pod for chat. Answers 202; light_state goes opening → open once the pod is up. A failed pause leaves the agent parked.",
+                "description": "Pauses the agent's CronJobs (runs that had not started yet are cancelled), then wakes its pod for chat. Answers 202; light_state goes opening → open once the pod is up. A failed pause leaves the agent parked. Also recovers a park stuck in parking for three minutes.",
                 "produces": [
                     "application/json"
                 ],
@@ -591,7 +591,7 @@
                 ],
                 "responses": {
                     "200": {
-                        "description": "already open or opening",
+                        "description": "already open or opening (the owner takes it over)",
                         "schema": {
                             "type": "object",
                             "additionalProperties": true
@@ -604,8 +604,22 @@
                             "additionalProperties": true
                         }
                     },
+                    "400": {
+                        "description": "LIGHT_BAD_REQUEST",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
                     "403": {
                         "description": "LIGHT_SELF_FORBIDDEN",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "404": {
+                        "description": "WORKSPACE_NOT_FOUND, LIGHT_TENANT_NOT_FOUND",
                         "schema": {
                             "type": "object",
                             "additionalProperties": true
@@ -618,8 +632,22 @@
                             "additionalProperties": true
                         }
                     },
+                    "500": {
+                        "description": "LIGHT_FAILED",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
                     "501": {
                         "description": "LIGHT_UNSUPPORTED",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "502": {
+                        "description": "LIGHT_FAILED",
                         "schema": {
                             "type": "object",
                             "additionalProperties": true
@@ -642,7 +670,7 @@
                         "BearerAuth": []
                     }
                 ],
-                "description": "Hands the agent's schedules to the control plane as CronJobs, stops its pod and resumes the CronJobs. Answers 202 once the CronJobs are written; light_state goes parking → parked in the background (poll GET /workspaces/{id}/light). A refusal leaves the agent open.",
+                "description": "Hands the agent's schedules to the control plane as CronJobs, stops its pod and resumes the CronJobs. Answers 202 once the CronJobs are written; light_state goes parking → parked in the background (poll GET /workspaces/{id}/light). A refusal before the parking claim changes nothing; one after it returns the agent to open and records last_error.",
                 "produces": [
                     "application/json"
                 ],
@@ -674,8 +702,22 @@
                             "additionalProperties": true
                         }
                     },
+                    "400": {
+                        "description": "LIGHT_BAD_REQUEST",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
                     "403": {
                         "description": "LIGHT_SELF_FORBIDDEN",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "404": {
+                        "description": "WORKSPACE_NOT_FOUND, LIGHT_TENANT_NOT_FOUND",
                         "schema": {
                             "type": "object",
                             "additionalProperties": true
@@ -702,6 +744,13 @@
                             "additionalProperties": true
                         }
                     },
+                    "500": {
+                        "description": "LIGHT_FAILED",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
                     "501": {
                         "description": "LIGHT_UNSUPPORTED",
                         "schema": {
@@ -710,7 +759,7 @@
                         }
                     },
                     "502": {
-                        "description": "LIGHT_SCHEDULES_UNREADABLE",
+                        "description": "LIGHT_SCHEDULES_UNREADABLE, LIGHT_FAILED",
                         "schema": {
                             "type": "object",
                             "additionalProperties": true
@@ -776,7 +825,7 @@
                         }
                     },
                     "404": {
-                        "description": "LIGHT_SCHEDULE_NOT_FOUND",
+                        "description": "WORKSPACE_NOT_FOUND, LIGHT_SCHEDULE_NOT_FOUND, LIGHT_TENANT_NOT_FOUND",
                         "schema": {
                             "type": "object",
                             "additionalProperties": true
@@ -796,8 +845,22 @@
                             "additionalProperties": true
                         }
                     },
+                    "500": {
+                        "description": "LIGHT_FAILED",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
                     "501": {
                         "description": "LIGHT_UNSUPPORTED",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "502": {
+                        "description": "LIGHT_FAILED",
                         "schema": {
                             "type": "object",
                             "additionalProperties": true

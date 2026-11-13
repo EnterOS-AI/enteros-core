@@ -86,18 +86,33 @@ func TestHeartbeatFromAParkedLightAgentIs409AndWritesNothing(t *testing.T) {
 	}
 }
 
+// lightParkingBusySQL is the one write a parking agent's heartbeat makes.
+const lightParkingBusySQL = `UPDATE workspaces SET active_tasks = \$2, is_busy = COALESCE\(\$3, \(\$2 > 0\)\)\s+WHERE id = \$1 AND light_state = 'parking' AND status IN \('online', 'degraded'\)`
+
+// A parking agent's heartbeat is refused and revives nothing, but it still
+// records whether the agent is busy, so the park sees a turn that started
+// around its claim and is undone (review 21718 R3).
 func TestHeartbeatFromAParkingLightAgentIs409(t *testing.T) {
 	mock := setupTestDB(t)
-	setupTestRedis(t)
+	mr := setupTestRedis(t)
 	h := NewRegistryHandler(newTestBroadcaster())
 
 	expectNoLiveInstanceToken(mock, lightTestWS)
 	expectLightState(mock, lightTestWS, "parking")
+	mock.ExpectExec(lightParkingBusySQL).WithArgs(lightTestWS, 1, true).WillReturnResult(sqlmock.NewResult(0, 1))
 	rec := recordSQL(t)
 
-	body := `{"workspace_id":"` + lightTestWS + `","active_tasks":0}`
+	body := `{"workspace_id":"` + lightTestWS + `","active_tasks":1,"is_busy":true,"current_task":"a turn"}`
 	assertLightParked409(t, registryCall(t, h.Heartbeat, "/registry/heartbeat", body, ""), "LIGHT_AGENT_PARKING")
-	assertNoWrites(t, rec())
+	writes := sqlWrites(rec())
+	if len(writes) != 1 || !strings.Contains(writes[0], "SET active_tasks = $2, is_busy = COALESCE($3, ($2 > 0)) WHERE id = $1 AND light_state = 'parking'") {
+		t.Errorf("writes = %v, want only the busy fields of a parking row", writes)
+	}
+	for _, key := range []string{"ws:" + lightTestWS, "ws:" + lightTestWS + ":url", "ws:" + lightTestWS + ":internal_url"} {
+		if mr.Exists(key) {
+			t.Errorf("Redis key %s written for a parking agent", key)
+		}
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet: %v", err)
 	}

@@ -49,13 +49,22 @@ func TestIntegration_LightMonitor_AutoParkPredicate(t *testing.T) {
 	failed := seedLightWorkspace(t, conn, "test-light-failed", "online", "open")
 	parked := seedLightWorkspace(t, conn, "test-light-parked", "hibernated", "parked")
 	ordinary := seedLightWorkspace(t, conn, "test-light-ordinary", "online", "")
+	busyFlag := seedLightWorkspace(t, conn, "test-light-busy-flag", "online", "open")
+	refreshNow := seedLightWorkspace(t, conn, "test-light-refresh-now", "online", "open")
+	refreshActive := seedLightWorkspace(t, conn, "test-light-refresh-active", "online", "open")
 	old := `UPDATE workspaces SET light_state_at = now() - interval '45 minutes', last_activity_at = now() - interval '40 minutes' WHERE id = ANY($1::uuid[])`
-	for _, id := range []string{idle, busy, recent, failed, parked, ordinary} {
+	for _, id := range []string{idle, busy, recent, failed, parked, ordinary, busyFlag} {
 		lightExec(t, conn, old, "{"+id+"}")
 	}
 	lightExec(t, conn, `UPDATE workspaces SET active_tasks = 1 WHERE id = $1`, busy)
+	// A runtime that reports is_busy without active_tasks (RFC #4402 B2).
+	lightExec(t, conn, `UPDATE workspaces SET active_tasks = 0, is_busy = true WHERE id = $1`, busyFlag)
 	lightExec(t, conn, `UPDATE workspaces SET last_activity_at = now() - interval '5 minutes' WHERE id = $1`, recent)
-	lightExec(t, conn, `UPDATE workspaces SET light_opened_by = 'refresh' WHERE id = $1`, refresh)
+	// A refresh-opened agent parks once quiet for a minute (not the idle
+	// window): not while it has just come up, nor right after activity.
+	lightExec(t, conn, `UPDATE workspaces SET light_opened_by = 'refresh', light_state_at = now() - interval '2 minutes' WHERE id = $1`, refresh)
+	lightExec(t, conn, `UPDATE workspaces SET light_opened_by = 'refresh', light_state_at = now() - interval '10 seconds' WHERE id = $1`, refreshNow)
+	lightExec(t, conn, `UPDATE workspaces SET light_opened_by = 'refresh', light_state_at = now() - interval '5 minutes', last_activity_at = now() - interval '10 seconds' WHERE id = $1`, refreshActive)
 	lightExec(t, conn, `UPDATE workspaces SET light_last_error = '{"code":"X","message":"y"}', light_last_error_at = now() - interval '1 minute' WHERE id = $1`, failed)
 
 	rows, err := lightAutoParkCandidates(context.Background(), 30*time.Minute)
@@ -66,7 +75,8 @@ func TestIntegration_LightMonitor_AutoParkPredicate(t *testing.T) {
 	if got[idle] != "owner" || got[refresh] != "refresh" {
 		t.Errorf("want idle (owner) and refresh-opened (refresh); got %v", got)
 	}
-	for name, id := range map[string]string{"busy": busy, "recent activity": recent, "recent failure": failed, "parked": parked, "not Light": ordinary} {
+	for name, id := range map[string]string{"busy": busy, "is_busy": busyFlag, "recent activity": recent, "recent failure": failed, "parked": parked, "not Light": ordinary,
+		"refresh-opened a moment ago": refreshNow, "refresh-opened with recent activity": refreshActive} {
 		if _, ok := got[id]; ok {
 			t.Errorf("%s agent must not be auto-parked", name)
 		}
@@ -98,13 +108,30 @@ func TestIntegration_LightMonitor_RefreshCandidates(t *testing.T) {
 		}
 	}
 
-	// The park's watermark covers exactly the refreshes queued before it.
-	var watermark = lightRefreshWatermark(context.Background(), pending)
-	lightExec(t, conn, `INSERT INTO light_pending_actions (workspace_id, kind, source) VALUES ($1, 'refresh', 'plugin')`, pending)
-	markLightRefreshApplied(context.Background(), pending, watermark)
+	// The parking claim records the watermark: the newest refresh queued
+	// before it. A refresh queued while the park runs is a new row even when an
+	// identical one is waiting (that one is covered by this park's snapshot),
+	// and a second one is merged into the new row (review 21718 R1).
+	ctx := context.Background()
+	lightExec(t, conn, `UPDATE workspaces SET status = 'online', light_state = 'open' WHERE id = $1`, pending)
+	wh := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	watermark, claimed, err := wh.claimLightParking(ctx, pending, lightTriggerRefresh)
+	if err != nil || !claimed || watermark == 0 {
+		t.Fatalf("claim = %d %v %v", watermark, claimed, err)
+	}
+	for i, want := range []bool{true, false} {
+		if queued, err := queueLightRefresh(ctx, pending, "plugin"); err != nil || queued != want {
+			t.Errorf("refresh %d during the park: queued=%v err=%v, want %v", i+1, queued, err, want)
+		}
+	}
+	markLightRefreshApplied(ctx, pending, watermark)
 	var left int
 	if err := conn.QueryRow(`SELECT COUNT(*) FROM light_pending_actions WHERE workspace_id = $1 AND applied_at IS NULL`, pending).Scan(&left); err != nil || left != 1 {
-		t.Errorf("unapplied after the park = %d (%v), want only the refresh queued after the watermark", left, err)
+		t.Errorf("unapplied after the park = %d (%v), want only the refresh queued after the claim", left, err)
+	}
+	var trig string
+	if err := conn.QueryRow(`SELECT light_park_trigger FROM workspaces WHERE id = $1`, pending).Scan(&trig); err != nil || trig != "refresh" {
+		t.Errorf("light_park_trigger = %q (%v), want the claim to record who parked", trig, err)
 	}
 }
 
@@ -217,12 +244,14 @@ func TestIntegration_LightStreak_OrderAndCancelled(t *testing.T) {
 	ws := seedLightWorkspace(t, conn, "test-light-streak", "hibernated", "parked")
 	lightExec(t, conn, `INSERT INTO light_schedules (workspace_id, name, cron, prompt) VALUES ($1, 'daily', '0 9 * * *', 'p')`, ws)
 	at := func(h int) time.Time { return time.Date(2026, 11, 10+h, 9, 0, 0, 0, time.UTC) }
-	ins := `INSERT INTO light_runs (workspace_id, run_id, schedule, status, source, scheduled_for, error) VALUES ($1, $2, 'daily', $3, 'job', $4, $5)`
-	lightExec(t, conn, ins, ws, "r1", "succeeded", at(0), "")
-	lightExec(t, conn, ins, ws, "r2", "timed_out", at(1), "")
-	lightExec(t, conn, ins, ws, "r3", "failed", at(2), "")
-	lightExec(t, conn, ins, ws, "r4", "cancelled", at(3), "")
-	lightExec(t, conn, ins, ws, "r5", "failed", at(4), "OOMKilled (exit 137)")
+	// created_at runs against the scheduled order: the oldest run (r1, the one
+	// success) was written last, as a run recorded late from its Job is.
+	ins := `INSERT INTO light_runs (workspace_id, run_id, schedule, status, source, scheduled_for, error, created_at) VALUES ($1, $2, 'daily', $3, 'job', $4, $5, now() - make_interval(mins => $6))`
+	lightExec(t, conn, ins, ws, "r1", "succeeded", at(0), "", 1)
+	lightExec(t, conn, ins, ws, "r2", "timed_out", at(1), "", 50)
+	lightExec(t, conn, ins, ws, "r3", "failed", at(2), "", 40)
+	lightExec(t, conn, ins, ws, "r4", "cancelled", at(3), "", 30)
+	lightExec(t, conn, ins, ws, "r5", "failed", at(4), "OOMKilled (exit 137)", 20)
 
 	api := &fakeLightAPI{}
 	wh := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
@@ -282,10 +311,13 @@ func TestIntegration_LightRuns_JobsNeverOverwriteAReport(t *testing.T) {
 		t.Errorf("a run that never reported is recorded from its Job: %s", s)
 	}
 
-	recordCancelledLightRuns(ctx, ws, []string{"light-x-aaaaaaaa-9"})
+	recordCancelledLightRuns(ctx, ws, []string{"light-x-aaaaaaaa-9", "light-x-aaaaaaaa-1"})
 	var schedule, st string
 	if err := conn.QueryRow(`SELECT schedule, status FROM light_runs WHERE workspace_id = $1 AND run_id = 'light-x-aaaaaaaa-9'`, ws).Scan(&schedule, &st); err != nil || schedule != "daily" || st != "cancelled" {
 		t.Errorf("cancelled run: schedule=%q status=%q (%v); want its schedule found from its CronJob", schedule, st, err)
+	}
+	if s, _, _ := status("light-x-aaaaaaaa-1"); s != "succeeded" {
+		t.Errorf("a cancelled record overwrote a finished run: %s", s)
 	}
 
 	lightExec(t, conn, `UPDATE light_runs SET created_at = now() - interval '31 days' WHERE workspace_id = $1 AND run_id = 'light-x-aaaaaaaa-1'`, ws)

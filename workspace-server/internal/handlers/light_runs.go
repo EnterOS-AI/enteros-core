@@ -290,13 +290,15 @@ func (h *LightHandler) ReportRun(c *gin.Context) {
 	log.Printf("light op=report ws=%s run=%s schedule=%q phase=%s status=%s", id, row.RunID, row.Schedule, report.Phase, row.Status)
 	if report.Phase == "finished" && (row.Status == models.LightRunFailed || row.Status == models.LightRunTimedOut) {
 		// A failure may complete a streak: evaluate it now rather than at the
-		// next jobs poll, after the answer so the run pod is not held.
+		// next jobs poll, after the answer so the run pod is not held. Under
+		// the agent's Light lock; while a transition holds it the jobs poll
+		// evaluates it instead.
 		wh, schedule := h.wh, row.Schedule
 		wh.goAsync(func() {
 			sctx, cancel := context.WithTimeout(context.Background(), lightTransitionTimeout)
 			defer cancel()
-			if _, err := wh.evaluateLightStreak(sctx, id, schedule); err != nil {
-				log.Printf("light: evaluating the streak of %s/%q failed: %v (the jobs poll retries)", id, schedule, err)
+			if _, err := wh.evaluateLightStreakLocked(sctx, id, schedule); err != nil {
+				log.Printf("light: evaluating the streak of %s/%q: %v (the jobs poll retries)", id, schedule, err)
 			}
 		})
 	}

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -387,5 +388,71 @@ func TestListRunsOfAMissingWorkspaceIs404(t *testing.T) {
 	mock.ExpectQuery(`SELECT 1 FROM workspaces`).WithArgs(lightTestWS).WillReturnError(sql.ErrNoRows)
 	if w := lightCall(lh.ListRuns, http.MethodGet, "/", "", nil); w.Code != http.StatusNotFound {
 		t.Fatalf("list = %d %s", w.Code, w.Body.String())
+	}
+}
+
+// A failed finished report evaluates the schedule's streak at once, after the
+// answer (plan Step 3.15), under the agent's Light lock.
+func TestAFailedFinishedReportEvaluatesTheStreakAtOnce(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	api := &fakeLightAPI{}
+	lh, wh := newLightTestHandler(t, api)
+	finishedAt := time.Date(2026, 11, 13, 4, 41, 10, 0, time.UTC)
+	expectLightState(mock, lightTestWS, "parked")
+	mock.ExpectExec(lightReportFinishedSQL).
+		WithArgs(lightTestWS, "light-be7540cfd160-1a2b3c4d-29384756", "daily-report", "timed_out", lightRunStartedAt, finishedAt, 124, "", "the run timed out").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(lightStreakScheduleSQL).WithArgs(lightTestWS, "daily-report").
+		WillReturnRows(sqlmock.NewRows([]string{"suspended_reason", "suspended_at"}).AddRow(nil, nil))
+	mock.ExpectQuery(lightStreakRunsSQL).WithArgs(lightTestWS, "daily-report", nil).WillReturnRows(threeFailures())
+	mock.ExpectExec(lightStreakCountSQL).WithArgs(lightTestWS, "daily-report", 3).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(lightStreakClaimSQL).WithArgs(lightTestWS, "daily-report", "3 runs in a row failed").
+		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("daily-report"))
+	mock.ExpectQuery(`SELECT name, talk_to_user_enabled FROM workspaces`).WithArgs(lightTestWS).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "talk_to_user_enabled"}).AddRow("Light agent", false))
+
+	w := lightCall(lh.ReportRun, http.MethodPost, "/", finishedBody("timed_out", "", "the run timed out", 124), asWorkspaceToken)
+	if w.Code != http.StatusOK {
+		t.Fatalf("report = %d %s", w.Code, w.Body.String())
+	}
+	wh.waitAsyncForTest()
+	if calls := api.Calls(); !reflect.DeepEqual(calls, []string{"suspend " + lightTestWS + " daily-report"}) {
+		t.Errorf("CP calls = %v, want the schedule suspended right after the report", calls)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+// While a transition holds the agent, a failed report's streak is left to the
+// jobs poll: nothing is evaluated between a park's render and its PUT (review
+// 21718 O1).
+func TestAFailedReportDuringATransitionLeavesTheStreakToThePoll(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	api := &fakeLightAPI{}
+	lh, wh := newLightTestHandler(t, api)
+	expectLightState(mock, lightTestWS, "parked")
+	mock.ExpectExec(lightReportFinishedSQL).WillReturnResult(sqlmock.NewResult(0, 1))
+	rec := recordSQL(t)
+	lock := lightOpLock(lightTestWS)
+	lock.Lock()
+	w := lightCall(lh.ReportRun, http.MethodPost, "/", finishedBody("failed", "", "boom", 1), asWorkspaceToken)
+	wh.waitAsyncForTest()
+	lock.Unlock()
+	if w.Code != http.StatusOK {
+		t.Fatalf("report = %d %s", w.Code, w.Body.String())
+	}
+	for _, q := range rec() {
+		if strings.Contains(q, "suspended_reason") || strings.Contains(q, "consecutive_failures") {
+			t.Errorf("the streak was evaluated while a transition held the agent: %s", q)
+		}
+	}
+	if len(api.Calls()) != 0 {
+		t.Errorf("CP called: %v", api.Calls())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
 	}
 }

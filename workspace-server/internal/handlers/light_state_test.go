@@ -99,7 +99,7 @@ func TestSetLightStateIsAGuardedTransition(t *testing.T) {
 
 func TestQueueLightRefreshDedupesAnUnappliedRefresh(t *testing.T) {
 	mock := setupTestDB(t)
-	insert := `INSERT INTO light_pending_actions \(workspace_id, kind, payload, source\)\s+SELECT \$1, \$2, \$3::jsonb, \$4\s+WHERE NOT EXISTS \(\s+SELECT 1 FROM light_pending_actions\s+WHERE workspace_id = \$1 AND kind = \$2 AND applied_at IS NULL AND payload = \$3::jsonb\)`
+	insert := `INSERT INTO light_pending_actions \(workspace_id, kind, payload, source\)\s+SELECT \$1, \$2, \$3::jsonb, \$4\s+WHERE NOT EXISTS \(\s+SELECT 1 FROM light_pending_actions a\s+WHERE a.workspace_id = \$1 AND a.kind = \$2 AND a.applied_at IS NULL AND a.payload = \$3::jsonb\s+AND a.id > COALESCE\(\(SELECT w.light_park_watermark FROM workspaces w\s+WHERE w.id = \$1 AND w.light_state = 'parking'\), 0\)\)`
 	mock.ExpectExec(insert).WithArgs(lightTestWS, "refresh", "{}", "secret-change").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(insert).WithArgs(lightTestWS, "refresh", "{}", "secret-change").WillReturnResult(sqlmock.NewResult(0, 0))
 
