@@ -892,17 +892,31 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// are the atomic-byok-create shape and are allowed; platform-resolving
 	// creates keep the full guard.
 	allowVendorKeysForByokCreate := false
+	// createKeyDecision describes the CREATE inputs for the refusal message only
+	// (the verdict below is unchanged): the stored-state read cannot see
+	// payload.Model yet, so a refusal built from it would misreport "MODEL is
+	// not set" for a create that named a platform (slash-form) model.
+	createKeyDecision := vendorKeyGuardDecision{blocked: true, runtime: payload.Runtime, model: strings.TrimSpace(payload.Model), reason: "registry_unavailable"}
 	if m, regErr := providerRegistry(); regErr == nil && m != nil {
 		keys := make([]string, 0, len(payload.Secrets))
 		for k := range payload.Secrets {
 			keys = append(keys, k)
 		}
-		if prov, dErr := m.DeriveProvider(payload.Runtime, strings.TrimSpace(payload.Model), keys); dErr == nil && !prov.IsPlatform() {
+		prov, dErr := m.DeriveProvider(payload.Runtime, strings.TrimSpace(payload.Model), keys)
+		switch {
+		case dErr == nil && !prov.IsPlatform():
 			allowVendorKeysForByokCreate = true
+		case dErr == nil:
+			createKeyDecision.provider, createKeyDecision.reason = prov.Name, "platform_model"
+		case createKeyDecision.model == "":
+			createKeyDecision.reason = "model_unset"
+		default:
+			createKeyDecision.reason = "model_unregistered"
 		}
 	}
 	for k, v := range payload.Secrets {
-		if !allowVendorKeysForByokCreate && rejectPlatformManagedDirectLLMBypassForWorkspace(c, id, k) {
+		if !allowVendorKeysForByokCreate && isPlatformManagedDirectLLMBypassKey(k) && platformManagedLLMModeForWorkspace(c, id) {
+			writeVendorKeyRefusal(c, id, k, createKeyDecision)
 			tx.Rollback() //nolint:errcheck
 			return
 		}

@@ -61,6 +61,21 @@ func isPlatformManagedDirectLLMBypassKey(key string) bool {
 // derived (unregistered / ambiguous / no model), block the bypass-list write —
 // fail safer not freer.
 func platformManagedLLMModeForWorkspace(c *gin.Context, workspaceID string) bool {
+	return platformManagedLLMDecisionForWorkspace(c, workspaceID).blocked
+}
+
+// vendorKeyGuardDecision is the vendor-key guard's verdict PLUS the inputs it
+// judged, so a refusal can name them. The verdict logic is unchanged; the
+// inputs are carried out only to build an actionable message.
+type vendorKeyGuardDecision struct {
+	blocked  bool
+	runtime  string
+	model    string
+	provider string // derived provider name; "" when derivation failed
+	reason   string // "platform_model" | "model_unset" | "model_unregistered" | "registry_unavailable"
+}
+
+func platformManagedLLMDecisionForWorkspace(c *gin.Context, workspaceID string) vendorKeyGuardDecision {
 	ctx := c.Request.Context()
 	// Block a vendor-key write whenever it would co-mingle with platform
 	// billing. The MODEL decides: a platform-servable model (derives to the
@@ -69,27 +84,76 @@ func platformManagedLLMModeForWorkspace(c *gin.Context, workspaceID string) bool
 	// co-stored vendor key. Only a specific VENDOR model is a BYOK setup where
 	// the customer may write their own key (INCLUDING the first key).
 	runtime, model, authEnv := readWorkspaceDeriveInputs(ctx, workspaceID)
+	d := vendorKeyGuardDecision{runtime: runtime, model: model}
 	manifest, err := providerRegistry()
 	if err != nil || manifest == nil {
 		log.Printf("secrets: provider registry unavailable for workspace=%s: %v (blocking vendor-key write for safety)", workspaceID, err)
-		return true
+		d.blocked, d.reason = true, "registry_unavailable"
+		return d
 	}
 	provider, dErr := manifest.DeriveProvider(runtime, model, authEnv)
 	if dErr != nil {
 		// Unregistered / ambiguous / no model → cannot prove it's a vendor BYOK
 		// setup; block (safe default, matches the create-time only-registered gate).
-		return true
+		d.blocked = true
+		if strings.TrimSpace(model) == "" {
+			d.reason = "model_unset"
+		} else {
+			d.reason = "model_unregistered"
+		}
+		return d
 	}
+	d.provider = provider.Name
 	if provider.IsPlatform() {
 		// Platform-servable model → block (a platform model must never host a
 		// co-stored vendor key — the proxy serves it and bills the platform).
-		return true
+		d.blocked, d.reason = true, "platform_model"
+		return d
 	}
 	// Vendor model: allow the key write. With the per-workspace billing-mode
 	// override removed (2026-06-30), the provider selection alone decides — a
 	// specific vendor model is a BYOK setup where the customer supplies their
 	// own key.
-	return false
+	return d
+}
+
+// vendorKeyRefusalMessage explains a vendor-key refusal in terms the customer
+// can act on: WHICH MODEL value was judged, WHAT it means for billing, and
+// WHICH model form the key they are writing would be accepted with.
+//
+// Live 2026-11-13 (reno-stars): MODEL=anthropic/claude-sonnet-4-6 on a
+// claude-code workspace refused CLAUDE_CODE_OAUTH_TOKEN with a generic
+// "blocked for platform-managed workspaces" line, and the customer only found
+// the subscription form (sonnet/opus/haiku) by trial and error.
+//
+// The leading clause is kept verbatim so existing callers matching on it keep
+// working; everything after it is the explanation.
+func vendorKeyRefusalMessage(d vendorKeyGuardDecision, key string) string {
+	var b strings.Builder
+	b.WriteString("direct vendor key writes are blocked for platform-managed workspaces: ")
+	model := strings.TrimSpace(d.model)
+	switch d.reason {
+	case "platform_model":
+		b.WriteString(`MODEL="` + model + `" is a platform-billed model`)
+		if strings.Contains(model, "/") {
+			b.WriteString(` (the provider/model slash form means platform billing: the platform LLM proxy serves it and bills platform credits)`)
+		}
+		b.WriteString(", so a co-stored vendor key such as " + key + " is refused.")
+	case "model_unset":
+		b.WriteString("MODEL is not set on this workspace, so it cannot be shown to be a bring-your-own-key setup and " + key + " is refused.")
+	case "model_unregistered":
+		b.WriteString(`MODEL="` + model + `" does not resolve to a registered provider for runtime "` + d.runtime + `", so ` + key + " is refused.")
+	default:
+		b.WriteString("the provider registry is unavailable, so " + key + " is refused for safety; retry shortly.")
+		return b.String()
+	}
+	if d.runtime == "claude-code" {
+		b.WriteString(" To use your own Claude subscription, set MODEL to sonnet, opus or haiku (no provider/ prefix) and then set CLAUDE_CODE_OAUTH_TOKEN;" +
+			" to use an Anthropic API key, set MODEL to a bare claude-* model id (e.g. claude-sonnet-4-6) and then set ANTHROPIC_API_KEY.")
+	} else {
+		b.WriteString(" To bring your own key, first set MODEL to a specific vendor model (not the provider/model platform form), then set the vendor key.")
+	}
+	return b.String()
 }
 
 // rejectPlatformManagedDirectLLMBypassForWorkspace blocks raw vendor-key
@@ -97,15 +161,30 @@ func platformManagedLLMModeForWorkspace(c *gin.Context, workspaceID string) bool
 // provider; a workspace on a specific vendor model (BYOK) can write its own
 // vendor key via the canvas Secrets tab.
 func rejectPlatformManagedDirectLLMBypassForWorkspace(c *gin.Context, workspaceID, key string) bool {
-	if !platformManagedLLMModeForWorkspace(c, workspaceID) || !isPlatformManagedDirectLLMBypassKey(key) {
+	if !isPlatformManagedDirectLLMBypassKey(key) {
 		return false
 	}
+	d := platformManagedLLMDecisionForWorkspace(c, workspaceID)
+	if !d.blocked {
+		return false
+	}
+	writeVendorKeyRefusal(c, workspaceID, key, d)
+	return true
+}
+
+// writeVendorKeyRefusal writes the 400 for a refused vendor-key write, naming
+// the inputs the guard judged (see vendorKeyRefusalMessage).
+func writeVendorKeyRefusal(c *gin.Context, workspaceID, key string, d vendorKeyGuardDecision) {
 	c.JSON(http.StatusBadRequest, gin.H{
-		"error":        "direct vendor key writes are blocked for platform-managed workspaces; use MODEL/LLM_PROVIDER or the platform LLM proxy env instead, or select a specific vendor model so the workspace runs BYOK",
+		"error":        vendorKeyRefusalMessage(d, key),
+		"code":         "VENDOR_KEY_ON_PLATFORM_MODEL",
 		"key":          key,
 		"workspace_id": workspaceID,
+		"model":        d.model,
+		"runtime":      d.runtime,
+		"provider":     d.provider,
+		"reason":       d.reason,
 	})
-	return true
 }
 
 // callerWorkspaceID resolves the caller's workspace identity from the request.
