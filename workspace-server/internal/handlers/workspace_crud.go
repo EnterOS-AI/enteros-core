@@ -1109,7 +1109,12 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 	captureRuntimeSchedulesForCarryover(captureCtx, allIDs)
 	captureCancel()
 
-	var stopErrs []error
+	// Enter OS Light: a Light agent's control-plane objects (its schedule
+	// CronJobs and run Jobs) go before any compute stops, so no scheduled run
+	// starts for a workspace being removed. A failure counts as a stop failure
+	// (the delete answers 500) and the row keeps light_state, marking the
+	// objects still to delete. Its own budget, so it never eats the stops'.
+	stopErrs := h.deleteLightForCascade(ctx, allIDs)
 	stopAndRemove := func(wsID string) {
 		// Delete-path stop uses bounded retry (matches the restart path) and
 		// records a durable structure_events row on exhaustion so a leaked /

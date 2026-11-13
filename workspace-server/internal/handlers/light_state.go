@@ -10,8 +10,8 @@ package handlers
 // guards only decide what the caller is told.
 //
 // TRANSITIONS. Every light_state change is one guarded UPDATE (the from-set in
-// the WHERE), stamps light_state_at, broadcasts WORKSPACE_UPDATED with the new
-// state and logs one line.
+// the WHERE, setLightState) that stamps light_state_at; the caller broadcasts
+// WORKSPACE_UPDATED with the new state and logs one line.
 
 import (
 	"context"
@@ -26,7 +26,6 @@ import (
 	"github.com/lib/pq"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 )
 
@@ -137,32 +136,10 @@ func setLightState(ctx context.Context, exec activityExecutor, workspaceID strin
 	return n > 0, nil
 }
 
-// lightTransition is setLightState plus the broadcast and the log line every
-// transition emits.
-func (h *WorkspaceHandler) lightTransition(ctx context.Context, workspaceID, op, trigger string, from []string, to string) (bool, error) {
-	changed, err := setLightState(ctx, db.DB, workspaceID, from, to)
-	result := "ok"
-	switch {
-	case err != nil:
-		result = "error"
-	case !changed:
-		result = "not-in-state"
-	}
-	log.Printf("light op=%s ws=%s from=%v to=%q trigger=%s result=%s", op, workspaceID, from, to, trigger, result)
-	if err == nil && changed && h != nil && h.broadcaster != nil {
-		var state interface{}
-		if to != "" {
-			state = to
-		}
-		h.broadcaster.BroadcastOnly(workspaceID, string(events.EventWorkspaceUpdated), map[string]interface{}{"light_state": state})
-	}
-	return changed, err
-}
-
 // Pending-action kinds. A pending action is work queued for a parked agent:
-// the monitor opens the agent, applies each action once it is online and
-// idle, and parks it again (light_monitor.go). 'refresh' needs nothing applied
-// beyond the open itself (the env snapshot is retaken at the next park).
+// the Light monitor opens the agent, applies each action once it is online and
+// idle, and parks it again. 'refresh' needs nothing applied beyond the open
+// itself (the control plane's env snapshot is retaken at the next park).
 const lightActionRefresh = "refresh"
 
 // Who opened a Light agent last (workspaces.light_opened_by). A refresh-opened
@@ -233,24 +210,4 @@ func queueLightRefreshIfBlocked(ctx context.Context, workspaceID, source string)
 	}
 	queued, _ := queueLightRefresh(ctx, workspaceID, source)
 	return queued
-}
-
-// recordLightError stores the last background Light failure for GET /light.
-func recordLightError(ctx context.Context, workspaceID, code, message string) {
-	if _, err := db.DB.ExecContext(ctx, `
-		UPDATE workspaces
-		SET light_last_error = jsonb_build_object('code', $2::text, 'message', $3::text), light_last_error_at = now()
-		WHERE id = $1`, workspaceID, code, message); err != nil {
-		log.Printf("light: recording error %s for %s failed: %v", code, workspaceID, err)
-	}
-}
-
-// clearLightError forgets the last background failure once an operation of
-// the same kind succeeded.
-func clearLightError(ctx context.Context, workspaceID string) {
-	if _, err := db.DB.ExecContext(ctx, `
-		UPDATE workspaces SET light_last_error = NULL, light_last_error_at = NULL
-		WHERE id = $1 AND light_last_error IS NOT NULL`, workspaceID); err != nil {
-		log.Printf("light: clearing the last error of %s failed: %v", workspaceID, err)
-	}
 }

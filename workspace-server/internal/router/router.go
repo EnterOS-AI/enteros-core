@@ -294,6 +294,17 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// to 'hibernated'. The workspace auto-wakes on the next A2A message.
 		wsAuth.POST("/hibernate", wh.Hibernate)
 
+		// Enter OS Light (contracts C3/C5; docs/api-protocol/light-api.md): a
+		// parked agent whose schedules run as isolated copies in their own pods.
+		// Management routes refuse the workspace's own token (a run pod holds
+		// it); POST /light/runs is the run pods' ledger and takes only that token.
+		lh := handlers.NewLightHandler(wh)
+		wsAuth.GET("/light", lh.Get)
+		wsAuth.POST("/light/enable", lh.Enable)
+		wsAuth.POST("/light/disable", lh.Disable)
+		wsAuth.GET("/light/runs", lh.ListRuns)
+		wsAuth.POST("/light/runs", lh.ReportRun)
+
 		// Test-only busy-inject (task #92). Compiled ONLY under the
 		// e2e_busy_inject build tag — a no-op stub in every shipped image
 		// (testbusy_disabled.go), so no route is registered and the path 404s in

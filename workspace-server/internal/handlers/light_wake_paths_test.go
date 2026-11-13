@@ -81,6 +81,10 @@ var reviewedLightWakeSites = map[string]string{
 	"workspace_restart.go|WorkspaceHandler.Resume|provisionWorkspaceAuto": "resume guard + claim predicate",
 	// Provider switch: guard 409 + pre-claim `light_state IS NULL`.
 	"workspace_switch_provider.go|WorkspaceHandler.SwitchProvider|provisionWorkspaceAuto": "switch guard + pre-claim",
+	// Light enable/disable apply the MOLECULE_LIGHT env change while the agent
+	// is open (enable) or no longer Light (disable): both are outside parking/parked.
+	"light_handlers.go|WorkspaceHandler.applyLightEnvChange|WakeWorkspace":            "Light enable/disable, light_state open or NULL",
+	"light_handlers.go|WorkspaceHandler.applyLightEnvChange|RestartByIDAfterMutation": "Light enable/disable, light_state open or NULL",
 }
 
 func TestEveryWakeAndProvisionCallSiteIsReviewedForLight(t *testing.T) {

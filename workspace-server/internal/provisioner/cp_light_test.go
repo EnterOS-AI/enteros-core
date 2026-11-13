@@ -261,3 +261,16 @@ func TestLightCPBoundsTheResponseBody(t *testing.T) {
 		t.Fatalf("err = %v, want a size refusal", err)
 	}
 }
+
+// TestBuildCPTenantEnvCarriesMoleculeLight: the env core sends the control
+// plane keeps MOLECULE_LIGHT=1 (C1), which the CP's park requires in the live
+// Deployment.
+func TestBuildCPTenantEnvCarriesMoleculeLight(t *testing.T) {
+	env := buildCPTenantEnv(WorkspaceConfig{
+		EnvVars:             map[string]string{"MOLECULE_LIGHT": "1", "MOLECULE_CONTINUOUS": "false"},
+		WorkspaceSecretKeys: map[string]struct{}{"MOLECULE_LIGHT": {}, "MOLECULE_CONTINUOUS": {}},
+	})
+	if env["MOLECULE_LIGHT"] != "1" || env["MOLECULE_CONTINUOUS"] != "false" {
+		t.Fatalf("CP env = %v", env)
+	}
+}
