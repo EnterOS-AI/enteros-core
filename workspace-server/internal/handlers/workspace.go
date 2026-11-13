@@ -630,6 +630,17 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// providers.yaml (P2-A artifact); the check stays in sync with the SSOT
 	// via the verify-providers-gen + sync-providers-yaml CI gates.
 	if !isExternal {
+		if isAutoModel(payload.Model) {
+			secretKeys := make([]string, 0, len(payload.Secrets))
+			for k := range payload.Secrets {
+				secretKeys = append(secretKeys, k)
+			}
+			if anyDirectVendorKey(secretKeys) {
+				log.Printf("Create: 422 %s (runtime=%q model=%q)", autoRequiresPlatformCreditsCode, payload.Runtime, payload.Model)
+				respondAutoRequiresPlatformCredits(c, payload.Runtime, payload.Model)
+				return
+			}
+		}
 		if ok, why := validateRegisteredModelForRuntime(payload.Runtime, payload.Model); !ok {
 			log.Printf("Create: 422 UNREGISTERED_MODEL_FOR_RUNTIME (runtime=%q model=%q): %s [internal#718 P4 PR-2 hard-reject]", payload.Runtime, payload.Model, why)
 			c.JSON(http.StatusUnprocessableEntity, gin.H{

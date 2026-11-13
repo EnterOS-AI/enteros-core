@@ -945,6 +945,11 @@ func (h *SecretsHandler) SetModel(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read workspace runtime"})
 			return
 		}
+		if isAutoModel(body.Model) && workspaceHoldsDirectVendorKey(ctx, workspaceID) {
+			log.Printf("SetModel: 422 %s (workspace=%s model=%q)", autoRequiresPlatformCreditsCode, workspaceID, body.Model)
+			respondAutoRequiresPlatformCredits(c, runtime, body.Model)
+			return
+		}
 		if ok, why := validateRegisteredModelForRuntime(runtime, body.Model); !ok {
 			log.Printf("SetModel: 422 UNREGISTERED_MODEL_FOR_RUNTIME (runtime=%q model=%q): %s", runtime, body.Model, why)
 			c.JSON(http.StatusUnprocessableEntity, gin.H{
