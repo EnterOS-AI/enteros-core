@@ -353,35 +353,57 @@ func (h *RegistryHandler) fireReconcileMCPRecovery(ctx context.Context, workspac
 // as "no row yet, default to push" — that's the first-register flow,
 // and at that point we don't know the runtime yet so push is the
 // historical compatible default.
-// registerKeepsPlatformHostedRoute is the Register upsert predicate (evaluated
-// on the UPDATE arm, against the PRE-update row) under which a register keeps
-// the row's existing url AND delivery_mode instead of overwriting them:
+// refusePollRegisterOnProvisionedWorkspace answers 409 (and returns true) when
+// a poll-mode /registry/register targets a workspace whose compute the PLATFORM
+// provisioned — workspaces.instance_id set, which the CP provisioner writes for
+// every workspace it starts (workspace_provision.go, incl. local-docker
+// container names) and which a register-created external peer never has.
 //
-//	the register carries NO url, the row already HAS one, and the row's runtime
-//	is NOT external-like (i.e. the platform provisioned this box and its URL).
+// Why refuse rather than accept: poll mode means "the platform never dispatches
+// to me; I fetch my inbox". For a provisioned box that is never what the box
+// asks for — no provisioning path sets poll — so a poll register for its id
+// comes from something else holding its token, and applying it wipes the
+// box's platform URL (poll stores the payload url unvalidated, often none) and
+// parks its A2A for a poller the box is not running. Live 2026-11-13
+// (reno-stars, ca17a092, claude-code): an external client registered the
+// workspace poll with no url via the ingress (04:50–06:06Z); every URL forward
+// (schedules, chat files) then 422'd "no callback URL" for ~4.5h while the box
+// served at its platform URL, until a restart re-registered it.
 //
-// Why: a URL-less register is what a poll-mode client sends. For a BYO-compute
-// (external-like) row that is the legitimate push→poll switch and still clears
-// the URL. For a platform-hosted row it can only come from something OTHER than
-// the box — the box always registers the URL the platform gave it — so letting
-// it write url=NULL, delivery_mode='poll' detaches a serving box from the
-// platform until its next restart. Live 2026-11-13 (reno-stars, ca17a092,
-// claude-code): an external client holding the workspace token registered it
-// poll with no url; every URL forward (schedules, chat files) then 422'd "no
-// callback URL" for ~4.5h while the box was up at its platform URL.
+// The discriminator is instance_id, NOT runtime: /registry/register inserts
+// unknown ids without a runtime, so register-created external peers carry the
+// column default ('hermes') and look exactly like hosted workspaces by runtime.
 //
-// Built from the externalLikeRuntimes SSOT (constants, never request data), so
-// a new BYO-compute runtime only needs adding there.
-var registerKeepsPlatformHostedRoute = func() string {
-	quoted := make([]string, len(externalLikeRuntimes))
-	for i, r := range externalLikeRuntimes {
-		quoted[i] = "'" + strings.ReplaceAll(r, "'", "''") + "'"
+// A 409 (not a silent keep) so a misconfigured client fails loudly instead of
+// believing it is now the workspace's poller. Fail-open on a lookup error is
+// deliberate: the existing upsert behaviour is the fallback, and the error is
+// logged.
+func (h *RegistryHandler) refusePollRegisterOnProvisionedWorkspace(ctx context.Context, c *gin.Context, workspaceID string) bool {
+	var instanceID, storedMode sql.NullString
+	err := db.DB.QueryRowContext(ctx,
+		`SELECT instance_id, delivery_mode FROM workspaces WHERE id = $1`, workspaceID,
+	).Scan(&instanceID, &storedMode)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			log.Printf("Registry register: provisioned-workspace check failed for %s: %v (falling through)", workspaceID, err)
+		}
+		return false
 	}
-	return `(EXCLUDED.url IS NULL
-				     AND workspaces.url IS NOT NULL
-				     AND workspaces.url <> ''
-				     AND COALESCE(workspaces.runtime, '') NOT IN (` + strings.Join(quoted, ", ") + `))`
-}()
+	if !instanceID.Valid || strings.TrimSpace(instanceID.String) == "" {
+		return false
+	}
+	log.Printf("Registry register: REFUSED poll-mode register for platform-provisioned workspace %s (instance_id set) — a poll register would detach the running box from its platform URL", workspaceID)
+	c.JSON(http.StatusConflict, gin.H{
+		"error": "workspace " + workspaceID + " is platform-hosted (its compute was provisioned by the platform and is reached at its platform URL); " +
+			"a poll-mode registration would detach it. Register external peers under their own workspace ids " +
+			"(create one with POST /workspaces runtime=external) instead of reusing this workspace's id and token.",
+		"code":         "POLL_REGISTER_ON_PLATFORM_HOSTED_WORKSPACE",
+		"workspace_id": workspaceID,
+		// The mode the row KEEPS — never the one the caller asked for.
+		"delivery_mode": storedMode.String,
+	})
+	return true
+}
 
 func (h *RegistryHandler) resolveDeliveryMode(ctx context.Context, workspaceID, payloadMode string) (string, error) {
 	if payloadMode != "" {
@@ -882,6 +904,15 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 		return
 	}
 
+	// A poll-mode register must not detach a PLATFORM-PROVISIONED workspace.
+	// See refusePollRegisterOnProvisionedWorkspace for the predicate and the
+	// 2026-11-13 incident.
+	if effectiveMode == models.DeliveryModePoll {
+		if refused := h.refusePollRegisterOnProvisionedWorkspace(ctx, c, payload.ID); refused {
+			return
+		}
+	}
+
 	// Issue #2970: fail CLOSED if a platform agent reaches registration without
 	// BOTH the seeded MODEL workspace_secret AND its management MCP server (the
 	// runtime reports availability via mcp_server_present; the MCP is delivered by
@@ -1044,9 +1075,7 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// becomes NULL via sql.NullString so the row's URL stays clean (the
 	// CASE below also preserves an existing provisioner-set URL, which
 	// matters for hybrid setups where a workspace was previously push
-	// and is being re-registered as poll). For a PLATFORM-HOSTED row the
-	// URL-less register keeps both url and delivery_mode — see
-	// registerKeepsPlatformHostedRoute.
+	// and is being re-registered as poll).
 	var urlForUpsert sql.NullString
 	if effectiveURL != "" {
 		urlForUpsert = sql.NullString{String: effectiveURL, Valid: true}
@@ -1125,10 +1154,6 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// re-register (so a platform agent re-registering without kind is never
 	// downgraded). A non-root row asking for 'platform' is rejected by the
 	// workspaces_platform_root_check constraint → friendly 409 below.
-	//
-	// A URL-less register cannot detach a PLATFORM-HOSTED row: url and
-	// delivery_mode are kept under registerKeepsPlatformHostedRoute (see there
-	// for the predicate and the 2026-11-13 incident).
 	_, err = db.DB.ExecContext(ctx, `
 		INSERT INTO workspaces (id, name, url, agent_card, status, last_heartbeat_at, delivery_mode, kind)
 		-- core#3082: a NEW platform concierge INSERTs as 'provisioning' (the warming
@@ -1166,8 +1191,6 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 				          OR workspaces.url LIKE 'http://localhost:%')
 				     AND CAST(substring(workspaces.url FROM ':([0-9]+)$') AS int) <> 8000
 				THEN workspaces.url
-				WHEN `+registerKeepsPlatformHostedRoute+`
-				THEN workspaces.url
 				ELSE EXCLUDED.url
 			END,
 			agent_card = EXCLUDED.agent_card,
@@ -1179,11 +1202,7 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 			-- row value — correct for re-register. Non-platform keeps fast online.
 			status = (CASE WHEN workspaces.kind = 'platform' THEN workspaces.status ELSE 'online' END)::workspace_status,
 			last_heartbeat_at = now(),
-			delivery_mode = CASE
-				WHEN `+registerKeepsPlatformHostedRoute+`
-				THEN workspaces.delivery_mode
-				ELSE EXCLUDED.delivery_mode
-			END,
+			delivery_mode = EXCLUDED.delivery_mode,
 			kind = COALESCE(NULLIF($6, ''), workspaces.kind),
 			updated_at = now()
 		WHERE workspaces.status NOT IN ('removed', 'paused', 'hibernated')

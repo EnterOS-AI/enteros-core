@@ -1950,6 +1950,12 @@ func TestRegister_PollMode_AcceptsEmptyURL(t *testing.T) {
 	// payload value is non-empty). Asserted by the absence of an
 	// ExpectQuery for SELECT delivery_mode here.
 
+	// Poll-mode guard: the row is not platform-provisioned (no row yet), so
+	// the register proceeds. See refusePollRegisterOnProvisionedWorkspace.
+	mock.ExpectQuery(`SELECT instance_id, delivery_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnError(sql.ErrNoRows)
+
 	// Upsert MUST run with empty URL (sql.NullString) and delivery_mode=poll.
 	mock.ExpectExec("INSERT INTO workspaces").
 		WithArgs(wsID, wsID, sql.NullString{}, `{"name":"poll-agent"}`, "poll", "").
