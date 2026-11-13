@@ -198,7 +198,9 @@ func TestParkRefusesBeforeWritingAnything(t *testing.T) {
 					q.WillReturnRows(encryptedRow(t, tc.secret))
 				}
 			}
+			rec := recordSQL(t)
 			w := lightCall(lh.Park, http.MethodPost, "/", "", nil)
+			assertNoWrites(t, rec())
 			if w.Code != tc.wantStatus || lightBody(t, w)["code"] != tc.wantCode {
 				t.Fatalf("park = %d %s, want %d %s", w.Code, w.Body.String(), tc.wantStatus, tc.wantCode)
 			}
@@ -506,7 +508,9 @@ func TestOpenWhosePauseFailsLeavesTheAgentParked(t *testing.T) {
 	api := &fakeLightAPI{pauseErr: &provisioner.LightCPError{HTTPStatus: 503, Code: "LIGHT_BACKEND_UNAVAILABLE"}}
 	lh, _ := newLightTestHandler(t, api)
 	expectLightLoad(mock, "hibernated", "hermes", "workspace", "parked", 0, nil, nil)
+	rec := recordSQL(t)
 	w := lightCall(lh.Open, http.MethodPost, "/", "", nil)
+	assertNoWrites(t, rec())
 	if w.Code != http.StatusServiceUnavailable || lightBody(t, w)["code"] != "LIGHT_BACKEND_UNAVAILABLE" || w.Header().Get("Retry-After") == "" {
 		t.Fatalf("open = %d %s", w.Code, w.Body.String())
 	}

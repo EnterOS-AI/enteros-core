@@ -577,7 +577,7 @@ func recordLightJobs(ctx context.Context, workspaceID string, jobs []provisioner
 					    exit_code = EXCLUDED.exit_code, error = EXCLUDED.error,
 					    scheduled_for = COALESCE(light_runs.scheduled_for, EXCLUDED.scheduled_for), updated_at = now()
 					WHERE light_runs.status = 'running'`,
-				workspaceID, j.RunID, j.Schedule, status, scheduledFor, started, finished, exit, headUTF8(lightJobError(j), lightErrorLimit)); err != nil {
+				workspaceID, j.RunID, j.Schedule, status, scheduledFor, started, finished, exit, headUTF8(lightStorableText(lightJobError(j)), lightErrorLimit)); err != nil {
 				log.Printf("light: recording finished job %s of %s failed: %v", j.RunID, workspaceID, err)
 				continue
 			}
