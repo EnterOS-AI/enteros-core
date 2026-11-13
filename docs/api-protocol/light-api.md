@@ -112,9 +112,9 @@ and message; its body carries only the extras the control plane sent (`key`,
 `run_id`), never `status`, `active_tasks` or `light_state`.
 
 Management routes answer `409 LIGHT_TRANSITION_IN_PROGRESS` while another
-Light operation on the same agent is running (an owner call, or a background
-step: a park's pod stop and resume, a refresh, a failure-streak check); retry
-after a few seconds.
+Light operation on the same agent is running (an owner call, a workspace
+delete, or a background step: a park's pod stop and resume, a refresh, a
+failure-streak check); retry after a few seconds.
 
 Times are RFC 3339 in UTC.
 

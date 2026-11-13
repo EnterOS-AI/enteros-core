@@ -265,9 +265,9 @@ func recordPendingLightToken(ctx context.Context, workspaceID, tokenID string) e
 	var prev sql.NullString
 	err := db.DB.QueryRowContext(ctx, `
 		UPDATE workspaces w SET light_pending_token_id = $2
-		FROM workspaces old
-		WHERE w.id = $1 AND old.id = $1
-		RETURNING old.light_pending_token_id`, workspaceID, tokenID).Scan(&prev)
+		FROM workspaces prev
+		WHERE w.id = $1 AND prev.id = $1
+		RETURNING prev.light_pending_token_id`, workspaceID, tokenID).Scan(&prev)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
