@@ -55,16 +55,24 @@ resource friendly.
 `workspaces.light_state`: `NULL` (not Light) | `open` | `parking` | `parked`
 | `opening`.
 
-- **Park** (`open → parking → parked`): checks (hermes, online, idle, the
-  `MOLECULE_LIGHT=1` secret), claim `parking`, read the grid through the
-  schedules proxy, render (a schedule core suspended goes out `enabled:false`
-  unless the owner parks or its definition changed), mint a run token, C4
-  `PUT`, store the set; then hibernate the agent through the ordinary path and
-  C4 `resume`, retried while the control plane answers `LIGHT_AGENT_AWAKE`
-  (the pod's 30 s grace). Any refusal before the pod stops returns to `open`.
-- **Open** (`parked → opening → open`): C4 `pause` first, while every wake
-  path still refuses the agent; record the runs the pause cancelled; claim
-  `opening`; wake. The monitor flips `opening → open` once the pod is up.
+- **Park** (`open → parking → parked`): checks (hermes, online, no task and
+  not busy, the `MOLECULE_LIGHT=1` secret), claim `parking` (recording who
+  parked and the refresh watermark in the same statement), read the grid from
+  the runtime (up to 8 MiB), render (a schedule core suspended goes out
+  `enabled:false` unless the owner parks or its definition changed), mint a
+  run token and record it as pending, C4 `PUT`, commit the token, store the
+  set; then, unless the agent reports a task or wrote activity since the claim
+  (then the park is undone with `LIGHT_AGENT_BUSY`), hibernate it through the
+  ordinary path and C4 `resume`, retried while the control plane answers
+  `LIGHT_AGENT_AWAKE` (the pod's 30 s grace). A refusal after the claim and
+  before the pod stops returns to `open`. A heartbeat of a `parking` agent is
+  refused but still records `active_tasks`/`is_busy`.
+- **Open** (`parked → opening → open`): record the open marker
+  (`LIGHT_OPEN_INCOMPLETE`), C4 `pause` while every wake path still refuses
+  the agent, record the runs the pause cancelled, claim `opening` (clearing the
+  marker), wake. The monitor flips `opening → open` once the pod is up. A park
+  stuck in `parking` for three minutes can be opened (to `open` when its pod
+  is up). The owner's open of an open agent takes it over.
 - **Run now**: C4 `run` on a parked agent.
 - **Disable**: C4 `DELETE` first, then revoke the run tokens and clear the
   Light state, secrets, stored schedules and queued work.
@@ -85,20 +93,29 @@ At most two are live.
 **Queued work.** A change that would restart a parked agent (secret, model,
 plugin) is queued in `light_pending_actions` as a `refresh` instead. The
 monitor opens the agent (`light_opened_by = 'refresh'`), applies any queued
-action that has an applier, and parks it again as soon as it is online and
-idle; the park's env snapshot completes the refresh. The table's `kind` is
+action that has an applier, and parks it again once it is online, idle and
+quiet for a minute; the park's env snapshot completes the refreshes queued
+before its claim (a change made while it parks stays queued). A refresh open
+that does not bring the agent up is parked again on its previous snapshot and
+retried after a 10-minute back-off. The table's `kind` is
 free text with a JSONB payload, so a later kind (for example a schedule edit
 made while parked) needs an applier, not a schema change.
 
 ## Monitor (core)
 
-Every 30 s: finish or continue interrupted parks and opens; auto-park an open
-agent idle for 30 minutes; open at most two parked agents with queued work at
-a time; delete the Light objects a workspace delete could not. Every 5
-minutes: read each agent's jobs listing, record runs that never reported
-(killed, out of memory, image pull, deadline, quota), suspend a schedule whose
-last three terminal runs failed and tell the owner, revoke a retired run token
-once no run holds it. Hourly: delete finished runs older than 30 days.
+Every 30 s: finish or continue interrupted parks and opens (a continued park
+keeps its trigger and watermark), park again failed refresh opens, resume the
+CronJobs of an interrupted open; auto-park an open agent idle for 30 minutes;
+open at most two parked agents with queued work at a time; delete the Light
+objects a workspace delete could not. Every 5 minutes, ten agents a tick: read
+each agent's jobs listing, record runs that never reported (killed, out of
+memory, image pull, deadline, quota), suspend a schedule whose last three
+terminal runs failed and tell the owner (under the agent's Light lock, so never
+between a park's render and its PUT), revoke a retired run token once no run
+holds it. Hourly: delete finished runs older than 30 days. A refused
+background step records `last_error`, which holds the agent back for 10
+minutes. Each sweep acts on at most five agents and starts nothing after 90 s;
+each tick reports `light-monitor` to `/admin/liveness`.
 
 ## Contracts
 

@@ -24,6 +24,7 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 )
 
 func lightIntegrationHandler(t *testing.T, api provisioner.LightAPI) *WorkspaceHandler {
@@ -469,5 +470,88 @@ func TestIntegration_LightPark_CompletedParkKeepsTheRefreshBackoff(t *testing.T)
 	}
 	if got["LIGHT_PARK_INCOMPLETE"] != "" || got[lightCodeRefreshOpenFailed] != lightCodeRefreshOpenFailed || got[lightCodeActionFailed] != lightCodeActionFailed {
 		t.Errorf("after a completed park: %v", got)
+	}
+}
+
+// A park that a core restart interrupted with the pod still up is continued
+// by the monitor after two minutes as the original park (here the owner's):
+// the run token the interrupted attempt minted is revoked, the refreshes up
+// to its claim's watermark are marked applied (a later one stays queued), the
+// owner's park clears the schedule's suspension, and the agent ends parked
+// (plan Step 3.13; review 21718 N1, N4, N5).
+func TestIntegration_LightMonitor_ContinuesAnInterruptedPark(t *testing.T) {
+	conn := integrationDB_Light(t)
+	setupTestRedis(t)
+	ctx := context.Background()
+	ws := seedLightWorkspace(t, conn, "test-light-continue", "online", "open")
+	seedLightSecret(t, conn, ws)
+	lightExec(t, conn, `INSERT INTO light_schedules (workspace_id, name, cron, timezone, prompt, suspended_reason, suspended_at) VALUES ($1, 'daily', '0 9 * * *', 'UTC', 'p', '3 runs in a row failed', now())`, ws)
+	lightExec(t, conn, `INSERT INTO light_pending_actions (workspace_id, kind, source) VALUES ($1, 'refresh', 'secret')`, ws)
+	api := &fakeLightAPI{putRes: lightIntegrationPut()}
+	wh := lightIntegrationHandler(t, api)
+	wh.lightScheduleReader = func(context.Context, string) ([]volumeEntry, error) { return lightIntegrationGrid(), nil }
+	var stops int32
+	wh.stopFnOverride = func(context.Context, string) { atomic.AddInt32(&stops, 1) }
+
+	// The interrupted attempt: claimed, minted and noted its token; then core
+	// restarted. A refresh queued after its claim must survive the park.
+	if _, claimed, err := wh.claimLightParking(ctx, ws, lightTriggerOwner); err != nil || !claimed {
+		t.Fatalf("claim = %v %v", claimed, err)
+	}
+	lost, _, err := wsauth.IssueAPITokenWithID(ctx, conn, ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recordPendingLightToken(ctx, ws, lost); err != nil {
+		t.Fatal(err)
+	}
+	lightExec(t, conn, `INSERT INTO light_pending_actions (workspace_id, kind, source) VALUES ($1, 'refresh', 'plugin')`, ws)
+	lightExec(t, conn, `UPDATE workspaces SET light_state_at = now() - interval '3 minutes' WHERE id = $1`, ws)
+
+	if res := NewLightMonitor(wh).SweepTransitions(ctx); res.Acted != 1 || res.Errors != 0 {
+		t.Fatalf("sweep = %+v", res)
+	}
+	if st, ls := lightRowStatus(t, conn, ws); st != "hibernated" || ls != "parked" {
+		t.Fatalf("status=%s light_state=%s, want the park finished", st, ls)
+	}
+	if !lightTokenRevoked(t, conn, lost) {
+		t.Error("the run token of the interrupted attempt is still live")
+	}
+	var pending, reason sql.NullString
+	if err := conn.QueryRow(`SELECT light_pending_token_id FROM workspaces WHERE id = $1`, ws).Scan(&pending); err != nil || pending.Valid {
+		t.Errorf("light_pending_token_id = %v (%v), want it cleared by the commit", pending, err)
+	}
+	if err := conn.QueryRow(`SELECT suspended_reason FROM light_schedules WHERE workspace_id = $1 AND name = 'daily'`, ws).Scan(&reason); err != nil || reason.Valid {
+		t.Errorf("suspended_reason = %v (%v), want it cleared: the continued park is the owner's", reason, err)
+	}
+	if n := lightUnappliedRefreshes(t, conn, ws); n != 1 {
+		t.Errorf("unapplied refreshes = %d, want only the one queued after the claim", n)
+	}
+	if got := atomic.LoadInt32(&stops); got != 1 {
+		t.Errorf("pod stops = %d, want 1", got)
+	}
+}
+
+// A park stuck in 'hibernating' for five minutes is finished by the monitor
+// (marked hibernated, CronJobs resumed, parked); a younger one is left to the
+// hibernate path still running (plan Step 3.13).
+func TestIntegration_LightMonitor_FinishesAStuckHibernate(t *testing.T) {
+	conn := integrationDB_Light(t)
+	setupTestRedis(t)
+	ctx := context.Background()
+	stuck := seedLightWorkspace(t, conn, "test-light-hibernating", "hibernating", "parking")
+	young := seedLightWorkspace(t, conn, "test-light-hibernating-young", "hibernating", "parking")
+	lightExec(t, conn, `UPDATE workspaces SET light_state_at = now() - interval '6 minutes' WHERE id = $1`, stuck)
+	api := &fakeLightAPI{}
+	wh := lightIntegrationHandler(t, api)
+	NewLightMonitor(wh).SweepTransitions(ctx)
+	if st, ls := lightRowStatus(t, conn, stuck); st != "hibernated" || ls != "parked" {
+		t.Errorf("stuck: status=%s light_state=%s, want hibernated/parked", st, ls)
+	}
+	if st, ls := lightRowStatus(t, conn, young); st != "hibernating" || ls != "parking" {
+		t.Errorf("young: status=%s light_state=%s, want it left alone", st, ls)
+	}
+	if calls := strings.Join(api.Calls(), ","); calls != "resume "+stuck {
+		t.Errorf("CP calls = %s, want only the stuck park resumed", calls)
 	}
 }
