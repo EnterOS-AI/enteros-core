@@ -402,6 +402,10 @@ func main() {
 		})
 	if cpProv != nil {
 		wh.SetCPProvisioner(cpProv)
+		// Enter OS Light (contract C4): the CP's Light routes ride the same
+		// provisioner client and auth. No CP (self-host) = no Light: the Light
+		// endpoints answer 501 LIGHT_UNSUPPORTED.
+		wh.SetLightAPI(cpProv)
 	}
 
 	// Desktop computer-use wiring (design decision B). ON BY DEFAULT wherever a
