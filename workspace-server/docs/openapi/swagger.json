@@ -832,7 +832,7 @@
                         }
                     },
                     "409": {
-                        "description": "LIGHT_NOT_PARKED, LIGHT_RUN_ACTIVE, LIGHT_RUN_EXISTS, LIGHT_AGENT_AWAKE, LIGHT_TENANT_SUSPENDED",
+                        "description": "LIGHT_NOT_PARKED, LIGHT_RUN_ACTIVE, LIGHT_RUN_EXISTS, LIGHT_AGENT_AWAKE, LIGHT_TENANT_SUSPENDED, LIGHT_TRANSITION_IN_PROGRESS",
                         "schema": {
                             "type": "object",
                             "additionalProperties": true

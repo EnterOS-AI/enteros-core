@@ -784,6 +784,7 @@ func TestSweepRunsRevokesARetiredTokenOnlyOnceNoRunIsUnfinished(t *testing.T) {
 		t.Fatalf("a pending run may still hold the retired token: %+v", res)
 	}
 	assertNoWrites(t, rec())
+	assertNoTransaction(t, rec())
 
 	api.jobs = []provisioner.LightJob{{RunID: "light-a-b-9", Schedule: "daily", Phase: "running"}}
 	mock.ExpectQuery(lightRunsSQL).WithArgs(lightRunsZeroCursor, lightRunsPerTick).WillReturnRows(sqlmock.NewRows([]string{"id", "retired"}).AddRow(lightTestWS, "tok-old"))
@@ -793,6 +794,7 @@ func TestSweepRunsRevokesARetiredTokenOnlyOnceNoRunIsUnfinished(t *testing.T) {
 		t.Fatalf("a running run may still hold the retired token: %+v", res)
 	}
 	assertNoWrites(t, rec(), "light_runs")
+	assertNoTransaction(t, rec())
 
 	api.jobs = []provisioner.LightJob{}
 	mock.ExpectQuery(lightRunsSQL).WithArgs(lightRunsZeroCursor, lightRunsPerTick).WillReturnRows(sqlmock.NewRows([]string{"id", "retired"}).AddRow(lightTestWS, "tok-old"))
@@ -828,6 +830,7 @@ func TestSweepRunsLeavesStreaksAloneWhileATransitionHoldsTheAgent(t *testing.T) 
 		t.Fatalf("res = %+v", res)
 	}
 	assertNoWrites(t, rec(), "light_runs")
+	assertNoTransaction(t, rec())
 	for _, q := range rec() {
 		if strings.Contains(q, "suspended_reason") || strings.Contains(q, "consecutive_failures") {
 			t.Errorf("the streak was evaluated under a held lock: %s", q)

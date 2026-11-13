@@ -172,6 +172,9 @@ func (c *serialisingConn) Begin() (driver.Tx, error) {
 }
 
 func (c *serialisingConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	// Observed too: a transaction sqlmock refuses at BEGIN never sends the
+	// write it was opened for, and the code may swallow that refusal.
+	observeStatement("BEGIN")
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	tx, err := c.inner.(driver.ConnBeginTx).BeginTx(ctx, opts)

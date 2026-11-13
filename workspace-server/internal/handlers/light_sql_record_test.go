@@ -66,6 +66,19 @@ func assertNoWrites(t *testing.T, stmts []string, allowed ...string) {
 	}
 }
 
+// assertNoTransaction fails when the code opened a transaction: sqlmock
+// refuses an unexpected BEGIN, so the writes it was opened for never show up
+// as statements.
+func assertNoTransaction(t *testing.T, stmts []string) {
+	t.Helper()
+	for _, q := range stmts {
+		if q == "BEGIN" {
+			t.Errorf("a refused call opened a transaction (statements: %v)", stmts)
+			return
+		}
+	}
+}
+
 func TestSQLWritesSeesEveryWriteShape(t *testing.T) {
 	stmts := []string{
 		`SELECT COALESCE(light_state, '') FROM workspaces WHERE id = $1`,

@@ -853,7 +853,7 @@ func (h *LightHandler) Open(c *gin.Context) {
 //	@Failure	404	{object}	map[string]interface{}	"WORKSPACE_NOT_FOUND, LIGHT_SCHEDULE_NOT_FOUND, LIGHT_TENANT_NOT_FOUND"
 //	@Failure	500	{object}	map[string]interface{}	"LIGHT_FAILED"
 //	@Failure	502	{object}	map[string]interface{}	"LIGHT_FAILED"
-//	@Failure	409	{object}	map[string]interface{}	"LIGHT_NOT_PARKED, LIGHT_RUN_ACTIVE, LIGHT_RUN_EXISTS, LIGHT_AGENT_AWAKE, LIGHT_TENANT_SUSPENDED"
+//	@Failure	409	{object}	map[string]interface{}	"LIGHT_NOT_PARKED, LIGHT_RUN_ACTIVE, LIGHT_RUN_EXISTS, LIGHT_AGENT_AWAKE, LIGHT_TENANT_SUSPENDED, LIGHT_TRANSITION_IN_PROGRESS"
 //	@Failure	422	{object}	map[string]interface{}	"LIGHT_INVALID"
 //	@Failure	501	{object}	map[string]interface{}	"LIGHT_UNSUPPORTED"
 //	@Failure	503	{object}	map[string]interface{}	"LIGHT_BACKEND_UNAVAILABLE"
