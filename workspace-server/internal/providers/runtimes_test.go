@@ -133,6 +133,8 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 			"MiniMax-M2", "MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3",
 			// minimax via platform proxy
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
+			// Claude Fable 5.1 via platform proxy + Auto routing (molecule-ai-sdk#221).
+			"anthropic/claude-fable-5-1", "platform/auto",
 		},
 		// hermes: kimi (BYOK gateway) + platform-managed kimi + platform-managed
 		// MiniMax (task #83 / shared-default parity, CTO 2026-06-24): MiniMax is
@@ -148,6 +150,8 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 			"minimax:MiniMax-M2.7", "minimax:MiniMax-M2.7-highspeed", "minimax:MiniMax-M3",
 			// minimax via platform proxy (task #83 platform default)
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
+			// Auto routing pseudo-model (molecule-ai-sdk#221).
+			"platform/auto",
 		},
 		// codex: openai BYOK + platform-managed openai (served via the proxy
 		// Responses surface; codex CLI 0.130+ is Responses-API-only) +
@@ -163,6 +167,8 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 			"openai/gpt-5.4", "openai/gpt-5.4-mini",
 			// minimax via platform proxy (task #83 platform default)
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
+			// Auto routing pseudo-model (molecule-ai-sdk#221).
+			"platform/auto",
 		},
 		// openclaw: kimi BYOK (moonshot: prefix -> KIMI_API_KEY ->
 		// api.kimi.com/coding gateway) + platform-managed kimi (moonshot/) +
@@ -179,6 +185,8 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 			"minimax:MiniMax-M2.7", "minimax:MiniMax-M2.7-highspeed",
 			// minimax via platform proxy (task #83 platform default)
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
+			// Auto routing pseudo-model (molecule-ai-sdk#221).
+			"platform/auto",
 		},
 	}
 
