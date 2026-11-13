@@ -10,14 +10,17 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
 const (
-	lightReportStartedSQL  = `INSERT INTO light_runs \(workspace_id, run_id, schedule, status, source, started_at\)\s+VALUES \(\$1, \$2, \$3, 'running', 'report', \$4\)\s+ON CONFLICT \(workspace_id, run_id\) DO UPDATE[\s\S]*WHERE light_runs\.status = 'running'\s+RETURNING status`
-	lightReportFinishedSQL = `INSERT INTO light_runs \(workspace_id, run_id, schedule, status, source, started_at, finished_at, exit_code, output, error\)[\s\S]*WHERE light_runs\.status = 'running' OR light_runs\.source = 'job'`
+	lightReportStartedSQL = `INSERT INTO light_runs \(workspace_id, run_id, schedule, status, source, started_at\)\s+VALUES \(\$1, \$2, \$3, 'running', 'report', \$4\)\s+ON CONFLICT \(workspace_id, run_id\) DO UPDATE\s+SET source = 'report',\s+started_at = COALESCE\(light_runs\.started_at, EXCLUDED\.started_at\),\s+updated_at = now\(\)\s+WHERE light_runs\.status = 'running'\s+RETURNING status`
+	// The SET lists are pinned whole: a finished report must set the run's
+	// status (C3), and a regex that skipped the list could not see it change.
+	lightReportFinishedSQL = `INSERT INTO light_runs \(workspace_id, run_id, schedule, status, source, started_at, finished_at, exit_code, output, error\)\s+VALUES \(\$1, \$2, \$3, \$4, 'report', \$5, COALESCE\(\$6, now\(\)\), \$7, \$8, \$9\)\s+ON CONFLICT \(workspace_id, run_id\) DO UPDATE\s+SET status = EXCLUDED\.status,\s+source = 'report',\s+started_at = COALESCE\(light_runs\.started_at, EXCLUDED\.started_at\),\s+finished_at = EXCLUDED\.finished_at,\s+exit_code = EXCLUDED\.exit_code,\s+output = EXCLUDED\.output,\s+error = EXCLUDED\.error,\s+updated_at = now\(\)\s+WHERE light_runs\.status = 'running' OR light_runs\.source = 'job'`
 )
 
 // asWorkspaceToken marks the request as authenticated by the workspace's own
@@ -171,6 +174,10 @@ func TestReportRunValidatesTheBody(t *testing.T) {
 		"no started_at":    {strings.Replace(startedBody, `"started_at":"2026-11-13T04:39:52Z"`, `"started_at":null`, 1), "started_at"},
 		"bad started_at":   {strings.Replace(startedBody, `2026-11-13T04:39:52Z`, `yesterday`, 1), "started_at"},
 		"bad finished_at":  {strings.Replace(finishedBody("failed", "", "", 1), `2026-11-13T04:41:10Z`, `later`, 1), "finished_at"},
+		// exit_code is an INTEGER column: outside int32 is the report's fault
+		// (400), not a database error (500).
+		"exit above int32": {strings.Replace(finishedBody("failed", "", "", 1), `"exit_code":1`, `"exit_code":2147483648`, 1), "exit_code"},
+		"exit below int32": {strings.Replace(finishedBody("failed", "", "", 1), `"exit_code":1`, `"exit_code":-2147483649`, 1), "exit_code"},
 	}
 	for name, tc := range cases {
 		w := lightCall(lh.ReportRun, http.MethodPost, "/", tc.body, asWorkspaceToken)
@@ -178,6 +185,33 @@ func TestReportRunValidatesTheBody(t *testing.T) {
 		if w.Code != http.StatusBadRequest || body["code"] != "LIGHT_INVALID_REPORT" || body["field"] != tc.field {
 			t.Errorf("%s: %d %v, want 400 LIGHT_INVALID_REPORT field %s", name, w.Code, body, tc.field)
 		}
+	}
+}
+
+// A NUL in output or error cannot be stored in a Postgres text column; it
+// becomes U+FFFD before the byte limits, so the report is never refused and
+// the stored text still fits. (Real Postgres: light_runs_integration_test.go.)
+func TestValidateLightRunReportReplacesNULAndKeepsTheLimits(t *testing.T) {
+	start := "2026-11-13T04:39:52Z"
+	exit := 2147483647
+	out := "tool said a\x00b"
+	errText := "bad\x00err"
+	row, bad := validateLightRunReport(lightRunReport{
+		RunID: "light-x-1", Schedule: "daily", Phase: "finished", Status: "failed",
+		StartedAt: &start, ExitCode: &exit, Output: &out, Error: &errText,
+	})
+	if bad != "" || row.Output != "tool said a\uFFFDb" || row.Error != "bad\uFFFDerr" {
+		t.Fatalf("row=%+v bad=%q, want NUL replaced by U+FFFD and int32 max accepted", row, bad)
+	}
+	big := strings.Repeat("\x00", lightOutputLimit)
+	bigErr := strings.Repeat("\x00", lightErrorLimit)
+	row, bad = validateLightRunReport(lightRunReport{
+		RunID: "light-x-1", Schedule: "daily", Phase: "finished", Status: "failed", StartedAt: &start, Output: &big, Error: &bigErr,
+	})
+	if bad != "" || len(row.Output) > lightOutputLimit || len(row.Error) > lightErrorLimit ||
+		strings.ContainsRune(row.Output, 0) || !utf8.ValidString(row.Output) || !utf8.ValidString(row.Error) {
+		t.Fatalf("output %d bytes, error %d bytes (limits %d/%d), valid=%v/%v",
+			len(row.Output), len(row.Error), lightOutputLimit, lightErrorLimit, utf8.ValidString(row.Output), utf8.ValidString(row.Error))
 	}
 }
 

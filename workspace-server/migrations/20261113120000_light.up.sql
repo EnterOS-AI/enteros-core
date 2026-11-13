@@ -27,6 +27,11 @@ ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS light_retired_token_id UUID;
 -- The last Light operation that failed in the background: {"code","message"}.
 ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS light_last_error JSONB;
 ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS light_last_error_at TIMESTAMPTZ;
+-- The workspace's own MOLECULE_CONTINUOUS secret (the 24/7 switch) as it was
+-- before enable set it to false, so disable restores exactly that:
+-- {"present": false} = no workspace row; {"present": true, "encrypted_value":
+-- <base64>, "encryption_version": N} = that row, byte for byte.
+ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS light_continuous_before JSONB;
 
 -- The monitors scan Light agents only.
 CREATE INDEX IF NOT EXISTS idx_workspaces_light_state

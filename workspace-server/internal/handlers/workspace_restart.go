@@ -429,12 +429,20 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	containerRuntime := h.restartRuntimeFromConfig(ctx, id, wsName, dbRuntime, body.ApplyTemplate)
 
 	// Reset to provisioning. The claim refuses a parking or parked Light agent
-	// (the guard read above failed open): nothing is dispatched for it.
+	// (the guard read above failed open) and a row deleted meanwhile: nothing
+	// is dispatched for either, and the answer says which.
 	if !markProvisioningForRestart(ctx, id) {
-		c.JSON(http.StatusConflict, gin.H{
-			"error": lightParkedMessage,
-			"code":  "LIGHT_AGENT_PARKED",
-		})
+		state, stateErr := readLightState(ctx, id)
+		switch {
+		case errors.Is(stateErr, sql.ErrNoRows):
+			c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
+		case stateErr == nil && models.LightBlocksWake(state):
+			lightParkedRefusal(state).write(c)
+		default:
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "the workspace changed state before the restart could start; re-check its status before retrying",
+			})
+		}
 		return
 	}
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), id, map[string]interface{}{
@@ -1713,11 +1721,23 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID, autoTrigger string) {
 		armRestartQueueHold(workspaceID)
 	}
 
-	if _, err := db.DB.ExecContext(ctx,
+	// Enter OS Light: the provisioning write carries the predicate too. The
+	// SELECT above saw the agent open, but the stop can take tens of seconds,
+	// and a park may have claimed it meanwhile; a parking or parked agent is not
+	// re-provisioned (its schedules run as the control plane's CronJobs). A
+	// mutation-driven cycle leaves a refresh instead, as the SELECT branch does.
+	if res, err := db.DB.ExecContext(ctx,
 		// Clear mcp_unloaded_since — fresh warming clock for the new provisioning
 		// episode (core#4457 cluster-2; see Restart path above).
-		`UPDATE workspaces SET status = $1, url = '', mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2`, models.StatusProvisioning, workspaceID); err != nil {
+		`UPDATE workspaces SET status = $1, url = '', mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2 AND `+models.LightWakeAllowedSQL,
+		models.StatusProvisioning, workspaceID); err != nil {
 		log.Printf("Auto-restart: failed to set provisioning status for %s: %v", workspaceID, err)
+	} else if n, raErr := res.RowsAffected(); raErr == nil && n == 0 {
+		log.Printf("Auto-restart: %s (%s) was parked (or deleted) while it restarted — not re-provisioned", wsName, workspaceID)
+		if autoTrigger == "" {
+			queueLightRefreshIfBlocked(ctx, workspaceID, "restart")
+		}
+		return
 	}
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), workspaceID, map[string]interface{}{
 		"name": wsName, "tier": tier, "runtime": dbRuntime, "template": dbTemplate,

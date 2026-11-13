@@ -12,6 +12,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -66,11 +67,13 @@ func TestHeartbeatFromAParkedLightAgentIs409AndWritesNothing(t *testing.T) {
 
 	expectValidWorkspaceBearer(mock, lightTestWS, "run-or-instance-token")
 	expectLightState(mock, lightTestWS, "parked")
+	rec := recordSQL(t)
 
 	body := `{"workspace_id":"` + lightTestWS + `","error_rate":0,"sample_error":"","active_tasks":1,"uptime_seconds":60,"monthly_spend":500}`
 	w := registryCall(t, h.Heartbeat, "/registry/heartbeat", body, "run-or-instance-token")
 
 	assertLightParked409(t, w, "LIGHT_AGENT_PARKED")
+	assertNoWrites(t, rec(), "workspace_auth_tokens")
 	// No write beyond auth's own token last_used_at bump: no spend ledger row,
 	// no heartbeat UPDATE, no drain.
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -90,9 +93,11 @@ func TestHeartbeatFromAParkingLightAgentIs409(t *testing.T) {
 
 	expectNoLiveInstanceToken(mock, lightTestWS)
 	expectLightState(mock, lightTestWS, "parking")
+	rec := recordSQL(t)
 
 	body := `{"workspace_id":"` + lightTestWS + `","active_tasks":0}`
 	assertLightParked409(t, registryCall(t, h.Heartbeat, "/registry/heartbeat", body, ""), "LIGHT_AGENT_PARKING")
+	assertNoWrites(t, rec())
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet: %v", err)
 	}
@@ -110,11 +115,13 @@ func TestRegisterFromAParkedLightAgentIs409AndWritesNothing(t *testing.T) {
 	expectLightState(mock, lightTestWS, "parked")
 	// Nothing after: no upsert, no SetOnline, no URL cache, and — because the
 	// guard runs before authOK — no deferred last_register_failure_at UPDATE.
+	rec := recordSQL(t)
 
 	body := `{"id":"` + lightTestWS + `","url":"http://ws.example:8000","agent_card":{"name":"x"}}`
 	w := registryCall(t, h.Register, "/registry/register", body, "")
 
 	assertLightParked409(t, w, "LIGHT_AGENT_PARKED")
+	assertNoWrites(t, rec())
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet: %v", err)
 	}
@@ -130,9 +137,11 @@ func TestUpdateCardForAParkedLightAgentIs409AndWritesNothing(t *testing.T) {
 
 	expectNoLiveInstanceToken(mock, lightTestWS)
 	expectLightState(mock, lightTestWS, "parked")
+	rec := recordSQL(t)
 
 	body := `{"workspace_id":"` + lightTestWS + `","agent_card":{"name":"rewritten by a run"}}`
 	assertLightParked409(t, registryCall(t, h.UpdateCard, "/registry/update-card", body, ""), "LIGHT_AGENT_PARKED")
+	assertNoWrites(t, rec())
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet: %v", err)
 	}
@@ -161,7 +170,7 @@ func TestHeartbeatUpdateCarriesTheLightPredicate(t *testing.T) {
 func TestRegisterUpsertAndCardUpdateCarryTheLightPredicate(t *testing.T) {
 	// Both statements are long and their remaining flow is covered elsewhere;
 	// pin the predicate on the statements themselves at the source level.
-	src := readHandlerSource(t, "registry.go")
+	src := readLightSource(t, "registry.go")
 	for _, want := range []string{
 		"WHERE workspaces.status NOT IN ('removed', 'paused', 'hibernated') AND `+models.LightWakeAllowedSQLFor(\"workspaces\")+`",
 		"UPDATE workspaces SET agent_card = $2::jsonb, updated_at = now() WHERE id = $1 AND `+models.LightWakeAllowedSQL+`",
@@ -170,4 +179,28 @@ func TestRegisterUpsertAndCardUpdateCarryTheLightPredicate(t *testing.T) {
 			t.Errorf("registry.go lacks %q", want)
 		}
 	}
+}
+
+// The restart cycle's provisioning write carries the predicate like every
+// other revive write: its SELECT saw the agent open, but a park can claim it
+// during the stop (review 21716, R4; behaviour on real Postgres in
+// TestIntegration_LightGuards_RestartInFlightCannotReprovision).
+func TestRestartCycleProvisioningWriteCarriesTheLightPredicate(t *testing.T) {
+	src := readLightSource(t, "workspace_restart.go")
+	want := "`UPDATE workspaces SET status = $1, url = '', mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2 AND `+models.LightWakeAllowedSQL"
+	if !strings.Contains(src, want) {
+		t.Errorf("workspace_restart.go's restart-cycle provisioning write lacks the Light predicate: want %q", want)
+	}
+}
+
+// readLightSource reads a file of this package by its relative path (go test
+// runs in the package directory), so the read also works for a test binary
+// built on another OS.
+func readLightSource(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatalf("read %s: %v", name, err)
+	}
+	return string(b)
 }

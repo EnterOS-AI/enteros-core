@@ -9,6 +9,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -51,9 +52,13 @@ func TestProxyA2AToAParkedLightAgentIs409AndWritesNothing(t *testing.T) {
 				WillReturnRows(sqlmock.NewRows([]string{"kind", "status"}).AddRow("workspace", "hibernated"))
 			expectLightState(mock, lightTestWS, tc.state)
 			// Nothing after the guard: no ingest INSERT, no delivery-mode read, no
-			// URL resolve, no wake claim.
+			// URL resolve, no wake claim. recordSQL sees a write even where a
+			// best-effort writer swallows sqlmock's "unexpected" error.
+			rec := recordSQL(t)
 
 			_, _, perr := h.proxyA2ARequest(context.Background(), lightTestWS, []byte(lightMsgSend), "", true, true)
+			h.waitAsyncForTest()
+			assertNoWrites(t, rec())
 			if perr == nil || perr.Status != http.StatusConflict {
 				t.Fatalf("proxy error = %+v, want a 409", perr)
 			}
@@ -161,9 +166,11 @@ func TestRestartOfAParkedLightAgentIs409AndDoesNotProvision(t *testing.T) {
 
 	expectRestartLookup(mock, "hibernated")
 	expectLightState(mock, lightTestWS, "parked")
+	rec := recordSQL(t)
 
 	w := lightRestartCall(h)
 	h.waitAsyncForTest()
+	assertNoWrites(t, rec())
 
 	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"code":"LIGHT_AGENT_PARKED"`) {
 		t.Fatalf("restart = %d %s, want 409 LIGHT_AGENT_PARKED", w.Code, w.Body.String())
@@ -189,9 +196,11 @@ func TestRestartClaimRefusesALightRowWhenTheGuardReadFails(t *testing.T) {
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").WithArgs(lightTestWS).
 		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
 	// The claim's predicate refuses the parked row: zero rows.
-	mock.ExpectExec(`UPDATE workspaces SET status = \$1, mcp_unloaded_since = NULL, updated_at = now\(\) WHERE id = \$2 AND `+lightPredicateRe).
+	mock.ExpectExec(restartClaimRe).
 		WithArgs(models.StatusProvisioning, lightTestWS).
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	// The answer names why: the row is a parked Light agent.
+	expectLightState(mock, lightTestWS, "parked")
 
 	w := lightRestartCall(h)
 	h.waitAsyncForTest()
@@ -204,6 +213,48 @@ func TestRestartClaimRefusesALightRowWhenTheGuardReadFails(t *testing.T) {
 	}
 	if calls := trackedCPCalls(cp); len(calls) != 0 {
 		t.Errorf("an unclaimed restart was dispatched: CP calls %v", calls)
+	}
+}
+
+const restartClaimRe = `UPDATE workspaces SET status = \$1, mcp_unloaded_since = NULL, updated_at = now\(\) WHERE id = \$2 AND `
+
+// A claim that misses for a row that is not a Light agent (deleted, or changed
+// state concurrently) must not answer with Light's wording (review N2).
+func TestRestartClaimMissOfANonLightRowSaysWhatHappened(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		read       func(sqlmock.Sqlmock)
+		wantStatus int
+	}{
+		{"row deleted", func(mock sqlmock.Sqlmock) {
+			mock.ExpectQuery(lightStateQuery).WithArgs(lightTestWS).WillReturnError(sql.ErrNoRows)
+		}, http.StatusNotFound},
+		{"not a Light agent", func(mock sqlmock.Sqlmock) { expectLightState(mock, lightTestWS, "") }, http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := setupTestDB(t)
+			setupTestRedis(t)
+			cp := &trackingCPProv{}
+			h := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+			h.SetCPProvisioner(cp)
+			waitForHandlerAsyncBeforeDBCleanup(t, h)
+
+			expectRestartLookup(mock, "online")
+			expectLightState(mock, lightTestWS, "")
+			mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").WithArgs(lightTestWS).
+				WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+			mock.ExpectExec(restartClaimRe).WithArgs(models.StatusProvisioning, lightTestWS).WillReturnResult(sqlmock.NewResult(0, 0))
+			tc.read(mock)
+
+			w := lightRestartCall(h)
+			h.waitAsyncForTest()
+			if w.Code != tc.wantStatus || strings.Contains(w.Body.String(), "LIGHT") || strings.Contains(w.Body.String(), "Light agent") {
+				t.Fatalf("restart = %d %s, want %d without Light wording", w.Code, w.Body.String(), tc.wantStatus)
+			}
+			if calls := trackedCPCalls(cp); len(calls) != 0 {
+				t.Errorf("an unclaimed restart was dispatched: CP calls %v", calls)
+			}
+		})
 	}
 }
 
@@ -304,22 +355,36 @@ func lightResumeCall(h *WorkspaceHandler) *httptest.ResponseRecorder {
 	return w
 }
 
-func TestResumeOfAParkedLightAgentIs409(t *testing.T) {
+func TestResumeOfAParkedLightAgentIs409AndDoesNotProvision(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
+	cp := &trackingCPProv{}
 	h := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
-	h.SetCPProvisioner(&trackingCPProv{})
+	h.SetCPProvisioner(cp)
 	waitForHandlerAsyncBeforeDBCleanup(t, h)
 
 	expectLightState(mock, lightTestWS, "parked")
+	rec := recordSQL(t)
+	provLog := captureProvLog(t)
 
 	w := lightResumeCall(h)
+	h.waitAsyncForTest()
 	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"code":"LIGHT_AGENT_PARKED"`) {
 		t.Fatalf("resume = %d %s, want 409", w.Code, w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet: %v", err)
 	}
+	// A provision is dispatched synchronously (provisionWorkspaceAuto logs
+	// provision.start before it spawns), so nothing may have been logged,
+	// written or sent to the control plane.
+	if strings.Contains(provLog(), "provision.start") {
+		t.Error("resume of a parked Light agent dispatched a provision")
+	}
+	if calls := trackedCPCalls(cp); len(calls) != 0 {
+		t.Errorf("resume reached the CP: %v", calls)
+	}
+	assertNoWrites(t, rec())
 }
 
 func TestResumeCascadeAndClaimCarryTheLightPredicate(t *testing.T) {

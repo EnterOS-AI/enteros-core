@@ -4,8 +4,8 @@ package handlers
 // GET /workspaces/:id/light.
 
 import (
-	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -18,6 +18,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 )
 
@@ -31,6 +32,32 @@ func expectLightLoad(mock sqlmock.Sqlmock, status, runtime, kind, lightState str
 }
 
 const lightSecretReadSQL = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = \$2`
+
+const lightEnableClaimSQL = `UPDATE workspaces SET light_state = 'open', light_state_at = now\(\), light_opened_by = 'owner',\s+light_continuous_before = \$2::jsonb, updated_at = now\(\)\s+WHERE id = \$1 AND light_state IS NULL`
+
+// continuousBeforeArg matches the light_continuous_before JSON enable records:
+// whether the workspace had its own MOLECULE_CONTINUOUS row, and (when it did)
+// that row's value, decrypted from the recorded ciphertext.
+type continuousBeforeArg struct {
+	present bool
+	plain   string
+}
+
+func (a continuousBeforeArg) Match(v driver.Value) bool {
+	s, ok := v.(string)
+	if !ok {
+		return false
+	}
+	var b lightSecretBefore
+	if json.Unmarshal([]byte(s), &b) != nil || b.Present != a.present {
+		return false
+	}
+	if !a.present {
+		return len(b.EncryptedValue) == 0
+	}
+	plain, err := crypto.DecryptVersioned(b.EncryptedValue, b.EncryptionVersion)
+	return err == nil && string(plain) == a.plain
+}
 
 func expectLightSecretMissingAndWritten(mock sqlmock.Sqlmock, key, value string) {
 	mock.ExpectQuery(lightSecretReadSQL).WithArgs(lightTestWS, key).WillReturnError(sql.ErrNoRows)
@@ -83,8 +110,8 @@ func TestLightEnableWritesBothSecretsAndRestarts(t *testing.T) {
 	mock.ExpectBegin()
 	expectLightSecretMissingAndWritten(mock, "MOLECULE_LIGHT", "1")
 	expectLightSecretMissingAndWritten(mock, "MOLECULE_CONTINUOUS", "false")
-	mock.ExpectExec(`UPDATE workspaces SET light_state = 'open', light_state_at = now\(\), light_opened_by = 'owner', updated_at = now\(\)\s+WHERE id = \$1 AND light_state IS NULL`).
-		WithArgs(lightTestWS).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(lightEnableClaimSQL).
+		WithArgs(lightTestWS, continuousBeforeArg{present: false}).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
 	w := lightCall(lh.Enable, http.MethodPost, "/workspaces/"+lightTestWS+"/light/enable", "", nil)
@@ -113,7 +140,7 @@ func TestLightEnableWakesAHibernatedAgent(t *testing.T) {
 	mock.ExpectBegin()
 	expectLightSecretMissingAndWritten(mock, "MOLECULE_LIGHT", "1")
 	expectLightSecretMissingAndWritten(mock, "MOLECULE_CONTINUOUS", "false")
-	mock.ExpectExec(`UPDATE workspaces SET light_state = 'open'`).WithArgs(lightTestWS).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(lightEnableClaimSQL).WithArgs(lightTestWS, continuousBeforeArg{present: false}).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
 	w := lightCall(lh.Enable, http.MethodPost, "/", "", nil)
@@ -274,29 +301,57 @@ func TestLightManagementRefusesTheWorkspaceItself(t *testing.T) {
 		"enable":  func(h *LightHandler) func(*gin.Context) { return h.Enable },
 		"disable": func(h *LightHandler) func(*gin.Context) { return h.Disable },
 	}
+	// The identity WorkspaceAuth proved and recorded (any token of the
+	// workspace, a run token included), and the X-Workspace-ID header.
+	callers := map[string]func(*gin.Context){
+		"workspace token": func(c *gin.Context) {
+			c.Request.Header.Set("Authorization", "Bearer the-run-token")
+			c.Set("authenticated_workspace_id", lightTestWS)
+		},
+		"X-Workspace-ID": func(c *gin.Context) { c.Request.Header.Set("X-Workspace-ID", lightTestWS) },
+	}
 	for name, route := range routes {
-		t.Run(name, func(t *testing.T) {
-			mock := setupTestDB(t)
-			setupTestRedis(t)
-			api := &fakeLightAPI{}
-			lh, _ := newLightTestHandler(t, api)
-			sum := sha256.Sum256([]byte("the-run-token"))
-			mock.ExpectQuery(`SELECT t\.id, t\.workspace_id`).WithArgs(sum[:]).
-				WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-run", lightTestWS))
+		for callerName, caller := range callers {
+			t.Run(name+"/"+callerName, func(t *testing.T) {
+				mock := setupTestDB(t)
+				setupTestRedis(t)
+				api := &fakeLightAPI{}
+				lh, _ := newLightTestHandler(t, api)
+				rec := recordSQL(t)
 
-			w := lightCall(route(lh), http.MethodPost, "/", "", func(c *gin.Context) {
-				c.Request.Header.Set("Authorization", "Bearer the-run-token")
+				w := lightCall(route(lh), http.MethodPost, "/", "", caller)
+				if w.Code != http.StatusForbidden || lightBody(t, w)["code"] != "LIGHT_SELF_FORBIDDEN" {
+					t.Fatalf("%s by the workspace itself = %d %s, want 403 LIGHT_SELF_FORBIDDEN", name, w.Code, w.Body.String())
+				}
+				if len(api.Calls()) != 0 {
+					t.Errorf("CP called: %v", api.Calls())
+				}
+				// Fail-closed: the refusal rests on the recorded identity, not on a
+				// second token lookup that a database error could turn into "".
+				if stmts := rec(); len(stmts) != 0 {
+					t.Errorf("the self check touched the database: %v", stmts)
+				}
+				if err := mock.ExpectationsWereMet(); err != nil {
+					t.Errorf("unmet: %v", err)
+				}
 			})
-			if w.Code != http.StatusForbidden || lightBody(t, w)["code"] != "LIGHT_SELF_FORBIDDEN" {
-				t.Fatalf("%s by the workspace itself = %d %s, want 403 LIGHT_SELF_FORBIDDEN", name, w.Code, w.Body.String())
-			}
-			if len(api.Calls()) != 0 {
-				t.Errorf("CP called: %v", api.Calls())
-			}
-			if err := mock.ExpectationsWereMet(); err != nil {
-				t.Errorf("unmet (nothing may be read or written past the token): %v", err)
-			}
-		})
+		}
+	}
+}
+
+// Another workspace's bearer never reaches these handlers (WorkspaceAuth binds
+// a workspace token to :id), and owner credentials record no workspace: the
+// self check lets them through.
+func TestLightManagementLetsTheOwnerThrough(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	lh, _ := newLightTestHandler(t, &fakeLightAPI{})
+	expectLightLoad(mock, "online", "hermes", "workspace", "", 0, nil, nil)
+	w := lightCall(lh.Disable, http.MethodPost, "/", "", func(c *gin.Context) {
+		c.Set("org_token_id", "tok-org")
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("disable by the owner = %d %s", w.Code, w.Body.String())
 	}
 }
 
@@ -316,15 +371,32 @@ func TestLightRoutesRejectANonCanonicalID(t *testing.T) {
 	}
 }
 
-func expectLightDisableWrites(mock sqlmock.Sqlmock, tokens []string) {
+const (
+	lightDisableBeforeSQL     = `SELECT light_continuous_before FROM workspaces WHERE id = \$1 FOR UPDATE`
+	lightDeleteSecretSQL      = `DELETE FROM workspace_secrets WHERE workspace_id = \$1 AND key = \$2`
+	lightRestoreContinuousSQL = `INSERT INTO workspace_secrets \(workspace_id, key, encrypted_value, encryption_version\)\s+VALUES \(\$1, \$2, \$3, \$4\)\s+ON CONFLICT \(workspace_id, key\) DO UPDATE\s+SET encrypted_value = EXCLUDED\.encrypted_value, encryption_version = EXCLUDED\.encryption_version, updated_at = now\(\)`
+)
+
+// expectLightDisableWrites scripts disable's transaction. before is the
+// recorded light_continuous_before ("" = none recorded); restore scripts what
+// it puts back.
+func expectLightDisableWrites(mock sqlmock.Sqlmock, tokens []string, before string, restore func(sqlmock.Sqlmock)) {
 	mock.ExpectBegin()
+	var b interface{}
+	if before != "" {
+		b = []byte(before)
+	}
+	mock.ExpectQuery(lightDisableBeforeSQL).WithArgs(lightTestWS).
+		WillReturnRows(sqlmock.NewRows([]string{"light_continuous_before"}).AddRow(b))
 	if len(tokens) > 0 {
 		mock.ExpectExec(`UPDATE workspace_auth_tokens SET revoked_at = now\(\)\s+WHERE workspace_id = \$1 AND id::text = ANY\(\$2\) AND revoked_at IS NULL`).
 			WithArgs(lightTestWS, pqArrayArg(tokens)).WillReturnResult(sqlmock.NewResult(0, int64(len(tokens))))
 	}
-	mock.ExpectExec(`DELETE FROM workspace_secrets WHERE workspace_id = \$1 AND key = ANY\(\$2\)`).
-		WithArgs(lightTestWS, pqArrayArg{"MOLECULE_LIGHT", "MOLECULE_CONTINUOUS"}).WillReturnResult(sqlmock.NewResult(0, 2))
-	mock.ExpectExec(`UPDATE workspaces\s+SET light_state = NULL, light_state_at = now\(\), light_opened_by = NULL,\s+light_run_token_id = NULL, light_retired_token_id = NULL,`).
+	mock.ExpectExec(lightDeleteSecretSQL).WithArgs(lightTestWS, "MOLECULE_LIGHT").WillReturnResult(sqlmock.NewResult(0, 1))
+	if restore != nil {
+		restore(mock)
+	}
+	mock.ExpectExec(`UPDATE workspaces\s+SET light_state = NULL, light_state_at = now\(\), light_opened_by = NULL,\s+light_run_token_id = NULL, light_retired_token_id = NULL, light_continuous_before = NULL,`).
 		WithArgs(lightTestWS).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`DELETE FROM light_schedules WHERE workspace_id = \$1`).WithArgs(lightTestWS).WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectExec(`DELETE FROM light_pending_actions WHERE workspace_id = \$1 AND applied_at IS NULL`).WithArgs(lightTestWS).WillReturnResult(sqlmock.NewResult(0, 0))
@@ -338,7 +410,9 @@ func TestLightDisableDeletesCPObjectsThenEverythingElse(t *testing.T) {
 	lh, _ := newLightTestHandler(t, api)
 
 	expectLightLoad(mock, "hibernated", "hermes", "workspace", "parked", 0, "tok-current", "tok-retired")
-	expectLightDisableWrites(mock, []string{"tok-current", "tok-retired"})
+	expectLightDisableWrites(mock, []string{"tok-current", "tok-retired"}, `{"present":false}`, func(mock sqlmock.Sqlmock) {
+		mock.ExpectExec(lightDeleteSecretSQL).WithArgs(lightTestWS, "MOLECULE_CONTINUOUS").WillReturnResult(sqlmock.NewResult(0, 1))
+	})
 
 	w := lightCall(lh.Disable, http.MethodPost, "/", "", nil)
 	want := map[string]interface{}{
@@ -382,7 +456,7 @@ func TestLightDisableTreatsUnsupportedAndNoTenantAsDeleted(t *testing.T) {
 		setupTestRedis(t)
 		lh, _ := newLightTestHandler(t, &fakeLightAPI{deleteErr: cpErr})
 		expectLightLoad(mock, "online", "hermes", "workspace", "open", 0, nil, nil)
-		expectLightDisableWrites(mock, nil)
+		expectLightDisableWrites(mock, nil, "", nil)
 
 		w := lightCall(lh.Disable, http.MethodPost, "/", "", nil)
 		if w.Code != http.StatusOK || lightBody(t, w)["restart"] != "started" {
@@ -391,6 +465,76 @@ func TestLightDisableTreatsUnsupportedAndNoTenantAsDeleted(t *testing.T) {
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("unmet: %v", err)
 		}
+	}
+}
+
+// Enable records the agent's own 24/7 row as it was — on, off or absent — so
+// disable can put exactly that back (review 21716, R3).
+func TestLightEnableRecordsThe247SettingAsItWas(t *testing.T) {
+	for _, prior := range []string{"true", "false"} {
+		t.Run(prior, func(t *testing.T) {
+			mock := setupTestDB(t)
+			setupTestRedis(t)
+			lh, _ := newLightTestHandler(t, &fakeLightAPI{})
+			expectLightLoad(mock, "online", "hermes", "workspace", "", 0, nil, nil)
+			mock.ExpectBegin()
+			expectLightSecretMissingAndWritten(mock, "MOLECULE_LIGHT", "1")
+			mock.ExpectQuery(lightSecretReadSQL).WithArgs(lightTestWS, "MOLECULE_CONTINUOUS").WillReturnRows(encryptedRow(t, prior))
+			if prior == "true" {
+				mock.ExpectExec(`INSERT INTO workspace_secrets \(workspace_id, key, encrypted_value, encryption_version\)`).
+					WithArgs(lightTestWS, "MOLECULE_CONTINUOUS", encryptedAs("false"), sqlmock.AnyArg()).
+					WillReturnResult(sqlmock.NewResult(1, 1))
+			}
+			mock.ExpectExec(lightEnableClaimSQL).WithArgs(lightTestWS, continuousBeforeArg{present: true, plain: prior}).
+				WillReturnResult(sqlmock.NewResult(0, 1))
+			mock.ExpectCommit()
+
+			if w := lightCall(lh.Enable, http.MethodPost, "/", "", nil); w.Code != http.StatusOK {
+				t.Fatalf("enable = %d %s", w.Code, w.Body.String())
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet (the record must hold the row as it was before enable): %v", err)
+			}
+		})
+	}
+}
+
+func TestLightDisableRestoresThe247SettingAsItWas(t *testing.T) {
+	cipher, err := crypto.Encrypt([]byte("true"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	present, _ := json.Marshal(lightSecretBefore{Present: true, EncryptedValue: cipher, EncryptionVersion: 7})
+	cases := []struct {
+		name, before string
+		restore      func(sqlmock.Sqlmock)
+	}{
+		{"no workspace row before enable: removed again", `{"present":false}`, func(mock sqlmock.Sqlmock) {
+			mock.ExpectExec(lightDeleteSecretSQL).WithArgs(lightTestWS, "MOLECULE_CONTINUOUS").WillReturnResult(sqlmock.NewResult(0, 1))
+		}},
+		{"a workspace row before enable: put back byte for byte", string(present), func(mock sqlmock.Sqlmock) {
+			mock.ExpectExec(lightRestoreContinuousSQL).WithArgs(lightTestWS, "MOLECULE_CONTINUOUS", cipher, 7).WillReturnResult(sqlmock.NewResult(1, 1))
+		}},
+		// No record (not written by enable): the owner's setting is left alone.
+		{"no record", "", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := setupTestDB(t)
+			setupTestRedis(t)
+			lh, _ := newLightTestHandler(t, &fakeLightAPI{})
+			expectLightLoad(mock, "online", "hermes", "workspace", "open", 0, nil, nil)
+			expectLightDisableWrites(mock, nil, tc.before, tc.restore)
+
+			// The transaction is scripted statement by statement: any other
+			// write to the 24/7 row fails it, and disable then answers 500.
+			if w := lightCall(lh.Disable, http.MethodPost, "/", "", nil); w.Code != http.StatusOK {
+				t.Fatalf("disable = %d %s", w.Code, w.Body.String())
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet: %v", err)
+			}
+		})
 	}
 }
 

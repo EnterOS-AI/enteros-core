@@ -49,6 +49,7 @@ func integrationDB_Light(t *testing.T) *sql.DB {
 	if _, err := conn.ExecContext(context.Background(), `
 		DELETE FROM activity_logs WHERE workspace_id IN (SELECT id FROM workspaces WHERE name LIKE 'test-light-%');
 		DELETE FROM workspace_auth_tokens WHERE workspace_id IN (SELECT id FROM workspaces WHERE name LIKE 'test-light-%');
+		DELETE FROM workspace_secrets WHERE workspace_id IN (SELECT id FROM workspaces WHERE name LIKE 'test-light-%');
 		DELETE FROM workspaces WHERE name LIKE 'test-light-%';
 	`); err != nil {
 		t.Fatalf("cleanup: %v", err)

@@ -53,6 +53,19 @@ import (
 
 var serialisedMockCounter atomic.Int64
 
+// statementObserver, when set, sees the text of every statement a serialised
+// mock is asked to run, expected or not. sqlmock answers an unexpected
+// statement with an error, and a best-effort write swallows that error, so a
+// test that must prove a code path wrote nothing records what it tried
+// instead (recordSQL). Observation changes nothing else.
+var statementObserver atomic.Pointer[func(query string)]
+
+func observeStatement(query string) {
+	if f := statementObserver.Load(); f != nil {
+		(*f)(query)
+	}
+}
+
 // newSerialisedSqlmock builds a sqlmock whose every driver call is serialised.
 //
 // It returns the *sql.DB the code under test should use, the raw *sql.DB that
@@ -111,12 +124,14 @@ var (
 )
 
 func (c *serialisingConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	observeStatement(query)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.inner.(driver.ExecerContext).ExecContext(ctx, query, args)
 }
 
 func (c *serialisingConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	observeStatement(query)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.inner.(driver.QueryerContext).QueryContext(ctx, query, args)
@@ -129,6 +144,7 @@ func (c *serialisingConn) Ping(ctx context.Context) error {
 }
 
 func (c *serialisingConn) Prepare(query string) (driver.Stmt, error) {
+	observeStatement(query)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	stmt, err := c.inner.Prepare(query)
@@ -139,6 +155,7 @@ func (c *serialisingConn) Prepare(query string) (driver.Stmt, error) {
 }
 
 func (c *serialisingConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	observeStatement(query)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	stmt, err := c.inner.(driver.ConnPrepareContext).PrepareContext(ctx, query)

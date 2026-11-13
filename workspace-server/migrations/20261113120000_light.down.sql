@@ -11,6 +11,7 @@ DROP TABLE IF EXISTS light_schedules;
 DROP TABLE IF EXISTS light_runs;
 
 DROP INDEX IF EXISTS idx_workspaces_light_state;
+ALTER TABLE workspaces DROP COLUMN IF EXISTS light_continuous_before;
 ALTER TABLE workspaces DROP COLUMN IF EXISTS light_last_error_at;
 ALTER TABLE workspaces DROP COLUMN IF EXISTS light_last_error;
 ALTER TABLE workspaces DROP COLUMN IF EXISTS light_retired_token_id;

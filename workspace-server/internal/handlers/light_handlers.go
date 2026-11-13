@@ -98,12 +98,22 @@ func lightPreamble(c *gin.Context, op string, management bool) (string, bool) {
 		lightCode(c, op, id, http.StatusBadRequest, "LIGHT_BAD_REQUEST", "invalid workspace ID", nil)
 		return "", false
 	}
-	if management && callerWorkspaceID(c) == id {
+	if management && lightCallerIsTheWorkspace(c, id) {
 		lightCode(c, op, id, http.StatusForbidden, "LIGHT_SELF_FORBIDDEN",
 			"a workspace cannot manage its own Light state; call with the owner's credentials", nil)
 		return "", false
 	}
 	return id, true
+}
+
+// lightCallerIsTheWorkspace reports whether the caller authenticated as the
+// workspace itself (any of its tokens, a run pod's run token included). It
+// uses the identity WorkspaceAuth already proved and recorded — no second
+// token lookup that could fail open — and also refuses a caller that names
+// the workspace in X-Workspace-ID.
+func lightCallerIsTheWorkspace(c *gin.Context, workspaceID string) bool {
+	return c.GetString("authenticated_workspace_id") == workspaceID ||
+		strings.TrimSpace(c.GetHeader("X-Workspace-ID")) == workspaceID
 }
 
 // lightLoad reads the workspace or answers 404/500.
@@ -217,11 +227,20 @@ func lightTruthy(v string) bool {
 	return false
 }
 
+// lightSecretBefore is a workspace secret row as it was before enable wrote
+// it (workspaces.light_continuous_before), so disable can restore exactly it.
+// EncryptedValue is base64 in JSON.
+type lightSecretBefore struct {
+	Present           bool   `json:"present"`
+	EncryptedValue    []byte `json:"encrypted_value,omitempty"`
+	EncryptionVersion int    `json:"encryption_version,omitempty"`
+}
+
 // writeLightSecrets makes MOLECULE_LIGHT=1 and MOLECULE_CONTINUOUS=false the
 // workspace's own secrets (the 24/7 switch off: an open Light agent idles into
 // auto-park instead of waking itself). changed is false when both already held
-// those values.
-func writeLightSecrets(ctx context.Context, tx *sql.Tx, workspaceID string) (changed bool, err error) {
+// those values. continuousBefore is the MOLECULE_CONTINUOUS row as it was.
+func writeLightSecrets(ctx context.Context, tx *sql.Tx, workspaceID string) (changed bool, continuousBefore lightSecretBefore, err error) {
 	for _, s := range []struct {
 		key, value string
 		holds      func(string) bool
@@ -236,15 +255,18 @@ func writeLightSecrets(ctx context.Context, tx *sql.Tx, workspaceID string) (cha
 			workspaceID, s.key).Scan(&enc, &ver)
 		switch {
 		case err == nil:
+			if s.key == continuousSecretKey {
+				continuousBefore = lightSecretBefore{Present: true, EncryptedValue: enc, EncryptionVersion: ver}
+			}
 			if plain, decErr := crypto.DecryptVersioned(enc, ver); decErr == nil && s.holds(string(plain)) {
 				continue
 			}
 		case !errors.Is(err, sql.ErrNoRows):
-			return false, err
+			return false, continuousBefore, err
 		}
 		cipher, err := crypto.Encrypt([]byte(s.value))
 		if err != nil {
-			return false, err
+			return false, continuousBefore, err
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO workspace_secrets (workspace_id, key, encrypted_value, encryption_version)
@@ -252,11 +274,38 @@ func writeLightSecrets(ctx context.Context, tx *sql.Tx, workspaceID string) (cha
 			ON CONFLICT (workspace_id, key) DO UPDATE
 				SET encrypted_value = $3, encryption_version = $4, updated_at = now()`,
 			workspaceID, s.key, cipher, crypto.CurrentEncryptionVersion()); err != nil {
-			return false, err
+			return false, continuousBefore, err
 		}
 		changed = true
 	}
-	return changed, nil
+	return changed, continuousBefore, nil
+}
+
+// restoreLightContinuous puts the workspace's MOLECULE_CONTINUOUS secret back
+// as it was before enable (disable): no row → no row; a row → that row, byte
+// for byte. Without a record (before is NULL) the secret is left as it is.
+func restoreLightContinuous(ctx context.Context, tx *sql.Tx, workspaceID string, before []byte) error {
+	if len(before) == 0 {
+		log.Printf("light op=disable ws=%s: no record of the 24/7 setting before enable; MOLECULE_CONTINUOUS left as it is", workspaceID)
+		return nil
+	}
+	var b lightSecretBefore
+	if err := json.Unmarshal(before, &b); err != nil {
+		log.Printf("light op=disable ws=%s: unreadable record of the 24/7 setting (%v); MOLECULE_CONTINUOUS left as it is", workspaceID, err)
+		return nil
+	}
+	if !b.Present {
+		_, err := tx.ExecContext(ctx,
+			`DELETE FROM workspace_secrets WHERE workspace_id = $1 AND key = $2`, workspaceID, continuousSecretKey)
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO workspace_secrets (workspace_id, key, encrypted_value, encryption_version)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (workspace_id, key) DO UPDATE
+			SET encrypted_value = EXCLUDED.encrypted_value, encryption_version = EXCLUDED.encryption_version, updated_at = now()`,
+		workspaceID, continuousSecretKey, b.EncryptedValue, b.EncryptionVersion)
+	return err
 }
 
 // applyLightEnvChange makes the agent pick up a Light env change: a hibernated
@@ -343,7 +392,7 @@ func (h *LightHandler) Enable(c *gin.Context) {
 		return
 	}
 	defer func() { _ = tx.Rollback() }()
-	secretsChanged, err := writeLightSecrets(ctx, tx, id)
+	secretsChanged, continuousBefore, err := writeLightSecrets(ctx, tx, id)
 	if err != nil {
 		log.Printf("light op=enable ws=%s: writing the Light secrets failed: %v", id, err)
 		lightCode(c, op, id, http.StatusInternalServerError, "LIGHT_FAILED", "failed to enable Light", nil)
@@ -351,9 +400,17 @@ func (h *LightHandler) Enable(c *gin.Context) {
 	}
 	enabled := false
 	if row.LightState == "" {
+		// The 24/7 setting as it was, for disable to restore (only on the
+		// transition: a repeated enable must not record its own write).
+		before, err := json.Marshal(continuousBefore)
+		if err != nil {
+			lightCode(c, op, id, http.StatusInternalServerError, "LIGHT_FAILED", "failed to enable Light", nil)
+			return
+		}
 		res, err := tx.ExecContext(ctx, `
-			UPDATE workspaces SET light_state = 'open', light_state_at = now(), light_opened_by = 'owner', updated_at = now()
-			WHERE id = $1 AND light_state IS NULL`, id)
+			UPDATE workspaces SET light_state = 'open', light_state_at = now(), light_opened_by = 'owner',
+			       light_continuous_before = $2::jsonb, updated_at = now()
+			WHERE id = $1 AND light_state IS NULL`, id, string(before))
 		if err == nil {
 			n, _ := res.RowsAffected()
 			enabled = n > 0
@@ -480,8 +537,9 @@ func (h *WorkspaceHandler) deleteLightForCascade(ctx context.Context, ids []stri
 
 // disableLight turns a Light agent back into an ordinary one: the control
 // plane's Light objects first (its runs stop), then, in one transaction, the
-// run tokens, the Light secrets, the state, the rendered schedules and the
-// queued actions. The ledger keeps its history.
+// run tokens, the MOLECULE_LIGHT secret, the 24/7 setting as it was before
+// enable, the state, the rendered schedules and the queued actions. The ledger
+// keeps its history.
 func (h *WorkspaceHandler) disableLight(ctx context.Context, workspaceID string, row lightWorkspaceRow) (provisioner.LightDeleteResult, error) {
 	deleted, err := h.deleteLightObjects(ctx, workspaceID)
 	if err != nil {
@@ -492,6 +550,12 @@ func (h *WorkspaceHandler) disableLight(ctx context.Context, workspaceID string,
 		return deleted, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	var continuousBefore []byte
+	if err := tx.QueryRowContext(ctx,
+		`SELECT light_continuous_before FROM workspaces WHERE id = $1 FOR UPDATE`, workspaceID,
+	).Scan(&continuousBefore); err != nil {
+		return deleted, err
+	}
 	var tokens []string
 	for _, t := range []sql.NullString{row.RunTokenID, row.RetiredTokenID} {
 		if t.Valid && t.String != "" {
@@ -507,14 +571,16 @@ func (h *WorkspaceHandler) disableLight(ctx context.Context, workspaceID string,
 		}
 	}
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM workspace_secrets WHERE workspace_id = $1 AND key = ANY($2)`,
-		workspaceID, pq.Array([]string{lightSecretKey, continuousSecretKey})); err != nil {
+		`DELETE FROM workspace_secrets WHERE workspace_id = $1 AND key = $2`, workspaceID, lightSecretKey); err != nil {
+		return deleted, err
+	}
+	if err := restoreLightContinuous(ctx, tx, workspaceID, continuousBefore); err != nil {
 		return deleted, err
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE workspaces
 		SET light_state = NULL, light_state_at = now(), light_opened_by = NULL,
-		    light_run_token_id = NULL, light_retired_token_id = NULL,
+		    light_run_token_id = NULL, light_retired_token_id = NULL, light_continuous_before = NULL,
 		    light_last_error = NULL, light_last_error_at = NULL, updated_at = now()
 		WHERE id = $1`, workspaceID); err != nil {
 		return deleted, err
@@ -537,7 +603,7 @@ func (h *WorkspaceHandler) disableLight(ctx context.Context, workspaceID string,
 // Disable handles POST /workspaces/:id/light/disable.
 //
 //	@Summary	Turn a Light agent back into an ordinary agent
-//	@Description	Deletes the control plane's Light objects (CronJobs, Jobs, Secret) first, then revokes the run tokens, removes the Light secrets, clears light_state and wakes (or restarts) the agent. Works from any Light state.
+//	@Description	Deletes the control plane's Light objects (CronJobs, Jobs, Secret) first, then revokes the run tokens, removes MOLECULE_LIGHT, restores the 24/7 setting (MOLECULE_CONTINUOUS) exactly as it was before enable, clears light_state and wakes (or restarts) the agent. Works from any Light state.
 //	@Tags		light
 //	@Produce	json
 //	@Param		id	path		string	true	"Workspace ID"

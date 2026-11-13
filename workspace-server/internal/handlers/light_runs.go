@@ -16,7 +16,9 @@ package handlers
 //     never goes back to running.
 //
 // Output is kept to its last 64 KiB and error to its first 4 KiB (the runtime
-// already truncates; core enforces it rather than refusing the report).
+// already truncates; core enforces it rather than refusing the report), and
+// U+0000 or invalid UTF-8 in them becomes U+FFFD (Postgres text cannot hold a
+// NUL; refusing would lose the run's outcome).
 
 import (
 	"context"
@@ -26,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -164,13 +167,23 @@ func validateLightRunReport(r lightRunReport) (lightRunRow, string) {
 		return row, "finished_at"
 	}
 	row.FinishedAt = finished
+	if r.ExitCode != nil && (*r.ExitCode < math.MinInt32 || *r.ExitCode > math.MaxInt32) {
+		return row, "exit_code"
+	}
 	if r.Output != nil {
-		row.Output = tailUTF8(strings.ToValidUTF8(*r.Output, "�"), lightOutputLimit)
+		row.Output = tailUTF8(lightStorableText(*r.Output), lightOutputLimit)
 	}
 	if r.Error != nil {
-		row.Error = headUTF8(strings.ToValidUTF8(*r.Error, "�"), lightErrorLimit)
+		row.Error = headUTF8(lightStorableText(*r.Error), lightErrorLimit)
 	}
 	return row, ""
+}
+
+// lightStorableText makes report text storable in a Postgres text column:
+// invalid UTF-8 and U+0000 (which text refuses) become U+FFFD. Applied before
+// the byte limits, so the stored text still fits them.
+func lightStorableText(s string) string {
+	return strings.ReplaceAll(strings.ToValidUTF8(s, "\uFFFD"), "\x00", "\uFFFD")
 }
 
 // upsertLightRunReport writes a run pod's report. accepted is false for a
