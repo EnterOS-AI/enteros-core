@@ -52,11 +52,16 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | GET/DELETE | /workspaces/:id/v2/memories[/:memoryId] | memories_v2.go — `GET` lists (canvas Memory tab), `DELETE :memoryId` is `Forget`. Wired only when `MEMORY_PLUGIN_URL` is configured; without it these return 503 rather than nil-deref. |
 | GET | /workspaces/:id/v2/namespaces | memories_v2.go |
 | GET | /workspaces/:id/traces | traces.go |
-| GET/POST | /workspaces/:id/activity | activity.go |
+| GET/POST | /workspaces/:id/activity | activity.go — `GET ?run_id=<id>` lists the rows one Enter OS Light run wrote (a run pod's requests carry `X-Molecule-Run-Id`; rows they write get `activity_logs.run_id`) |
 | POST | /workspaces/:id/notify | activity.go (agent→user push message via WebSocket) |
 | POST | /workspaces/:id/restart | workspace.go |
 | POST | /workspaces/:id/pause | workspace.go (stops container, status→paused) |
 | POST | /workspaces/:id/resume | workspace.go (re-provisions paused workspace) |
+| GET | /workspaces/:id/light | light_handlers.go — Enter OS Light state: `light_state` (`null` = not a Light agent), the schedules rendered at the last park, queued work, the last background failure. Full contract: `docs/api-protocol/light-api.md` |
+| POST | /workspaces/:id/light/enable | light_handlers.go — make a hermes agent on the Kubernetes substrate a Light agent (secrets `MOLECULE_LIGHT=1`, `MOLECULE_CONTINUOUS=false`; `light_state=open`; restart or wake). Refuses the workspace's own token (`403 LIGHT_SELF_FORBIDDEN`) |
+| POST | /workspaces/:id/light/disable | light_handlers.go — delete the control plane's Light objects first, then revoke the run tokens, remove the Light secrets, clear `light_state`; restart or wake. Refuses the workspace's own token |
+| POST | /workspaces/:id/light/runs | light_runs.go — a run pod's ledger report (`phase` started/finished); only the workspace's own token |
+| GET | /workspaces/:id/light/runs | light_runs.go — runs newest first: `?limit=` (1..100, default 20), `?schedule=`, `?before=<next_before>` |
 | POST | /workspaces/:id/a2a | a2a_proxy.go — requires a source-bound workspace bearer or verified human/inbound credential; optional `X-Workspace-ID` must match bearer ownership. Combined self-host/dev Canvas requests may use same-origin only when CP session verification is unconfigured. |
 | GET | /workspaces/:id/a2a/queue/:queue_id | a2a_queue_status.go — same authentication as A2A send, followed by queue sender/target ownership checks |
 | POST | /workspaces/:id/delegate | delegation.go (async fire-and-forget) |
@@ -140,3 +145,6 @@ Migration files live in `workspace-server/migrations/` (timestamp-named; check t
 | `workspace_auth_tokens` | Bearer tokens; auto-revoked on workspace delete |
 | `agent_memories` | HMA scoped memory (LOCAL / TEAM / GLOBAL) |
 | `approvals` | Human-in-the-loop approval requests |
+| `light_runs` | Enter OS Light run ledger, keyed `(workspace_id, run_id)`: one row per scheduled run, written by the run pod's reports (`source='report'`) or by core from the control plane's jobs listing (`source='job'`) |
+| `light_schedules` | The schedules a Light agent had at its last park, with core's suspension record (`suspended_reason`, `consecutive_failures`) |
+| `light_pending_actions` | Work queued for a parked Light agent's next open/park cycle (`kind`, `payload` JSONB; `applied_at` once done) |
