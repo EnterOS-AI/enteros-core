@@ -288,6 +288,18 @@ func (h *LightHandler) ReportRun(c *gin.Context) {
 		return
 	}
 	log.Printf("light op=report ws=%s run=%s schedule=%q phase=%s status=%s", id, row.RunID, row.Schedule, report.Phase, row.Status)
+	if report.Phase == "finished" && (row.Status == models.LightRunFailed || row.Status == models.LightRunTimedOut) {
+		// A failure may complete a streak: evaluate it now rather than at the
+		// next jobs poll, after the answer so the run pod is not held.
+		wh, schedule := h.wh, row.Schedule
+		wh.goAsync(func() {
+			sctx, cancel := context.WithTimeout(context.Background(), lightTransitionTimeout)
+			defer cancel()
+			if _, err := wh.evaluateLightStreak(sctx, id, schedule); err != nil {
+				log.Printf("light: evaluating the streak of %s/%q failed: %v (the jobs poll retries)", id, schedule, err)
+			}
+		})
+	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 

@@ -881,6 +881,17 @@ func main() {
 		registry.StartHibernationMonitor(c, wh.HibernateWorkspace)
 	})
 
+	// Enter OS Light monitor: finishes interrupted parks and opens, parks idle
+	// Light agents (LIGHT_AUTO_PARK_IDLE_MINUTES, default 30), refreshes parked
+	// agents with queued work, records runs that never reported, suspends a
+	// schedule after three failed runs in a row. Light needs the control plane
+	// (Kubernetes substrate), so the monitor runs only with one; disable via
+	// LIGHT_MONITOR_DISABLED=true.
+	if handlers.LightMonitorEnabled(cpProv != nil) {
+		lightMonitor := handlers.NewLightMonitor(wh)
+		go supervised.RunWithRecover(ctx, "light-monitor", lightMonitor.Start)
+	}
+
 	// RFC #2829 PR-3: stuck-task sweeper for the durable delegations
 	// ledger. Marks deadline-exceeded rows as failed and heartbeat-stale
 	// in-flight rows as stuck. Both transitions go through the ledger's
