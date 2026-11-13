@@ -217,6 +217,24 @@ func queueLightRefresh(ctx context.Context, workspaceID, source string) (bool, e
 	return queued, err
 }
 
+// queueLightRefreshIfBlocked queues a refresh when the workspace is a parking
+// or parked Light agent: the restart chokepoint (runRestartCycle) calls it for
+// a mutation-driven restart it refused. A read error queues nothing (logged).
+func queueLightRefreshIfBlocked(ctx context.Context, workspaceID, source string) bool {
+	state, err := readLightState(ctx, workspaceID)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			log.Printf("light: cannot read light_state of %s to queue a refresh: %v", workspaceID, err)
+		}
+		return false
+	}
+	if !models.LightBlocksWake(state) {
+		return false
+	}
+	queued, _ := queueLightRefresh(ctx, workspaceID, source)
+	return queued
+}
+
 // recordLightError stores the last background Light failure for GET /light.
 func recordLightError(ctx context.Context, workspaceID, code, message string) {
 	if _, err := db.DB.ExecContext(ctx, `

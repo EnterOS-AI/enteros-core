@@ -139,3 +139,21 @@ func (f *fakeLightAPI) DeleteLight(_ context.Context, workspaceID string) (provi
 }
 
 var _ provisioner.LightAPI = (*fakeLightAPI)(nil)
+
+// trackedCPCalls lists what a trackingCPProv was asked to do (start, stop,
+// prune): empty proves nothing was provisioned or torn down.
+func trackedCPCalls(r *trackingCPProv) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for _, s := range r.started {
+		out = append(out, "start "+s)
+	}
+	for _, s := range r.stopped {
+		out = append(out, "stop "+s)
+	}
+	for _, s := range r.pruned {
+		out = append(out, "prune "+s)
+	}
+	return out
+}
