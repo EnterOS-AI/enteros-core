@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/approvals"
@@ -118,13 +119,19 @@ func platformManagedLLMDecisionForWorkspace(c *gin.Context, workspaceID string) 
 }
 
 // vendorKeyRefusalMessage explains a vendor-key refusal in terms the customer
-// can act on: WHICH MODEL value was judged, WHAT it means for billing, and
-// WHICH model form the key they are writing would be accepted with.
+// can act on: WHICH MODEL value was judged, WHAT it means for billing, and —
+// derived from the provider registry for THIS runtime, never hard-coded — WHICH
+// MODEL values the key they are writing would be accepted with.
 //
 // Live 2026-11-13 (reno-stars): MODEL=anthropic/claude-sonnet-4-6 on a
 // claude-code workspace refused CLAUDE_CODE_OAUTH_TOKEN with a generic
 // "blocked for platform-managed workspaces" line, and the customer only found
 // the subscription form (sonnet/opus/haiku) by trial and error.
+//
+// The advice is per-runtime on purpose: the same model id means different
+// things on different runtimes (on hermes `anthropic/claude-sonnet-4-6` is the
+// BYOK Anthropic form, on claude-code it is the platform-billed form), so a
+// generic "slash form = platform" rule would be false outside claude-code.
 //
 // The leading clause is kept verbatim so existing callers matching on it keep
 // working; everything after it is the explanation.
@@ -134,9 +141,11 @@ func vendorKeyRefusalMessage(d vendorKeyGuardDecision, key string) string {
 	model := strings.TrimSpace(d.model)
 	switch d.reason {
 	case "platform_model":
-		b.WriteString(`MODEL="` + model + `" is a platform-billed model`)
-		if strings.Contains(model, "/") {
-			b.WriteString(` (the provider/model slash form means platform billing: the platform LLM proxy serves it and bills platform credits)`)
+		b.WriteString(`MODEL="` + model + `" is a platform-billed model on runtime "` + d.runtime + `" (the platform LLM proxy serves it and bills platform credits)`)
+		if d.runtime == "claude-code" && strings.HasPrefix(model, "anthropic/") {
+			// Scoped: on claude-code the anthropic/<model> slash form is the
+			// platform form; the BYOK Anthropic forms are the bare ids.
+			b.WriteString(`; on claude-code the anthropic/<model> slash form means platform billing`)
 		}
 		b.WriteString(", so a co-stored vendor key such as " + key + " is refused.")
 	case "model_unset":
@@ -147,13 +156,116 @@ func vendorKeyRefusalMessage(d vendorKeyGuardDecision, key string) string {
 		b.WriteString("the provider registry is unavailable, so " + key + " is refused for safety; retry shortly.")
 		return b.String()
 	}
-	if d.runtime == "claude-code" {
-		b.WriteString(" To use your own Claude subscription, set MODEL to sonnet, opus or haiku (no provider/ prefix) and then set CLAUDE_CODE_OAUTH_TOKEN;" +
-			" to use an Anthropic API key, set MODEL to a bare claude-* model id (e.g. claude-sonnet-4-6) and then set ANTHROPIC_API_KEY.")
-	} else {
-		b.WriteString(" To bring your own key, first set MODEL to a specific vendor model (not the provider/model platform form), then set the vendor key.")
-	}
+	b.WriteString(" " + byokAdviceForKey(d.runtime, key))
 	return b.String()
+}
+
+// byokAdviceMaxProviders / byokAdviceMaxModels bound the advice so a runtime
+// with many providers on one shared key (ANTHROPIC_API_KEY on hermes) still
+// yields a readable message.
+const (
+	byokAdviceMaxProviders = 4
+	byokAdviceMaxModels    = 4
+)
+
+// byokAdviceForKey names, from the registry, the MODEL values on `runtime` whose
+// (non-platform) provider takes `key` — i.e. the settings under which writing
+// `key` would be accepted. Providers with an explicit model list are named by
+// their ids; providers that accept a family of ids are named by the registry's
+// model_prefix_match pattern.
+func byokAdviceForKey(runtime, key string) string {
+	m, err := providerRegistry()
+	if err != nil || m == nil {
+		return "To bring your own key, first set MODEL to a model whose provider takes " + key + ", then set " + key + "."
+	}
+	rt, ok := m.Runtimes[runtime]
+	if !ok {
+		return `Runtime "` + runtime + `" is not in the provider registry, so no bring-your-own-key MODEL can be named for ` + key + "."
+	}
+	byName := make(map[string]int, len(m.Providers))
+	for i, p := range m.Providers {
+		byName[p.Name] = i
+	}
+	upperKey := strings.ToUpper(strings.TrimSpace(key))
+	// Two tiers: providers whose PRIMARY key (auth_env[0]) is this key first —
+	// that is the provider the key is "for" (byok-anthropic for
+	// ANTHROPIC_API_KEY) — then providers that merely also accept it.
+	var primary, secondary []string
+	otherKeys := map[string]struct{}{}
+	for _, ref := range rt.Providers {
+		i, ok := byName[ref.Name]
+		if !ok {
+			continue
+		}
+		p := m.Providers[i]
+		if p.IsPlatform() {
+			continue
+		}
+		takesKey, isPrimary := false, false
+		for j, env := range p.AuthEnv {
+			otherKeys[env] = struct{}{}
+			if strings.EqualFold(env, upperKey) {
+				takesKey, isPrimary = true, j == 0
+			}
+		}
+		if !takesKey {
+			continue
+		}
+		label := p.DisplayName
+		if label == "" {
+			label = p.Name
+		}
+		var opt string
+		switch {
+		case len(ref.Models) > 0:
+			ids := ref.Models
+			more := ""
+			if len(ids) > byokAdviceMaxModels {
+				ids, more = ids[:byokAdviceMaxModels], ", …"
+			}
+			opt = label + ": " + strings.Join(ids, ", ") + more
+		case p.ModelPrefixMatch != "":
+			opt = label + ": a model id matching " + p.ModelPrefixMatch
+		default:
+			continue
+		}
+		if isPrimary {
+			primary = append(primary, opt)
+		} else {
+			secondary = append(secondary, opt)
+		}
+	}
+	options := append(primary, secondary...)
+	if len(options) > byokAdviceMaxProviders {
+		options = options[:byokAdviceMaxProviders]
+	}
+	if len(options) == 0 {
+		keys := make([]string, 0, len(otherKeys))
+		for k := range otherKeys {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		return `On runtime "` + runtime + `" no bring-your-own-key provider takes ` + key +
+			"; the keys its BYOK providers take are: " + strings.Join(keys, ", ") + "."
+	}
+	return `To bring your own ` + key + ` on runtime "` + runtime + `", first set MODEL to one the provider registry accepts for that key (` +
+		strings.Join(options, "; ") + "), then set " + key + "."
+}
+
+// vendorKeyRefusalCode gives each refusal reason its own machine-readable
+// code, so a client can tell "your model is platform-billed" from "you have
+// not chosen a model yet" from "try again".
+func vendorKeyRefusalCode(reason string) string {
+	switch reason {
+	case "platform_model":
+		return "VENDOR_KEY_ON_PLATFORM_MODEL"
+	case "model_unset":
+		return "VENDOR_KEY_MODEL_UNSET"
+	case "model_unregistered":
+		return "VENDOR_KEY_MODEL_UNREGISTERED"
+	default:
+		return "VENDOR_KEY_PROVIDER_REGISTRY_UNAVAILABLE"
+	}
 }
 
 // rejectPlatformManagedDirectLLMBypassForWorkspace blocks raw vendor-key
@@ -177,7 +289,7 @@ func rejectPlatformManagedDirectLLMBypassForWorkspace(c *gin.Context, workspaceI
 func writeVendorKeyRefusal(c *gin.Context, workspaceID, key string, d vendorKeyGuardDecision) {
 	c.JSON(http.StatusBadRequest, gin.H{
 		"error":        vendorKeyRefusalMessage(d, key),
-		"code":         "VENDOR_KEY_ON_PLATFORM_MODEL",
+		"code":         vendorKeyRefusalCode(d.reason),
 		"key":          key,
 		"workspace_id": workspaceID,
 		"model":        d.model,
