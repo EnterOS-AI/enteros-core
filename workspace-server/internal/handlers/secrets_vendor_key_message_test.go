@@ -201,3 +201,36 @@ func TestWorkspaceCreate_VendorKeyOnPlatformModel_MessageNamesPayloadModel(t *te
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
+
+// Every MODEL id the refusal advises must actually be accepted for the key:
+// run each advised id, on every registered runtime and for every vendor key the
+// guard blocks, back through DeriveProvider and require a NON-platform
+// provider. (Pattern-only options name a regex, not an id, and are checked by
+// the hermes test above.) A registry change that makes the advice false fails
+// here instead of misleading a customer.
+func TestByokAdvice_EveryAdvisedModelDerivesToANonPlatformProvider(t *testing.T) {
+	m, err := providerRegistry()
+	if err != nil || m == nil {
+		t.Fatalf("provider registry: %v", err)
+	}
+	checked := 0
+	for runtime := range m.Runtimes {
+		for key := range platformManagedDirectLLMBypassKeys {
+			opts, _ := byokOptionsForKey(m, runtime, key)
+			for _, o := range opts {
+				for _, model := range o.models {
+					p, err := m.DeriveProvider(runtime, model, []string{key})
+					if err != nil || p.IsPlatform() {
+						t.Errorf("advice is false: runtime=%s key=%s advises MODEL=%q (%s) but DeriveProvider -> %q platform=%v err=%v",
+							runtime, key, model, o.provider, p.Name, p.IsPlatform(), err)
+					}
+					checked++
+				}
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no advised model ids were checked — the table is vacuous")
+	}
+	t.Logf("checked %d advised (runtime, key, model) triples", checked)
+}

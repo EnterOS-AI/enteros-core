@@ -13,6 +13,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/audit"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/providers"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
@@ -178,20 +179,57 @@ func byokAdviceForKey(runtime, key string) string {
 	if err != nil || m == nil {
 		return "To bring your own key, first set MODEL to a model whose provider takes " + key + ", then set " + key + "."
 	}
-	rt, ok := m.Runtimes[runtime]
-	if !ok {
+	if _, ok := m.Runtimes[runtime]; !ok {
 		return `Runtime "` + runtime + `" is not in the provider registry, so no bring-your-own-key MODEL can be named for ` + key + "."
 	}
+	opts, otherKeys := byokOptionsForKey(m, runtime, key)
+	if len(opts) == 0 {
+		return `On runtime "` + runtime + `" no bring-your-own-key provider takes ` + key +
+			"; the keys its BYOK providers take are: " + strings.Join(otherKeys, ", ") + "."
+	}
+	parts := make([]string, 0, len(opts))
+	for _, o := range opts {
+		if len(o.models) > 0 {
+			more := ""
+			if o.truncated {
+				more = ", …"
+			}
+			parts = append(parts, o.label+": "+strings.Join(o.models, ", ")+more)
+		} else {
+			parts = append(parts, o.label+": a model id matching "+o.pattern)
+		}
+	}
+	return `To bring your own ` + key + ` on runtime "` + runtime + `", first set MODEL to one the provider registry accepts for that key (` +
+		strings.Join(parts, "; ") + "), then set " + key + "."
+}
+
+// byokOption is one advised way to make `key` acceptable on a runtime: a
+// non-platform provider that takes the key, named by the model ids the message
+// lists (models, possibly truncated) or, when the runtime lists none, by the
+// provider's model_prefix_match pattern.
+type byokOption struct {
+	provider  string
+	label     string
+	models    []string
+	truncated bool
+	pattern   string
+}
+
+// byokOptionsForKey selects the advice from the registry — the structured form
+// byokAdviceForKey formats, kept separate so a test can run every advised
+// model id back through DeriveProvider. Providers whose PRIMARY key
+// (auth_env[0]) is this key come first (byok-anthropic for ANTHROPIC_API_KEY),
+// then providers that merely also accept it; capped at byokAdviceMaxProviders.
+// otherKeys is the sorted set of keys the runtime's BYOK providers take.
+func byokOptionsForKey(m *providers.Manifest, runtime, key string) (opts []byokOption, otherKeys []string) {
+	rt := m.Runtimes[runtime]
 	byName := make(map[string]int, len(m.Providers))
 	for i, p := range m.Providers {
 		byName[p.Name] = i
 	}
 	upperKey := strings.ToUpper(strings.TrimSpace(key))
-	// Two tiers: providers whose PRIMARY key (auth_env[0]) is this key first —
-	// that is the provider the key is "for" (byok-anthropic for
-	// ANTHROPIC_API_KEY) — then providers that merely also accept it.
-	var primary, secondary []string
-	otherKeys := map[string]struct{}{}
+	var primary, secondary []byokOption
+	keySet := map[string]struct{}{}
 	for _, ref := range rt.Providers {
 		i, ok := byName[ref.Name]
 		if !ok {
@@ -203,7 +241,7 @@ func byokAdviceForKey(runtime, key string) string {
 		}
 		takesKey, isPrimary := false, false
 		for j, env := range p.AuthEnv {
-			otherKeys[env] = struct{}{}
+			keySet[env] = struct{}{}
 			if strings.EqualFold(env, upperKey) {
 				takesKey, isPrimary = true, j == 0
 			}
@@ -211,45 +249,36 @@ func byokAdviceForKey(runtime, key string) string {
 		if !takesKey {
 			continue
 		}
-		label := p.DisplayName
-		if label == "" {
-			label = p.Name
+		o := byokOption{provider: p.Name, label: p.DisplayName}
+		if o.label == "" {
+			o.label = p.Name
 		}
-		var opt string
 		switch {
 		case len(ref.Models) > 0:
-			ids := ref.Models
-			more := ""
-			if len(ids) > byokAdviceMaxModels {
-				ids, more = ids[:byokAdviceMaxModels], ", …"
+			o.models = ref.Models
+			if len(o.models) > byokAdviceMaxModels {
+				o.models, o.truncated = o.models[:byokAdviceMaxModels], true
 			}
-			opt = label + ": " + strings.Join(ids, ", ") + more
 		case p.ModelPrefixMatch != "":
-			opt = label + ": a model id matching " + p.ModelPrefixMatch
+			o.pattern = p.ModelPrefixMatch
 		default:
 			continue
 		}
 		if isPrimary {
-			primary = append(primary, opt)
+			primary = append(primary, o)
 		} else {
-			secondary = append(secondary, opt)
+			secondary = append(secondary, o)
 		}
 	}
-	options := append(primary, secondary...)
-	if len(options) > byokAdviceMaxProviders {
-		options = options[:byokAdviceMaxProviders]
+	opts = append(primary, secondary...)
+	if len(opts) > byokAdviceMaxProviders {
+		opts = opts[:byokAdviceMaxProviders]
 	}
-	if len(options) == 0 {
-		keys := make([]string, 0, len(otherKeys))
-		for k := range otherKeys {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		return `On runtime "` + runtime + `" no bring-your-own-key provider takes ` + key +
-			"; the keys its BYOK providers take are: " + strings.Join(keys, ", ") + "."
+	for k := range keySet {
+		otherKeys = append(otherKeys, k)
 	}
-	return `To bring your own ` + key + ` on runtime "` + runtime + `", first set MODEL to one the provider registry accepts for that key (` +
-		strings.Join(options, "; ") + "), then set " + key + "."
+	sort.Strings(otherKeys)
+	return opts, otherKeys
 }
 
 // vendorKeyRefusalCode gives each refusal reason its own machine-readable
