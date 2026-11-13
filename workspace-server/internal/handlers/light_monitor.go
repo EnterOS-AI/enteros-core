@@ -458,10 +458,16 @@ func (h *WorkspaceHandler) resumeAfterInterruptedOpen(ctx context.Context, works
 	return err
 }
 
+// lightQuietWindowSQL is how long an open agent must have been open, and
+// without activity of its own, before it auto-parks: the idle window ($1,
+// minutes), or lightRefreshQuiet ($3, seconds) when a refresh opened it.
+const lightQuietWindowSQL = `CASE WHEN workspaces.light_opened_by = 'refresh' THEN make_interval(secs => $3) ELSE make_interval(mins => $1) END`
+
 // lightAutoParkCandidates lists open Light agents to park now: online, idle
-// (no task, not busy), no Light failure in the last 10 minutes, and without
-// activity for the idle window, or for lightRefreshQuiet when a refresh opened
-// it. Agents without a recorded failure come first. Rows are (id, opened_by).
+// (no task, not busy), no Light failure in the last 10 minutes, and neither
+// opened nor active within the quiet window. Only the agent's own activity
+// counts: rows its runs write carry a run_id (review 21719 O-A). Agents without
+// a recorded failure come first. Rows are (id, opened_by).
 func lightAutoParkCandidates(ctx context.Context, idle time.Duration) ([][]string, error) {
 	return queryLightIDs(ctx, `
 		SELECT id, COALESCE(light_opened_by, 'owner')
@@ -469,8 +475,10 @@ func lightAutoParkCandidates(ctx context.Context, idle time.Duration) ([][]strin
 		WHERE light_state = 'open' AND status IN ('online', 'degraded')
 		  AND COALESCE(active_tasks, 0) = 0 AND NOT COALESCE(is_busy, false)
 		  AND `+lightErrorBackoffSQL+`
-		  AND GREATEST(COALESCE(last_activity_at, light_state_at), light_state_at) < now() - CASE
-		      WHEN light_opened_by = 'refresh' THEN make_interval(secs => $3) ELSE make_interval(mins => $1) END
+		  AND light_state_at < now() - `+lightQuietWindowSQL+`
+		  AND NOT EXISTS (SELECT 1 FROM activity_logs a
+		                  WHERE a.workspace_id = workspaces.id AND a.run_id IS NULL
+		                    AND a.created_at >= now() - `+lightQuietWindowSQL+`)
 		ORDER BY light_last_error_at NULLS FIRST, light_state_at
 		LIMIT $2`, int(idle/time.Minute), lightSweepLimit, int(lightRefreshQuiet/time.Second))
 }
@@ -632,11 +640,12 @@ func lightRefreshCandidates(ctx context.Context, kinds []string, limit int) ([][
 
 // lightRefreshInFlightSQL counts the refresh cycles holding a slot: agents a
 // refresh opened that are opening or open, except those whose pod failed
-// (SweepTransitions parks them again).
+// (SweepTransitions parks them again) and those the owner paused (they stay
+// as the owner left them; review 21719 N-B).
 const lightRefreshInFlightSQL = `
 		SELECT COUNT(*) FROM workspaces
 		WHERE light_state IN ('opening', 'open') AND light_opened_by = 'refresh'
-		  AND status NOT IN ('failed', 'removed')`
+		  AND status NOT IN ('failed', 'paused', 'removed')`
 
 // SweepRefresh opens parked agents that have queued work this core can
 // complete, keeping at most maxRefresh refresh cycles in flight. Each opened

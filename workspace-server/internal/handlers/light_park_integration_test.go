@@ -23,6 +23,8 @@ import (
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/middleware"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 )
@@ -292,7 +294,8 @@ func TestIntegration_LightPark_TaskAroundTheClaimUndoesThePark(t *testing.T) {
 		setupTestRedis(t)
 		ctx := context.Background()
 		ws := seedLightWorkspace(t, conn, "test-light-activity", "online", "parking")
-		lightExec(t, conn, `UPDATE workspaces SET light_state_at = now() - interval '5 seconds', last_activity_at = now() WHERE id = $1`, ws)
+		lightExec(t, conn, `UPDATE workspaces SET light_state_at = now() - interval '5 seconds' WHERE id = $1`, ws)
+		lightActivityRow(t, conn, ws, "", 0)
 		wh := lightIntegrationHandler(t, &fakeLightAPI{})
 		var stops int32
 		wh.stopFnOverride = func(context.Context, string) { atomic.AddInt32(&stops, 1) }
@@ -553,5 +556,175 @@ func TestIntegration_LightMonitor_FinishesAStuckHibernate(t *testing.T) {
 	}
 	if calls := strings.Join(api.Calls(), ","); calls != "resume "+stuck {
 		t.Errorf("CP calls = %s, want only the stuck park resumed", calls)
+	}
+}
+
+// P7: a run of the agent's last park, still going while the owner had the
+// agent open, writes a tool-call row after the owner's parking claim. The row
+// carries the run id (a run pod writes under the agent's id); the agent itself
+// is idle, so the park goes through (review 21719 O-A).
+func TestIntegration_LightPark_RunActivityDoesNotUndoThePark(t *testing.T) {
+	conn := integrationDB_Light(t)
+	setupTestRedis(t)
+	ctx := context.Background()
+	ws := seedLightWorkspace(t, conn, "test-light-run-activity", "online", "open")
+	seedLightSecret(t, conn, ws)
+	api := &fakeLightAPI{putRes: lightIntegrationPut()}
+	wh := lightIntegrationHandler(t, api)
+	wh.lightScheduleReader = func(context.Context, string) ([]volumeEntry, error) { return lightIntegrationGrid(), nil }
+	var stops int32
+	wh.stopFnOverride = func(context.Context, string) { atomic.AddInt32(&stops, 1) }
+	if _, ref := wh.parkLight(ctx, nil, ws, lightTriggerOwner); ref != nil {
+		t.Fatalf("park refused: %d %v", ref.Status, ref.Body)
+	}
+	time.Sleep(20 * time.Millisecond)
+	summary := "run tool call"
+	runCtx := middleware.WithLightRun(ctx, "light-x-aaaaaaaa-29384756", ws)
+	LogActivity(runCtx, nil, ActivityParams{WorkspaceID: ws, ActivityType: "agent_log", Summary: &summary, Status: "ok"})
+	var tagged int
+	if err := conn.QueryRow(`SELECT count(*) FROM activity_logs WHERE workspace_id = $1 AND run_id = 'light-x-aaaaaaaa-29384756'`, ws).Scan(&tagged); err != nil || tagged != 1 {
+		t.Fatalf("setup: tagged rows = %d (%v), want the run's row", tagged, err)
+	}
+	if err := wh.finishLightPark(ctx, ws, lightTriggerOwner, time.Second); err != nil {
+		t.Fatalf("finish = %v, want the park to go through", err)
+	}
+	if st, ls := lightRowStatus(t, conn, ws); st != "hibernated" || ls != "parked" || atomic.LoadInt32(&stops) != 1 {
+		t.Errorf("status=%s light_state=%s stops=%d last_error=%q, want parked", st, ls, atomic.LoadInt32(&stops), lightLastErrorCode(t, conn, ws))
+	}
+}
+
+// P8: an attempt minted and recorded its token, then core stopped before the
+// commit. The monitor's continuation finds the agent busy and returns it to
+// open: the attempt's token is revoked then and there. A token left pending
+// some other way is revoked when the next park records its own (review 21719
+// N-A).
+func TestIntegration_LightPark_AnInterruptedAttemptsTokenNeverStaysLive(t *testing.T) {
+	conn := integrationDB_Light(t)
+	setupTestRedis(t)
+	ctx := context.Background()
+	ws := seedLightWorkspace(t, conn, "test-light-pending", "online", "open")
+	seedLightSecret(t, conn, ws)
+	api := &fakeLightAPI{putRes: lightIntegrationPut()}
+	wh := lightIntegrationHandler(t, api)
+	wh.lightScheduleReader = func(context.Context, string) ([]volumeEntry, error) { return lightIntegrationGrid(), nil }
+	pending := func() string {
+		var p sql.NullString
+		if err := conn.QueryRow(`SELECT light_pending_token_id::text FROM workspaces WHERE id = $1`, ws).Scan(&p); err != nil {
+			t.Fatal(err)
+		}
+		return p.String
+	}
+
+	// Attempt A up to the PUT, then the process stops.
+	if _, claimed, err := wh.claimLightParking(ctx, ws, lightTriggerOwner); err != nil || !claimed {
+		t.Fatalf("claim: %v %v", claimed, err)
+	}
+	tokA, _, err := mintLightRunToken(ctx, nil, ws, lightTriggerOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recordPendingLightToken(ctx, ws, tokA); err != nil {
+		t.Fatal(err)
+	}
+	// Minutes on, a parking heartbeat has recorded a task: the continuation is refused.
+	lightExec(t, conn, `UPDATE workspaces SET active_tasks = 1, light_state_at = now() - interval '3 minutes' WHERE id = $1`, ws)
+	if _, ref := wh.parkLight(ctx, nil, ws, lightTriggerMonitor); ref == nil || ref.code() != "LIGHT_AGENT_BUSY" {
+		t.Fatalf("continuation = %v, want LIGHT_AGENT_BUSY", ref)
+	}
+	if !lightTokenRevoked(t, conn, tokA) || pending() != "" {
+		t.Fatalf("after the refused continuation: tokA revoked=%v pending=%q, want it revoked and forgotten", lightTokenRevoked(t, conn, tokA), pending())
+	}
+
+	// A pending token left behind by any other path is revoked when the next
+	// park records its own.
+	tokB, _, err := mintLightRunToken(ctx, nil, ws, lightTriggerOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recordPendingLightToken(ctx, ws, tokB); err != nil {
+		t.Fatal(err)
+	}
+	lightExec(t, conn, `UPDATE workspaces SET active_tasks = 0, light_state = 'open' WHERE id = $1`, ws)
+	if _, ref := wh.parkLight(ctx, nil, ws, lightTriggerOwner); ref != nil {
+		t.Fatalf("park refused: %d %v", ref.Status, ref.Body)
+	}
+	if !lightTokenRevoked(t, conn, tokB) || pending() != "" {
+		t.Errorf("after the next park: tokB revoked=%v pending=%q, want the left-behind token revoked", lightTokenRevoked(t, conn, tokB), pending())
+	}
+}
+
+// The re-park of a failed refresh open leaves alone an agent the owner took
+// over after the sweep read it (its row said a refresh opened it), because the
+// claim re-checks light_opened_by (review 21719 O-B, X06).
+func TestIntegration_LightMonitor_ReparkLeavesAnOwnerTakeoverAlone(t *testing.T) {
+	conn := integrationDB_Light(t)
+	setupTestRedis(t)
+	ctx := context.Background()
+	ws := seedLightWorkspace(t, conn, "test-light-takeover", "failed", "open")
+	lightExec(t, conn, `UPDATE workspaces SET light_opened_by = 'owner' WHERE id = $1`, ws)
+	api := &fakeLightAPI{}
+	wh := lightIntegrationHandler(t, api)
+	// The sweep's row, read before the owner's open took the agent over.
+	stale := lightTransitionRow{id: ws, state: models.LightOpen, status: models.StatusFailed, age: time.Minute, openedBy: lightOpenedByRefresh}
+	acted, err := NewLightMonitor(wh).finishTransition(ctx, stale)
+	if err != nil || acted {
+		t.Fatalf("finishTransition = %v, %v; want nothing done", acted, err)
+	}
+	if st, ls := lightRowStatus(t, conn, ws); st != "failed" || ls != "open" || len(api.Calls()) != 0 {
+		t.Errorf("status=%s light_state=%s calls=%v, want the owner's agent untouched", st, ls, api.Calls())
+	}
+}
+
+// Auto-park candidates without a recorded Light error come first, so agents a
+// refused park keeps failing cannot starve the others out of the sweep's limit
+// once their back-off ends (review 21719 O-B, X15).
+func TestIntegration_LightMonitor_AutoParkCandidatesWithoutAnErrorComeFirst(t *testing.T) {
+	conn := integrationDB_Light(t)
+	ctx := context.Background()
+	erred := seedLightWorkspace(t, conn, "test-light-erred", "online", "open")
+	clean := seedLightWorkspace(t, conn, "test-light-clean", "online", "open")
+	// The erred agent has been open longer, so without the error ordering it
+	// would come first.
+	lightExec(t, conn, `UPDATE workspaces SET light_state_at = now() - interval '50 minutes',
+		light_last_error = '{"code":"LIGHT_RUNTIME_UNSUPPORTED","message":"m"}', light_last_error_at = now() - interval '20 minutes' WHERE id = $1`, erred)
+	lightExec(t, conn, `UPDATE workspaces SET light_state_at = now() - interval '40 minutes' WHERE id = $1`, clean)
+	rows, err := lightAutoParkCandidates(ctx, 30*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	for _, r := range rows {
+		if r[0] == erred || r[0] == clean {
+			order = append(order, r[0])
+		}
+	}
+	if len(order) != 2 || order[0] != clean {
+		t.Errorf("candidate order = %v, want %s (no error) before %s", order, clean, erred)
+	}
+}
+
+// A refresh-opened agent the owner paused does not hold a refresh slot: two
+// of them do not stop the next parked agent's refresh (review 21719 N-B).
+func TestIntegration_LightMonitor_PausedRefreshOpensReleaseTheirSlots(t *testing.T) {
+	conn := integrationDB_Light(t)
+	setupTestRedis(t)
+	ctx := context.Background()
+	a := seedLightWorkspace(t, conn, "test-light-paused-a", "paused", "open")
+	b := seedLightWorkspace(t, conn, "test-light-paused-b", "paused", "opening")
+	c := seedLightWorkspace(t, conn, "test-light-waiting", "hibernated", "parked")
+	lightExec(t, conn, `UPDATE workspaces SET light_opened_by = 'refresh' WHERE id = ANY($1::uuid[])`, "{"+a+","+b+"}")
+	lightExec(t, conn, `INSERT INTO light_pending_actions (workspace_id, kind, source) VALUES ($1, 'refresh', 'secret')`, c)
+	api := &fakeLightAPI{}
+	wh := lightIntegrationHandler(t, api)
+	if res := NewLightMonitor(wh).SweepRefresh(ctx); res.Acted != 1 {
+		t.Fatalf("refresh sweep = %+v calls=%v, want the waiting agent opened", res, api.Calls())
+	}
+	if _, ls := lightRowStatus(t, conn, c); ls != "opening" {
+		t.Errorf("light_state = %s, want opening", ls)
+	}
+	for name, id := range map[string]string{"a": a, "b": b} {
+		if st, _ := lightRowStatus(t, conn, id); st != "paused" {
+			t.Errorf("%s: status = %s, want it left paused", name, st)
+		}
 	}
 }

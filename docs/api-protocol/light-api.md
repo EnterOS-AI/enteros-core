@@ -43,7 +43,9 @@ How an agent moves between them:
 ```
 
 Opening a park stuck in `parking` for three minutes leads to `open` when its
-pod is still up, and to `opening` when the pod was already stopped.
+pod is still up, and to `opening` when the pod was already stopped. While the
+pod is still stopping (`status: hibernating`) open answers `409`; the monitor
+finishes that stop five minutes into the park.
 
 `park` and `open` answer `202 Accepted` as soon as the step that can be
 refused is done; the rest finishes in the background. Poll
@@ -94,7 +96,9 @@ Common to every route:
 | 500 | `LIGHT_FAILED` | core could not complete the step; safe to retry |
 
 Common to routes that call the control plane (`enable`, `park`, `open`, `run`,
-`disable`):
+`disable`). `disable` never answers the `404` or the `501`: a tenant with no
+namespace, or one that cannot run Light, has no Light objects to delete, so
+disable goes ahead.
 
 | Status | `code` | When |
 |---|---|---|
@@ -197,7 +201,7 @@ that cannot is refused here rather than at the first park.
 |---|---|
 | `status` | `enabled`; `unchanged` when the agent already was a Light agent |
 | `light_state` | the state after the call |
-| `restart` | `started` (restart begun), `woken` (a hibernated agent is waking), `refresh_queued` (a parking or parked agent had lost a Light secret: restored, and picked up by a refresh), `none` (both secrets were already in place, or the agent is paused or stopping) |
+| `restart` | `started` (restart begun), `woken` (a hibernated agent is waking), `refresh_queued` (a parking or parked agent had lost a Light secret: restored, and picked up by a refresh), `none` (both secrets were already in place, or the agent's pod is stopping: `status: hibernating`) |
 
 The restart is asynchronous: watch the workspace's `status`.
 
@@ -293,8 +297,9 @@ deleted meanwhile; core deletes whatever the park wrote to the control plane.
 
 **After the 202.** If the agent turns out to be working (a task that started
 around the claim: its heartbeat still reports the task while `parking`, and any
-activity it writes counts), the park is undone before the pod is stopped: the
-agent goes back to `open` and `last_error` is `LIGHT_AGENT_BUSY`. If stopping
+activity the agent itself writes after the claim counts; rows written by its
+runs, which carry a `run_id`, do not), the park is undone before the pod is
+stopped: the agent goes back to `open` and `last_error` is `LIGHT_AGENT_BUSY`. If stopping
 the pod or resuming the CronJobs fails, the agent stays `parking`, `last_error`
 says why (`LIGHT_PARK_INCOMPLETE`, or the control plane's code such as
 `LIGHT_TENANT_SUSPENDED`), and core keeps retrying.
@@ -302,7 +307,9 @@ says why (`LIGHT_PARK_INCOMPLETE`, or the control plane's code such as
 **A stuck park.** When a park cannot finish (its resume keeps failing), call
 `POST /light/open` once the agent has been `parking` for three minutes: it
 takes the agent back to `open` (or `opening`, when its pod was already
-stopped). `POST /light/disable` also works from any state.
+stopped). While its pod is still stopping (`status: hibernating`), open keeps
+answering `409` until the monitor finishes the stop, five minutes into the
+park. `POST /light/disable` also works from any state.
 
 ## `POST /workspaces/{id}/light/open`
 
@@ -336,7 +343,7 @@ window (30 minutes without activity) has passed from this call.
 |---|---|---|
 | 403 | `LIGHT_SELF_FORBIDDEN` | called with the workspace's own token |
 | 409 | `LIGHT_NOT_ENABLED` | not a Light agent |
-| 409 | `LIGHT_TRANSITION_IN_PROGRESS` | the agent is being parked (`light_state` is `parking`): open it once it is parked, or three minutes into the park if it cannot finish; also while another Light operation is running |
+| 409 | `LIGHT_TRANSITION_IN_PROGRESS` | the agent is being parked (`light_state` is `parking`): open it once it is parked, or, if the park cannot finish, once it has been parking for three minutes with its pod up or stopped (a pod still stopping, `hibernating`, is finished by the monitor five minutes into the park); also while another Light operation is running |
 
 Any refusal leaves the agent as it was. When the pause may already have run
 (it failed, `503`/`502`/`404`, or the claim after it failed, `500`/`409`), core
@@ -344,7 +351,7 @@ resumes the CronJobs of the still-parked agent, and if that fails too, the
 monitor resumes them two minutes later. A `500` before the pause (core could
 not record the open) changes nothing.
 
-An open agent parks itself again after 30 minutes without activity (see
+An open agent parks itself again after 30 minutes without activity of its own (see
 [Background](#what-core-does-in-the-background)).
 
 ## `POST /workspaces/{id}/light/run`
@@ -356,8 +363,10 @@ runs even when it is off or suspended (to try a fix).
 {"schedule": "daily-report"}
 ```
 
-**201** `{"run_id": "light-be7540cfd160-1a2b3c4d-m1763000000"}`. The run then
-appears in `GET /light/runs`.
+**201** `{"run_id": "light-be7540cfd160-1a2b3c4d-m1763000000"}`. The run
+appears in `GET /light/runs` once its pod reports `started`, or once the jobs
+poll (every 5 minutes) sees it running; a run still waiting (for quota, or an
+image pull) is not listed yet.
 
 | Status | `code` | When |
 |---|---|---|
@@ -441,7 +450,9 @@ The body is at most 256 KiB. Unknown keys are ignored. Core upserts on
   cancelled) core answers `409 LIGHT_RUN_FINISHED` and the run must not start.
 - `finished` records the outcome once. A repeated `finished` is a `200` no-op,
   and a finished run never goes back to `running`. A `failed` or `timed_out`
-  outcome is checked against the schedule's failure streak right away.
+  outcome is checked against the schedule's failure streak right away, or,
+  when a Light operation holds the agent at that moment, by the next jobs poll
+  (within 5 minutes).
 
 **200** `{"ok": true}`
 
@@ -549,19 +560,22 @@ instead; disable Light before switching the provider).
 
 A monitor in core, every 30 s:
 
-- **Auto-park.** An `open` agent that is online, idle (no task, not busy) and
-  has had no activity for 30 minutes (`LIGHT_AUTO_PARK_IDLE_MINUTES`) is
-  parked, so schedules cannot stay paused by mistake. Auto-park keeps core's
+- **Auto-park.** An `open` agent that is online, idle (no task, not busy),
+  open for 30 minutes (`LIGHT_AUTO_PARK_IDLE_MINUTES`) and without activity of
+  its own for as long (rows written by its runs, which carry a `run_id`, do not
+  count) is parked, so schedules cannot stay paused by mistake. Auto-park keeps core's
   schedule suspensions. A refused auto-park records its code in `last_error`
   and is not retried for 10 minutes.
 - **Refresh.** A change that would restart a parked agent (a secret, its
   model, a plugin), including one made while a park is under way, queues a
   `refresh`. Core opens the agent, and parks it again once it is online, idle
-  and has had no activity for a minute, so later runs carry the change. At
-  most two agents are in a refresh at a time. A refresh open whose agent fails
-  to start, or is not online within 15 minutes, is parked again on its
-  previous configuration (`LIGHT_REFRESH_OPEN_FAILED`) and retried 10 minutes
-  later. When you open an agent that a refresh opened, it is yours: it stays
+  and has had no activity of its own for a minute, so later runs carry the
+  change. At most two agents are in a refresh at a time; one whose refresh
+  open failed, or that you paused, does not count. A refresh-opened agent
+  whose pod fails, or that is not online after 15 minutes in `opening` or
+  `open`, is parked again on its previous configuration
+  (`LIGHT_REFRESH_OPEN_FAILED`) and retried 10 minutes later; one you paused
+  is left as you left it. When you open an agent that a refresh opened, it is yours: it stays
   open for the full idle window.
 - **Interrupted steps.** A park or open that a core restart or a control-plane
   outage left half-way is finished: a park whose pod is still up is re-run

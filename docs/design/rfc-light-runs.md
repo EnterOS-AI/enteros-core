@@ -61,8 +61,9 @@ resource friendly.
   the runtime (up to 8 MiB), render (a schedule core suspended goes out
   `enabled:false` unless the owner parks or its definition changed), mint a
   run token and record it as pending, C4 `PUT`, commit the token, store the
-  set; then, unless the agent reports a task or wrote activity since the claim
-  (then the park is undone with `LIGHT_AGENT_BUSY`), hibernate it through the
+  set; then, unless the agent reports a task or wrote activity of its own
+  since the claim (its runs' rows carry a `run_id` and do not count; then the
+  park is undone with `LIGHT_AGENT_BUSY`), hibernate it through the
   ordinary path and C4 `resume`, retried while the control plane answers
   `LIGHT_AGENT_AWAKE` (the pod's 30 s grace). A refusal after the claim and
   before the pod stops returns to `open`. A heartbeat of a `parking` agent is
@@ -94,7 +95,7 @@ At most two are live.
 plugin) is queued in `light_pending_actions` as a `refresh` instead. The
 monitor opens the agent (`light_opened_by = 'refresh'`), applies any queued
 action that has an applier, and parks it again once it is online, idle and
-quiet for a minute; the park's env snapshot completes the refreshes queued
+quiet (no activity of its own) for a minute; the park's env snapshot completes the refreshes queued
 before its claim (a change made while it parks stays queued). A refresh open
 that does not bring the agent up is parked again on its previous snapshot and
 retried after a 10-minute back-off. The table's `kind` is
@@ -105,8 +106,10 @@ made while parked) needs an applier, not a schema change.
 
 Every 30 s: finish or continue interrupted parks and opens (a continued park
 keeps its trigger and watermark), park again failed refresh opens, resume the
-CronJobs of an interrupted open; auto-park an open agent idle for 30 minutes;
-open at most two parked agents with queued work at a time; delete the Light
+CronJobs of an interrupted open; auto-park an open agent idle for 30 minutes
+(its runs' activity does not count); open at most two parked agents with
+queued work at a time (a refresh open that failed or that the owner paused
+holds no slot); delete the Light
 objects a workspace delete could not. Every 5 minutes, ten agents a tick: read
 each agent's jobs listing, record runs that never reported (killed, out of
 memory, image pull, deadline, quota), suspend a schedule whose last three

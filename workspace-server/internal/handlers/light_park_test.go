@@ -25,9 +25,9 @@ import (
 const (
 	lightSetStateSQL        = `UPDATE workspaces\s+SET light_state = NULLIF\(\$3, ''\), light_state_at = now\(\), updated_at = now\(\)\s+WHERE id = \$1 AND COALESCE\(light_state, ''\) = ANY\(\$2\)`
 	lightClaimParkingSQL    = `UPDATE workspaces\s+SET light_state = 'parking', light_state_at = now\(\), updated_at = now\(\),\s+light_park_trigger = \$2,\s+light_park_watermark = \(SELECT COALESCE\(MAX\(a\.id\), 0\) FROM light_pending_actions a\s+WHERE a\.workspace_id = \$1 AND a\.kind = \$3 AND a\.applied_at IS NULL\)\s+WHERE id = \$1 AND light_state = 'open'\s+RETURNING light_park_watermark`
-	lightPendingTokenSQL    = `UPDATE workspaces SET light_pending_token_id = \$2 WHERE id = \$1`
+	lightPendingTokenSQL    = `UPDATE workspaces w SET light_pending_token_id = \$2\s+FROM workspaces old\s+WHERE w\.id = \$1 AND old\.id = \$1\s+RETURNING old\.light_pending_token_id`
 	lightDropPendingSQL     = `UPDATE workspaces SET light_pending_token_id = NULL WHERE id = \$1 AND light_pending_token_id = \$2`
-	lightBusySQL            = `SELECT COALESCE\(active_tasks, 0\) > 0 OR COALESCE\(is_busy, false\)\s+OR COALESCE\(last_activity_at > light_state_at, false\)\s+FROM workspaces WHERE id = \$1`
+	lightBusySQL            = `SELECT COALESCE\(w\.active_tasks, 0\) > 0 OR COALESCE\(w\.is_busy, false\)\s+OR EXISTS \(SELECT 1 FROM activity_logs a\s+WHERE a\.workspace_id = w\.id AND a\.run_id IS NULL AND a\.created_at > w\.light_state_at\)\s+FROM workspaces w WHERE w\.id = \$1`
 	lightCommitSQL          = `SELECT w\.status, w\.light_run_token_id, w\.light_retired_token_id,[\s\S]*FOR UPDATE OF w`
 	lightClearParkErrorSQL  = `UPDATE workspaces SET light_last_error = NULL, light_last_error_at = NULL\s+WHERE id = \$1 AND light_last_error IS NOT NULL AND NOT \(COALESCE\(light_last_error->>'code', ''\) = ANY\(\$2\)\)`
 	lightClearOpenMarkerSQL = `UPDATE workspaces SET light_last_error = NULL, light_last_error_at = NULL\s+WHERE id = \$1 AND light_state = 'parked' AND light_last_error->>'code' = \$2`
@@ -55,6 +55,13 @@ func expectLightClaimParking(mock sqlmock.Sqlmock, trig string, watermark int64)
 func expectLightClearParkError(mock sqlmock.Sqlmock) {
 	mock.ExpectExec(lightClearParkErrorSQL).WithArgs(lightTestWS, pqArrayArg{"LIGHT_REFRESH_OPEN_FAILED", "LIGHT_ACTION_FAILED"}).
 		WillReturnResult(sqlmock.NewResult(0, 0))
+}
+
+// expectLightPendingToken scripts recordPendingLightToken: prev is the
+// pending token it replaces (nil for none).
+func expectLightPendingToken(mock sqlmock.Sqlmock, token string, prev interface{}) {
+	mock.ExpectQuery(lightPendingTokenSQL).WithArgs(lightTestWS, token).
+		WillReturnRows(sqlmock.NewRows([]string{"light_pending_token_id"}).AddRow(prev))
 }
 
 // expectLightBusy scripts lightAgentBusy.
@@ -92,7 +99,7 @@ func expectParkUpToThePutAs(t *testing.T, mock sqlmock.Sqlmock, stored *sqlmock.
 	mock.ExpectQuery(`INSERT INTO workspace_auth_tokens \(workspace_id, token_hash, prefix, kind\)`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("tok-new"))
 	expectLightAudit(mock)
-	mock.ExpectExec(lightPendingTokenSQL).WithArgs(lightTestWS, "tok-new").WillReturnResult(sqlmock.NewResult(0, 1))
+	expectLightPendingToken(mock, "tok-new", nil)
 }
 
 // expectParkAfterThePut scripts the token commit (from open), the stored set
@@ -977,6 +984,147 @@ func TestParkOfAWorkspaceDeletedDuringThePutDeletesItsObjectsAgain(t *testing.T)
 	}
 	if len(*stops) != 0 {
 		t.Errorf("stops = %v", *stops)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+// No marker, no pause: when the open cannot record its marker it answers 500
+// before pausing, so an open that dies later can never leave paused CronJobs
+// that nothing resumes (review 21719 O-B, X12).
+func TestOpenWhoseMarkerCannotBeRecordedPausesNothing(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	api := &fakeLightAPI{}
+	lh, _ := newLightTestHandler(t, api)
+	expectLightLoad(mock, "hibernated", "hermes", "workspace", "parked", 0, nil, nil)
+	mock.ExpectExec(lightRecordErrorSQL).WithArgs(lightTestWS, "LIGHT_OPEN_INCOMPLETE", sqlmock.AnyArg()).
+		WillReturnError(errors.New("connection reset by peer"))
+
+	w := lightCall(lh.Open, http.MethodPost, "/", "", nil)
+	if w.Code != http.StatusInternalServerError || lightBody(t, w)["code"] != "LIGHT_FAILED" {
+		t.Fatalf("open = %d %s, want 500 LIGHT_FAILED", w.Code, w.Body.String())
+	}
+	if calls := api.Calls(); len(calls) != 0 {
+		t.Errorf("CP calls = %v, want no pause without a marker", calls)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+// An open whose claim fails after its pause resumes the CronJobs at once,
+// while the agent is still parked, and clears its marker; the monitor's
+// two-minute fallback is only for an open that died (review 21719 O-B, X13).
+func TestOpenWhoseClaimFailsResumesTheSchedulesAtOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		claimErr   error
+		wantStatus int
+	}{
+		{"the claim errs", errors.New("connection reset by peer"), http.StatusInternalServerError},
+		{"the claim misses", nil, http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := setupTestDB(t)
+			setupTestRedis(t)
+			api := &fakeLightAPI{}
+			lh, _ := newLightTestHandler(t, api)
+			expectLightLoad(mock, "hibernated", "hermes", "workspace", "parked", 0, nil, nil)
+			expectLightOpenMarker(mock)
+			claim := mock.ExpectExec(lightClaimOpeningSQL).WithArgs(lightTestWS, "owner", "opening", "parked")
+			if tc.claimErr != nil {
+				claim.WillReturnError(tc.claimErr)
+			} else {
+				claim.WillReturnResult(sqlmock.NewResult(0, 0))
+			}
+			mock.ExpectQuery(lightReadRowSQL).WithArgs(lightTestWS).
+				WillReturnRows(sqlmock.NewRows([]string{"light_state", "status"}).AddRow("parked", "hibernated"))
+			mock.ExpectExec(lightClearOpenMarkerSQL).WithArgs(lightTestWS, "LIGHT_OPEN_INCOMPLETE").WillReturnResult(sqlmock.NewResult(0, 1))
+
+			w := lightCall(lh.Open, http.MethodPost, "/", "", nil)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("open = %d %s, want %d", w.Code, w.Body.String(), tc.wantStatus)
+			}
+			if calls := api.Calls(); !reflect.DeepEqual(calls, []string{"pause " + lightTestWS, "resume " + lightTestWS}) {
+				t.Errorf("CP calls = %v, want the pause undone by a resume", calls)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet: %v", err)
+			}
+		})
+	}
+}
+
+// A stuck park whose pod is still stopping (hibernating) is not opened: the
+// agent would end open with no pod, a state no sweep looks at. The monitor
+// finishes the stop after five minutes (review 21719 O-B, X18).
+func TestOpenLeavesAStuckParkWhosePodIsStillStopping(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	api := &fakeLightAPI{}
+	lh, _ := newLightTestHandler(t, api)
+	expectLightLoadWith(mock, "hibernating", "hermes", "workspace", "parking", 0, "tok-cur", nil,
+		lightLoadExtra{stateAt: time.Now().Add(-4 * time.Minute)})
+	rec := recordSQL(t)
+	w := lightCall(lh.Open, http.MethodPost, "/", "", nil)
+	assertNoWrites(t, rec())
+	if w.Code != http.StatusConflict || lightBody(t, w)["code"] != "LIGHT_TRANSITION_IN_PROGRESS" || len(api.Calls()) != 0 {
+		t.Fatalf("open = %d %s calls=%v, want 409 and nothing done", w.Code, w.Body.String(), api.Calls())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+// A continued park that its precondition refuses (the agent turned out busy)
+// still revokes the run token the interrupted attempt minted, before it puts
+// the agent back to open (review 21719 N-A).
+func TestARefusedParkContinuationRevokesTheInterruptedAttemptsToken(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	api := &fakeLightAPI{}
+	_, wh, _ := newParkTestHandler(t, api, lightGrid())
+	expectLightLoadWith(mock, "online", "hermes", "workspace", "parking", 1, "tok-cur", nil,
+		lightLoadExtra{parkTrigger: "owner", parkWatermark: 7, pendingTokenID: "tok-lost"})
+	mock.ExpectExec(lightRevokeTokenSQL).WithArgs("tok-lost", lightTestWS).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(lightDropPendingSQL).WithArgs(lightTestWS, "tok-lost").WillReturnResult(sqlmock.NewResult(0, 1))
+	expectLightSetState(mock, []string{"parking"}, "open", 1)
+	mock.ExpectExec(lightRecordErrorSQL).WithArgs(lightTestWS, "LIGHT_AGENT_BUSY", sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if _, ref := wh.parkLight(context.Background(), nil, lightTestWS, lightTriggerMonitor); ref == nil || ref.code() != "LIGHT_AGENT_BUSY" {
+		t.Fatalf("continuation = %v, want LIGHT_AGENT_BUSY", ref)
+	}
+	if len(api.Calls()) != 0 {
+		t.Errorf("CP called: %v", api.Calls())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet (the interrupted attempt's token must be revoked): %v", err)
+	}
+}
+
+// Recording a park's pending token revokes a pending token an earlier attempt
+// left behind: once replaced, no park, open or disable could reach it (review
+// 21719 N-A). With nothing pending, nothing is revoked.
+func TestRecordPendingLightTokenRevokesTheOneItReplaces(t *testing.T) {
+	mock := setupTestDB(t)
+	ctx := context.Background()
+	expectLightPendingToken(mock, "tok-new", "tok-left")
+	mock.ExpectExec(lightRevokeTokenSQL).WithArgs("tok-left", lightTestWS).WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := recordPendingLightToken(ctx, lightTestWS, "tok-new"); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	expectLightPendingToken(mock, "tok-next", nil)
+	rec := recordSQL(t)
+	if err := recordPendingLightToken(ctx, lightTestWS, "tok-next"); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	for _, q := range rec() {
+		if strings.Contains(q, "workspace_auth_tokens") {
+			t.Errorf("a token was revoked although none was pending: %s", q)
+		}
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet: %v", err)

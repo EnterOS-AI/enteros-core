@@ -258,11 +258,27 @@ func revokeLightToken(ctx context.Context, workspaceID, tokenID string) {
 
 // recordPendingLightToken notes the run token a park just minted, before the
 // PUT hands it to the control plane: an interruption before commit leaves it
-// here for the next park, an open or a disable to revoke (review 21718 N1).
+// here for the next park, an open or a disable to revoke (review 21718 N1). A
+// pending token an earlier attempt left behind is revoked as it is replaced:
+// once overwritten, nothing could reach it (review 21719 N-A).
 func recordPendingLightToken(ctx context.Context, workspaceID, tokenID string) error {
-	_, err := db.DB.ExecContext(ctx,
-		`UPDATE workspaces SET light_pending_token_id = $2 WHERE id = $1`, workspaceID, tokenID)
-	return err
+	var prev sql.NullString
+	err := db.DB.QueryRowContext(ctx, `
+		UPDATE workspaces w SET light_pending_token_id = $2
+		FROM workspaces old
+		WHERE w.id = $1 AND old.id = $1
+		RETURNING old.light_pending_token_id`, workspaceID, tokenID).Scan(&prev)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if prev.Valid && prev.String != "" && prev.String != tokenID {
+		log.Printf("light: revoking the run token an interrupted park of %s left pending", workspaceID)
+		revokeLightToken(ctx, workspaceID, prev.String)
+	}
+	return nil
 }
 
 // dropPendingLightToken revokes a park's unrecorded run token and forgets it.
@@ -490,6 +506,12 @@ func (h *WorkspaceHandler) parkLight(ctx context.Context, c *gin.Context, worksp
 		recordLightError(ctx, workspaceID, ref.code(), fmt.Sprint(ref.Body["error"]))
 		return lightParkResult{}, ref
 	}
+	if continuing && row.PendingTokenID.Valid {
+		// The interrupted attempt minted a token it never recorded; no run ever
+		// held it (the CronJobs were never resumed). Revoked before anything can
+		// refuse the continuation (review 21719 N-A).
+		dropPendingLightToken(ctx, workspaceID, row.PendingTokenID.String)
+	}
 	if ref := h.lightParkPrecondition(ctx, workspaceID, row, awake); ref != nil {
 		if continuing {
 			return undo(ref)
@@ -508,10 +530,6 @@ func (h *WorkspaceHandler) parkLight(ctx context.Context, c *gin.Context, worksp
 				"another Light operation on this agent is in progress; retry shortly", nil)
 		}
 		watermark = wm
-	} else if row.PendingTokenID.Valid {
-		// The interrupted attempt minted a token it never recorded; no run ever
-		// held it (the CronJobs were never resumed).
-		dropPendingLightToken(ctx, workspaceID, row.PendingTokenID.String)
 	}
 
 	grid, err := h.readAgentSchedules(ctx, workspaceID)
@@ -593,15 +611,19 @@ func readLightRow(ctx context.Context, workspaceID string) (state, status string
 
 // lightAgentBusy reports whether a 'parking' agent is doing something: a task
 // its heartbeats report (they still record active_tasks and is_busy while
-// 'parking'), or any activity written since the parking claim. A message can
-// no longer reach it once 'parking' is claimed, so such activity comes from a
-// turn that was already running (its reply, its tool calls).
+// 'parking'), or an activity row the agent itself wrote since the parking
+// claim. A message can no longer reach it once 'parking' is claimed, so such a
+// row comes from a turn that was already running (its tool calls, its log).
+// Rows of its runs do not count (they carry a run_id; a run pod writes under
+// the agent's id): a run of the last park may still be going while the agent
+// is open (review 21719 O-A).
 func lightAgentBusy(ctx context.Context, workspaceID string) (bool, error) {
 	var busy bool
 	err := db.DB.QueryRowContext(ctx, `
-		SELECT COALESCE(active_tasks, 0) > 0 OR COALESCE(is_busy, false)
-		       OR COALESCE(last_activity_at > light_state_at, false)
-		FROM workspaces WHERE id = $1`, workspaceID,
+		SELECT COALESCE(w.active_tasks, 0) > 0 OR COALESCE(w.is_busy, false)
+		       OR EXISTS (SELECT 1 FROM activity_logs a
+		                  WHERE a.workspace_id = w.id AND a.run_id IS NULL AND a.created_at > w.light_state_at)
+		FROM workspaces w WHERE w.id = $1`, workspaceID,
 	).Scan(&busy)
 	return busy, err
 }

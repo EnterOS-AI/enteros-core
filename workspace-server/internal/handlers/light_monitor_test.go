@@ -26,7 +26,7 @@ import (
 const (
 	lightTransitionsSQL       = `SELECT id, light_state, status, EXTRACT\(EPOCH FROM \(now\(\) - COALESCE\(light_state_at, now\(\)\)\)\)::bigint,\s+COALESCE\(light_opened_by, ''\)\s+FROM workspaces\s+WHERE status != 'removed' AND \(`
 	lightAutoParkSQL          = `SELECT id, COALESCE\(light_opened_by, 'owner'\)\s+FROM workspaces\s+WHERE light_state = 'open' AND status IN \('online', 'degraded'\)`
-	lightInFlightSQL          = `SELECT COUNT\(\*\) FROM workspaces\s+WHERE light_state IN \('opening', 'open'\) AND light_opened_by = 'refresh'\s+AND status NOT IN \('failed', 'removed'\)`
+	lightInFlightSQL          = `SELECT COUNT\(\*\) FROM workspaces\s+WHERE light_state IN \('opening', 'open'\) AND light_opened_by = 'refresh'\s+AND status NOT IN \('failed', 'paused', 'removed'\)`
 	lightRefreshSQL           = `SELECT w.id FROM workspaces w\s+JOIN LATERAL`
 	lightRemovedSQL           = `SELECT id FROM workspaces WHERE status = 'removed' AND light_state IS NOT NULL`
 	lightClearAfterSQL        = `UPDATE workspaces\s+SET light_state = NULL, light_state_at = now\(\), light_opened_by = NULL`
@@ -204,15 +204,15 @@ func TestSweepTransitionsContinuesAnInterruptedPark(t *testing.T) {
 	expectTransitions(mock, transitionRow("parking", "online", "200"))
 	expectLightLoadWith(mock, "online", "hermes", "workspace", "parking", 0, "tok-cur", "tok-old",
 		lightLoadExtra{parkTrigger: "owner", parkWatermark: 7, pendingTokenID: "tok-lost"})
-	mock.ExpectQuery(lightSecretReadSQL).WithArgs(lightTestWS, "MOLECULE_LIGHT").WillReturnRows(encryptedRow(t, "1"))
 	mock.ExpectExec(lightRevokeTokenSQL).WithArgs("tok-lost", lightTestWS).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(lightDropPendingSQL).WithArgs(lightTestWS, "tok-lost").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(lightSecretReadSQL).WithArgs(lightTestWS, "MOLECULE_LIGHT").WillReturnRows(encryptedRow(t, "1"))
 	mock.ExpectQuery(lightStoredSchedulesSQL).WithArgs(lightTestWS).
 		WillReturnRows(lightStoredRows().AddRow("daily", "0 9 * * *", "UTC", "p", true, "3 runs in a row failed"))
 	mock.ExpectQuery(`INSERT INTO workspace_auth_tokens \(workspace_id, token_hash, prefix, kind\)`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("tok-new"))
 	expectLightAudit(mock)
-	mock.ExpectExec(lightPendingTokenSQL).WithArgs(lightTestWS, "tok-new").WillReturnResult(sqlmock.NewResult(0, 1))
+	expectLightPendingToken(mock, "tok-new", nil)
 	// Stored as the owner's park: the suspension is cleared ($8 true), and the
 	// refreshes up to the claim's watermark are marked applied.
 	expectParkAfterThePutAs(mock, [][]driver.Value{{"daily", "0 9 * * *", "UTC", "p", true, "light-x-aaaaaaaa", true}}, []string{"daily"}, 7)
@@ -284,6 +284,8 @@ func TestSweepTransitionsParksAFailedRefreshOpenAgain(t *testing.T) {
 		{"opening, pod failed", "opening", "failed", "100", true},
 		{"opening, not up after 15 minutes", "opening", "provisioning", "1000", true},
 		{"opening, still in time", "opening", "provisioning", "100", false},
+		{"open, down for 15 minutes", "open", "offline", "1000", true},
+		{"open, down but in time", "open", "offline", "100", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mock := setupTestDB(t)

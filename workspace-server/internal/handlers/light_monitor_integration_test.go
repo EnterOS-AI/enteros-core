@@ -28,6 +28,18 @@ func lightExec(t *testing.T, conn *sql.DB, query string, args ...interface{}) {
 	}
 }
 
+// lightActivityRow writes one activity row of ws, secsAgo seconds old: the
+// agent's own (runID "") or one of its runs'.
+func lightActivityRow(t *testing.T, conn *sql.DB, ws, runID string, secsAgo int) {
+	t.Helper()
+	var run interface{}
+	if runID != "" {
+		run = runID
+	}
+	lightExec(t, conn, `INSERT INTO activity_logs (workspace_id, activity_type, summary, run_id, created_at)
+		VALUES ($1, 'agent_log', 'test activity', $2, now() - make_interval(secs => $3))`, ws, run, secsAgo)
+}
+
 func lightIDSet(rows [][]string) map[string]string {
 	out := map[string]string{}
 	for _, r := range rows {
@@ -52,19 +64,27 @@ func TestIntegration_LightMonitor_AutoParkPredicate(t *testing.T) {
 	busyFlag := seedLightWorkspace(t, conn, "test-light-busy-flag", "online", "open")
 	refreshNow := seedLightWorkspace(t, conn, "test-light-refresh-now", "online", "open")
 	refreshActive := seedLightWorkspace(t, conn, "test-light-refresh-active", "online", "open")
+	runOnly := seedLightWorkspace(t, conn, "test-light-run-only", "online", "open")
+	refreshRun := seedLightWorkspace(t, conn, "test-light-refresh-run", "online", "open")
 	old := `UPDATE workspaces SET light_state_at = now() - interval '45 minutes', last_activity_at = now() - interval '40 minutes' WHERE id = ANY($1::uuid[])`
-	for _, id := range []string{idle, busy, recent, failed, parked, ordinary, busyFlag} {
+	for _, id := range []string{idle, busy, recent, failed, parked, ordinary, busyFlag, runOnly} {
 		lightExec(t, conn, old, "{"+id+"}")
 	}
 	lightExec(t, conn, `UPDATE workspaces SET active_tasks = 1 WHERE id = $1`, busy)
 	// A runtime that reports is_busy without active_tasks (RFC #4402 B2).
 	lightExec(t, conn, `UPDATE workspaces SET active_tasks = 0, is_busy = true WHERE id = $1`, busyFlag)
-	lightExec(t, conn, `UPDATE workspaces SET last_activity_at = now() - interval '5 minutes' WHERE id = $1`, recent)
+	lightActivityRow(t, conn, recent, "", 5*60)
 	// A refresh-opened agent parks once quiet for a minute (not the idle
 	// window): not while it has just come up, nor right after activity.
 	lightExec(t, conn, `UPDATE workspaces SET light_opened_by = 'refresh', light_state_at = now() - interval '2 minutes' WHERE id = $1`, refresh)
 	lightExec(t, conn, `UPDATE workspaces SET light_opened_by = 'refresh', light_state_at = now() - interval '10 seconds' WHERE id = $1`, refreshNow)
-	lightExec(t, conn, `UPDATE workspaces SET light_opened_by = 'refresh', light_state_at = now() - interval '5 minutes', last_activity_at = now() - interval '10 seconds' WHERE id = $1`, refreshActive)
+	lightExec(t, conn, `UPDATE workspaces SET light_opened_by = 'refresh', light_state_at = now() - interval '5 minutes' WHERE id = $1`, refreshActive)
+	lightActivityRow(t, conn, refreshActive, "", 10)
+	// Only the agent's own activity counts: a run of its last park, still
+	// going, writes rows under its id that carry the run id (review 21719 O-A).
+	lightActivityRow(t, conn, runOnly, "light-x-aaaaaaaa-29384756", 60)
+	lightExec(t, conn, `UPDATE workspaces SET light_opened_by = 'refresh', light_state_at = now() - interval '5 minutes' WHERE id = $1`, refreshRun)
+	lightActivityRow(t, conn, refreshRun, "light-x-aaaaaaaa-29384756", 5)
 	lightExec(t, conn, `UPDATE workspaces SET light_last_error = '{"code":"X","message":"y"}', light_last_error_at = now() - interval '1 minute' WHERE id = $1`, failed)
 
 	rows, err := lightAutoParkCandidates(context.Background(), 30*time.Minute)
@@ -72,8 +92,8 @@ func TestIntegration_LightMonitor_AutoParkPredicate(t *testing.T) {
 		t.Fatalf("candidates: %v", err)
 	}
 	got := lightIDSet(rows)
-	if got[idle] != "owner" || got[refresh] != "refresh" {
-		t.Errorf("want idle (owner) and refresh-opened (refresh); got %v", got)
+	if got[idle] != "owner" || got[refresh] != "refresh" || got[runOnly] != "owner" || got[refreshRun] != "refresh" {
+		t.Errorf("want idle (owner), refresh-opened (refresh), and the two whose only recent activity is a run's; got %v", got)
 	}
 	for name, id := range map[string]string{"busy": busy, "is_busy": busyFlag, "recent activity": recent, "recent failure": failed, "parked": parked, "not Light": ordinary,
 		"refresh-opened a moment ago": refreshNow, "refresh-opened with recent activity": refreshActive} {
