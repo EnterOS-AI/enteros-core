@@ -811,6 +811,14 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	if err := h.requireWorkspaceToken(ctx, c, payload.ID); err != nil {
 		return // 401 response already written by requireWorkspaceToken
 	}
+	// Enter OS Light (C5): a parking or parked Light agent registers nothing.
+	// Placed BEFORE authOK so the deferred failure stamp
+	// (last_register_failure_at) is not written either; the upsert below
+	// carries the predicate too.
+	if ref := lightWakeRefusal(ctx, payload.ID, "register"); ref != nil {
+		ref.write(c)
+		return
+	}
 	authOK = true
 
 	// SECURITY (privilege-escalation fix): the public register path must never
@@ -1144,7 +1152,7 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 			delivery_mode = EXCLUDED.delivery_mode,
 			kind = COALESCE(NULLIF($6, ''), workspaces.kind),
 			updated_at = now()
-		WHERE workspaces.status NOT IN ('removed', 'paused', 'hibernated')
+		WHERE workspaces.status NOT IN ('removed', 'paused', 'hibernated') AND `+models.LightWakeAllowedSQLFor("workspaces")+`
 	`, payload.ID, payload.ID, urlForUpsert, agentCardStr, modeForUpsert, payload.Kind)
 	if err != nil {
 		if isPlatformRootViolation(err) {
@@ -1329,6 +1337,15 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 		return // response already written
 	}
 
+	// Enter OS Light (C5): a parking or parked Light agent's heartbeat writes
+	// nothing — no last_heartbeat_at, active_tasks, Redis liveness key or URL
+	// cache — and is answered 409. Its pod is being (or has been) stopped; a run
+	// pod never heartbeats. The UPDATEs below carry the predicate too.
+	if ref := lightWakeRefusal(ctx, payload.WorkspaceID, "heartbeat"); ref != nil {
+		ref.write(c)
+		return
+	}
+
 	// Read previous current_task + status to detect changes (before the UPDATE).
 	//
 	// prevStatus is load-bearing for the RFC#2843 #32 plugin reconcile: the
@@ -1446,7 +1463,7 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				-- fast first-heartbeat flip. kind is NOT NULL so the CASE is safe.
 				status            = (CASE WHEN status = 'provisioning' AND kind <> 'platform' THEN 'online' ELSE status END)::workspace_status,
 				updated_at        = now()
-			WHERE id = $1 AND status != 'removed'
+			WHERE id = $1 AND status != 'removed' AND `+models.LightWakeAllowedSQL+`
 		`, payload.WorkspaceID, payload.ErrorRate, payload.SampleError,
 			activeTasks, payload.UptimeSeconds, payload.CurrentTask,
 			payload.MonthlySpend, payload.IsBusy)
@@ -1468,7 +1485,7 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				-- fast first-heartbeat flip. kind is NOT NULL so the CASE is safe.
 				status            = (CASE WHEN status = 'provisioning' AND kind <> 'platform' THEN 'online' ELSE status END)::workspace_status,
 				updated_at        = now()
-			WHERE id = $1 AND status != 'removed'
+			WHERE id = $1 AND status != 'removed' AND `+models.LightWakeAllowedSQL+`
 		`, payload.WorkspaceID, payload.ErrorRate, payload.SampleError,
 			activeTasks, payload.UptimeSeconds, payload.CurrentTask,
 			payload.IsBusy)
@@ -3308,6 +3325,12 @@ func (h *RegistryHandler) UpdateCard(c *gin.Context) {
 	if err := h.requireWorkspaceToken(c.Request.Context(), c, payload.WorkspaceID); err != nil {
 		return // response already written
 	}
+	// Enter OS Light (C5): a run of a parked Light agent (update_agent_card
+	// from a run pod) must not rewrite the parked agent's card.
+	if ref := lightWakeRefusal(c.Request.Context(), payload.WorkspaceID, "update-card"); ref != nil {
+		ref.write(c)
+		return
+	}
 
 	// Validate agent_card.url if present — prevents SSRF via transcript proxy
 	// (issue #2130). An attacker who compromises a workspace token could
@@ -3326,7 +3349,7 @@ func (h *RegistryHandler) UpdateCard(c *gin.Context) {
 
 	agentCardStr := string(payload.AgentCard)
 	_, err := db.DB.ExecContext(c.Request.Context(), `
-		UPDATE workspaces SET agent_card = $2::jsonb, updated_at = now() WHERE id = $1
+		UPDATE workspaces SET agent_card = $2::jsonb, updated_at = now() WHERE id = $1 AND `+models.LightWakeAllowedSQL+`
 	`, payload.WorkspaceID, agentCardStr)
 	if err != nil {
 		log.Printf("UpdateCard error: %v", err)
