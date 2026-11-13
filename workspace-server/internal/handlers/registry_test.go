@@ -1952,7 +1952,7 @@ func TestRegister_PollMode_AcceptsEmptyURL(t *testing.T) {
 
 	// Poll-mode guard: the row is not platform-provisioned (no row yet), so
 	// the register proceeds. See refusePollRegisterOnProvisionedWorkspace.
-	mock.ExpectQuery(`SELECT instance_id, delivery_mode, url FROM workspaces WHERE id = \$1`).
+	mock.ExpectQuery(`SELECT instance_id, delivery_mode, url, runtime FROM workspaces WHERE id = \$1`).
 		WithArgs(wsID).
 		WillReturnError(sql.ErrNoRows)
 

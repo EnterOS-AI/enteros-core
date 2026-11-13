@@ -359,53 +359,62 @@ func (h *RegistryHandler) fireReconcileMCPRecovery(ctx context.Context, workspac
 var pollRegisterPrecheck = (*RegistryHandler).refusePollRegisterOnProvisionedWorkspace
 
 // refusePollRegisterOnProvisionedWorkspace answers 409 (and returns true) when
-// a poll-mode /registry/register targets a workspace whose compute the PLATFORM
-// provisioned (workspaceIsPlatformProvisioned: instance_id set by the CP
-// provisioner, or the self-host docker provisioner's host-port URL) — neither
-// of which a register-created external peer has.
+// a poll-mode /registry/register targets a workspace that
 //
-// Why refuse rather than accept: poll mode means "the platform never dispatches
-// to me; I fetch my inbox". For a provisioned box that is never what the box
-// asks for — no provisioning path sets poll — so a poll register for its id
-// comes from something else holding its token, and applying it wipes the
-// box's platform URL (poll stores the payload url unvalidated, often none) and
-// parks its A2A for a poller the box is not running. Live 2026-11-13
-// (reno-stars, ca17a092, claude-code): an external client registered the
-// workspace poll with no url via the ingress (04:50–06:06Z); every URL forward
-// (schedules, chat files) then 422'd "no callback URL" for ~4.5h while the box
-// served at its platform URL, until a restart re-registered it.
+//   - the PLATFORM provisioned (workspaceIsPlatformProvisioned: instance_id set
+//     by the CP provisioner, or the self-host docker provisioner's host-port
+//     URL on a non-external runtime), AND
+//   - is STORED as push (or has no stored mode).
 //
-// The discriminator is NOT runtime: /registry/register inserts
-// unknown ids without a runtime, so register-created external peers carry the
-// column default ('hermes') and look exactly like hosted workspaces by runtime.
+// Why only stored-push: a platform-hosted box may legitimately run poll — the
+// runtime takes it from MOLECULE_DELIVERY_MODE / config.a2a.delivery_mode,
+// declares it in every register and starts its inbox poller, and
+// POST /workspaces stores delivery_mode=poll at create. Such a row is stored
+// poll and its own poll register goes through unchanged. What must not happen
+// is a poll register FLIPPING a push box: that wipes its platform URL (poll
+// stores the payload url unvalidated, often none) and parks its A2A for a
+// poller the box is not running. Live 2026-11-13 (reno-stars, ca17a092,
+// claude-code, stored push): an external client registered the workspace poll
+// with no url via the ingress (04:50–06:06Z); every URL forward (schedules,
+// chat files) then 422'd "no callback URL" for ~4.5h while the box served at
+// its platform URL, until a restart re-registered it.
+//
+// The discriminator is NOT runtime alone: /registry/register inserts unknown
+// ids without a runtime, so register-created external peers carry the column
+// default ('hermes') and look exactly like hosted workspaces by runtime.
 //
 // A 409 (not a silent keep) so a misconfigured client fails loudly instead of
-// believing it is now the workspace's poller. Fail-open on a lookup error is
-// deliberate: the existing upsert behaviour is the fallback, and the error is
-// logged.
+// believing it is now the workspace's poller. The 409 does NOT stamp
+// last_register_failure_at (see Register's deferred stamp): the box was not the
+// caller, and a looping rogue client must not flap it to degraded. Fail-open on
+// a lookup error is deliberate — the SQL arm (pollRegisterKeepsProvisionedRowSQL)
+// still keeps the row.
 func (h *RegistryHandler) refusePollRegisterOnProvisionedWorkspace(ctx context.Context, c *gin.Context, workspaceID string) bool {
-	var instanceID, storedMode, storedURL sql.NullString
+	var instanceID, storedMode, storedURL, runtime sql.NullString
 	err := db.DB.QueryRowContext(ctx,
-		`SELECT instance_id, delivery_mode, url FROM workspaces WHERE id = $1`, workspaceID,
-	).Scan(&instanceID, &storedMode, &storedURL)
+		`SELECT instance_id, delivery_mode, url, runtime FROM workspaces WHERE id = $1`, workspaceID,
+	).Scan(&instanceID, &storedMode, &storedURL, &runtime)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			log.Printf("Registry register: provisioned-workspace check failed for %s: %v (falling through)", workspaceID, err)
 		}
 		return false
 	}
-	if !workspaceIsPlatformProvisioned(instanceID.String, storedURL.String) {
+	if storedMode.Valid && storedMode.String != "" && storedMode.String != models.DeliveryModePush {
+		return false // already stored poll: the box's own poll register (supported config)
+	}
+	if !workspaceIsPlatformProvisioned(instanceID.String, storedURL.String, runtime.String) {
 		return false
 	}
-	log.Printf("Registry register: REFUSED poll-mode register for platform-provisioned workspace %s — a poll register would detach the running box from its platform URL", workspaceID)
+	log.Printf("Registry register: REFUSED poll-mode register for platform-provisioned push workspace %s — it would detach the running box from its platform URL", workspaceID)
 	c.JSON(http.StatusConflict, gin.H{
-		"error": "workspace " + workspaceID + " is platform-hosted (its compute was provisioned by the platform and is reached at its platform URL); " +
+		"error": "workspace " + workspaceID + " is platform-hosted and registered in push mode (its compute was provisioned by the platform and is reached at its platform URL); " +
 			"a poll-mode registration would detach it. Register external peers under their own workspace ids " +
 			"(create one with POST /workspaces runtime=external) instead of reusing this workspace's id and token.",
 		"code":         "POLL_REGISTER_ON_PLATFORM_HOSTED_WORKSPACE",
 		"workspace_id": workspaceID,
 		// The mode the row KEEPS — never the one the caller asked for.
-		"delivery_mode": storedMode.String,
+		"delivery_mode": models.DeliveryModePush,
 	})
 	return true
 }
@@ -424,25 +433,41 @@ func (h *RegistryHandler) refusePollRegisterOnProvisionedWorkspace(ctx context.C
 //     instance_id. It writes the host-port URL it advertises
 //     (http://localhost:<port> / 127.0.0.1:<port>, port != 8000) — the same
 //     shape the upsert's existing CASE already treats as provisioner-owned —
-//     so that URL is the discriminator for this backend.
-func workspaceIsPlatformProvisioned(instanceID, url string) bool {
-	return strings.TrimSpace(instanceID) != "" || isProvisionerHostPortURL(url)
+//     so that URL is the discriminator for this backend, EXCEPT on an
+//     external-like runtime (a self-host peer created with runtime=external
+//     that once registered push at a localhost port must still be able to
+//     switch to poll).
+func workspaceIsPlatformProvisioned(instanceID, url, runtime string) bool {
+	if strings.TrimSpace(instanceID) != "" {
+		return true
+	}
+	return isProvisionerHostPortURL(url) && !isExternalLikeRuntime(runtime)
 }
 
 // pollRegisterKeepsProvisionedRowSQL is the ATOMIC half of the poll-register
 // guard, evaluated on the upsert's UPDATE arm against the PRE-update row: a
 // poll register never rewrites url or delivery_mode of a platform-provisioned
-// row. The Go 409 (refusePollRegisterOnProvisionedWorkspace) gives the
-// explicit error; this arm makes the protection hold even if the Go check is
-// raced (instance_id persisted between the check and the upsert) or fails
-// open on a lookup error.
-const pollRegisterKeepsProvisionedRowSQL = `(EXCLUDED.delivery_mode = 'poll'
+// row STORED AS PUSH (or with no stored mode). A row already stored poll (a box
+// legitimately running poll) is not touched by this arm. The Go 409
+// (refusePollRegisterOnProvisionedWorkspace) gives the explicit error; this arm
+// makes the protection hold even if the Go check is raced (instance_id
+// persisted between the check and the upsert) or fails open on a lookup error.
+// Built from the externalLikeRuntimes SSOT (constants, never request data).
+var pollRegisterKeepsProvisionedRowSQL = func() string {
+	quoted := make([]string, len(externalLikeRuntimes))
+	for i, r := range externalLikeRuntimes {
+		quoted[i] = "'" + strings.ReplaceAll(r, "'", "''") + "'"
+	}
+	return `(EXCLUDED.delivery_mode = 'poll'
+				     AND COALESCE(NULLIF(workspaces.delivery_mode, ''), 'push') = 'push'
 				     AND ((workspaces.instance_id IS NOT NULL AND workspaces.instance_id <> '')
 				          OR (workspaces.url IS NOT NULL
 				              AND (workspaces.url LIKE 'http://127.0.0.1:%'
 				                   OR workspaces.url LIKE 'http://localhost:%')
 				              AND substring(workspaces.url FROM ':([0-9]+)$') IS NOT NULL
-				              AND CAST(substring(workspaces.url FROM ':([0-9]+)$') AS int) <> 8000)))`
+				              AND CAST(substring(workspaces.url FROM ':([0-9]+)$') AS int) <> 8000
+				              AND COALESCE(workspaces.runtime, '') NOT IN (` + strings.Join(quoted, ", ") + `))))`
+}()
 
 func (h *RegistryHandler) resolveDeliveryMode(ctx context.Context, workspaceID, payloadMode string) (string, error) {
 	if payloadMode != "" {
@@ -833,6 +858,10 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// client timeout / unreachable $PLATFORM_URL.
 	registerStart := time.Now()
 	authOK := false
+	// skipFailureStamp: set for a refusal that is about the CALLER, not the
+	// workspace (the poll-register 409). Stamping it would let a looping rogue
+	// client flap a healthy box to degraded via the heartbeat failure window.
+	skipFailureStamp := false
 	defer func(wsID string) {
 		if status := c.Writer.Status(); status != http.StatusOK {
 			log.Printf("Registry register: workspace=%s boot_register_failed status=%d duration=%s", wsID, status, time.Since(registerStart))
@@ -842,7 +871,7 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 			// mutate workspace state — otherwise anyone can POST /registry/register
 			// without a bearer and force a false-degraded status via the heartbeat
 			// 5-minute failure window.
-			if authOK {
+			if authOK && !skipFailureStamp {
 				if _, err := db.DB.ExecContext(context.Background(), `UPDATE workspaces SET last_register_failure_at = now() WHERE id = $1`, wsID); err != nil {
 					log.Printf("Registry register: failed to record failure timestamp for %s: %v", wsID, err)
 				}
@@ -948,6 +977,7 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// 2026-11-13 incident.
 	if effectiveMode == models.DeliveryModePoll {
 		if refused := pollRegisterPrecheck(h, ctx, c, payload.ID); refused {
+			skipFailureStamp = true
 			return
 		}
 	}

@@ -38,6 +38,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 )
 
 const platformHostedURL = "http://enteros-ws-abc.enteros-test.svc.cluster.local:8000"
@@ -226,5 +228,86 @@ func TestIntegration_Register_PollOnProvisionedWorkspace_SQLArmHoldsWithoutPrech
 				t.Errorf("SQL arm did not hold: url=%q mode=%q, want %q/push", url, mode, tc.url)
 			}
 		})
+	}
+}
+
+// A platform-hosted box may legitimately run poll (MOLECULE_DELIVERY_MODE /
+// config.a2a.delivery_mode; POST /workspaces stores delivery_mode=poll). Its
+// row is stored poll, and its own poll register must go through — neither
+// the Go 409 nor the SQL arm may force it back to push.
+func TestIntegration_Register_PollOnProvisionedWorkspaceStoredPoll_Accepted(t *testing.T) {
+	conn := integrationDB_DormantRegister(t)
+	setupTestRedis(t)
+	h := &RegistryHandler{broadcaster: newTestBroadcaster()}
+
+	id := uuid.NewString()
+	seedRegisteredWorkspace(t, conn, id, "claude-code", "enteros-ws-"+id[:12], platformHostedURL, "poll")
+
+	code, body := callPollRegister(t, h, id, "")
+
+	if code != http.StatusOK {
+		t.Fatalf("a provisioned box stored poll registering poll: http=%d, want 200 (%s)", code, body)
+	}
+	if _, mode := urlAndModeOf(t, conn, id); mode != "poll" {
+		t.Errorf("stored-poll provisioned row: mode=%q after its own poll register, want poll", mode)
+	}
+}
+
+// The 409 is about the CALLER. It must not stamp last_register_failure_at on
+// the workspace, or a looping rogue client could flap a healthy box to
+// degraded via the heartbeat failure window.
+func TestIntegration_Register_PollRefusal_DoesNotStampRegisterFailure(t *testing.T) {
+	conn := integrationDB_DormantRegister(t)
+	setupTestRedis(t)
+	h := &RegistryHandler{broadcaster: newTestBroadcaster()}
+
+	id := uuid.NewString()
+	seedRegisteredWorkspace(t, conn, id, "claude-code", "enteros-ws-"+id[:12], platformHostedURL, "push")
+
+	// Authenticated caller (a live instance token for this workspace), so the
+	// deferred stamp's authOK gate is genuinely passed.
+	tok, err := wsauth.IssueToken(context.Background(), conn, id)
+	if err != nil {
+		t.Fatalf("issue token: %v", err)
+	}
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := fmt.Sprintf(`{"id":%q,"delivery_mode":"poll","agent_card":{"name":"external-peer","version":"1.0"}}`, id)
+	c.Request = httptest.NewRequest("POST", "/registry/register", strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Authorization", "Bearer "+tok)
+	h.Register(c)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("authenticated poll register on a provisioned push workspace: http=%d, want 409 (%s)", w.Code, w.Body.String())
+	}
+	var stamped sql.NullTime
+	if err := conn.QueryRowContext(context.Background(),
+		`SELECT last_register_failure_at FROM workspaces WHERE id = $1`, id).Scan(&stamped); err != nil {
+		t.Fatalf("read last_register_failure_at: %v", err)
+	}
+	if stamped.Valid {
+		t.Errorf("refused poll register stamped last_register_failure_at=%v on the victim workspace; want NULL", stamped.Time)
+	}
+}
+
+// A self-host EXTERNAL peer that once registered push at a localhost port is
+// not docker-provisioned; it must still be able to switch to poll.
+func TestIntegration_Register_PollOnExternalLocalhostPeer_SwitchesToPoll(t *testing.T) {
+	conn := integrationDB_DormantRegister(t)
+	setupTestRedis(t)
+	h := &RegistryHandler{broadcaster: newTestBroadcaster()}
+
+	id := uuid.NewString()
+	seedRegisteredWorkspace(t, conn, id, "external", "", "http://localhost:41236", "push")
+
+	code, body := callPollRegister(t, h, id, "")
+
+	if code != http.StatusOK {
+		t.Fatalf("external localhost peer poll register: http=%d, want 200 (%s)", code, body)
+	}
+	if _, mode := urlAndModeOf(t, conn, id); mode != "poll" {
+		t.Errorf("external localhost peer: mode=%q, want poll", mode)
 	}
 }
