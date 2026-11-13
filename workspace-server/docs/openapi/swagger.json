@@ -432,7 +432,7 @@
                         "BearerAuth": []
                     }
                 ],
-                "description": "Deletes the control plane's Light objects (CronJobs, Jobs, Secret) first, then revokes the run tokens, removes the Light secrets, clears light_state and wakes (or restarts) the agent. Works from any Light state.",
+                "description": "Deletes the control plane's Light objects (CronJobs, Jobs, Secret) first, then revokes the run tokens, removes MOLECULE_LIGHT, restores the 24/7 setting (MOLECULE_CONTINUOUS) exactly as it was before enable, clears light_state and wakes (or restarts) the agent. Works from any Light state.",
                 "produces": [
                     "application/json"
                 ],

@@ -133,7 +133,8 @@ Core stores two workspace secrets, `MOLECULE_LIGHT=1` (the runtime leaves its
 own scheduler off; the control plane refuses to park an agent without it) and
 `MOLECULE_CONTINUOUS=false` (the 24/7 switch off, so an idle open agent can be
 parked), sets `light_state` to `open`, and restarts the agent so the new env
-applies (a hibernated agent is woken instead).
+applies (a hibernated agent is woken instead). It records the agent's 24/7
+setting as it was, so disable can put it back.
 
 **200**
 
@@ -166,9 +167,11 @@ Turns a Light agent back into an ordinary agent, from any Light state. No body.
 
 Core first deletes the control plane's Light objects (the CronJobs, any run
 still going, the run Secret); only when that succeeds does it revoke the run
-tokens, remove the two Light secrets, clear `light_state`, drop the stored
-schedules and queued actions, and restart the agent (or wake it, when parked).
-The run history (`GET /light/runs`) is kept.
+tokens, remove `MOLECULE_LIGHT`, put the 24/7 setting back exactly as it was
+before enable (the workspace's own `MOLECULE_CONTINUOUS` value, or no
+workspace value at all), clear `light_state`, drop the stored schedules and
+queued actions, and restart the agent (or wake it, when parked). The run
+history (`GET /light/runs`) is kept.
 
 **200**
 

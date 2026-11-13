@@ -59,7 +59,7 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | POST | /workspaces/:id/resume | workspace.go (re-provisions paused workspace) |
 | GET | /workspaces/:id/light | light_handlers.go — Enter OS Light state: `light_state` (`null` = not a Light agent), the schedules rendered at the last park, queued work, the last background failure. Full contract: `docs/api-protocol/light-api.md` |
 | POST | /workspaces/:id/light/enable | light_handlers.go — make a hermes agent on the Kubernetes substrate a Light agent (secrets `MOLECULE_LIGHT=1`, `MOLECULE_CONTINUOUS=false`; `light_state=open`; restart or wake). Refuses the workspace's own token (`403 LIGHT_SELF_FORBIDDEN`) |
-| POST | /workspaces/:id/light/disable | light_handlers.go — delete the control plane's Light objects first, then revoke the run tokens, remove the Light secrets, clear `light_state`; restart or wake. Refuses the workspace's own token |
+| POST | /workspaces/:id/light/disable | light_handlers.go — delete the control plane's Light objects first, then revoke the run tokens, remove `MOLECULE_LIGHT`, restore the 24/7 setting as it was before enable, clear `light_state`; restart or wake. Refuses the workspace's own token |
 | POST | /workspaces/:id/light/runs | light_runs.go — a run pod's ledger report (`phase` started/finished); only the workspace's own token |
 | GET | /workspaces/:id/light/runs | light_runs.go — runs newest first: `?limit=` (1..100, default 20), `?schedule=`, `?before=<next_before>` |
 | POST | /workspaces/:id/a2a | a2a_proxy.go — requires a source-bound workspace bearer or verified human/inbound credential; optional `X-Workspace-ID` must match bearer ownership. Combined self-host/dev Canvas requests may use same-origin only when CP session verification is unconfigured. |
