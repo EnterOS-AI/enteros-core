@@ -757,6 +757,182 @@ paths:
       summary: Make a workspace an Enter OS Light agent
       tags:
       - light
+  /workspaces/{id}/light/open:
+    post:
+      description: Pauses the agent's CronJobs (runs that had not started yet are
+        cancelled), then wakes its pod for chat. Answers 202; light_state goes opening
+        → open once the pod is up. A failed pause leaves the agent parked.
+      parameters:
+      - description: Workspace ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: already open or opening
+          schema:
+            additionalProperties: true
+            type: object
+        "202":
+          description: '{\"light_state\":\"opening\",\"cancelled\":[...]}'
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: LIGHT_SELF_FORBIDDEN
+          schema:
+            additionalProperties: true
+            type: object
+        "409":
+          description: LIGHT_NOT_ENABLED, LIGHT_TRANSITION_IN_PROGRESS
+          schema:
+            additionalProperties: true
+            type: object
+        "501":
+          description: LIGHT_UNSUPPORTED
+          schema:
+            additionalProperties: true
+            type: object
+        "503":
+          description: LIGHT_BACKEND_UNAVAILABLE
+          schema:
+            additionalProperties: true
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Open a parked Light agent
+      tags:
+      - light
+  /workspaces/{id}/light/park:
+    post:
+      description: Hands the agent's schedules to the control plane as CronJobs, stops
+        its pod and resumes the CronJobs. Answers 202 once the CronJobs are written;
+        light_state goes parking → parked in the background (poll GET /workspaces/{id}/light).
+        A refusal leaves the agent open.
+      parameters:
+      - description: Workspace ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: already parked
+          schema:
+            additionalProperties: true
+            type: object
+        "202":
+          description: '{\"light_state\":\"parking\",\"schedules\":[...],\"removed\":[...]}'
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: LIGHT_SELF_FORBIDDEN
+          schema:
+            additionalProperties: true
+            type: object
+        "409":
+          description: LIGHT_NOT_ENABLED, LIGHT_AGENT_NOT_AWAKE, LIGHT_AGENT_BUSY,
+            LIGHT_RESTART_REQUIRED, LIGHT_ENV_UNSUPPORTED, LIGHT_TRANSITION_IN_PROGRESS
+          schema:
+            additionalProperties: true
+            type: object
+        "413":
+          description: LIGHT_TOO_LARGE
+          schema:
+            additionalProperties: true
+            type: object
+        "422":
+          description: LIGHT_INVALID, LIGHT_RUNTIME_UNSUPPORTED
+          schema:
+            additionalProperties: true
+            type: object
+        "501":
+          description: LIGHT_UNSUPPORTED
+          schema:
+            additionalProperties: true
+            type: object
+        "502":
+          description: LIGHT_SCHEDULES_UNREADABLE
+          schema:
+            additionalProperties: true
+            type: object
+        "503":
+          description: LIGHT_BACKEND_UNAVAILABLE
+          schema:
+            additionalProperties: true
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Park a Light agent
+      tags:
+      - light
+  /workspaces/{id}/light/run:
+    post:
+      consumes:
+      - application/json
+      description: Starts one run of the named schedule outside its cron times. Parked
+        agents only.
+      parameters:
+      - description: Workspace ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: '{\"run_id\":\"light-...\"}'
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: LIGHT_BAD_REQUEST
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: LIGHT_SELF_FORBIDDEN
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: LIGHT_SCHEDULE_NOT_FOUND
+          schema:
+            additionalProperties: true
+            type: object
+        "409":
+          description: LIGHT_NOT_PARKED, LIGHT_RUN_ACTIVE, LIGHT_RUN_EXISTS, LIGHT_AGENT_AWAKE,
+            LIGHT_TENANT_SUSPENDED
+          schema:
+            additionalProperties: true
+            type: object
+        "422":
+          description: LIGHT_INVALID
+          schema:
+            additionalProperties: true
+            type: object
+        "501":
+          description: LIGHT_UNSUPPORTED
+          schema:
+            additionalProperties: true
+            type: object
+        "503":
+          description: LIGHT_BACKEND_UNAVAILABLE
+          schema:
+            additionalProperties: true
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Run one schedule of a parked Light agent now
+      tags:
+      - light
   /workspaces/{id}/light/runs:
     get:
       description: Each run with its outcome, output (last 64 KiB) and error, the

@@ -29,15 +29,34 @@ While an agent is `parking` or `parked`, nothing wakes it implicitly: chat,
 restarts and every other wake path answer `409` (see
 [What other endpoints answer](#what-other-endpoints-answer-for-a-parked-agent)).
 
+How an agent moves between them:
+
+```
+            enable                 park (202)                 (pod stopped, CronJobs resumed)
+  null ──────────────▶ open ─────────────────▶ parking ──────────────────────────────▶ parked
+   ▲                    ▲  ◀──────────────────────┘ a refusal, or the agent took a task   │
+   │                    │                                                                 │
+   │                    └──────────── opening ◀───────────────────────────────────────────┘
+   │                       (pod up)            open (202: CronJobs paused first)
+   └──── disable (from any state)
+```
+
+`park` and `open` answer `202 Accepted` as soon as the step that can be
+refused is done; the rest finishes in the background. Poll
+`GET /workspaces/{id}/light` (every few seconds) until `light_state` is
+`parked` or `open`. A park usually completes within a minute (the agent's pod
+needs about 30 s to stop); an open takes as long as the agent's boot. If a
+background step fails, `last_error` says why, and core retries it.
+
 ## Authentication
 
 Every route sits behind `WorkspaceAuth`: the owner's session, an org API
 token, the tenant admin token, or a workspace token of `{id}`. Anything else is
 `401`.
 
-- **Management** routes (`enable`, `disable`) refuse the workspace's own
-  tokens with `403 LIGHT_SELF_FORBIDDEN`: a run pod holds the agent's run
-  token and must not manage its own agent.
+- **Management** routes (`enable`, `disable`, `park`, `open`, `run`) refuse
+  the workspace's own tokens with `403 LIGHT_SELF_FORBIDDEN`: a run pod holds
+  the agent's run token and must not manage its own agent.
 - `POST /light/runs` accepts **only** the workspace's own token (the run pod's
   run token) and answers anyone else `403 LIGHT_RUN_TOKEN_REQUIRED`.
 - Reads (`GET /light`, `GET /light/runs`) accept any `WorkspaceAuth`
@@ -115,7 +134,8 @@ The agent's Light state.
 - `light_state`: `null` for an ordinary agent; `light_state_at` is when it
   last changed.
 - `schedules`: the set the agent had at its **last park**, with core's
-  suspension record. While the agent is open, its live schedules are at
+  suspension record (`suspended_at` is when it was last suspended, kept after a
+  resume). While the agent is open, its live schedules are at
   `GET /workspaces/{id}/schedules`.
 - `pending_actions`: work queued for the agent's next open/park cycle, each
   `{"kind", "source", "queued_at"}`. `refresh_pending` is true when a `refresh`
@@ -160,6 +180,104 @@ The restart is asynchronous: watch the workspace's `status`.
 | 422 | `LIGHT_RUNTIME_UNSUPPORTED` | not a hermes agent; `runtime` names its runtime |
 | 422 | `LIGHT_PLATFORM_AGENT` | the org's platform agent cannot be a Light agent |
 | 501 | `LIGHT_UNSUPPORTED` | the tenant cannot run Light (checked before anything is written) |
+
+## `POST /workspaces/{id}/light/park`
+
+Parks an open Light agent. No body.
+
+Core checks the agent, reads its schedules from the agent itself (the same
+list as `GET /workspaces/{id}/schedules`), mints a new run token, and hands the
+set to the control plane, which writes one CronJob per schedule. Then, in the
+background, it stops the agent's pod and resumes the CronJobs. A schedule core
+suspended after failed runs stays suspended unless this park is the owner's
+(this call clears every suspension) or its definition changed.
+
+**202**
+
+```json
+{
+  "light_state": "parking",
+  "schedules": [
+    {"name": "daily-report", "cron": "0 9 * * *", "timezone": "America/Vancouver",
+     "enabled": true, "suspended": false, "cronjob": "light-be7540cfd160-1a2b3c4d"}
+  ],
+  "removed": ["old-schedule"]
+}
+```
+
+`removed` lists schedules the control plane held from an earlier park that the
+agent no longer has. A park that was already in its last step answers `202`
+with empty lists. An agent already parked answers
+`200 {"status": "unchanged", "light_state": "parked"}`.
+
+**Errors** (besides the common ones). After any of them the agent is `open`
+and reachable, and `last_error` repeats the reason.
+
+| Status | `code` | When |
+|---|---|---|
+| 403 | `LIGHT_SELF_FORBIDDEN` | called with the workspace's own token |
+| 409 | `LIGHT_NOT_ENABLED` | not a Light agent |
+| 409 | `LIGHT_AGENT_NOT_AWAKE` | the agent is not online; `status` gives its status |
+| 409 | `LIGHT_AGENT_BUSY` | the agent is working; `active_tasks` gives how many tasks |
+| 409 | `LIGHT_RESTART_REQUIRED` | the agent runs without `MOLECULE_LIGHT=1` (call enable again, or restart it) |
+| 409 | `LIGHT_ENV_UNSUPPORTED` | the agent's env has a value the control plane cannot copy; `key` names it |
+| 409 | `LIGHT_TRANSITION_IN_PROGRESS` | the agent is opening, or another Light operation is running |
+| 413 | `LIGHT_TOO_LARGE` | the schedule set is over the control plane's size limit |
+| 422 | `LIGHT_INVALID` | some schedules are invalid; `invalid` lists `{"schedule", "field", "reason"}` for each |
+| 422 | `LIGHT_RUNTIME_UNSUPPORTED` | not a hermes agent |
+| 501 | `LIGHT_UNSUPPORTED` | the tenant cannot run Light |
+| 502 | `LIGHT_SCHEDULES_UNREADABLE` | the agent's schedules could not be read |
+
+If the agent takes a task after the `202` but before its pod stops, the park
+is undone: the agent goes back to `open` and `last_error` is
+`LIGHT_AGENT_BUSY`.
+
+## `POST /workspaces/{id}/light/open`
+
+Opens a parked agent for chat or editing. No body.
+
+Core first pauses the CronJobs, while the agent is still parked; runs that had
+not started yet are cancelled (recorded as `cancelled`, listed in the answer)
+and runs already going finish. Then it wakes the agent's pod.
+
+**202**
+
+```json
+{"light_state": "opening", "cancelled": ["light-be7540cfd160-1a2b3c4d-29384756"]}
+```
+
+`light_state` becomes `open` once the pod is up. An agent already `open` or
+`opening` answers `200 {"status": "unchanged", "light_state": "<state>"}`.
+
+**Errors** (besides the common ones): `403 LIGHT_SELF_FORBIDDEN`,
+`409 LIGHT_NOT_ENABLED`, `409 LIGHT_TRANSITION_IN_PROGRESS` (the agent is
+being parked; open it once it is parked). A `503` leaves the agent parked.
+
+An open agent parks itself again after 30 minutes without activity (see
+[Background](#what-core-does-in-the-background)).
+
+## `POST /workspaces/{id}/light/run`
+
+Runs one schedule of a parked agent now, outside its cron times.
+
+```json
+{"schedule": "daily-report"}
+```
+
+**201** `{"run_id": "light-be7540cfd160-1a2b3c4d-m1763000000"}`. The run then
+appears in `GET /light/runs`.
+
+| Status | `code` | When |
+|---|---|---|
+| 400 | `LIGHT_BAD_REQUEST` | the body is not `{"schedule": "<name>"}` (unknown keys are refused) |
+| 403 | `LIGHT_SELF_FORBIDDEN` | called with the workspace's own token |
+| 404 | `LIGHT_SCHEDULE_NOT_FOUND` | the parked agent has no such schedule |
+| 409 | `LIGHT_NOT_PARKED` | the agent is not parked; `light_state` gives its state |
+| 409 | `LIGHT_RUN_ACTIVE` / `LIGHT_RUN_EXISTS` | that schedule already has a run going, or one started this second; `run_id` names it |
+| 409 | `LIGHT_AGENT_AWAKE` | the agent's pod is still stopping after a park; retry in a few seconds |
+| 409 | `LIGHT_TENANT_SUSPENDED` | the tenant is suspended for billing |
+| 409 | `LIGHT_TRANSITION_IN_PROGRESS` | another Light operation is running |
+| 422 | `LIGHT_INVALID` | no schedule named |
 
 ## `POST /workspaces/{id}/light/disable`
 
@@ -327,9 +445,37 @@ For a Light agent in **any** state, `POST /workspaces/{id}/hibernate` and
 `POST /workspaces/{id}/switch-provider` answer `409 LIGHT_ENABLED` (park it
 instead; disable Light before switching the provider).
 
+## What core does in the background
+
+A monitor in core (every 30 s; runs every 5 minutes):
+
+- **Auto-park.** An `open` agent that is online, idle and has had no activity
+  for 30 minutes (`LIGHT_AUTO_PARK_IDLE_MINUTES`) is parked, so schedules
+  cannot stay paused by mistake. Auto-park keeps core's schedule suspensions.
+- **Refresh.** A change that would restart a parked agent (a secret, its
+  model, a plugin) queues a `refresh`. Core opens the agent, and parks it again
+  as soon as it is online and idle, so later runs carry the change. At most two
+  agents are in a refresh at a time.
+- **Interrupted steps.** A park or open that a core restart or a control-plane
+  outage left half-way is finished (or, for a park whose pod never stopped,
+  re-run).
+- **Runs that never reported.** A run pod killed before it could report (out
+  of memory, image pull failure, deadline, no room in the tenant's quota) is
+  recorded from its Kubernetes Job with `source: "job"`.
+- **Failed schedules.** When a schedule's last three runs all failed or timed
+  out, core suspends it and tells the owner in the agent's chat (or, when the
+  agent may not message the user, through a `WORKSPACE_UPDATED` event naming
+  the schedule). `GET /light` shows `suspended` and `suspended_reason`. Parking
+  the agent yourself (`POST /light/park`) or changing the schedule resumes it.
+- **Retention.** Finished runs older than 30 days are deleted.
+
+**Known gap.** hermes reports a provider refusal (out of credits, quota) as a
+successful run whose output is the refusal text, so such runs count as
+`succeeded` until hermes classifies them.
+
 ## Deleting a Light agent
 
 `DELETE /workspaces/{id}` deletes the agent's control-plane Light objects
 before it stops any compute. If that step fails, the delete answers `500` like
-any other teardown failure, and the workspace keeps `light_state` so the
-leftover objects can be found and deleted later.
+any other teardown failure, and the workspace keeps `light_state`; the monitor
+retries the deletion until the objects are gone.

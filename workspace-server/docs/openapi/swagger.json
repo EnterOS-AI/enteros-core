@@ -565,6 +565,254 @@
                 }
             }
         },
+        "/workspaces/{id}/light/open": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Pauses the agent's CronJobs (runs that had not started yet are cancelled), then wakes its pod for chat. Answers 202; light_state goes opening → open once the pod is up. A failed pause leaves the agent parked.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "light"
+                ],
+                "summary": "Open a parked Light agent",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Workspace ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "already open or opening",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "202": {
+                        "description": "{\\\"light_state\\\":\\\"opening\\\",\\\"cancelled\\\":[...]}",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "403": {
+                        "description": "LIGHT_SELF_FORBIDDEN",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "409": {
+                        "description": "LIGHT_NOT_ENABLED, LIGHT_TRANSITION_IN_PROGRESS",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "501": {
+                        "description": "LIGHT_UNSUPPORTED",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "503": {
+                        "description": "LIGHT_BACKEND_UNAVAILABLE",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/workspaces/{id}/light/park": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Hands the agent's schedules to the control plane as CronJobs, stops its pod and resumes the CronJobs. Answers 202 once the CronJobs are written; light_state goes parking → parked in the background (poll GET /workspaces/{id}/light). A refusal leaves the agent open.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "light"
+                ],
+                "summary": "Park a Light agent",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Workspace ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "already parked",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "202": {
+                        "description": "{\\\"light_state\\\":\\\"parking\\\",\\\"schedules\\\":[...],\\\"removed\\\":[...]}",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "403": {
+                        "description": "LIGHT_SELF_FORBIDDEN",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "409": {
+                        "description": "LIGHT_NOT_ENABLED, LIGHT_AGENT_NOT_AWAKE, LIGHT_AGENT_BUSY, LIGHT_RESTART_REQUIRED, LIGHT_ENV_UNSUPPORTED, LIGHT_TRANSITION_IN_PROGRESS",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "413": {
+                        "description": "LIGHT_TOO_LARGE",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "422": {
+                        "description": "LIGHT_INVALID, LIGHT_RUNTIME_UNSUPPORTED",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "501": {
+                        "description": "LIGHT_UNSUPPORTED",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "502": {
+                        "description": "LIGHT_SCHEDULES_UNREADABLE",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "503": {
+                        "description": "LIGHT_BACKEND_UNAVAILABLE",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/workspaces/{id}/light/run": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Starts one run of the named schedule outside its cron times. Parked agents only.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "light"
+                ],
+                "summary": "Run one schedule of a parked Light agent now",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Workspace ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "{\\\"run_id\\\":\\\"light-...\\\"}",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "LIGHT_BAD_REQUEST",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "403": {
+                        "description": "LIGHT_SELF_FORBIDDEN",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "404": {
+                        "description": "LIGHT_SCHEDULE_NOT_FOUND",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "409": {
+                        "description": "LIGHT_NOT_PARKED, LIGHT_RUN_ACTIVE, LIGHT_RUN_EXISTS, LIGHT_AGENT_AWAKE, LIGHT_TENANT_SUSPENDED",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "422": {
+                        "description": "LIGHT_INVALID",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "501": {
+                        "description": "LIGHT_UNSUPPORTED",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "503": {
+                        "description": "LIGHT_BACKEND_UNAVAILABLE",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
         "/workspaces/{id}/light/runs": {
             "get": {
                 "security": [
