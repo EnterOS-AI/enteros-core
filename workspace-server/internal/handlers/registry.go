@@ -353,6 +353,36 @@ func (h *RegistryHandler) fireReconcileMCPRecovery(ctx context.Context, workspac
 // as "no row yet, default to push" — that's the first-register flow,
 // and at that point we don't know the runtime yet so push is the
 // historical compatible default.
+// registerKeepsPlatformHostedRoute is the Register upsert predicate (evaluated
+// on the UPDATE arm, against the PRE-update row) under which a register keeps
+// the row's existing url AND delivery_mode instead of overwriting them:
+//
+//	the register carries NO url, the row already HAS one, and the row's runtime
+//	is NOT external-like (i.e. the platform provisioned this box and its URL).
+//
+// Why: a URL-less register is what a poll-mode client sends. For a BYO-compute
+// (external-like) row that is the legitimate push→poll switch and still clears
+// the URL. For a platform-hosted row it can only come from something OTHER than
+// the box — the box always registers the URL the platform gave it — so letting
+// it write url=NULL, delivery_mode='poll' detaches a serving box from the
+// platform until its next restart. Live 2026-11-13 (reno-stars, ca17a092,
+// claude-code): an external client holding the workspace token registered it
+// poll with no url; every URL forward (schedules, chat files) then 422'd "no
+// callback URL" for ~4.5h while the box was up at its platform URL.
+//
+// Built from the externalLikeRuntimes SSOT (constants, never request data), so
+// a new BYO-compute runtime only needs adding there.
+var registerKeepsPlatformHostedRoute = func() string {
+	quoted := make([]string, len(externalLikeRuntimes))
+	for i, r := range externalLikeRuntimes {
+		quoted[i] = "'" + strings.ReplaceAll(r, "'", "''") + "'"
+	}
+	return `(EXCLUDED.url IS NULL
+				     AND workspaces.url IS NOT NULL
+				     AND workspaces.url <> ''
+				     AND COALESCE(workspaces.runtime, '') NOT IN (` + strings.Join(quoted, ", ") + `))`
+}()
+
 func (h *RegistryHandler) resolveDeliveryMode(ctx context.Context, workspaceID, payloadMode string) (string, error) {
 	if payloadMode != "" {
 		// Validated by IsValidDeliveryMode in the caller.
@@ -1014,7 +1044,9 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// becomes NULL via sql.NullString so the row's URL stays clean (the
 	// CASE below also preserves an existing provisioner-set URL, which
 	// matters for hybrid setups where a workspace was previously push
-	// and is being re-registered as poll).
+	// and is being re-registered as poll). For a PLATFORM-HOSTED row the
+	// URL-less register keeps both url and delivery_mode — see
+	// registerKeepsPlatformHostedRoute.
 	var urlForUpsert sql.NullString
 	if effectiveURL != "" {
 		urlForUpsert = sql.NullString{String: effectiveURL, Valid: true}
@@ -1093,6 +1125,10 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// re-register (so a platform agent re-registering without kind is never
 	// downgraded). A non-root row asking for 'platform' is rejected by the
 	// workspaces_platform_root_check constraint → friendly 409 below.
+	//
+	// A URL-less register cannot detach a PLATFORM-HOSTED row: url and
+	// delivery_mode are kept under registerKeepsPlatformHostedRoute (see there
+	// for the predicate and the 2026-11-13 incident).
 	_, err = db.DB.ExecContext(ctx, `
 		INSERT INTO workspaces (id, name, url, agent_card, status, last_heartbeat_at, delivery_mode, kind)
 		-- core#3082: a NEW platform concierge INSERTs as 'provisioning' (the warming
@@ -1130,6 +1166,8 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 				          OR workspaces.url LIKE 'http://localhost:%')
 				     AND CAST(substring(workspaces.url FROM ':([0-9]+)$') AS int) <> 8000
 				THEN workspaces.url
+				WHEN `+registerKeepsPlatformHostedRoute+`
+				THEN workspaces.url
 				ELSE EXCLUDED.url
 			END,
 			agent_card = EXCLUDED.agent_card,
@@ -1141,7 +1179,11 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 			-- row value — correct for re-register. Non-platform keeps fast online.
 			status = (CASE WHEN workspaces.kind = 'platform' THEN workspaces.status ELSE 'online' END)::workspace_status,
 			last_heartbeat_at = now(),
-			delivery_mode = EXCLUDED.delivery_mode,
+			delivery_mode = CASE
+				WHEN `+registerKeepsPlatformHostedRoute+`
+				THEN workspaces.delivery_mode
+				ELSE EXCLUDED.delivery_mode
+			END,
 			kind = COALESCE(NULLIF($6, ''), workspaces.kind),
 			updated_at = now()
 		WHERE workspaces.status NOT IN ('removed', 'paused', 'hibernated')
