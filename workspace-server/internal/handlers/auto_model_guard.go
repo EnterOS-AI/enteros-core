@@ -60,6 +60,20 @@ func workspaceHoldsDirectVendorKey(ctx context.Context, workspaceID string) bool
 	return anyDirectVendorKey(keys)
 }
 
+// tenantHoldsDirectVendorKey reports whether the tenant has a direct vendor
+// key in global_secrets (tenant-wide BYOK keys are injected into every
+// workspace). A failed scan fails open, as workspaceHoldsDirectVendorKey.
+func tenantHoldsDirectVendorKey(ctx context.Context) bool {
+	keys, ok := globalSecretKeyNames(ctx)
+	return ok && anyDirectVendorKey(keys)
+}
+
+// holdsDirectVendorKey reports whether the workspace, or the tenant through a
+// global secret, holds a direct vendor key.
+func holdsDirectVendorKey(ctx context.Context, workspaceID string) bool {
+	return workspaceHoldsDirectVendorKey(ctx, workspaceID) || tenantHoldsDirectVendorKey(ctx)
+}
+
 func respondAutoRequiresPlatformCredits(c *gin.Context, runtime, model string) {
 	c.JSON(http.StatusUnprocessableEntity, gin.H{
 		"error":   autoRequiresPlatformCreditsMsg,

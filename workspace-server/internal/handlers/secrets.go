@@ -945,7 +945,7 @@ func (h *SecretsHandler) SetModel(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read workspace runtime"})
 			return
 		}
-		if isAutoModel(body.Model) && workspaceHoldsDirectVendorKey(ctx, workspaceID) {
+		if isAutoModel(body.Model) && holdsDirectVendorKey(ctx, workspaceID) {
 			log.Printf("SetModel: 422 %s (workspace=%s model=%q)", autoRequiresPlatformCreditsCode, workspaceID, body.Model)
 			respondAutoRequiresPlatformCredits(c, runtime, body.Model)
 			return

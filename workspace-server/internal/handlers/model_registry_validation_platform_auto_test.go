@@ -82,7 +82,6 @@ func TestDeriveProvider_PlatformAutoIgnoresVendorKeys(t *testing.T) {
 	}
 }
 
-
 // The BYOK create preflight treats platform/auto as platform-derived: allowed
 // with no DB work and no credential needed. (This proves derivation, not that a
 // BYOK workspace is refused; see auto_model_guard_test.go for that.)

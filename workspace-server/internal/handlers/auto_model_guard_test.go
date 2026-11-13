@@ -50,6 +50,48 @@ func expectRuntimeAndKeys(mock sqlmock.Sqlmock, keys ...string) {
 	mock.ExpectQuery(`SELECT key FROM workspace_secrets WHERE workspace_id = \$1`).WithArgs(autoGuardWS).WillReturnRows(rows)
 }
 
+func expectGlobalKeys(mock sqlmock.Sqlmock, keys ...string) {
+	rows := sqlmock.NewRows([]string{"key"})
+	for _, k := range keys {
+		rows.AddRow(k)
+	}
+	mock.ExpectQuery(`SELECT key FROM global_secrets`).WillReturnRows(rows)
+}
+
+// I-2: a tenant-wide (global_secrets) vendor key is BYOK too.
+func TestSetModel_AutoRefusedWhenGlobalVendorKeyStored(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	expectRuntimeAndKeys(mock, "SOME_OTHER_SECRET")
+	expectGlobalKeys(mock, "GITHUB_TOKEN", "ANTHROPIC_API_KEY") // no INSERT expected
+	w := putModel(t, NewSecretsHandler(nil), "platform/auto")
+	if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), `"code":"AUTO_REQUIRES_PLATFORM_CREDITS"`) {
+		t.Fatalf("want 422 AUTO_REQUIRES_PLATFORM_CREDITS, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock: %v", err)
+	}
+}
+
+func TestWorkspaceCreate_AutoWithGlobalVendorKey422(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	expectGlobalKeys(mock, "ANTHROPIC_API_KEY")
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"name":"Auto Global Byok","runtime":"claude-code","model":"platform/auto"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	handler.Create(c)
+	if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), `"code":"AUTO_REQUIRES_PLATFORM_CREDITS"`) {
+		t.Fatalf("want 422 AUTO_REQUIRES_PLATFORM_CREDITS, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock: %v", err)
+	}
+}
+
 func TestSetModel_AutoRefusedWhenVendorKeyStored(t *testing.T) {
 	for _, model := range []string{"platform/auto", "auto"} {
 		t.Run(model, func(t *testing.T) {
@@ -77,6 +119,7 @@ func TestSetModel_AutoAllowedWithoutVendorKey(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	expectRuntimeAndKeys(mock, "SOME_OTHER_SECRET") // a non-vendor key does not trigger the guard
+	expectGlobalKeys(mock, "GITHUB_TOKEN")
 	mock.ExpectExec(`INSERT INTO workspace_secrets[\s\S]*'MODEL'`).
 		WithArgs(autoGuardWS, sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))

@@ -635,7 +635,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			for k := range payload.Secrets {
 				secretKeys = append(secretKeys, k)
 			}
-			if anyDirectVendorKey(secretKeys) {
+			if anyDirectVendorKey(secretKeys) || tenantHoldsDirectVendorKey(c.Request.Context()) {
 				log.Printf("Create: 422 %s (runtime=%q model=%q)", autoRequiresPlatformCreditsCode, payload.Runtime, payload.Model)
 				respondAutoRequiresPlatformCredits(c, payload.Runtime, payload.Model)
 				return
