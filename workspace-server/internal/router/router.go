@@ -91,6 +91,11 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// c.Next() returns.
 	r.Use(middleware.SecurityHeaders())
 
+	// Enter OS Light (contract C3b): a run pod's requests carry
+	// X-Molecule-Run-Id; with a workspace token, the run rides the request
+	// context so the activity rows it writes carry run_id. Never fails a request.
+	r.Use(middleware.LightRunID(db.DB))
+
 	// Health
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
