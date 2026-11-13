@@ -353,11 +353,16 @@ func (h *RegistryHandler) fireReconcileMCPRecovery(ctx context.Context, workspac
 // as "no row yet, default to push" — that's the first-register flow,
 // and at that point we don't know the runtime yet so push is the
 // historical compatible default.
+// pollRegisterPrecheck is the Go-side (explicit 409) half of the poll-register
+// guard. A package var only so an integration test can disable it and prove
+// the SQL arm (pollRegisterKeepsProvisionedRowSQL) holds on its own.
+var pollRegisterPrecheck = (*RegistryHandler).refusePollRegisterOnProvisionedWorkspace
+
 // refusePollRegisterOnProvisionedWorkspace answers 409 (and returns true) when
 // a poll-mode /registry/register targets a workspace whose compute the PLATFORM
-// provisioned — workspaces.instance_id set, which the CP provisioner writes for
-// every workspace it starts (workspace_provision.go, incl. local-docker
-// container names) and which a register-created external peer never has.
+// provisioned (workspaceIsPlatformProvisioned: instance_id set by the CP
+// provisioner, or the self-host docker provisioner's host-port URL) — neither
+// of which a register-created external peer has.
 //
 // Why refuse rather than accept: poll mode means "the platform never dispatches
 // to me; I fetch my inbox". For a provisioned box that is never what the box
@@ -370,7 +375,7 @@ func (h *RegistryHandler) fireReconcileMCPRecovery(ctx context.Context, workspac
 // (schedules, chat files) then 422'd "no callback URL" for ~4.5h while the box
 // served at its platform URL, until a restart re-registered it.
 //
-// The discriminator is instance_id, NOT runtime: /registry/register inserts
+// The discriminator is NOT runtime: /registry/register inserts
 // unknown ids without a runtime, so register-created external peers carry the
 // column default ('hermes') and look exactly like hosted workspaces by runtime.
 //
@@ -379,20 +384,20 @@ func (h *RegistryHandler) fireReconcileMCPRecovery(ctx context.Context, workspac
 // deliberate: the existing upsert behaviour is the fallback, and the error is
 // logged.
 func (h *RegistryHandler) refusePollRegisterOnProvisionedWorkspace(ctx context.Context, c *gin.Context, workspaceID string) bool {
-	var instanceID, storedMode sql.NullString
+	var instanceID, storedMode, storedURL sql.NullString
 	err := db.DB.QueryRowContext(ctx,
-		`SELECT instance_id, delivery_mode FROM workspaces WHERE id = $1`, workspaceID,
-	).Scan(&instanceID, &storedMode)
+		`SELECT instance_id, delivery_mode, url FROM workspaces WHERE id = $1`, workspaceID,
+	).Scan(&instanceID, &storedMode, &storedURL)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			log.Printf("Registry register: provisioned-workspace check failed for %s: %v (falling through)", workspaceID, err)
 		}
 		return false
 	}
-	if !instanceID.Valid || strings.TrimSpace(instanceID.String) == "" {
+	if !workspaceIsPlatformProvisioned(instanceID.String, storedURL.String) {
 		return false
 	}
-	log.Printf("Registry register: REFUSED poll-mode register for platform-provisioned workspace %s (instance_id set) — a poll register would detach the running box from its platform URL", workspaceID)
+	log.Printf("Registry register: REFUSED poll-mode register for platform-provisioned workspace %s — a poll register would detach the running box from its platform URL", workspaceID)
 	c.JSON(http.StatusConflict, gin.H{
 		"error": "workspace " + workspaceID + " is platform-hosted (its compute was provisioned by the platform and is reached at its platform URL); " +
 			"a poll-mode registration would detach it. Register external peers under their own workspace ids " +
@@ -404,6 +409,40 @@ func (h *RegistryHandler) refusePollRegisterOnProvisionedWorkspace(ctx context.C
 	})
 	return true
 }
+
+// workspaceIsPlatformProvisioned is the Go form of the provisioned-row half of
+// pollRegisterKeepsProvisionedRowSQL. The two MUST agree; the integration
+// tests drive both (409 from this, row kept by the SQL).
+//
+// Backends:
+//   - CP (EC2 / k8s / CP local-docker): instance_id, persisted right after
+//     cpProv.Start returns (workspace_provision.go UPDATE … SET instance_id) —
+//     before the box's first register in practice, and never cleared by
+//     stop / pause / hibernate (only by delete, switch-provider and the
+//     removed-row orphan sweeper).
+//   - Self-host local docker (h.provisioner.Start): does NOT write
+//     instance_id. It writes the host-port URL it advertises
+//     (http://localhost:<port> / 127.0.0.1:<port>, port != 8000) — the same
+//     shape the upsert's existing CASE already treats as provisioner-owned —
+//     so that URL is the discriminator for this backend.
+func workspaceIsPlatformProvisioned(instanceID, url string) bool {
+	return strings.TrimSpace(instanceID) != "" || isProvisionerHostPortURL(url)
+}
+
+// pollRegisterKeepsProvisionedRowSQL is the ATOMIC half of the poll-register
+// guard, evaluated on the upsert's UPDATE arm against the PRE-update row: a
+// poll register never rewrites url or delivery_mode of a platform-provisioned
+// row. The Go 409 (refusePollRegisterOnProvisionedWorkspace) gives the
+// explicit error; this arm makes the protection hold even if the Go check is
+// raced (instance_id persisted between the check and the upsert) or fails
+// open on a lookup error.
+const pollRegisterKeepsProvisionedRowSQL = `(EXCLUDED.delivery_mode = 'poll'
+				     AND ((workspaces.instance_id IS NOT NULL AND workspaces.instance_id <> '')
+				          OR (workspaces.url IS NOT NULL
+				              AND (workspaces.url LIKE 'http://127.0.0.1:%'
+				                   OR workspaces.url LIKE 'http://localhost:%')
+				              AND substring(workspaces.url FROM ':([0-9]+)$') IS NOT NULL
+				              AND CAST(substring(workspaces.url FROM ':([0-9]+)$') AS int) <> 8000)))`
 
 func (h *RegistryHandler) resolveDeliveryMode(ctx context.Context, workspaceID, payloadMode string) (string, error) {
 	if payloadMode != "" {
@@ -908,7 +947,7 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// See refusePollRegisterOnProvisionedWorkspace for the predicate and the
 	// 2026-11-13 incident.
 	if effectiveMode == models.DeliveryModePoll {
-		if refused := h.refusePollRegisterOnProvisionedWorkspace(ctx, c, payload.ID); refused {
+		if refused := pollRegisterPrecheck(h, ctx, c, payload.ID); refused {
 			return
 		}
 	}
@@ -1191,6 +1230,8 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 				          OR workspaces.url LIKE 'http://localhost:%')
 				     AND CAST(substring(workspaces.url FROM ':([0-9]+)$') AS int) <> 8000
 				THEN workspaces.url
+				WHEN `+pollRegisterKeepsProvisionedRowSQL+`
+				THEN workspaces.url
 				ELSE EXCLUDED.url
 			END,
 			agent_card = EXCLUDED.agent_card,
@@ -1202,7 +1243,11 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 			-- row value — correct for re-register. Non-platform keeps fast online.
 			status = (CASE WHEN workspaces.kind = 'platform' THEN workspaces.status ELSE 'online' END)::workspace_status,
 			last_heartbeat_at = now(),
-			delivery_mode = EXCLUDED.delivery_mode,
+			delivery_mode = CASE
+				WHEN `+pollRegisterKeepsProvisionedRowSQL+`
+				THEN workspaces.delivery_mode
+				ELSE EXCLUDED.delivery_mode
+			END,
 			kind = COALESCE(NULLIF($6, ''), workspaces.kind),
 			updated_at = now()
 		WHERE workspaces.status NOT IN ('removed', 'paused', 'hibernated')

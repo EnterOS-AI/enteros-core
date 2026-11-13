@@ -176,3 +176,55 @@ func TestIntegration_Register_PushOnProvisionedWorkspace_StillAccepted(t *testin
 		t.Errorf("push register left mode=%q, want push", mode)
 	}
 }
+
+func TestIntegration_Register_PollOnDockerProvisionedWorkspace_Refused(t *testing.T) {
+	// Self-host local-docker provisioner shape (workspace_provision.go
+	// h.provisioner.Start): it does NOT write instance_id; it writes the
+	// host-port URL it advertises (http://localhost:<port>, port != 8000).
+	conn := integrationDB_DormantRegister(t)
+	setupTestRedis(t)
+	h := &RegistryHandler{broadcaster: newTestBroadcaster()}
+
+	const dockerURL = "http://localhost:41234"
+	id := uuid.NewString()
+	seedRegisteredWorkspace(t, conn, id, "claude-code", "", dockerURL, "push")
+
+	code, body := callPollRegister(t, h, id, "")
+
+	if code != http.StatusConflict {
+		t.Errorf("poll register on a docker-provisioned workspace: http=%d, want 409 (%s)", code, body)
+	}
+	if url, mode := urlAndModeOf(t, conn, id); url != dockerURL || mode != "push" {
+		t.Errorf("docker-provisioned row changed: url=%q mode=%q, want %q/push", url, mode, dockerURL)
+	}
+}
+
+// TestIntegration_Register_PollOnProvisionedWorkspace_SQLArmHoldsWithoutPrecheck
+// disables the Go 409 precheck and proves the upsert's own CASE arm keeps url
+// AND delivery_mode — the protection is atomic in SQL, not only a
+// check-then-act in Go (a raced or failed-open precheck cannot detach the box).
+func TestIntegration_Register_PollOnProvisionedWorkspace_SQLArmHoldsWithoutPrecheck(t *testing.T) {
+	conn := integrationDB_DormantRegister(t)
+	setupTestRedis(t)
+	h := &RegistryHandler{broadcaster: newTestBroadcaster()}
+
+	prev := pollRegisterPrecheck
+	pollRegisterPrecheck = func(*RegistryHandler, context.Context, *gin.Context, string) bool { return false }
+	t.Cleanup(func() { pollRegisterPrecheck = prev })
+
+	for _, tc := range []struct{ name, instanceID, url string }{
+		{"CP-provisioned (instance_id)", "enteros-ws-sqlarm", platformHostedURL},
+		{"docker-provisioned (host-port url)", "", "http://127.0.0.1:41235"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := uuid.NewString()
+			seedRegisteredWorkspace(t, conn, id, "claude-code", tc.instanceID, tc.url, "push")
+
+			_, _ = callPollRegister(t, h, id, "https://attacker.example.com")
+
+			if url, mode := urlAndModeOf(t, conn, id); url != tc.url || mode != "push" {
+				t.Errorf("SQL arm did not hold: url=%q mode=%q, want %q/push", url, mode, tc.url)
+			}
+		})
+	}
+}
