@@ -6,6 +6,8 @@ import { api } from "@/lib/api";
 import { showToast } from "./Toaster";
 import { statusDotClass } from "@/lib/design-tokens";
 import { workspaceLogsUrl } from "@/lib/dozzle";
+import { openLight, parkLight } from "@/lib/api/light";
+import { lightBlocksWake, lightErrorSentence, workspaceStatusLabel } from "@/lib/light";
 
 interface MenuItem {
   label: string;
@@ -38,6 +40,9 @@ export function ContextMenu() {
   const setPendingDelete = useCanvasStore((s) => s.setPendingDelete);
   const ref = useRef<HTMLDivElement>(null);
   const [actionLoading, setActionLoading] = useState(false);
+  // Synchronous guard: a second click before React re-renders the disabled
+  // item must not send a second park or open.
+  const lightActionRef = useRef(false);
   // Clamped position — (left, top) from contextMenu may overflow when the
   // user right-clicks near the right/bottom viewport edge. We measure the
   // rendered menu and shift it back inside on the same frame the cursor
@@ -192,6 +197,31 @@ export function ContextMenu() {
     }
   }, [contextMenu, updateNodeData, closeContextMenu]);
 
+  // Enter OS Light (docs/api-protocol/light-api.md): open a parked agent, park
+  // an open one. The answer's light_state moves the node at once; the
+  // WORKSPACE_UPDATED broadcast confirms it.
+  const handleLightAction = useCallback(async (kind: "open" | "park") => {
+    if (!contextMenu || lightActionRef.current) return;
+    lightActionRef.current = true;
+    const nodeId = contextMenu.nodeId;
+    setActionLoading(true);
+    try {
+      const res = kind === "open" ? await openLight(nodeId) : await parkLight(nodeId);
+      updateNodeData(nodeId, { lightState: res.light_state });
+      if (res.status === "unchanged") {
+        showToast(kind === "open" ? "The agent already is open" : "The agent already is parked", "info");
+      } else {
+        showToast(kind === "open" ? "Opening the agent" : "Parking the agent", "success");
+      }
+    } catch (e) {
+      showToast(lightErrorSentence(e), "error");
+    } finally {
+      lightActionRef.current = false;
+      setActionLoading(false);
+    }
+    closeContextMenu();
+  }, [contextMenu, updateNodeData, closeContextMenu]);
+
   const handleDelete = useCallback(() => {
     if (!contextMenu) return;
     // Hoist delete confirmation to the Canvas-level dialog (via store) so
@@ -282,7 +312,32 @@ export function ContextMenu() {
   const isOfflineOrFailed = contextMenu.nodeData.status === "offline" || contextMenu.nodeData.status === "failed";
   const isOnline = contextMenu.nodeData.status === "online";
   const isPaused = contextMenu.nodeData.status === "paused";
+  const isDegraded = contextMenu.nodeData.status === "degraded";
+  // A parked or parking Light agent answers pause, resume and restart with
+  // 409: those items give way to Open. An open one offers Park, which needs
+  // the agent online (or degraded); while opening, park answers 409.
+  const lightState = contextMenu.nodeData.lightState ?? null;
+  const lightBlocks = lightBlocksWake(lightState);
+  const lightItems: MenuItem[] =
+    lightState === "parked" || lightState === "parking"
+      ? [{
+          label: "Open",
+          icon: "☀",
+          action: () => void handleLightAction("open"),
+          // While parking, open answers 409 until the park has been stuck
+          // three minutes; the Schedule tab's Light card offers that path.
+          disabled: lightState === "parking" || actionLoading,
+        }]
+      : lightState === "open" || lightState === "opening"
+        ? [{
+            label: "Park",
+            icon: "☾",
+            action: () => void handleLightAction("park"),
+            disabled: lightState === "opening" || !(isOnline || isDegraded) || actionLoading,
+          }]
+        : [];
   const isChild = !!contextMenu.nodeData.parentId;
+  const headerStatus = workspaceStatusLabel(contextMenu.nodeData.status, contextMenu.nodeData.lightState);
 
   const items: MenuItem[] = [
     { label: "Details", icon: "i", action: handleViewDetails },
@@ -307,10 +362,15 @@ export function ContextMenu() {
         ]
       : []),
     { label: "", icon: "", action: () => {}, divider: true },
-    ...(isPaused
-      ? [{ label: "Resume", icon: "▶", action: handleResume }]
-      : [{ label: "Pause", icon: "⏸", action: handlePause, disabled: !isOnline }]),
-    { label: "Restart", icon: "↻", action: handleRestart, disabled: !(isOfflineOrFailed || isPaused) },
+    ...lightItems,
+    ...(lightBlocks
+      ? []
+      : isPaused
+        ? [{ label: "Resume", icon: "▶", action: handleResume }]
+        : [{ label: "Pause", icon: "⏸", action: handlePause, disabled: !isOnline }]),
+    ...(lightBlocks
+      ? []
+      : [{ label: "Restart", icon: "↻", action: handleRestart, disabled: !(isOfflineOrFailed || isPaused) }]),
     { label: "Delete", icon: "✕", action: handleDelete, danger: true },
   ];
 
@@ -331,7 +391,7 @@ export function ContextMenu() {
             aria-hidden="true"
             className={`w-1.5 h-1.5 rounded-full ${statusDotClass(contextMenu.nodeData.status)}`}
           />
-          <span className="text-[10px] text-ink">{contextMenu.nodeData.status}</span>
+          <span className="text-[10px] text-ink" title={headerStatus.tooltip}>{headerStatus.label}</span>
         </div>
       </div>
 
