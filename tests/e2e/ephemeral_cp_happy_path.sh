@@ -458,6 +458,16 @@ boot_cp() {
     # e2e LLM key — the SAME real key the post-merge gate uses (RFC finding D
     # moves it to a dedicated low-value e2e Infisical path later).
     [ -n "${MINIMAX_API_KEY:-}" ] && echo "MINIMAX_API_KEY=${MINIMAX_API_KEY}"
+    # CI LLM upstream (owner decision 2026-11-14, while the platform's LLM vendor
+    # accounts are unfunded): when the workflow sets E2E_LLM_BASE_URL (its
+    # E2E_LLM_UPSTREAM=ci-llm switch), the CP's proxy sends this CP's minimax
+    # traffic to the CI LLM gateway instead of api.minimax.io, on both wire
+    # protocols, with MINIMAX_API_KEY above holding the gateway's key. Unset =
+    # the vendor, exactly as before.
+    if [ -n "${E2E_LLM_BASE_URL:-}" ]; then
+      echo "MINIMAX_BASE_URL=${E2E_LLM_BASE_URL%/}/v1"
+      echo "MINIMAX_ANTHROPIC_BASE_URL=${E2E_LLM_BASE_URL%/}/anthropic/v1"
+    fi
   } >> "$boot_env"
 
   echo "[proof] spinning up throwaway CP (baseline ${CP_IMAGE}) provisioning tenant ${TENANT_IMAGE} in ${NS}..." >&2
@@ -495,6 +505,7 @@ write_state() {
     echo "RUNTIME=${RUNTIME}"
     echo "ROUTE_DOMAIN=${ROUTE_DOMAIN}"
     echo "MINIMAX_API_KEY=${MINIMAX_API_KEY:-}"
+    echo "E2E_LLM_BASE_URL=${E2E_LLM_BASE_URL:-}"
   } > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
 }

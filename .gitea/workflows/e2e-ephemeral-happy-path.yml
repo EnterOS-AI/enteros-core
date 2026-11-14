@@ -189,6 +189,17 @@ jobs:
     # 75 is what the staging BYOK lane it replaces already budgets. A too-tight
     # timeout would surface as a timeout, not as the honest failure underneath.
     timeout-minutes: 75
+    # LLM UPSTREAM SWITCH (owner decision 2026-11-14). `ci-llm`: the throwaway CP's
+    # LLM proxy sends its minimax traffic to the CI LLM gateway (a small local model
+    # behind https://ci-llm.moleculesai.app; URL and key in Infisical
+    # /shared/ci-llm), because every platform LLM vendor account is unfunded and
+    # this required gate would otherwise red every PR on a 402. The CP's proxy,
+    # token lookup, credit reservation, routing and settlement, the tenant and the
+    # workspace runtime all still run for real; only the model behind the
+    # upstream URL changes. `vendor`: the real MiniMax key and api.minimax.io, as
+    # before. Switch back to `vendor` once the vendor accounts are funded.
+    env:
+      E2E_LLM_UPSTREAM: ci-llm
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -254,7 +265,22 @@ jobs:
               -H "Authorization: Bearer $TOK" \
               | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
           }
-          MINIMAX_API_KEY=$(read_secret MINIMAX_API_KEY %2Fshared%2Fcontrolplane)
+          case "${E2E_LLM_UPSTREAM:-vendor}" in
+            ci-llm)
+              # The gateway's key rides the CP's MINIMAX_API_KEY slot; the script turns
+              # E2E_LLM_BASE_URL into MINIMAX_BASE_URL / MINIMAX_ANTHROPIC_BASE_URL.
+              MINIMAX_API_KEY=$(read_secret CI_LLM_API_KEY %2Fshared%2Fci-llm)
+              E2E_LLM_BASE_URL=$(read_secret CI_LLM_BASE_URL %2Fshared%2Fci-llm)
+              [ -n "$E2E_LLM_BASE_URL" ] || { echo "::error::E2E_LLM_UPSTREAM=ci-llm but Infisical /shared/ci-llm CI_LLM_BASE_URL is empty"; exit 1; }
+              echo "E2E_LLM_BASE_URL=$E2E_LLM_BASE_URL" >> "$GITHUB_ENV"
+              echo "LLM upstream: CI LLM gateway (${E2E_LLM_BASE_URL})"
+              ;;
+            vendor)
+              MINIMAX_API_KEY=$(read_secret MINIMAX_API_KEY %2Fshared%2Fcontrolplane)
+              echo "LLM upstream: vendor (api.minimax.io)"
+              ;;
+            *) echo "::error::unknown E2E_LLM_UPSTREAM=${E2E_LLM_UPSTREAM} (want ci-llm or vendor)"; exit 1 ;;
+          esac
           AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils)
 
           # FAIL CLOSED on an empty secret VALUE, not just a failed login.
@@ -269,7 +295,7 @@ jobs:
           #
           # A gate that cannot observe its subject must not report success.
           missing=""
-          [ -n "$MINIMAX_API_KEY" ]  || missing="$missing MINIMAX_API_KEY(/shared/controlplane)"
+          [ -n "$MINIMAX_API_KEY" ]  || missing="$missing MINIMAX_API_KEY(/shared/controlplane, or CI_LLM_API_KEY in /shared/ci-llm for ci-llm)"
           [ -n "$AUTO_SYNC_TOKEN" ]  || missing="$missing AUTO_SYNC_TOKEN(/shared/dev-utils)"
           if [ -n "$missing" ]; then
             echo "::error::Infisical returned an EMPTY value for:$missing — refusing to report success on a gate that cannot run. Check the key name/secretPath in the Infisical SSOT; do NOT re-add a skip-guard."
