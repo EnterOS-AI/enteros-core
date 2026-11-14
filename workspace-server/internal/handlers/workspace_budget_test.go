@@ -36,6 +36,7 @@ var wsColumns = []string{
 	"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 	"loaded_mcp_tools",
 	"mcp_surface",
+	"light_state",
 }
 
 // ==================== GET — financial fields stripped from open endpoint ====================
@@ -61,6 +62,7 @@ func TestWorkspaceBudget_Get_NilLimit(t *testing.T) {
 				true,  // talk_to_user_enabled
 				[]byte(`{}`), "workspace", []byte(`[]`),
 				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
+				"",          // light_state: NULL = not a Light agent
 			))
 
 	w := httptest.NewRecorder()
@@ -108,6 +110,7 @@ func TestWorkspaceBudget_Get_WithLimit(t *testing.T) {
 				false, true, // broadcast_enabled, talk_to_user_enabled
 				[]byte(`{}`), "workspace", []byte(`[]`),
 				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
+				"",          // light_state: NULL = not a Light agent
 			))
 
 	w := httptest.NewRecorder()

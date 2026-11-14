@@ -33,6 +33,7 @@ func TestWorkspaceGet_Success(t *testing.T) {
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
 		"mcp_surface",
+		"light_state",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("cccccccc-0001-0000-0000-000000000000").
@@ -42,6 +43,7 @@ func TestWorkspaceGet_Success(t *testing.T) {
 				"", 10.0, 20.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`["a2a","mcp__molecule-platform__provision_workspace"]`),
 				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
+				"",          // light_state: NULL = not a Light agent
 			))
 
 	w := httptest.NewRecorder()
@@ -137,6 +139,7 @@ func TestWorkspaceGet_RemovedReturns410(t *testing.T) {
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
 		"mcp_surface",
+		"light_state",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
@@ -146,6 +149,7 @@ func TestWorkspaceGet_RemovedReturns410(t *testing.T) {
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
 				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
+				"",          // light_state: NULL = not a Light agent
 			))
 	mock.ExpectQuery(`SELECT updated_at FROM workspaces`).
 		WithArgs(id).
@@ -206,6 +210,7 @@ func TestWorkspaceGet_RemovedReturns410WithNullRemovedAtOnTimestampFetchFailure(
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
 		"mcp_surface",
+		"light_state",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
@@ -215,6 +220,7 @@ func TestWorkspaceGet_RemovedReturns410WithNullRemovedAtOnTimestampFetchFailure(
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
 				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
+				"",          // light_state: NULL = not a Light agent
 			))
 	// Simulate the row vanishing between the two queries.
 	mock.ExpectQuery(`SELECT updated_at FROM workspaces`).
@@ -273,6 +279,7 @@ func TestWorkspaceGet_RemovedWithIncludeQueryReturns200(t *testing.T) {
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
 		"mcp_surface",
+		"light_state",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
@@ -282,6 +289,7 @@ func TestWorkspaceGet_RemovedWithIncludeQueryReturns200(t *testing.T) {
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
 				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
+				"",          // light_state: NULL = not a Light agent
 			))
 	// last_outbound_at follow-up query (existing path)
 	mock.ExpectQuery(`SELECT last_outbound_at FROM workspaces`).
@@ -1444,6 +1452,7 @@ func TestWorkspaceGet_FinancialFieldsStripped(t *testing.T) {
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
 		"mcp_surface",
+		"light_state",
 	}
 	// Populate with non-zero financial values to confirm they are stripped.
 	mock.ExpectQuery("SELECT w.id, w.name").
@@ -1454,6 +1463,7 @@ func TestWorkspaceGet_FinancialFieldsStripped(t *testing.T) {
 				"", 0.0, 0.0, false,
 				int64(50000), int64(12500), false, true, []byte(`{}`), "workspace", []byte(`[]`),
 				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
+				"",          // light_state: NULL = not a Light agent
 			)) // budget_limit=500 USD, spend=125 USD
 
 	w := httptest.NewRecorder()
@@ -1511,6 +1521,7 @@ func TestWorkspaceGet_SensitiveFieldsStripped(t *testing.T) {
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
 		"mcp_surface",
+		"light_state",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("cccccccc-0955-0000-0000-000000000000").
@@ -1525,6 +1536,7 @@ func TestWorkspaceGet_SensitiveFieldsStripped(t *testing.T) {
 				0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
 				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
+				"",          // light_state: NULL = not a Light agent
 			))
 
 	w := httptest.NewRecorder()
@@ -2149,6 +2161,7 @@ func TestWorkspaceGet_Wedged_FreshHeartbeatStaleOutbound(t *testing.T) {
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
 		"mcp_surface",
+		"light_state",
 	}
 	// active_tasks=1 (busy), but the GET row carries only what
 	// scanWorkspaceRow scans (which does NOT include last_heartbeat_at).
@@ -2160,6 +2173,7 @@ func TestWorkspaceGet_Wedged_FreshHeartbeatStaleOutbound(t *testing.T) {
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
 				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
+				"",          // light_state: NULL = not a Light agent
 			))
 	// Follow-up query for last_outbound_at (existing #817 path).
 	mock.ExpectQuery(`SELECT last_outbound_at FROM workspaces`).
@@ -2231,6 +2245,7 @@ func TestWorkspaceGet_Wedged_StaleHeartbeatStaleOutbound(t *testing.T) {
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
 		"mcp_surface",
+		"light_state",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
@@ -2240,6 +2255,7 @@ func TestWorkspaceGet_Wedged_StaleHeartbeatStaleOutbound(t *testing.T) {
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
 				[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
+				"",          // light_state: NULL = not a Light agent
 			))
 	mock.ExpectQuery(`SELECT last_outbound_at FROM workspaces`).
 		WithArgs(id).

@@ -15,7 +15,9 @@ owner's own apps). Every route is under `/workspaces/{id}` and returns JSON.
 
 ## States
 
-`light_state` on the workspace:
+`light_state` on the workspace (also on every workspace object of
+`GET /workspaces` and `GET /workspaces/{id}`, `null` for an ordinary agent;
+changes are broadcast as `WORKSPACE_UPDATED` with `{"light_state": ...}`):
 
 | Value | Meaning |
 |---|---|
@@ -143,7 +145,8 @@ The agent's Light state.
       "suspended_reason": null,
       "suspended_at": null,
       "consecutive_failures": 0,
-      "cronjob": "light-be7540cfd160-1a2b3c4d"
+      "cronjob": "light-be7540cfd160-1a2b3c4d",
+      "next_run_at": "2026-11-13T16:00:00Z"
     }
   ]
 }
@@ -157,6 +160,13 @@ The agent's Light state.
   record (`suspended_at` is when it was last suspended, kept after a resume);
   a suspended schedule does not fire even when `enabled` is true. While the
   agent is open, its live schedules are at `GET /workspaces/{id}/schedules`.
+- `next_run_at`: the schedule's next fire time after now, RFC 3339 in UTC: its
+  `cron` in its `timezone` (an empty `timezone` is UTC), parsed as the schedule
+  grid parses crons (five fields). It is the schedule's own minute (a run the
+  control plane starts a minute early still begins its task at this time) and
+  does not depend on `light_state`, so an open agent's paused schedules still
+  show when they would run. `null` when the schedule is off (`enabled` false),
+  suspended, or its `cron` or `timezone` does not parse.
 - `pending_actions`: work queued for the agent's next open/park cycle, each
   `{"kind", "source", "queued_at"}`. `refresh_pending` is true when a `refresh`
   is queued (a secret, plugin or config change made while the agent was parked
@@ -593,12 +603,12 @@ A monitor in core, every 30 s:
 - **Failed schedules.** When a schedule's last three runs all failed or timed
   out, core suspends it and tells the owner in the agent's chat (or, when the
   agent may not message the user, through a `WORKSPACE_UPDATED` event naming
-  the schedule). `GET /light` shows `suspended` and `suspended_reason`. The
-  agent is parked when this happens, so to resume the schedule: open the
-  agent, fix the cause (or change the schedule), then park it yourself
-  (`POST /light/park`): your park resumes every suspended schedule, and a
-  changed schedule is resumed by any park. `POST /light/run` still runs a
-  suspended schedule once, to try a fix.
+  the schedule, `{"light_schedule_suspended": "<name>"}`). `GET /light` shows
+  `suspended` and `suspended_reason`. The agent is parked when this happens,
+  so to resume the schedule: open the agent, fix the cause (or change the
+  schedule), then park it yourself (`POST /light/park`): your park resumes
+  every suspended schedule, and a changed schedule is resumed by any park.
+  `POST /light/run` still runs a suspended schedule once, to try a fix.
 - **Retention.** Finished runs older than 30 days are deleted (hourly).
 
 Each sweep acts on at most five agents (a refresh sweep on at most two) and

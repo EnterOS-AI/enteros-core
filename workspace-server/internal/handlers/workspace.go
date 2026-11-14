@@ -1569,7 +1569,7 @@ func (h *WorkspaceHandler) ProvisionTimeoutSecondsForRuntime(runtime string) int
 func scanWorkspaceRow(rows interface {
 	Scan(dest ...interface{}) error
 }) (map[string]interface{}, error) {
-	var id, name, role, status, url, sampleError, currentTask, runtime, workspaceDir, kind string
+	var id, name, role, status, url, sampleError, currentTask, runtime, workspaceDir, kind, lightState string
 	var computeRaw, loadedMCPToolsRaw, mcpSurfaceRaw []byte
 	var tier, activeTasks, maxConcurrentTasks, uptimeSeconds int
 	var errorRate, x, y float64
@@ -1583,7 +1583,7 @@ func scanWorkspaceRow(rows interface {
 		&parentID, &activeTasks, &maxConcurrentTasks, &errorRate, &sampleError, &uptimeSeconds,
 		&currentTask, &runtime, &workspaceDir, &x, &y, &collapsed,
 		&budgetLimit, &monthlySpend, &broadcastEnabled, &talkToUserEnabled, &computeRaw, &kind,
-		&loadedMCPToolsRaw, &mcpSurfaceRaw)
+		&loadedMCPToolsRaw, &mcpSurfaceRaw, &lightState)
 	if err != nil {
 		return nil, err
 	}
@@ -1672,6 +1672,16 @@ func scanWorkspaceRow(rows interface {
 		ws["mcp_surface"] = nil
 	}
 
+	// Enter OS Light (docs/api-protocol/light-api.md): the agent's Light state
+	// (open, parking, parked, opening), null for an ordinary agent. The canvas
+	// renders the Light badge and the Light-aware tabs from it; live changes
+	// arrive as WORKSPACE_UPDATED {"light_state": ...}.
+	if lightState != "" {
+		ws["light_state"] = lightState
+	} else {
+		ws["light_state"] = nil
+	}
+
 	return ws, nil
 }
 
@@ -1689,7 +1699,8 @@ const workspaceListQuery = `
 		   COALESCE(w.compute, '{}'::jsonb),
 		   COALESCE(w.kind, 'workspace'),
 		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb),
-		   COALESCE(w.mcp_surface::text, '')
+		   COALESCE(w.mcp_surface::text, ''),
+		   COALESCE(w.light_state, '')
 	FROM workspaces w
 	LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 	WHERE w.status != 'removed'
@@ -1793,7 +1804,8 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 			   COALESCE(w.compute, '{}'::jsonb),
 		   COALESCE(w.kind, 'workspace'),
 		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb),
-		   COALESCE(w.mcp_surface::text, '')
+		   COALESCE(w.mcp_surface::text, ''),
+		   COALESCE(w.light_state, '')
 		FROM workspaces w
 		LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 		WHERE w.id = $1

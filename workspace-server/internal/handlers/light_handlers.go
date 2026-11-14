@@ -24,6 +24,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/lib/pq"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/cronspec"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
@@ -923,6 +924,9 @@ func (h *LightHandler) RunNow(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"run_id": runID})
 }
 
+// lightNow is the clock GET /light computes next_run_at with (a test seam).
+var lightNow = time.Now
+
 // lightScheduleView is one rendered schedule as GET /light reports it.
 type lightScheduleView struct {
 	Name                string     `json:"name"`
@@ -935,6 +939,29 @@ type lightScheduleView struct {
 	SuspendedAt         *time.Time `json:"suspended_at"`
 	ConsecutiveFailures int        `json:"consecutive_failures"`
 	CronJob             *string    `json:"cronjob"`
+	NextRunAt           *time.Time `json:"next_run_at"`
+}
+
+// lightNextRunAt is a schedule's next fire time after now, in UTC: its cron in
+// its time zone (no zone is UTC, the schedule grid's default and what the
+// control plane renders), parsed the way the schedules proxy parses crons
+// (cronspec: five fields, no descriptors). nil when the schedule is off or
+// suspended, or its cron or zone does not parse. It is the schedule's own
+// minute, whatever the Light state: a CronJob the control plane fires a minute
+// early (start early) holds its turn until this time.
+func lightNextRunAt(s lightScheduleView, now time.Time) *time.Time {
+	if !s.Enabled || s.Suspended {
+		return nil
+	}
+	tz := s.Timezone
+	if tz == "" {
+		tz = "UTC"
+	}
+	next, err := cronspec.ComputeNextRun(s.Cron, tz, now)
+	if err != nil {
+		return nil
+	}
+	return &next
 }
 
 // lightPendingView is one queued action as GET /light reports it.
@@ -980,6 +1007,7 @@ func (h *LightHandler) Get(c *gin.Context) {
 	}
 
 	schedules := []lightScheduleView{}
+	now := lightNow()
 	rows, err := db.DB.QueryContext(ctx, `
 		SELECT name, cron, timezone, prompt, enabled, suspended_reason, suspended_at, consecutive_failures, cronjob
 		FROM light_schedules WHERE workspace_id = $1 ORDER BY name`, id)
@@ -1007,6 +1035,7 @@ func (h *LightHandler) Get(c *gin.Context) {
 		if cronjob.Valid {
 			s.CronJob = &cronjob.String
 		}
+		s.NextRunAt = lightNextRunAt(s, now)
 		schedules = append(schedules, s)
 	}
 	rows.Close()
