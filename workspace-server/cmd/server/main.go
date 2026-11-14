@@ -402,6 +402,10 @@ func main() {
 		})
 	if cpProv != nil {
 		wh.SetCPProvisioner(cpProv)
+		// Enter OS Light (contract C4): the CP's Light routes ride the same
+		// provisioner client and auth. No CP (self-host) = no Light: the Light
+		// endpoints answer 501 LIGHT_UNSUPPORTED.
+		wh.SetLightAPI(cpProv)
 	}
 
 	// Desktop computer-use wiring (design decision B). ON BY DEFAULT wherever a
@@ -876,6 +880,17 @@ func main() {
 	go supervised.RunWithRecover(ctx, "hibernation-monitor", func(c context.Context) {
 		registry.StartHibernationMonitor(c, wh.HibernateWorkspace)
 	})
+
+	// Enter OS Light monitor: finishes interrupted parks and opens, parks idle
+	// Light agents (LIGHT_AUTO_PARK_IDLE_MINUTES, default 30), refreshes parked
+	// agents with queued work, records runs that never reported, suspends a
+	// schedule after three failed runs in a row. Light needs the control plane
+	// (Kubernetes substrate), so the monitor runs only with one; disable via
+	// LIGHT_MONITOR_DISABLED=true.
+	if handlers.LightMonitorEnabled(cpProv != nil) {
+		lightMonitor := handlers.NewLightMonitor(wh)
+		go supervised.RunWithRecover(ctx, "light-monitor", lightMonitor.Start)
+	}
 
 	// RFC #2829 PR-3: stuck-task sweeper for the durable delegations
 	// ledger. Marks deadline-exceeded rows as failed and heartbeat-stale

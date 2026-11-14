@@ -283,6 +283,15 @@ jobs:
               fi
               echo "E2E_LLM_BASE_URL=$E2E_LLM_BASE_URL" >> "$GITHUB_ENV"
               echo "LLM upstream: CI LLM gateway (${E2E_LLM_BASE_URL})"
+              # 10g DELIVER needs the model to call send_message_to_user from a long
+              # scheduled session. The CI model does that only when the session is
+              # short: replaying a captured 10g request (118 messages, 61 tools),
+              # qwen3:4b answered with the marker as text 0/10 at temperature 0.7 and
+              # 1.0, and llama3.1:8b / qwen3:8b failed it too. It passed in 2 of 4
+              # runs, so the plumbing works; the leg is a model-capability coin flip
+              # here. ci-llm turns off just that leg (its documented switch); the
+              # 10d FIRE half stays hard. `vendor` mode keeps it on.
+              echo "E2E_SCHEDULE_DELIVER_CHECK=off" >> "$GITHUB_ENV"
               ;;
             vendor)
               MINIMAX_API_KEY=$(read_secret MINIMAX_API_KEY %2Fshared%2Fcontrolplane)

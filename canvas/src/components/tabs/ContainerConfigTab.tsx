@@ -14,6 +14,7 @@ import { runtimeDisplayName } from "@/lib/runtime-names";
 import { isSaaSTenant } from "@/lib/tenant";
 import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
 import type { WorkspaceCompute } from "@/store/socket";
+import { workspaceStatusLabel } from "@/lib/light";
 
 const RUNTIME_OPTIONS = ["claude-code", "codex", "hermes", "openclaw", "kimi", "kimi-cli", "external"];
 const RESOLUTIONS = ["1280x720", "1440x900", "1920x1080", "2560x1440"];
@@ -24,7 +25,7 @@ type Props = {
   data: Pick<
     WorkspaceNodeData,
     "runtime" | "status" | "needsRestart" | "activeTasks" | "deliveryMode"
-    | "workspaceAccess" | "maxConcurrentTasks" | "compute" | "applyTemplateOnRestart"
+    | "workspaceAccess" | "maxConcurrentTasks" | "compute" | "applyTemplateOnRestart" | "lightState"
   >;
 };
 
@@ -370,7 +371,7 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
       <section className="rounded-lg border border-line/50 bg-surface-card/40 p-4">
         <h3 className="mb-3 text-sm font-semibold text-ink">Status</h3>
         <dl className="grid grid-cols-1 gap-2 text-[11px]">
-          <ConfigRow label="Container status" value={data.status} />
+          <ConfigRow label="Container status" {...containerStatus(data)} />
           <ConfigRow label="Active tasks" value={String(data.activeTasks ?? 0)} />
           <ConfigRow label="Workspace access" value={workspaceAccess} />
           <ConfigRow label="Max concurrent tasks" value={maxConcurrentTasks} />
@@ -462,18 +463,27 @@ function formatAccess(value: string | null | undefined): string {
   return value.replace(/_/g, "-");
 }
 
+/** A parked Enter OS Light agent reads "Parked" (asleep between scheduled
+ *  runs), not the hibernated status of its pod. */
+function containerStatus(data: Pick<WorkspaceNodeData, "status" | "lightState">): { value: string; title?: string } {
+  const s = workspaceStatusLabel(data.status, data.lightState);
+  return { value: s.label, title: s.tooltip };
+}
+
 function ConfigRow({
   label,
   value,
+  title,
 }: {
   label: string;
   value: string;
+  title?: string;
 }) {
   return (
     <div className="flex items-start justify-between gap-3 rounded-md bg-surface-sunken/40 px-3 py-2">
       <dt className="text-ink-mid">{label}</dt>
       <dd className="min-w-0 text-right">
-        <div className="font-mono text-ink break-words">{value}</div>
+        <div title={title} className="font-mono text-ink break-words">{value}</div>
       </dd>
     </div>
   );
