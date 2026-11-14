@@ -30,9 +30,14 @@ import (
 //
 // How it detects
 // --------------
-// last_activity_at is stamped write-through on EVERY activity_logs write
-// (handlers/activity.go logActivityExec, via a CTE). A workspace that is
-// genuinely working advances it constantly. So:
+// last_activity_at is stamped write-through, in the same statement (a CTE),
+// by every activity row written through logActivityExec (handlers/activity.go):
+// A2A traffic, the runtime's activity reports, memory writes. Two kinds of
+// row leave it alone: an Enter OS Light run's own rows (a run is not the
+// agent's own activity), and rows other handlers INSERT directly (notifies to
+// the user, delegation records, the MCP bridge's tool-call row, memory audit
+// rows, broadcasts). A workspace that is genuinely working advances it through
+// its own reports and replies. So:
 //
 //	status='online' AND active_tasks>0 AND last_activity_at < now()-STALE_AFTER
 //

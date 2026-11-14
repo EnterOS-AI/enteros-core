@@ -91,6 +91,11 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// c.Next() returns.
 	r.Use(middleware.SecurityHeaders())
 
+	// Enter OS Light (contract C3b): a run pod's requests carry
+	// X-Molecule-Run-Id; with a workspace token, the run rides the request
+	// context so the activity rows it writes carry run_id. Never fails a request.
+	r.Use(middleware.LightRunID(db.DB))
+
 	// Health
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
@@ -293,6 +298,20 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// Manual hibernate (opt-in, #711) — stops the container and sets status
 		// to 'hibernated'. The workspace auto-wakes on the next A2A message.
 		wsAuth.POST("/hibernate", wh.Hibernate)
+
+		// Enter OS Light (contracts C3/C5; docs/api-protocol/light-api.md): a
+		// parked agent whose schedules run as isolated copies in their own pods.
+		// Management routes refuse the workspace's own token (a run pod holds
+		// it); POST /light/runs is the run pods' ledger and takes only that token.
+		lh := handlers.NewLightHandler(wh)
+		wsAuth.GET("/light", lh.Get)
+		wsAuth.POST("/light/enable", lh.Enable)
+		wsAuth.POST("/light/disable", lh.Disable)
+		wsAuth.POST("/light/park", lh.Park)
+		wsAuth.POST("/light/open", lh.Open)
+		wsAuth.POST("/light/run", lh.RunNow)
+		wsAuth.GET("/light/runs", lh.ListRuns)
+		wsAuth.POST("/light/runs", lh.ReportRun)
 
 		// Test-only busy-inject (task #92). Compiled ONLY under the
 		// e2e_busy_inject build tag — a no-op stub in every shipped image

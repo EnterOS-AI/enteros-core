@@ -559,6 +559,13 @@ jobs:
     if: ${{ always() }}
     timeout-minutes: 30
     env:
+      # LLM UPSTREAM SWITCH (owner decision 2026-11-14), the same switch as the
+      # happy path's: `ci-llm` points this lane's BYOK claude-code workspace at the
+      # CI LLM gateway (Infisical /shared/ci-llm; the workspace gets an
+      # ANTHROPIC_BASE_URL secret, which the claude-code adapter honours over its
+      # minimax default) because the MiniMax account is unfunded; `vendor` is the
+      # real MiniMax key and api.minimax.io, as before.
+      E2E_LLM_UPSTREAM: ci-llm
       PG_CONTAINER: pg-lpe2e-real-${{ github.run_id }}-${{ github.run_attempt }}
       REDIS_CONTAINER: redis-lpe2e-real-${{ github.run_id }}-${{ github.run_attempt }}
       # Hard-code dev mode at the job level so the platform server ALWAYS sees it,
@@ -644,7 +651,34 @@ jobs:
             echo "::error::Infisical login returned success with an empty accessToken — misconfiguration, failing closed."
             exit 1
           fi
-          SECRET_BODY=$(curl -fsS --max-time 30 "$BASE/api/v3/secrets/raw/MINIMAX_API_KEY?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=%2Fshared%2Fcontrolplane" \
+          case "${E2E_LLM_UPSTREAM:-vendor}" in
+            ci-llm)
+              SECRET_KEY=CI_LLM_API_KEY; SECRET_PATH=%2Fshared%2Fci-llm
+              URL_BODY=$(curl -fsS --max-time 30 "$BASE/api/v3/secrets/raw/CI_LLM_BASE_URL?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=$SECRET_PATH" \
+                -H "Authorization: Bearer $TOK") || URL_RC=$?
+              if [ "${URL_RC:-0}" -ne 0 ]; then
+                echo "::warning::Infisical secret read unreachable (curl rc=${URL_RC}) — external dependency, recording a transient."
+                echo "infisical-unreachable read_curl_rc=${URL_RC}" >> "$TRANSIENT_LEDGER"
+                exit 0
+              fi
+              LLM_BASE=$(printf '%s' "$URL_BODY" | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+              while [ "${LLM_BASE%/}" != "$LLM_BASE" ]; do LLM_BASE="${LLM_BASE%/}"; done
+              # Strict https only: the workspace sends the gateway key with every
+              # call, and the value lands in $GITHUB_ENV.
+              # Whole-string match ([[ =~ ]], not grep -x, which passes a value whose
+              # FIRST line matches and smuggles a second line into $GITHUB_ENV).
+              url_re='^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)*$'
+              if ! [[ $LLM_BASE =~ $url_re ]]; then
+                echo "::error::E2E_LLM_UPSTREAM=ci-llm but Infisical staging /shared/ci-llm CI_LLM_BASE_URL is empty or not a plain https URL — failing closed."
+                exit 1
+              fi
+              echo "LIFECYCLE_ANTHROPIC_BASE_URL=${LLM_BASE}/anthropic" >> "$GITHUB_ENV"
+              echo "LLM upstream: CI LLM gateway (${LLM_BASE})"
+              ;;
+            vendor) SECRET_KEY=MINIMAX_API_KEY; SECRET_PATH=%2Fshared%2Fcontrolplane ;;
+            *) echo "::error::unknown E2E_LLM_UPSTREAM=${E2E_LLM_UPSTREAM} (want ci-llm or vendor)"; exit 1 ;;
+          esac
+          SECRET_BODY=$(curl -fsS --max-time 30 "$BASE/api/v3/secrets/raw/$SECRET_KEY?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=$SECRET_PATH" \
             -H "Authorization: Bearer $TOK") || READ_RC=$?
           READ_RC=${READ_RC:-0}
           if [ "$READ_RC" -ne 0 ]; then
@@ -655,7 +689,7 @@ jobs:
           MINIMAX_API_KEY=$(printf '%s' "$SECRET_BODY" | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")')
           echo "::add-mask::$MINIMAX_API_KEY"
           if [ -z "$MINIMAX_API_KEY" ]; then
-            echo "::error::Infisical returned empty MINIMAX_API_KEY at staging /shared/controlplane — failing closed."
+            echo "::error::Infisical returned an empty $SECRET_KEY at staging $SECRET_PATH — failing closed."
             exit 1
           fi
           echo "MINIMAX_API_KEY=$MINIMAX_API_KEY" >> "$GITHUB_ENV"

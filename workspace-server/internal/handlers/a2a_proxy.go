@@ -816,6 +816,15 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		}
 	}
 
+	// Enter OS Light (C5): a parking or parked Light agent is never reached or
+	// woken by a message — from any caller, system and self included (a run pod
+	// holds the agent's own token). Placed before the ingest write below, so a
+	// refused message leaves no row; resolveAgentURL's auto-wake is further
+	// closed by WakeWorkspace's claim predicate if this read fails.
+	if ref := lightWakeRefusal(ctx, workspaceID, "a2a"); ref != nil {
+		return 0, nil, &proxyA2AError{Status: ref.Status, Response: ref.Body}
+	}
+
 	// #2560 (chat UX: persist in-flight exchange across leave/refresh):
 	// write the user message to activity_logs AT RECEIPT — before any of
 	// the downstream short-circuits (poll-mode, mock-runtime, push dispatch)

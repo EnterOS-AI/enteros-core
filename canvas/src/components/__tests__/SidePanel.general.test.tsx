@@ -171,6 +171,14 @@ describe("SidePanel — meta pills", () => {
     expect(screen.getByText("claude-code")).toBeTruthy();
   });
 
+  it("a parked Light agent's Status pill reads Parked with the tooltip", () => {
+    storeState.nodes = [{ ...BASE_NODE, data: { ...BASE_NODE.data, status: "hibernated", lightState: "parked" } as typeof BASE_NODE.data }];
+    render(<SidePanel />);
+    const value = screen.getByText("Parked");
+    expect(value.closest("span[title]")?.getAttribute("title")).toBe("Asleep between scheduled runs");
+    expect(screen.queryByText("hibernated")).toBeNull();
+  });
+
   it("shows skill count in meta pill", () => {
     render(<SidePanel />);
     expect(screen.getByText("3")).toBeTruthy();
