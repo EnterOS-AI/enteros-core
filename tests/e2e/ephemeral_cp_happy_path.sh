@@ -465,8 +465,10 @@ boot_cp() {
     # protocols, with MINIMAX_API_KEY above holding the gateway's key. Unset =
     # the vendor, exactly as before.
     if [ -n "${E2E_LLM_BASE_URL:-}" ]; then
-      echo "MINIMAX_BASE_URL=${E2E_LLM_BASE_URL%/}/v1"
-      echo "MINIMAX_ANTHROPIC_BASE_URL=${E2E_LLM_BASE_URL%/}/anthropic/v1"
+      local llm_base="$E2E_LLM_BASE_URL"
+      while [ "${llm_base%/}" != "$llm_base" ]; do llm_base="${llm_base%/}"; done
+      echo "MINIMAX_BASE_URL=${llm_base}/v1"
+      echo "MINIMAX_ANTHROPIC_BASE_URL=${llm_base}/anthropic/v1"
     fi
   } >> "$boot_env"
 
@@ -504,8 +506,9 @@ write_state() {
     echo "CP_ADMIN_API_TOKEN=${CP_ADMIN_API_TOKEN}"
     echo "RUNTIME=${RUNTIME}"
     echo "ROUTE_DOMAIN=${ROUTE_DOMAIN}"
-    echo "MINIMAX_API_KEY=${MINIMAX_API_KEY:-}"
-    echo "E2E_LLM_BASE_URL=${E2E_LLM_BASE_URL:-}"
+    # %q: load_state sources this file, so a value is quoted, never executed.
+    printf 'MINIMAX_API_KEY=%q\n' "${MINIMAX_API_KEY:-}"
+    printf 'E2E_LLM_BASE_URL=%q\n' "${E2E_LLM_BASE_URL:-}"
   } > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
 }

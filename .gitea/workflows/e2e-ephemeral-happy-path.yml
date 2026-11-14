@@ -271,7 +271,16 @@ jobs:
               # E2E_LLM_BASE_URL into MINIMAX_BASE_URL / MINIMAX_ANTHROPIC_BASE_URL.
               MINIMAX_API_KEY=$(read_secret CI_LLM_API_KEY %2Fshared%2Fci-llm)
               E2E_LLM_BASE_URL=$(read_secret CI_LLM_BASE_URL %2Fshared%2Fci-llm)
-              [ -n "$E2E_LLM_BASE_URL" ] || { echo "::error::E2E_LLM_UPSTREAM=ci-llm but Infisical /shared/ci-llm CI_LLM_BASE_URL is empty"; exit 1; }
+              # Strict https only: the CP sends the gateway key with every turn, and
+              # the value lands in $GITHUB_ENV (no newline can get through this).
+              while [ "${E2E_LLM_BASE_URL%/}" != "$E2E_LLM_BASE_URL" ]; do E2E_LLM_BASE_URL="${E2E_LLM_BASE_URL%/}"; done
+              # Whole-string match ([[ =~ ]], not grep -x, which passes a value whose
+              # FIRST line matches and smuggles a second line into $GITHUB_ENV).
+              url_re='^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)*$'
+              if ! [[ $E2E_LLM_BASE_URL =~ $url_re ]]; then
+                echo "::error::E2E_LLM_UPSTREAM=ci-llm but Infisical /shared/ci-llm CI_LLM_BASE_URL is empty or not a plain https URL; refusing to send the gateway key anywhere else."
+                exit 1
+              fi
               echo "E2E_LLM_BASE_URL=$E2E_LLM_BASE_URL" >> "$GITHUB_ENV"
               echo "LLM upstream: CI LLM gateway (${E2E_LLM_BASE_URL})"
               ;;
