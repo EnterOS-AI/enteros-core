@@ -1129,9 +1129,11 @@ func logActivityExec(ctx context.Context, exec activityExecutor, broadcaster eve
 
 	// Agent-Liveness RFC, Layer 3 (A2): write-through the activity timestamp
 	// onto the workspaces row IN THE SAME STATEMENT as the activity_logs
-	// INSERT, via a CTE. Every activity_logs write IS, by definition, the
-	// workspace doing something, so this is the single canonical point to
-	// stamp last_activity_at — the stall-watchdog sweeper
+	// INSERT, via a CTE. A row written here is the workspace doing something,
+	// so this is the single canonical point to stamp last_activity_at (rows
+	// other handlers INSERT directly, such as notifies and delegation records,
+	// never stamp it, and an Enter OS Light run's own rows are stored without
+	// the stamp, below) — the stall-watchdog sweeper
 	// (handlers/stall_watchdog.go) reads it to tell a busy-but-silently-hung
 	// workspace from one that's actively producing activity (the case the
 	// Redis TTL liveness monitor and the status='failed' watchdog both miss,

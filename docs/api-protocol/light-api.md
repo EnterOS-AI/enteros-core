@@ -307,9 +307,10 @@ deleted meanwhile; core deletes whatever the park wrote to the control plane.
 
 **After the 202.** If the agent turns out to be working (a task that started
 around the claim: its heartbeat still reports the task while `parking`, and any
-activity of its own after the claim counts, such as a reply or a tool call; what
-its runs write does not), the park is undone before the pod is
-stopped: the agent goes back to `open` and `last_error` is `LIGHT_AGENT_BUSY`. If stopping
+activity of its own after the claim counts, as defined under
+[Auto-park](#what-core-does-in-the-background), such as a reply; what its runs
+write does not), the park is undone before the pod is stopped: the agent goes
+back to `open` and `last_error` is `LIGHT_AGENT_BUSY`. If stopping
 the pod or resuming the CronJobs fails, the agent stays `parking`, `last_error`
 says why (`LIGHT_PARK_INCOMPLETE`, or the control plane's code such as
 `LIGHT_TENANT_SUSPENDED`), and core keeps retrying.
@@ -514,8 +515,9 @@ The agent's runs, newest first.
   from the run's Kubernetes Job (a pod that never reported: killed, out of
   memory, image pull failure, deadline). A Job that ran out its deadline, or
   exited 124, is `timed_out`.
-- `activity_count` / `activity_path`: the activity rows the run wrote (its
-  tool calls, messages, A2A traffic) and the path that lists them.
+- `activity_count` / `activity_path`: the activity rows the run wrote (the
+  activity its runtime reports, its messages to the owner, its A2A traffic)
+  and the path that lists them.
 - `next_before`: pass it back as `before` for the next page; `null` on the last
   page. It is opaque: do not parse it.
 
@@ -572,9 +574,14 @@ A monitor in core, every 30 s:
 
 - **Auto-park.** An `open` agent that is online, idle (no task, not busy),
   open for 30 minutes (`LIGHT_AUTO_PARK_IDLE_MINUTES`) and without activity of
-  its own for as long is parked. Its own activity is a message to it, its reply
-  (the clock restarts when it finishes a turn, however long the turn took) and
-  its tool calls; what its runs write does not count. Auto-park exists so
+  its own for as long is parked. Its own activity is what moves the agent's
+  `last_activity_at`: a message to it, its reply (the clock restarts when it
+  finishes a turn, however long the turn took), its A2A traffic, and the
+  activity its runtime reports to core (status updates, memory writes). Rows
+  core inserts on its own (notifies to the owner, delegation records, the MCP
+  bridge's tool-call rows, broadcasts) do not count, and neither does what its
+  runs write; a turn in progress keeps the agent from parking through its
+  heartbeat (`active_tasks`, `is_busy`) whatever it logs. Auto-park exists so
   schedules cannot stay paused by mistake, and it keeps core's schedule
   suspensions. A refused auto-park records its code in `last_error` and is not
   retried for 10 minutes.
@@ -616,10 +623,6 @@ starts no agent once it has run 90 seconds, so a slow control plane delays the
 rest to the next pass; the jobs poll reads ten agents a pass until it has read
 them all. The monitor reports itself as `light-monitor` in
 `GET /admin/liveness`.
-
-**Known gap.** hermes reports a provider refusal (out of credits, quota) as a
-successful run whose output is the refusal text, so such runs count as
-`succeeded` until hermes classifies them.
 
 ## Deleting a Light agent
 
