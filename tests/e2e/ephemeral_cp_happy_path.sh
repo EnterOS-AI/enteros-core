@@ -10,7 +10,9 @@
 #
 # IMAGE SUBSTITUTION (core PR): CP = caller-supplied baseline (CP_IMAGE); tenant
 # = THIS PR's workspace-server build (TENANT_IMAGE), fed to the CP's local-docker
-# provisioner via LOCAL_TENANT_IMAGE. CI builds CP_IMAGE from the workflow's
+# provisioner as the molecule-tenant image pin (stage_tenant_pin_image +
+# seed_tenant_pin; LOCAL_TENANT_IMAGE too, which CPs before
+# molecule-controlplane#2698 read). CI builds CP_IMAGE from the workflow's
 # pinned CP_EPHEMERAL_REF; the local wrapper builds it from the selected sibling
 # checkout. (A controlplane PR does the inverse.)
 #
@@ -336,6 +338,170 @@ seed_workspace_image() {
   for rt in $(matrix_runtimes); do
     seed_one_runtime_image "$rt"
   done
+}
+
+# ── The tenant image PIN: make the throwaway CP provision THIS PR's tenant ──────
+#
+# Since molecule-controlplane#2698 a fresh tenant provision reads its image ONLY
+# from the runtime_image_pins row (template_name='molecule-tenant',
+# region='global') and runs
+#   <RegistryPrefix()>/molecule-tenant@sha256:<digest>
+# (ResolveTenantImageRefForProvision; LOCAL_TENANT_IMAGE is diagnostic only, never
+# a fallback). With no row, every provision fails with "no global molecule-tenant
+# pin is configured". So the gate has to (1) give the PR's locally built image a
+# digest under the CANONICAL repository name, in the nested daemon the CP drives,
+# and (2) write that digest as the pin through the CP's admin API.
+#
+# WHY THE CANONICAL NAME, NOT A LOCAL REGISTRY HOST. The other way to get a digest
+# ref would be MOLECULE_IMAGE_REGISTRY=<local registry> on the CP. The CP forwards
+# that variable into the tenant's env (tenantImageRegistryEnvArgs) and formats
+# every pinned workspace image through it, so the tenant under test would resolve
+# workspace images against a registry that does not exist outside this job. The CP
+# here keeps its default RegistryPrefix (the boot env sets no MOLECULE_IMAGE_REGISTRY)
+# and nothing about the tenant's or the workspaces' image resolution changes.
+#
+# HOW. Docker records a repository digest for a ref only when it pushes or pulls
+# it, and only under the registry host it talked to. So, inside the disposable dind
+# only, and only before the CP exists:
+#   - a throwaway registry (distribution, built here with the job's Go toolchain:
+#     no Docker Hub pull, no new image) listens on the dind's 127.0.0.1:80;
+#   - the dind's /etc/hosts points the canonical registry host at 127.0.0.1. A
+#     loopback-resolving registry is "insecure" by Docker's default
+#     InsecureRegistryCIDRs (127.0.0.0/8), so the daemon falls back to plain HTTP
+#     after https on :443 is refused;
+#   - `docker push <canonical>/molecule-tenant:<tag>` records
+#     <canonical>/molecule-tenant@sha256:<digest> against the PR image;
+#   - /etc/hosts is restored and the registry stopped, on every exit path.
+# The CP's later `docker run <canonical>/molecule-tenant@sha256:<digest>` resolves
+# that ref from the local store (pull policy "missing"), so it neither pulls nor
+# touches the real registry. The push sends no credentials (empty DOCKER_CONFIG).
+# Only the dind's own daemon is affected, it is destroyed at teardown, and the
+# window closes before the CP or any workspace pull exists.
+#
+# Not in non-dind mode (the local wrapper's direct Docker): spoofing a developer's
+# own resolver is not acceptable, so there it is skipped with a warning; a CP at or
+# after #2698 then fails the provision with its own clear error.
+#
+# TENANT_PIN_REPO must equal the CP's defaultOurRegistryPrefix + /molecule-tenant
+# (controlplane internal/provisioner/imageregistry.go) for CP_EPHEMERAL_REF, since
+# the boot env sets no MOLECULE_IMAGE_REGISTRY.
+TENANT_PIN_REPO="${TENANT_PIN_REPO:-registry.moleculesai.app/molecule-ai/molecule-tenant}"
+TENANT_PIN_REGISTRY_MODULE="github.com/distribution/distribution/v3/cmd/registry@v3.0.0"
+TENANT_PIN_DIGEST=""
+
+# Runs in a subshell (its EXIT trap restores the dind); prints ONLY the digest on
+# stdout, everything else on stderr.
+publish_tenant_pin_image() (
+  set -euo pipefail
+  local repo="$TENANT_PIN_REPO" host="${TENANT_PIN_REPO%%/*}"
+  local tag; tag="e2e-${NS}"
+  local work; work="$(mktemp -d)"
+  local spoofed=0 started=0
+  restore() {
+    if [ "$spoofed" = 1 ]; then
+      host_docker exec "$DIND" sh -c 'cat /molreg/hosts.orig > /etc/hosts' >&2 \
+        || echo "WARN: could not restore the dind's /etc/hosts" >&2
+      spoofed=0
+    fi
+    if [ "$started" = 1 ]; then
+      host_docker exec "$DIND" pkill -f /molreg/registry >/dev/null 2>&1 || true
+      started=0
+    fi
+    host_docker exec "$DIND" rm -rf /molreg/data >/dev/null 2>&1 || true
+    rm -rf "$work"
+  }
+  trap restore EXIT
+
+  echo "[proof] tenant pin: building a throwaway registry (${TENANT_PIN_REGISTRY_MODULE}) with the job's Go toolchain..." >&2
+  command -v go >/dev/null 2>&1 || { echo "FATAL: go is not on PATH (the workflow's setup-go step provides it)" >&2; exit 1; }
+  ( cd "$work" && GOWORK=off GOFLAGS= GOBIN="$work/bin" CGO_ENABLED=0 GOOS=linux \
+      timeout 600 go install "$TENANT_PIN_REGISTRY_MODULE" ) >&2 \
+    || { echo "FATAL: could not build the throwaway registry" >&2; exit 1; }
+  cat > "$work/config.yml" <<'YML'
+version: 0.1
+log:
+  level: warn
+storage:
+  filesystem:
+    rootdirectory: /molreg/data
+http:
+  addr: 127.0.0.1:80
+YML
+  host_docker exec "$DIND" mkdir -p /molreg >&2
+  host_docker cp "$work/bin/registry" "$DIND:/molreg/registry" >&2
+  host_docker cp "$work/config.yml" "$DIND:/molreg/config.yml" >&2
+  host_docker exec -d "$DIND" /molreg/registry serve /molreg/config.yml
+  started=1
+  local up=""
+  for _ in $(seq 1 30); do
+    if host_docker exec "$DIND" wget -q -O /dev/null http://127.0.0.1:80/v2/ 2>/dev/null; then up=1; break; fi
+    sleep 1  # wait_for: registry /v2/ answers (real-signal poll, bounded)
+  done
+  [ -n "$up" ] || { echo "FATAL: the throwaway registry never answered on the dind's 127.0.0.1:80" >&2; exit 1; }
+
+  host_docker exec "$DIND" sh -c 'cp /etc/hosts /molreg/hosts.orig && printf "127.0.0.1 %s\n" "$1" >> /etc/hosts' sh "$host" >&2
+  spoofed=1
+  # dockerd's Go resolver re-reads /etc/hosts at most every 5s.
+  sleep 6  # wait_for: resolver hosts-file cache window (no observable signal)
+
+  docker tag "$TENANT_IMAGE" "${repo}:${tag}" >&2
+  mkdir -p "$work/docker-config"
+  DOCKER_CONFIG="$work/docker-config" docker push "${repo}:${tag}" >&2 \
+    || { echo "FATAL: push of ${repo}:${tag} to the throwaway registry failed" >&2; exit 1; }
+  local digest
+  digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${repo}:${tag}" \
+    | sed -n "s|^${repo}@\(sha256:[0-9a-f]\{64\}\)\$|\1|p" | head -1)"
+  [ -n "$digest" ] || { echo "FATAL: the push recorded no ${repo}@sha256 digest" >&2; exit 1; }
+
+  restore
+  trap - EXIT
+  sleep 6  # wait_for: resolver hosts-file cache window after the restore
+  if host_docker exec "$DIND" grep -q "$host" /etc/hosts; then
+    echo "FATAL: the dind's /etc/hosts still names ${host} after the restore" >&2; exit 1
+  fi
+  # The CP's `docker run` must find this ref in the local store, without a pull.
+  docker image inspect "${repo}@${digest}" >/dev/null \
+    || { echo "FATAL: ${repo}@${digest} does not resolve in the dind's store" >&2; exit 1; }
+  echo "[proof] tenant pin: ${TENANT_IMAGE} is ${repo}@${digest} in the dind's store" >&2
+  printf '%s\n' "$digest"
+)
+
+stage_tenant_pin_image() {
+  if [ "${EPHEMERAL_DIND:-}" != "1" ] || [ -z "${DIND:-}" ] || [ -z "${DOCKER_HOST:-}" ]; then
+    echo "::warning::tenant pin: not in dind mode, so the PR tenant image is not staged under a digest and no molecule-tenant pin is seeded. A CP at or after molecule-controlplane#2698 will refuse to provision the tenant." >&2
+    return 0
+  fi
+  TENANT_PIN_DIGEST="$(publish_tenant_pin_image)" \
+    || { echo "FATAL: could not stage the PR tenant image under a digest" >&2; exit 1; }
+  case "$TENANT_PIN_DIGEST" in
+    sha256:*) : ;;
+    *) echo "FATAL: implausible tenant pin digest '${TENANT_PIN_DIGEST}'" >&2; exit 1 ;;
+  esac
+}
+
+# Write the pin through the throwaway CP's own admin API (POST
+# /cp/admin/runtime-image/promote; the molecule-tenant row skips the workspace
+# image pre-warm guard). The bearer travels on curl's stdin config, not argv.
+seed_tenant_pin() {
+  [ -n "$TENANT_PIN_DIGEST" ] || return 0
+  local git_sha="" body resp code
+  case "${HEAD_SHA:-}" in
+    *[!0-9a-f]*|"") : ;;
+    *) [ "${#HEAD_SHA}" -ge 7 ] && [ "${#HEAD_SHA}" -le 40 ] && git_sha="$HEAD_SHA" ;;
+  esac
+  body="$(printf '{"template_name":"molecule-tenant","region":"global","image_digest":"%s","git_sha":"%s","notes":"core ephemeral happy path: PR tenant image %s"}' \
+    "$TENANT_PIN_DIGEST" "$git_sha" "$TENANT_IMAGE")"
+  resp="$(mktemp)"
+  code="$(printf 'header = "Authorization: Bearer %s"\n' "$CP_ADMIN_API_TOKEN" \
+    | curl -sS -K - -o "$resp" -w '%{http_code}' -X POST \
+        -H 'Content-Type: application/json' --data "$body" \
+        "${CP_BASE_URL}/cp/admin/runtime-image/promote")" || code="curl-failed"
+  if [ "$code" != "200" ]; then
+    echo "FATAL: seeding the molecule-tenant pin failed (HTTP ${code}): $(head -c 600 "$resp")" >&2
+    rm -f "$resp"; exit 1
+  fi
+  rm -f "$resp"
+  echo "[proof] molecule-tenant pin (global) = ${TENANT_PIN_DIGEST} — the CP provisions ${TENANT_PIN_REPO}@${TENANT_PIN_DIGEST} (this PR's image)" >&2
 }
 
 # ── start_pg: throwaway postgres:16 on an ephemeral host port ────────────────
@@ -1454,9 +1620,11 @@ case "$CMD" in
   all)
     require_boot_env
     seed_workspace_image
+    stage_tenant_pin_image
     trap 'rc=$?; stop_tenant_log_collector; if [ -n "${KEEP_UP:-}" ]; then print_reattach; cleanup_tenant_log_dir; else teardown; fi; exit "$rc"' EXIT INT TERM
     start_pg
     boot_cp
+    seed_tenant_pin
     write_state    # so `KEEP_UP=1 … all` (or a mid-run peek) can attach a scenario
     # Follow tenant logs from BEFORE the first tenant exists. run_scenario may
     # delete the tenant within seconds of a failure, so there is no later point
@@ -1482,8 +1650,10 @@ case "$CMD" in
   boot)
     require_boot_env
     seed_workspace_image
+    stage_tenant_pin_image
     start_pg
     boot_cp
+    seed_tenant_pin
     write_state
     print_reattach
     ;;
