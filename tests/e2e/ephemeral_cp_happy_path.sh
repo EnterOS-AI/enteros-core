@@ -886,7 +886,7 @@ run_scenario_concierge_user_tasks() {
 # supports it. Mirrors e2e-staging-saas.yml job
 # `e2e-staging-concierge-creates-workspace`.
 run_scenario_concierge_creates_workspace() {
-  echo "[proof][extra] concierge CREATES-a-workspace (real A2A -> platform-MCP provision_workspace + member boot + real MiniMax turn) against the ephemeral CP..." >&2
+  echo "[proof][extra] concierge CREATES-a-workspace (real A2A -> platform-MCP provision_workspace + member boot + real model turn on ${E2E_PLATFORM_MODEL:-the MCP default}) against the ephemeral CP..." >&2
   # Topology env identical to run_scenario_concierge_user_tasks: MOLECULE_TENANT_URL
   # + ROUTE_DOMAIN carry the ephemeral-CP slug routing (Host + X-Molecule-Org-Slug),
   # and MOLECULE_TENANT_ORIGIN_TEMPLATE presents the tenant's real CORS_ORIGINS
@@ -900,6 +900,9 @@ run_scenario_concierge_creates_workspace() {
   #     FAIL (exit 5), never a silent skip — the false-green guard a real gate needs
   #     (and it flips the script past its no-creds PR-mode self-check into the real
   #     run since MOLECULE_ADMIN_TOKEN is also supplied).
+  #   E2E_MEMBER_MODEL: the concierge is told to create the member on the lane's
+  #     model. Left to itself the management MCP picks its own fallback
+  #     (minimax/MiniMax-M2.7), which the gemini lane's CP cannot serve.
   MOLECULE_CP_URL="${CP_BASE_URL}" \
   MOLECULE_TENANT_URL="${CP_BASE_URL}" \
   MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
@@ -909,6 +912,7 @@ run_scenario_concierge_creates_workspace() {
   E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
   E2E_REQUIRE_LIVE=1 \
   E2E_PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-600}" \
+  E2E_MEMBER_MODEL="${E2E_PLATFORM_MODEL:-}" \
   E2E_RUN_ID="${PR_NUMBER:-0}-${HEAD_SHA:-local0000}-cncrgmk" \
     bash "$HERE/test_staging_concierge_creates_workspace_e2e.sh"
 }

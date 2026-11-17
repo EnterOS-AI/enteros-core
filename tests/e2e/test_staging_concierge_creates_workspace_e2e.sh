@@ -1056,9 +1056,19 @@ log "4/6 CREATE A TEAM — sending the concierge a natural-language create-team-
 # workspace NAME and ROLE, and tell it not to ask a clarifying question. The
 # message/send envelope is the canvas user→agent chat path (handlers/a2a_proxy.go),
 # identical to the shape test_a2a_e2e.sh / test_staging_full_saas.sh use.
+# E2E_MEMBER_MODEL (optional): the model the member must run. Without it the
+# management MCP fills its own fallback (molecule-mcp-server
+# defaultProvisionWorkspaceModel: MOLECULE_LLM_DEFAULT_MODEL / MOLECULE_MODEL /
+# MODEL from the MCP process env, else minimax/MiniMax-M2.7), which a lane whose
+# CP serves one upstream only (the ephemeral gate's gemini lane) cannot answer.
+MEMBER_MODEL_CLAUSE=""
+if [ -n "${E2E_MEMBER_MODEL:-}" ]; then
+  MEMBER_MODEL_CLAUSE=", model \"${E2E_MEMBER_MODEL}\","
+  log "    member model the concierge is asked to pass: ${E2E_MEMBER_MODEL}"
+fi
 AGENT_PROMPT="Please create a new workspace in this org right now using your platform tools. \
-Use the ${PLATFORM_MCP_REQUIRED_TOOL} tool with name exactly \"${WORKER_NAME}\" and role \"engineer\". \
-Do not ask me any clarifying questions — the name and role are final. \
+Use the ${PLATFORM_MCP_REQUIRED_TOOL} tool with name exactly \"${WORKER_NAME}\"${MEMBER_MODEL_CLAUSE} and role \"engineer\". \
+Do not ask me any clarifying questions — these values are final. \
 After the tool succeeds, reply with the new workspace id."
 A2A_PAYLOAD=$(WORKER_NAME="$WORKER_NAME" AGENT_PROMPT="$AGENT_PROMPT" python3 -c "
 import json, os, uuid
