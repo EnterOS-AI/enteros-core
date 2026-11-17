@@ -10,7 +10,9 @@
 #
 # IMAGE SUBSTITUTION (core PR): CP = caller-supplied baseline (CP_IMAGE); tenant
 # = THIS PR's workspace-server build (TENANT_IMAGE), fed to the CP's local-docker
-# provisioner via LOCAL_TENANT_IMAGE. CI builds CP_IMAGE from the workflow's
+# provisioner as the molecule-tenant image pin (stage_tenant_pin_image +
+# seed_tenant_pin; LOCAL_TENANT_IMAGE too, which CPs before
+# molecule-controlplane#2698 read). CI builds CP_IMAGE from the workflow's
 # pinned CP_EPHEMERAL_REF; the local wrapper builds it from the selected sibling
 # checkout. (A controlplane PR does the inverse.)
 #
@@ -338,6 +340,160 @@ seed_workspace_image() {
   done
 }
 
+# ── The tenant image PIN: make the throwaway CP provision THIS PR's tenant ──────
+#
+# Since molecule-controlplane#2698 a fresh tenant provision reads its image ONLY
+# from the runtime_image_pins row (template_name='molecule-tenant',
+# region='global') and runs
+#   <RegistryPrefix()>/molecule-tenant@sha256:<digest>
+# (ResolveTenantImageRefForProvision; LOCAL_TENANT_IMAGE is diagnostic only, never
+# a fallback). With no row, every provision fails with "no global molecule-tenant
+# pin is configured". So the gate has to (1) give the PR's locally built image a
+# digest under the CANONICAL repository name, in the nested daemon the CP drives,
+# and (2) write that digest as the pin through the CP's admin API.
+#
+# WHY THE CANONICAL NAME, NOT A LOCAL REGISTRY HOST. The other way to get a digest
+# ref would be MOLECULE_IMAGE_REGISTRY=<local registry> on the CP. The CP forwards
+# that variable into the tenant's env (tenantImageRegistryEnvArgs) and formats
+# every pinned workspace image through it, so the tenant under test would resolve
+# workspace images against a registry that does not exist outside this job. The CP
+# here keeps its default RegistryPrefix (the boot env sets no MOLECULE_IMAGE_REGISTRY)
+# and nothing about the tenant's or the workspaces' image resolution changes.
+#
+# HOW. Docker records a repository digest for a ref only when it pushes or pulls
+# it, and only under the registry host it talked to. So, inside the disposable dind
+# only, and only before the CP exists:
+#   - a throwaway push-only registry (tests/e2e/lib/pushsink: standard library
+#     only, built here with the job's Go toolchain, so no Docker Hub pull, no image
+#     and no module download) listens on the dind's 127.0.0.1:80;
+#   - the dind's /etc/hosts points the canonical registry host at 127.0.0.1. A
+#     loopback-resolving registry is "insecure" by Docker's default
+#     InsecureRegistryCIDRs (127.0.0.0/8), so the daemon falls back to plain HTTP
+#     after https on :443 is refused;
+#   - `docker push <canonical>/molecule-tenant:<tag>` records
+#     <canonical>/molecule-tenant@sha256:<digest> against the PR image;
+#   - /etc/hosts is restored and the registry stopped, on every exit path.
+# The CP's later `docker run <canonical>/molecule-tenant@sha256:<digest>` resolves
+# that ref from the local store (pull policy "missing"), so it neither pulls nor
+# touches the real registry. The push sends no credentials (empty DOCKER_CONFIG).
+# Only the dind's own daemon is affected, it is destroyed at teardown, and the
+# window closes before the CP or any workspace pull exists.
+#
+# Not in non-dind mode (the local wrapper's direct Docker): spoofing a developer's
+# own resolver is not acceptable, so there it is skipped with a warning; a CP at or
+# after #2698 then fails the provision with its own clear error.
+#
+# TENANT_PIN_REPO must equal the CP's defaultOurRegistryPrefix + /molecule-tenant
+# (controlplane internal/provisioner/imageregistry.go) for CP_EPHEMERAL_REF, since
+# the boot env sets no MOLECULE_IMAGE_REGISTRY.
+TENANT_PIN_REPO="${TENANT_PIN_REPO:-registry.moleculesai.app/molecule-ai/molecule-tenant}"
+TENANT_PIN_DIGEST=""
+
+# Runs in a subshell (its EXIT trap restores the dind); prints ONLY the digest on
+# stdout, everything else on stderr.
+publish_tenant_pin_image() (
+  set -euo pipefail
+  local repo="$TENANT_PIN_REPO" host="${TENANT_PIN_REPO%%/*}"
+  local tag; tag="e2e-${NS}"
+  local work; work="$(mktemp -d)"
+  local spoofed=0 started=0
+  restore() {
+    if [ "$spoofed" = 1 ]; then
+      host_docker exec "$DIND" sh -c 'cat /molreg/hosts.orig > /etc/hosts' >&2 \
+        || echo "WARN: could not restore the dind's /etc/hosts" >&2
+      spoofed=0
+    fi
+    if [ "$started" = 1 ]; then
+      host_docker exec "$DIND" pkill -f /molreg/registry >/dev/null 2>&1 || true
+      started=0
+    fi
+    host_docker exec "$DIND" rm -rf /molreg/data >/dev/null 2>&1 || true
+    rm -rf "$work"
+  }
+  trap restore EXIT
+
+  echo "[proof] tenant pin: building the throwaway push-only registry (tests/e2e/lib/pushsink)..." >&2
+  command -v go >/dev/null 2>&1 || { echo "FATAL: go is not on PATH (the workflow's setup-go step provides it)" >&2; exit 1; }
+  # Standard library only, so GOPROXY=off: no module download can fail this.
+  ( cd "$HERE/lib/pushsink" && GOWORK=off GOFLAGS='' GOPROXY=off CGO_ENABLED=0 GOOS=linux \
+      go build -o "$work/registry" . ) >&2 \
+    || { echo "FATAL: could not build tests/e2e/lib/pushsink" >&2; exit 1; }
+  host_docker exec "$DIND" mkdir -p /molreg >&2
+  host_docker cp "$work/registry" "$DIND:/molreg/registry" >&2
+  host_docker exec -d "$DIND" /molreg/registry -addr 127.0.0.1:80 -root /molreg/data
+  started=1
+  local up=""
+  for _ in $(seq 1 30); do  # poll: until the registry answers /v2/ (bounded)
+    if host_docker exec "$DIND" wget -q -O /dev/null http://127.0.0.1:80/v2/ 2>/dev/null; then up=1; break; fi
+    sleep 1  # wait_for: registry /v2/ answers (real-signal poll, bounded)
+  done
+  [ -n "$up" ] || { echo "FATAL: the throwaway registry never answered on the dind's 127.0.0.1:80" >&2; exit 1; }
+
+  host_docker exec "$DIND" sh -c 'cp /etc/hosts /molreg/hosts.orig && printf "127.0.0.1 %s\n" "$1" >> /etc/hosts' sh "$host" >&2
+  spoofed=1
+  # dockerd's Go resolver re-reads /etc/hosts at most every 5s.
+  sleep 6  # lint-allow: env-coupling — dockerd re-reads /etc/hosts at most every 5s; no observable signal
+
+  docker tag "$TENANT_IMAGE" "${repo}:${tag}" >&2
+  mkdir -p "$work/docker-config"
+  DOCKER_CONFIG="$work/docker-config" docker push "${repo}:${tag}" >&2 \
+    || { echo "FATAL: push of ${repo}:${tag} to the throwaway registry failed" >&2; exit 1; }
+  local digest
+  digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${repo}:${tag}" \
+    | sed -n "s|^${repo}@\(sha256:[0-9a-f]\{64\}\)\$|\1|p" | head -1)"
+  [ -n "$digest" ] || { echo "FATAL: the push recorded no ${repo}@sha256 digest" >&2; exit 1; }
+
+  restore
+  trap - EXIT
+  sleep 6  # lint-allow: env-coupling — same 5s hosts-file cache window, after the restore
+  if host_docker exec "$DIND" grep -q "$host" /etc/hosts; then
+    echo "FATAL: the dind's /etc/hosts still names ${host} after the restore" >&2; exit 1
+  fi
+  # The CP's `docker run` must find this ref in the local store, without a pull.
+  docker image inspect "${repo}@${digest}" >/dev/null \
+    || { echo "FATAL: ${repo}@${digest} does not resolve in the dind's store" >&2; exit 1; }
+  echo "[proof] tenant pin: ${TENANT_IMAGE} is ${repo}@${digest} in the dind's store" >&2
+  printf '%s\n' "$digest"
+)
+
+stage_tenant_pin_image() {
+  if [ "${EPHEMERAL_DIND:-}" != "1" ] || [ -z "${DIND:-}" ] || [ -z "${DOCKER_HOST:-}" ]; then
+    echo "::warning::tenant pin: not in dind mode, so the PR tenant image is not staged under a digest and no molecule-tenant pin is seeded. A CP at or after molecule-controlplane#2698 will refuse to provision the tenant." >&2
+    return 0
+  fi
+  TENANT_PIN_DIGEST="$(publish_tenant_pin_image)" \
+    || { echo "FATAL: could not stage the PR tenant image under a digest" >&2; exit 1; }
+  case "$TENANT_PIN_DIGEST" in
+    sha256:*) : ;;
+    *) echo "FATAL: implausible tenant pin digest '${TENANT_PIN_DIGEST}'" >&2; exit 1 ;;
+  esac
+}
+
+# Write the pin through the throwaway CP's own admin API (POST
+# /cp/admin/runtime-image/promote; the molecule-tenant row skips the workspace
+# image pre-warm guard). The bearer travels on curl's stdin config, not argv.
+seed_tenant_pin() {
+  [ -n "$TENANT_PIN_DIGEST" ] || return 0
+  local git_sha="" body resp code
+  case "${HEAD_SHA:-}" in
+    *[!0-9a-f]*|"") : ;;
+    *) [ "${#HEAD_SHA}" -ge 7 ] && [ "${#HEAD_SHA}" -le 40 ] && git_sha="$HEAD_SHA" ;;
+  esac
+  body="$(printf '{"template_name":"molecule-tenant","region":"global","image_digest":"%s","git_sha":"%s","notes":"core ephemeral happy path: PR tenant image %s"}' \
+    "$TENANT_PIN_DIGEST" "$git_sha" "$TENANT_IMAGE")"
+  resp="$(mktemp)"
+  code="$(printf 'header = "Authorization: Bearer %s"\n' "$CP_ADMIN_API_TOKEN" \
+    | curl -sS -K - -o "$resp" -w '%{http_code}' -X POST \
+        -H 'Content-Type: application/json' --data "$body" \
+        "${CP_BASE_URL}/cp/admin/runtime-image/promote")" || code="curl-failed"
+  if [ "$code" != "200" ]; then
+    echo "FATAL: seeding the molecule-tenant pin failed (HTTP ${code}): $(head -c 600 "$resp")" >&2
+    rm -f "$resp"; exit 1
+  fi
+  rm -f "$resp"
+  echo "[proof] molecule-tenant pin (global) = ${TENANT_PIN_DIGEST} — the CP provisions ${TENANT_PIN_REPO}@${TENANT_PIN_DIGEST} (this PR's image)" >&2
+}
+
 # ── start_pg: throwaway postgres:16 on an ephemeral host port ────────────────
 # The CP's `up` requires an EXTERNAL PG — it creates a fresh per-run database on
 # it and does NOT stand up its own. `up` reaches it via --pg-container (docker
@@ -369,7 +525,7 @@ start_pg() {
   local ready=""
   # wait_for: poll the REAL ready signal (pg_isready); the 30x 1s loop is a
   # safety deadline we break out of the instant PG is ready, never wait out.
-  for _ in $(seq 1 30); do
+  for _ in $(seq 1 30); do  # poll: until the registry answers /v2/ (bounded)
     if docker exec "$PG_CTR" pg_isready -U postgres >/dev/null 2>&1; then ready=1; break; fi
     sleep 1  # wait_for: pg_isready backoff (real-signal poll above, not a fixed timer)
   done
@@ -470,6 +626,15 @@ boot_cp() {
       echo "MINIMAX_BASE_URL=${llm_base}/v1"
       echo "MINIMAX_ANTHROPIC_BASE_URL=${llm_base}/anthropic/v1"
     fi
+    # Gemini upstream (the workflow's E2E_LLM_UPSTREAM=gemini, owner decision
+    # 2026-11-17): the platform Gemini key, with which this CP's proxy serves
+    # google/* through Google AI Studio (molecule-controlplane#3070).
+    [ -n "${E2E_GEMINI_API_KEY:-}" ] && echo "GEMINI_API_KEY=${E2E_GEMINI_API_KEY}"
+    # The lane's model (E2E_PLATFORM_MODEL, set per E2E_LLM_UPSTREAM by the
+    # workflow) is this CP's platform default, so the concierge seeds it. Explicit
+    # in every mode: a current CP's unset-value fallback is the gemini-4-carbon
+    # platform default, which no e2e lane may spend on.
+    [ -n "${E2E_PLATFORM_MODEL:-}" ] && echo "MOLECULE_LLM_DEFAULT_MODEL=${E2E_PLATFORM_MODEL}"
   } >> "$boot_env"
 
   echo "[proof] spinning up throwaway CP (baseline ${CP_IMAGE}) provisioning tenant ${TENANT_IMAGE} in ${NS}..." >&2
@@ -509,6 +674,8 @@ write_state() {
     # %q: load_state sources this file, so a value is quoted, never executed.
     printf 'MINIMAX_API_KEY=%q\n' "${MINIMAX_API_KEY:-}"
     printf 'E2E_LLM_BASE_URL=%q\n' "${E2E_LLM_BASE_URL:-}"
+    printf 'E2E_GEMINI_API_KEY=%q\n' "${E2E_GEMINI_API_KEY:-}"
+    printf 'E2E_PLATFORM_MODEL=%q\n' "${E2E_PLATFORM_MODEL:-}"
   } > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
 }
@@ -550,11 +717,13 @@ load_state() {
 # gate runs the PLATFORM leg — see below), and it is what lets the post-merge
 # staging lanes be retired instead of merely duplicated. Override with
 # E2E_MODE=smoke for a fast local loop.
-# workspace provisioned with NO tenant key, model = the hermes default
-# minimax/MiniMax-M3 (SLASH form = PLATFORM-managed per CTO task#83; the
-# CP LLM proxy bills, required_env=[]), completion flows workspace → tenant
-# proxy env → THIS ephemeral CP's /cp/internal/llm proxy → api.minimax.io with
-# the CP's own MINIMAX_API_KEY (injected via the boot-env). The BYOK matrix is
+# workspace provisioned with NO tenant key, model = the lane's e2e model
+# (E2E_PLATFORM_MODEL; google/gemini-3.1-flash-lite in the default gemini mode,
+# SLASH form = PLATFORM-managed, the CP LLM proxy bills, required_env=[]),
+# completion flows workspace → tenant proxy env → THIS ephemeral CP's
+# /cp/internal/llm proxy → Google AI Studio with the CP's own GEMINI_API_KEY
+# (ci-llm/vendor modes: minimax/MiniMax-M3 → the gateway or api.minimax.io with
+# MINIMAX_API_KEY), injected via the boot-env. The BYOK matrix is
 # the staging BYOK job's coverage, not this gate's. NOTE: hermes' harness model
 # map has no MiniMax BYOK arm (pick_model_slug hermes → openai/gpt-4o), so a
 # stray E2E_MINIMAX_API_KEY here would go BYOK-openai and 422 — the platform
@@ -602,7 +771,7 @@ run_scenario() {
   # send_message_to_user and the message lands in the AgentMessageWriter notify
   # ground-truth. It CO-GATES on E2E_SCHEDULER_CHECK=on (the fire machinery) AND a
   # real tool-calling LLM. This lane's real-LLM arm is the platform path below
-  # (E2E_LLM_PATH=platform → CP-proxied minimax/MiniMax-M3), so 10g runs HARD
+  # (E2E_LLM_PATH=platform → the CP-proxied lane model), so 10g runs HARD
   # per-PR here; a keyless/mock arm SKIPs it (never reds). The FIRE half (10d)
   # stays hard on every arm. Set E2E_SCHEDULE_DELIVER_CHECK=off to disable JUST
   # the deliver leg without disabling the fire gate.
@@ -639,6 +808,7 @@ run_scenario() {
   E2E_BUSY_INJECT="${E2E_BUSY_INJECT:-0}" \
   E2E_HIBERNATE_FORCE_BUSY_REQUIRED="${E2E_HIBERNATE_FORCE_BUSY_REQUIRED:-0}" \
   E2E_LLM_PATH=platform \
+  E2E_DEFAULT_PLATFORM_MODEL="${E2E_PLATFORM_MODEL:-}" \
   E2E_INFRA_BACKEND=local-docker \
   E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
   E2E_MODE="${E2E_MODE:-full}" \
@@ -716,7 +886,7 @@ run_scenario_concierge_user_tasks() {
 # supports it. Mirrors e2e-staging-saas.yml job
 # `e2e-staging-concierge-creates-workspace`.
 run_scenario_concierge_creates_workspace() {
-  echo "[proof][extra] concierge CREATES-a-workspace (real A2A -> platform-MCP provision_workspace + member boot + real MiniMax turn) against the ephemeral CP..." >&2
+  echo "[proof][extra] concierge CREATES-a-workspace (real A2A -> platform-MCP provision_workspace + member boot + real model turn on ${E2E_PLATFORM_MODEL:-the MCP default}) against the ephemeral CP..." >&2
   # Topology env identical to run_scenario_concierge_user_tasks: MOLECULE_TENANT_URL
   # + ROUTE_DOMAIN carry the ephemeral-CP slug routing (Host + X-Molecule-Org-Slug),
   # and MOLECULE_TENANT_ORIGIN_TEMPLATE presents the tenant's real CORS_ORIGINS
@@ -730,6 +900,9 @@ run_scenario_concierge_creates_workspace() {
   #     FAIL (exit 5), never a silent skip — the false-green guard a real gate needs
   #     (and it flips the script past its no-creds PR-mode self-check into the real
   #     run since MOLECULE_ADMIN_TOKEN is also supplied).
+  #   E2E_MEMBER_MODEL: the concierge is told to create the member on the lane's
+  #     model. Left to itself the management MCP picks its own fallback
+  #     (minimax/MiniMax-M2.7), which the gemini lane's CP cannot serve.
   MOLECULE_CP_URL="${CP_BASE_URL}" \
   MOLECULE_TENANT_URL="${CP_BASE_URL}" \
   MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
@@ -739,6 +912,7 @@ run_scenario_concierge_creates_workspace() {
   E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
   E2E_REQUIRE_LIVE=1 \
   E2E_PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-600}" \
+  E2E_MEMBER_MODEL="${E2E_PLATFORM_MODEL:-}" \
   E2E_RUN_ID="${PR_NUMBER:-0}-${HEAD_SHA:-local0000}-cncrgmk" \
     bash "$HERE/test_staging_concierge_creates_workspace_e2e.sh"
 }
@@ -801,6 +975,7 @@ run_scenario_reconciler_heals_terminated() {
   E2E_PROVIDER=molecules-server \
   E2E_RUNTIME="${RUNTIME}" \
   E2E_LLM_PATH=platform \
+  E2E_DEFAULT_PLATFORM_MODEL="${E2E_PLATFORM_MODEL:-}" \
   E2E_PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}" \
   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-900}" \
   E2E_RECONCILE_OFFLINE_TIMEOUT_SECS="${E2E_RECONCILE_OFFLINE_TIMEOUT_SECS:-180}" \
@@ -844,7 +1019,7 @@ run_scenario_peer_visibility() {
   local mode; mode="$(pv_provision_mode)"
   if [ "$mode" = "managed" ]; then
     local rts; rts="$(matrix_runtimes)"
-    echo "[proof][extra] peer_visibility (literal MCP list_peers, REAL managed-boot matrix=[${rts}], model=${E2E_MODEL_SLUG:-minimax/MiniMax-M3}) against the ephemeral CP..." >&2
+    echo "[proof][extra] peer_visibility (literal MCP list_peers, REAL managed-boot matrix=[${rts}], model=${E2E_MODEL_SLUG:-${E2E_PLATFORM_MODEL:-google/gemini-3.1-flash-lite}}) against the ephemeral CP..." >&2
     # Managed real-boot: E2E_MODEL_SLUG pins the model to the ephemeral CP's one
     # keyed vendor (overriding pv_platform_model_for_runtime's staging
     # anthropic/moonshot defaults). Timeout is the REAL cold-boot budget — three
@@ -857,7 +1032,7 @@ run_scenario_peer_visibility() {
     E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
     PV_PROVISION_MODE=managed \
     PV_RUNTIMES="$rts" \
-    E2E_MODEL_SLUG="${E2E_MODEL_SLUG:-minimax/MiniMax-M3}" \
+    E2E_MODEL_SLUG="${E2E_MODEL_SLUG:-${E2E_PLATFORM_MODEL:-google/gemini-3.1-flash-lite}}" \
     E2E_PROVISION_TIMEOUT_SECS="${E2E_PV_PROVISION_TIMEOUT_SECS:-900}" \
     E2E_RUN_ID="${PR_NUMBER:-0}-${HEAD_SHA:-local0000}-pv" \
       bash "$HERE/test_peer_visibility_mcp_staging.sh"
@@ -982,6 +1157,7 @@ run_scenario_plugin_install_lifecycle() {
     MOLECULE_ADMIN_TOKEN="${CP_ADMIN_API_TOKEN}" \
     E2E_INFRA_BACKEND=local-docker \
     E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
+    E2E_MODEL="${E2E_PLATFORM_MODEL:-google/gemini-3.1-flash-lite}" \
       go test -tags staging_e2e ./internal/staginge2e/ -run TestPluginInstallLifecycle_Staging -count=1 -v -timeout 55m )
 }
 
@@ -1237,7 +1413,7 @@ start_tenant_log_collector() {
     # runner can't pollute us) intersected with the provisioner name shapes,
     # plus anything on our leg network.
     while :; do
-      for c in $( { docker ps -a --filter "since=molecule-cp-${NS}" --format '{{.Names}}' 2>/dev/null | grep -E '^mol-tenant-|^ws-|^mol-ws-' ;
+      for c in $( { docker ps -a --filter "since=molecule-cp-${NS}" --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-tenant-|^ws-|^(mol|enteros)-ws-' ;
                     docker ps -a --filter "network=mol-net-${NS}" --format '{{.Names}}' 2>/dev/null ; } | sort -u ); do
         case "$c" in "molecule-cp-${NS}"|"pg-${NS}"|"") continue ;; esac
         [ -e "${TENANT_LOG_DIR}/${c}.following" ] && continue
@@ -1438,9 +1614,11 @@ case "$CMD" in
   all)
     require_boot_env
     seed_workspace_image
+    stage_tenant_pin_image
     trap 'rc=$?; stop_tenant_log_collector; if [ -n "${KEEP_UP:-}" ]; then print_reattach; cleanup_tenant_log_dir; else teardown; fi; exit "$rc"' EXIT INT TERM
     start_pg
     boot_cp
+    seed_tenant_pin
     write_state    # so `KEEP_UP=1 … all` (or a mid-run peek) can attach a scenario
     # Follow tenant logs from BEFORE the first tenant exists. run_scenario may
     # delete the tenant within seconds of a failure, so there is no later point
@@ -1466,8 +1644,10 @@ case "$CMD" in
   boot)
     require_boot_env
     seed_workspace_image
+    stage_tenant_pin_image
     start_pg
     boot_cp
+    seed_tenant_pin
     write_state
     print_reattach
     ;;

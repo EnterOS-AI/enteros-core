@@ -197,6 +197,20 @@ if [ "$LIFECYCLE_LLM" = "minimax" ]; then
   [ "${RESTART_TIMEOUT_EXPLICIT:-0}" -eq 0 ] && RESTART_TIMEOUT=240
 fi
 
+# LIFECYCLE_LLM=none — the REAL claude-code template image (provisioner build,
+#   same as minimax mode) with NO model call: Step 5 asserts the runtime is
+#   reachable through the proxy, not a model reply. This is the workflow's
+#   E2E_LLM_UPSTREAM=gemini mode: this lane has no platform proxy, and its BYOK
+#   claude-code workspace speaks only the Anthropic protocol, which Google AI
+#   Studio does not serve, so it cannot reach Gemini (the Gemini round trip is
+#   the ephemeral happy path's, through the CP proxy). One fewer assertion than
+#   minimax mode (no result-envelope check on a model reply).
+if [ "$LIFECYCLE_LLM" = "none" ]; then
+  LIFECYCLE_PROVISIONER_BUILDS="1"
+  [ "$ONLINE_TIMEOUT_EXPLICIT" -eq 0 ] && ONLINE_TIMEOUT=180
+  [ "${RESTART_TIMEOUT_EXPLICIT:-0}" -eq 0 ] && RESTART_TIMEOUT=240
+fi
+
 # RESTART_TIMEOUT governs Step 4 (restart-survival poll). The default
 # initialization + _EXPLICIT probe happen ABOVE this block (alongside
 # ONLINE_TIMEOUT), so the LIFECYCLE_LLM=minimax override below can

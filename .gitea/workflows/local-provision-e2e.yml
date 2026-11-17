@@ -559,13 +559,19 @@ jobs:
     if: ${{ always() }}
     timeout-minutes: 30
     env:
-      # LLM UPSTREAM SWITCH (owner decision 2026-11-14), the same switch as the
-      # happy path's: `ci-llm` points this lane's BYOK claude-code workspace at the
-      # CI LLM gateway (Infisical /shared/ci-llm; the workspace gets an
-      # ANTHROPIC_BASE_URL secret, which the claude-code adapter honours over its
-      # minimax default) because the MiniMax account is unfunded; `vendor` is the
-      # real MiniMax key and api.minimax.io, as before.
-      E2E_LLM_UPSTREAM: ci-llm
+      # LLM UPSTREAM SWITCH, the same switch as the happy path's.
+      #   `gemini` (owner decision 2026-11-17, the default): this lane has no
+      #     platform proxy, and its BYOK claude-code workspace speaks only the
+      #     Anthropic protocol, which Google AI Studio does not serve, so it cannot
+      #     reach Gemini. The real template image still provisions, boots, survives
+      #     a restart and answers through the proxy, with no model call
+      #     (LIFECYCLE_LLM=none, one assertion fewer). The Gemini round trip is the
+      #     ephemeral happy path's, through the CP proxy. No key is read.
+      #   `ci-llm` (2026-11-14): the workspace is pointed at the CI LLM gateway
+      #     (Infisical /shared/ci-llm; an ANTHROPIC_BASE_URL secret, which the
+      #     claude-code adapter honours over its minimax default).
+      #   `vendor`: the real MiniMax key and api.minimax.io, as before.
+      E2E_LLM_UPSTREAM: gemini
       PG_CONTAINER: pg-lpe2e-real-${{ github.run_id }}-${{ github.run_attempt }}
       REDIS_CONTAINER: redis-lpe2e-real-${{ github.run_id }}-${{ github.run_attempt }}
       # Hard-code dev mode at the job level so the platform server ALWAYS sees it,
@@ -652,6 +658,10 @@ jobs:
             exit 1
           fi
           case "${E2E_LLM_UPSTREAM:-vendor}" in
+            gemini)
+              echo "LLM upstream: none on this lane in gemini mode (real image, no model call); no key read."
+              exit 0
+              ;;
             ci-llm)
               SECRET_KEY=CI_LLM_API_KEY; SECRET_PATH=%2Fshared%2Fci-llm
               URL_BODY=$(curl -fsS --max-time 30 "$BASE/api/v3/secrets/raw/CI_LLM_BASE_URL?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=$SECRET_PATH" \
@@ -676,7 +686,7 @@ jobs:
               echo "LLM upstream: CI LLM gateway (${LLM_BASE})"
               ;;
             vendor) SECRET_KEY=MINIMAX_API_KEY; SECRET_PATH=%2Fshared%2Fcontrolplane ;;
-            *) echo "::error::unknown E2E_LLM_UPSTREAM=${E2E_LLM_UPSTREAM} (want ci-llm or vendor)"; exit 1 ;;
+            *) echo "::error::unknown E2E_LLM_UPSTREAM=${E2E_LLM_UPSTREAM} (want gemini, ci-llm or vendor)"; exit 1 ;;
           esac
           SECRET_BODY=$(curl -fsS --max-time 30 "$BASE/api/v3/secrets/raw/$SECRET_KEY?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=$SECRET_PATH" \
             -H "Authorization: Bearer $TOK") || READ_RC=$?
@@ -879,7 +889,8 @@ jobs:
           # having asserted nothing. That was harmless while the job was masked;
           # now that the lane gates, the guard step below turns any such
           # zero-assertion exit into a loud, named red.
-          LIFECYCLE_LLM: minimax
+          # gemini mode: `none` (real image, no model call; see the job env).
+          LIFECYCLE_LLM: ${{ env.E2E_LLM_UPSTREAM != 'gemini' && 'minimax' || 'none' }}
           # The script appends every workspace id it provisions here, so the teardown can
           # delete OUR containers and only ours. See #4346 — this is the job whose live
           # container a concurrent run's teardown deleted mid-restart.
@@ -934,7 +945,9 @@ jobs:
           TRANSIENT_LEDGER: /tmp/lpe2e_transient_${{ github.run_id }}_${{ github.run_attempt }}.txt
           # Floor, not equality: adding a 19th assertion to the e2e must not red
           # this. 18 is what every one of the 279 logs sampled 2026-08-01..09 printed.
-          E2E_MIN_ASSERTIONS: '18'
+          # gemini mode (LIFECYCLE_LLM=none) makes one assertion fewer: no
+          # result-envelope check on a model reply.
+          E2E_MIN_ASSERTIONS: ${{ env.E2E_LLM_UPSTREAM != 'gemini' && '18' || '17' }}
           # Space-separated. EXTERNAL-unreachable signatures only.
           E2E_TRANSIENT_CLASSES: 'infisical-unreachable a2a-connect-timeout'
           E2E_TRANSIENT_BUDGET: '1'

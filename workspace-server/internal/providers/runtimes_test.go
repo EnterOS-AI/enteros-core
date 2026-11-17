@@ -135,6 +135,9 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
 			// Claude Fable 5.1 via platform proxy + Auto routing (molecule-ai-sdk#221).
 			"anthropic/claude-fable-5-1", "platform/auto",
+			// Gemini via platform proxy (Google AI Studio): the platform default and
+			// the e2e model (molecule-ai-sdk#225).
+			"google/gemini-4-carbon", "google/gemini-3.1-flash-lite",
 		},
 		// hermes: kimi (BYOK gateway) + platform-managed kimi + platform-managed
 		// MiniMax (task #83 / shared-default parity, CTO 2026-06-24): MiniMax is
@@ -152,6 +155,8 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
 			// Auto routing pseudo-model (molecule-ai-sdk#221).
 			"platform/auto",
+			// Gemini via platform proxy (molecule-ai-sdk#225).
+			"google/gemini-4-carbon", "google/gemini-3.1-flash-lite",
 		},
 		// codex: openai BYOK + platform-managed openai (served via the proxy
 		// Responses surface; codex CLI 0.130+ is Responses-API-only) +
@@ -169,6 +174,8 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
 			// Auto routing pseudo-model (molecule-ai-sdk#221).
 			"platform/auto",
+			// Gemini via platform proxy (molecule-ai-sdk#225).
+			"google/gemini-4-carbon", "google/gemini-3.1-flash-lite",
 		},
 		// openclaw: kimi BYOK (moonshot: prefix -> KIMI_API_KEY ->
 		// api.kimi.com/coding gateway) + platform-managed kimi (moonshot/) +
@@ -187,6 +194,8 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
 			// Auto routing pseudo-model (molecule-ai-sdk#221).
 			"platform/auto",
+			// Gemini via platform proxy (molecule-ai-sdk#225).
+			"google/gemini-4-carbon", "google/gemini-3.1-flash-lite",
 		},
 	}
 
