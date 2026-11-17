@@ -49,7 +49,7 @@ import (
 // semantic for withdrawn ids. Under this pin a workspace already pinned to a
 // moonshot/* platform id behaves exactly as it did under #203. Closing that gap
 // is a separate change to internal/providers (see the SDK #204 arm comment).
-const canonicalRegistrySHA256 = "ebea2aaa1bed55a5858fa076355181d7873d460193e2c8963aae2d56eceb775a"
+const canonicalRegistrySHA256 = "391c6e293cc0a6601213278bae17ae0c1c3dfe53683399ab26d2086c1e844ebc"
 
 func TestSyncedYAMLMatchesCanonicalSHA(t *testing.T) {
 	sum := sha256.Sum256(embeddedYAML)
