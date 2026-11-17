@@ -86,7 +86,7 @@ run_test "empty runtime → slash-form fallback"                     ""         
 # ── Platform-managed path (E2E_LLM_PATH=platform) ──
 # Selects the slash-namespaced platform model, defaulting to the e2e model
 # (google/gemini-3.1-flash-lite, the cheapest platform Gemini model — never the
-# gemini-4-carbon platform default), takes precedence over the per-key BYOK
+# gemini-4-hydrogen platform default), takes precedence over the per-key BYOK
 # branches, and is itself overridden by E2E_MODEL_SLUG and
 # E2E_DEFAULT_PLATFORM_MODEL.
 echo

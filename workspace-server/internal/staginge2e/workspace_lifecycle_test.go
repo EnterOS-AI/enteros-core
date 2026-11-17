@@ -884,7 +884,7 @@ func tenantAdminToken(t *testing.T, cfg stagingCfg, slug string) string {
 // de-hardcode lanes use — E2E_RUNTIME / E2E_MODEL are exported by the e2e
 // workflows. When unset (local runs and the ephemeral gate), the model falls back
 // to the e2e model, google/gemini-3.1-flash-lite: the cheapest platform Gemini
-// model, never the gemini-4-carbon platform default.
+// model, never the gemini-4-hydrogen platform default.
 func tenantCreateWorkspace(t *testing.T, cfg stagingCfg, host, token, orgID string) string {
 	t.Helper()
 	return tenantCreateWorkspaceWithRuntime(

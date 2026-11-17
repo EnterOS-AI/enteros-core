@@ -21,19 +21,19 @@ E2E = "google/gemini-3.1-flash-lite"
 HERMES_SHAPE = """runtime: hermes
 runtime_config:
   # Default model.
-  model: google/gemini-4-carbon
+  model: google/gemini-4-hydrogen
 
   models:
-    - id: google/gemini-4-carbon
-      name: Gemini 4 Carbon (Molecule platform)
+    - id: google/gemini-4-hydrogen
+      name: Gemini 4 Hydrogen (Molecule platform)
 """
 
 OPENCLAW_SHAPE = """runtime: openclaw
-model: google/gemini-4-carbon  # platform default
+model: google/gemini-4-hydrogen  # platform default
 runtime_config:
-  model: google/gemini-4-carbon
+  model: google/gemini-4-hydrogen
   models:
-  - id: google/gemini-4-carbon
+  - id: google/gemini-4-hydrogen
 """
 
 
@@ -43,14 +43,14 @@ class PinTest(unittest.TestCase):
         self.assertEqual(n, 1)
         self.assertIn("  model: " + E2E + "\n", out)
         # the menu is untouched
-        self.assertIn("    - id: google/gemini-4-carbon\n", out)
+        self.assertIn("    - id: google/gemini-4-hydrogen\n", out)
 
     def test_top_level_and_nested_keep_comments(self):
         out, n = ptm.pin(OPENCLAW_SHAPE, E2E)
         self.assertEqual(n, 2)
         self.assertIn("model: " + E2E + "  # platform default\n", out)
         self.assertIn("  model: " + E2E + "\n", out)
-        self.assertNotIn("carbon\n  models", out.replace("- id: google/gemini-4-carbon", ""))
+        self.assertNotIn("hydrogen\n  models", out.replace("- id: google/gemini-4-hydrogen", ""))
 
     def test_only_first_nested_model_is_rewritten(self):
         text = "runtime_config:\n  model: a/b\n  sub:\n    model: c/d\n"

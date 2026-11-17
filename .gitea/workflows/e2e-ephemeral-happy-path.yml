@@ -203,7 +203,7 @@ jobs:
     #     vendor and every e2e lane runs on its cheapest model. The throwaway CP gets
     #     the platform Gemini key (Infisical /shared/controlplane/llm GEMINI_API_KEY,
     #     staging) and serves google/gemini-3.1-flash-lite through Google AI Studio;
-    #     never the gemini-4-carbon platform default. The 10g DELIVER leg is on.
+    #     never the gemini-4-hydrogen platform default. The 10g DELIVER leg is on.
     #   `ci-llm` (2026-11-14): minimax/MiniMax-M3, with the CP's minimax traffic sent
     #     to the CI LLM gateway on the owner's PC (Infisical /shared/ci-llm); 10g off.
     #   `vendor`: minimax/MiniMax-M3 with the real MiniMax key and api.minimax.io.
@@ -400,7 +400,7 @@ jobs:
             .tenant-bundle-deps/plugins
           echo "manifest deps cloned"
 
-      # The base templates' shipped default is the gemini-4-carbon platform default.
+      # The base templates' shipped default is the gemini-4-hydrogen platform default.
       # A workspace created from a template without a model takes that default; in
       # this gate that is the member concierge_creates_workspace's concierge
       # provisions. Pin the bundled copies to the lane's model so no e2e run spends

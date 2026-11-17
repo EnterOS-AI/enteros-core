@@ -40,7 +40,7 @@
 #   the e2e model, google/gemini-3.1-flash-lite — see the constant below. It was
 #   the SSOT default (minimax/MiniMax-M3, before that moonshot/kimi-k2.6) until
 #   Gemini became the platform vendor on 2026-11-17; e2e lanes now run on the
-#   cheapest Gemini model and never on the gemini-4-carbon default. Override the
+#   cheapest Gemini model and never on the gemini-4-hydrogen default. Override the
 #   specific platform model with E2E_MODEL_SLUG. The provision branch in
 #   test_staging_full_saas.sh sends NO secrets for this path (platform-managed
 #   needs none), so the workspace must boot online purely on the proxy env the
@@ -60,8 +60,8 @@
 # Default platform-managed model for the platform-boot regression path: the e2e
 # model, google/gemini-3.1-flash-lite (owner 2026-11-17: "use its cheapest model
 # for any e2e testing"). It is deliberately NOT the platform SSOT default
-# (MOLECULE_LLM_DEFAULT_MODEL = google/gemini-4-carbon): no e2e lane spends on
-# Carbon. The ephemeral gate passes its lane's model explicitly as
+# (MOLECULE_LLM_DEFAULT_MODEL = google/gemini-4-hydrogen): no e2e lane spends on
+# Hydrogen or Carbon. The ephemeral gate passes its lane's model explicitly as
 # E2E_DEFAULT_PLATFORM_MODEL (E2E_PLATFORM_MODEL, per E2E_LLM_UPSTREAM); this is
 # only the baked fallback. Must stay a member of every runtime's `platform` arm
 # in the SDK registry (molecule-ai-sdk contracts/llm-registry; the deterministic
