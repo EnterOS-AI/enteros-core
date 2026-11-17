@@ -423,7 +423,7 @@ publish_tenant_pin_image() (
   host_docker exec -d "$DIND" /molreg/registry -addr 127.0.0.1:80 -root /molreg/data
   started=1
   local up=""
-  for _ in $(seq 1 30); do
+  for _ in $(seq 1 30); do  # poll: until the registry answers /v2/ (bounded)
     if host_docker exec "$DIND" wget -q -O /dev/null http://127.0.0.1:80/v2/ 2>/dev/null; then up=1; break; fi
     sleep 1  # wait_for: registry /v2/ answers (real-signal poll, bounded)
   done
@@ -432,7 +432,7 @@ publish_tenant_pin_image() (
   host_docker exec "$DIND" sh -c 'cp /etc/hosts /molreg/hosts.orig && printf "127.0.0.1 %s\n" "$1" >> /etc/hosts' sh "$host" >&2
   spoofed=1
   # dockerd's Go resolver re-reads /etc/hosts at most every 5s.
-  sleep 6  # wait_for: resolver hosts-file cache window (no observable signal)
+  sleep 6  # lint-allow: env-coupling — dockerd re-reads /etc/hosts at most every 5s; no observable signal
 
   docker tag "$TENANT_IMAGE" "${repo}:${tag}" >&2
   mkdir -p "$work/docker-config"
@@ -445,7 +445,7 @@ publish_tenant_pin_image() (
 
   restore
   trap - EXIT
-  sleep 6  # wait_for: resolver hosts-file cache window after the restore
+  sleep 6  # lint-allow: env-coupling — same 5s hosts-file cache window, after the restore
   if host_docker exec "$DIND" grep -q "$host" /etc/hosts; then
     echo "FATAL: the dind's /etc/hosts still names ${host} after the restore" >&2; exit 1
   fi
@@ -525,7 +525,7 @@ start_pg() {
   local ready=""
   # wait_for: poll the REAL ready signal (pg_isready); the 30x 1s loop is a
   # safety deadline we break out of the instant PG is ready, never wait out.
-  for _ in $(seq 1 30); do
+  for _ in $(seq 1 30); do  # poll: until the registry answers /v2/ (bounded)
     if docker exec "$PG_CTR" pg_isready -U postgres >/dev/null 2>&1; then ready=1; break; fi
     sleep 1  # wait_for: pg_isready backoff (real-signal poll above, not a fixed timer)
   done
