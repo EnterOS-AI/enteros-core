@@ -9,9 +9,9 @@ template without an explicit model takes the template's default
 (handlers/workspace.go Create: top-level `model:`, else the first indented
 `model:` inside `runtime_config:`). The concierge-created member in
 concierge_creates_workspace is such a workspace, so without this step every e2e
-run would spend on the base templates' default, the gemini-4-carbon platform
-default (owner 2026-11-17: the cheapest model for any e2e testing, Carbon for the
-default), and a ci-llm or vendor run could not serve it at all.
+run would spend on the base templates' default, the gemini-4-hydrogen platform
+default (owner 2026-11-17: the cheapest model for any e2e testing, Hydrogen for
+the default), and a ci-llm or vendor run could not serve it at all.
 
 This rewrites, in the cloned copies only, exactly the lines Create reads (same
 scanner semantics, including that an unindented line - a blank one too - ends the

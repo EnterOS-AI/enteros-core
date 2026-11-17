@@ -632,7 +632,7 @@ boot_cp() {
     [ -n "${E2E_GEMINI_API_KEY:-}" ] && echo "GEMINI_API_KEY=${E2E_GEMINI_API_KEY}"
     # The lane's model (E2E_PLATFORM_MODEL, set per E2E_LLM_UPSTREAM by the
     # workflow) is this CP's platform default, so the concierge seeds it. Explicit
-    # in every mode: a current CP's unset-value fallback is the gemini-4-carbon
+    # in every mode: a current CP's unset-value fallback is the gemini-4-hydrogen
     # platform default, which no e2e lane may spend on.
     [ -n "${E2E_PLATFORM_MODEL:-}" ] && echo "MOLECULE_LLM_DEFAULT_MODEL=${E2E_PLATFORM_MODEL}"
   } >> "$boot_env"
