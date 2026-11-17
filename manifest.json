@@ -28,7 +28,7 @@
     {"name": "lark-channel", "repo": "molecule-ai/lark-channel-molecule", "ref": "973a35b70d17694c6412b40fe963689fae2a353f"}
   ],
   "workspace_templates": [
-    {"name": "claude-code-default", "repo": "molecule-ai/molecule-ai-workspace-template-claude-code", "ref": "4c625bad7a2ae134f2a7c8664fdd37a635083787"},
+    {"name": "claude-code-default", "repo": "molecule-ai/molecule-ai-workspace-template-claude-code", "ref": "c44d2d03ed280ebbf11cac1d65f59c10777b5827"},
     {"name": "platform-agent", "repo": "molecule-ai/molecule-ai-workspace-template-platform-agent", "ref": "c61e905dd6fd322a75aab85ad7e8855608241c31", "runtime": "claude-code"},
     {"name": "hermes", "repo": "molecule-ai/molecule-ai-workspace-template-hermes", "ref": "456c2f9c5c5cbe2b7304fb4d0b97806a8712c0bd"},
     {"name": "openclaw", "repo": "molecule-ai/molecule-ai-workspace-template-openclaw", "ref": "9ade46b14d7893536ad1ba572ea4d2f33fc8db5a"},
