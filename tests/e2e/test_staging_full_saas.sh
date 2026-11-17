@@ -227,6 +227,11 @@ source "$(dirname "$0")/lib/idle_digest_wait.sh"
 # Signal-driven waits for the kind:trigger scheduler daemon (fire evidence vs a
 # wedged tick loop vs a live-but-not-yet-fired daemon). Unit-tested offline by
 # lib/test_trigger_daemon_wait_unit.sh.
+# Trigger-state dir resolver ($TRIGGER_STATE_DIR_SH sets $TSD in the container):
+# the grid/health/history live on the durable plugin-state root when the CP
+# declares one, else on /configs/schedules.
+# shellcheck source=lib/trigger_state_dir.sh
+source "$(dirname "$0")/lib/trigger_state_dir.sh"
 # shellcheck source=lib/trigger_daemon_wait.sh
 source "$(dirname "$0")/lib/trigger_daemon_wait.sh"
 # shellcheck source=lib/self_schedule_create_retry.sh
@@ -3404,9 +3409,9 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
       local _sc _grid _health _hist _caps
       while IFS= read -r _sc; do
         [ -n "$_sc" ] || continue
-        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
-        _health=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-health.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 300)
-        _hist=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-history.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
+        _grid=$(docker exec "$_sc" sh -c "$TRIGGER_STATE_DIR_SH"'cat "$TSD"/schedules.yaml 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
+        _health=$(docker exec "$_sc" sh -c "$TRIGGER_STATE_DIR_SH"'cat "$TSD"/schedule-health.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 300)
+        _hist=$(docker exec "$_sc" sh -c "$TRIGGER_STATE_DIR_SH"'cat "$TSD"/schedule-history.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
         _caps=$(docker exec "$_sc" sh -c 'env | grep -E "^MOLECULE_(DECLARED_PLUGINS|TRIGGER)" | sort | tr "\n" " "' 2>/dev/null || echo "exec-failed")
         log "    [scheduler diag] $_sc env: ${_caps:-none}"
         log "    [scheduler diag] $_sc grid: ${_grid:-ABSENT (create never reached the volume — capability/routing gap)}"
@@ -3433,7 +3438,7 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
       _SCHED_CAP_EVIDENCE=""
       while IFS= read -r _sc; do
         [ -n "$_sc" ] || continue
-        _health=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-health.json 2>/dev/null' 2>/dev/null)
+        _health=$(docker exec "$_sc" sh -c "$TRIGGER_STATE_DIR_SH"'cat "$TSD"/schedule-health.json 2>/dev/null' 2>/dev/null)
         # Non-null quoted last_tick = daemon armed & ticking. A literal `null`
         # (pre-first-tick fallback {"last_tick":null,...}) does NOT match, so the
         # gate correctly keeps waiting until the daemon has actually ticked.
@@ -3485,7 +3490,7 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
       _SCHED_GRID_EVIDENCE=""
       while IFS= read -r _sc; do
         [ -n "$_sc" ] || continue
-        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null)
+        _grid=$(docker exec "$_sc" sh -c "$TRIGGER_STATE_DIR_SH"'cat "$TSD"/schedules.yaml 2>/dev/null' 2>/dev/null)
         if printf '%s' "$_grid" | grep -Fq "$_SCHED_NAME"; then
           _SCHED_GRID_EVIDENCE="$_sc (schedules.yaml)"
           _SCHED_TARGET_SC="$_sc"
@@ -3569,7 +3574,7 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
         # {"name":"<name>","status":"fired"} entry, written only after a real
         # self-scheduled turn — survives CP-driven container replacement.
         if docker exec "$_sc" sh -c \
-          "grep -Fq '\"name\": \"$_SCHED_NAME\"' /configs/schedules/schedule-history.json 2>/dev/null && grep -Fq '\"status\": \"fired\"' /configs/schedules/schedule-history.json 2>/dev/null" \
+          "${TRIGGER_STATE_DIR_SH}grep -Fq '\"name\": \"$_SCHED_NAME\"' \"\$TSD\"/schedule-history.json 2>/dev/null && grep -Fq '\"status\": \"fired\"' \"\$TSD\"/schedule-history.json 2>/dev/null" \
           >/dev/null 2>&1; then
           _SCHED_FIRED="$_sc (durable schedule-history.json)"
           return 0
@@ -3738,8 +3743,8 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ] && [ "${E2E_SCHEDULE_DELIVER_CHECK:-on}
       local _sc _grid _hist _act
       while IFS= read -r _sc; do
         [ -n "$_sc" ] || continue
-        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 300)
-        _hist=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-history.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
+        _grid=$(docker exec "$_sc" sh -c "$TRIGGER_STATE_DIR_SH"'cat "$TSD"/schedules.yaml 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 300)
+        _hist=$(docker exec "$_sc" sh -c "$TRIGGER_STATE_DIR_SH"'cat "$TSD"/schedule-history.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
         log "    [deliver diag] $_sc grid: ${_grid:-ABSENT}"
         log "    [deliver diag] $_sc history: ${_hist:-ABSENT}"
       done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
@@ -3768,7 +3773,7 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ] && [ "${E2E_SCHEDULE_DELIVER_CHECK:-on}
       _DLV_GRID_EVIDENCE=""
       while IFS= read -r _sc; do
         [ -n "$_sc" ] || continue
-        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null || true)
+        _grid=$(docker exec "$_sc" sh -c "$TRIGGER_STATE_DIR_SH"'cat "$TSD"/schedules.yaml 2>/dev/null' 2>/dev/null || true)
         if printf '%s' "$_grid" | grep -Fq "$_DLV_NAME"; then _DLV_GRID_EVIDENCE="$_sc"; return 0; fi
       done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
       return 1
@@ -3800,7 +3805,7 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ] && [ "${E2E_SCHEDULE_DELIVER_CHECK:-on}
         [ -n "$_sc" ] || continue
         if docker logs "$_sc" 2>&1 | grep -F "fired schedule '$_DLV_NAME'" >/dev/null; then _DLV_FIRED="$_sc (runtime log)"; return 0; fi
         if docker exec "$_sc" sh -c \
-          "grep -Fq '\"name\": \"$_DLV_NAME\"' /configs/schedules/schedule-history.json 2>/dev/null && grep -Fq '\"status\": \"fired\"' /configs/schedules/schedule-history.json 2>/dev/null" \
+          "${TRIGGER_STATE_DIR_SH}grep -Fq '\"name\": \"$_DLV_NAME\"' \"\$TSD\"/schedule-history.json 2>/dev/null && grep -Fq '\"status\": \"fired\"' \"\$TSD\"/schedule-history.json 2>/dev/null" \
           >/dev/null 2>&1; then _DLV_FIRED="$_sc (durable schedule-history.json)"; return 0; fi
       done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
       return 1
@@ -4102,7 +4107,7 @@ if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
     # $1=name present on the OWN (self) container's volume grid?
     self_schedule_own_grid_has() {
       local _grid
-      _grid=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null || true)
+      _grid=$(docker exec "$_SS_SELF_CID" sh -c "$TRIGGER_STATE_DIR_SH"'cat "$TSD"/schedules.yaml 2>/dev/null' 2>/dev/null || true)
       printf '%s' "$_grid" | grep -Fq "$1"
     }
 
@@ -4111,7 +4116,7 @@ if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
       local _sc _grid
       while IFS= read -r _sc; do
         [ -n "$_sc" ] || continue
-        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null || true)
+        _grid=$(docker exec "$_sc" sh -c "$TRIGGER_STATE_DIR_SH"'cat "$TSD"/schedules.yaml 2>/dev/null' 2>/dev/null || true)
         if printf '%s' "$_grid" | grep -Fq "$1"; then
           return 0
         fi
@@ -4131,7 +4136,7 @@ if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
           return 0
         fi
         if docker exec "$_sc" sh -c \
-          "grep -Fq '\"name\": \"$_name\"' /configs/schedules/schedule-history.json 2>/dev/null && grep -Fq '\"status\": \"fired\"' /configs/schedules/schedule-history.json 2>/dev/null" \
+          "${TRIGGER_STATE_DIR_SH}grep -Fq '\"name\": \"$_name\"' \"\$TSD\"/schedule-history.json 2>/dev/null && grep -Fq '\"status\": \"fired\"' \"\$TSD\"/schedule-history.json 2>/dev/null" \
           >/dev/null 2>&1; then
           _SS_FIRED="$_sc (durable schedule-history.json)"
           return 0
@@ -4377,10 +4382,10 @@ print(rid)
       # not evidence for this grid, and the target may have stopped and disappeared
       # from `docker ps` by the time the failure arm runs.
       if [ -n "${_SS_SELF_CID:-}" ]; then
-        _grid=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null | tr '\n' ' ' | head -c 1200 || true)
-        _health=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedule-health.json 2>/dev/null' 2>/dev/null | tr '\n' ' ' | head -c 800 || true)
-        _state=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedule-state.json 2>/dev/null' 2>/dev/null | tr '\n' ' ' | head -c 1200 || true)
-        _history=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedule-history.json 2>/dev/null' 2>/dev/null | tr '\n' ' ' | tail -c 1600 || true)
+        _grid=$(docker exec "$_SS_SELF_CID" sh -c "$TRIGGER_STATE_DIR_SH"'cat "$TSD"/schedules.yaml 2>/dev/null' 2>/dev/null | tr '\n' ' ' | head -c 1200 || true)
+        _health=$(docker exec "$_SS_SELF_CID" sh -c "$TRIGGER_STATE_DIR_SH"'cat "$TSD"/schedule-health.json 2>/dev/null' 2>/dev/null | tr '\n' ' ' | head -c 800 || true)
+        _state=$(docker exec "$_SS_SELF_CID" sh -c "$TRIGGER_STATE_DIR_SH"'cat "$TSD"/schedule-state.json 2>/dev/null' 2>/dev/null | tr '\n' ' ' | head -c 1200 || true)
+        _history=$(docker exec "$_SS_SELF_CID" sh -c "$TRIGGER_STATE_DIR_SH"'cat "$TSD"/schedule-history.json 2>/dev/null' 2>/dev/null | tr '\n' ' ' | tail -c 1600 || true)
         log "    [self-schedule diag] TARGET $_SS_SELF_CID schedules.yaml: ${_grid:-ABSENT}"
         log "    [self-schedule diag] TARGET $_SS_SELF_CID schedule-health.json: ${_health:-ABSENT}"
         log "    [self-schedule diag] TARGET $_SS_SELF_CID schedule-state.json: ${_state:-ABSENT}"
@@ -4439,7 +4444,7 @@ print(rid)
     _SS_ARGS_EXPLICIT=$(SS_WS="$PARENT_ID" SS_NM="$_SS_SN" python3 -c 'import json,os; print(json.dumps({"workspace_id":os.environ["SS_WS"],"name":os.environ["SS_NM"],"cron_expr":"* * * * *","prompt":"e2e self-schedule explicit-id probe","enabled":True}))')
     log "    LEG B(i): create_schedule with EXPLICIT workspace_id=$PARENT_ID name='$_SS_SN' via self-mode mcp-server ($_SS_MCP_SPEC) on $_SS_SELF_CID, retrying only a proven UUID DB-misroute for up to ${_SS_CREATE_TIMEOUT_SECS}s."
     if self_schedule_create_until_own_grid "$_SS_ARGS_EXPLICIT" "$_SS_SN"; then
-      ok "    LEG B(i): explicit-id schedule '$_SS_SN' landed on the OWN volume grid ($_SS_SELF_CID:/configs/schedules/schedules.yaml)"
+      ok "    LEG B(i): explicit-id schedule '$_SS_SN' landed on the OWN volume grid ($_SS_SELF_CID trigger-state schedules.yaml)"
     else
       _ss_create_rc=$?
       self_schedule_diagnostics
