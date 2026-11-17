@@ -220,6 +220,42 @@ func TestIntegration_LightRunToken_RetireThenRevoke(t *testing.T) {
 	}
 }
 
+// The runs sweep's candidates on real Postgres: an agent re-parked with no
+// schedules but still holding its previous park's token is swept (so the
+// token can be revoked); one with neither schedules nor a retired token is
+// not. Before 2026-11-17 the query required a schedule and missed the first.
+func TestIntegration_LightSweepRuns_CandidatesIncludeARetiredTokenWithoutSchedules(t *testing.T) {
+	conn := integrationDB_Light(t)
+	ctx := context.Background()
+	noSchedulesRetired := seedLightWorkspace(t, conn, "test-light-retired-no-schedules", "hibernated", "parked")
+	noSchedulesClean := seedLightWorkspace(t, conn, "test-light-clean-no-schedules", "hibernated", "parked")
+	withSchedule := seedLightWorkspace(t, conn, "test-light-with-schedule", "hibernated", "parked")
+	retired, _, err := wsauth.IssueAPITokenWithID(ctx, conn, noSchedulesRetired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lightExec(t, conn, `UPDATE workspaces SET light_retired_token_id = $2 WHERE id = $1`, noSchedulesRetired, retired)
+	lightExec(t, conn, `INSERT INTO light_schedules (workspace_id, name, cron, prompt) VALUES ($1, 'daily', '0 9 * * *', 'p')`, withSchedule)
+
+	rows, err := queryLightIDs(ctx, lightRunsCandidatesQuery, lightRunsZeroCursor, 100000)
+	if err != nil {
+		t.Fatalf("candidates: %v", err)
+	}
+	got := map[string]string{}
+	for _, r := range rows {
+		got[r[0]] = r[1]
+	}
+	if tok, ok := got[noSchedulesRetired]; !ok || tok != retired {
+		t.Errorf("the agent with no schedules and a retired token: in=%v token=%q, want it swept with %s", ok, tok, retired)
+	}
+	if _, ok := got[withSchedule]; !ok {
+		t.Error("the agent with a schedule must still be swept")
+	}
+	if _, ok := got[noSchedulesClean]; ok {
+		t.Error("an agent with no schedules and no retired token has nothing to sweep")
+	}
+}
+
 func TestIntegration_LightSchedules_StoreAndSuspensions(t *testing.T) {
 	conn := integrationDB_Light(t)
 	ctx := context.Background()
