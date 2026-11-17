@@ -470,6 +470,15 @@ boot_cp() {
       echo "MINIMAX_BASE_URL=${llm_base}/v1"
       echo "MINIMAX_ANTHROPIC_BASE_URL=${llm_base}/anthropic/v1"
     fi
+    # Gemini upstream (the workflow's E2E_LLM_UPSTREAM=gemini, owner decision
+    # 2026-11-17): the platform Gemini key, with which this CP's proxy serves
+    # google/* through Google AI Studio (molecule-controlplane#3070).
+    [ -n "${E2E_GEMINI_API_KEY:-}" ] && echo "GEMINI_API_KEY=${E2E_GEMINI_API_KEY}"
+    # The lane's model (E2E_PLATFORM_MODEL, set per E2E_LLM_UPSTREAM by the
+    # workflow) is this CP's platform default, so the concierge seeds it. Explicit
+    # in every mode: a current CP's unset-value fallback is the gemini-4-carbon
+    # platform default, which no e2e lane may spend on.
+    [ -n "${E2E_PLATFORM_MODEL:-}" ] && echo "MOLECULE_LLM_DEFAULT_MODEL=${E2E_PLATFORM_MODEL}"
   } >> "$boot_env"
 
   echo "[proof] spinning up throwaway CP (baseline ${CP_IMAGE}) provisioning tenant ${TENANT_IMAGE} in ${NS}..." >&2
@@ -509,6 +518,8 @@ write_state() {
     # %q: load_state sources this file, so a value is quoted, never executed.
     printf 'MINIMAX_API_KEY=%q\n' "${MINIMAX_API_KEY:-}"
     printf 'E2E_LLM_BASE_URL=%q\n' "${E2E_LLM_BASE_URL:-}"
+    printf 'E2E_GEMINI_API_KEY=%q\n' "${E2E_GEMINI_API_KEY:-}"
+    printf 'E2E_PLATFORM_MODEL=%q\n' "${E2E_PLATFORM_MODEL:-}"
   } > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
 }
@@ -550,11 +561,13 @@ load_state() {
 # gate runs the PLATFORM leg — see below), and it is what lets the post-merge
 # staging lanes be retired instead of merely duplicated. Override with
 # E2E_MODE=smoke for a fast local loop.
-# workspace provisioned with NO tenant key, model = the hermes default
-# minimax/MiniMax-M3 (SLASH form = PLATFORM-managed per CTO task#83; the
-# CP LLM proxy bills, required_env=[]), completion flows workspace → tenant
-# proxy env → THIS ephemeral CP's /cp/internal/llm proxy → api.minimax.io with
-# the CP's own MINIMAX_API_KEY (injected via the boot-env). The BYOK matrix is
+# workspace provisioned with NO tenant key, model = the lane's e2e model
+# (E2E_PLATFORM_MODEL; google/gemini-3.1-flash-lite in the default gemini mode,
+# SLASH form = PLATFORM-managed, the CP LLM proxy bills, required_env=[]),
+# completion flows workspace → tenant proxy env → THIS ephemeral CP's
+# /cp/internal/llm proxy → Google AI Studio with the CP's own GEMINI_API_KEY
+# (ci-llm/vendor modes: minimax/MiniMax-M3 → the gateway or api.minimax.io with
+# MINIMAX_API_KEY), injected via the boot-env. The BYOK matrix is
 # the staging BYOK job's coverage, not this gate's. NOTE: hermes' harness model
 # map has no MiniMax BYOK arm (pick_model_slug hermes → openai/gpt-4o), so a
 # stray E2E_MINIMAX_API_KEY here would go BYOK-openai and 422 — the platform
@@ -602,7 +615,7 @@ run_scenario() {
   # send_message_to_user and the message lands in the AgentMessageWriter notify
   # ground-truth. It CO-GATES on E2E_SCHEDULER_CHECK=on (the fire machinery) AND a
   # real tool-calling LLM. This lane's real-LLM arm is the platform path below
-  # (E2E_LLM_PATH=platform → CP-proxied minimax/MiniMax-M3), so 10g runs HARD
+  # (E2E_LLM_PATH=platform → the CP-proxied lane model), so 10g runs HARD
   # per-PR here; a keyless/mock arm SKIPs it (never reds). The FIRE half (10d)
   # stays hard on every arm. Set E2E_SCHEDULE_DELIVER_CHECK=off to disable JUST
   # the deliver leg without disabling the fire gate.
@@ -639,6 +652,7 @@ run_scenario() {
   E2E_BUSY_INJECT="${E2E_BUSY_INJECT:-0}" \
   E2E_HIBERNATE_FORCE_BUSY_REQUIRED="${E2E_HIBERNATE_FORCE_BUSY_REQUIRED:-0}" \
   E2E_LLM_PATH=platform \
+  E2E_DEFAULT_PLATFORM_MODEL="${E2E_PLATFORM_MODEL:-}" \
   E2E_INFRA_BACKEND=local-docker \
   E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
   E2E_MODE="${E2E_MODE:-full}" \
@@ -801,6 +815,7 @@ run_scenario_reconciler_heals_terminated() {
   E2E_PROVIDER=molecules-server \
   E2E_RUNTIME="${RUNTIME}" \
   E2E_LLM_PATH=platform \
+  E2E_DEFAULT_PLATFORM_MODEL="${E2E_PLATFORM_MODEL:-}" \
   E2E_PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}" \
   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-900}" \
   E2E_RECONCILE_OFFLINE_TIMEOUT_SECS="${E2E_RECONCILE_OFFLINE_TIMEOUT_SECS:-180}" \
@@ -844,7 +859,7 @@ run_scenario_peer_visibility() {
   local mode; mode="$(pv_provision_mode)"
   if [ "$mode" = "managed" ]; then
     local rts; rts="$(matrix_runtimes)"
-    echo "[proof][extra] peer_visibility (literal MCP list_peers, REAL managed-boot matrix=[${rts}], model=${E2E_MODEL_SLUG:-minimax/MiniMax-M3}) against the ephemeral CP..." >&2
+    echo "[proof][extra] peer_visibility (literal MCP list_peers, REAL managed-boot matrix=[${rts}], model=${E2E_MODEL_SLUG:-${E2E_PLATFORM_MODEL:-google/gemini-3.1-flash-lite}}) against the ephemeral CP..." >&2
     # Managed real-boot: E2E_MODEL_SLUG pins the model to the ephemeral CP's one
     # keyed vendor (overriding pv_platform_model_for_runtime's staging
     # anthropic/moonshot defaults). Timeout is the REAL cold-boot budget — three
@@ -857,7 +872,7 @@ run_scenario_peer_visibility() {
     E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
     PV_PROVISION_MODE=managed \
     PV_RUNTIMES="$rts" \
-    E2E_MODEL_SLUG="${E2E_MODEL_SLUG:-minimax/MiniMax-M3}" \
+    E2E_MODEL_SLUG="${E2E_MODEL_SLUG:-${E2E_PLATFORM_MODEL:-google/gemini-3.1-flash-lite}}" \
     E2E_PROVISION_TIMEOUT_SECS="${E2E_PV_PROVISION_TIMEOUT_SECS:-900}" \
     E2E_RUN_ID="${PR_NUMBER:-0}-${HEAD_SHA:-local0000}-pv" \
       bash "$HERE/test_peer_visibility_mcp_staging.sh"
@@ -982,6 +997,7 @@ run_scenario_plugin_install_lifecycle() {
     MOLECULE_ADMIN_TOKEN="${CP_ADMIN_API_TOKEN}" \
     E2E_INFRA_BACKEND=local-docker \
     E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
+    E2E_MODEL="${E2E_PLATFORM_MODEL:-google/gemini-3.1-flash-lite}" \
       go test -tags staging_e2e ./internal/staginge2e/ -run TestPluginInstallLifecycle_Staging -count=1 -v -timeout 55m )
 }
 

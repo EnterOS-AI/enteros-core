@@ -966,8 +966,9 @@ func conciergeDefaultRuntime() string {
 // codex, openclaw AND hermes), so a fresh concierge on any runtime resolves it to
 // the proxy, never to a tenant BYOK key. A genuine CP transport/auth FAILURE
 // still fails closed (defaultResolveConciergeModel) — the fallback covers "SSOT
-// unset", not "SSOT unreachable".
-const platformDefaultModelFallback = "minimax/MiniMax-M3"
+// unset", not "SSOT unreachable". Gemini 4 Carbon since 2026-11-17 (owner: Gemini
+// is the platform vendor; the CP proxy serves google/* through Google AI Studio).
+const platformDefaultModelFallback = "google/gemini-4-carbon"
 
 // conciergeModelResolver resolves the concierge's seed model at provision time.
 // It is a variable so tests can stub it. The default implementation fetches the
