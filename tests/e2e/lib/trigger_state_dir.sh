@@ -11,6 +11,7 @@
 # (/home/agent/.molecule/plugin-state) on every local-docker workspace; older
 # ones do not. The literal root is a fallback for a container whose exec env
 # lacks the variable. Whichever directory the runtime created wins.
-# shellcheck disable=SC2016  # expanded by the container's sh, not here
+# shellcheck disable=SC2016,SC2089  # a shell snippet for the container sh, quotes intended
 TRIGGER_STATE_DIR_SH='TSD=/configs/schedules; for _r in "${MOLECULE_PLUGIN_STATE_ROOT:-}" /home/agent/.molecule/plugin-state; do if [ -n "$_r" ] && [ -d "$_r/.trigger-state" ]; then TSD="$_r/.trigger-state"; break; fi; done; '
+# shellcheck disable=SC2090
 export TRIGGER_STATE_DIR_SH
