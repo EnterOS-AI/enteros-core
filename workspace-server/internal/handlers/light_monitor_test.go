@@ -813,6 +813,31 @@ func TestSweepRunsRevokesARetiredTokenOnlyOnceNoRunIsUnfinished(t *testing.T) {
 	}
 }
 
+// An agent re-parked with no schedules still holds its previous park's token;
+// the sweep must consider it (the candidate query's retired-token arm) and
+// revoke the token once its jobs listing shows no unfinished run. Before
+// 2026-11-17 the query required a schedule, so such a token stayed valid.
+func TestSweepRunsRevokesTheRetiredTokenOfAnAgentWithNoSchedulesLeft(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	api := &fakeLightAPI{jobs: []provisioner.LightJob{}}
+	m, _ := newLightMonitorForTest(t, api)
+	mock.ExpectQuery(`AND \(EXISTS \(SELECT 1 FROM light_schedules s WHERE s.workspace_id = w.id\)\s+OR w.light_retired_token_id IS NOT NULL\)`).
+		WithArgs(lightRunsZeroCursor, lightRunsPerTick).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "retired"}).AddRow(lightTestWS, "tok-old"))
+	mock.ExpectBegin()
+	mock.ExpectExec(`UPDATE workspaces SET light_retired_token_id = NULL\s+WHERE id = \$1 AND light_retired_token_id = \$2`).
+		WithArgs(lightTestWS, "tok-old").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE workspace_auth_tokens SET revoked_at = now\(\)`).WithArgs(lightTestWS, "tok-old").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	if res := m.SweepRuns(context.Background()); res.Considered != 1 || res.Acted != 1 {
+		t.Fatalf("res = %+v, want the agent considered and its retired token revoked", res)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
 // The jobs poll records what the listing says, but leaves streaks and the
 // retired token alone while a transition holds the agent (review 21718 O1).
 func TestSweepRunsLeavesStreaksAloneWhileATransitionHoldsTheAgent(t *testing.T) {

@@ -860,10 +860,26 @@ func recordLightJobs(ctx context.Context, workspaceID string, jobs []provisioner
 // lightRunsZeroCursor is the cursor a run poll starts from.
 const lightRunsZeroCursor = "00000000-0000-0000-0000-000000000000"
 
+// lightRunsCandidatesQuery selects the Light agents the runs sweep reads, by id
+// after a cursor: those with schedules (their runs to record and streaks to
+// evaluate) and those still holding a retired run token. The second arm
+// matters for an agent re-parked with no schedules: before it, the sweep
+// skipped such an agent, so its previous park's token was never revoked and
+// stayed valid indefinitely (security review, 2026-11-17). Its jobs listing
+// still says whether a run of the previous park can hold the token.
+const lightRunsCandidatesQuery = `
+		SELECT w.id, COALESCE(w.light_retired_token_id::text, '') FROM workspaces w
+		WHERE w.light_state IS NOT NULL AND w.status != 'removed' AND w.id > $1::uuid
+		  AND (EXISTS (SELECT 1 FROM light_schedules s WHERE s.workspace_id = w.id)
+		       OR w.light_retired_token_id IS NOT NULL)
+		ORDER BY w.id
+		LIMIT $2`
+
 // SweepRuns reads the jobs listing of the next lightRunsPerTick Light agents
 // (by id, carrying on from where the last tick stopped): runs that never
 // reported are recorded from their Jobs, failure streaks are evaluated, and a
-// retired run token is revoked once no run is unfinished.
+// retired run token is revoked once no run is unfinished, also on an agent
+// that has no schedules left.
 func (m *LightMonitor) SweepRuns(ctx context.Context) LightSweepResult {
 	var res LightSweepResult
 	if m.wh.lightAPI == nil {
@@ -873,12 +889,7 @@ func (m *LightMonitor) SweepRuns(ctx context.Context) LightSweepResult {
 	if after == "" {
 		after = lightRunsZeroCursor
 	}
-	rows, err := queryLightIDs(ctx, `
-		SELECT w.id, COALESCE(w.light_retired_token_id::text, '') FROM workspaces w
-		WHERE w.light_state IS NOT NULL AND w.status != 'removed' AND w.id > $1::uuid
-		  AND EXISTS (SELECT 1 FROM light_schedules s WHERE s.workspace_id = w.id)
-		ORDER BY w.id
-		LIMIT $2`, after, lightRunsPerTick)
+	rows, err := queryLightIDs(ctx, lightRunsCandidatesQuery, after, lightRunsPerTick)
 	if err != nil {
 		log.Printf("LightMonitor: runs query failed: %v", err)
 		res.Errors++
