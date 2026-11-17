@@ -3326,7 +3326,7 @@ if [ "${E2E_IDLE_DIGEST_CHECK:-}" = "on" ]; then
           _ID_FIRED="$_idc (durable last_included_at)"
           return 0
         fi
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
       return 1
     }
 
@@ -3338,7 +3338,7 @@ if [ "${E2E_IDLE_DIGEST_CHECK:-}" = "on" ]; then
         _idgoal=$(docker exec "$_idc" sh -c 'cat /workspace/.molecule/idle-prompt/providers/goal-state/goal.yaml 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 500)
         log "    [idle-digest diag] $_idc env: ${_idenv:-none}"
         log "    [idle-digest diag] $_idc goal.yaml: ${_idgoal:-ABSENT}"
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
     }
 
     log "10c/11 Idle-digest: polling durable completion evidence for up to ${_IDLE_TIMEOUT_SECS}s (fire threshold=${E2E_IDLE_FIRE_SECONDS:-30}s; poll=${_IDLE_POLL_SECS}s)."
@@ -3412,7 +3412,7 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
         log "    [scheduler diag] $_sc grid: ${_grid:-ABSENT (create never reached the volume — capability/routing gap)}"
         log "    [scheduler diag] $_sc health: ${_health:-ABSENT (daemon never wrote a heartbeat — not armed)}"
         log "    [scheduler diag] $_sc history: ${_hist:-ABSENT (no schedule ever fired)}"
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
     }
 
     # ── 10d.1 Daemon-armed precondition (the "capability-ready" wait) ──
@@ -3441,7 +3441,7 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
           _SCHED_CAP_EVIDENCE="$_sc (schedule-health.json last_tick live)"
           return 0
         fi
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
       return 1
     }
 
@@ -3491,7 +3491,7 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
           _SCHED_TARGET_SC="$_sc"
           return 0
         fi
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
       return 1
     }
 
@@ -3574,7 +3574,7 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
           _SCHED_FIRED="$_sc (durable schedule-history.json)"
           return 0
         fi
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
       return 1
     }
 
@@ -3742,7 +3742,7 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ] && [ "${E2E_SCHEDULE_DELIVER_CHECK:-on}
         _hist=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-history.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
         log "    [deliver diag] $_sc grid: ${_grid:-ABSENT}"
         log "    [deliver diag] $_sc history: ${_hist:-ABSENT}"
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
       _act=$(tenant_call GET "/workspaces/$PARENT_ID/activity?limit=20" 2>/dev/null | sanitize_http_body | tr '\n' ' ' | head -c 600)
       log "    [deliver diag] recent activity (redacted): ${_act:-<none>}"
     }
@@ -3770,7 +3770,7 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ] && [ "${E2E_SCHEDULE_DELIVER_CHECK:-on}
         [ -n "$_sc" ] || continue
         _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null || true)
         if printf '%s' "$_grid" | grep -Fq "$_DLV_NAME"; then _DLV_GRID_EVIDENCE="$_sc"; return 0; fi
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
       return 1
     }
     # This wait stays on plain idle_digest_wait — NOT trigger_daemon_wait — and
@@ -3802,7 +3802,7 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ] && [ "${E2E_SCHEDULE_DELIVER_CHECK:-on}
         if docker exec "$_sc" sh -c \
           "grep -Fq '\"name\": \"$_DLV_NAME\"' /configs/schedules/schedule-history.json 2>/dev/null && grep -Fq '\"status\": \"fired\"' /configs/schedules/schedule-history.json 2>/dev/null" \
           >/dev/null 2>&1; then _DLV_FIRED="$_sc (durable schedule-history.json)"; return 0; fi
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
       return 1
     }
     # Same signal-driven policy as 10d: this is the SAME daemon and the same
@@ -3949,7 +3949,7 @@ print(s.rsplit('/', 1)[-1])
           _DP_LOADED="$_sc (runtime log)"
           return 0
         fi
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
       return 1
     }
 
@@ -3966,7 +3966,7 @@ print(s.rsplit('/', 1)[-1])
         log "    [digest-plugin diag] $_sc env: ${_env:-none}"
         log "    [digest-plugin diag] $_sc installed plugins: ${_installed:-ABSENT (boot-install never fetched the plugin — check MOLECULE_DECLARED_PLUGINS reached the container)}"
         log "    [digest-plugin diag] $_sc loader lines: ${_warn:-NONE (loader never ran — flag off, or the digest never armed; refused/native=False here means the trust source rejected the plugin)}"
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
     }
 
     log "10e/11 Digest plugin: polling for in-process native load of '${_DP_NAME}' for up to ${_DP_TIMEOUT_SECS}s (poll=${_DP_POLL_SECS}s)."
@@ -4095,7 +4095,7 @@ if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
           _SS_SELF_WSID="$_wsid"
           return 0
         fi
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
       return 1
     }
 
@@ -4115,7 +4115,7 @@ if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
         if printf '%s' "$_grid" | grep -Fq "$1"; then
           return 0
         fi
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
       return 1
     }
 
@@ -4136,7 +4136,7 @@ if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
           _SS_FIRED="$_sc (durable schedule-history.json)"
           return 0
         fi
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
       return 1
     }
 
@@ -4394,7 +4394,7 @@ print(rid)
         log "    [self-schedule diag] $_sc declared/mode: ${_decl:-none}"
         log "    [self-schedule diag] $_sc installed plugins: ${_plug:-ABSENT (boot-install never fetched schedule-self — check MOLECULE_DECLARED_PLUGINS reached the container)}"
         log "    [self-schedule diag] $_sc recent self/schedule log: ${_slog:-NONE}"
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-ws-' || true)
       if [ -n "${_SS_OUT_FILE:-}" ] && [ -f "${_SS_OUT_FILE:-}" ]; then
         log "    [self-schedule diag] last create JSON-RPC payload (class=${_SS_CLASS:-?}, id=${_SS_ID:-empty}): $(sanitize_http_body < "$_SS_OUT_FILE" | tr '\n' '|' | head -c 600 || true)"
       fi

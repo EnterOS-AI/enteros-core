@@ -1409,7 +1409,7 @@ start_tenant_log_collector() {
     # runner can't pollute us) intersected with the provisioner name shapes,
     # plus anything on our leg network.
     while :; do
-      for c in $( { docker ps -a --filter "since=molecule-cp-${NS}" --format '{{.Names}}' 2>/dev/null | grep -E '^mol-tenant-|^ws-|^mol-ws-' ;
+      for c in $( { docker ps -a --filter "since=molecule-cp-${NS}" --format '{{.Names}}' 2>/dev/null | grep -E '^(mol|enteros)-tenant-|^ws-|^(mol|enteros)-ws-' ;
                     docker ps -a --filter "network=mol-net-${NS}" --format '{{.Names}}' 2>/dev/null ; } | sort -u ); do
         case "$c" in "molecule-cp-${NS}"|"pg-${NS}"|"") continue ;; esac
         [ -e "${TENANT_LOG_DIR}/${c}.following" ] && continue
