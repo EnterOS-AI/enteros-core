@@ -363,8 +363,9 @@ seed_workspace_image() {
 # HOW. Docker records a repository digest for a ref only when it pushes or pulls
 # it, and only under the registry host it talked to. So, inside the disposable dind
 # only, and only before the CP exists:
-#   - a throwaway registry (distribution, built here with the job's Go toolchain:
-#     no Docker Hub pull, no new image) listens on the dind's 127.0.0.1:80;
+#   - a throwaway push-only registry (tests/e2e/lib/pushsink: standard library
+#     only, built here with the job's Go toolchain, so no Docker Hub pull, no image
+#     and no module download) listens on the dind's 127.0.0.1:80;
 #   - the dind's /etc/hosts points the canonical registry host at 127.0.0.1. A
 #     loopback-resolving registry is "insecure" by Docker's default
 #     InsecureRegistryCIDRs (127.0.0.0/8), so the daemon falls back to plain HTTP
@@ -386,7 +387,6 @@ seed_workspace_image() {
 # (controlplane internal/provisioner/imageregistry.go) for CP_EPHEMERAL_REF, since
 # the boot env sets no MOLECULE_IMAGE_REGISTRY.
 TENANT_PIN_REPO="${TENANT_PIN_REPO:-registry.moleculesai.app/molecule-ai/molecule-tenant}"
-TENANT_PIN_REGISTRY_MODULE="github.com/distribution/distribution/v3/cmd/registry@v3.0.0"
 TENANT_PIN_DIGEST=""
 
 # Runs in a subshell (its EXIT trap restores the dind); prints ONLY the digest on
@@ -412,25 +412,15 @@ publish_tenant_pin_image() (
   }
   trap restore EXIT
 
-  echo "[proof] tenant pin: building a throwaway registry (${TENANT_PIN_REGISTRY_MODULE}) with the job's Go toolchain..." >&2
+  echo "[proof] tenant pin: building the throwaway push-only registry (tests/e2e/lib/pushsink)..." >&2
   command -v go >/dev/null 2>&1 || { echo "FATAL: go is not on PATH (the workflow's setup-go step provides it)" >&2; exit 1; }
-  ( cd "$work" && GOWORK=off GOFLAGS= GOBIN="$work/bin" CGO_ENABLED=0 GOOS=linux \
-      timeout 600 go install "$TENANT_PIN_REGISTRY_MODULE" ) >&2 \
-    || { echo "FATAL: could not build the throwaway registry" >&2; exit 1; }
-  cat > "$work/config.yml" <<'YML'
-version: 0.1
-log:
-  level: warn
-storage:
-  filesystem:
-    rootdirectory: /molreg/data
-http:
-  addr: 127.0.0.1:80
-YML
+  # Standard library only, so GOPROXY=off: no module download can fail this.
+  ( cd "$HERE/lib/pushsink" && GOWORK=off GOFLAGS='' GOPROXY=off CGO_ENABLED=0 GOOS=linux \
+      go build -o "$work/registry" . ) >&2 \
+    || { echo "FATAL: could not build tests/e2e/lib/pushsink" >&2; exit 1; }
   host_docker exec "$DIND" mkdir -p /molreg >&2
-  host_docker cp "$work/bin/registry" "$DIND:/molreg/registry" >&2
-  host_docker cp "$work/config.yml" "$DIND:/molreg/config.yml" >&2
-  host_docker exec -d "$DIND" /molreg/registry serve /molreg/config.yml
+  host_docker cp "$work/registry" "$DIND:/molreg/registry" >&2
+  host_docker exec -d "$DIND" /molreg/registry -addr 127.0.0.1:80 -root /molreg/data
   started=1
   local up=""
   for _ in $(seq 1 30); do
