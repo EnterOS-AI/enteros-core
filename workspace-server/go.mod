@@ -22,7 +22,7 @@ require (
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	github.com/stretchr/testify v1.11.1
 	go.moleculesai.app/plugin/gh-identity v0.0.0-20260509010445-788988195fce
-	go.moleculesai.app/sdk/gen/go v0.0.0-20261113113728-834353cbe6a0
+	go.moleculesai.app/sdk/gen/go v0.0.0-20261117115914-d65d7a4818a1
 	golang.org/x/crypto v0.50.0
 	golang.org/x/text v0.36.0
 	gopkg.in/yaml.v3 v3.0.1
