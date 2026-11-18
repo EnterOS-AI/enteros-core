@@ -161,6 +161,23 @@ func (h *ChatFilesHandler) WithPendingUploads(storage pendinguploads.Storage, br
 // the runtime cost is zero.
 var chatUploadMaxBytes = uploads.DefaultUploadLimits().PerRequestBytes
 
+// workspaceNotReadyCode is the code of the 503 a forward to a workspace's
+// agent answers while the agent is not registered or not reachable yet (it is
+// starting, or a restart is replacing its pod): retry after Retry-After
+// seconds. Cloudflare passes a 503's body through (it replaces an origin's 502
+// and 504 pages), so clients behind it still see the code.
+const workspaceNotReadyCode = "WORKSPACE_NOT_READY"
+
+// workspaceNotReadyRetryAfter is the Retry-After of a WORKSPACE_NOT_READY 503.
+const workspaceNotReadyRetryAfter = "10"
+
+// writeWorkspaceNotReady answers 503 WORKSPACE_NOT_READY with Retry-After;
+// message is the sentence (kept as each forward has always worded it).
+func writeWorkspaceNotReady(c *gin.Context, message string) {
+	c.Header("Retry-After", workspaceNotReadyRetryAfter)
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": message, "code": workspaceNotReadyCode})
+}
+
 // resolveWorkspaceForwardCreds resolves the workspace's URL +
 // platform_inbound_secret for an /internal/* forward, applying
 // lazy-heal on a missing inbound secret (RFC #2312 backfill — the
@@ -204,8 +221,9 @@ func resolveWorkspaceForwardCreds(c *gin.Context, ctx context.Context, workspace
 		//
 		//  push-mode → URL just isn't on the row yet (workspace
 		//    restart in progress, or first /registry/register hasn't
-		//    landed). 503 + "not registered yet" is correct — retry
-		//    after the next heartbeat (~30s) will likely succeed.
+		//    landed). 503 WORKSPACE_NOT_READY + "not registered yet"
+		//    + Retry-After is correct — a retry once the new pod has
+		//    registered succeeds.
 		//
 		//  anything else (poll-mode, NULL, empty string) → URL is
 		//    structurally absent. The platform never dispatches to a
@@ -228,7 +246,7 @@ func resolveWorkspaceForwardCreds(c *gin.Context, ctx context.Context, workspace
 			})
 			return "", "", false
 		}
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "workspace url not registered yet"})
+		writeWorkspaceNotReady(c, "workspace url not registered yet")
 		return "", "", false
 	}
 	// Defense-in-depth for #2316: workspaces.url is validated at

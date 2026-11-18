@@ -126,6 +126,8 @@ describe("error mapping", () => {
     ["LIGHT_PLATFORM_AGENT", {}, /platform agent cannot be a Light agent/],
     ["LIGHT_AGENT_BUSY", { active_tasks: 2 }, /working on a task/],
     ["LIGHT_AGENT_NOT_AWAKE", { status: "offline" }, /not online \(it is offline\)/],
+    ["LIGHT_AGENT_NOT_READY", { status: "online" }, /starting or restarting.*Try again/],
+    ["LIGHT_SCHEDULES_UNREADABLE", {}, /not a list of schedules/],
     ["LIGHT_TRANSITION_IN_PROGRESS", {}, /Another Light step/],
     ["LIGHT_RESTART_REQUIRED", {}, /not running with Light switched on/],
     ["LIGHT_INVALID", { invalid: [{ schedule: "daily", field: "cron", reason: "six fields" }, { schedule: "w", field: "timezone", reason: "unknown" }] },

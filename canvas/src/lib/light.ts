@@ -251,13 +251,15 @@ const CODE_SENTENCES: Record<string, (extras: Obj) => string> = {
     const status = str(x.status);
     return `The agent is not online${status ? ` (it is ${status})` : ""}. Park it once it is online.`;
   },
+  LIGHT_AGENT_NOT_READY: () =>
+    "The agent is starting or restarting and does not answer yet, so nothing changed. Try again in a few seconds.",
   LIGHT_AGENT_BUSY: () => "The agent is working on a task. Park it once the task is done.",
   LIGHT_RESTART_REQUIRED: () =>
     "The agent is not running with Light switched on yet. Restart it (or enable Light again), then park it.",
   LIGHT_TOO_LARGE: () =>
     "The agent's schedules are too large to park (over 8 MiB, or over the platform's limit). Shorten or remove some, then park.",
   LIGHT_SCHEDULES_UNREADABLE: () =>
-    "The agent's schedules could not be read, so it was not parked. Try again once the agent responds.",
+    "The agent answered with something that is not a list of schedules, so it was not parked. Check the agent's schedules, then park it.",
   LIGHT_INVALID: (x) => {
     const list = invalidList(x);
     return list
