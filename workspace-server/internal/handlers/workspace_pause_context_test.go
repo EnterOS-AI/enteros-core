@@ -534,7 +534,9 @@ func TestPauseHandler_ClaimIsStatusGuarded(t *testing.T) {
 	handler := newPauseHandler(t, cp)
 
 	expectPauseLookup(mock, wsID, "Guarded", nil)
-	mock.ExpectExec(`WHERE id = \$2 AND status NOT IN \('removed', 'paused'\)$`).
+	// Enter OS Light: the claim also carries the wake predicate, so a parking or
+	// parked Light agent can never be claimed paused.
+	mock.ExpectExec(`WHERE id = \$2 AND status NOT IN \('removed', 'paused'\) AND COALESCE\(light_state, ''\) NOT IN \('parking', 'parked'\)$`).
 		WithArgs(models.StatusPaused, wsID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("INSERT INTO structure_events").

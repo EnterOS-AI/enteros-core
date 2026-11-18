@@ -84,20 +84,30 @@ run_test "unknown runtime → slash-form fallback"                   gemini     
 run_test "empty runtime → slash-form fallback"                     ""          "openai/gpt-4o"
 
 # ── Platform-managed path (E2E_LLM_PATH=platform) ──
-# Selects the slash-namespaced platform model, defaulting to the shared platform
-# SSOT default (minimax/MiniMax-M3 — MOLECULE_LLM_DEFAULT_MODEL), takes
-# precedence over the per-key BYOK branches, and is itself overridden by
-# E2E_MODEL_SLUG. These pins guard the harness's ability to drive the platform
-# arm with the SAME default a fresh tenant resolves.
+# Selects the slash-namespaced platform model, defaulting to the e2e model
+# (google/gemini-3.1-flash-lite, the cheapest platform Gemini model — never the
+# gemini-4-hydrogen platform default), takes precedence over the per-key BYOK
+# branches, and is itself overridden by E2E_MODEL_SLUG and
+# E2E_DEFAULT_PLATFORM_MODEL.
 echo
 echo "Test: pick_model_slug — platform-managed path (E2E_LLM_PATH=platform)"
 echo
 
 got=$(unset E2E_MODEL_SLUG E2E_DEFAULT_PLATFORM_MODEL; E2E_LLM_PATH=platform pick_model_slug claude-code)
-assert_eq "claude-code + platform path → shared SSOT default model" "$got" "minimax/MiniMax-M3"
+assert_eq "claude-code + platform path → the e2e model (flash-lite)" "$got" "google/gemini-3.1-flash-lite"
+
+got=$(unset E2E_MODEL_SLUG E2E_DEFAULT_PLATFORM_MODEL; E2E_LLM_PATH=platform pick_model_slug hermes)
+assert_eq "hermes + platform path → the e2e model (flash-lite)"    "$got" "google/gemini-3.1-flash-lite"
 
 got=$(unset E2E_MODEL_SLUG E2E_DEFAULT_PLATFORM_MODEL; E2E_LLM_PATH=platform E2E_MINIMAX_API_KEY="mx-stray" pick_model_slug claude-code)
-assert_eq "platform path beats a stray BYOK key (no mask)"         "$got" "minimax/MiniMax-M3"
+assert_eq "platform path beats a stray BYOK key (no mask)"         "$got" "google/gemini-3.1-flash-lite"
+
+# The e2e fallback is never the platform default (owner 2026-11-17: the
+# cheapest model for any e2e testing, Carbon for the default).
+case "$E2E_DEFAULT_PLATFORM_MODEL_FALLBACK" in
+  *carbon*) assert_eq "e2e fallback is not the Carbon default" "$E2E_DEFAULT_PLATFORM_MODEL_FALLBACK" "<not carbon>" ;;
+  *)        assert_eq "e2e fallback is not the Carbon default" "ok" "ok" ;;
+esac
 
 got=$(unset E2E_MODEL_SLUG; E2E_LLM_PATH=platform E2E_DEFAULT_PLATFORM_MODEL="minimax/MiniMax-M2.7-highspeed" pick_model_slug claude-code)
 assert_eq "platform path honours E2E_DEFAULT_PLATFORM_MODEL"        "$got" "minimax/MiniMax-M2.7-highspeed"

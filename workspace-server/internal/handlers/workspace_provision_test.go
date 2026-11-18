@@ -2099,3 +2099,31 @@ func TestRuntimeUsesAnthropicNativeProxy_CaseAndWhitespace(t *testing.T) {
 		}
 	}
 }
+
+// TestLightSecretReachesTheProvisionEnv: enable stores MOLECULE_LIGHT=1 as a
+// workspace secret, and the ordinary secret-to-env path carries it into the
+// pod (C1) — no forbidden-key or privileged-key filter drops it.
+func TestLightSecretReachesTheProvisionEnv(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1`).
+		WithArgs("ws-light").
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
+			AddRow("MOLECULE_LIGHT", []byte("1"), 0).
+			AddRow("MOLECULE_CONTINUOUS", []byte("false"), 0))
+
+	envVars, _, workspaceKeys, errMsg := loadWorkspaceSecrets(context.Background(), "ws-light")
+	if errMsg != "" {
+		t.Fatalf("loadWorkspaceSecrets: %s", errMsg)
+	}
+	if envVars["MOLECULE_LIGHT"] != "1" || envVars["MOLECULE_CONTINUOUS"] != "false" {
+		t.Fatalf("env = %v, want MOLECULE_LIGHT=1 and MOLECULE_CONTINUOUS=false", envVars)
+	}
+	if _, ok := workspaceKeys["MOLECULE_LIGHT"]; !ok {
+		t.Error("MOLECULE_LIGHT is not recorded as workspace-authored")
+	}
+	if isForbiddenTenantEnvKey("MOLECULE_LIGHT") || len(findForbiddenTenantEnvKeys(envVars)) != 0 || len(findPrivilegedTenantAdminEnvKeys(envVars)) != 0 {
+		t.Error("a provision filter would drop MOLECULE_LIGHT")
+	}
+}

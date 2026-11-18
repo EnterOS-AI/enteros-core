@@ -182,10 +182,21 @@ func (w *AgentMessageWriter) Send(
 		return nil
 	}
 	preview := textutil.TruncateRunes(message, 80)
-	if _, err := w.db.ExecContext(ctx, `
+	stmt := `
 		INSERT INTO activity_logs (workspace_id, activity_type, method, summary, response_body, status)
 		VALUES ($1, 'a2a_receive', 'notify', $2, $3::jsonb, 'ok')
-	`, workspaceID, "Agent message: "+preview, string(respJSON)); err != nil {
+	`
+	args := []interface{}{workspaceID, "Agent message: " + preview, string(respJSON)}
+	// Enter OS Light (C3b): a message a Light run sent carries its run id; the
+	// statement every other message writes is unchanged.
+	if runID := activityRunID(ctx, workspaceID, nil); runID != "" {
+		stmt = `
+		INSERT INTO activity_logs (workspace_id, activity_type, method, summary, response_body, status, run_id)
+		VALUES ($1, 'a2a_receive', 'notify', $2, $3::jsonb, 'ok', $4)
+	`
+		args = append(args, runID)
+	}
+	if _, err := w.db.ExecContext(ctx, stmt, args...); err != nil {
 		// Best-effort: the broadcast already returned ok and the user
 		// has seen the message. Logging a structured line lets operators
 		// notice persistence-failure rates spike if the DB is unhealthy,

@@ -7,6 +7,7 @@ import { StatusDot } from "../StatusDot";
 import { BudgetSection } from "./BudgetSection";
 import { WorkspaceUsage } from "../WorkspaceUsage";
 import { ConsoleModal } from "../ConsoleModal";
+import { workspaceStatusLabel } from "@/lib/light";
 
 interface Props {
   workspaceId: string;
@@ -199,7 +200,7 @@ export function DetailsTab({ workspaceId, data }: Props) {
             <Row label="Name" value={data.name} />
             <Row label="Role" value={data.role || "—"} />
             <Row label="Tier" value={`T${data.tier}`} />
-            <Row label="Status" value={data.status} />
+            <Row label="Status" {...statusRow(data)} />
             <Row label="URL" value={data.url || "—"} mono />
             <Row label="Parent" value={data.parentId || "root"} mono />
             <Row label="Active Tasks" value={String(data.activeTasks)} />
@@ -411,11 +412,18 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-function Row({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+/** A parked Enter OS Light agent reads "Parked" (asleep between scheduled
+ *  runs), not the hibernated status of its pod. */
+function statusRow(data: WorkspaceNodeData): { value: string; title?: string } {
+  const s = workspaceStatusLabel(data.status, data.lightState);
+  return { value: s.label, title: s.tooltip };
+}
+
+function Row({ label, value, mono, title }: { label: string; value: string; mono?: boolean; title?: string }) {
   return (
     <div className="flex justify-between">
       <span className="text-xs text-ink-mid">{label}</span>
-      <span className={`text-xs text-ink ${mono ? "font-mono" : ""} text-right max-w-[200px] truncate`}>
+      <span title={title} className={`text-xs text-ink ${mono ? "font-mono" : ""} text-right max-w-[200px] truncate`}>
         {value}
       </span>
     </div>
