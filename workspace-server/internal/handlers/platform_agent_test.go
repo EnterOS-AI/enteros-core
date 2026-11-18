@@ -768,6 +768,46 @@ func TestConciergePlatformMCPEnv(t *testing.T) {
 	})
 }
 
+// TestConciergePlatformMCPEnv_DefaultModel: the management MCP's default for a
+// workspace nobody named a model for is the platform default the TENANT holds
+// (MOLECULE_LLM_DEFAULT_MODEL in the tenant server's env, from the control
+// plane on SaaS) — never the concierge's own model, which may be a BYOK pick or
+// an older platform default.
+func TestConciergePlatformMCPEnv_DefaultModel(t *testing.T) {
+	t.Run("carries the tenant's platform default, not the concierge's model", func(t *testing.T) {
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "google/gemini-4-hydrogen")
+		env := map[string]string{
+			"MODEL":          "minimax/MiniMax-M2.7", // the concierge's own (stale) model
+			"MOLECULE_MODEL": "minimax/MiniMax-M2.7",
+		}
+		conciergePlatformMCPEnv(env, "ws-self-1", "admintok")
+		if got := env["MOLECULE_LLM_DEFAULT_MODEL"]; got != "google/gemini-4-hydrogen" {
+			t.Errorf("MOLECULE_LLM_DEFAULT_MODEL = %q, want the tenant's google/gemini-4-hydrogen", got)
+		}
+		if env["MODEL"] != "minimax/MiniMax-M2.7" {
+			t.Errorf("the concierge's own MODEL must be left alone, got %q", env["MODEL"])
+		}
+	})
+
+	t.Run("unset tenant env falls back to the shared platform default", func(t *testing.T) {
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
+		env := map[string]string{}
+		conciergePlatformMCPEnv(env, "ws-self-1", "admintok")
+		if got := env["MOLECULE_LLM_DEFAULT_MODEL"]; got != platformDefaultModelFallback {
+			t.Errorf("MOLECULE_LLM_DEFAULT_MODEL = %q, want %q", got, platformDefaultModelFallback)
+		}
+	})
+
+	t.Run("does not clobber a value already on the box env", func(t *testing.T) {
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "google/gemini-4-hydrogen")
+		env := map[string]string{"MOLECULE_LLM_DEFAULT_MODEL": "google/gemini-3.1-flash-lite"}
+		conciergePlatformMCPEnv(env, "ws-self-1", "admintok")
+		if got := env["MOLECULE_LLM_DEFAULT_MODEL"]; got != "google/gemini-3.1-flash-lite" {
+			t.Errorf("MOLECULE_LLM_DEFAULT_MODEL overwritten to %q, want the preset kept", got)
+		}
+	})
+}
+
 // TestPluginRegistryBase pins the registry-base precedence: an explicit
 // MOLECULE_PLUGIN_REGISTRY wins, else the gitea resolver's MOLECULE_GITEA_BASE_URL
 // (one knob for a self-host that already configured its Gitea origin), else the
