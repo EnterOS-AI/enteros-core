@@ -132,20 +132,36 @@ jobs:
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
         run: |
+          # NOTE: -e is ON regardless of this line — Gitea runs the step as
+          # `bash --noprofile --norc -e -o pipefail {0}` and `set -uo pipefail`
+          # cannot unset it. The two `|| echo ""` fallbacks below exist because
+          # of that: `-fsS` makes curl exit non-zero on any HTTP error, pipefail
+          # promotes it to the pipeline's status, and a bare `VAR=$(pipeline)`
+          # inherits it — so -e killed this step BEFORE the fail-closed guards
+          # could print their diagnostic. The guards are the whole point of the
+          # step; they have to be reachable. Empty is the sentinel each guard
+          # already tests for, and each still exits 1 — fail-closed is preserved,
+          # it just says why now.
           set -uo pipefail
           BASE="https://key.moleculesai.app"
           TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
             -H 'Content-Type: application/json' \
             -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")' || echo "")
           if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
           read_secret() {
             curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=$2" \
               -H "Authorization: Bearer $TOK" \
               | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
           }
-          ADMIN_TOKEN=$(read_secret CP_ADMIN_API_TOKEN %2Fshared%2Fcontrolplane-admin)
-          echo "::add-mask::$ADMIN_TOKEN"
+          ADMIN_TOKEN=$(read_secret CP_ADMIN_API_TOKEN %2Fshared%2Fcontrolplane-admin || echo "")
+          # Mask first (before anything can echo it), but never emit an EMPTY
+          # add-mask: with the guard below now REACHABLE this line runs on the
+          # failure path too, and a zero-length mask pattern is at best ignored
+          # and at worst applied to every log line. `if` and not `[ -n ] &&`:
+          # the latter returns 1 when the token is empty, which -e would take
+          # as a step failure at exactly the wrong moment.
+          if [ -n "$ADMIN_TOKEN" ]; then echo "::add-mask::$ADMIN_TOKEN"; fi
           if [ -z "$ADMIN_TOKEN" ]; then
             echo "::error::Infisical returned empty CP_ADMIN_API_TOKEN at staging /shared/controlplane-admin — failing closed."
             exit 1
@@ -259,12 +275,21 @@ jobs:
             set -e
             # Stderr from curl (-sS shows dial errors etc.) goes to runner log.
             http_code=$(cat /tmp/del_code 2>/dev/null || echo "000")
+            [ -n "$http_code" ] || http_code="000"
             if [ "$http_code" = "200" ] || [ "$http_code" = "204" ]; then
               deleted=$((deleted+1))
               echo "  deleted: $slug"
             else
               failed=$((failed+1))
-              echo "  FAILED ($http_code): $slug — $(cat /tmp/del_resp 2>/dev/null | head -c 200)"
+              # Same absent-response-file case as the orphan-tunnel step below.
+              # This one did NOT take main down only by luck of position: the
+              # substitution sits inside `echo`'s argument, so `echo` supplies
+              # the exit status 0 and -e never sees the failure. Read the file
+              # directly with a usable fallback anyway — the shape must not be
+              # copied out of here into a bare assignment, and "FAILED (000):
+              # slug — " with an empty tail is a worse ops message than one
+              # that says why there is no body.
+              echo "  FAILED ($http_code): $slug — $(head -c 200 /tmp/del_resp 2>/dev/null || echo '<no response body — curl wrote no output file>')"
             fi
           done < stale_slugs.txt
           echo ""
@@ -297,14 +322,43 @@ jobs:
         # tick re-attempts. Errors flow to step output for ops review.
         if: env.DRY_RUN != 'true'
         run: |
+          # SHELL FLAGS ARE NOT WHAT THIS BLOCK'S `set` LINES SAY.
+          # Gitea/act_runner invokes a `run:` block as
+          #     bash --noprofile --norc -e -o pipefail {0}
+          # so -e AND -o pipefail are ALREADY ON at line 1. A step cannot
+          # infer its flags from its own `set` line; it can only ADD to them.
           set +e
           curl -sS -o /tmp/cleanup_resp -w "%{http_code}" \
             --max-time 60 \
             -X POST "$MOLECULE_CP_URL/cp/admin/orphan-tunnels/cleanup" \
             -H "Authorization: Bearer $ADMIN_TOKEN" >/tmp/cleanup_code
           set -e
+          # /tmp/cleanup_code is created by the shell redirect, so it always
+          # exists — but it is EMPTY if curl never ran. Normalise, per the
+          # fix template in .gitea/scripts/lint-curl-status-capture.py.
+          # (`[ -n x ] || y` and not `[ -z x ] && y`: the latter returns 1 when
+          # its test is false, which detonates if it ever ends up last in a step.)
           http_code=$(cat /tmp/cleanup_code 2>/dev/null || echo "000")
-          body=$(cat /tmp/cleanup_resp 2>/dev/null | head -c 500)
+          [ -n "$http_code" ] || http_code="000"
+          # THE RESPONSE FILE IS ROUTINELY ABSENT. curl's `-o` does not open
+          # the output file when the transfer dies at DNS/connect/timeout —
+          # precisely the failure this step exists to report. The previous
+          # line here was
+          #     body=$(cat /tmp/cleanup_resp 2>/dev/null | head -c 500)
+          # which is a PIPELINE inside a bare assignment: under the inherited
+          # -e -o pipefail, `cat`'s exit 1 became the pipeline's status, became
+          # the assignment's status, and killed the step — one line ABOVE the
+          # `if` that prints the benign warning. `2>/dev/null` hid the message,
+          # not the status (the redirect belongs to `cat`; the failure is the
+          # pipeline's). A step documented "best-effort, failure here doesn't
+          # fail the workflow" red-walled main for over an hour on 2026-08-11.
+          # Read the file directly — no pipeline — and give the fallback a
+          # USABLE value. `|| true` would be wrong: it converts "command
+          # failed" into "empty body", which reads downstream as "the endpoint
+          # answered with nothing" and is a different bug. Symmetry with the
+          # http_code fallback above is the point; one line having a fallback
+          # and its neighbour not is how this survived review.
+          body=$(head -c 500 /tmp/cleanup_resp 2>/dev/null || echo "<no response body — curl wrote no output file (connect/DNS/timeout failure)>")
           if [ "$http_code" = "200" ]; then
             count=$(echo "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read() or '{}'); print(d.get('deleted_count', 0))" 2>/dev/null || echo "0")
             failed_n=$(echo "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read() or '{}'); print(len(d.get('failed') or {}))" 2>/dev/null || echo "0")

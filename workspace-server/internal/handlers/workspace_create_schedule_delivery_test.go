@@ -101,6 +101,16 @@ func driveScheduledCreate(t *testing.T, configsDir, templateName string) provisi
 	capture := &captureCPProv{}
 	wh.SetCPProvisioner(capture)
 
+	// A REAL uuid: workspaces.id is `uuid`, and the create path now validates a
+	// caller-supplied parent_id (validateCreateParentID) before the INSERT, so
+	// the old "parent-ws" placeholder is a 400. It would have failed the FK
+	// cast against a real database too — the placeholder only ever worked
+	// because sqlmock does not type-check arguments.
+	const schedParentID = "dddddddd-000a-0000-0000-000000000000"
+	mock.ExpectQuery("SELECT status.*FROM workspaces WHERE id").
+		WithArgs(schedParentID).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("online"))
+
 	// ── Parent-goroutine load-bearing statements (Create body) ──
 	mock.ExpectBegin()
 	mock.ExpectExec(`INSERT INTO workspaces`).
@@ -120,7 +130,7 @@ func driveScheduledCreate(t *testing.T, configsDir, templateName string) provisi
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	body := `{"name":"Sched Create","runtime":"claude-code","model":"minimax/MiniMax-M2.7","template":"` +
-		templateName + `","parent_id":"parent-ws"}`
+		templateName + `","parent_id":"` + schedParentID + `"}`
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
@@ -252,10 +262,11 @@ func TestWorkspaceCreate_ScheduleGuardsHoldOnCreatePath(t *testing.T) {
 	// Boot-brick guard: the ASSEMBLED document must parse (pre-fix emission of
 	// the indented-first-line prompt fails right here).
 	entries := parseRenderedSchedules(t, delivered)
-	// The non-kebab "Bad Name" must be skipped; the two contract-valid entries
-	// survive.
-	if len(entries) != 2 {
-		t.Fatalf("want 2 surviving schedules (non-kebab skipped), got %d:\n%s", len(entries), delivered)
+	// "Bad Name" is now SLUGIFIED rather than skipped, so all three survive.
+	// The guard that matters is unchanged: the raw non-contract name must never
+	// reach the delivered config.yaml, because the runtime would skip it.
+	if len(entries) != 3 {
+		t.Fatalf("want 3 surviving schedules (non-kebab slugified), got %d:\n%s", len(entries), delivered)
 	}
 	names := map[string]bool{}
 	for _, e := range entries {
@@ -264,8 +275,16 @@ func TestWorkspaceCreate_ScheduleGuardsHoldOnCreatePath(t *testing.T) {
 	if !names["indented-review"] || !names["plain-sibling"] {
 		t.Errorf("valid siblings missing: %#v", entries)
 	}
+	if !names["bad-name"] {
+		t.Errorf("the non-kebab entry should have been slugified to bad-name: %#v", entries)
+	}
 	if names["Bad Name"] || strings.Contains(string(delivered), "Bad Name") {
-		t.Errorf("non-contract name leaked into delivered config.yaml:\n%s", delivered)
+		t.Errorf("raw non-contract name leaked into delivered config.yaml:\n%s", delivered)
+	}
+	for n := range names {
+		if !scheduleNamePattern.MatchString(n) {
+			t.Errorf("delivered config.yaml carries %q, which the runtime would skip", n)
+		}
 	}
 	// Indented-first-line prompt content preserved byte-exact, and the
 	// known-broken block-scalar indicator is absent.

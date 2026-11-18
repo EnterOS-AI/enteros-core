@@ -30,9 +30,14 @@ import (
 //
 // How it detects
 // --------------
-// last_activity_at is stamped write-through on EVERY activity_logs write
-// (handlers/activity.go logActivityExec, via a CTE). A workspace that is
-// genuinely working advances it constantly. So:
+// last_activity_at is stamped write-through, in the same statement (a CTE),
+// by every activity row written through logActivityExec (handlers/activity.go):
+// A2A traffic, the runtime's activity reports, memory writes. Two kinds of
+// row leave it alone: an Enter OS Light run's own rows (a run is not the
+// agent's own activity), and rows other handlers INSERT directly (notifies to
+// the user, delegation records, the MCP bridge's tool-call row, memory audit
+// rows, broadcasts). A workspace that is genuinely working advances it through
+// its own reports and replies. So:
 //
 //	status='online' AND active_tasks>0 AND last_activity_at < now()-STALE_AFTER
 //
@@ -125,8 +130,8 @@ type StallWatchdog struct {
 	enqueue stallEnqueueFunc
 
 	// restart fires a soft-restart (existing-volume) for a workspace id.
-	// Production wiring passes WorkspaceHandler.RestartByID; tests inject a
-	// recorder. nil restart = restart stage disabled (probe-only), logged.
+	// Production wiring passes WorkspaceHandler.AutoRestartByID; tests inject
+	// a recorder. nil restart = restart stage disabled (probe-only), logged.
 	restart func(workspaceID string)
 
 	// decideWake / markWakeDelivered route the probe through the wake-lifecycle
@@ -160,7 +165,7 @@ func (s *StallWatchdog) SetWakeHooks(
 // long-running process picks them up via restart, not mid-flight (mirrors
 // NewRequestNudgeSweeper / NewDelegationSweeper).
 //
-// restartFunc is the in-process soft-restart (WorkspaceHandler.RestartByID).
+// restartFunc is the in-process soft-restart (WorkspaceHandler.AutoRestartByID).
 func NewStallWatchdog(handle *sql.DB, restartFunc func(string)) *StallWatchdog {
 	if handle == nil {
 		handle = db.DB

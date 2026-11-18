@@ -47,6 +47,7 @@
 #
 # Required env:
 #   MOLECULE_ADMIN_TOKEN   staging CP admin bearer from Infisical /shared/controlplane-admin
+#   E2E_INFRA_BACKEND      required: local-docker
 # Optional env:
 #   MOLECULE_CP_URL        default https://staging-api.moleculesai.app
 #   E2E_RUN_ID             slug suffix; CI passes ${GITHUB_RUN_ID}
@@ -77,6 +78,8 @@ set -uo pipefail
 # local.sh). Only provisioning/teardown differs per backend.
 # shellcheck source=tests/e2e/lib/peer_visibility_assert.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/peer_visibility_assert.sh"
+# shellcheck source=tests/e2e/lib/model_slug.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/model_slug.sh"
 # Shared ephemeral-topology contract (derive_tenant_topology). Default (all
 # MOLECULE_TENANT_* unset) reproduces exact staging routing byte-for-byte; the
 # ephemeral runner points MOLECULE_TENANT_URL at the CP base +
@@ -91,6 +94,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/cp_purge_receipt.sh"
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
+e2e_cp_require_local_backend || exit 2
+e2e_cp_require_staging_origin "$CP_URL" || exit 2
 # RUN_ID_SUFFIX removed (core#2782 follow-up shellcheck): the slug
 # now comes from make_collision_proof_slug below; the old suffix
 # var is dead.
@@ -227,6 +232,42 @@ teardown() {
     0) log "[teardown] ✓ $SLUG purged" ;;
     2) exit 2 ;;
     *)
+      # ── MERGE NOTE: main 9fc3d764c × this fix ────────────────────────────────
+      # Two intentional changes met here and BOTH are kept.
+      #
+      # This fix replaces the hand-rolled single-shot DELETE with the SSOT helper,
+      # so a transient 409 "active lifecycle operation" is now RETRIED instead of
+      # leaking the tenant. main 9fc3d764c independently established that failing
+      # to prove the purge is an INFRA sub-step, not the thing under test:
+      # escalating rc 0->4 fails the whole scenario, and peer_visibility is in
+      # E2E_EPHEMERAL_EXTRA_GATING, so on the ephemeral CP that turns a PASS into a
+      # merge-block (core#4923 run 584794 printed
+      #   ✅ GATE PASSED — every runtime under test sees its platform peers via the literal MCP call
+      # for 3/3 peers on all three runtimes, then was failed by the escalation alone).
+      #
+      # The escalation is RIGHT on staging, where a leaked tenant is durable and has
+      # caused a real provisioning outage. It is wrong on the ephemeral CP: that
+      # control plane is destroyed with the job, so a tenant outliving teardown
+      # outlives nothing — and the remediation the message names
+      # (sweep-stale-e2e-orgs, 90m age floor, "a later main push") never sees an
+      # ephemeral org at all.
+      #
+      # E2E_CP_ALLOW_EPHEMERAL_LOOPBACK is the discriminator: ephemeral_cp_happy_path.sh
+      # sets it on BOTH peer_visibility invocations (managed and external) and no
+      # staging lane does. NOT E2E_INFRA_BACKEND=local-docker — staging-tenant-cd.yml
+      # and runtime-default-flip-gate.yml set that too, so keying on it would silently
+      # disarm the check on staging, the one place it must keep biting.
+      #
+      # Only the rc ESCALATION is suppressed, never the diagnosis: the helper has
+      # already printed WHICH failure this was ([cp-purge] persistent 409 / receipt
+      # mismatch / surviving org) on stderr above, and that stays in the log. The
+      # staging arm below is still fully fail-closed, and
+      # test_peer_visibility_teardown_unit.sh drives the persistent-409 case through
+      # BOTH arms so neither is a no-op.
+      if [ "${E2E_CP_ALLOW_EPHEMERAL_LOOPBACK:-0}" = "1" ]; then
+        echo "::warning::[teardown] $SLUG was not provably purged on an EPHEMERAL CP (see the [cp-purge] diagnosis above). The control plane is torn down with this job, so this is not a durable leak and does NOT fail the gate. (sweep-stale-e2e-orgs does not apply here.) Scenario result is unchanged: rc=$rc" >&2
+        exit "$rc"
+      fi
       echo "::warning::[teardown] $SLUG was not provably purged — investigate now; sweep-stale-e2e-orgs retries on a later main push after its 90m age floor" >&2
       [ "$rc" -eq 0 ] && rc=4
       exit "$rc"
@@ -323,16 +364,10 @@ SECRETS_JSON='{}'
 # needed; this gate only needs the workspace to boot + list peers, not heavy
 # LLM work), validated against the controlplane providers SSOT
 # (internal/providers/providers.yaml runtimes.<rt>.providers[platform].models):
-#   claude-code → anthropic/claude-sonnet-4-6   (platform claude model)
-#   hermes/openclaw → moonshot/kimi-k2.6         (their only platform family)
+# All three runtimes use the shared platform default from lib/model_slug.sh.
 # E2E_MODEL_SLUG overrides for operator-dispatched runs.
 pv_platform_model_for_runtime() {
-  if [ -n "${E2E_MODEL_SLUG:-}" ]; then printf '%s' "$E2E_MODEL_SLUG"; return 0; fi
-  case "$1" in
-    claude-code) printf 'anthropic/claude-sonnet-4-6' ;;
-    hermes|openclaw) printf 'moonshot/kimi-k2.6' ;;
-    *) printf 'moonshot/kimi-k2.6' ;;
-  esac
+  E2E_LLM_PATH=platform pick_model_slug "$1"
 }
 
 log "4/6 provisioning parent + one sibling per runtime under test (mode=${PV_PROVISION_MODE})..."

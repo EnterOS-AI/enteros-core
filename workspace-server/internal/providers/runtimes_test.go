@@ -115,19 +115,29 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 			"claude-sonnet-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-haiku-4-5", "claude-sonnet-4-5",
 			"anthropic:claude-sonnet-4-6", "anthropic:claude-opus-4-7", "anthropic:claude-opus-4-8",
 			"anthropic:claude-haiku-4-5", "anthropic:claude-sonnet-4-5",
-			// anthropic via platform proxy (namespaced)
+			// anthropic via platform proxy (namespaced) — WITHDRAWN 2026-08-04
+			// (sdk#203, minimax-only platform arms). Kept listed as a comment so
+			// RESTORED 2026-08-05 (sdk#204): these three were healthy all along
+			// (HTTP 200 through the metered proxy) and #203 withdrew them by
+			// mistake. Back on the menu verbatim, as the note above prescribed.
 			"anthropic/claude-opus-4-7", "anthropic/claude-opus-4-8", "anthropic/claude-sonnet-4-6",
 			// kimi (kimi-coding gateway, bare form only — colon-forms removed
 			// because claude-code's adapter cannot strip the moonshot: prefix;
 			// openclaw retains them natively, cp#521).
 			"kimi-for-coding", "kimi-k2.5", "kimi-k2",
-			// kimi via platform proxy
-			"moonshot/kimi-k2.6", "moonshot/kimi-k2.5",
+			// kimi via platform proxy — WITHDRAWN 2026-08-04 (suspended Moonshot
+			// vendor account; sdk#203). Restore alongside the registry arm:
+			//   "moonshot/kimi-k2.6", "moonshot/kimi-k2.5",
 			// minimax BYOK (bare form only — colon-forms removed because
 			// claude-code's adapter cannot strip the minimax: prefix, cp#521).
 			"MiniMax-M2", "MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3",
 			// minimax via platform proxy
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
+			// Claude Fable 5.1 via platform proxy + Auto routing (molecule-ai-sdk#221).
+			"anthropic/claude-fable-5-1", "platform/auto",
+			// Gemini via platform proxy (Google AI Studio): the platform default and
+			// the e2e model (molecule-ai-sdk#225).
+			"google/gemini-4-hydrogen", "google/gemini-4-carbon", "google/gemini-3.1-flash-lite",
 		},
 		// hermes: kimi (BYOK gateway) + platform-managed kimi + platform-managed
 		// MiniMax (task #83 / shared-default parity, CTO 2026-06-24): MiniMax is
@@ -136,11 +146,17 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 		// — closing the cross-runtime gap that left hermes Kimi-only.
 		"hermes": {
 			"kimi-coding/kimi-k2",
-			"moonshot/kimi-k2.6", "moonshot/kimi-k2.5",
+			// kimi via platform proxy — WITHDRAWN 2026-08-04 (suspended Moonshot
+			// vendor account; sdk#203). Restore alongside the registry arm:
+			//   "moonshot/kimi-k2.6", "moonshot/kimi-k2.5",
 			// minimax via tenant BYOK key (self-host onboarding default)
 			"minimax:MiniMax-M2.7", "minimax:MiniMax-M2.7-highspeed", "minimax:MiniMax-M3",
 			// minimax via platform proxy (task #83 platform default)
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
+			// Auto routing pseudo-model (molecule-ai-sdk#221).
+			"platform/auto",
+			// Gemini via platform proxy (molecule-ai-sdk#225).
+			"google/gemini-4-hydrogen", "google/gemini-4-carbon", "google/gemini-3.1-flash-lite",
 		},
 		// codex: openai BYOK + platform-managed openai (served via the proxy
 		// Responses surface; codex CLI 0.130+ is Responses-API-only) +
@@ -150,9 +166,16 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 		"codex": {
 			"gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
 			"gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2",
+			// openai via platform proxy — RESTORED 2026-08-05 (sdk#204). #203
+			// withdrew these under the minimax-only directive even though they
+			// were LIVE and healthy; the live probe confirmed HTTP 200 on both.
 			"openai/gpt-5.4", "openai/gpt-5.4-mini",
 			// minimax via platform proxy (task #83 platform default)
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
+			// Auto routing pseudo-model (molecule-ai-sdk#221).
+			"platform/auto",
+			// Gemini via platform proxy (molecule-ai-sdk#225).
+			"google/gemini-4-hydrogen", "google/gemini-4-carbon", "google/gemini-3.1-flash-lite",
 		},
 		// openclaw: kimi BYOK (moonshot: prefix -> KIMI_API_KEY ->
 		// api.kimi.com/coding gateway) + platform-managed kimi (moonshot/) +
@@ -161,11 +184,18 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 		// ids (the platform default), distinct from its BYOK colon-form models.
 		"openclaw": {
 			"moonshot:kimi-k2.6", "moonshot:kimi-k2.5",
-			"moonshot/kimi-k2.6", "moonshot/kimi-k2.5",
+			// kimi via platform proxy — WITHDRAWN 2026-08-04 (suspended Moonshot
+			// vendor account; sdk#203). The BYOK COLON forms above are untouched:
+			// they bill the tenant's own KIMI_API_KEY. Restore with the arm:
+			//   "moonshot/kimi-k2.6", "moonshot/kimi-k2.5",
 			// minimax via tenant BYOK key (self-host onboarding default)
 			"minimax:MiniMax-M2.7", "minimax:MiniMax-M2.7-highspeed",
 			// minimax via platform proxy (task #83 platform default)
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
+			// Auto routing pseudo-model (molecule-ai-sdk#221).
+			"platform/auto",
+			// Gemini via platform proxy (molecule-ai-sdk#225).
+			"google/gemini-4-hydrogen", "google/gemini-4-carbon", "google/gemini-3.1-flash-lite",
 		},
 	}
 

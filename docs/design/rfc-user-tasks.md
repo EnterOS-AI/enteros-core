@@ -78,7 +78,7 @@ delete_user_task(user_task_id)          → delete own task
 So every agent (any workspace, via MCP) can create AND manage its own asks —
 `request_user_action` is the create; `list_/update_/delete_user_task` are the
 read/update/delete, all scoped to tasks the calling workspace raised. None are
-gated behind `MOLECULE_MCP_ALLOW_SEND_MESSAGE` (that gate is specific to
+affected by `MOLECULE_MCP_ALLOW_SEND_MESSAGE` (that kill-switch is specific to
 `send_message_to_user`); raising/managing an ask is always allowed.
 
 ### Events

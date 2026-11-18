@@ -89,7 +89,13 @@ exit code unaffected) and is promoted to blocking by setting
 `NOOP_GATE_ENFORCE=1` once those four lanes are converted to
 always-run. Arm A is and stays BLOCKING. Tracking: task #105.
 
-Exit codes:
+Exit codes — the MACHINE-READABLE copy is `EXIT_MEANING` below; this prose
+must agree with it, and the test suite enumerates the dict, not this text.
+Every non-clean exit writes a GITHUB_STEP_SUMMARY block whose wording is
+determined by its class there ("finding" says it IS one; "did-not-run" says
+it is NOT). A branch that skips the summary fails
+`test_every_non_clean_exit_writes_a_summary`.
+
   0 — no required workflow has a paths/paths-ignore filter (clean).
       Arm-B findings may be present as ::warning:: (report-only mode).
   1 — at least one required workflow has a paths/paths-ignore filter
@@ -99,12 +105,57 @@ Exit codes:
   2 — env contract violation (missing GITEA_TOKEN/HOST/REPO/BRANCH).
   3 — workflows directory missing, workflow YAML unparseable, or the
       required-contexts SSOT file is missing.
-  4 — FAIL-CLOSED verification failure: branch_protections 401/403
-      auth failure (token can't read BP), 5xx transient (propagated
-      ApiError), unexpected response shape, or an EMPTY enforced-context
-      set (nothing to lint == the absent-input green; see above). This
-      is a HARD gate on a protected context — it MUST NOT green when it
-      cannot verify.
+  4 — FAIL-CLOSED verification failure: THE API ANSWERED and its answer
+      blocks verification — branch_protections 401/403 auth failure
+      (token can't read BP), any other terminal 4xx, unexpected response
+      shape, or an EMPTY enforced-context set (nothing to lint == the
+      absent-input green; see above). This is a HARD gate on a protected
+      context — it MUST NOT green when it cannot verify.
+  5 — INFRASTRUCTURE UNREACHABLE: the API NEVER ANSWERED. Every attempt
+      failed transiently (5xx / 429 / connection reset / timeout) and
+      the retry budget was exhausted. See "Transient failures" below.
+
+Transient failures — "did not run" is not "failed" (added after a
+Cloudflare 502 red-Xed this required lane)
+------------------------------------------------------------------
+Runners reach git.moleculesai.app THROUGH CLOUDFLARE. A transient 502 at
+that edge used to propagate out of `api()` as an uncaught ApiError:
+
+    ApiError: GET /repos/molecule-ai/molecule-core/branch_protections/main
+              → HTTP 502
+
+An uncaught exception exits 1 — and exit 1 in the table above means "at
+least one required workflow has a paths/paths-ignore filter". The lint
+had opened ZERO workflow files. It reported a compliance finding it had
+not made. That is the inverse of the vacuous pass and the same underlying
+fault: the result did not reflect what was examined.
+
+Now:
+  * `api()` RETRIES transient failures — 5xx (including Cloudflare's 52x
+    family), 429, and any incomplete HTTP transaction (classified by BASE
+    class: `OSError` + `http.client.HTTPException`, which covers reset,
+    timeout, TLS error, half-closed keepalive and truncated body in BOTH
+    the connect AND the read phase) — with jittered exponential backoff,
+    `API_MAX_ATTEMPTS` (default 4) attempts.
+  * Nothing escapes as a bare traceback. `main()` catches `Exception` and
+    returns 4 ("verification did not complete"), never 1. It does NOT
+    return 5 for an internal fault: exit 5 asserts "the API never
+    answered", and claiming that about a bug in our own YAML walk would be
+    inventing a cause we did not observe — the same fault, one level up.
+  * 4xx IS NOT RETRIED. A 401/403/404/422 is an authorisation or
+    addressing FACT; the next identical request returns the identical
+    answer. Retrying it burns the budget for no possible change AND —
+    the real harm — buries a permissions defect under retry noise so it
+    reads as weather. (Live instance: the merge-queue actor 403s on this
+    exact endpoint and falls back to a hardcoded REQUIRED_APPROVALS: 2
+    while BP says 1. That 403 must stay loud and immediate.) 429 is the
+    sole 4xx exception: it means "later", not "no".
+  * Retry exhaustion raises `ApiUnreachable` (a distinct subclass) and
+    exits 5 behind an unmistakable `LINT DID NOT RUN` banner stating
+    that zero workflow files were inspected and that there is no finding
+    to hunt. Red, deliberately — a lint that greens when it cannot check
+    is the defect this catalogue is full of — but never red with a
+    compliance-shaped message.
 
 Auth note: the token used for `GET /repos/.../branch_protections/{branch}`
 needs repo-admin access. The workflow-default `GITHUB_TOKEN` is non-admin;
@@ -116,10 +167,14 @@ tolerated graceful skip.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import random
 import re
 import sys
+import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -130,13 +185,239 @@ import yaml  # PyYAML 6.0.2 — installed by the workflow before this runs.
 
 
 # --------------------------------------------------------------------------
+# THE EXIT CONTRACT — machine-readable, because prose is not enumerable
+# --------------------------------------------------------------------------
+# This table is the SSOT for what each exit code MEANS, and it exists so the
+# test suite can ENUMERATE the contract instead of hand-listing a subset of
+# it. The first version of the "every branch reports" control parametrised
+# over three hand-written scenarios covering exits {0,4,5} and claimed to
+# prove that no branch could be added without a run-summary — while exits 1,
+# 2 and 3 wrote nothing and the control could not notice. A guard that
+# covers half its class and claims the whole class is the same defect this
+# file exists to eliminate, so the class is now derived from here.
+#
+# `klass` drives the CONTENT contract, because the branches genuinely differ:
+#   "finding"     — the lint looked and found something. Exit 1 IS a
+#                   compliance finding; its banner must say so.
+#   "did-not-run" — the lint could not complete a verdict. Its banner must
+#                   say it is NOT a compliance finding.
+#   "clean"       — nothing to report; must NOT emit a scary banner.
+#
+# It is authoritative for WHICH CODES EXIST as well as what they mean. That
+# second half is enforced from OUTSIDE the runtime, by an AST test that walks
+# this module and asserts every `return <int>` / `sys.exit(<int>)` / `_die(<int>)`
+# literal is a key here. Membership cannot be checked at runtime because a
+# branch that never executes never proves anything — so the domain is DERIVED
+# from the source, never enumerated by hand. (Same technique as cp#2938 for a
+# structurally identical problem.) Add a branch returning an undeclared code
+# and `test_every_exit_literal_is_declared` fails, naming the line.
+#
+# Fields: (klass, meaning, what the operator should do).
+EXIT_MEANING: dict[int, tuple[str, str, str]] = {
+    0: (
+        "clean",
+        "clean — every resolvable enforced context was inspected",
+        "nothing to do",
+    ),
+    1: (
+        "finding",
+        "a required workflow carries a paths/paths-ignore filter",
+        "fix the workflow: remove the filter, make the job always run",
+    ),
+    2: (
+        "did-not-run",
+        "env contract violation (missing GITEA_TOKEN/HOST/REPO/BRANCH)",
+        "fix the workflow's env block",
+    ),
+    3: (
+        "did-not-run",
+        "unusable input (workflows dir, workflow YAML, or SSOT file)",
+        "fix the checked-in input the message names",
+    ),
+    4: (
+        "did-not-run",
+        "the API answered and its answer blocks verification",
+        "fix the token / the SSOT — re-running will NOT help",
+    ),
+    5: (
+        "did-not-run",
+        "the API never answered (transient, retries exhausted)",
+        "re-run the job; if it persists the Gitea/Cloudflare edge is down",
+    ),
+    # The class here is "unknown", and that third class exists because of a
+    # real inversion found in review. `_verdict_summary()` raises KeyError on
+    # an undeclared code; KeyError is an Exception; main()'s catch-all mapped
+    # it to exit 4, whose class is "did-not-run". So `_die(6, "workflow
+    # carries a filter")` — a FINDING with an unregistered code — reached the
+    # operator as "NOT a compliance finding". Loud (traceback, THE LINT
+    # CRASHED, red CI), but the CLASS WAS WRONG: the exact inversion this
+    # file exists to prevent, one frame up.
+    #
+    # When the contract is violated we do not KNOW the class, so we must
+    # assert neither. Hence a class that claims nothing.
+    7: (
+        "unknown",
+        "the lint's own exit contract was violated — verdict UNKNOWN",
+        "bug in the lint: this run proves nothing either way; fix the "
+        "undeclared exit code",
+    ),
+}
+
+# ONE table, built fresh from EXIT_MEANING on every call. There is
+# deliberately NO module-level `_EXIT_TABLE_MD` constant: a constant computed
+# at import time cannot be seen to track EXIT_MEANING, so a drift test cannot
+# tell "derived" from "hand-written but currently identical". Building it here
+# means `test_the_banners_track_EXIT_MEANING` can mutate the registry and
+# assert the banner follows — which catches a re-added hand table in ANY
+# quoting style, and catches real drift, neither of which a byte-string
+# regression pin can do.
+def _exit_table_md(highlight: int | None = None) -> str:
+    """The derived exit table, optionally bolding the row you are on."""
+    rows = ["| exit | meaning | what to do |", "|---|---|---|"]
+    for c, (_k, why, action) in sorted(EXIT_MEANING.items()):
+        if c == highlight:
+            rows.append(f"| **{c}** | **{why} — you are here** | **{action}** |")
+        else:
+            rows.append(f"| {c} | {why} | {action} |")
+    return "\n".join(rows)
+
+
+class ExitContractViolation(Exception):
+    """A branch tried to exit with a code EXIT_MEANING does not declare.
+
+    Its own type, rather than a bare KeyError, so `main()` can handle it
+    BEFORE the generic catch-all. That ordering is the whole point: the
+    catch-all maps to exit 4, whose class is "did-not-run", which would
+    describe an undeclared FINDING as a non-run.
+
+    NOTE THE ASYMMETRY — this is a runtime guard and it only fires on paths
+    that try to DESCRIBE themselves (`_die()` / `_report_finding()`). A bare
+    `return 6` in `run()` never reaches `_verdict_summary()` at all, so for
+    `return` statements the AST test is the ONLY gate.
+    """
+
+
+def _step_summary(markdown: str) -> None:
+    """Also surface a message in the run-summary UI, not only in the log.
+
+    A failed step's log is collapsed by default; the run summary is what an
+    operator sees first. "Unmistakable" has to mean unmistakable BEFORE
+    anyone expands a log — that is the difference between reading
+    `LINT DID NOT RUN` and spending an hour hunting a workflow defect that
+    does not exist. Best-effort: never let reporting break the verdict."""
+    dest = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not dest:
+        return
+    try:
+        with open(dest, "a", encoding="utf-8") as fh:
+            fh.write(markdown.rstrip() + "\n")
+    except OSError as exc:  # pragma: no cover - reporting must never throw
+        sys.stderr.write(f"::warning::could not write step summary: {exc}\n")
+
+
+def _verdict_summary(code: int, headline: str, detail: str = "") -> str:
+    """Build the class-appropriate run-summary block for `code`.
+
+    RAISES on an undeclared code — deliberately, and this is the runtime half
+    of making EXIT_MEANING authoritative for EXISTENCE and not just meaning.
+
+    This used to be `EXIT_MEANING.get(code, ("did-not-run", "unknown"))`. A
+    silent fallback is exactly the wrong behaviour here: a new branch exiting
+    an undeclared code would be described as "did-not-run" — so a genuine
+    FINDING would be announced to the operator as a non-run. That is the
+    precise inversion this whole file exists to prevent, arrived at by
+    default rather than by decision. A branch that cannot say what it means
+    must fail while trying to say it, not guess.
+    """
+    if code not in EXIT_MEANING:
+        raise ExitContractViolation(
+            f"exit code {code} is not declared in EXIT_MEANING. Every exit "
+            f"this script can produce must be registered there with its "
+            f"class ('finding' vs 'did-not-run'), because the class decides "
+            f"how the run-summary characterises the result. Refusing to "
+            f"guess."
+        )
+    klass, why, _action = EXIT_MEANING[code]
+    if klass == "finding":
+        lead = (
+            "**This IS a compliance finding — a required workflow really does "
+            "carry a paths/paths-ignore filter.**"
+        )
+        title = "lint-required-no-paths — **FINDING**"
+    elif klass == "unknown":
+        # Assert NEITHER class. We do not know which this was, and guessing
+        # is what produced the inversion this class exists to prevent.
+        lead = (
+            "**This run proves NOTHING about compliance.** The lint could not "
+            "classify its own outcome, so treat the result as unverified — "
+            "do not conclude that anything is compliant or non-compliant."
+        )
+        title = "lint-required-no-paths — **EXIT CONTRACT VIOLATED**"
+    else:
+        lead = (
+            "**This is NOT a compliance finding. No workflow was judged.**"
+        )
+        title = "lint-required-no-paths — **LINT DID NOT COMPLETE**"
+    parts = [f"## ⚠ {title}", "", lead, "", headline]
+    if detail:
+        parts += ["", detail]
+    parts += ["", f"Exit **{code}** — {why}.", "", _exit_table_md(code)]
+    return "\n".join(parts)
+
+
+def _report_finding(
+    offenders: list[tuple[str, "Path", list[str]]], *, arm: str
+) -> None:
+    """Run-summary block for exit 1 — the branch that IS a finding.
+
+    Exits 4 and 5 got a banner first because they were the ones being
+    MISREAD as findings. But the converse branch needs the summary just as
+    much: a real Arm-A hit is what the operator must act on, and it was
+    the only non-clean exit still reporting to a collapsed log alone.
+    """
+    lines = "\n".join(
+        f"- `{ctx}` — `{path.name}`" for ctx, path, _f in offenders
+    )
+    _step_summary(
+        _verdict_summary(
+            1,
+            f"**Arm {arm}** — {len(offenders)} required context(s) affected:",
+            f"{lines}\n\nA required check that cannot run (Arm A) or can "
+            f"green without running (Arm B) is a vacuous gate. Fix the "
+            f"workflow: remove the filter and make the job always run.",
+        )
+    )
+
+
+def _die(code: int, message: str, *, detail: str = "") -> None:
+    """Terminal exit for the hard-input / env branches.
+
+    Writes the `::error::` line AND the run-summary block, then exits — so
+    a branch cannot be added that reports to the log but not to the summary.
+    Raises SystemExit, which main() deliberately does NOT catch (see there).
+
+    THIS FUNCTION IS THE STRUCTURAL GUARANTEE — not the test drivers.
+    `test_every_non_clean_exit_writes_a_summary` covers each exit CODE once,
+    which is NOT the same as covering each exit SITE: there are four
+    `_die(3, ...)` call sites and the exit-3 driver exercises only the
+    missing-SSOT one, so reverting a different site to a bare
+    `stderr.write()` + `sys.exit(3)` would leave the suite green. What makes
+    every site safe is that they all route through here. If you are adding a
+    hard-input exit, call `_die()`; do not hand-roll the pair, because the
+    per-code driver will not notice that you did.
+    """
+    sys.stderr.write(f"::error::{message}\n")
+    _step_summary(_verdict_summary(code, message, detail))
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------
 # Environment
 # --------------------------------------------------------------------------
 def _env(key: str, *, required: bool = True, default: str | None = None) -> str:
     val = os.environ.get(key, default)
     if required and not val:
-        sys.stderr.write(f"::error::missing required env var: {key}\n")
-        sys.exit(2)
+        _die(2, f"missing required env var: {key}")
     return val or ""
 
 
@@ -179,14 +460,40 @@ API = f"https://{GITEA_HOST}/api/v1" if GITEA_HOST else ""
 # the same reason.)
 _GITEA_UA = "molecule-ci-gate/1.0 (+gitea-api)"
 
+# ---- Gitea's OWN 403 bodies, quoted verbatim -----------------------------
+# These are named constants and not inline literals for one reason: they are
+# EXTERNAL text. A quoted external message must come from a captured response
+# or an existing in-repo occurrence — never from memory of what such a message
+# looks like. An earlier revision of this table carried a paraphrase along
+# the lines of "<user> lacks admin access to <repo>" — plausible, reading
+# exactly like real Gitea output, and NONEXISTENT. Because the surrounding
+# column
+# says "the body says" and the banner tells the operator to MATCH against it,
+# a real permission-403 matched neither Gitea row and fell through to the
+# Cloudflare row — the wrong diagnosis for the one 403 this repo actually
+# hits, and worse than the prose it replaced.
+#
+# Sources (both, deliberately — probe AND in-repo corroboration):
+#   permission  — live probe of GET /repos/{o}/{r}/branch_protections/{b} on
+#                 Gitea 1.26.4 with three separate non-admin tokens, and
+#                 `.gitea/scripts/gitea-merge-queue.py:1163`, which documents
+#                 the same endpoint's admin-only 403 in the same words.
+#   token scope — live probe, same endpoint, scope-restricted token.
+# `test_the_403_substrings_are_the_real_gitea_strings` pins both, including
+# the cross-check against gitea-merge-queue.py, so the next edit cannot drift
+# them back into paraphrase.
+_BP_403_PERMISSION = (
+    "user should be an owner or a collaborator with admin write of a repository"
+)
+_BP_403_TOKEN_SCOPE = "token does not have at least one of required scope(s)"
+
 
 def _require_runtime_env() -> None:
     """Enforce env contract — called from `run()` only. Tests import
     individual functions without setting the full env contract."""
     for key in ("GITEA_TOKEN", "GITEA_HOST", "REPO", "BRANCH"):
         if not os.environ.get(key):
-            sys.stderr.write(f"::error::missing required env var: {key}\n")
-            sys.exit(2)
+            _die(2, f"missing required env var: {key}")
 
 
 # --------------------------------------------------------------------------
@@ -195,7 +502,127 @@ def _require_runtime_env() -> None:
 # `feedback_api_helper_must_raise_not_return_dict`).
 # --------------------------------------------------------------------------
 class ApiError(RuntimeError):
-    """Raised when a Gitea API call cannot be trusted to have succeeded."""
+    """Raised when a Gitea API call cannot be trusted to have succeeded.
+
+    Semantics: the API ANSWERED, and its answer means we cannot proceed
+    (403 = fix the token, 422 = fix the request, non-JSON = fix the host).
+    The answer is a FACT about the request, and repeating the request
+    reproduces it.
+    """
+
+
+class ApiUnreachable(ApiError):
+    """The API could NOT BE REACHED — every attempt failed transiently.
+
+    Deliberately a DIFFERENT type from ApiError, because the two demand
+    different verdicts from a lint:
+
+      ApiError       — we asked and were told no. We learned something.
+      ApiUnreachable — we never got an answer. We learned NOTHING, and
+                       therefore examined nothing, and therefore MUST NOT
+                       report a finding about workflow files we never read.
+
+    Collapsing the two is exactly the defect this class exists to fix: a
+    Cloudflare 502 on the branch-protection GET surfaced as a bare
+    traceback and process exit 1, and exit 1 in this lint's contract means
+    "a required workflow carries a paths filter". The lint claimed a
+    compliance finding it had not made.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempts: int,
+        last_status: int | None = None,
+        last_error: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+        self.last_status = last_status
+        self.last_error = last_error
+
+
+# ---- Transient-vs-terminal classification --------------------------------
+# 4xx AND 5xx ARE TREATED DIFFERENTLY, ON PURPOSE.
+#
+#   5xx → TRANSIENT. Retry with backoff. Runners reach git.moleculesai.app
+#     THROUGH CLOUDFLARE; 502/520/521/522/524 at that edge are an
+#     established, observed, self-clearing condition. They say nothing
+#     about our request. A single-attempt call on this path in a lane
+#     whose status is merge-blocking under BP `["*"]` will red
+#     intermittently forever.
+#
+#   4xx → TERMINAL. Do NOT retry. A 401/403/404/422 is an AUTHORISATION or
+#     ADDRESSING FACT about this token and this path; the next identical
+#     request returns the identical answer. Retrying it (a) burns the
+#     backoff budget for no possible change in outcome, and (b) — the real
+#     harm — buries a permissions defect under "attempt 3/4 …" noise so it
+#     reads like a network flake. This repo has a live instance: the merge
+#     queue actor 403s on THIS EXACT endpoint and silently falls back to a
+#     hardcoded REQUIRED_APPROVALS: 2 while branch protection says 1. A
+#     retry loop over that 403 would make the defect look like weather.
+#     403 must stay loud, immediate, and attributed to the token.
+#
+#   429 is the ONE 4xx exception: it is not a statement about
+#     authorisation, it is the server saying "later" and it carries
+#     Retry-After. Backing off is the protocol-defined response.
+_RETRYABLE_STATUSES = frozenset({429})
+
+
+def _is_transient_status(status: int) -> bool:
+    """5xx (incl. Cloudflare's 52x family) plus 429. Nothing else."""
+    return 500 <= status < 600 or status in _RETRYABLE_STATUSES
+
+
+# Transport-level failures: the request never produced a COMPLETE HTTP
+# response (reset, timeout, half-closed keepalive, TLS error, truncated
+# body). By definition we learned nothing, so these are transient too.
+#
+# These two BASE classes are deliberately broad, and the breadth is the
+# point — an earlier revision of this fix enumerated leaf types
+# (ConnectionResetError, TimeoutError, SSLEOFError, IncompleteRead, ...)
+# and left a hole exactly where it hurts most:
+#
+#   urlopen() SUCCEEDS, and the failure happens later in `resp.read()`.
+#   urllib only wraps CONNECT-phase errors in URLError, so a read-phase
+#   `ssl.SSLError` / raw `OSError` / `http.client.ResponseNotReady` matched
+#   none of the leaf types, escaped as a bare traceback, and exited 1 —
+#   i.e. "a required workflow has a paths filter". The very defect this
+#   file exists to eliminate, surviving inside its own fix.
+#
+# So classify by BASE class instead of by enumeration:
+#   OSError                 — URLError, ssl.SSLError, every Connection*Error,
+#                             TimeoutError (socket.timeout), raw errno OSError
+#   http.client.HTTPException — RemoteDisconnected, IncompleteRead,
+#                             BadStatusLine, ResponseNotReady, LineTooLong
+# Together these are "the HTTP transaction did not complete". Anything that
+# is NOT one of these is a bug in this script, not weather — and is handled
+# separately in main(), which must not claim the API was unreachable.
+#
+# NOTE: urllib.error.HTTPError subclasses URLError subclasses OSError, so
+# HTTPError MUST be caught first or every 403 would be misfiled as a
+# transport failure and retried. It is; see api().
+_TRANSIENT_EXC: tuple[type[BaseException], ...] = (
+    OSError,
+    http.client.HTTPException,
+)
+
+# 4 attempts, jittered exponential backoff 1s/2s/4s (cap 8s) → worst case
+# ~7s of sleeping plus 4×30s of socket timeout = ~127s, inside the
+# workflow's timeout-minutes: 5 alongside checkout/setup-python/Infisical.
+API_MAX_ATTEMPTS = max(1, int(os.environ.get("API_MAX_ATTEMPTS", "4") or 4))
+API_BACKOFF_BASE = float(os.environ.get("API_BACKOFF_BASE", "1.0") or 1.0)
+API_BACKOFF_CAP = float(os.environ.get("API_BACKOFF_CAP", "8.0") or 8.0)
+API_TIMEOUT = float(os.environ.get("API_TIMEOUT", "30") or 30)
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Jittered exponential backoff for `attempt` (1-based)."""
+    raw = min(API_BACKOFF_CAP, API_BACKOFF_BASE * (2 ** (attempt - 1)))
+    # Full-ish jitter (50-100%) so parallel PR runs don't re-collide in
+    # lockstep on a recovering edge.
+    return raw * (0.5 + random.random() / 2.0)
 
 
 def api(
@@ -206,6 +633,15 @@ def api(
     query: dict[str, str] | None = None,
     expect_json: bool = True,
 ) -> tuple[int, Any]:
+    """GET/POST the Gitea API, retrying ONLY transient failures.
+
+    Raises:
+        ApiUnreachable: every attempt failed transiently (5xx/429/transport).
+            The call NEVER completed — the caller has learned nothing and
+            must not report a finding.
+        ApiError: the API answered with a terminal 4xx, or answered 2xx with
+            an unparseable body. One attempt, no retry.
+    """
     url = f"{API}{path}"
     if query:
         url = f"{url}?{urllib.parse.urlencode(query)}"
@@ -218,29 +654,102 @@ def api(
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, method=method, data=data, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read()
-            status = resp.status
-    except urllib.error.HTTPError as e:
-        raw = e.read()
-        status = e.code
 
-    if not (200 <= status < 300):
+    last_status: int | None = None
+    last_detail = ""
+
+    for attempt in range(1, API_MAX_ATTEMPTS + 1):
+        req = urllib.request.Request(
+            url, method=method, data=data, headers=headers
+        )
+        raw = b""
+        status: int | None = None
+        try:
+            with urllib.request.urlopen(req, timeout=API_TIMEOUT) as resp:
+                raw = resp.read()
+                status = resp.status
+        except urllib.error.HTTPError as e:
+            # ██ CLAUSE ORDER IS THE ONLY THING KEEPING 4xx OUT OF THE
+            # ██ RETRY LOOP. DO NOT REORDER THESE TWO `except` CLAUSES.
+            #
+            # Since _TRANSIENT_EXC widened to base classes,
+            # `issubclass(urllib.error.HTTPError, _TRANSIENT_EXC)` is
+            # literally True (HTTPError -> URLError -> OSError). Python
+            # takes the FIRST matching clause, so this one wins and 4xx
+            # stays terminal. Move it below the transport clause and every
+            # 403 is silently retried four times with backoff — turning
+            # the authorisation fact this lint is careful to surface
+            # loudly (see the merge-queue actor's live 403) back into
+            # something that reads like weather. No error, no warning:
+            # just a slower, quieter wrong answer.
+            #
+            # `test_4xx_is_NEVER_retried` asserts exactly one attempt over
+            # six status codes. That test is the guardrail; it is what
+            # stops the reorder, so do not weaken it either.
+            #
+            # An HTTP status came back, so we learned something.
+            try:
+                raw = e.read()
+            except Exception:  # pragma: no cover - body already consumed
+                raw = b""
+            status = e.code
+        except _TRANSIENT_EXC as e:
+            last_status = None
+            last_detail = f"{type(e).__name__}: {e}"
+            if attempt < API_MAX_ATTEMPTS:
+                delay = _backoff_delay(attempt)
+                sys.stderr.write(
+                    f"::warning::{method} {path} → transport failure "
+                    f"({last_detail}) on attempt {attempt}/"
+                    f"{API_MAX_ATTEMPTS}; retrying in {delay:.1f}s\n"
+                )
+                time.sleep(delay)
+                continue
+            break
+
+        assert status is not None
+        if 200 <= status < 300:
+            if not raw:
+                return status, None
+            try:
+                return status, json.loads(raw)
+            except json.JSONDecodeError as e:
+                if expect_json:
+                    # 2xx with a broken body is NOT transient: the origin
+                    # answered and its answer is malformed. Terminal.
+                    raise ApiError(
+                        f"{method} {path} → HTTP {status} but body is not "
+                        f"JSON: {e}"
+                    ) from e
+                return status, {"_raw": raw.decode("utf-8", errors="replace")}
+
         snippet = raw[:500].decode("utf-8", errors="replace") if raw else ""
-        raise ApiError(f"{method} {path} → HTTP {status}: {snippet}")
+        if not _is_transient_status(status):
+            # 4xx: TERMINAL. One attempt, immediate raise. See the block
+            # comment above — retrying an authorisation fact hides it.
+            raise ApiError(f"{method} {path} → HTTP {status}: {snippet}")
 
-    if not raw:
-        return status, None
-    try:
-        return status, json.loads(raw)
-    except json.JSONDecodeError as e:
-        if expect_json:
-            raise ApiError(
-                f"{method} {path} → HTTP {status} but body is not JSON: {e}"
-            ) from e
-        return status, {"_raw": raw.decode("utf-8", errors="replace")}
+        last_status = status
+        last_detail = snippet
+        if attempt < API_MAX_ATTEMPTS:
+            delay = _backoff_delay(attempt)
+            sys.stderr.write(
+                f"::warning::{method} {path} → HTTP {status} (transient) on "
+                f"attempt {attempt}/{API_MAX_ATTEMPTS}; retrying in "
+                f"{delay:.1f}s\n"
+            )
+            time.sleep(delay)
+
+    where = (
+        f"HTTP {last_status}" if last_status is not None else "transport failure"
+    )
+    raise ApiUnreachable(
+        f"{method} {path} → UNREACHABLE after {API_MAX_ATTEMPTS} attempt(s); "
+        f"last: {where}: {last_detail}",
+        attempts=API_MAX_ATTEMPTS,
+        last_status=last_status,
+        last_error=last_detail,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -279,8 +788,7 @@ def parse_context(ctx: str) -> tuple[str, str, str] | None:
 def _iter_workflow_files() -> list[Path]:
     d = Path(WORKFLOWS_DIR)
     if not d.is_dir():
-        sys.stderr.write(f"::error::workflows directory not found: {d}\n")
-        sys.exit(3)
+        _die(3, f"workflows directory not found: {d}")
     # `.yml` and `.yaml` — Gitea accepts both (rarely used `.yaml`, but
     # don't silently miss it if a future port uses it).
     return sorted(list(d.glob("*.yml")) + list(d.glob("*.yaml")))
@@ -308,8 +816,7 @@ def detect_paths_filters(workflow_path: Path) -> list[str]:
     try:
         doc = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
     except yaml.YAMLError as e:
-        sys.stderr.write(f"::error::YAML parse error in {workflow_path}: {e}\n")
-        sys.exit(3)
+        _die(3, f"YAML parse error in {workflow_path}: {e}")
     if not isinstance(doc, dict):
         return []
 
@@ -392,12 +899,12 @@ def load_enforced_contexts(path: str) -> list[str]:
     """
     p = Path(path)
     if not p.is_file():
-        sys.stderr.write(
-            f"::error::required-contexts SSOT not found: {path} — cannot "
-            f"enumerate the enforced set, so this lint FAILS CLOSED rather "
-            f"than greening a gate it could not verify.\n"
+        _die(
+            3,
+            f"required-contexts SSOT not found: {path} — cannot enumerate "
+            f"the enforced set, so this lint FAILS CLOSED rather than "
+            f"greening a gate it could not verify.",
         )
-        sys.exit(3)
     out: list[str] = []
     for raw in p.read_text(encoding="utf-8").splitlines():
         if _PENDING_MARKER_RE.match(raw.strip()):
@@ -421,8 +928,7 @@ def build_job_index() -> dict[str, tuple[Path, str, dict]]:
         try:
             doc = yaml.safe_load(f.read_text(encoding="utf-8"))
         except yaml.YAMLError as e:
-            sys.stderr.write(f"::error::YAML parse error in {f}: {e}\n")
-            sys.exit(3)
+            _die(3, f"YAML parse error in {f}: {e}")
         if not isinstance(doc, dict):
             continue
         wf_name = doc.get("name") or f.stem
@@ -649,13 +1155,17 @@ def detect_noop_gate(doc: dict, job_key: str) -> list[str]:
 def run() -> int:
     """Main lint entrypoint. Returns the process exit code.
 
-    Exit semantics (see module docstring for full table):
-      0 — clean (no offending paths-filter on any required workflow),
-          OR protection unreadable (403/404) — surfaced as ::error::
-          but treated as non-fatal so token-scope issues don't red-X
-          every PR.
-      1 — at least one required workflow carries a paths/paths-ignore
-          filter — the regression class this lint exists to prevent.
+    Exit semantics (see module docstring for the full table):
+      0 — clean: the enforced set was enumerated, every resolvable
+          workflow was read, and none carries a paths/paths-ignore filter.
+      1 — A FINDING: at least one required workflow carries a
+          paths/paths-ignore filter (Arm A) — the regression class this
+          lint exists to prevent. Exit 1 means the lint LOOKED and found
+          something; never use it for "could not look".
+      4 — the API answered and its answer blocks verification
+          (401/403/other terminal 4xx, bad shape, empty enforced set).
+      5 — the API never answered (transient, retries exhausted). The lint
+          DID NOT RUN. No workflow was judged.
     """
     _require_runtime_env()
 
@@ -663,6 +1173,82 @@ def run() -> int:
     protection: Any = {}
     try:
         _, protection = api("GET", protection_path)
+    except ApiUnreachable as e:
+        # ---- THE CHECK DID NOT RUN. This is NOT a compliance finding. ----
+        # Retry exhaustion on a transient path. Zero workflow files have
+        # been opened; the enforced-context set was never enumerated. The
+        # ONLY honest statement available is "unknown".
+        #
+        # RED-vs-DISTINCT-SIGNAL, decided: RED, on a DEDICATED exit code (5).
+        #   * Red, not green: an unreadable branch-protection API means we
+        #     cannot verify the invariant at all, and this repo's whole
+        #     failure catalogue is gates that pass without checking. A lint
+        #     that greens when it cannot check IS the bug.
+        #   * A dedicated code, not the existing 4: exit 1 means "a required
+        #     workflow carries a paths filter" (fix the workflow); exit 4
+        #     means "the API answered and its answer blocks verification"
+        #     (fix the token / the SSOT). Exit 5 means "we never reached the
+        #     API" (retry the job / check the edge). Three different operator
+        #     actions, so three different codes — and the exit code is the
+        #     only part of a red step that survives into a status summary.
+        #   * The banner below exists because the exit code is NOT enough:
+        #     an hour was lost hunting a workflow defect that did not exist.
+        print("")
+        print(
+            "::error::================ LINT DID NOT RUN ================"
+        )
+        print(
+            f"::error::GITEA API UNREACHABLE — this is NOT a compliance "
+            f"finding. {e}"
+        )
+        print(
+            f"::error::ZERO workflow files were inspected. NOTHING in "
+            f"{WORKFLOWS_DIR} has been reported as non-compliant, because "
+            f"the lint never got far enough to look at any of it."
+        )
+        print(
+            f"::error::What failed: GET {protection_path} against "
+            f"{GITEA_HOST} failed transiently on all {e.attempts} attempt(s) "
+            f"(last: "
+            + (f"HTTP {e.last_status}" if e.last_status else "transport error")
+            + "). Runners reach Gitea through Cloudflare; 502/52x and "
+            "connection resets at that edge are self-clearing."
+        )
+        print(
+            "::error::DO NOT go looking for a paths-filter defect in a "
+            "workflow. There is no finding here. Re-run the job; if it "
+            "keeps happening, the Cloudflare/Gitea edge is genuinely down "
+            "and that is the thing to fix."
+        )
+        print(
+            "::error::Exit 5 = INFRASTRUCTURE UNREACHABLE (exit 1 would "
+            "mean a real Arm-A paths-filter finding; exit 4 would mean the "
+            "API answered but blocked verification). This is 5."
+        )
+        print(
+            "::error::=================================================="
+        )
+        sys.stderr.write(
+            f"::error::lint-required-no-paths: DID NOT RUN — "
+            f"{GITEA_HOST} unreachable after {e.attempts} attempts. "
+            f"NOT a compliance failure.\n"
+        )
+        _step_summary(
+            "## ⚠ lint-required-no-paths — **THE LINT DID NOT RUN**\n\n"
+            "**This is NOT a compliance finding. No workflow is "
+            "non-compliant. Do not go looking for one.**\n\n"
+            f"`GET {protection_path}` against `{GITEA_HOST}` failed "
+            f"transiently on all {e.attempts} attempt(s) (last: "
+            + (f"HTTP {e.last_status}" if e.last_status else "transport error")
+            + "). Runners reach Gitea through Cloudflare, where 502/52x and "
+            "connection resets are self-clearing.\n\n"
+            "**ZERO workflow files were inspected** — the lint never got far "
+            "enough to look at any of them.\n\n"
+            # Derived, not hand-maintained. This block used to carry its own
+            # 3-row copy of the exit table — the last one that could drift.
+            + _exit_table_md(5)
+        )
+        return 5
     except ApiError as e:
         msg = str(e)
         m = re.search(r"HTTP (\d{3})", msg)
@@ -680,14 +1266,77 @@ def run() -> int:
         #     protection. Nothing to enumerate; tolerated degradation,
         #     surfaced loudly (exit 0 with ::warning::).
         if http_status in (401, 403):
+            # REPORT THE OBSERVED FACT, NOT A PRESUMED CAUSE.
+            #
+            # This text used to end "Fix: grant repo-admin to mc-drift-bot
+            # (org team `drift-bot`, perm=admin)". That instruction is
+            # ALREADY SATISFIED — team `drift-bot` is perm=admin,
+            # mc-drift-bot is its sole member, and its effective permission
+            # on this repo is `owner`. An operator following it finds the
+            # box ticked and concludes the LINT is broken. A remediation
+            # that names a cause we did not observe is the same fault as a
+            # verdict that names a finding we did not make.
+            #
+            # So: state the status, quote what Gitea actually said, and
+            # point at DIAGNOSING WHICH KIND of 403 this is. The three kinds
+            # need different actions and the API message distinguishes them:
+            #   - permission 403  : the token's account lacks repo-admin
+            #                       (BP read needs admin:true; push:true is
+            #                       not enough — verified)
+            #   - PAT-scope 403   : the account has admin but the TOKEN was
+            #                       minted without the scope
+            #   - Cloudflare 403  : WAF, not Gitea at all (e.g. the
+            #                       error-1010 UA ban this file already
+            #                       works around) — body is HTML/CF JSON
             sys.stderr.write(
                 f"::error::GET {protection_path} returned HTTP "
-                f"{http_status} — DRIFT_BOT_TOKEN cannot read branch "
-                f"protections (needs repo-admin scope). AUTH FAILURE: "
-                f"cannot enumerate required checks, so this lint FAILS "
-                f"CLOSED rather than greening a gate it could not verify. "
-                f"Fix: grant repo-admin to mc-drift-bot (org team "
-                f"`drift-bot`, perm=admin) — fix the token, not the lint.\n"
+                f"{http_status}. AUTH FAILURE: cannot enumerate the "
+                f"required-check set, so this lint FAILS CLOSED rather than "
+                f"greening a gate it could not verify. This is an "
+                f"authorisation fact, not a transient one — it was NOT "
+                f"retried and re-running will not fix it. Gitea said: {e}\n"
+            )
+            # This branch needs the run-summary banner MORE than any other,
+            # not less. A failed step's log is collapsed by default, and
+            # this is the one branch pointing at a LIVE PERMISSIONS DEFECT
+            # rather than at weather: the merge-queue actor already 403s on
+            # this exact endpoint and falls back to a hardcoded
+            # REQUIRED_APPROVALS: 2 while branch protection says 1. The
+            # collapsed-log argument that justified the exit-5 banner
+            # applies most strongly right here — a 403 buried in a folded
+            # log is how an authorisation defect gets mistaken for flake.
+            _step_summary(
+                "## ⚠ lint-required-no-paths — **AUTH FAILURE, LINT COULD "
+                "NOT VERIFY**\n\n"
+                "**This is NOT a compliance finding. No workflow was "
+                "judged.**\n\n"
+                f"`GET {protection_path}` returned **HTTP {http_status}**, "
+                "so the required-check set could not be enumerated and the "
+                "no-paths-filter invariant could not be verified. Failing "
+                "closed rather than greening a gate it could not check.\n\n"
+                "**This is an authorisation fact, not a transient one — it "
+                "was NOT retried, and re-running will not fix it.**\n\n"
+                "**What the API actually said** (this is the diagnostic — "
+                "do not skip it):\n\n"
+                f"```\n{e}\n```\n\n"
+                "**Diagnose which kind of 403 this is — match the body above "
+                "against these. They need different actions:**\n\n"
+                "| kind | the body says | action |\n"
+                "|---|---|---|\n"
+                f"| permission | `\"{_BP_403_PERMISSION}\"` — the ACCOUNT "
+                "lacks repo-admin (BP read needs `admin:true`; `push:true` "
+                "is not enough) | grant repo-admin to the token's account |\n"
+                f"| PAT scope | `\"{_BP_403_TOKEN_SCOPE}\"` — the account "
+                "HAS admin but the TOKEN was minted without it | re-mint "
+                "the token with the admin scope |\n"
+                "| Cloudflare WAF | not Gitea JSON at all — HTML, or "
+                "`error code: 1010`, or a `cloudflare` / `cf-ray` marker "
+                "| edge/UA issue, not a permission; see the `_GITEA_UA` "
+                "note above |\n\n"
+                "Note: `mc-drift-bot` is already `owner` on this repo via "
+                "team `drift-bot` (perm=admin), so a bare *grant repo-admin* "
+                "is most likely NOT the fix — match the body above first.\n\n"
+                + _exit_table_md(4)
             )
             return 4
         if http_status == 404:
@@ -706,7 +1355,20 @@ def run() -> int:
             )
             protection = {}
         else:
-            raise
+            # Any OTHER terminal answer (400/405/409/422, or a 2xx with an
+            # unparseable body). This used to `raise` — a bare traceback
+            # exiting 1, i.e. the process claiming an Arm-A paths-filter
+            # finding it had not made. Same defect class as the 502; same
+            # fix. Exit 4: the API answered, and its answer blocks
+            # verification.
+            sys.stderr.write(
+                f"::error::LINT DID NOT COMPLETE — GET {protection_path} "
+                f"returned a terminal error the lint cannot interpret: {e}. "
+                f"This is NOT a compliance finding: zero workflow files were "
+                f"inspected. Exit 4 (verification impossible), not exit 1 "
+                f"(paths-filter defect).\n"
+            )
+            return 4
 
     if not isinstance(protection, dict):
         sys.stderr.write(
@@ -835,9 +1497,11 @@ def run() -> int:
                 "blocking. Tracking: task #105."
             )
         elif not offenders:
+            _report_finding(noop_offenders, arm="B")
             return 1
 
     if offenders:
+        _report_finding(offenders, arm="A")
         return 1
 
     print("")
@@ -855,5 +1519,94 @@ def run() -> int:
     return 0
 
 
+def main() -> int:
+    """Last-resort net: NOTHING may escape as a bare traceback, because an
+    uncaught exception exits 1 and exit 1 is this lint's code for "a
+    required workflow carries a paths filter". That is how a Cloudflare 502
+    came to report a compliance finding, and an earlier revision of the fix
+    still leaked read-phase network errors through the same hole.
+
+    The catch-all is `Exception`, and it maps to exit 4 — NOT 5. That
+    distinction is deliberate:
+
+      * Exit 5 asserts a specific fact — "the API never answered". For a
+        network failure that is true and provable (api() exhausted its
+        retries). For a TypeError in our own YAML walk it is a FABRICATION:
+        we would be blaming Cloudflare for our own bug. Inventing a cause
+        you did not observe is the same fault as inventing a finding you
+        did not make, so a blanket route to 5 would reintroduce the defect
+        one level up.
+      * Exit 4 claims only what is actually known: verification did not
+        complete. Honest for any unexpected failure.
+
+    Either way the load-bearing property holds — an internal fault NEVER
+    exits 1 and NEVER reads as non-compliance.
+    """
+    try:
+        return run()
+    except ApiUnreachable as e:
+        sys.stderr.write(
+            f"::error::LINT DID NOT RUN — Gitea API unreachable after "
+            f"{e.attempts} attempt(s): {e}. This is NOT a compliance "
+            f"finding; no workflow was judged. Exit 5.\n"
+        )
+        return 5
+    except ApiError as e:
+        sys.stderr.write(
+            f"::error::LINT DID NOT COMPLETE — unusable Gitea API response: "
+            f"{e}. This is NOT a compliance finding; no workflow was "
+            f"judged. Exit 4.\n"
+        )
+        return 4
+    # `Exception`, NOT `BaseException` — and that is LOAD-BEARING, not an
+    # oversight. The env-contract and YAML-parse failures signal via
+    # `sys.exit(2)` / `sys.exit(3)`, which raise SystemExit — a
+    # BaseException, deliberately outside this net. Widening to
+    # BaseException would silently collapse exit 2 and exit 3 into 4,
+    # destroying two documented codes inside the very contract this file
+    # exists to sharpen (and would swallow KeyboardInterrupt besides).
+    # If you are here to widen this catch: don't. The next person will
+    # reach for BaseException for exactly the reasons the transient
+    # classifier above reaches for OSError — the difference is that
+    # OSError widens a class of NETWORK faults, while BaseException would
+    # widen over this script's own EXIT PROTOCOL.
+    except ExitContractViolation as e:
+        # BEFORE the catch-all, deliberately. Routing this to exit 4 would
+        # label it "did-not-run" — and an undeclared code might have been a
+        # FINDING, so that guesses the one thing we must not guess. Exit 7's
+        # class is "unknown": it asserts neither.
+        sys.stderr.write(
+            f"::error::EXIT CONTRACT VIOLATED — {e} This run proves NOTHING "
+            f"about compliance: the lint could not classify its own outcome, "
+            f"so it will not claim the result IS or is NOT a finding. This "
+            f"is a bug in the lint. Exit 7.\n"
+        )
+        _step_summary(
+            _verdict_summary(
+                7,
+                "The lint produced an exit code it does not declare, so it "
+                "cannot say what the run meant.",
+                f"`{e}`",
+            )
+        )
+        return 7
+    except Exception as e:  # noqa: BLE001 - deliberate catch-all; see docstring
+        sys.stderr.write(
+            f"::error::LINT DID NOT COMPLETE — unexpected internal error in "
+            f"lint-required-no-paths: {type(e).__name__}: {e}. This is NOT a "
+            f"compliance finding — no workflow was judged, and this is a bug "
+            f"in the lint itself, not a finding about any workflow. "
+            f"Traceback follows for debugging; exit 4.\n"
+        )
+        traceback.print_exc(file=sys.stderr)
+        _step_summary(
+            "## ⚠ lint-required-no-paths — **THE LINT CRASHED**\n\n"
+            "**This is NOT a compliance finding. No workflow was judged.** "
+            f"Internal error: `{type(e).__name__}: {e}`\n\n"
+            "This is a bug in the lint, not in any workflow. Exit 4.\n"
+        )
+        return 4
+
+
 if __name__ == "__main__":
-    sys.exit(run())
+    sys.exit(main())

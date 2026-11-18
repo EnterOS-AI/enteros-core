@@ -14,6 +14,7 @@ import { runtimeDisplayName } from "@/lib/runtime-names";
 import { isSaaSTenant } from "@/lib/tenant";
 import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
 import type { WorkspaceCompute } from "@/store/socket";
+import { workspaceStatusLabel } from "@/lib/light";
 
 const RUNTIME_OPTIONS = ["claude-code", "codex", "hermes", "openclaw", "kimi", "kimi-cli", "external"];
 const RESOLUTIONS = ["1280x720", "1440x900", "1920x1080", "2560x1440"];
@@ -24,7 +25,7 @@ type Props = {
   data: Pick<
     WorkspaceNodeData,
     "runtime" | "status" | "needsRestart" | "activeTasks" | "deliveryMode"
-    | "workspaceAccess" | "maxConcurrentTasks" | "compute" | "applyTemplateOnRestart"
+    | "workspaceAccess" | "maxConcurrentTasks" | "compute" | "applyTemplateOnRestart" | "lightState"
   >;
 };
 
@@ -46,9 +47,30 @@ const DATA_PERSISTENCE_OPTIONS = ["", "persist", "ephemeral"];
 const dataPersistenceLabel = (v: string): string =>
   v === "persist" ? "Always keep (persist)" : v === "ephemeral" ? "Don't keep (ephemeral)" : "Auto";
 
-// Cloud/compute backend display name (read-only fallback for non-SaaS / legacy).
+// Cloud/compute backend display name (read-only badge for non-SaaS / legacy).
+//
+// Mirrors the Display names in the SDK cloud-provider SSOT
+// (molecule-ai-sdk contracts/cloudproviders.yaml). `local` and `docker` are the
+// accepted wire ALIASES of the canonical `molecules-server` id, and the row
+// stores the backend key rather than the canonical id, so all three must resolve
+// to one label.
+//
+// This used to be `... : "AWS"` -- a catch-all that rendered "AWS" on every
+// workspace of a platform that provisions zero AWS. The badge is only rendered
+// when !isSaaS (i.e. on a local box), so an empty/unrecorded provider here is an
+// Enter OS Server container; that is also what the SDK default resolves "" to.
+// An unrecognised value falls through to itself rather than to a guess, so a
+// future provider can never be silently mislabelled.
+const CLOUD_PROVIDER_LABELS: Record<string, string> = {
+  aws: "AWS",
+  gcp: "GCP",
+  hetzner: "Hetzner",
+  "molecules-server": "Enter OS Server",
+  local: "Enter OS Server",
+  docker: "Enter OS Server",
+};
 const cloudProviderLabel = (v: string | undefined): string =>
-  v === "gcp" ? "GCP" : v === "hetzner" ? "Hetzner" : "AWS";
+  !v ? "Enter OS Server" : (CLOUD_PROVIDER_LABELS[v] ?? v);
 
 export function ContainerConfigTab({ workspaceId, data }: Props) {
   // Provider is editable only in SaaS (CP-provisioned boxes). Local/Docker has no
@@ -157,11 +179,26 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
             : { mode: "none" },
           // internal#734: omit when "auto" so the wire/default behavior is unchanged.
           ...(form.dataPersistence ? { data_persistence: form.dataPersistence } : {}),
-          // Cloud backend: send the (possibly switched) provider. Omit for the
-          // legacy wire default (aws) so a non-switching AWS save stays unchanged;
-          // a switch TO aws (omit) vs FROM aws (explicit) both register correctly
-          // because the workspace-server normalizes ""→aws when diffing.
-          ...(normalizeProvider(form.provider) !== "aws" ? { provider: normalizeProvider(form.provider) } : {}),
+          // Cloud backend: send the provider WHENEVER the workspace has one.
+          //
+          // This used to omit it when it normalized to "aws", and
+          // normalizeProvider() coerces local/docker/molecules-server -> "aws"
+          // (it resolves an instance-type CATALOG key; it is not an identity
+          // function). So a local box never sent a provider at all,
+          // workspace_compute.go's `if compute.Provider != ""` then left the key
+          // out of the persisted JSON, and `compute->>'provider'` was absent on
+          // every production row -- which is what made CP's ensure-image answer
+          // `not_applicable` and left the core#5019 pull-before-stop guard inert.
+          //
+          // Being explicit also removes the ambiguity created by flipping the SDK
+          // default (molecule-ai-sdk#195, "" -> molecules-server): a row that
+          // records nothing would otherwise be resolved by whatever the default
+          // happens to be at read time.
+          //
+          // Still omitted when the workspace genuinely has no provider -- absent
+          // means "not recorded", and inventing one would write a guess into the
+          // row.
+          ...(form.provider ? { provider: form.provider } : {}),
         };
 
         const resp = await api.patch<{ needs_restart?: boolean }>(`/workspaces/${workspaceId}`, {
@@ -334,7 +371,7 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
       <section className="rounded-lg border border-line/50 bg-surface-card/40 p-4">
         <h3 className="mb-3 text-sm font-semibold text-ink">Status</h3>
         <dl className="grid grid-cols-1 gap-2 text-[11px]">
-          <ConfigRow label="Container status" value={data.status} />
+          <ConfigRow label="Container status" {...containerStatus(data)} />
           <ConfigRow label="Active tasks" value={String(data.activeTasks ?? 0)} />
           <ConfigRow label="Workspace access" value={workspaceAccess} />
           <ConfigRow label="Max concurrent tasks" value={maxConcurrentTasks} />
@@ -360,7 +397,17 @@ function formFromData(data: {
   const width = data.displayWidth ?? 1920;
   const height = data.displayHeight ?? 1080;
   const resolution = `${width}x${height}`;
-  const provider = normalizeProvider(data.provider);
+  // Keep the provider's IDENTITY in form state. This used to be
+  // normalizeProvider(data.provider), which collapses local/docker/
+  // molecules-server (and "") to "aws" -- that helper resolves an instance-type
+  // CATALOG key, and a local box has no catalog, so it answers "aws" for
+  // everything that is not gcp/hetzner. Storing that answer as the identity is
+  // what erased the real provider before the PATCH could ever send it.
+  //
+  // The catalog lookup below still normalizes (defaultInstanceForProvider does
+  // it internally), and both the selector's value and the destructive-switch
+  // comparison still normalize at their own call sites, so neither changes.
+  const provider = data.provider ?? "";
   return {
     runtime: data.runtime || "claude-code",
     provider,
@@ -416,18 +463,27 @@ function formatAccess(value: string | null | undefined): string {
   return value.replace(/_/g, "-");
 }
 
+/** A parked Enter OS Light agent reads "Parked" (asleep between scheduled
+ *  runs), not the hibernated status of its pod. */
+function containerStatus(data: Pick<WorkspaceNodeData, "status" | "lightState">): { value: string; title?: string } {
+  const s = workspaceStatusLabel(data.status, data.lightState);
+  return { value: s.label, title: s.tooltip };
+}
+
 function ConfigRow({
   label,
   value,
+  title,
 }: {
   label: string;
   value: string;
+  title?: string;
 }) {
   return (
     <div className="flex items-start justify-between gap-3 rounded-md bg-surface-sunken/40 px-3 py-2">
       <dt className="text-ink-mid">{label}</dt>
       <dd className="min-w-0 text-right">
-        <div className="font-mono text-ink break-words">{value}</div>
+        <div title={title} className="font-mono text-ink break-words">{value}</div>
       </dd>
     </div>
   );

@@ -35,6 +35,7 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | GET/POST/PUT | /workspaces/:id/secrets | secrets.go (POST/PUT auto-restarts workspace) |
 | DELETE | /workspaces/:id/secrets/:key | secrets.go (DELETE auto-restarts workspace) |
 | GET | /workspaces/:id/model | secrets.go |
+| GET/PUT | /workspaces/:id/continuous | workspace_continuous.go — the "24/7" switch `{continuous: bool}`, stored as `MOLECULE_CONTINUOUS` (a workspace row beats a global row; off = no idle self-wake). A change restarts the workspace, except the platform root and self-writes (`restart: "skipped"`); an unchanged PUT writes and restarts nothing |
 | GET | /settings/secrets | secrets.go — list global secrets (keys only, values masked) |
 | PUT/POST | /settings/secrets | secrets.go — set a global secret `{key, value}`; auto-restarts every non-paused/non-removed/non-external workspace that does not shadow the key with a workspace-level override |
 | DELETE | /settings/secrets/:key | secrets.go — delete a global secret; same auto-restart fan-out as PUT/POST |
@@ -46,25 +47,36 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | POST | /workspaces/:id/approvals/:id/decide | approvals.go |
 | POST | /workspaces/:id/approvals/:id/withdraw | approvals.go — requester pulls back a pending approval (#66) |
 | GET | /approvals/pending | approvals.go |
-| POST/GET | /workspaces/:id/memories | memories.go |
-| DELETE | /workspaces/:id/memories/:id | memories.go |
+| POST/GET | /workspaces/:id/memories | memories.go — `POST` commits through the v2 plugin; `GET` is a v2 shim (issue #1828) |
+| ~~DELETE~~ | ~~/workspaces/:id/memories/:id~~ | **REMOVED — returns 404.** Dropped in phase A3 (#1792) with the v1 Search/Update routes; it read `agent_memories`, which no longer exists. Use the v2 route below. |
+| GET/DELETE | /workspaces/:id/v2/memories[/:memoryId] | memories_v2.go — `GET` lists (canvas Memory tab), `DELETE :memoryId` is `Forget`. Wired only when `MEMORY_PLUGIN_URL` is configured; without it these return 503 rather than nil-deref. |
+| GET | /workspaces/:id/v2/namespaces | memories_v2.go |
 | GET | /workspaces/:id/traces | traces.go |
-| GET/POST | /workspaces/:id/activity | activity.go |
+| GET/POST | /workspaces/:id/activity | activity.go — `GET ?run_id=<id>` lists the rows one Enter OS Light run wrote (a run pod's requests carry `X-Molecule-Run-Id`; rows they write get `activity_logs.run_id`) |
 | POST | /workspaces/:id/notify | activity.go (agent→user push message via WebSocket) |
 | POST | /workspaces/:id/restart | workspace.go |
 | POST | /workspaces/:id/pause | workspace.go (stops container, status→paused) |
 | POST | /workspaces/:id/resume | workspace.go (re-provisions paused workspace) |
+| GET | /workspaces/:id/light | light_handlers.go — Enter OS Light state: `light_state` (`null` = not a Light agent), the schedules rendered at the last park, queued work, the last background failure. Full contract: `docs/api-protocol/light-api.md` |
+| POST | /workspaces/:id/light/enable | light_handlers.go — make a hermes agent on the Kubernetes substrate a Light agent (secrets `MOLECULE_LIGHT=1`, `MOLECULE_CONTINUOUS=false`; `light_state=open`; restart or wake). Refuses the workspace's own token (`403 LIGHT_SELF_FORBIDDEN`) |
+| POST | /workspaces/:id/light/disable | light_handlers.go — delete the control plane's Light objects first, then revoke the run tokens, remove `MOLECULE_LIGHT`, restore the 24/7 setting as it was before enable, clear `light_state`; restart or wake. Refuses the workspace's own token |
+| POST | /workspaces/:id/light/park | light_handlers.go, light_park.go — hand the agent's schedules to the control plane as CronJobs (`202`, `light_state=parking`), then stop its pod and resume them (`parked`). A refusal before the claim changes nothing; one after it returns the agent to `open` with `last_error`. Refuses the workspace's own token |
+| POST | /workspaces/:id/light/open | light_handlers.go, light_park.go — pause the CronJobs first (unstarted runs `cancelled`), then wake the agent (`202`, `opening` → `open`); also recovers a park stuck in `parking` for three minutes; the owner's open of an open agent takes it over. Refuses the workspace's own token |
+| POST | /workspaces/:id/light/run | light_handlers.go — `{"schedule": "<name>"}`: run one schedule of a parked agent now (`201 {"run_id"}`). Refuses the workspace's own token |
+| POST | /workspaces/:id/light/runs | light_runs.go — a run pod's ledger report (`phase` started/finished); only the workspace's own token |
+| GET | /workspaces/:id/light/runs | light_runs.go — runs newest first: `?limit=` (1..100, default 20), `?schedule=`, `?before=<next_before>` |
 | POST | /workspaces/:id/a2a | a2a_proxy.go — requires a source-bound workspace bearer or verified human/inbound credential; optional `X-Workspace-ID` must match bearer ownership. Combined self-host/dev Canvas requests may use same-origin only when CP session verification is unconfigured. |
 | GET | /workspaces/:id/a2a/queue/:queue_id | a2a_queue_status.go — same authentication as A2A send, followed by queue sender/target ownership checks |
 | POST | /workspaces/:id/delegate | delegation.go (async fire-and-forget) |
 | GET | /workspaces/:id/delegations | delegation.go (list delegation status) |
-| GET/POST | /workspaces/:id/schedules | schedules.go (cron CRUD). When the workspace advertises the `scheduler` capability (it runs the `kind: trigger` scheduler plugin), these routes proxy to the runtime's volume-backed `/internal/schedules*` API (schedules_proxy.go) — the volume grid is the source of truth; otherwise they serve the legacy `workspace_schedules` table (kept until P4b). `SCHEDULE_VOLUME_PROXY_DISABLED=1` forces the legacy path. |
-| PATCH/DELETE | /workspaces/:id/schedules/:scheduleId | schedules.go — same volume-proxy/legacy split as above; in the volume model `:scheduleId` is the schedule *name* |
-| POST | /workspaces/:id/schedules/:scheduleId/run | schedules.go (manual trigger) — volume path pokes the trigger daemon, which fires an autonomous `self-scheduler` turn (response carries `fired_by:"daemon"`); legacy path as before |
-| GET | /workspaces/:id/schedules/:scheduleId/history | schedules.go (past runs) — still reads core `activity_logs` `cron_run` rows; the volume re-point (runtime history file) is pending. Daemon fires on a plugin workspace do not write `activity_logs`, so use the runtime's history surface for those. |
-| GET | /workspaces/:id/schedules/health | schedules.go — peer-readable schedule health (issue #249); still reads the legacy table (volume re-point pending) |
-| POST | /admin/workspaces/:id/schedules/migrate-to-volume | schedules_proxy.go — `AdminAuth`; copies the workspace's `source='runtime'` schedule rows from the DB to its volume grid, idempotent; see `docs/guides/selfhost-schedule-migration.md` |
-| POST | /admin/schedules/backfill-plugin | scheduler_plugin.go — `AdminAuth`; declares the `molecule-scheduler` trigger plugin for every workspace with `workspace_schedules` rows; **dry-run by default**, `?apply=true` to declare + arm; see `docs/runbooks/scheduler-plugin.md` |
+| GET/POST | /workspaces/:id/schedules | schedules.go (cron CRUD) — **unconditionally** proxied to the runtime's volume-backed `/internal/schedules*` API (schedules_proxy.go). The volume grid is the only source of truth. The legacy `workspace_schedules` dual path and its `SCHEDULE_VOLUME_PROXY_DISABLED` kill-switch were **removed in P4b**; core no longer reads that table anywhere. |
+| PATCH/DELETE | /workspaces/:id/schedules/:scheduleId | schedules.go — volume-proxied as above; `:scheduleId` is the schedule *name* (the grid's state key) |
+| POST | /workspaces/:id/schedules/:scheduleId/run | schedules.go (manual trigger) — pokes the trigger daemon, which fires an autonomous `self-scheduler` turn (response carries `fired_by:"daemon"`) |
+| GET | /workspaces/:id/schedules/:scheduleId/history | schedules.go (past runs) — **volume-proxied** to the runtime's history file (`scheduleHistoryLimit = 20`, mirroring the legacy window). Daemon fires are recorded there, not in `activity_logs`. |
+| GET | /workspaces/:id/schedules/health | schedules.go — peer-readable schedule health (issue #249); **volume-proxied** to the runtime's health surface |
+| GET | /admin/schedules/health | admin_schedules_health.go — `AdminAuth`; cross-workspace schedule health (issue #618). Reads the **volume** grid per workspace (`volumeAdminScheduleHealth`); its only SQL is a workspace-name lookup. There is no legacy-DB leg left to disagree with it. |
+| ~~POST~~ | ~~/admin/workspaces/:id/schedules/migrate-to-volume~~ | **REMOVED — returns 404.** The one-shot P4b DB→volume migration lever. `MigrateToVolume` has zero non-test Go references and the path is absent from the engine's route table. See the note below the table. |
+| ~~POST~~ | ~~/admin/schedules/backfill-plugin~~ | **REMOVED — returns 404.** The one-shot plugin-backfill lever. `BackfillSchedulerPlugin` has zero non-test Go references and the path is absent from the engine's route table. See the note below the table. |
 | GET/POST | /workspaces/:id/channels | channels.go (social channel CRUD) |
 | PATCH/DELETE | /workspaces/:id/channels/:channelId | channels.go |
 | POST | /workspaces/:id/channels/:channelId/send | channels.go (outbound message) |
@@ -99,6 +111,21 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | GET | /admin/liveness | inline — `AdminAuth` required. Returns per-subsystem `supervised.Snapshot()` ages; use to check health of the background worker goroutines (health-sweep, orphan-sweeper, liveness-monitor, …). The core scheduler loop is no longer among them — it was retired in core#4399; schedule firing is per-workspace (see `docs/runbooks/scheduler-plugin.md`) |
 | GET | /ws | socket.go — Canvas requires a verified tenant session, org token, or `ADMIN_TOKEN`; workspace subscribers require `X-Workspace-ID` plus a bearer bound to that workspace |
 
+> **On the removed rows above.** The two struck-through admin schedule routes and the
+> legacy `DELETE /workspaces/:id/memories/:id` are kept in this table, struck through,
+> rather than silently deleted — each was documented as live for long enough to appear
+> in runbooks and rollout plans, and a reader who finds one there needs to learn it is
+> gone rather than find nothing. The schedule pair were one-shot P4b migration levers;
+> they were removable because the thing they migrated *from* is gone — nothing in core
+> reads `workspace_schedules` any more, so there is no DB path left to migrate off or
+> fall back to. Do not plan a rollout step around them. See
+> `docs/guides/selfhost-schedule-migration.md` for what recovery looks like now.
+>
+> These were found by checking every documented route against the **engine's own route
+> table** (`gin.Engine.Routes()` on a constructed router), not a grep of `router.go`. That
+> distinction matters: routes are registered in more than one file, so a `router.go`-only
+> scan reports `/admin/cutovers/native-channels/inventory` as dead when it is live.
+
 ---
 
 ## Database
@@ -113,7 +140,7 @@ Migration files live in `workspace-server/migrations/` (timestamp-named; check t
 | `canvas_layouts` | Per-workspace x/y canvas position |
 | `structure_events` | Append-only event log (workspace lifecycle, agent, approval events) |
 | `activity_logs` | A2A communications, task updates, agent logs, errors. Historical `cron_run` rows (with `error_detail`) were written by the retired core scheduler loop and still back the legacy History route; the per-workspace trigger daemon writes its run log to the workspace volume instead. |
-| `workspace_schedules` | **Legacy** cron store — expression, timezone, prompt, run bookkeeping, `source` (`'template'` for org/import-seeded, `'runtime'` for Canvas/API-created). For a workspace running the scheduler trigger plugin the volume grid is the source of truth and this table is bypassed by CRUD; it still serves non-plugin workspaces, template seeding, History/Health, admin health, and the webhook poke. Retired in P4b (issue #4411 item 5). |
+| `workspace_schedules` | **Retired (P4b).** Nothing in core reads or writes this table any more — the workspace's volume grid is the only schedule store. Rows left over from before the migration are inert: nothing reads them and nothing fires them. The table itself is dropped separately; see `docs/guides/selfhost-schedule-migration.md`. |
 | `workspace_channels` | Social channel integrations (Telegram, Slack, etc.) with JSONB config and allowlist |
 | `agents` | Agent records |
 | `workspace_secrets` | Per-workspace encrypted secrets |
@@ -121,3 +148,6 @@ Migration files live in `workspace-server/migrations/` (timestamp-named; check t
 | `workspace_auth_tokens` | Bearer tokens; auto-revoked on workspace delete |
 | `agent_memories` | HMA scoped memory (LOCAL / TEAM / GLOBAL) |
 | `approvals` | Human-in-the-loop approval requests |
+| `light_runs` | Enter OS Light run ledger, keyed `(workspace_id, run_id)`: one row per scheduled run, written by the run pod's reports (`source='report'`) or by core from the control plane's jobs listing (`source='job'`) |
+| `light_schedules` | The schedules a Light agent had at its last park, with core's suspension record (`suspended_reason`, `consecutive_failures`) |
+| `light_pending_actions` | Work queued for a parked Light agent's next open/park cycle (`kind`, `payload` JSONB; `applied_at` once done) |

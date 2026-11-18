@@ -95,6 +95,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -628,6 +629,16 @@ def fetch_log(target_url: str) -> str | None:
     return None
 
 
+# act_runner prefixes every log line with an RFC3339 timestamp, e.g.
+# ``2026-09-03T21:07:36.4496366Z ::group::Run python3 foo.py``. The
+# ``::group::`` bookkeeping below has to see through that prefix.
+LOG_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+")
+
+
+def _strip_log_timestamp(line: str) -> str:
+    return LOG_TS_RE.sub("", line, count=1)
+
+
 def grep_fail_markers(log_text: str) -> list[str]:
     """Return up to 5 sample matching lines for any FAIL_PATTERNS hit.
     Empty list = clean log.
@@ -637,22 +648,48 @@ def grep_fail_markers(log_text: str) -> list[str]:
     than actual execution output. The Gitea Actions log prints the raw
     script before executing it; ``echo "::error::"`` lines in that
     display are false positives.
+
+    Two bugs made that heuristic a no-op on real logs, both fixed here:
+
+    1. **The timestamp prefix.** ``line.strip()`` on a fetched log line
+       leaves the leading ``2026-09-03T21:07:36.4496366Z``, so
+       ``startswith("::group::Run")`` never matched and the block was
+       never skipped. The ``echo "::error::"`` prefix check downstream
+       is timestamp-agnostic, which is why the gate mostly still worked
+       and this stayed hidden.
+
+    2. **Nested groups.** A ``::group::`` inside a ``Run`` block (e.g.
+       ``actions/setup-python``'s ``::group::Installed versions``) hit
+       the first ``::endgroup::`` and cleared ``in_run_group`` early,
+       un-skipping the rest of the block. ``group_depth`` was tracked
+       but never used; it is now authoritative.
+
+    Restoring the skip matters beyond ``echo`` lines: the ``::group::Run``
+    block also carries the step's ``env:`` dump, and for
+    ``lint-mask-pr-atomicity`` that dump contains ``PR_BODY`` — the PR
+    description, verbatim. Any PR whose *prose* mentions ``::error::`` or
+    a failing job then reads as a masked failure in a job that was in
+    fact green, and blocks an unrelated flip. Observed on run 693558.
+
+    Real step output lives AFTER ``::endgroup::``, so nothing that a
+    masked job actually emitted is skipped by this.
     """
     matches: list[str] = []
     in_run_group = False
     group_depth = 0
     for line in log_text.splitlines():
-        stripped = line.strip()
+        stripped = _strip_log_timestamp(line).strip()
         # Track Gitea Actions group markers so we can skip the
-        # ``::group::Run`` script-source display blocks.
-        if stripped.startswith("::group::Run"):
-            in_run_group = True
-            group_depth = 1
+        # ``::group::Run`` script-source + env-dump display blocks.
+        if stripped.startswith("::group::"):
+            if group_depth == 0 and stripped.startswith("::group::Run"):
+                in_run_group = True
+            group_depth += 1
             continue
         if stripped == "::endgroup::":
-            if in_run_group:
+            group_depth = max(0, group_depth - 1)
+            if group_depth == 0:
                 in_run_group = False
-                group_depth = 0
             continue
         if in_run_group:
             continue

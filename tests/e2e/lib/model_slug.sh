@@ -11,7 +11,7 @@
 #                                    default + 401, see PR #1714.)
 #
 #   claude-code → auth-aware:
-#                  E2E_MINIMAX_API_KEY    → "MiniMax-M2.7"
+#                  E2E_MINIMAX_API_KEY    → "MiniMax-M3"
 #                                           (BARE registered BYOK id — see the
 #                                            claude-code dispatch arm below for
 #                                            why bare, not the colon form)
@@ -37,8 +37,11 @@
 #
 #   E2E_LLM_PATH=platform selects a platform-managed model id (slash-namespaced,
 #   no tenant key — Molecule owns billing via the CP LLM proxy). The default is
-#   "moonshot/kimi-k2.6", the headline incident combo. Override the specific
-#   platform model with E2E_MODEL_SLUG. The provision branch in
+#   the e2e model, google/gemini-3.1-flash-lite — see the constant below. It was
+#   the SSOT default (minimax/MiniMax-M3, before that moonshot/kimi-k2.6) until
+#   Gemini became the platform vendor on 2026-11-17; e2e lanes now run on the
+#   cheapest Gemini model and never on the gemini-4-hydrogen default. Override the
+#   specific platform model with E2E_MODEL_SLUG. The provision branch in
 #   test_staging_full_saas.sh sends NO secrets for this path (platform-managed
 #   needs none), so the workspace must boot online purely on the proxy env the
 #   control plane injects + the manifest-derived `provider: platform` that Fix A
@@ -54,19 +57,19 @@
 # authentication method" + the synth-E2E gate goes red without naming
 # the slug-format mismatch.
 
-# Default platform-managed model for the platform-boot regression path. This
-# MIRRORS the platform SSOT default (MOLECULE_LLM_DEFAULT_MODEL =
-# minimax/MiniMax-M2.7 in Infisical /shared/controlplane/llm), so the e2e
-# exercises the SAME default a fresh tenant resolves — not a stale literal. The
-# authoritative value is the env override E2E_DEFAULT_PLATFORM_MODEL (which the
-# CI injects from the staging KMS SSOT); this is only the baked fallback. Must
-# stay a member of the claude-code `platform` arm in
-# workspace-server/internal/providers/providers.yaml (the deterministic suite
-# TestEnsureDefaultConfig_StampsProviderForEverySSOTPlatformModel enforces every
-# member of that arm derives provider=platform). Resolved INSIDE pick_model_slug
-# via ${E2E_DEFAULT_PLATFORM_MODEL:-...} so callers can override it (or unset it)
-# without tripping `set -u`.
-E2E_DEFAULT_PLATFORM_MODEL_FALLBACK="minimax/MiniMax-M2.7"
+# Default platform-managed model for the platform-boot regression path: the e2e
+# model, google/gemini-3.1-flash-lite (owner 2026-11-17: "use its cheapest model
+# for any e2e testing"). It is deliberately NOT the platform SSOT default
+# (MOLECULE_LLM_DEFAULT_MODEL = google/gemini-4-hydrogen): no e2e lane spends on
+# Hydrogen or Carbon. The ephemeral gate passes its lane's model explicitly as
+# E2E_DEFAULT_PLATFORM_MODEL (E2E_PLATFORM_MODEL, per E2E_LLM_UPSTREAM); this is
+# only the baked fallback. Must stay a member of every runtime's `platform` arm
+# in the SDK registry (molecule-ai-sdk contracts/llm-registry; the deterministic
+# suite TestEnsureDefaultConfig_StampsProviderForEverySSOTPlatformModel enforces
+# every member of that arm derives provider=platform). Resolved INSIDE
+# pick_model_slug via ${E2E_DEFAULT_PLATFORM_MODEL:-...} so callers can override
+# it (or unset it) without tripping `set -u`.
+E2E_DEFAULT_PLATFORM_MODEL_FALLBACK="google/gemini-3.1-flash-lite"
 
 # Usage: pick_model_slug <runtime>
 #   stdout: the slug string
@@ -88,42 +91,19 @@ pick_model_slug() {
   fi
   case "$runtime" in
     hermes)      printf 'openai/gpt-4o' ;;
-    # seo-agent is a claude-code-adapter template VARIANT selected by
-    # template name (template="seo-agent"), not a distinct registry runtime
-    # (it is absent from manifest.json + runtime_registry.go). Its config.yaml
-    # declares `runtime: claude-code` and copies the claude-code `providers:`
-    # block (providers.yaml:21 "The same block is copy-pasted into the seo-agent
-    # template"), so its model dispatch is IDENTICAL to claude-code's: the BARE
-    # registered MiniMax BYOK id (the staging-default key path), else direct
-    # Anthropic, else the OAuth `sonnet` alias. Sharing the claude-code branch
-    # keeps the SSOT one place — a seo-agent run is just a claude-code run
-    # behind a productized template skin, and (because the runtime resolves to
-    # claude-code server-side) its model must be a *claude-code-registered* form.
-    claude-code|seo-agent)
+    # seo-agent is a template VARIANT selected by template name
+    # (template="seo-agent"), not a distinct registry runtime. Since the
+    # seo-agent template moved to `runtime: hermes` (seo-agent template #29,
+    # manifest pin 34a1bd8) its config.yaml offers only platform-proxy
+    # MiniMax models, so every key path resolves to the slash-namespaced
+    # platform model the template registers.
+    seo-agent)   printf 'minimax/MiniMax-M2.7' ;;
+    claude-code)
       if [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then
-        # BARE registered BYOK id `MiniMax-M2.7`, NOT the colon form
-        # `minimax:MiniMax-M2.7`. On the claude-code runtime the three MiniMax
-        # spellings have three DISTINCT, intentional outcomes (provider-registry
-        # SSOT, internal#718; pinned by workspace-server/internal/providers/
-        # derive_provider_matrix_test.go, the #2263/#2274 "colon-vs-slash-vs-bare
-        # triple"):
-        #   * bare  "MiniMax-M2.7"        -> provider=minimax  (BYOK, MINIMAX_API_KEY)
-        #   * slash "minimax/MiniMax-M2.7" -> provider=platform (CP proxy bills)
-        #   * colon "minimax:MiniMax-M2.7" -> UNREGISTERED 422  (the claude-code
-        #         adapter CANNOT strip the `minimax:` prefix, so the id is not a
-        #         registered model for runtime claude-code; create-validation,
-        #         internal#718, rejects it)
-        # The bare form is registered in the claude-code `minimax` arm
-        # (registry_gen.go:88 Models=[MiniMax-M2,MiniMax-M2.7,
-        # MiniMax-M2.7-highspeed,MiniMax-M3]) and derives provider=minimax (BYOK
-        # via MINIMAX_API_KEY), so it satisfies the #1994 byok-not-platform guard
-        # (test_staging_full_saas.sh) AND passes create-validation — unlike the
-        # colon form, which 422'd "5/11 Provisioning parent workspace" with
-        # UNREGISTERED_MODEL_FOR_RUNTIME on real staging (job 295075).
-        # NOTE: the colon form IS the correct BYOK-minimax id on openclaw/hermes
-        # (those adapters DO strip `minimax:` — matrix test), but this dispatch
-        # arm only emits for claude-code/seo-agent, where bare is the right form.
-        printf 'MiniMax-M2.7'
+        # Claude Code's registered BYOK form is the bare MiniMax-M3 id.
+        # The slash form selects platform billing; the colon form is rejected
+        # by this runtime. Keep this path on the supplied MiniMax credential.
+        printf 'MiniMax-M3'
       elif [ -n "${E2E_ANTHROPIC_API_KEY:-}" ]; then
         printf 'claude-sonnet-4-6'
       else

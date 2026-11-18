@@ -70,11 +70,11 @@ vi.mock("@xyflow/react", () => {
 
 // ── Mock dependencies ─────────────────────────────────────────────────────────
 const mockGetConfigurationStatus = vi.fn(() => "configured");
-const mockGetConfigurationError = vi.fn(() => null);
+const mockGetConfigurationError = vi.fn<() => string | null>(() => null);
 
 vi.mock("@/store/canvas-topology", () => ({
-  getConfigurationStatus: (...args: unknown[]) => mockGetConfigurationStatus(...args),
-  getConfigurationError: (...args: unknown[]) => mockGetConfigurationError(...args),
+  getConfigurationStatus: (...args: unknown[]) => mockGetConfigurationStatus(),
+  getConfigurationError: (...args: unknown[]) => mockGetConfigurationError(),
 }));
 
 // Expose for per-test override
@@ -195,19 +195,25 @@ const makeNode = (overrides: Record<string, unknown> = {}) => ({
     parentId: null,
     activeTasks: 0,
     needsRestart: false,
-    currentTask: null as string | null,
-    lastSampleError: null as string | null,
+    currentTask: "",
+    lastSampleError: "",
     collapsed: false,
     agentCard: null,
-    runtime: null as string | null,
+    runtime: "",
+    lastErrorRate: 0,
+    url: "",
+    budgetLimit: null,
     ...overrides,
   },
 });
 
 const renderNode = (nodeOverrides: Record<string, unknown> = {}) => {
   const node = makeNode(nodeOverrides);
-  // WorkspaceNode expects NodeProps — it receives { id, data } as props
-  return render(<WorkspaceNode id={node.id as string} data={node.data as never} />);
+  return render(<WorkspaceNode
+    id={node.id} data={node.data} type="workspaceNode" selected={false}
+    dragging={false} draggable selectable deletable isConnectable
+    zIndex={0} positionAbsoluteX={0} positionAbsoluteY={0}
+  />);
 };
 
 // ── Tests ────────────────────────────────────────────────────────────────────

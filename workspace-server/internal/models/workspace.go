@@ -272,6 +272,14 @@ type WorkspaceComputeDisplay struct {
 	Width    int    `json:"width,omitempty"`
 	Height   int    `json:"height,omitempty"`
 	Protocol string `json:"protocol,omitempty"`
+	// IdleTimeoutSeconds is the scale-to-zero threshold for the desktop
+	// sidecar: after this many seconds with no agent control-server activity
+	// (and no human VNC input), the desktop is torn down while its profile
+	// volume persists. 0 = use the deployment default. Desired config, so it
+	// lives in the compute jsonb; the CHURNING runtime lifecycle state
+	// (running/stopped, last_agent_activity_at, lease) lives in a side table
+	// off the hot workspaces row. See the design RFC §10, §12.
+	IdleTimeoutSeconds int `json:"idle_timeout_seconds,omitempty"`
 }
 
 type WorkspaceCompute struct {

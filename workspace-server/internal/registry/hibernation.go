@@ -31,6 +31,9 @@ const defaultHibernationInterval = 2 * time.Minute
 //   - hibernation_idle_minutes IS NOT NULL AND > 0
 //   - runtime != 'external' (external agents have no Docker container)
 //   - last heartbeat older than hibernation_idle_minutes minutes ago
+//   - not an Enter OS Light agent (light_state IS NULL): a Light agent is
+//     parked by the Light monitor after its idle window, never hibernated
+//     here (a plain hibernate would leave its schedules paused)
 //
 // are candidates. The last_heartbeat_at column tracks the most recent
 // successful heartbeat from the agent; when it is NULL the workspace has
@@ -74,6 +77,7 @@ func hibernateIdleWorkspaces(ctx context.Context, onHibernate HibernateHandler) 
 		  AND COALESCE(runtime, 'claude-code') != 'external'
 		  AND last_heartbeat_at IS NOT NULL
 		  AND last_heartbeat_at < now() - (hibernation_idle_minutes * INTERVAL '1 minute')
+		  AND light_state IS NULL
 	`)
 	if err != nil {
 		log.Printf("Hibernation monitor: query error: %v", err)

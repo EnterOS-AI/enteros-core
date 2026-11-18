@@ -1,0 +1,196 @@
+name: promote-prod-tenant-pin
+
+# One manual action promotes the exact image qualified by staging, updates both
+# pin stores, rolls production targets, and verifies their digest and build SHA.
+# The existing production freeze and arming switch remain operational controls.
+# See docs/operations/tenant-release.md. No push can deploy production.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-tenant-release
+  cancel-in-progress: false
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
+jobs:
+  # bp-exempt: manual production release, independent of code merge readiness
+  promote:
+    name: Promote the production molecule-tenant pin
+    if: github.ref == 'refs/heads/main'
+    runs-on: local-deploy
+    timeout-minutes: 60
+    env:
+      PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}
+      PROMOTE_ARMED: ${{ vars.PROD_TENANT_PIN_PROMOTE_ARMED || '' }}
+      TENANT_IMAGE: ${{ vars.MOLECULE_TENANT_IMAGE || 'registry.moleculesai.app/molecule-ai/molecule-tenant' }}
+      PROD_CP_BASE_URLS: ${{ vars.PROD_CP_BASE_URLS || 'cp_prod=https://api.moleculesai.app=prod' }}
+      STAGING_CP_BASE_URL: ${{ vars.STAGING_CP_BASE_URL || 'https://staging-api.moleculesai.app' }}
+      INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+      INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+      INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+      CP_CENSUS_NAMESPACE: ${{ vars.CP_PROD_NAMESPACE || 'controlplane-prod' }}
+      CP_CENSUS_DB_POD: ${{ vars.CP_PROD_DB_POD || 'controlplane-db-postgres-0' }}
+      CP_CENSUS_DB_USER: ${{ vars.CP_PROD_DB_USER || 'cp' }}
+      CP_CENSUS_DB_NAME: ${{ vars.CP_PROD_DB_NAME || 'cp_prod' }}
+      INFISICAL_SECRET_ENV: prod
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve the deploy toolchain
+        run: |
+          set -euo pipefail
+          resolved="$(bash scripts/deploy/require-deploy-toolchain.sh \
+            'DEPLOY_PYTHON3:python3:python3:--version' \
+            'KUBECTL:kubectl:kubectl:version --client')"
+          test -n "$resolved"
+          printf '%s\n' "$resolved" >> "$GITHUB_ENV"
+
+      - name: Resolve the target from completed staging validation
+        id: target
+        env:
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REG_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
+          REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          token="$("$DEPLOY_PYTHON3" .gitea/scripts/infisical-read-secret.py CP_ADMIN_API_TOKEN /shared/controlplane-admin staging)"
+          echo "::add-mask::$token"
+          curl -fsS -A curl/8.4.0 --max-time 30 -H "Authorization: Bearer $token" \
+            "${STAGING_CP_BASE_URL%/}/cp/admin/runtime-image" > "$RUNNER_TEMP/staging-pins.json"
+          "$DEPLOY_PYTHON3" .gitea/scripts/staging_release.py \
+            --pins "$RUNNER_TEMP/staging-pins.json" --output "$RUNNER_TEMP/release.env"
+          # The qualifier emits only validated SHAs, digests, a tag and a run id.
+          set -a
+          . "$RUNNER_TEMP/release.env"
+          set +a
+          git merge-base --is-ancestor "$sha" origin/main
+          served="$("$DEPLOY_PYTHON3" .gitea/scripts/registry-manifest-state.py "${TENANT_IMAGE}:${tag}")"
+          if [ "$served" != "$digest" ]; then
+            echo "::error::registry artifact differs from the image qualified by staging"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/release.env" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Production release candidate"
+            echo "- Commit: $sha"
+            echo "- Immutable image: ${TENANT_IMAGE}@${digest}"
+            echo "- Staging validation: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${staging_run}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve production inventory
+        run: |
+          set -euo pipefail
+          bash scripts/deploy/resolve-k8s-fleet-census.sh --allow-empty --env-out "$RUNNER_TEMP/fleet.env"
+          # This lane owns the Kubernetes fleet. Refuse an unsupported substrate
+          # before any pin write, rather than claim a partial fleet release.
+          set -a
+          . "$RUNNER_TEMP/fleet.env"
+          set +a
+          if awk -F '\t' '$3 != "k8s" { found=1 } END { exit !found }' "$FLEET_CENSUS_TSV"; then
+            echo "::error::production census contains a non-Kubernetes tenant; configure its release driver before promotion"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/fleet.env" >> "$GITHUB_ENV"
+
+      - name: Plan current pin vs target on every production control plane
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+          TARGET_DIGEST: ${{ steps.target.outputs.digest }}
+        run: |
+          set -euo pipefail
+          umask 077
+          args=()
+          endpoints="$("$DEPLOY_PYTHON3" .gitea/scripts/prod_cp_endpoints.py "$PROD_CP_BASE_URLS" --env prod)"
+          if [ "$(printf '%s\n' "$endpoints" | wc -l)" -ne 1 ]; then
+            echo "::error::This fleet census requires exactly one production control plane"
+            exit 1
+          fi
+          while IFS=$'\t' read -r label base inf_env; do
+            token="$("$DEPLOY_PYTHON3" .gitea/scripts/infisical-read-secret.py CP_ADMIN_API_TOKEN /shared/controlplane-admin "$inf_env")"
+            echo "::add-mask::$token"
+            resp="$RUNNER_TEMP/pins-${label}.json"
+            curl -fsS -A curl/8.4.0 --max-time 30 -H "Authorization: Bearer $token" \
+              "${base%/}/cp/admin/runtime-image" > "$resp"
+            args+=("${label}=${resp}")
+          done <<< "$endpoints"
+          "$DEPLOY_PYTHON3" .gitea/scripts/prod_pin_plan.py \
+            --target "${TENANT_IMAGE}@${TARGET_DIGEST}" --target-digest "$TARGET_DIGEST" \
+            --needed-out "$RUNNER_TEMP/needed.txt" "${args[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
+          bash scripts/deploy/rollback-production-release.sh "$RUNNER_TEMP" --validate-only
+          bash scripts/deploy/redeploy-tenant-fleet-k8s.sh --digest "$TARGET_DIGEST" --dry-run --allow-empty
+
+      - name: Decide plan vs apply
+        id: mode
+        run: |
+          set -euo pipefail
+          apply=0
+          case "${PROD_AUTO_DEPLOY_DISABLED,,}" in
+            1|true|yes|on|disabled|disable) echo "::notice::Production freeze is active; plan only." ;;
+            *)
+              if [ "${PROMOTE_ARMED,,}" = "true" ]; then
+                apply=1
+              else
+                echo "::notice::Production release is not armed; plan only."
+              fi
+              ;;
+          esac
+          echo "apply=$apply" >> "$GITHUB_OUTPUT"
+
+      - name: Apply production pins and boot defaults
+        id: apply
+        if: ${{ steps.mode.outputs.apply == '1' }}
+        env:
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE }}
+          TARGET_DIGEST: ${{ steps.target.outputs.digest }}
+          TENANT_PIN_GIT_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test -f "$RUNNER_TEMP/needed.txt"
+          endpoints="$("$DEPLOY_PYTHON3" .gitea/scripts/prod_cp_endpoints.py "$PROD_CP_BASE_URLS" --env prod)"
+          while IFS=$'\t' read -r label base inf_env; do
+            CP_BASE_URL="$base" INFISICAL_ENV="$inf_env" \
+              ./scripts/deploy/advance-staging-tenant-pin.sh \
+                --image "${TENANT_IMAGE}@${TARGET_DIGEST}" --git-sha "$TENANT_PIN_GIT_SHA"
+          done <<< "$endpoints"
+          # The shared writer reconciles the boot secret even when the DB pin
+          # is already current. A retry also rolls any targets missed last time.
+
+      - name: Roll and verify production targets
+        id: roll
+        if: ${{ steps.mode.outputs.apply == '1' }}
+        env:
+          EXPECTED_BUILD_SHA: ${{ steps.target.outputs.sha }}
+          TARGET_DIGEST: ${{ steps.target.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Empty active inventory is a legitimate first deployment: the pin
+          # controls fresh provisions. Counts still distinguish it from a roll.
+          bash scripts/deploy/redeploy-tenant-fleet-k8s.sh --digest "$TARGET_DIGEST" --allow-empty \
+            2>&1 | tee "$RUNNER_TEMP/production-roll.log"
+          cat "$RUNNER_TEMP/production-roll.log" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore previous pins and production image after a failed release
+        if: ${{ failure() && steps.mode.outputs.apply == '1' && (steps.apply.outcome == 'failure' || steps.roll.outcome == 'failure') }}
+        env:
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE }}
+        run: |
+          set -euo pipefail
+          bash scripts/deploy/rollback-production-release.sh "$RUNNER_TEMP"
+
+      - name: Remove temporary cluster and pin files
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/fleet.kubeconfig" "$RUNNER_TEMP/staging-pins.json" "$RUNNER_TEMP"/pins-*.json

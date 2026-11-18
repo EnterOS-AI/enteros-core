@@ -165,7 +165,7 @@ skills: []
 description: fresh
 tier: 4
 runtime: claude-code
-model: moonshot/kimi-k2.6
+model: minimax/MiniMax-M2.7
 runtime_config:
   required_env: [TENANT_NAME]
   recommended_env: [GOOGLE_GSC_SITE]
@@ -1412,7 +1412,7 @@ skills: []
 	if regModelIDs["totally-made-up-model"] {
 		t.Errorf("RegistryModels leaked the template's unregistered model id")
 	}
-	for _, want := range []string{"sonnet", "opus", "claude-opus-4-7", "anthropic/claude-opus-4-7"} {
+	for _, want := range []string{"sonnet", "opus", "claude-opus-4-7", "minimax/MiniMax-M2.7"} {
 		if !regModelIDs[want] {
 			t.Errorf("RegistryModels missing native model %q; got %v", want, regModelIDs)
 		}
@@ -1471,8 +1471,8 @@ skills: []
 		t.Errorf("claude-opus-4-7 derived provider: want anthropic-api, got %q", provByModel["claude-opus-4-7"])
 	}
 	// A platform-namespaced model derives to the closed platform provider.
-	if provByModel["anthropic/claude-opus-4-7"] != "platform" {
-		t.Errorf("anthropic/claude-opus-4-7 derived provider: want platform, got %q", provByModel["anthropic/claude-opus-4-7"])
+	if provByModel["minimax/MiniMax-M2.7"] != "platform" {
+		t.Errorf("minimax/MiniMax-M2.7 derived provider: want platform, got %q", provByModel["minimax/MiniMax-M2.7"])
 	}
 
 	// registry_providers carries the provider display_name + auth_env for the

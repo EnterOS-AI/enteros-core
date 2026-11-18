@@ -565,6 +565,45 @@ var scheduleNamePattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 // grammar is ASCII, so Go byte length == the schema's code-point length).
 const maxScheduleNameLen = 128
 
+// slugifyScheduleName maps an authored display name onto the runtime's kebab
+// grammar (scheduleNamePattern).
+//
+// Template authors write human names — "SEO Weekly Report (Monday 8:03 AM)",
+// "B) Tue defensive: hreflang". Those are not valid grid keys, and the renderer
+// used to SKIP them, which is why 35 declared schedules across 5 template repos
+// have never fired. Slugifying here fixes every one of them with no template
+// edit, because the grid is the only thing that enforces the grammar.
+//
+// Any run of characters outside [a-z0-9] collapses to a single "-", and leading
+// and trailing separators are trimmed, so the result either matches
+// scheduleNamePattern or is empty. Over-long names are truncated to
+// maxScheduleNameLen and re-trimmed (truncation can leave a trailing "-").
+// A name that is ALREADY valid kebab is returned byte-identical — the two
+// schedules that render today must not move.
+func slugifyScheduleName(name string) string {
+	var b strings.Builder
+	b.Grow(len(name))
+	pendingSep := false
+	for _, r := range strings.ToLower(name) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			if pendingSep && b.Len() > 0 {
+				b.WriteByte('-')
+			}
+			pendingSep = false
+			b.WriteRune(r)
+			continue
+		}
+		// Collapse any run of separators/punctuation/non-ASCII into one "-",
+		// emitted lazily so a trailing run never produces a trailing dash.
+		pendingSep = true
+	}
+	slug := b.String()
+	if len(slug) > maxScheduleNameLen {
+		slug = strings.TrimRight(slug[:maxScheduleNameLen], "-")
+	}
+	return slug
+}
+
 // scheduleEntryRoundTrips is the per-entry emitter guard: it marshals the
 // single entry as its own schedules doc, re-parses it, and reports whether
 // every field survives byte-exact. Any residual yaml.v3 emitter
@@ -624,6 +663,10 @@ func renderTemplateSchedulesYAML(schedules []OrgSchedule, orgBaseDir, filesDir, 
 		return "", 0, 0
 	}
 	entries := make([]renderedTemplateSchedule, 0, len(schedules))
+	// Slug -> the authored name that claimed it. The name is the grid's STATE
+	// KEY, so two authored names collapsing onto one slug would make the second
+	// silently overwrite the first's run state. That is refused, not merged.
+	claimed := make(map[string]string, len(schedules))
 	for i, sched := range schedules {
 		if len(entries) >= maxTemplateSchedules {
 			remaining := len(schedules) - i
@@ -634,8 +677,27 @@ func renderTemplateSchedulesYAML(schedules []OrgSchedule, orgBaseDir, filesDir, 
 		// Name must satisfy the runtime contract (scheduleNamePattern +
 		// maxScheduleNameLen — see the var doc): a non-conforming name would
 		// be silently dropped by the runtime's validate-and-skip seeding.
-		if sched.Name == "" || len(sched.Name) > maxScheduleNameLen || !scheduleNamePattern.MatchString(sched.Name) {
-			log.Printf("Org import: schedule render for %s: entry %d name %q violates the schedule contract (lowercase kebab ^[a-z0-9]+(?:-[a-z0-9]+)*$, ≤%d chars — the runtime would silently skip it) — skipping", wsName, i, sched.Name, maxScheduleNameLen)
+		//
+		// Rather than skip, SLUGIFY on write. Template authors write display
+		// names; the grammar is the grid's, not the author's. A name that is
+		// already valid passes through byte-identical, so this cannot move a
+		// schedule that renders today.
+		scheduleName := sched.Name
+		if !scheduleNamePattern.MatchString(scheduleName) || len(scheduleName) > maxScheduleNameLen {
+			slug := slugifyScheduleName(sched.Name)
+			if slug == "" {
+				log.Printf("Org import: schedule render for %s: entry %d name %q has no slugifiable content (nothing in [a-z0-9] survives) — skipping", wsName, i, sched.Name)
+				skipped++
+				continue
+			}
+			log.Printf("Org import: schedule render for %s: entry %d name %q is not a valid grid key — renamed to %q", wsName, i, sched.Name, slug)
+			scheduleName = slug
+		}
+		if prior, dup := claimed[scheduleName]; dup {
+			// REFUSE. First claimant keeps the key; the collider is skipped
+			// loudly with both authored names, because silently overwriting
+			// would destroy the first schedule's run state.
+			log.Printf("Org import: schedule render for %s: entry %d name %q collides with %q — both map to grid key %q; refusing to overwrite, skipping the later entry", wsName, i, sched.Name, prior, scheduleName)
 			skipped++
 			continue
 		}
@@ -678,7 +740,7 @@ func renderTemplateSchedulesYAML(schedules []OrgSchedule, orgBaseDir, filesDir, 
 			enabled = *sched.Enabled
 		}
 		entry := renderedTemplateSchedule{
-			Name:     sched.Name,
+			Name:     scheduleName,
 			Cron:     sched.CronExpr,
 			Timezone: tz,
 			Prompt:   schedulePromptNode(prompt),
@@ -695,6 +757,11 @@ func renderTemplateSchedulesYAML(schedules []OrgSchedule, orgBaseDir, filesDir, 
 			skipped++
 			continue
 		}
+		// Claim the grid key only once the entry has actually survived every
+		// check. Claiming earlier would let an entry that is then rejected
+		// (bad cron, unresolvable prompt) block a later, valid entry that
+		// slugs to the same key.
+		claimed[scheduleName] = sched.Name
 		entries = append(entries, entry)
 	}
 	if len(entries) == 0 {

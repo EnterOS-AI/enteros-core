@@ -61,20 +61,65 @@ func IssueAPIToken(ctx context.Context, db *sql.DB, workspaceID string) (string,
 	return issueTokenKind(ctx, db, workspaceID, "api")
 }
 
-func issueTokenKind(ctx context.Context, db *sql.DB, workspaceID, kind string) (string, error) {
+// IssueAPITokenWithID is IssueAPIToken that also returns the token's row id,
+// so a caller that must revoke this exact token later (the Enter OS Light run
+// token core mints at every park) can keep a pointer to it instead of the
+// plaintext.
+func IssueAPITokenWithID(ctx context.Context, db *sql.DB, workspaceID string) (id, plaintext string, err error) {
+	plaintext, hash, prefix, err := newTokenMaterial()
+	if err != nil {
+		return "", "", err
+	}
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO workspace_auth_tokens (workspace_id, token_hash, prefix, kind)
+		VALUES ($1, $2, $3, 'api')
+		RETURNING id
+	`, workspaceID, hash, prefix).Scan(&id); err != nil {
+		return "", "", fmt.Errorf("wsauth: persist token: %w", err)
+	}
+	return id, plaintext, nil
+}
+
+// RevokeTokenByID revokes one live token of the workspace. revoked is false
+// when no live token of that id belongs to the workspace (already revoked, or
+// never this workspace's).
+func RevokeTokenByID(ctx context.Context, db *sql.DB, workspaceID, tokenID string) (revoked bool, err error) {
+	res, err := db.ExecContext(ctx, `
+		UPDATE workspace_auth_tokens
+		SET revoked_at = now()
+		WHERE id = $1 AND workspace_id = $2 AND revoked_at IS NULL
+	`, tokenID, workspaceID)
+	if err != nil {
+		return false, fmt.Errorf("wsauth: revoke token: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("wsauth: revoke token: %w", err)
+	}
+	return n > 0, nil
+}
+
+// newTokenMaterial generates a token's plaintext, the sha256 stored for it, and
+// the display prefix.
+func newTokenMaterial() (plaintext string, hash []byte, prefix string, err error) {
 	buf := make([]byte, tokenPayloadBytes)
 	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("wsauth: generate token: %w", err)
+		return "", nil, "", fmt.Errorf("wsauth: generate token: %w", err)
 	}
-	plaintext := base64.RawURLEncoding.EncodeToString(buf)
+	plaintext = base64.RawURLEncoding.EncodeToString(buf)
+	sum := sha256.Sum256([]byte(plaintext))
+	return plaintext, sum[:], plaintext[:tokenPrefixLen], nil
+}
 
-	hash := sha256.Sum256([]byte(plaintext))
-	prefix := plaintext[:tokenPrefixLen]
-
-	_, err := db.ExecContext(ctx, `
+func issueTokenKind(ctx context.Context, db *sql.DB, workspaceID, kind string) (string, error) {
+	plaintext, hash, prefix, err := newTokenMaterial()
+	if err != nil {
+		return "", err
+	}
+	_, err = db.ExecContext(ctx, `
 		INSERT INTO workspace_auth_tokens (workspace_id, token_hash, prefix, kind)
 		VALUES ($1, $2, $3, $4)
-	`, workspaceID, hash[:], prefix, kind)
+	`, workspaceID, hash, prefix, kind)
 	if err != nil {
 		return "", fmt.Errorf("wsauth: persist token: %w", err)
 	}

@@ -38,6 +38,15 @@ var trackedRefValues = map[string]bool{
 //	"tag:vX.Y.Z"      — track a specific tag
 //	"tag:latest"      — track latest tag, drift on every new tag
 //	"sha:<full-sha>"  — pinned to commit SHA
+//	"ref:<name>"      — track whatever this ref resolves to right now
+//
+// The "ref:" form covers a source pinned to a moving branch ("#main") or to a
+// bare tag name ("#v0.2.1"). Those two are syntactically indistinguishable
+// without a forge lookup, so they share one form rather than guessing: an
+// immutable tag simply resolves to a constant SHA and never reports drift,
+// while a branch tip advances and does. Before this form existed both
+// collapsed to "none" and the drift sweeper's `tracked_ref != 'none'` filter
+// excluded every real-world plugin (core#4977).
 func validateTrackedRef(s string) (string, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -52,7 +61,10 @@ func validateTrackedRef(s string) (string, error) {
 	if strings.HasPrefix(s, "sha:") && len(s) > 4 {
 		return s, nil
 	}
-	return "", fmt.Errorf("invalid track value %q: expected 'none' | 'tag:vX.Y.Z' | 'tag:latest' | 'sha:<full>'", s)
+	if strings.HasPrefix(s, "ref:") && len(s) > 4 {
+		return s, nil
+	}
+	return "", fmt.Errorf("invalid track value %q: expected 'none' | 'tag:vX.Y.Z' | 'tag:latest' | 'sha:<full>' | 'ref:<name>'", s)
 }
 
 // recordWorkspacePluginInstall upserts the workspace_plugins row for a
@@ -403,6 +415,33 @@ func deleteWorkspacePluginRow(ctx context.Context, workspaceID, pluginName strin
 	}
 	_, err := db.DB.ExecContext(ctx, `
 		DELETE FROM workspace_plugins WHERE workspace_id = $1 AND plugin_name = $2
+	`, workspaceID, pluginName)
+	return err
+}
+
+// deleteDeclaredPluginRow removes the workspace_declared_plugins row for a
+// workspace/plugin pair. Mirrors deleteWorkspacePluginRow for the DESIRED set.
+//
+// Used by the docker-less PULL uninstall path (plugins_install.go
+// uninstallByPull): dropping the installed row alone is NOT enough, because
+// desiredPluginSources (declared ∪ installed) still emits the plugin from its
+// declared row into MOLECULE_DECLARED_PLUGINS — so the runtime boot materializer
+// would re-pull the just-"uninstalled" plugin into /configs/plugins on the very
+// next restart. Deleting BOTH rows keeps the plugin out of the recomputed
+// desired set, so the fresh container simply never fetches it.
+//
+// Scope note (see uninstallByPull for the full list of limits): this removes a
+// USER-installed declaration cleanly. A TEMPLATE-declared plugin is re-injected
+// from the config.yaml payload by CP (injectTemplateDeclaredPlugins) on the
+// next provision, so deleting the declared row alone does not permanently
+// remove a template plugin — that is desired-state behavior, not a bug in this
+// path.
+func deleteDeclaredPluginRow(ctx context.Context, workspaceID, pluginName string) error {
+	if db.DB == nil {
+		return nil // nil in unit tests; no-op since the row is test-only
+	}
+	_, err := db.DB.ExecContext(ctx, `
+		DELETE FROM workspace_declared_plugins WHERE workspace_id = $1 AND plugin_name = $2
 	`, workspaceID, pluginName)
 	return err
 }

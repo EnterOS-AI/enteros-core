@@ -55,7 +55,7 @@ function MarkdownBubble({
       remarkPlugins={[remarkGfm]}
       components={{
         p: ({ children }) => (
-          <div style={{ margin: "2px 0", lineHeight: "inherit" }}>{children}</div>
+          <div style={{ margin: "2px 0", lineHeight: "inherit", whiteSpace: "pre-wrap", overflowWrap: "break-word" }}>{children}</div>
         ),
         a: ({ href, children }) => (
           <a
@@ -238,6 +238,7 @@ export function MobileChat({
     error: sendError,
     clearError,
     releaseSendGuards,
+    failSend,
   } = useChatSend(agentId, {
     onUserMessage: appendMessageDeduped,
     onAgentMessage: appendMessageDeduped,
@@ -250,10 +251,11 @@ export function MobileChat({
       appendMessageDeduped(m);
       clearError();
     },
-    onSendComplete: () => {
-      releaseSendGuards();
+    onSendComplete: (messageId) => {
+      releaseSendGuards(messageId);
       clearError();
     },
+    onSendError: failSend,
   });
 
   // Restore draft + attachments when a genuine send error surfaces, so the
@@ -308,6 +310,14 @@ export function MobileChat({
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages]);
+
+  // Register as a live consumer for as long as this chat is mounted — see
+  // useChatSocket for why the store must not buffer without one.
+  useEffect(() => {
+    const { retainAgentMessages, releaseAgentMessages } = useCanvasStore.getState();
+    retainAgentMessages(agentId);
+    return () => releaseAgentMessages(agentId);
+  }, [agentId]);
 
   // Consume any agent messages that arrived while history was loading.
   const initialConsumeDoneRef = useRef(false);

@@ -99,6 +99,9 @@ func TestExtended_WorkspaceUpdate(t *testing.T) {
 	mock.ExpectExec("UPDATE workspaces SET name").
 		WithArgs(wsUpdID, "New Name").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WithArgs("WORKSPACE_UPDATED", wsUpdID, `{"name":"New Name"}`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect canvas position upsert (x and y both provided)
 	mock.ExpectExec("INSERT INTO canvas_layouts").

@@ -148,7 +148,7 @@ func sweepOnlineWorkspaces(ctx context.Context, checker ContainerChecker, onOffl
 		// used by sweepStaleRemoteWorkspaces (below) and registry/liveness.go.
 		_, err = db.DB.ExecContext(ctx,
 			`UPDATE workspaces SET status = $1, updated_at = now()
-			 WHERE id = $2 AND status NOT IN ('removed', 'provisioning', 'paused', 'hibernated', 'hibernating')`,
+			 WHERE id = $2 AND status NOT IN ('removed', 'provisioning', 'paused', 'hibernated', 'hibernating') AND `+models.LightWakeAllowedSQL,
 			models.StatusOffline, id)
 		if err != nil {
 			log.Printf("Health sweep: failed to mark %s offline: %v", id, err)

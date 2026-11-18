@@ -131,6 +131,11 @@ type auditEventRow struct {
 	PrevHMAC           *string   `json:"prev_hmac"`
 	HMAC               string    `json:"hmac"`
 	WorkspaceID        string    `json:"workspace_id"`
+	// Details is the compact, key-sorted JSON payload naming the event's
+	// SUBJECT (deleted workspace id, revoked token id, client ip, …). Stored
+	// as TEXT, not JSONB, precisely so the bytes read back are the bytes
+	// signed — see migration 20260730120000. NULL on rows predating it.
+	Details *string `json:"details"`
 }
 
 // Query handles GET /workspaces/:id/audit.
@@ -209,7 +214,7 @@ func (h *AuditHandler) Query(c *gin.Context) {
 	// Fetch rows ------------------------------------------------------------
 	selectQuery := `SELECT id, timestamp, agent_id, session_id, operation,
 		input_hash, output_hash, model_used,
-		human_oversight_flag, risk_flag, prev_hmac, hmac, workspace_id
+		human_oversight_flag, risk_flag, prev_hmac, hmac, workspace_id, details
 		FROM audit_events ` + where +
 		fmt.Sprintf(" ORDER BY timestamp ASC, id ASC LIMIT $%d OFFSET $%d", idx, idx+1)
 
@@ -260,6 +265,14 @@ func (h *AuditHandler) Query(c *gin.Context) {
 		chainVerification = "disabled_no_salt"
 	case offset != 0 || sessionID != "" || fromStr != "":
 		chainVerification = "unavailable_partial_query"
+	case auditAnyUnsigned(events):
+		// Distinct from "tampered": these rows were never signed (appended
+		// while the salt was unset), so calling them tampered would send an
+		// operator hunting for an attacker who does not exist. Still
+		// fail-closed — chain_valid is false, not null.
+		f := false
+		chainValid = &f
+		chainVerification = "unsigned_events_present"
 	default:
 		chainValid = verifyAuditChain(events)
 		switch {
@@ -301,6 +314,7 @@ func scanAuditRows(rows *sql.Rows) ([]auditEventRow, error) {
 			&ev.PrevHMAC,
 			&ev.HMAC,
 			&ev.WorkspaceID,
+			&ev.Details,
 		); err != nil {
 			return nil, err
 		}
@@ -331,6 +345,21 @@ func verifyAuditChain(events []auditEventRow) *bool {
 
 	for i := range events {
 		ev := &events[i]
+
+		// A row stamped unsigned: was appended while AUDIT_LEDGER_SALT was
+		// unset — it is a real record but was never signed, so it can be
+		// neither verified nor honestly called tampered. Fail closed: the
+		// chain is not verifiable. Query reports this as
+		// "unsigned_events_present" so operators get the actionable reason.
+		if auditIsUnsigned(ev.HMAC) {
+			log.Printf(
+				"SECURITY/AUDIT: unsigned audit event %s (agent=%s) — written with AUDIT_LEDGER_SALT unset; chain is NOT tamper-evident",
+				ev.ID, ev.AgentID,
+			)
+			f := false
+			return &f
+		}
+
 		state, ok := chains[ev.AgentID]
 		if !ok {
 			state = &chainState{}
@@ -377,16 +406,20 @@ func verifyAuditChain(events []auditEventRow) *bool {
 	return &t
 }
 
-// computeAuditHMAC replicates Python's _compute_event_hmac() for a single row.
+// auditCanonicalPayload builds the signed byte string for one row.
 //
-// Canonical JSON rules (must match ledger.py exactly):
+// Canonical JSON rules:
 //   - All fields except "hmac", serialised as a JSON object
 //   - Keys sorted alphabetically (encoding/json.Marshal on map does this)
 //   - Compact separators (no spaces)
 //   - Timestamp as RFC-3339 seconds-precision with Z suffix
 //   - Null values as JSON null (Go *string nil → null)
-func computeAuditHMAC(key []byte, ev *auditEventRow) string {
-	// Build the canonical map — keys must sort alphabetically to match Python.
+//
+// "details" is OMITTED entirely when the column is NULL rather than emitted as
+// JSON null. That is deliberate and load-bearing: rows written before the
+// details column existed must keep hashing to exactly the same value, so
+// adding the column cannot retroactively invalidate a chain.
+func auditCanonicalPayload(ev *auditEventRow) string {
 	canonical := map[string]interface{}{
 		"agent_id":             ev.AgentID,
 		"human_oversight_flag": ev.HumanOversightFlag,
@@ -400,14 +433,26 @@ func computeAuditHMAC(key []byte, ev *auditEventRow) string {
 		"session_id":           ev.SessionID,
 		"timestamp":            ev.Timestamp.UTC().Format("2006-01-02T15:04:05Z"),
 	}
+	if ev.Details != nil {
+		canonical["details"] = *ev.Details
+	}
 
 	payload, marshalErr := json.Marshal(canonical) // compact, sorted keys
 	if marshalErr != nil {
 		log.Printf("auditChainHash: json.Marshal canonical failed: %v", marshalErr)
 		return ""
 	}
+	return string(payload)
+}
+
+// computeAuditHMAC signs one row's canonical form with the ledger key.
+func computeAuditHMAC(key []byte, ev *auditEventRow) string {
+	payload := auditCanonicalPayload(ev)
+	if payload == "" {
+		return ""
+	}
 	mac := hmac.New(sha256.New, key)
-	mac.Write(payload)
+	mac.Write([]byte(payload))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 

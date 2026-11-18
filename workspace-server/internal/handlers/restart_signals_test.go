@@ -52,8 +52,12 @@ func TestRewriteForDocker_NonDockerHostUrlUnchanged(t *testing.T) {
 	defer restore()
 
 	h := newHandlerWithTestDeps(t)
-	url := h.rewriteForDocker("http://example.com:8000/agent", "ws-test-123")
-	if url != "http://example.com:8000/agent" {
+	h.provisioner = &stubLocalProv{}
+	url, err := h.rewriteForDocker(context.Background(), "http://localhost:44911", "ws-test-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if url != "http://localhost:44911" {
 		t.Errorf("expected unchanged URL, got %q", url)
 	}
 }
@@ -66,7 +70,10 @@ func TestRewriteForDocker_LocalhostUrlUnchanged_NoProvisioner(t *testing.T) {
 
 	h := newHandlerWithTestDeps(t)
 	// h.provisioner is nil → no Docker rewrite even when platformInDocker=true
-	url := h.rewriteForDocker("http://127.0.0.1:49152/agent", "ws-test-123")
+	url, err := h.rewriteForDocker(context.Background(), "http://127.0.0.1:49152/agent", "ws-test-123")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if url != "http://127.0.0.1:49152/agent" {
 		t.Errorf("expected localhost URL unchanged (no provisioner), got %q", url)
 	}
@@ -79,10 +86,17 @@ func TestRewriteForDocker_LocalhostUrlRewritten(t *testing.T) {
 	restore := setPlatformInDockerForTest(true)
 	defer restore()
 
-	h := newHandlerWithTestDeps(t)
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	h := NewWorkspaceHandler(nil, nil, "http://localhost:8080", t.TempDir())
 	h.provisioner = &stubLocalProv{} // non-nil → triggers Docker rewrite
 
-	url := h.rewriteForDocker("http://127.0.0.1:49152/agent", "ws-test-123")
+	mock.ExpectQuery("SELECT COALESCE\\(runtime").WithArgs("ws-test-123").
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
+	url, err := h.rewriteForDocker(context.Background(), "http://127.0.0.1:49152/agent", "ws-test-123")
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Docker DNS form: ws-<short-id>:8000
 	if url == "http://127.0.0.1:49152/agent" {
 		t.Error("expected localhost URL to be rewritten to Docker DNS form")
@@ -91,6 +105,9 @@ func TestRewriteForDocker_LocalhostUrlRewritten(t *testing.T) {
 	expectedInternal := "http://ws-ws-test-123:8000"
 	if url != expectedInternal {
 		t.Errorf("expected %q, got %q", expectedInternal, url)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }
 
