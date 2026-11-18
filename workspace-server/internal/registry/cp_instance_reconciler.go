@@ -53,6 +53,7 @@ import (
 	"context"
 	"database/sql"
 	"log"
+	"sync"
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
@@ -69,6 +70,36 @@ import (
 type InstanceRunningChecker interface {
 	IsRunning(ctx context.Context, workspaceID string) (bool, error)
 }
+
+// InstanceStartingChecker is what a checker may add to tell an instance that
+// is still coming up from one that is gone (*provisioner.CPProvisioner does).
+// The control plane reports a Kubernetes workspace "provisioning" until its
+// pod is Ready, and the pod registers, so the row reads online, before it is:
+// IsRunning's (false, nil) in that window is a pod booting, not a dead
+// instance. Without this the reconciler restarted fresh agents seconds after
+// they registered (2026-11-18, staging: a new hermes agent replaced 7 s after
+// its registration, so the Light SDK's first schedule writes met a pod that was
+// going away).
+type InstanceStartingChecker interface {
+	InstanceStarting(ctx context.Context, workspaceID string) (bool, error)
+}
+
+// cpInstanceStartingGrace bounds how long the reconciler leaves an online
+// workspace whose instance the control plane still reports as starting: a pod
+// that never becomes Ready is reprovisioned once it has been starting this
+// long, as before.
+var cpInstanceStartingGrace = 5 * time.Minute
+
+// reconcilerNow is the reconciler's clock (a test seam).
+var reconcilerNow = time.Now
+
+// startingSince is when the reconciler first found each (workspace,
+// instance) online but starting; an entry not seen starting in a cycle is
+// dropped at its end.
+var (
+	startingMu    sync.Mutex
+	startingSince = map[string]time.Time{}
+)
 
 // CPInstanceReconcileLimit caps the per-cycle row count so a sustained
 // CP slowdown can't make a single sweep cycle run unbounded. With a 60s
@@ -193,6 +224,8 @@ func reconcileOnce(parent context.Context, checker InstanceRunningChecker, onOff
 	}
 
 	processed, skipped := 0, 0
+	startingSeen := map[string]bool{}
+	defer forgetStartingExcept(startingSeen)
 	for _, c := range candidates {
 		// Abandon the cycle if we've blown the per-cycle deadline; the
 		// next tick re-reads from the top (ORDER BY updated_at DESC) and
@@ -222,6 +255,28 @@ func reconcileOnce(parent context.Context, checker InstanceRunningChecker, onOff
 			continue
 		}
 
+		// An instance the control plane still reports as starting is a pod
+		// booting (see InstanceStartingChecker): leave it, for up to
+		// cpInstanceStartingGrace. An error asking is fail-safe too.
+		if sc, ok := checker.(InstanceStartingChecker); ok {
+			startCtx, cancelStart := context.WithTimeout(cycleCtx, cpInstanceCheckTimeout)
+			starting, startErr := sc.InstanceStarting(startCtx, c.id)
+			cancelStart()
+			if startErr != nil {
+				log.Printf("cp-instance-reconciler: InstanceStarting(%s) errored, leaving online (fail-safe): %v", c.id, startErr)
+				continue
+			}
+			if starting {
+				key := c.id + "/" + c.instanceID
+				startingSeen[key] = true
+				if since := markStarting(key); reconcilerNow().Sub(since) < cpInstanceStartingGrace {
+					log.Printf("cp-instance-reconciler: workspace %s (instance %s) is online and its instance is still starting (for %s) — leaving it", c.id, c.instanceID, reconcilerNow().Sub(since).Round(time.Second))
+					continue
+				}
+				log.Printf("cp-instance-reconciler: workspace %s (instance %s) has been starting for over %s — treating it as not running", c.id, c.instanceID, cpInstanceStartingGrace)
+			}
+		}
+
 		// (false, nil) is NOT yet proof the EC2 is dead. IsRunning
 		// resolves instance_id independently (resolveInstanceID); if the
 		// row's instance_id was cleared/NULLed (concurrent delete, the
@@ -246,6 +301,30 @@ func reconcileOnce(parent context.Context, checker InstanceRunningChecker, onOff
 		log.Printf("cp-instance-reconciler: workspace %s (instance %s) is online/degraded but its EC2 is not running (terminated/stopped) — flipping offline + triggering reprovision", c.id, c.instanceID)
 		if onOffline != nil {
 			onOffline(cycleCtx, c.id)
+		}
+	}
+}
+
+// markStarting records the first time key was seen starting and returns it.
+func markStarting(key string) time.Time {
+	startingMu.Lock()
+	defer startingMu.Unlock()
+	since, ok := startingSince[key]
+	if !ok {
+		since = reconcilerNow()
+		startingSince[key] = since
+	}
+	return since
+}
+
+// forgetStartingExcept drops the starting records a cycle did not see
+// starting (running again, offline, deleted, or another instance).
+func forgetStartingExcept(seen map[string]bool) {
+	startingMu.Lock()
+	defer startingMu.Unlock()
+	for key := range startingSince {
+		if !seen[key] {
+			delete(startingSince, key)
 		}
 	}
 }
