@@ -74,6 +74,7 @@ var reviewedLightWakeSites = map[string]reviewedWakeSite{
 	"handlers/plugins_install.go|PluginsHandler.uninstallViaEIC|restartFunc":                {2, "runRestartCycle predicates + refresh"},
 	"handlers/plugins_install_pipeline.go|PluginsHandler.deliverToContainer|restartFunc":    {2, "runRestartCycle predicates + refresh"},
 	"handlers/plugins_install_pipeline.go|PluginsHandler.reMaterialize|restartFunc":         {2, "runRestartCycle predicates + refresh"},
+	"handlers/plugins_install_pipeline.go|PluginsHandler.pullUninstall|restartFunc":         {2, "runRestartCycle predicates + refresh"},
 	"handlers/plugins_install_pipeline.go|PluginsHandler.deliverViaDocker|restartFunc":      {2, "runRestartCycle predicates + refresh"},
 	"handlers/secrets.go|SecretsHandler.Set|restartFunc":                                    {2, "runRestartCycle predicates + refresh"},
 	"handlers/secrets.go|SecretsHandler.Delete|restartFunc":                                 {2, "runRestartCycle predicates + refresh"},

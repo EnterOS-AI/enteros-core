@@ -48,12 +48,15 @@ package handlers
 // not recoverable; a visible stale key is. Rows are removed only when the
 // workspace itself is deleted (ON DELETE CASCADE on workspace_id).
 //
-// Note that resolution keeps working across an uninstall: PluginsHandler.
-// Uninstall deletes the workspace_plugins (installed) row and leaves
-// workspace_declared_plugins (declared) intact, and this resolver accepts
-// either. An operator can therefore still read and edit the settings of a
-// declared plugin between its uninstall and the reconcile that puts it back —
-// which is the point of retaining them.
+// Resolution across an uninstall depends on the delivery path. The push paths
+// of PluginsHandler.Uninstall (docker exec, EIC) delete the workspace_plugins
+// (installed) row and leave workspace_declared_plugins (declared) intact, and
+// this resolver accepts either, so an operator can still read and edit the
+// settings of a declared plugin between its uninstall and the reconcile that
+// puts it back. The pull path (uninstallByPull: a docker-less workspace)
+// deletes the declared row as well, so the name stops resolving (404) until
+// the plugin is reinstalled. In both cases the settings row itself is retained
+// and resolves again on reinstall — which is the point of retaining it.
 
 import (
 	"context"
