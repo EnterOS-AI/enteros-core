@@ -25,7 +25,7 @@ expect() { # expect <desc> <want-rc> <model-or-UNSET>
   if [ "$model" = "UNSET" ]; then
     out="$( (unset E2E_PLATFORM_MODEL; require_platform_model) 2>&1 )"; rc=$?
   else
-    out="$( (E2E_PLATFORM_MODEL="$model"; require_platform_model) 2>&1 )"; rc=$?
+    out="$( (export E2E_PLATFORM_MODEL="$model"; require_platform_model) 2>&1 )"; rc=$?
   fi
   if [ "$rc" = "$want" ]; then pass "$desc (rc=$rc)"; else failc "$desc: rc=$rc want $want — $out"; fi
   if [ "$want" != "0" ]; then
