@@ -50,6 +50,8 @@
 # Required env (mirrors test_staging_full_saas.sh):
 #   MOLECULE_CP_URL          default: https://staging-api.moleculesai.app
 #   MOLECULE_ADMIN_TOKEN     staging CP admin bearer from Infisical
+#   E2E_INFRA_BACKEND        required: local-docker (only active backend; the SSOT
+#                            teardown helper refuses to run against anything else)
 #
 # Optional env:
 #   E2E_PROVIDER                default molecules-server (the local-docker compute backend).
@@ -127,6 +129,8 @@ source "$(dirname "$0")/lib/tenant_topology.sh"
 # shellcheck source=lib/cp_purge_receipt.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/cp_purge_receipt.sh"
+e2e_cp_require_local_backend || exit 2
+e2e_cp_require_staging_origin "$CP_URL" || exit 2
 
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }

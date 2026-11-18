@@ -52,6 +52,8 @@
 # Required env:
 #   MOLECULE_CP_URL        default: https://staging-api.moleculesai.app
 #   MOLECULE_ADMIN_TOKEN   staging CP admin bearer from Infisical /shared/controlplane-admin
+#   E2E_INFRA_BACKEND      required: local-docker (only active backend; the SSOT
+#                          teardown helper refuses to run against anything else)
 #   E2E_PROVIDER           molecules-server (DEFAULT; docker rm -f the container)
 #                          | aws (legacy EC2 terminate-instances). molecules-server
 #                          needs a reachable docker daemon (DOCKER_HOST → the
@@ -158,6 +160,8 @@ source "$(dirname "$0")/lib/tenant_topology.sh"
 # shellcheck source=lib/cp_purge_receipt.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/cp_purge_receipt.sh"
+e2e_cp_require_local_backend || exit 2
+e2e_cp_require_staging_origin "$CP_URL" || exit 2
 # Kill primitive + leak sweep — provider-abstracted. The AWS lib is sourced ONLY
 # on the legacy AWS path (its e2e_* helpers are undefined on the molecules-server
 # path, and every call site is provider-branched below).

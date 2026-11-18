@@ -244,7 +244,7 @@ VICTIM=".gitea/workflows/sweep-stale-e2e-orgs.yml"
 # premise no longer holds.
 grep -qF -- "-X $DEL" "$ROOT/$VICTIM" \
   || bad "fixture error: the janitor no longer contains a hand-rolled teardown to neutralize"
-sed -i "s|-X $DEL|-X GET|g" "$ROOT/$VICTIM"
+sed -i.bak "s|-X $DEL|-X GET|g" "$ROOT/$VICTIM" && rm -f "$ROOT/$VICTIM.bak"
 rc=$(run_lint "$ROOT"); OUT=$(lint_out_for "$ROOT")
 if [ "$rc" != "0" ] && grep -q "stale SSOT-teardown allowlist entry" "$OUT"; then
   pass "an allowlist entry that no longer earns its exemption goes RED"
@@ -259,7 +259,7 @@ ROOT=$(fresh_copy ssot_renamed)
 SSOT_COPY="$ROOT/tests/e2e/lib/cp_purge_receipt.sh"
 grep -qF -- "e2e_cp_delete_and_verify_purge()" "$SSOT_COPY" \
   || bad "fixture error: SSOT helper definition not found in the copy"
-sed -i "s|e2e_cp_delete_and_verify_purge()|e2e_cp_delete_and_verify_purge_RENAMED()|g" "$SSOT_COPY"
+sed -i.bak "s|e2e_cp_delete_and_verify_purge()|e2e_cp_delete_and_verify_purge_RENAMED()|g" "$SSOT_COPY" && rm -f "$SSOT_COPY.bak"
 rc=$(run_lint "$ROOT"); OUT=$(lint_out_for "$ROOT")
 if [ "$rc" != "0" ] && grep -q "does not define e2e_cp_delete_and_verify_purge" "$OUT"; then
   pass "a renamed/removed SSOT helper goes RED instead of leaving every caller dangling"

@@ -18,6 +18,9 @@
 # this API does not expose an authoritative identity for them. The A2A assertion
 # proves the deployed default LLM route completes.
 
+# Required env: MOLECULE_ADMIN_TOKEN, E2E_INFRA_BACKEND=local-docker.
+# Optional: MOLECULE_CP_URL, E2E_RUNTIME, E2E_PROVIDER, E2E_KEEP_ORG.
+
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -36,6 +39,8 @@ source "$SCRIPT_DIR/lib/cp_purge_receipt.sh"
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
+e2e_cp_require_local_backend || exit 2
+e2e_cp_require_staging_origin "$CP_URL" || exit 2
 RUNTIME="${E2E_RUNTIME:-claude-code}"
 PROVIDER="${E2E_PROVIDER:-molecules-server}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}"

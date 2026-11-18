@@ -454,6 +454,45 @@ else
 fi
 
 echo ""
+echo "-- 9. preflight: unset E2E_INFRA_BACKEND fails closed before org creation --"
+assert_unset_backend_preflight() {
+  local label="$1" script="$2" key="$3"
+  shift 3
+  local d="$WORK/$key-unset" rc out posts
+  mkdir -p "$d"
+  env -u E2E_INFRA_BACKEND "$@" \
+    PATH="$SHIM:$PATH" \
+    FAKE_SCENARIO="transient-409" \
+    FAKE_STATE_DIR="$d" \
+    MOLECULE_CP_URL="https://staging-api.moleculesai.app" \
+    MOLECULE_TENANT_URL="http://127.0.0.1:9099" \
+    MOLECULE_TENANT_ROUTE_DOMAIN="lvh.me" \
+    MOLECULE_ADMIN_TOKEN="fake-admin-token" \
+    ADMIN_TOKEN="fake-admin-token" \
+    E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=0 \
+    E2E_RUN_ID="td409unset" \
+    timeout -k 5 "$SCRIPT_BUDGET_SECS" bash "$script" \
+      > "$d/stdout.txt" 2> "$d/stderr.txt"
+  rc=$?
+  out=$(output_of "$d")
+  posts=$(grep -c '^POST .*/cp/admin/orgs$' "$d/calls.log" 2>/dev/null || true)
+  posts="${posts:-0}"
+  if [ "$rc" = "2" ] && [ "$posts" = "0" ] && printf '%s' "$out" | grep -qF "unsupported E2E_INFRA_BACKEND=<unset>"; then
+    pass "$label — unset E2E_INFRA_BACKEND exits 2 with 0 POST /cp/admin/orgs"
+  else
+    bad "$label — unset E2E_INFRA_BACKEND preflight failed (rc=$rc posts=$posts)"
+    printf '%s' "$out" | tail -12
+  fi
+}
+
+assert_unset_backend_preflight "2307 peer-visibility" "$HERE/test_2307_peer_visibility_staging.sh" pv2307
+assert_unset_backend_preflight "mcp-stdio" "$HERE/test_mcp_stdio_staging.sh" mcpstdio
+assert_unset_backend_preflight "template-delivery" "$HERE/test_template_delivery_e2e.sh" tmpldel E2E_TMPL_SLUG="e2e-tmpl-0123abcd"
+assert_unset_backend_preflight "external-runtime" "$HERE/test_staging_external_runtime.sh" extrt
+assert_unset_backend_preflight "reconciler-heals" "$HERE/test_reconciler_heals_terminated_instance.sh" recheal E2E_PROVIDER=molecules-server
+assert_unset_backend_preflight "minimal-boot-cell" "$HERE/test_minimal_boot_cell.sh" bootcell
+
+echo ""
 echo "-- RESULT: $PASS passed, $FAIL failed --"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

@@ -41,6 +41,8 @@ source "$(dirname "$0")/lib/collision-proof-slug.sh"
 # shellcheck source=tests/e2e/lib/cp_purge_receipt.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/cp_purge_receipt.sh"
+e2e_cp_require_local_backend || exit 2
+e2e_cp_require_staging_origin "$CP_URL" || exit 2
 SLUG="e2e-2307-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" 9)"
 assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
 

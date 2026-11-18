@@ -1307,7 +1307,7 @@ jobs:
           # case, and RED on a stale allowlist entry or a renamed SSOT helper.
           # Offline: no docker, no network, no creds.
           bash tests/e2e/test_cp_purge_lint_unit.sh
-          # Fail-direction proof that the SEVEN migrated teardowns actually
+          # Fail-direction proof that the eight migrated teardowns actually
           # survive the CP org-lifecycle fence. Drives each REAL script against
           # a mocked CP that answers the first DELETE with 409 "organization has
           # an active lifecycle operation": transient 409 -> retried and provably
