@@ -273,18 +273,34 @@ e2e_cp_delete_and_verify_purge() {
   tmpdir=$(mktemp -d -t cp-purge-verify-XXXXXX) || return 2
   delete_body="$tmpdir/delete.json"
   audit_body="$tmpdir/audit.json"
-  # DELETE is synchronous. A 409 is the control plane's "organization has an
-  # active lifecycle operation" — claimOrgPurge could not claim the lifecycle
-  # parent row because the org's OWN in-flight workspace op (provision or
-  # deprovision) has not drained yet. It is transient and self-resolving: no
-  # purge audit row is created on 409 (nothing to poll), so the only correct
-  # recovery is to wait for the lifecycle claim to free and re-issue the DELETE.
-  # Without this, a teardown that lands while the org is still settling hard-
-  # fails and LEAKS the tenant (the staging-provisioning-outage leak class). The
-  # retry is bounded by its OWN delete_retry_secs budget (additive to the later
-  # audit/absence polls — see the local declaration). Any OTHER non-200 is a hard
-  # failure: it is not a self-resolving conflict, and retrying it would only mask
-  # a real teardown defect.
+  # DELETE is synchronous on the happy path. TWO responses mean "the lifecycle
+  # claim could not be taken yet", and both are transient and self-resolving:
+  #
+  #   409  the historical answer — claimOrgPurge could not claim the lifecycle
+  #        parent row because the org's OWN in-flight op (provision or
+  #        deprovision) has not drained. No purge audit row is created.
+  #   202  the current answer for the same condition (controlplane#2967). The CP
+  #        now RECORDS the teardown as a pending org_purges intent and executes
+  #        it from its retry runner once the lease drains, so the request is no
+  #        longer lost when the caller exits. A purge_id IS returned.
+  #
+  # 202 IS NOT SUCCESS AND MUST NOT BE TREATED AS ONE. It says the teardown is
+  # queued, not that the tenant is gone — accepting it here would hand the
+  # exact-absence proof below a tenant that is still serving, and this helper's
+  # whole job is to require that proof. But hard-failing on it, which is what
+  # this did before it knew the code, turns a self-healing retry into an instant
+  # red for the ordinary case of a teardown arriving a few seconds early.
+  #
+  # So both codes take the same path: wait for the claim to free and re-issue.
+  # The DELETE is idempotent for a queued org — the intent is deduped per org
+  # under the CP's org advisory lock and returns the same purge_id — so retrying
+  # cannot stack teardowns. Without this, a teardown that lands while the org is
+  # still settling hard-fails and LEAKS the tenant (the
+  # staging-provisioning-outage leak class). The retry is bounded by its OWN
+  # delete_retry_secs budget (additive to the later audit/absence polls — see the
+  # local declaration). Any OTHER non-200 is a hard failure: it is not a
+  # self-resolving conflict, and retrying it would only mask a real teardown
+  # defect.
   delete_deadline=$(( $(date +%s) + delete_retry_secs ))
   while true; do
     delete_started_epoch=$(date +%s)
@@ -306,13 +322,24 @@ e2e_cp_delete_and_verify_purge() {
       break
     fi
 
-    if [ "$delete_code" = "409" ]; then
+    if [ "$delete_code" = "409" ] || [ "$delete_code" = "202" ]; then
       if [ "$(date +%s)" -ge "$delete_deadline" ]; then
-        echo "[cp-purge] DELETE still 409 (active lifecycle operation) after ${delete_retry_secs}s for slug=$slug" >&2
+        # Fail closed, and say which shape it ended in. A 202 at the deadline
+        # means the CP owns the teardown and will run it — the tenant is not
+        # leaked — but it is NOT gone yet, so this gate must still be red.
+        if [ "$delete_code" = "202" ]; then
+          echo "[cp-purge] DELETE still 202 (teardown queued behind a lifecycle operation) after ${delete_retry_secs}s for slug=$slug; the control plane owns it now, but it is not torn down yet" >&2
+        else
+          echo "[cp-purge] DELETE still 409 (active lifecycle operation) after ${delete_retry_secs}s for slug=$slug" >&2
+        fi
         rm -rf "$tmpdir"
         return 4
       fi
-      echo "[cp-purge] DELETE 409 (active lifecycle operation) for slug=$slug; lifecycle op still draining, retrying in ${poll_interval}s"
+      if [ "$delete_code" = "202" ]; then
+        echo "[cp-purge] DELETE 202 (teardown queued behind a lifecycle operation) for slug=$slug; re-issuing in ${poll_interval}s"
+      else
+        echo "[cp-purge] DELETE 409 (active lifecycle operation) for slug=$slug; lifecycle op still draining, retrying in ${poll_interval}s"
+      fi
       sleep "$poll_interval"
       continue
     fi

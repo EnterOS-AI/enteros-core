@@ -15,13 +15,55 @@
  *   1. Tailwind core (v4) — provides preflight + utility generation.
  *   2. xterm — overrides preflight on its own .xterm-* class names; must
  *      load AFTER tailwind so its specificity wins.
- *   3. theme-tokens.css — canvas-only motion + deploy animation vars
+ *   3. @xyflow/react — the React Flow base stylesheet. See the block below
+ *      for why it is imported HERE and not from Canvas.tsx.
+ *   4. theme-tokens.css — canvas-only motion + deploy animation vars
  *      (--mol-duration-*, --mol-easing-*, --mol-deploy-*). NOT colour
  *      tokens; the semantic @theme block below owns those.
- *   4. settings-panel.css / org-deploy.css — feature stylesheets that
+ *   5. settings-panel.css / org-deploy.css — feature stylesheets that
  *      reference the variables above.
  */
 @import "xterm/css/xterm.css";
+/*
+ * React Flow's base stylesheet MUST be a LAYOUT stylesheet, i.e. reachable
+ * from this file, which layout.tsx imports.
+ *
+ * It used to be imported by `Canvas.tsx` (a client component). In an App
+ * Router production build that puts it in the PAGE css chunk, and Next does
+ * not emit page css as a render-blocking `<link rel="stylesheet">`: the
+ * initial document carries only `<link rel="preload" as="style">` plus an
+ * RSC-payload `<link precedence>` entry that REACT inserts on the client
+ * during hydration. Until React has inserted it and the browser has applied
+ * it, `.react-flow__background` has no `pointer-events: none` and
+ * `.react-flow__node` has no `position: absolute` — the canvas renders
+ * unstyled, the background svg swallows every click, and a node's
+ * bounding box is nowhere near where the user sees it.
+ *
+ * That window is REAL and its length is not ours to bound. Measured on this
+ * exact production build (chromium, standalone `node server.js`): at
+ * DOMContentLoaded the rule is absent on 100% of loads, and it becomes
+ * effective at ~450ms on an idle machine but ~5000ms at 20x CPU throttling.
+ * React itself is willing to wait `SUSPENSEY_STYLESHEET_TIMEOUT` = 60s
+ * before force-inserting a suspended stylesheet, so nothing in the stack
+ * caps it. On a loaded CI runner it overran the E2E chat lane's 15s
+ * node-hittability budget — the "workspace node never became hittable"
+ * failures on main (runs 628513, 630140) and the
+ * `<rect> from <svg data-testid="rf__background"> subtree intercepts
+ * pointer events` actionability failures (run 629224) are the same defect.
+ *
+ * Imported here, it lands in the LAYOUT css chunk, which Next emits as a
+ * plain render-blocking `<link rel="stylesheet">` in the initial HTML. The
+ * browser will not render the document until it has been applied, so there
+ * is no window in which the canvas can exist unstyled — with or without
+ * JavaScript, before or after hydration.
+ *
+ * Cascade note: this now loads BEFORE the `.react-flow__*` overrides later
+ * in this file rather than after them, so those overrides win ties they
+ * previously lost. They set only `transition`/`animation` (plus `!important`
+ * stroke rules), which React Flow's own `.react-flow__node` /
+ * `.react-flow__edge-path` do not set, so no declaration changes hands.
+ */
+@import "@xyflow/react/dist/style.css";
 @import "../styles/theme-tokens.css";
 @import "../styles/settings-panel.css";
 @import "../styles/org-deploy.css";

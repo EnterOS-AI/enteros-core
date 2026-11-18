@@ -50,7 +50,7 @@ function makeStore(
   nodes: Node<WorkspaceNodeData>[] = [],
   edges: Edge[] = []
 ) {
-  const state = { nodes, edges, selectedNodeId: null, agentMessages: {} };
+  const state = { nodes, edges, selectedNodeId: null, agentMessages: {}, agentMessageConsumers: {} };
   const get = () => state;
   const set = vi.fn((partial: Record<string, unknown>) => { Object.assign(state, partial); });
   return { state, get, set };

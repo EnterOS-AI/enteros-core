@@ -113,6 +113,36 @@ E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path
 # enforceable — unlike the staging-concierge journey parked below.
 sdk-route-milestone-contract-drift / SDK route + milestone derive-gates
 
+# PROMOTED (core#5158) — the gate that catches a lane vanishing from CI.
+#
+# lint-context-set-shrink derives the contexts a PR's head SHOULD post and reds
+# when one of them never arrives. It exists because of core#5153: a duplicate
+# `env:` key stopped Gitea scheduling local-provision-e2e.yml at all, both of its
+# jobs stopped posting, and the head read 43/43 `success` and was fully mergeable.
+# The lane did not fail; it ceased to exist.
+#
+# WHY THIS LINE, AND NOT JUST THE ['*'] WILDCARD. Branch protection requires every
+# POSTED context to be green, so a RED from this gate already blocks and listing it
+# adds no new red exposure. What listing adds is the other half: PRESENCE. Delete
+# `.gitea/workflows/lint-context-set-shrink.yml` and the workflow does not schedule
+# at head, so Check B never executes and the wildcard requires nothing of a context
+# that never posts — the gate could be removed by accident, or by a bad merge, and
+# nothing would notice. That is the exact shape it was written to close, pointed at
+# itself, and it is the last hole in the design.
+#
+# gitea-merge-queue.py::enforced_file_contexts_green scores an absent enforced
+# context as `missing` → not green → the queue blocks. Mutation-tested rather than
+# assumed: with the workflow file deleted on a scratch head, the context is absent
+# from the posted set and that function returns not-green naming this entry.
+#
+# This could NOT be added in #5157, the PR that introduced the workflow:
+# lint-phantom-gate Guard F resolves every enforced entry against the LIVE Gitea
+# Actions API, which does not know a workflow until it lands on the default branch.
+# At that point the API returned 75 workflows against a head tree of 76, so the
+# entry resolved to no producer → P2 phantom → exit 1, with no remedy inside the
+# PR. It is added now that the API reports 76 and lists this workflow as `active`.
+lint-context-set-shrink / lint-context-set-shrink
+
 # RE-ENABLED on MOLECULES-SERVER 2026-07-03 — enforcement SEQUENCED ─────────
 # `E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace`
 # is NO LONGER workflow_dispatch-only: its producer (e2e-staging-saas.yml) was
@@ -163,6 +193,47 @@ sdk-route-milestone-contract-drift / SDK route + milestone derive-gates
 # Real per-PR coverage of this journey is the EPHEMERAL-CP gate (task #86), which
 # needs no shared-staging credential at all because it stands up its own throwaway
 # control plane. That is the correct home for "pull, not after push".
+
+# pending-#5145 (not yet enforced) ─────────────────────────────────────
+# `pin-provenance-guard / Pin provenance` — the image-pin provenance gate
+# (SDK pin diff arm + tenant-pin live audit). PARKED FOR SEQUENCING ONLY, and
+# the sequencing reason is mechanical, not a doubt about the gate.
+#
+# It is ALREADY merge-blocking when RED: it posts on every pull_request with no
+# paths filter and no skippable arm, and main's branch protection is
+# status_check_contexts=['*'], under which every POSTED context must be
+# success. Parking changes exactly one thing — a MISSING context does not hold
+# the queue.
+#
+# Why that matters here and not in the abstract: gitea-merge-queue.py evaluates
+# the enforced-file set at step 4b, BEFORE step 5 updates a behind-main head.
+# Every PR whose head predates this workflow file therefore never posts the
+# context, returns `wait`, and never reaches the update that would give it the
+# file — a permanent deadlock across every open PR, not a transient one. That is
+# the "merge-train freezes the repo" shape, caused by the promotion rather than
+# by the gate.
+#
+# PROMOTE (move this line above the first pending marker) once every open PR
+# has either merged or taken main — i.e. once `pin-provenance-guard / Pin
+# provenance` is posting on every open PR head. No other condition.
+#
+# The gate has been proven in BOTH directions, and the run ids matter because
+# this block is what a future operator reads when deciding to enforce it:
+#
+#   run 638139  RED   on a hand-edited pin (27s, reached a verdict:
+#                     `FAIL 18ab12d2a431 has NO Pin-Provenance trailer …
+#                     not the bump bot …`)
+#   run 638013  green on a lane-produced bump carrying a real trailer
+#   run 637975  green on a clean diff
+#
+# An earlier version of this block cited run 637991 as the red. THAT WAS WRONG:
+# 637991 posted `failure` with description "Has been cancelled" — it hung for
+# ten minutes inside the checkout fetch on molecule-runner-robot-2-10 with every
+# later step left `queued`, so the guard NEVER REACHED A VERDICT. A cancelled
+# run is not a negative result; citing one as proof is the same defect main
+# fixed in c2ca41d9 ("stop citing a fixture as fact"). 638139 is the run that
+# actually failed on the hand edit.
+pin-provenance-guard / Pin provenance
 
 # pending-#86 (not yet enforced) ────────────────────────────────────────
 # The staging concierge journey is

@@ -203,7 +203,7 @@ func LocalImageTag(runtime, sha, platform string) string {
 	if len(short) > 12 {
 		short = short[:12]
 	}
-	return fmt.Sprintf("%s/workspace-template-%s:%s-%s", localImagePrefix, runtime, short, localImageArchSuffix(platform))
+	return fmt.Sprintf("%s/workspace-template-%s:%s-%s%s", localImagePrefix, runtime, short, localImageArchSuffix(platform), localImageIsolationSuffix())
 }
 
 // localImageArchSuffix derives the tag's arch component from a --platform
@@ -225,7 +225,7 @@ func localImageArchSuffix(platform string) string {
 // human-readable alias and as the value RuntimeImage() returns in
 // local-mode.
 func LocalImageLatestTag(runtime string) string {
-	return fmt.Sprintf("%s/workspace-template-%s:latest", localImagePrefix, runtime)
+	return fmt.Sprintf("%s/workspace-template-%s:latest%s", localImagePrefix, runtime, localImageIsolationSuffix())
 }
 
 // IsLocalBuildImage reports whether an image reference names a locally-built
@@ -302,6 +302,14 @@ func checkToolOnPath(tool string) error {
 func ensureLocalImageWithOpts(ctx context.Context, runtime string, opts *LocalBuildOptions) (string, error) {
 	if !IsKnownRuntime(runtime) {
 		return "", fmt.Errorf("local-build: refusing to build unknown runtime %q (must be one of %v)", runtime, knownRuntimes)
+	}
+
+	// core#5031: refuse BEFORE any tag is formatted. localImageIsolationSuffix()
+	// returns "" for an unusable token, which would put this process back on the
+	// SHARED tag while its caller believes it is isolated — the exact silent
+	// clobber the isolation exists to remove.
+	if _, err := LocalImageIsolation(); err != nil {
+		return "", fmt.Errorf("local-build: %w", err)
 	}
 
 	lock := runtimeBuildLock(runtime)

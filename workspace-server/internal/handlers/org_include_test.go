@@ -1,18 +1,22 @@
 package handlers
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-// runCmd wraps exec.Command for convenience in tests.
-func runCmd(name string, args ...string) (exitCode int, stdout, stderr string) {
-	cmd := exec.Command(name, args...)
+// runCmd wraps exec.CommandContext for convenience in tests. The context
+// bounds the subprocess so a slow/hung network git operation fails fast
+// instead of running until the package test timeout fires.
+func runCmd(ctx context.Context, name string, args ...string) (exitCode int, stdout, stderr string) {
+	cmd := exec.CommandContext(ctx, name, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return -1, string(out), err.Error()
@@ -228,13 +232,38 @@ func isFrozenDevDeptExternalErr(err error) bool {
 }
 
 func TestResolveYAMLIncludes_RealMoleculeDev(t *testing.T) {
+	// LIVE-NETWORK GATE. This test does a `git clone` over HTTPS plus a
+	// nested !external git fetch. Network latency is unbounded and variable,
+	// so under a slow CI network + `-race` it can eat many seconds toward the
+	// per-package test timeout — the recurring `internal/handlers` timeout
+	// flake (the whole package rides the ~60s -race edge, and this test's
+	// variable network time is what tips it over on slow runs). It is
+	// therefore kept OUT of the default `go test` lane and runs only when
+	// explicitly opted in, mirroring the MOLECULE_LIVE_DOCKER convention in
+	// plugin_settings_writer_live_test.go.
+	//
+	// The resolver/parser logic this test exercises is fully covered
+	// hermetically by the TestResolveYAMLIncludes_* fixture tests above, which
+	// KEEP running in the default lane. CI runs this live smoke in a dedicated,
+	// generously-timed step (see .gitea/workflows/ci.yml: "live org-template
+	// clone+resolve smoke"), which sets MOLECULE_LIVE_ORG_TEMPLATE=1. Run it
+	// locally with:
+	//
+	//   MOLECULE_LIVE_ORG_TEMPLATE=1 go test ./internal/handlers/ -run '^TestResolveYAMLIncludes_RealMoleculeDev$' -v
+	if os.Getenv("MOLECULE_LIVE_ORG_TEMPLATE") != "1" {
+		t.Skip("set MOLECULE_LIVE_ORG_TEMPLATE=1 to run the live org-template clone+resolve smoke (kept out of the default -race lane to avoid the internal/handlers timeout flake; the hermetic TestResolveYAMLIncludes_* tests cover the resolver)")
+	}
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available in this runtime")
 	}
 	tmp := t.TempDir()
 	// Clone the canonical standalone org template. No token needed — the
-	// repo is public on the same Gitea instance.
-	res, _, _ := runCmd("git", "clone", "--depth", "1",
+	// repo is public on the same Gitea instance. Bound the clone with a
+	// context timeout so a slow/hung network fetch fails fast rather than
+	// running until the package test timeout fires.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	res, _, _ := runCmd(ctx, "git", "clone", "--depth", "1",
 		"https://git.moleculesai.app/molecule-ai/molecule-ai-org-template-molecule-dev.git",
 		tmp)
 	if res != 0 {

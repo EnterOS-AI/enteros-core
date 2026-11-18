@@ -27,7 +27,37 @@ func TestValidateRegisteredModelForRuntime(t *testing.T) {
 	}
 	cases := []tc{
 		{
+			// The platform-billed slash form on the surviving minimax-only
+			// platform arm. Retargeted 2026-08-04 off `anthropic/claude-opus-4-7`,
+			// which sdk#203 withdrew and sdk#204 RESTORED; the minimax arm is kept
+			// here because it is present on all four runtimes.
 			name:    "registered_platform_model_allowed",
+			runtime: "claude-code",
+			model:   "minimax/MiniMax-M2.7",
+			wantOK:  true,
+		},
+		{
+			// sdk#203 (2026-08-04): every runtime's platform arm is minimax-only.
+			// A withdrawn platform id must be REFUSED here — this is the create-time
+			// 422 UNREGISTERED_MODEL_FOR_RUNTIME that stops a customer provisioning
+			// a workspace onto the suspended Moonshot vendor account. It must NOT
+			// fall through to a BYOK arm (that would demand a tenant key the
+			// workspace does not have). Exhaustive per-runtime coverage lives in
+			// providers.TestDeriveProvider_PlatformArmMembership; this case
+			// pins the behaviour at the API boundary the customer actually hits.
+			name:    "withdrawn_platform_model_rejected",
+			runtime: "claude-code",
+			model:   "moonshot/kimi-k2.6",
+			wantOK:  false,
+		},
+		{
+			// RESTORED by sdk#204 (2026-08-05). #203 withdrew this id even
+			// though it was healthy (HTTP 200 through the metered proxy), which
+			// made it unselectable for NEW workspaces; #204 puts it back on the
+			// platform arm, so the create gate must ALLOW it again. The five
+			// restored ids get exhaustive coverage — with negative controls — in
+			// TestValidateRegisteredModelForRuntime_Sdk204RestoredPlatformIDs.
+			name:    "restored_anthropic_platform_model_allowed",
 			runtime: "claude-code",
 			model:   "anthropic/claude-opus-4-7",
 			wantOK:  true,

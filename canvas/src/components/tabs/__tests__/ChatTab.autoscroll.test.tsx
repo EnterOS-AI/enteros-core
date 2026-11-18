@@ -55,7 +55,7 @@ vi.mock("../chat/hooks/useChatSocket", () => ({
   useChatSocket: () => {},
 }));
 
-let scrollIntoView: ReturnType<typeof vi.fn>;
+let scrollIntoView: ReturnType<typeof vi.fn<Element["scrollIntoView"]>>;
 let scrollEventListeners: Array<(e: Event) => void> = [];
 let currentScrollTop = 0;
 let currentScrollHeight = 1000;
@@ -71,7 +71,7 @@ beforeEach(() => {
   // the send in-flight, which is exactly the state the scroll assertions
   // exercise.
   apiPost.mockImplementation(() => new Promise(() => {}));
-  scrollIntoView = vi.fn();
+  scrollIntoView = vi.fn<Element["scrollIntoView"]>();
   scrollEventListeners = [];
   currentScrollTop = 0;
   currentScrollHeight = 1000;

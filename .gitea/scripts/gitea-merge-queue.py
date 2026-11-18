@@ -293,6 +293,116 @@ _SELF_STATUS_RE = re.compile(
 # status view used by wildcard branch protection. Keep both waits short and
 # bounded: failure to observe the write is a hard stop, never permission to
 # bypass the protected endpoint.
+
+# --------------------------------------------------------------------------
+# Gitea's NATIVE cancellation stamp (core#5156)
+# --------------------------------------------------------------------------
+# When an Actions run is cancelled, Gitea's own Actions engine — not any step,
+# script or `if: always()` reporter — writes a commit status with
+# `state=failure` and `description="Has been cancelled"`. Measured on
+# molecule-core PR #5156, head 626d2049da, run 644628 / job 949071:
+#
+#   id=148  pending   05:59:31Z  "Blocked by required conditions"
+#   id=149  failure   05:59:53Z  "Has been cancelled"
+#   job 949071: status=completed conclusion=cancelled
+#               started_at=1970-01-01T00:00:00Z  run_attempt=0
+#
+# `started_at=1970` and `run_attempt=0` prove the job NEVER STARTED, so no
+# workflow-side code could have posted either row; and every one of the 149
+# rows on that SHA except a single status-reaper POST carries `creator: null`,
+# the signature of a server-side write with no API user behind it. There is
+# therefore NO workflow-side way to stop the `failure` being written.
+#
+# Why THIS run was cancelled even though `cancel-in-progress: false`:
+#   644627  head 1165a63f64 (PR #5167)  job created 05:59:06Z -> RUNNING
+#   644628  head 626d2049da (PR #5156)  job created 05:59:31Z -> BLOCKED
+#   644629  head 67e1299253 (PR #5166)  job created 05:59:53Z -> evicts 644628
+# 644628 is cancelled at exactly 05:59:53Z, the second 644629 arrives.
+#
+# NOTE the mechanism, because the obvious reading is wrong: this is NOT
+# `cancel-in-progress` (this workflow sets it to `false`). That setting protects
+# the RUNNING member of a concurrency group; at most one run may sit QUEUED per
+# group, so a newer arrival evicts the older queued run regardless. And the
+# three runs are three DIFFERENT PRs, one approval each inside 48 seconds — not
+# a burst on one PR. Because this workflow's group is repo-global
+# (`gitea-merge-queue-${{ github.repository }}`), approving ANY PR can kill the
+# queued run of ANY OTHER PR. Nothing will ever post to the evicted SHA's
+# timeline again, so the `failure` latches permanently under
+# `status_check_contexts=["*"]`.
+#
+# The operational corollary — and the reason it is a consequence, not folklore:
+# space approvals ACROSS THE REPO until the prior queue run reaches a terminal
+# state. Re-approving a latched PR does clear it (a fresh run re-posts the
+# context), but only if that approval is not itself part of a burst; a clustered
+# approval re-creates the latch it was meant to clear. This code change removes
+# the dependence on that discipline for the queue's own context.
+#
+# A cancelled gate-runner job carries ZERO information about the PR it was
+# evaluating: it never executed a single check. Requiring it green is the exact
+# same self-referential impossibility as requiring the `pending` row green
+# (core#4420), so the strip below covers both. It is NOT a blanket
+# cancelled-is-green rule: it applies ONLY to `SELF_STATUS_CONTEXT`, only under
+# a GLOB pattern, and a genuine queue-job `failure` (any other description)
+# still blocks. See `_is_native_cancellation_artifact`.
+#
+# Description-string coupling is a SOFT contract with Gitea, deliberately the
+# same one `.gitea/scripts/main-red-watchdog.py` already relies on. If a future
+# Gitea release renames the string, cancelled self-statuses simply start
+# blocking again — visible, not silent — and this constant gets re-pinned.
+NATIVE_CANCELLED_DESCRIPTION = "Has been cancelled"
+# Second, independent predicate: the row must point at an Actions run/job, i.e.
+# it was written by the Actions engine rather than POSTed by a bot that happened
+# to choose the same description text.
+_ACTIONS_TARGET_URL_RE = re.compile(
+    r"\A(?:https?://[^/]+)?/[^/\s]+/[^/\s]+/actions/runs/[0-9]+/jobs/[0-9]+\Z"
+)
+
+# --------------------------------------------------------------------------
+# Gitea 1.27 FILTERED-WORKFLOW PLACEHOLDERS are not results
+# --------------------------------------------------------------------------
+# Gitea 1.27 posts a `skipped` commit status for every job of a workflow that
+# MATCHED the event but was excluded by its own `branches:` / `paths:` filter,
+# whenever the job's context matches a branch-protection pattern
+# (services/actions/commit_status.go, CreateSkippedCommitStatusForFilteredWorkflow).
+# No run is created, so the row is written with
+#
+#     state="skipped"  description="Skipped"  target_url=""  (Actions user)
+#
+# With status_check_contexts=["*"] every filtered job qualifies, so EVERY PR
+# head carries one per push-only job -- including `CI / all-required (push)`,
+# because ci.yml's push trigger is `branches: [main]`. One live head shows both
+# kinds of `skipped` side by side (PR #5212, head 0c75646966):
+#
+#   CI / Platform (Go) (pull_request)  failure  /actions/runs/763155/jobs/1076636
+#   CI / all-required (pull_request)   skipped  /actions/runs/763155/jobs/1076641  REAL skip
+#   CI / all-required (push)           skipped  ""                                 placeholder
+#
+# On PR #5135 (head e99eb1e6aa: 41 success + 102 placeholders, zero failures)
+# the queue logged `CRITICAL required context(s) not green (fail-closed):
+# CI / all-required=skipped` and the PR was merged by hand 29 s later. The
+# step-0 critical guard needs EVERY event flavour of the aggregator to be
+# success and the ["*"] sweep needs every posted context to be success, so on
+# Gitea 1.27 the queue could merge no PR at all.
+#
+# A placeholder records that NO run happened; it is not a verdict. It is
+# dropped BEFORE the newest-wins reduction -- what Gitea <= 1.26 did by never
+# writing it. Consequences, all deliberate:
+#   * a context that also has real rows is judged on its newest REAL row, so a
+#     placeholder written later (the same commit pushed to a filtered branch)
+#     can never mask an earlier real failure;
+#   * a context with ONLY placeholders is absent: a literal requirement reports
+#     `missing` and the step-0 guard reports `missing` -- both still block, so
+#     "did not run" is never "passed";
+#   * a REAL job-level skip (all-required skipped because a `needs:` failed --
+#     the core#1676 shape) carries its Actions job URL, is not a placeholder,
+#     and still blocks.
+# Recognition needs ALL of: state `skipped`, description exactly "Skipped",
+# a `target_url` field that is present and empty, and no creator (a row an API
+# user POSTed is never treated as one). Rows missing those fields -- the
+# conductor snapshot carries only context+status -- are never dropped, so a
+# change in Gitea's shape makes placeholders block again: visible, not silent.
+FILTERED_WORKFLOW_PLACEHOLDER_DESCRIPTION = "Skipped"
+
 SELF_STATUS_CONFIRM_ATTEMPTS = 5
 SELF_STATUS_CONFIRM_DELAY_SECONDS = 0.25
 MERGE_STATUS_RETRY_ATTEMPTS = 3
@@ -300,9 +410,16 @@ MERGE_STATUS_RETRY_DELAY_SECONDS = 0.5
 
 # Required contexts for push (main/staging) runs. The push CI uses the same
 # aggregator names with " (push)" suffix. Checking these explicitly instead of
-# the combined state avoids false-pause when non-blocking jobs (e.g. Platform
-# Go with continue-on-error: true due to mc#774) have failed — their failures
-# pollute the combined state but do not block merges.
+# the combined state avoids false-pause when a genuinely non-blocking job has
+# failed — such a failure pollutes the combined state but does not block merges.
+#
+# The example this comment used to cite ("Platform Go with continue-on-error:
+# true due to mc#774") is STALE and was actively misleading: mc#774 was closed
+# 2026-07-08 as CLOSE_STALE by org triage — not because the mask was retired —
+# and `platform-build` has carried `continue-on-error: false` since the RFC #219
+# Phase 4 flip. Platform (Go) IS blocking: it is a `needs:` of the `all-required`
+# sentinel, which is a branch-protection required context. Do not treat a red
+# Platform (Go) as ignorable on the strength of this comment.
 PUSH_REQUIRED_CONTEXTS_RAW = _env(
     "PUSH_REQUIRED_CONTEXTS",
     default="CI / all-required (push)",
@@ -678,6 +795,74 @@ def status_state(status: dict) -> str:
     return str(status.get("status") or status.get("state") or "").lower()
 
 
+def _is_native_cancellation_artifact(status: dict) -> bool:
+    """True when this row is Gitea's server-side `cancelled -> failure` stamp.
+
+    Requires BOTH predicates to hold, so a real red can never be mistaken for
+    one (see NATIVE_CANCELLED_DESCRIPTION for the measured evidence):
+
+      1. state is `failure` AND the description is EXACTLY the engine's
+         cancellation text. Exact match after strip — a substring test would
+         swallow a genuine failure whose description merely quotes the phrase
+         (e.g. a test named "Has been cancelled by the user unexpectedly"),
+         which is the same trap `main-red-watchdog._is_cancel_cascade` avoids.
+      2. `target_url` is an Actions run/job link, proving the Actions engine
+         wrote it rather than a bot POSTing the same text.
+
+    A run that genuinely FAILED carries "Failing after Ns" and is unaffected.
+    """
+    if status_state(status) != "failure":
+        return False
+    description = status.get("description")
+    if not isinstance(description, str):
+        return False
+    if description.strip() != NATIVE_CANCELLED_DESCRIPTION:
+        return False
+    target_url = status.get("target_url")
+    if not isinstance(target_url, str):
+        return False
+    return bool(_ACTIONS_TARGET_URL_RE.fullmatch(target_url.strip()))
+
+
+def is_filtered_workflow_placeholder(status: dict) -> bool:
+    """True only for Gitea 1.27's no-run `skipped` row for a filtered workflow.
+
+    See FILTERED_WORKFLOW_PLACEHOLDER_DESCRIPTION for the measured shapes. Every
+    predicate must hold; anything else -- including a real job-level skip,
+    which carries its Actions job URL -- is a status and is evaluated normally.
+    """
+    if not isinstance(status, dict) or status_state(status) != "skipped":
+        return False
+    if "target_url" not in status:
+        return False
+    target_url = status.get("target_url")
+    if not isinstance(target_url, str) or target_url.strip():
+        return False
+    description = status.get("description")
+    if not isinstance(description, str):
+        return False
+    if description.strip() != FILTERED_WORKFLOW_PLACEHOLDER_DESCRIPTION:
+        return False
+    return not status.get("creator")
+
+
+def self_status_is_uninformative(status: dict) -> bool:
+    """True when the queue's OWN gate-runner status carries no verdict.
+
+    Two shapes, one meaning — "this queue job never reached a conclusion about
+    the PR", so requiring it green under a wildcard is self-referential:
+
+      * `pending`   — the status of the very run doing this evaluation
+                      (core#4420).
+      * cancelled   — the run was evicted from the repo-global concurrency
+                      group and never executed a single step (core#5156).
+
+    Every other state (`success`, a real `failure`, `error`) IS a verdict and
+    is left to the ordinary evaluation.
+    """
+    return status_state(status) == "pending" or _is_native_cancellation_artifact(status)
+
+
 def status_numeric_id(status: dict) -> int:
     """Return a sortable Gitea commit-status id, or -1 when unavailable."""
     value = status.get("id")
@@ -693,8 +878,14 @@ def latest_statuses_by_context(statuses: list[dict]) -> dict[str, dict]:
     # Gitea /statuses endpoint returns entries in ascending id order (oldest
     # first). We need the LAST occurrence of each context, so iterate in
     # reverse to prefer newer entries.
+    #
+    # Gitea 1.27 filtered-workflow placeholders are dropped before the
+    # reduction (FILTERED_WORKFLOW_PLACEHOLDER_DESCRIPTION): they record that no
+    # run happened, so they can neither pass nor fail a context.
     latest: dict[str, dict] = {}
     for status in reversed(statuses):
+        if is_filtered_workflow_placeholder(status):
+            continue
         context = status.get("context")
         if isinstance(context, str):
             latest[context] = status  # overwrite: reverse order → newest wins
@@ -889,22 +1080,29 @@ def required_contexts_green(
             continue
         matches = [c for c in latest_statuses if matcher.fullmatch(c)]
         if _is_glob(pattern):
-            # Drop the queue's OWN in-flight status from wildcard matches ONLY
-            # while it is `pending` — it stays `pending` throughout this very run,
-            # so requiring it green under a glob like "*" is a self-referential
-            # deadlock (core#4420, see SELF_STATUS_CONTEXT). The strip is gated on
-            # the pending state (fail-closed): a self-status that has actually
-            # FAILED/errored is a real red and MUST still block the merge — it
-            # self-heals on the next clean tick when a fresh run re-posts a
-            # pending (then success) status. A LITERAL requirement is left
-            # untouched: a narrow glob ("CI /*") never matches it anyway, and if a
-            # policy deliberately names it exactly, honor that.
+            # Drop the queue's OWN status from wildcard matches ONLY while it
+            # carries no verdict about the PR — see self_status_is_uninformative:
+            #   * `pending`: it stays pending throughout this very run, so
+            #     requiring it green under a glob like "*" is a self-referential
+            #     deadlock (core#4420, see SELF_STATUS_CONTEXT).
+            #   * Gitea's native cancellation stamp: the run was evicted while
+            #     QUEUED in the repo-global concurrency group and never executed
+            #     a step (core#5156). The pre-#5156 code stripped only `pending`
+            #     and justified it with "it self-heals on the next clean tick" —
+            #     that assumption is FALSE for a repo-global group, because the
+            #     evicting run belongs to a different head SHA and no future run
+            #     ever posts to this one again. The red latched forever.
+            # The strip stays fail-closed for everything else: a self-status that
+            # genuinely FAILED/errored is a real red and MUST still block the
+            # merge. A LITERAL requirement is left untouched: a narrow glob
+            # ("CI /*") never matches it anyway, and if a policy deliberately
+            # names it exactly, honor that.
             matches = [
                 c
                 for c in matches
                 if not (
                     _SELF_STATUS_RE.fullmatch(c)
-                    and status_state(latest_statuses.get(c) or {}) == "pending"
+                    and self_status_is_uninformative(latest_statuses.get(c) or {})
                 )
             ]
         if not matches:
@@ -1834,6 +2032,10 @@ def critical_contexts_block(
         canonical case — a skipped aggregator sentinel means nothing gated
         the required jobs.)
       * Only `success` clears a critical context.
+      * Gitea 1.27 filtered-workflow placeholders never reach this function
+        (latest_statuses_by_context drops them): the PR head's
+        `CI / all-required (push)` placeholder is not a flavour of the
+        aggregator that ran. A REAL skip keeps its Actions URL and blocks here.
 
     Each critical PREFIX must be matched by at least one observed context whose
     base name equals it AND that context must be `success`. If the prefix is
@@ -2139,12 +2341,22 @@ def get_combined_status(sha: str, *, prefer_live: bool = False) -> dict:
     # concurrent status writes can move page boundaries and surface an older
     # pending row before its newer success row.  Status ids are monotonic, so
     # sorting by id makes enrichment deterministic across page-order races.
+    #
+    # Gitea 1.27 filtered-workflow placeholders are skipped in BOTH passes, so
+    # a context whose server-reduced latest row is a placeholder falls through
+    # to its newest REAL row from the history (a placeholder must never mask
+    # an earlier real failure), and a placeholder-only context is absent. See
+    # FILTERED_WORKFLOW_PLACEHOLDER_DESCRIPTION.
     latest: dict[str, dict] = {}
     for status in sorted(combined_statuses, key=status_numeric_id, reverse=True):
+        if is_filtered_workflow_placeholder(status):
+            continue
         ctx = status.get("context")
         if isinstance(ctx, str) and ctx not in latest:
             latest[ctx] = status
     for status in sorted(all_statuses, key=status_numeric_id, reverse=True):
+        if is_filtered_workflow_placeholder(status):
+            continue
         ctx = status.get("context")
         if isinstance(ctx, str) and ctx not in latest:
             latest[ctx] = status

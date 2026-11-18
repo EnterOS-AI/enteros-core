@@ -77,6 +77,20 @@ func delegationCorrelationJSON(delegationID string) string {
 // terminalization itself — a row stuck in-flight forever is worse than a
 // missing notification, and the sweeper will not revisit a terminal row.
 func emitTerminalDelegationReply(ctx context.Context, callerID, calleeID, delegationID, status, errorDetail string) (replyWriteFailed bool) {
+	return emitTerminalDelegationReplyWithResult(ctx, callerID, calleeID, delegationID,
+		status, errorDetail, "")
+}
+
+// emitTerminalDelegationReplyWithResult is emitTerminalDelegationReply plus the
+// target's ANSWER (#4338).
+//
+// The sweeper and the MCP failure path have no result to report, so they keep the
+// wrapper above. The async MCP COMPLETION path does: delegate_task_async does not
+// block, so this inbox row is not merely a notification that the delegation ended —
+// it is the only place the caller's agent ever receives the thing it delegated for.
+// Sending "Delegation completed" with an empty body would tell the agent its work is
+// done and withhold the work.
+func emitTerminalDelegationReplyWithResult(ctx context.Context, callerID, calleeID, delegationID, status, errorDetail, resultPreview string) (replyWriteFailed bool) {
 	// NO-OP BY CONSTRUCTION WHILE THE LEDGER IS DARK.
 	//
 	// The sweeper is started UNCONDITIONALLY (cmd/server/main.go) — it is not
@@ -116,7 +130,7 @@ func emitTerminalDelegationReply(ctx context.Context, callerID, calleeID, delega
 	// The inbox push runs even if the ledger row failed — a missing dashboard row
 	// is not a reason to also deny the agent its notification. Its failure counts
 	// too: it is the write the agent actually reads.
-	if pushDelegationResultToInbox(ctx, callerID, calleeID, delegationID, status, "", errorDetail) {
+	if pushDelegationResultToInbox(ctx, callerID, calleeID, delegationID, status, resultPreview, errorDetail) {
 		replyWriteFailed = true
 	}
 	return replyWriteFailed

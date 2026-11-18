@@ -61,25 +61,13 @@ afterEach(() => {
 // ─── Fetch mock helper ────────────────────────────────────────────────────────
 
 function mockFetchOk(body: string, contentType = "video/mp4") {
-  const blob = new Blob([body], { type: contentType });
-  const url = URL.createObjectURL(blob);
-  global.fetch = vi.fn((href: string, opts?: RequestInit) => {
-    void href;
-    void opts;
-    return Promise.resolve({
-      ok: true,
-      status: 200,
-      blob: () => Promise.resolve(blob),
-      headers: new Map([["content-type", contentType]]),
-    }) as unknown as Response;
-  });
-  return url;
+  global.fetch = vi.fn(async () => new Response(body, {
+    headers: { "content-type": contentType },
+  }));
 }
 
 function mockFetchError() {
-  global.fetch = vi.fn(() =>
-    Promise.resolve({ ok: false, status: 500 }) as unknown as Response,
-  );
+  global.fetch = vi.fn(async () => new Response(null, { status: 500 }));
 }
 
 // ─── Idle state ──────────────────────────────────────────────────────────────

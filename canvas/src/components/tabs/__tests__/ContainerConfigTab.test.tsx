@@ -25,9 +25,11 @@ vi.mock("@/store/canvas", () => ({
   ),
 }));
 
-// SaaS so the editable cloud-provider selector renders (non-SaaS shows a read-only
-// badge). Existing tests keep provider=aws (default), which is omitted from the
-// PATCH payload, so their assertions are unaffected.
+// SaaS so the editable cloud-provider selector renders (non-SaaS shows a
+// read-only badge -- covered separately in ContainerConfigTab.enterosProvider
+// .test.tsx, which is the substrate this platform actually provisions on).
+// Existing tests keep provider=aws; it is now sent EXPLICITLY rather than
+// omitted as "the default" (see the recreate test below for why).
 vi.mock("@/lib/tenant", () => ({
   isSaaSTenant: () => true,
 }));
@@ -51,6 +53,26 @@ beforeEach(() => {
 });
 
 describe("ContainerConfigTab", () => {
+  it("a parked Light agent's container status reads Parked, with the tooltip", () => {
+    render(
+      <ContainerConfigTab
+        workspaceId="ws-parked"
+        data={{
+          runtime: "hermes",
+          status: "hibernated",
+          lightState: "parked",
+          needsRestart: false,
+          activeTasks: 0,
+          maxConcurrentTasks: null,
+          workspaceAccess: "none",
+          deliveryMode: "push",
+          compute: undefined,
+        }}
+      />,
+    );
+    expect(screen.getByText("Parked").getAttribute("title")).toBe("Asleep between scheduled runs");
+  });
+
   it("defaults missing compute to the cost-efficient headless profile", () => {
     render(
       <ContainerConfigTab
@@ -521,7 +543,17 @@ describe("ContainerConfigTab", () => {
     }
   });
 
-  it("does not treat a non-provider edit as a recreate (no confirm; aws default omitted)", async () => {
+  // The no-confirm half of this test is unchanged and is the important one: a
+  // non-provider edit must never trigger the destructive recreate prompt.
+  //
+  // The payload half changed deliberately. This used to assert that an explicit
+  // `aws` was OMITTED from the wire ("the default anyway"). That is no longer
+  // safe: molecule-ai-sdk#195 flips the SSOT default so "" resolves to
+  // molecules-server, and a row that records nothing is resolved by whatever the
+  // default happens to be at read time -- so an omitted `aws` could later be
+  // read back as the local substrate. Sending the provider explicitly is what
+  // makes the default flip safe for a genuine cloud workspace.
+  it("does not treat a non-provider edit as a recreate (no confirm; provider sent explicitly)", async () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     render(
       <ContainerConfigTab
@@ -544,7 +576,7 @@ describe("ContainerConfigTab", () => {
     await waitFor(() => expect(apiPatch).toHaveBeenCalledTimes(1));
     expect(confirmSpy).not.toHaveBeenCalled();
     const body = apiPatch.mock.calls[0][1] as { compute: { provider?: string } };
-    expect(body.compute.provider).toBeUndefined(); // aws default omitted (wire unchanged)
+    expect(body.compute.provider).toBe("aws"); // recorded explicitly, not left to the default
     confirmSpy.mockRestore();
   });
 });

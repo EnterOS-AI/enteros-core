@@ -124,11 +124,54 @@ def compare_tokens(
     return ok, drift
 
 
+def find_missing(
+    tokens: Dict[str, Dict[str, str]], side: str
+) -> list[str]:
+    """Return `mode/name` for every declared shared token absent on `side`.
+
+    Without this, a token missing from BOTH files compares equal (None ==
+    None) and the gate reports "aligned" having verified nothing — and if
+    the @theme regex ever fails to match, EVERY token is missing on both
+    sides and the gate is a 100% vacuous pass. Presence is asserted
+    separately from equality so that can never happen silently.
+    """
+    missing: list[str] = []
+    for mode in ("light", "dark"):
+        for name in SHARED_TOKEN_NAMES:
+            if name not in tokens[mode]:
+                missing.append(f"{side}:{mode}/{name}")
+    return missing
+
+
 def main() -> int:
     token = os.environ.get("APP_SSOT_READ_TOKEN")
+    # The caller states whether this run is CREDENTIALLED. A trusted ref
+    # (push / workflow_dispatch / same-repo PR) can reach the Infisical CI
+    # machine identity, so an absent token there is a REAL misconfiguration
+    # and must red — not silently exit 0. Only an untrusted-fork PR, which
+    # structurally cannot hold secrets, is allowed the stated skip.
+    #
+    # This branch used to `return 0` unconditionally on a missing token.
+    # APP_SSOT_READ_TOKEN was never provisioned on the repo or the org, so
+    # that no-op was the ONLY path this gate ever took: it reported success
+    # on every run without fetching, parsing or comparing anything.
+    require_token = os.environ.get("DRIFT_GATE_REQUIRE_TOKEN", "") == "1"
     if not token:
-        print("::notice::APP_SSOT_READ_TOKEN not set; skipping app token-SSOT drift gate.")
-        print("           Gate will activate once the molecule-app read PAT is provisioned.")
+        if require_token:
+            print(
+                "::error::APP_SSOT_READ_TOKEN is empty on a TRUSTED run. This "
+                "gate cannot compare against the app SSOT without a "
+                "molecule-app read credential, and a check that cannot run "
+                "must not report success. Fix the credential wiring (the "
+                "workflow sources DRIFT_BOT_TOKEN from Infisical prod "
+                "/shared/drift-bot); do not re-add a skip-on-missing branch."
+            )
+            return 1
+        print(
+            "::notice::APP_SSOT_READ_TOKEN absent and DRIFT_GATE_REQUIRE_TOKEN "
+            "is not set — untrusted-fork PR, which cannot hold secrets. "
+            "Skipping the cross-repo comparison for that STATED reason."
+        )
         return 0
 
     if not os.path.exists(CANVAS_FILE_PATH):
@@ -147,9 +190,31 @@ def main() -> int:
     canvas_tokens = extract_shared_tokens(canvas_css)
     app_tokens = extract_shared_tokens(app_css)
 
+    # Assert PRESENCE before equality, and report the count that was
+    # actually compared. A silent zero-comparison run is indistinguishable
+    # from a clean one otherwise.
+    missing = (
+        find_missing(canvas_tokens, "canvas") + find_missing(app_tokens, "app")
+    )
+    expected = len(SHARED_TOKEN_NAMES) * 2  # light + dark
+    if missing:
+        print(
+            f"::error::Declared shared design tokens are MISSING, so the SSOT "
+            f"comparison would be vacuous: {len(missing)} of "
+            f"{expected * 2} expected (canvas+app) lookups found nothing."
+        )
+        for m in missing:
+            print(f"  missing: {m}")
+        return 1
+
     ok, drift = compare_tokens(canvas_tokens, app_tokens)
     if ok:
-        print("::notice::Canvas↔app token SSOT is aligned.")
+        print(
+            f"::notice::Canvas↔app token SSOT is aligned "
+            f"({expected} token comparisons: "
+            f"{len(SHARED_TOKEN_NAMES)} shared tokens x light+dark, "
+            f"0 drifted)."
+        )
         return 0
 
     print("::error::Canvas↔app token SSOT drift detected.")

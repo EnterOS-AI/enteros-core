@@ -158,17 +158,42 @@ func instanceTypeAllowedForProvider(provider, instanceType string) bool {
 	return ok
 }
 
-// workspaceComputeProviderAllowlist mirrors the controlplane cloud-provider SSOT
-// (controlplane internal/cloudprovider.Supported = {aws, hetzner, gcp}).
-// ws-server lives in a different repo and cannot import that package, so this is
-// a DELIBERATE mirror; TestValidateWorkspaceCompute_Provider pins the exact set
-// and this doc-comment names the SSOT, so a CP-side change forces a matching
-// change here (and the CP itself fail-closes an unwired provider with a 422).
-// "" = default (AWS) and is always accepted. This is the gate the switch-provider
-// flow reuses to reject a bad provider with a clean 400 before any CP round-trip.
-// DERIVED from workspaceComputeProvidersOrdered (the SSOT, core#2489) in init() so
-// the set the backend validates and the ordered list the canvas renders cannot
-// drift.
+// workspaceComputeProviderAllowlist is the set of provider values this validator
+// ACCEPTS. It is DERIVED in init() from the SDK cloud-provider SSOT: every
+// SELECTABLE provider (sdkcp.All / sdkcp.IDs()) plus each one's accepted wire
+// aliases. "" = default and is always accepted (handled before the lookup).
+//
+// THE BUG THIS FIXES. It used to derive from workspaceComputeProvidersOrdered,
+// i.e. sdkcp.CloudIDs(). CloudIDs is a COST grouping — the providers that carry
+// per-hour/per-GB cloud billing — and it deliberately excludes the local
+// self-hosted box, which has no cloud cost. The SDK has a test asserting
+// Molecules-Server must NOT be in CloudIDs(), and that test is CORRECT.
+//
+// Using a cost grouping as a VALIDATION allowlist made this validator reject
+// "molecules-server" with a 400 — the only substrate this platform actually
+// provisions (all prod organizations.provider rows are 'local'). The two sets
+// answer different questions:
+//
+//	CloudIDs() -> "which providers cost cloud money?"     (billing, instance types)
+//	IDs()/All  -> "which providers may a caller select?"  (validation)   <- this one
+//
+// The ALIASES matter as much as the ids, and the alias SET is the SDK's to
+// change: substrate-rename stage 3 (molecule-ai-sdk#200, adopted 2026-08-05)
+// DELETED "local" and "docker", leaving "enteros" — the routing key — as the
+// only alias of molecules-server. Because this allowlist is DERIVED from
+// sdkcp.All rather than written out, that deletion propagated here by rebuild:
+// the retired spellings now 400. Prod was already ahead of the code (all 6
+// organizations.provider rows read "enteros", and CP migration 071 narrowed the
+// CHECK to exclude the old spellings), so this closed a gap where core accepted
+// a value its own database would refuse.
+//
+// Matching stays EXACT/case-sensitive (not sdkcp.IsValidID, which lowercases):
+// "AWS" and "MOLECULES-SERVER" must still 400, as TestValidateWorkspaceCompute_Provider
+// and TestValidateWorkspaceCompute_AcceptsMoleculesServer pin.
+//
+// NOTE this is deliberately a DIFFERENT set from workspaceComputeProvidersOrdered,
+// which stays cloud-only: that list drives the canvas machine-size catalog, and
+// the local box has no instance types. Do not "simplify" them back together.
 var workspaceComputeProviderAllowlist = map[string]struct{}{}
 
 // workspaceComputeProviderLabels is the human-readable label the canvas
@@ -313,8 +338,16 @@ func checkComputeSSOTConsistency(
 }
 
 func init() {
-	for _, p := range workspaceComputeProvidersOrdered {
-		workspaceComputeProviderAllowlist[p] = struct{}{}
+	// Validation allowlist = every SELECTABLE provider + its accepted wire
+	// aliases. Sourced from sdkcp.All (the full set), NOT from
+	// workspaceComputeProvidersOrdered (= sdkcp.CloudIDs(), the billable cloud
+	// subset) — see the allowlist's doc-comment for why that distinction is the
+	// whole bug.
+	for _, p := range sdkcp.All {
+		workspaceComputeProviderAllowlist[p.ID] = struct{}{}
+		for _, a := range p.Aliases {
+			workspaceComputeProviderAllowlist[a] = struct{}{}
+		}
 	}
 	// SSOT consistency check (core#2489, Researcher's RC #11736
 	// bidirectional-init fix): the production init guard delegates
@@ -335,12 +368,30 @@ func init() {
 
 func validateWorkspaceCompute(compute models.WorkspaceCompute) error {
 	// Provider first (so the instance-type check below can be provider-scoped).
-	// "" = default (AWS). CP fail-closes an unwired provider with a 422; validating
-	// here gives a clean 400 before the round-trip and is the gate reused by the
-	// switch-provider flow. Mirrors the controlplane cloudprovider SSOT.
+	// "" = default. CP fail-closes an unwired provider with a 422; validating here
+	// gives a clean 400 before the round-trip and is the gate reused by the
+	// switch-provider flow. The allowlist is the FULL selectable set from the SDK
+	// cloudprovider SSOT (ids + aliases), which is why the self-hosted
+	// Molecules-Server box — the substrate prod actually runs on — is accepted.
+	//
+	// SUBSTRATE RENAME STAGE 3 (molecule-ai-sdk#200, adopted 2026-08-05): the
+	// retired spellings "local" and "docker" are NO LONGER aliases, so they now
+	// fail closed here. The error message derives its alias list from the SDK
+	// rather than naming spellings in prose — the old text hard-coded
+	// "local|docker" and would have kept advertising them after the SSOT dropped
+	// them, which is how a rejected value ends up recommended by its own error.
 	if compute.Provider != "" {
 		if _, ok := workspaceComputeProviderAllowlist[compute.Provider]; !ok {
-			return fmt.Errorf("unsupported compute.provider (want aws|gcp|hetzner)")
+			var aliases []string
+			for _, p := range sdkcp.All {
+				aliases = append(aliases, p.Aliases...)
+			}
+			msg := fmt.Sprintf("unsupported compute.provider %q (want one of %s",
+				compute.Provider, strings.Join(sdkcp.IDs(), "|"))
+			if len(aliases) > 0 {
+				msg += ", or the aliases " + strings.Join(aliases, "|")
+			}
+			return fmt.Errorf("%s)", msg)
 		}
 	}
 	// Instance type must belong to the chosen provider (an AWS t3.* is invalid on

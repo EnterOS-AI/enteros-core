@@ -36,11 +36,19 @@ import (
 // (up to the optional `#<ref>`) is the in-repo subpath. The resolved plugin
 // name is the last subpath segment (or <repo> when no subpath is given).
 //
-// Authentication: private Gitea repos need a PAT. The resolver reads the
-// token from the environment (MOLECULE_TEMPLATE_REPO_TOKEN by default — the
-// same read-only Gitea PAT CP PR#850 already places on every tenant box).
-// The token is sent in an Authorization header for API calls and is never
-// logged or returned to clients.
+// Authentication: private Gitea repos need a credential, resolved PER HOST by
+// HostTokenFor (see host_credentials.go) with the same precedence
+// molecule_runtime's boot-install path uses:
+//
+//	MOLECULE_GIT_TOKENS → MOLECULE_GIT_TOKEN__<HOST> → TokenEnv (base host only)
+//
+// molecule-core#4997: the first two carry the org's OWN read-only credential,
+// which the control plane resolves server-side and stamps into the workspace
+// env. TokenEnv (MOLECULE_TEMPLATE_REPO_TOKEN) remains only as the last-resort
+// seed for PLATFORM-owned repos — it must never be widened to read a customer's
+// private repo (see the control plane's template_repo_creds.go). The token is
+// sent in an Authorization header for API calls and is never logged or returned
+// to clients.
 //
 // Pinned-ref enforcement mirrors GithubResolver: an unpinned spec (no
 // `#<ref>`) is rejected unless PLUGIN_ALLOW_UNPINNED=true.
@@ -64,10 +72,11 @@ type GiteaResolver struct {
 	// ignored — file:// has no userinfo auth).
 	BaseURL string
 
-	// TokenEnv is the environment variable the PAT is read from at Fetch
-	// time. Read lazily (not at construction) so a token rotated into the
-	// process env after startup is picked up. Empty disables auth injection
-	// (anonymous API calls — works for public repos; fails fast on private).
+	// TokenEnv is the LAST-RESORT single-forge PAT variable, applied only to
+	// BaseURL's own host and only when no per-host credential is configured
+	// (see host_credentials.go). Read lazily (not at construction) so a token
+	// rotated into the process env after startup is picked up. Empty disables
+	// the seed; per-host credentials still apply.
 	TokenEnv string
 
 	// FetchTimeout bounds the archive download + SHA resolution for HTTP(S)
@@ -97,6 +106,28 @@ func NewGiteaResolver() *GiteaResolver {
 
 // Scheme returns "gitea".
 func (r *GiteaResolver) Scheme() string { return "gitea" }
+
+// token resolves the credential to present to this resolver's forge.
+//
+// molecule-core#4997: this is a PER-HOST lookup, not a single-variable read.
+// A plugin source may name a repo the CUSTOMER owns and keeps private, which
+// the platform-wide TokenEnv PAT cannot read and must not be widened to read
+// (see template_repo_creds.go). The control plane instead stamps a per-org,
+// read-only credential into the workspace env under the runtime's per-host key,
+// and HostTokenFor applies the same precedence molecule_runtime's boot-install
+// path uses — so both install paths on a box resolve the SAME credential for
+// the same host. TokenEnv is retained as the last-resort seed for the base
+// host, so platform-owned private repos do not regress.
+//
+// Read lazily (never cached) so a credential rotated into the process env after
+// startup is picked up, which the TokenEnv doc comment already promised.
+func (r *GiteaResolver) token() string {
+	base := r.BaseURL
+	if base == "" {
+		base = "https://git.moleculesai.app"
+	}
+	return HostTokenFor(os.Environ(), base, r.TokenEnv)
+}
 
 // LastSHA returns the SHA of the last successful Fetch, or "" if Fetch has
 // not been called or the last call failed.
@@ -178,13 +209,11 @@ func (r *GiteaResolver) cloneURL(owner, repo string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("gitea resolver: invalid base url: %w", err)
 	}
-	if r.TokenEnv != "" {
-		if tok := strings.TrimSpace(os.Getenv(r.TokenEnv)); tok != "" {
-			// Gitea accepts the PAT as the username with an empty (or any)
-			// password over HTTPS basic auth. url.UserPassword URL-encodes
-			// the credential so a token with reserved chars stays valid.
-			u.User = url.UserPassword(tok, "x-oauth-basic")
-		}
+	if tok := strings.TrimSpace(r.token()); tok != "" {
+		// Gitea accepts the PAT as the username with an empty (or any)
+		// password over HTTPS basic auth. url.UserPassword URL-encodes
+		// the credential so a token with reserved chars stays valid.
+		u.User = url.UserPassword(tok, "x-oauth-basic")
 	}
 	u.Path = strings.TrimSuffix(u.Path, "/") + path
 	return u.String(), nil
@@ -227,7 +256,7 @@ func defaultArchiveDownloader(ctx context.Context, archiveURL, token, dstDir str
 	case http.StatusOK:
 		// proceed
 	case http.StatusNotFound:
-		return fmt.Errorf("gitea resolver: %s: %w", archiveURL, ErrPluginNotFound)
+		return fmt.Errorf("gitea resolver: %s: %s: %w", archiveURL, notFoundDiagnosis(token), ErrPluginNotFound)
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return fmt.Errorf("gitea resolver: %s: repository not accessible (HTTP %d)", archiveURL, resp.StatusCode)
 	default:
@@ -291,6 +320,22 @@ func defaultArchiveDownloader(ctx context.Context, archiveURL, token, dstDir str
 		}
 	}
 	return nil
+}
+
+// notFoundDiagnosis explains a Gitea 404 in terms of what WE presented.
+//
+// molecule-core#4997: Gitea returns 404 — not 403 — for a private repo the
+// caller cannot see, so "not found" covers both "does not exist" and "exists,
+// and you are not allowed to know that". Those are indistinguishable from the
+// response, and this function does not pretend otherwise. What is NOT ambiguous
+// is whether a credential was presented, and saying so turns a dead end ("go
+// hunt a typo in a repo that is actually there") into a next step. Never
+// includes the token itself — only whether one existed.
+func notFoundDiagnosis(token string) string {
+	if strings.TrimSpace(token) == "" {
+		return "no credential was presented for this host, so a repo that exists but is PRIVATE is indistinguishable from one that is absent — it may simply be PRIVATE and need a per-org read credential (molecule-core#4997)"
+	}
+	return "a credential WAS presented, so either the repo/ref does not exist or the credential presented does not grant read on it (molecule-core#4997)"
 }
 
 // repoRootFromArchive picks the single top-level directory inside an
@@ -388,10 +433,7 @@ func (r *GiteaResolver) fetchGit(ctx context.Context, p parsedGiteaSpec, dst str
 // extracts it, and stages the requested subpath. It is bounded by a strict
 // timeout and maps 401/403/404 to clear, token-safe errors.
 func (r *GiteaResolver) fetchArchive(ctx context.Context, p parsedGiteaSpec, dst, base string) (string, error) {
-	token := ""
-	if r.TokenEnv != "" {
-		token = strings.TrimSpace(os.Getenv(r.TokenEnv))
-	}
+	token := strings.TrimSpace(r.token())
 
 	u, err := url.Parse(base)
 	if err != nil {
@@ -524,7 +566,7 @@ func (r *GiteaResolver) resolveSHA(ctx context.Context, owner, repo, ref, token,
 	switch resp.StatusCode {
 	case http.StatusOK:
 	case http.StatusNotFound:
-		return "", fmt.Errorf("gitea resolver: %s/%s ref %q: %w", owner, repo, ref, ErrPluginNotFound)
+		return "", fmt.Errorf("gitea resolver: %s/%s ref %q: %s: %w", owner, repo, ref, notFoundDiagnosis(token), ErrPluginNotFound)
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return "", fmt.Errorf("gitea resolver: %s/%s ref %q: not accessible (HTTP %d)", owner, repo, ref, resp.StatusCode)
 	default:
@@ -571,10 +613,7 @@ func (r *GiteaResolver) ResolveRef(ctx context.Context, spec string) (string, er
 		return r.resolveRefGit(ctx, p, ref)
 	}
 
-	token := ""
-	if r.TokenEnv != "" {
-		token = strings.TrimSpace(os.Getenv(r.TokenEnv))
-	}
+	token := strings.TrimSpace(r.token())
 
 	resolveCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()

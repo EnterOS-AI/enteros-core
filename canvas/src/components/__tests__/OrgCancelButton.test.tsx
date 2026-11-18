@@ -57,7 +57,7 @@ declare global {
 // vi.hoisted captures live references from its call-site lexical scope.
 
 // Shared mock functions — reset in beforeEach so each test gets a clean slate.
-const mockApiDel = vi.hoisted(() => vi.fn<[], Promise<unknown>>());
+const mockApiDel = vi.hoisted(() => vi.fn<(path: string, body?: unknown) => Promise<unknown>>());
 
 // Store factory — hoisted so it is available inside the vi.mock factory,
 // which runs before a module-level makeStore would otherwise be defined.

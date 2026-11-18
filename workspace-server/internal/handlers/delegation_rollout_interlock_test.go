@@ -65,22 +65,23 @@ func TestDelegationRolloutInterlock_AllowsEverySafeCombination(t *testing.T) {
 	}
 }
 
-// TestDelegationRolloutInterlock_IsActuallyEngagedToday — the test that stops this
-// whole apparatus from being decorative.
+// TestDelegationRolloutInterlock_IsActuallyEngagedToday WAS HERE, AND IS DELETED ON
+// PURPOSE — #4338.
 //
-// asyncMCPCompletionWired is a constant. If someone flips it to true to make a test
-// pass, or lands #4338's flip without its writer, the interlock silently becomes a
-// no-op and Phase 2 looks safe when it is not. This asserts the interlock is CLOSED —
-// and when #4338 genuinely lands, this test is the one that must be deliberately
-// deleted, in the same commit, by someone who read why it was here.
-func TestDelegationRolloutInterlock_IsActuallyEngagedToday(t *testing.T) {
-	if asyncMCPCompletionWired {
-		t.Fatal("asyncMCPCompletionWired is TRUE, so the #4338 interlock is now a no-op " +
-			"and DELEGATION_LEDGER_WRITE=1 will boot.\n" +
-			"    If #4338 has really landed — an async MCP delegation's COMPLETION is " +
-			"written to the ledger, not just its failure (see failAsyncMCPDelegation) — " +
-			"then delete this test in that same commit and say so in the message.\n" +
-			"    If it has not, put this back to false: flipping it is the difference " +
-			"between a safe flag flip and a fleet-wide false-failure event 6h later.")
-	}
-}
+// It asserted `asyncMCPCompletionWired == false`, so that flipping the constant broke
+// a test whose failure message explained what the flip actually claims. Its own
+// instruction was: "when #4338 genuinely lands, this test is the one that must be
+// deliberately deleted, in the same commit, by someone who read why it was here."
+// This is that commit. The writer it demanded is completeAsyncMCPDelegation
+// (mcp_async_completion.go), with the failure half (failAsyncMCPDelegation) left
+// intact as its scope note required, and both are covered against a real Postgres by
+// TestIntegration_AsyncMCPCompletion_* plus the never-answers negative control.
+//
+// The apparatus is NOT now decorative. The two tests above still pin the decision
+// function's fail arm and its safe arms, and TestAsyncMCPCompletionWired_IsTrue
+// (mcp_async_completion_test.go) is the inverted successor to this test: it fails if
+// the constant is ever put back to false while the writer is present, which would
+// re-block Phase 2 silently.
+//
+// Do not restore this test without also reverting the constant, and do not revert the
+// constant without deleting the writer. The constant is a claim about what exists.

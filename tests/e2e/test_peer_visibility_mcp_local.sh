@@ -249,7 +249,7 @@ _model_for_runtime() {
     claude-code) echo "sonnet" ;;
     codex)       echo "gpt-5.5" ;;
     kimi)        echo "kimi-coding/kimi-k2-coding-6" ;;
-    minimax)     echo "minimax/MiniMax-M2.7" ;;
+    minimax)     echo "minimax/MiniMax-M3" ;;
     external)    echo "external:custom" ;;
     *)           echo "anthropic:claude-opus-4-7" ;;
   esac

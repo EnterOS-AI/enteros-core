@@ -25,13 +25,13 @@
 import React from "react";
 import { render, screen, fireEvent, cleanup, act, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ScheduleTab } from "../ScheduleTab";
+import { ScheduleTab, type Schedule } from "../ScheduleTab";
 
 // Hoist mocks so vi.mock factory can reference them.
-const mockGet = vi.hoisted(() => vi.fn<[], Promise<unknown[]>>());
-const mockPost = vi.hoisted(() => vi.fn<[], Promise<unknown>>());
-const mockPatch = vi.hoisted(() => vi.fn<[], Promise<unknown>>());
-const mockDel = vi.hoisted(() => vi.fn<[], Promise<unknown>>());
+const mockGet = vi.hoisted(() => vi.fn<(path: string) => Promise<unknown[]>>());
+const mockPost = vi.hoisted(() => vi.fn<(path: string, body?: unknown) => Promise<unknown>>());
+const mockPatch = vi.hoisted(() => vi.fn<(path: string, body?: unknown) => Promise<unknown>>());
+const mockDel = vi.hoisted(() => vi.fn<(path: string, body?: unknown) => Promise<unknown>>());
 
 vi.mock("@/lib/api", () => ({
   api: { get: mockGet, post: mockPost, patch: mockPatch, del: mockDel },
@@ -62,7 +62,7 @@ vi.mock("@/components/ConfirmDialog", () => ({ ConfirmDialog: MockConfirmDialog 
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 
-const SCHEDULE_FIXTURE = {
+const SCHEDULE_FIXTURE: Schedule = {
   id: "sch-1",
   workspace_id: "ws-1",
   name: "Daily Security Scan",

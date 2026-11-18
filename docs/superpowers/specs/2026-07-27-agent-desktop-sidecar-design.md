@@ -30,9 +30,9 @@ Each workspace should be "a computer a human uses" — the agent opens a browser
 
 | Decision | Choice |
 |---|---|
-| Desktop scope | Full Linux desktop |
+| Desktop scope | Full Linux desktop **(v2 shipped a kiosk browser; realized as full XFCE in v3 §25)** |
 | Packaging | Dedicated per workspace (not shared) |
-| Lifecycle | Scale-to-zero + persistent profile volume |
+| Lifecycle | Scale-to-zero + persistent profile volume **→ v3: persistent-container full rootfs, `stop` not `rm` (§25.1)** |
 | Agent control | Computer-use loop (screenshot + xdotool), **gated on vision-capable adapter** |
 | Human path | Reuse noVNC proxy; **view split from control** |
 | Resolution | One fixed native resolution, no scaling |
@@ -312,6 +312,7 @@ Not a one-var swap. v2 edits: (a) re-type `displayForward`/`realDisplayForward` 
 
 ## 22. Revision history
 
+- **v3 (2026-07-31)** — Persistent full desktop (§25). The v2 impl shipped a **kiosk browser**, not the "Full Linux desktop" §2 locked. v3 realizes it: full **XFCE** session (panel/launcher/terminal/files), **full persistent rootfs** via a persistent container (scale-to-zero = `stop` not `rm`), **passwordless sudo/apt** to self-install (persists) with isolation unchanged (installs egress through the per-workspace proxy). Supersedes the v2 kiosk decision (§3.5), teardown-remove + profile-only persistence (§10–§11), and cap-drop-ALL/no-new-privileges (§6.2/§19.3/§21) **for the desktop sidecar** — network isolation (§0.1) still hard-required. Software rendering kept; GPU deferred.
 - **v2 (2026-07-27)** — Hardened after a five-lens adversarial review + plugin/SSOT recon. Corrected: arbitration (view/control split), self-host display is greenfield, adapter vision-gating, security isolation is a prerequisite (per-workspace net), the real sweeper bug is a credential-volume leak, image-result via attachment URI. Added: SSOT contract, backend-neutral abstraction, sensitive-action governance, agent-activity idle signal, graceful teardown, testing/CI/docs/cleanup sections, full checklist, per-tier availability gate (decision 4).
 - **v1 (2026-07-27)** — Initial design from brainstorming + five-subsystem recon.
 
@@ -411,3 +412,52 @@ B1 was the "load-bearing blocker." It is now precisely characterised and closed 
 - ✅ **SSRF allowlist** (`ValidateSidecarTarget`) — every resolved sidecar target pinned to `wsdesk-<hex-id>:<6070|6080>` before the gateway or noVNC proxy forwards; wired into both; 3 tests (commit `31924ccc2`).
 - ✅ **Input hardening** — focus-verify (`getactivewindow` before type/key, so keystrokes never land in the void) + type `--delay`; on top of the existing move→settle→click; tests added. IME clipboard-paste fallback deferred (needs xclip in the image).
 - ✅ **Human-preempts-agent arbitration** — a user acquiring control now PREEMPTS an active agent lock with no admin token / no force (one WHERE clause in `acquireDisplayControlQuery`), while another user still can't steal a human's lock. **Verified against real PG16** (4-step integration test). Completes the view/control split: once preempted, the gateway fails the agent's next `/input` closed. The paired agent-side `desktop_wait_for_control` blocking tool + pg_notify-on-release remain runtime-repo/follow-up.
+
+## 25. Persistent full desktop (v3, 2026-07-31)
+
+**Why this revision.** §2 locked the scope as a *"Full Linux desktop,"* but the shipped implementation is a **kiosk browser**: the entrypoint launches `chromium --kiosk` as the only foreground app (no panel, no launcher, no other apps), and the lifecycle (§10) **removes** the container on scale-to-zero, persisting only the browser profile volume (§11). So a human taking over sees a locked browser, not a desktop, and nothing installed survives. v3 realizes the original intent: a real, **stateful** Linux desktop the agent and a human can both use and install into.
+
+**Decisions locked (brainstorming, 2026-07-31):**
+
+| Decision | v2 (shipped) | v3 (this) |
+|---|---|---|
+| Desktop UI | `chromium --kiosk` only | **Full XFCE session** — panel, app menu, taskbar, file manager, terminal |
+| Persistence | remove container + keep profile volume (browser cookies only) | **Full persistent rootfs** — the whole writable layer survives |
+| Self-install | none (locked sandbox) | **passwordless sudo / apt** — install anything, it persists |
+| Rendering | Xvfb software framebuffer | unchanged (**GPU = follow-up**) |
+
+### 25.1 Persistence mechanism — persistent container (supersedes §10 teardown, §11)
+The rootfs *is* the state. Scale-to-zero becomes **`docker stop`, not `docker rm`** — a stopped container keeps its writable layer, so apt installs, `/home`, `/etc`, and files all survive. Scale-up is a fast **`docker start`** (which re-runs the entrypoint, so the entrypoint invariants — SingletonLock cleanup, websockify `--heartbeat` — still apply every start). Create-from-image happens only on the **first-ever** start; the "clear stale same-name container before create" step (ephemeral-model) is dropped. **WipeProfile / permanent-delete = `docker rm` + volume prune** = a genuine factory reset.
+
+Rejected alternatives: a persistent overlayfs upper-dir on a volume (fragile, storage-driver-specific); `docker commit` per scale-down (heavy, unbounded image bloat).
+
+### 25.2 Full XFCE desktop (supersedes the kiosk decision, §3 point 5)
+`Dockerfile.desktop-sidecar` installs XFCE (`xfce4` + `xfce4-terminal` + Thunar) + a browser + a text editor + `sudo`. The entrypoint runs an **XFCE session** (`startxfce4` / `xfce4-session`) instead of `chromium --kiosk`. The **coordinate contract (§3) is unchanged** — it is resolution-based; the agent now screenshots a desktop and clicks/launches apps exactly as before. The baked set is intentionally **lean** (a real desktop in ~1–1.5 GB); Blender/GIMP/LibreOffice/etc. are `apt install`-on-demand and persist (§25.1).
+
+### 25.3 Self-install — sudo/apt through the egress proxy (relaxes §6.2 hardening)
+The desktop user gets **passwordless sudo**; `no-new-privileges` is **removed** for the desktop container (it blocks sudo's setuid), and `cap-drop ALL` is dropped entirely so the container runs with **Docker's default cap set** — a small, well-understood list that already includes everything dpkg/apt need (`CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETUID`, `SETGID`, `SETPCAP`, …) without the dangerous ones (no `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, etc.). *(As-built: rather than enumerate a keep-list, we use the default set — simpler, and the default already excludes the risky caps.)* apt fetches **through the existing per-workspace egress proxy** (`http(s)_proxy` derived from `DESKTOP_PROXY`), so **network isolation is unchanged** — the desktop can reach the public internet to install, but still cannot reach infra, the host, or other tenants (§6.1). The Chromium userns-sandbox seccomp profile (§B3, §21) is the **only** `SecurityOpt` still applied and stays for the browser.
+
+**Security posture (honest, documented):** the desktop is now root-capable *inside its own container*. That is inherent to "a computer you can install anything on." The blast radius is one workspace's desktop; the per-workspace internal network + egress proxy (§6.1) remain the isolation boundary and are untouched. This **supersedes the v2 "cap-drop ALL + no-new-privileges" posture** (§6.2, §19.3, §21) for the desktop sidecar specifically — NOT the network isolation, which is still the hard prerequisite (§0.1).
+
+### 25.4 Tradeoffs
+- **Image freshness vs persistence.** A persistent container stays on its creation-time image; base-image security patches reach only *new* desktops. Existing ones update **in place via `apt upgrade`** (the real-computer model). Entrypoint fixes still re-run on every `docker start`.
+- **Disk growth.** The persistent rootfs grows with installs — needs a per-container writable-layer size cap (storage-opt / quota) + monitoring, else one workspace can fill host disk.
+- **Memory.** XFCE + arbitrary apps need more than the single-browser sidecar; the `Memory`/`MemorySwap` ceiling is raised from 2 GiB → **4 GiB default** (operator-overridable via `MOLECULE_DESKTOP_MEMORY_BYTES`), keeping swap pinned to the cap and the shed-desktop-first `oom_score_adj` (§10).
+
+### 25.5 What changes where
+- **Desktop image** (`Dockerfile.desktop-sidecar`, `scripts/desktop-sidecar-entrypoint.sh`): XFCE + apps + `sudo`; XFCE-session entrypoint; passwordless sudo; apt proxy config.
+- **Provisioner** (`internal/provisioner/local_sidecar_provisioner.go`) — **as-built**:
+  - `StopDesktop` → **stop-and-keep** the container (never `rm`); tears down the *stateless* egress proxy and detaches the platform, but **keeps** the per-workspace network (the stopped sidecar still holds an endpoint on it, so `NetworkRemove` would fail anyway and `StartDesktop` reuses it).
+  - `StartDesktop` → **start-existing-or-create** via a new `containerExists` (ContainerInspect) check: first-ever start creates volume + container; every later start is a plain `ContainerStart` on the persisted container. The old "force-remove any stale same-name container before create" step is deleted. Network + egress-proxy setup is idempotent and runs on both paths.
+  - `WipeProfile` → force-`rm` the container **+** remove the profile volume **+** tear down the egress proxy and the per-workspace network — a genuine factory reset (the old kiosk model only removed the volume).
+  - `SecurityOpt`/`CapDrop` relaxed via a new `desktopSecurityOpt()` (seccomp-only; the dead `securityOpt()` was removed); the egress proxy stays hardened.
+  - Resource ceiling raised (4 GiB default, env-overridable).
+  - The persistent **profile volume is KEPT** (bind-mounted `/home/desktop/profile`) — the container rootfs persists too, but the volume keeps `/home` state cleanly separable for a future "wipe logins but keep installs" split.
+- **Lifecycle store / gateway**: unchanged — scale-to-zero is still driven by the idle sweeper; `running` now means container-running, `stopped` means container-exists-but-stopped.
+- **Coordinate contract, control arbitration, egress proxy, SSRF allowlist, human URL bar (#4996)**: unchanged.
+
+### 25.6 Phasing / follow-ups
+- **GPU** (Xorg + driver + GPU scheduling) — deferred; likely gated on the k8s cluster (ties to the CP/k8s backend, §14). See molecule-core issue #4976.
+- **Writable-layer disk quota** — needs the right storage driver / storage-opt; ship with monitoring first if quotas are unavailable.
+- **Runtime prompt** (`molecule-ai-workspace-runtime`): tell the agent it has a full desktop — open a terminal, install tools — so it uses the capability. Separate repo.
+- **Per-PR e2e**: extend `TestDesktopSidecar_E2E` to boot the XFCE image and assert the desktop renders (panel present), an app launches, and `sudo apt-get -s install` resolves through the proxy; **wire it into CI** (the open gap flagged in the regression-guards PR — no workflow sets `DESKTOP_E2E_IMAGE`).

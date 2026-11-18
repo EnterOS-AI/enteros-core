@@ -18,6 +18,10 @@ export const STATUS_CONFIG: Record<string, { dot: string; glow: string; label: s
   // configuration. Hover renders agent_card.configuration_error in the tooltip so
   // the operator sees the exact env var to set.
   not_configured: { dot: "bg-amber-300", glow: "shadow-amber-300/50", label: "Not configured", bar: "from-amber-400/20 to-transparent" },
+  // parked: derived state — an Enter OS Light agent asleep between its
+  // scheduled runs (light_state=parked, status=hibernated). Its schedules run
+  // as short-lived copies, so it is not "offline": a calm teal, no glow.
+  parked: { dot: "bg-teal-400", glow: "", label: "Parked", bar: "from-teal-500/10 to-transparent" },
 };
 
 export function statusDotClass(status: string): string {

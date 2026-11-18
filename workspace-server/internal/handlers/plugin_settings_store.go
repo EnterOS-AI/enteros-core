@@ -20,9 +20,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
 	"path"
 	"strings"
+
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/envx"
 )
 
 // settingLayer names where a value came from, in precedence order.
@@ -381,16 +382,12 @@ func pluginNameFromSettingsFile(name string) (string, bool) {
 	return strings.TrimSuffix(file, ".json"), true
 }
 
-// pluginSettingsLayersEnabled gates the provision-time overlay.
+// pluginSettingsLayersEnabled reports whether the provision-time layer-6
+// overlay runs. It is what makes an operator override survive a re-provision
+// ON THE BOX (the DB half works either way).
 //
-// DEFAULT OFF. This is new behaviour on the Create path — the single most
-// blast-radius-sensitive code in the server — so it ships dark and is turned on
-// deliberately, rather than changing every provision the moment it merges.
-// With it off, provisioning is byte-identical to before: the rendered template
-// settings are delivered exactly as they were.
-//
-// Turning it on is what makes an operator override survive a re-provision ON
-// THE BOX (the DB half works either way).
+// ON by default as of core#5047 — the owner-gated flip this comment used to
+// wait for. Everything that was holding it dark has been discharged:
 //
 // THE BISECT THIS FLAG WAS ALSO INTRODUCED FOR HAS CONCLUDED — and it cleared
 // this code. template-delivery-e2e was red for a reason with no connection to
@@ -401,21 +398,16 @@ func pluginNameFromSettingsFile(name string) (string, bool) {
 // happened. Fixed in tests/harness/template-asset-delivery-gate.sh; the tenant
 // log naming the abort is quoted on core#4923.
 //
-// So what remains here is a shipping-posture choice, not an open question: the
-// overlay is proven by TestIntegration_PluginSettings_ReprovisionDeliversThe
-// OverrideToTheBox against a real Postgres, and it stays dark only because
-// changing the Create path deserves a deliberate flip rather than an automatic
-// one at merge. Until it is flipped, layer 6 survives in the DATABASE but a
-// re-provisioned box still runs the template value — M4's done-condition is
-// not met on the box with the flag off. Flipping it is owner-gated.
+// The overlay is proven by TestIntegration_PluginSettings_ReprovisionDelivers
+// TheOverrideToTheBox against a real Postgres. With it off, layer 6 survived
+// in the DATABASE but a re-provisioned box still ran the template value — M4's
+// done-condition was not met on the box, which is a defect, not a posture.
 //
-//	MOLECULE_PLUGIN_SETTINGS_LAYERS=1|true|yes   → on
-//	unset / anything else                        → off
+// MOLECULE_PLUGIN_SETTINGS_LAYERS survives as an OPERATOR KILL-SWITCH: set it
+// to 0/false/no/off and provisioning reverts to byte-identical-to-before,
+// delivering the rendered template settings exactly as they were — no redeploy
+// needed. Unset, empty, and truthy all mean ON; an unrecognised value fails
+// OPEN toward the shipped behaviour rather than silently re-darkening it.
 func pluginSettingsLayersEnabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("MOLECULE_PLUGIN_SETTINGS_LAYERS"))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
+	return envx.Enabled("MOLECULE_PLUGIN_SETTINGS_LAYERS")
 }

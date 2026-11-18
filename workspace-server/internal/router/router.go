@@ -38,7 +38,7 @@ import (
 // (main.go) gets the same pluginResolver instance so it can share scheme
 // enumeration if a deployment registers extra schemes externally. A nil
 // pluginResolver is harmless: plgh still works with its built-in defaults.
-func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, hostStateDir string, bootTokens *provisioner.BootConfigTokenStore, wh *handlers.WorkspaceHandler, greeter func(workspaceID string, toolCount int), channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) *gin.Engine {
+func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, hostStateDir string, bootTokens *provisioner.BootConfigTokenStore, wh *handlers.WorkspaceHandler, greeter func(workspaceID string, toolCount int), channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) (*gin.Engine, *handlers.AdminPluginDriftHandler) {
 	r := gin.Default()
 
 	// Issue #179 — trust no reverse-proxy headers. Without this call Gin's
@@ -90,6 +90,11 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// last so a handler can still opt out by setting its own header before
 	// c.Next() returns.
 	r.Use(middleware.SecurityHeaders())
+
+	// Enter OS Light (contract C3b): a run pod's requests carry
+	// X-Molecule-Run-Id; with a workspace token, the run rides the request
+	// context so the activity rows it writes carry run_id. Never fails a request.
+	r.Use(middleware.LightRunID(db.DB))
 
 	// Health
 	r.GET("/health", func(c *gin.Context) {
@@ -293,6 +298,20 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// Manual hibernate (opt-in, #711) — stops the container and sets status
 		// to 'hibernated'. The workspace auto-wakes on the next A2A message.
 		wsAuth.POST("/hibernate", wh.Hibernate)
+
+		// Enter OS Light (contracts C3/C5; docs/api-protocol/light-api.md): a
+		// parked agent whose schedules run as isolated copies in their own pods.
+		// Management routes refuse the workspace's own token (a run pod holds
+		// it); POST /light/runs is the run pods' ledger and takes only that token.
+		lh := handlers.NewLightHandler(wh)
+		wsAuth.GET("/light", lh.Get)
+		wsAuth.POST("/light/enable", lh.Enable)
+		wsAuth.POST("/light/disable", lh.Disable)
+		wsAuth.POST("/light/park", lh.Park)
+		wsAuth.POST("/light/open", lh.Open)
+		wsAuth.POST("/light/run", lh.RunNow)
+		wsAuth.GET("/light/runs", lh.ListRuns)
+		wsAuth.POST("/light/runs", lh.ReportRun)
 
 		// Test-only busy-inject (task #92). Compiled ONLY under the
 		// e2e_busy_inject build tag — a no-op stub in every shipped image
@@ -569,6 +588,18 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		beh := handlers.NewBootEventHandler(broadcaster)
 		wsAuth.POST("/boot-event", beh.Report)
 
+		// Plugin boot-install report — SDK contract contracts/plugin-install-report.
+		// DELIBERATELY UNLIKE the boot-step feed directly above it on the two axes
+		// that made a fleet-wide failure unobservable (#4953): every workspace
+		// reports regardless of kind (boot_step_emit is concierge-gated "so an
+		// ordinary, non-concierge tenant boot doesn't spam the endpoint"), and the
+		// report is PERSISTED (a BOOT_STEP is BroadcastOnly — presentation only, so
+		// it answers nothing for an operator asking an hour later). One POST per
+		// boot, not per boot phase.
+		pirh := handlers.NewPluginInstallReportHandler()
+		wsAuth.POST("/plugin-install-report", pirh.Report)
+		wsAuth.GET("/plugin-install-report", pirh.Get)
+
 		// Config
 		cfgh := handlers.NewConfigHandler()
 		wsAuth.GET("/config", cfgh.Get)
@@ -651,6 +682,11 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.DELETE("/secrets/:key", sech.Delete)
 		wsAuth.GET("/model", sech.GetModel)
 		wsAuth.PUT("/model", sech.SetModel)
+		// The 24/7 switch. Its restart is an explicit mutation, so it bypasses
+		// RestartByID's self-fire debounce (which would drop it silently).
+		conth := handlers.NewContinuousHandler(wh.RestartByIDAfterMutation)
+		wsAuth.GET("/continuous", conth.Get)
+		wsAuth.PUT("/continuous", conth.Set)
 		// internal#718 P4 closure: /provider endpoint is retired —
 		// the LLM_PROVIDER workspace_secret no longer exists and the
 		// provider is derived from (runtime, model) via the registry
@@ -686,7 +722,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		//   C2: MCPRateLimiter caps tool calls at 120/min/token so a long-lived
 		//       opencode session cannot saturate the platform.
 		//   C3: commit_memory/recall_memory with scope=GLOBAL → permission error;
-		//       send_message_to_user excluded unless MOLECULE_MCP_ALLOW_SEND_MESSAGE=true.
+		//       send_message_to_user is included by default and excluded only where
+		//       the MOLECULE_MCP_ALLOW_SEND_MESSAGE kill-switch is set falsy.
 		mcpH := handlers.NewMCPHandler(db.DB, broadcaster, pushNotifier)
 		if memBundle != nil {
 			mcpH.WithMemoryV2(memBundle.Plugin, memBundle.Resolver)
@@ -705,6 +742,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// bearer, same as the MCP endpoint.
 	wsAuth.GET("/desktop/screenshot", wh.DesktopScreenshot)
 	wsAuth.POST("/desktop/input", wh.DesktopInput)
+	wsAuth.POST("/desktop/navigate", wh.DesktopNavigate)
 	wsAuth.GET("/desktop/control", wh.DesktopControlStatus)
 
 	// Global secrets — /settings/secrets is the canonical path; /admin/secrets kept for backward compat.
@@ -764,6 +802,20 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		adH := handlers.NewAdminDelegationsHandler(db.DB)
 		r.GET("/admin/delegations", middleware.AdminAuth(db.DB), adH.List)
 		r.GET("/admin/delegations/stats", middleware.AdminAuth(db.DB), adH.Stats)
+	}
+
+	// Admin — the FLEET read over plugin-install reports (#4981 §1). The
+	// migration's `workspace_plugin_install_reports_not_live` partial index was
+	// created to answer "which workspaces booted with no live plugins" and no
+	// handler issued that query, so the question still needed direct DB access.
+	//
+	// AdminAuth, NOT the wsAuth group the POST/GET pair live in: those are bound
+	// to :id by WorkspaceAuth so a workspace can only see its own report, and this
+	// route returns rows for workspaces the caller never names. Same gate as the
+	// sibling operator reads above.
+	{
+		apirH := handlers.NewAdminPluginInstallReportsHandler(db.DB)
+		r.GET("/admin/plugin-install-reports", middleware.AdminAuth(db.DB), apirH.List)
 	}
 
 	// Admin — explicit registry-backed, single-host workspace image maintenance.
@@ -867,8 +919,14 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 	// Admin — plugin version-subscription drift queue (core#123).
 	// List pending drift entries and apply approved updates.
+	//
+	// driftH is hoisted out of this block and RETURNED so cmd/server can run
+	// the deterministic queue drainer against the same handler
+	// (handlers.StartPluginDriftApplier, core#4977). Setup builds the handler
+	// graph; main owns goroutine lifecycles — the same split the drift
+	// sweeper already uses.
+	driftH := handlers.NewAdminPluginDriftHandler(plgh)
 	{
-		driftH := handlers.NewAdminPluginDriftHandler(plgh)
 		adminAuth := r.Group("", middleware.AdminAuth(db.DB))
 		adminAuth.GET("/admin/plugin-updates-pending", driftH.ListPending)
 		adminAuth.POST("/admin/plugin-updates/:id/apply", driftH.Apply)
@@ -1114,7 +1172,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		r.NoRoute(canvasProxy)
 	}
 
-	return r
+	return r, driftH
 }
 
 func findPluginsDir(configsDir string) string {

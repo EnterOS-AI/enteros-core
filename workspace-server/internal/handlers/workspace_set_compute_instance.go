@@ -71,12 +71,13 @@ func (h *WorkspaceHandler) SetComputeInstance(c *gin.Context) {
 	// The provider is still REQUIRED (the CP always supplies the org's backend),
 	// but it is validated against the shared cloudprovider SSOT — NOT a hardcoded
 	// cloud-only {aws,hetzner,gcp} allowlist. That old allowlist rejected the
-	// Molecules-Server backend (org.provider="local", the CP re-provision path
-	// POSTs provider="local") with a 400, so RepointTenantComputeInstance failed
+	// Molecules-Server backend with a 400, so RepointTenantComputeInstance failed
 	// and the CP admin re-provision returned a cosmetic 500 even though the box
-	// came up fine (#190). Route validation through the SDK so molecules-server /
-	// its aliases (local, docker) are handled correctly and the cloud abstraction
-	// (aws/gcp/hetzner) is preserved unchanged.
+	// came up fine (#190). Route validation through the SDK so molecules-server
+	// and its CURRENT aliases are handled correctly and the cloud abstraction
+	// (aws/gcp/hetzner) is preserved unchanged. Since substrate-rename stage 3
+	// (molecule-ai-sdk#200) that alias set is {enteros}: "local" and "docker" are
+	// deleted and now 400 here, matching the prod organizations.provider CHECK.
 	if reqProvider == "" || !sdkcp.IsValidID(reqProvider) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "provider must be one of " + strings.Join(sdkcp.IDs(), "|") + " (aliases: local, docker → molecules-server)",
@@ -84,12 +85,14 @@ func (h *WorkspaceHandler) SetComputeInstance(c *gin.Context) {
 		return
 	}
 	// Persist the SDK BACKEND KEY (clouds map to themselves; molecules-server and
-	// its aliases map to "local"), which is exactly what the persisted
+	// its aliases local/docker map to "enteros" since SDK#199 substrate-rename
+	// stage 2 — they stay ACCEPTED on the wire, only the WRITTEN value moved),
+	// which is exactly what the persisted
 	// compute->>'provider' value drives downstream: the tenant CPProvisioner
 	// resolveProvider→Stop/status path forwards it as ?provider= to the CP
 	// Deprovision handler, whose effectiveTeardownProvider routes on backend keys.
-	// So a Molecules-Server workspace lands provider="local" and tears down via
-	// the local backend instead of the absent AWS path.
+	// So a Molecules-Server workspace lands provider="enteros" and tears down via
+	// the enteros backend instead of the absent AWS path.
 	provider, _ := sdkcp.BackendKey(reqProvider)
 
 	// Repoint instance_id + compute.provider only. jsonb_set preserves every

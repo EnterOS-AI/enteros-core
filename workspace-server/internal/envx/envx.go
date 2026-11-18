@@ -13,6 +13,7 @@ package envx
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -52,4 +53,33 @@ func Bool(name string, def bool) bool {
 		}
 	}
 	return def
+}
+
+// killSwitchOff is the set of values an operator may use to turn a shipped
+// capability OFF. Compared case-insensitively after trimming whitespace.
+var killSwitchOff = map[string]bool{
+	"0": true, "f": true, "false": true,
+	"n": true, "no": true, "off": true,
+	"disable": true, "disabled": true,
+}
+
+// Enabled reports whether a SHIPPED capability guarded by `name` is on. It is
+// the inverse polarity of Bool, for the opposite operator contract:
+//
+//	Bool(name, false) → "a dormant feature; set truthy to switch it on"
+//	Enabled(name)     → "shipped capability; set falsy to switch it OFF"
+//
+// Unset — production's actual state for a variable nobody has ever configured
+// — returns true. So does empty, a truthy value, and anything unrecognised: a
+// typo in an operator's env must fail OPEN toward the capability the product
+// ships, never silently dark-ship it. Only an explicit falsy value (0, f,
+// false, n, no, off, disable, disabled — any case, whitespace trimmed) is a
+// kill-switch.
+//
+// The kill-switch exists so an operator can revert a capability WITHOUT a
+// redeploy. This is the same shape the *_SWEEPER_DISABLED flags and
+// MOLECULE_MANIFEST_SSOT_ENFORCE=off already use in this repo; Enabled makes
+// it one tested helper instead of a per-site hand-rolled string compare.
+func Enabled(name string) bool {
+	return !killSwitchOff[strings.ToLower(strings.TrimSpace(os.Getenv(name)))]
 }

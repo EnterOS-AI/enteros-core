@@ -8,12 +8,12 @@ The gated staging tenant CD lives at .gitea/workflows/staging-tenant-cd.yml:
                               -> runtime-image-readiness ------>
 
 It is enforced INTRA-workflow by Gitea `needs:` (a red upstream job skips every
-downstream job). The pin advances before the local-docker staging fleet rolls to
-the candidate image. In parallel, runtime-image-readiness pre-pulls every
-promoted pinnable runtime digest on the exact local-deploy daemon; e2e-smoke
-cannot start until both paths are green, so its first workspace provision never
-spends the control plane's 90-second request budget on a 700MiB-1.3GiB cold
-pull.
+downstream job). The pin advances before the k8s staging fleet rolls to the
+candidate image. In parallel, runtime-image-readiness proves the registry
+serves every promoted pinnable runtime digest (manifest bytes hash-verified)
+and every child manifest and blob it references; e2e-smoke cannot
+start until both paths are green, so its first workspace provision cannot fail
+on a digest the registry does not have.
 rollback-pin must always run and restore the old pin + fleet image whenever any
 candidate-path job fails or is skipped. CP-host redeploys are provider-owned and
 must not be wired into this tenant-image CI path. That gate runs on
@@ -40,16 +40,16 @@ This lint is that mechanical guard. It fails the build if anyone:
      would let a downstream `needs:`-dependent job run despite a real failure;
      OR
   5. moves or weakens runtime-image-readiness: it must run the canonical
-     checkout -> local-deploy guard -> readiness consumer shape on exactly the
-     `local-deploy` runner with staging/Infisical inputs, with no workflow/job
-     execution overrides that can redirect or neutralize that shape; OR
+     checkout -> readiness consumer shape on exactly the `local-deploy` runner
+     with staging/Infisical/registry inputs, with no workflow/job execution
+     overrides that can redirect or neutralize that shape; OR
   6. reintroduces provider-specific CP deploy wiring (Railway CLI/tokens or the
      legacy reload-cp-candidate job) into this tenant-image CI path. Preparing
      the selected provider's runtime cache is not a CP deploy/reload.
 
 The dependency checks are behavior-based (they parse the YAML `needs:` graph).
-The one daemon-mutating readiness job is intentionally name- and shape-pinned so
-the rollback result mapping and exact local-deploy boundary cannot drift.
+The readiness job is intentionally name- and shape-pinned so the rollback
+result mapping and its credential inputs cannot drift.
 
 SSOT: the gate shape lives in staging-tenant-cd.yml. This lint encodes the
 contract; if the gate is ever intentionally restructured, update both. Mirrors
@@ -68,7 +68,6 @@ except ImportError:
 DEFAULT_WORKFLOW = ".gitea/workflows/staging-tenant-cd.yml"
 PINNED_CHECKOUT_ACTION = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
 READINESS_JOB = "runtime-image-readiness"
-READINESS_GUARD_COMMAND = "bash scripts/deploy/require-local-deploy-daemon.sh"
 READINESS_ACTION_COMMAND = "bash scripts/deploy/prepare-staging-runtime-images.sh"
 READINESS_ACTION_ENV = {
     "CP_BASE_URL": "https://staging-api.moleculesai.app",
@@ -77,8 +76,45 @@ READINESS_ACTION_ENV = {
     "INFISICAL_CLIENT_ID": "${{ secrets.INFISICAL_CI_CLIENT_ID }}",
     "INFISICAL_CLIENT_SECRET": "${{ secrets.INFISICAL_CI_CLIENT_SECRET }}",
     "INFISICAL_PROJECT_ID": "${{ secrets.INFISICAL_CI_PROJECT_ID }}",
+    "REG_USER": "${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}",
+    "REG_TOKEN": "${{ secrets.MOLECULE_REGISTRY_TOKEN }}",
 }
-READINESS_JOB_ALLOWED_KEYS = {"name", "needs", "runs-on", "timeout-minutes", "steps"}
+READINESS_JOB_ALLOWED_KEYS = {
+    "name",
+    "needs",
+    "runs-on",
+    "timeout-minutes",
+    "steps",
+    # `outputs` carries the ran-sentinel out of the job. It is a pure read of
+    # two step outputs (shape-pinned by check_ran_sentinel) and cannot redirect
+    # or neutralize the readiness action the way env/defaults/if/container can.
+    "outputs",
+}
+
+# ---------------------------------------------------------------------------
+# ran-sentinel (see scripts/deploy/ran-sentinel.sh)
+# ---------------------------------------------------------------------------
+# Every job whose `result` is consumed as a verdict must prove it ACTUALLY RAN.
+# Gitea's PickTask commits a task row as `running` before it assembles and
+# returns the FetchTask payload, and FetchTask is at-most-once, so a lost
+# response leaves a claim nobody is working on; StopZombieTasks reaps it as
+# `failure` with an EMPTY log 10-15 minutes later. Through
+# `needs.<job>.result` that is byte-identical to a genuine failure — and because
+# this workflow advances the pin BEFORE testing it, reading such a result as a
+# verdict ROLLS THE STAGING FLEET on a test that never ran (it did, twice).
+SENTINEL_JOBS = ["redeploy-fleet", READINESS_JOB, "e2e-smoke", "rollback-pin"]
+SENTINEL_BEGIN_ID = "ran_begin"
+SENTINEL_END_ID = "ran_end"
+SENTINEL_OUTPUTS = {
+    "ran_begin": "${{ steps.ran_begin.outputs.token }}",
+    "ran_end": "${{ steps.ran_end.outputs.token }}",
+}
+# The terminal auditor of rollback-pin's own sentinel. rollback-pin is equally
+# exposed (task 885373 was itself a phantom) and nothing else `needs:` it, so a
+# rollback that never ran would otherwise be indistinguishable from one that
+# succeeded — leaving the pin on a candidate that genuinely failed.
+AUDIT_JOB = "rollback-audit"
+SENTINEL_LIBRARY = "scripts/deploy/ran-sentinel.sh"
 FORBIDDEN_WORKFLOW_ENV_KEYS = {
     "BASH_ENV",
     "ENV",
@@ -117,6 +153,7 @@ GATING_JOBS = [
     READINESS_JOB,
     "e2e-smoke",
     "rollback-pin",
+    AUDIT_JOB,
 ]
 SUCCESS_ONLY_JOBS = ["advance-pin", "redeploy-fleet", READINESS_JOB, "e2e-smoke"]
 ROLLBACK_NEEDS = [
@@ -220,6 +257,127 @@ def values_contain(value, markers):
     return []
 
 
+def check_ran_sentinel(jobs, workflow, fails):
+    """Every consumed result must be backed by proof that the job executed.
+
+    This is a STRUCTURAL check only — it pins the wiring so the mechanism cannot
+    be quietly deleted or defanged. The BEHAVIOUR (that a missing sentinel
+    suppresses the rollback and reports loudly, and that the check is not
+    vacuous on an empty token) is proven by executing the real step bodies in
+    .gitea/scripts/tests/test_ran_sentinel.py.
+    """
+    for jk in SENTINEL_JOBS:
+        job = jobs.get(jk)
+        if not isinstance(job, dict):
+            continue  # missing-job already reported
+        steps = steps_of(job)
+        if len(steps) < 2:
+            fails.append(
+                f"`{jk}` has fewer than 2 steps in {workflow}; it cannot carry a "
+                f"ran-sentinel."
+            )
+            continue
+
+        first, last = steps[0], steps[-1]
+
+        # BEGIN must be the very first step and unconditional. Anything ahead of
+        # it (even a checkout) could fail and make a job that DID run look like
+        # one that never started; any `if:` on it could forge that same state.
+        if not isinstance(first, dict) or first.get("id") != SENTINEL_BEGIN_ID:
+            fails.append(
+                f"`{jk}` does not emit the ran-sentinel BEGIN marker "
+                f"(id: {SENTINEL_BEGIN_ID}) as its FIRST step in {workflow} — "
+                f"without it a task that was claimed but never delivered is "
+                f"indistinguishable from a job that ran and failed, and this "
+                f"workflow ROLLS THE STAGING FLEET on that difference."
+            )
+        elif "if" in first:
+            fails.append(
+                f"`{jk}` guards its ran-sentinel BEGIN step with an `if:` in "
+                f"{workflow}; the marker must be unconditional or a false "
+                f"condition forges a phantom."
+            )
+
+        # END must be the last step AND `if: always()`. always() is load-bearing
+        # in the safety direction: without it a job that ran and genuinely
+        # FAILED would emit no END, and its real failure would be misread as a
+        # phantom — suppressing a rollback that is genuinely owed.
+        if not isinstance(last, dict) or last.get("id") != SENTINEL_END_ID:
+            fails.append(
+                f"`{jk}` does not emit the ran-sentinel END marker "
+                f"(id: {SENTINEL_END_ID}) as its LAST step in {workflow} — a job "
+                f"killed part-way through would then be indistinguishable from "
+                f"one that completed."
+            )
+        elif str(last.get("if", "")).strip() != "always()":
+            fails.append(
+                f"`{jk}`'s ran-sentinel END step must be `if: always()` in "
+                f"{workflow}. Without it a genuine FAILURE emits no END, is "
+                f"misread as a phantom, and SUPPRESSES the rollback it is owed."
+            )
+
+        outputs = job.get("outputs")
+        if outputs != SENTINEL_OUTPUTS:
+            fails.append(
+                f"`{jk}` must publish exactly {SENTINEL_OUTPUTS} as job "
+                f"`outputs:` in {workflow}; got {outputs!r}. A marker no "
+                f"consumer can read is not a sentinel."
+            )
+
+    # Every result rollback-pin reads must arrive WITH its sentinel.
+    rollback = jobs.get("rollback-pin")
+    if isinstance(rollback, dict):
+        env_blob = values_contain(
+            steps_of(rollback),
+            [f"needs.{jk}.outputs.ran_{phase}" for jk in SENTINEL_JOBS[:3] for phase in ("begin", "end")],
+        )
+        missing = [
+            f"needs.{jk}.outputs.ran_{phase}"
+            for jk in SENTINEL_JOBS[:3]
+            for phase in ("begin", "end")
+            if f"needs.{jk}.outputs.ran_{phase}" not in env_blob
+        ]
+        if missing:
+            fails.append(
+                f"`rollback-pin` never reads {missing} in {workflow} — it would "
+                f"decide from `result` alone, which is exactly the phantom-red "
+                f"that rolled the staging fleet twice."
+            )
+        if not values_contain(steps_of(rollback), [SENTINEL_LIBRARY]):
+            fails.append(
+                f"`rollback-pin` does not source `{SENTINEL_LIBRARY}` in "
+                f"{workflow}; the classification must come from the shared SSOT, "
+                f"not a re-implementation that can drift."
+            )
+
+    # rollback-pin's own sentinel needs a consumer, or it proves nothing.
+    audit = jobs.get(AUDIT_JOB)
+    if not isinstance(audit, dict):
+        fails.append(
+            f"`{AUDIT_JOB}` is missing from {workflow} — nothing else `needs:` "
+            f"rollback-pin, so without it a rollback that NEVER RAN is "
+            f"indistinguishable from one that succeeded and the staging pin "
+            f"silently stays on a candidate that genuinely failed (task 885373)."
+        )
+    else:
+        if not always_if(audit):
+            fails.append(f"`{AUDIT_JOB}` must use `if: always()` in {workflow}.")
+        if "rollback-pin" not in needs_of(audit):
+            fails.append(
+                f"`{AUDIT_JOB}` must directly `needs:` `rollback-pin` in "
+                f"{workflow}."
+            )
+        for expr in (
+            "needs.rollback-pin.outputs.ran_begin",
+            "needs.rollback-pin.outputs.ran_end",
+        ):
+            if not values_contain(steps_of(audit), [expr]):
+                fails.append(
+                    f"`{AUDIT_JOB}` never reads `{expr}` in {workflow}; it would "
+                    f"audit nothing."
+                )
+
+
 def main():
     workflow = workflow_path()
     if not os.path.isfile(workflow):
@@ -281,8 +439,8 @@ def main():
                 f"runs after failed or skipped candidate-path jobs."
             )
 
-    # 4. Runtime readiness is a deliberately narrow cross-provider boundary:
-    # read CP projections, then mutate only the exact local-deploy daemon cache.
+    # 4. Runtime readiness is a deliberately narrow boundary: read CP
+    # projections, then send the registry credential only to the registry.
     readiness = jobs.get(READINESS_JOB)
     if isinstance(readiness, dict):
         extra_job_keys = sorted(set(readiness) - READINESS_JOB_ALLOWED_KEYS)
@@ -290,7 +448,7 @@ def main():
             fails.append(
                 f"`{READINESS_JOB}` execution schema has forbidden key(s) "
                 f"{extra_job_keys} in {workflow}; job-level env/defaults/if/"
-                f"container/strategy can redirect or neutralize the daemon guard."
+                f"container/strategy can redirect or neutralize the readiness action."
             )
         if runner_labels_of(readiness) != ["local-deploy"]:
             fails.append(
@@ -300,16 +458,19 @@ def main():
         if readiness.get("timeout-minutes") != 30:
             fails.append(
                 f"`{READINESS_JOB}` timeout-minutes must be exactly 30 in "
-                f"{workflow} (20-minute script budget plus runner overhead)."
+                f"{workflow} (10-minute script budget plus runner overhead)."
             )
         steps = steps_of(readiness)
-        if len(steps) != 3:
+        # ran-sentinel BEGIN and END bracket the canonical two. They are
+        # shape-checked by check_ran_sentinel() below; here we only strip them.
+        if len(steps) != 4:
             fails.append(
-                f"`{READINESS_JOB}` must have exactly checkout, daemon guard, "
-                f"and readiness action steps in {workflow}."
+                f"`{READINESS_JOB}` must have exactly ran-sentinel BEGIN, "
+                f"checkout, readiness action, and ran-sentinel END steps in "
+                f"{workflow}."
             )
         else:
-            checkout, guard, action = steps
+            checkout, action = steps[1:3]
             if (
                 not isinstance(checkout, dict)
                 or checkout.get("uses") != PINNED_CHECKOUT_ACTION
@@ -318,15 +479,6 @@ def main():
                 fails.append(
                     f"`{READINESS_JOB}` must start with the pinned, unredirected "
                     f"checkout action in {workflow}."
-                )
-            if (
-                not isinstance(guard, dict)
-                or run_command_of(guard) != READINESS_GUARD_COMMAND
-                or set(guard) - {"name", "run"}
-            ):
-                fails.append(
-                    f"`{READINESS_JOB}` must run `{READINESS_GUARD_COMMAND}` "
-                    f"unconditionally after checkout in {workflow}."
                 )
             if (
                 not isinstance(action, dict)
@@ -340,7 +492,8 @@ def main():
             elif action.get("env") != READINESS_ACTION_ENV:
                 fails.append(
                     f"`{READINESS_JOB}` readiness action env must be the exact "
-                    f"staging CP + Infisical SSOT mapping in {workflow}."
+                    f"staging CP + Infisical SSOT + registry credential mapping "
+                    f"in {workflow}."
                 )
 
         for field in ("shell", "working-directory"):
@@ -348,7 +501,7 @@ def main():
                 fails.append(
                     f"workflow-level `defaults.run.{field}` is forbidden in "
                     f"{workflow}; it can redirect or replace execution of the "
-                    f"local-deploy daemon guard."
+                    f"readiness action."
                 )
         forbidden_env = sorted(
             set(env_of(workflow_doc)).intersection(FORBIDDEN_WORKFLOW_ENV_KEYS)
@@ -356,8 +509,8 @@ def main():
         if forbidden_env:
             fails.append(
                 f"workflow-level env has forbidden execution/endpoint key(s) "
-                f"{forbidden_env} in {workflow}; trusted Docker endpoint values "
-                f"must come only from local-deploy runner configuration."
+                f"{forbidden_env} in {workflow}; these must never be set at "
+                f"workflow scope."
             )
 
     # 5. e2e-smoke must bind the expected candidate SHA before the staging e2e.
@@ -373,6 +526,9 @@ def main():
                 f"— staginge2e would skip its tenant /buildinfo candidate-SHA "
                 f"guard and could validate a stale fleet."
             )
+
+    # 5b. Every consumed result must be backed by ran-sentinel evidence.
+    check_ran_sentinel(jobs, workflow, fails)
 
     # 6. No continue-on-error on a gating job.
     for jk in GATING_JOBS:
@@ -397,9 +553,7 @@ def main():
                     f"(Gitea Quirk #10 / mc#1982). Remove the key."
                 )
 
-    # 8. Tenant-image CI must not deploy/reload the CP host. The explicit
-    # local-Docker cache preparation above is a provider boundary, not a CP
-    # deployment adapter.
+    # 8. Tenant-image CI must not deploy/reload the CP host.
     for jk in FORBIDDEN_JOB_KEYS:
         if jk in jobs:
             fails.append(
@@ -438,7 +592,8 @@ def main():
         "OK: staging tenant CD gate chain enforced — "
         "await-image -> advance-pin -> (redeploy-fleet + runtime-image-readiness) -> e2e-smoke, "
         "with rollback-pin coverage and no CP deploy/reload path"
-        " (needs: edges intact, no continue-on-error at job or step level)."
+        " (needs: edges intact, no continue-on-error at job or step level), "
+        "and every consumed result backed by a ran-sentinel."
     )
     return 0
 

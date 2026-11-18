@@ -107,6 +107,14 @@ func (h *WorkspaceHandler) DisplaySession(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), workspaceDisplaySessionTimeout)
 	defer cancel()
+	// Count this human viewer for the desktop's whole session so the idle sweeper
+	// does not reap the sidecar out from under a watching human (the agent-activity
+	// timer is usually already stale when a human takes over). Balanced on return,
+	// when the websocket has closed.
+	if useSidecar && h.desktopGateway != nil {
+		h.desktopGateway.ViewerConnected(ctx, workspaceID)
+		defer h.desktopGateway.ViewerDisconnected(ctx, workspaceID)
+	}
 	fwd := func(fn func(target *url.URL) error) error {
 		if useSidecar {
 			sidecarHost := provisioner.DesktopContainerName(workspaceID) + ":" + desktopNoVNCPort

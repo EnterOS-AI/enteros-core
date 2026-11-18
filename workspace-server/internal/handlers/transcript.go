@@ -163,13 +163,13 @@ func safeDialControl(network, address string, _ syscall.RawConn) error {
 			return &ssrfDialError{host: host, reason: errors.New("hostname resolution returned no addresses")}
 		}
 		for _, candidate := range ips {
-			if safeErr := isSafeURL("http://" + candidate.String() + "/"); safeErr != nil {
+			if safeErr := isSafeURL("http://" + net.JoinHostPort(candidate.String(), "80") + "/"); safeErr != nil {
 				return &ssrfDialError{ip: candidate, reason: safeErr}
 			}
 		}
 		return nil
 	}
-	if safeErr := isSafeURL("http://" + ip.String() + "/"); safeErr != nil {
+	if safeErr := isSafeURL("http://" + net.JoinHostPort(ip.String(), "80") + "/"); safeErr != nil {
 		return &ssrfDialError{ip: ip, reason: safeErr}
 	}
 	return nil

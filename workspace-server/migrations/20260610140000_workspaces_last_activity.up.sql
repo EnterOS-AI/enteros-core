@@ -1,7 +1,10 @@
 -- Agent-Liveness RFC, Layer 3 (A2): stall-watchdog support.
 --
--- last_activity_at — wall-clock of the most recent activity_logs write for a
--- workspace, stamped write-through by logActivityExec (handlers/activity.go).
+-- last_activity_at — wall-clock of the most recent activity row written for a
+-- workspace through logActivityExec (handlers/activity.go), stamped
+-- write-through in the same statement. Rows other handlers insert directly,
+-- and an Enter OS Light run's own rows (tagged with activity_logs.run_id),
+-- leave it alone.
 -- The stall-watchdog sweeper (handlers/stall_watchdog.go) compares this against
 -- now() to detect a workspace that is status='online' AND active_tasks>0 but
 -- has produced NO activity for too long — the "busy but silently hung" case

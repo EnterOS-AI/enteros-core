@@ -4,16 +4,25 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"io"
 	"log"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	dockerimage "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
+	"github.com/docker/docker/client"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
+
+// desktopImagePullTimeout bounds the ONE-TIME pull of the desktop image when a
+// tenant that has never run the desktop starts it (see ensureImage). Generous
+// because the image is ~GB and a cold registry is slow, but bounded so a wedged
+// registry can never leak the pull goroutine.
+const desktopImagePullTimeout = 10 * time.Minute
 
 // defaultDesktopSeccompProfile is the Chromium-tuned seccomp profile applied to
 // every sidecar (SecurityOpt "seccomp=<content>"). It is the upstream Docker
@@ -37,12 +46,23 @@ type sidecarDocker interface {
 	ContainerStart(ctx context.Context, name string, options container.StartOptions) error
 	ContainerStop(ctx context.Context, name string, options container.StopOptions) error
 	ContainerRemove(ctx context.Context, name string, options container.RemoveOptions) error
+	// ContainerUpdate reconciles a persisted (stopped) container's resource limits
+	// on wake — §25.1: the memory ceiling is set at create, so a raised
+	// MOLECULE_DESKTOP_MEMORY_BYTES only reaches an existing desktop by updating it
+	// here (recreating would defeat persistence). Verified: an update to a STOPPED
+	// container persists to the next start's memory.max.
+	ContainerUpdate(ctx context.Context, containerID string, updateConfig container.UpdateConfig) (container.UpdateResponse, error)
 	VolumeCreate(ctx context.Context, options volume.CreateOptions) (volume.Volume, error)
 	VolumeRemove(ctx context.Context, volumeID string, force bool) error
 	NetworkCreate(ctx context.Context, name string, options network.CreateOptions) (network.CreateResponse, error)
 	NetworkRemove(ctx context.Context, networkID string) error
 	NetworkConnect(ctx context.Context, networkID, containerID string, config *network.EndpointSettings) error
 	NetworkDisconnect(ctx context.Context, networkID, containerID string, force bool) error
+	// ImageInspect + ImagePull back ensureImage: ContainerCreate does NOT pull,
+	// so a CP/SaaS tenant that never pre-seeded the desktop image must fetch it
+	// on first StartDesktop. Signatures match the *client.Client SDK (v28).
+	ImageInspect(ctx context.Context, image string, opts ...client.ImageInspectOption) (dockerimage.InspectResponse, error)
+	ImagePull(ctx context.Context, ref string, opts dockerimage.PullOptions) (io.ReadCloser, error)
 }
 
 // LocalSidecarProvisioner is the Docker (self-host) backend of
@@ -124,7 +144,24 @@ type LocalSidecarProvisioner struct {
 	// workspace — see reconcileEgressBestEffort.
 	reconcileMu         sync.Mutex
 	lastEgressReconcile map[string]time.Time
+
+	// startupProbeWindow/startupProbeTick bound the post-start liveness probe
+	// (§25.1 self-heal): after a persisted container is restarted, poll for up to
+	// startupProbeWindow (every startupProbeTick) to catch a container that exits
+	// IMMEDIATELY — the signature of a corrupt writable layer / a boot-precondition
+	// failure — and recreate it once. Overridable by tests to keep them fast.
+	startupProbeWindow time.Duration
+	startupProbeTick   time.Duration
 }
+
+// desktopStartupProbeWindow/Tick default the post-start self-heal probe. A
+// HEALTHY cold wake pays up to the full window once per scale-up (never on the
+// screenshot/input hot loop); a corrupt-layer crash is caught within a tick or
+// two. Kept modest so cold-wake latency stays low.
+const (
+	desktopStartupProbeWindow = 1500 * time.Millisecond
+	desktopStartupProbeTick   = 150 * time.Millisecond
+)
 
 // egressReconcileInterval throttles the best-effort egress reconcile on
 // StartDesktop's already-running fast path. StartDesktop is called on every
@@ -177,22 +214,25 @@ func NewLocalSidecarProvisioner(cli sidecarDocker, image, networkPrefix string, 
 		memoryLimitBytes:    memoryLimitBytes,
 		seccompProfile:      seccompProfile,
 		lastEgressReconcile: make(map[string]time.Time),
+		startupProbeWindow:  desktopStartupProbeWindow,
+		startupProbeTick:    desktopStartupProbeTick,
 	}
 }
 
-// securityOpt builds the container SecurityOpt list: no-new-privileges always,
-// plus the seccomp profile (the embedded Chromium-tuned default unless an
-// operator supplied one, or "unconfined" to disable). Combined with CapDrop
-// ALL in StartDesktop, this is the B2 hardening — verified to keep the Chromium
-// userns sandbox active with no CAP_SYS_ADMIN (seccomp/README.md).
-func (p *LocalSidecarProvisioner) securityOpt() []string {
-	opts := []string{"no-new-privileges"}
+// desktopSecurityOpt is the SIDECAR's security options (§25.3): the seccomp
+// profile ONLY (the embedded Chromium-tuned default unless an operator supplied
+// one, or "unconfined" to disable). The v3 desktop must allow sudo/apt, so —
+// unlike the egress proxy, which stays hardened with no-new-privileges + cap-drop
+// ALL (hardcoded in ensureEgressProxy) — no-new-privileges is omitted here (it
+// blocks sudo's setuid) and the default cap set is kept (cap-drop ALL is NOT
+// applied). The Chromium-tuned seccomp profile stays so the browser's
+// unprivileged userns sandbox works without CAP_SYS_ADMIN. See the hostCfg
+// comment in StartDesktop and seccomp/README.md.
+func (p *LocalSidecarProvisioner) desktopSecurityOpt() []string {
 	if p.seccompProfile == "unconfined" {
-		opts = append(opts, "seccomp=unconfined")
-	} else {
-		opts = append(opts, "seccomp="+p.seccompProfile)
+		return []string{"seccomp=unconfined"}
 	}
-	return opts
+	return []string{"seccomp=" + p.seccompProfile}
 }
 
 // perWorkspaceNetwork is the dedicated network name for a workspace's desktop
@@ -248,8 +288,66 @@ func (p *LocalSidecarProvisioner) reconcileEgressBestEffort(ctx context.Context,
 // StartDesktop brings up the workspace's desktop sidecar, idempotently: if it
 // is already running, it returns the handle without creating a second one (the
 // agent's first tool call and a human opening the display can race, §10).
+// ensureImage guarantees the desktop sidecar image is present locally before
+// ContainerCreate (which never pulls). Present-image is the common case and
+// costs one cheap local inspect. When absent — a CP/SaaS tenant on first use —
+// it pulls, DETACHED from the caller's context: StartDesktop sits on the
+// gateway hot path, so the first (necessarily slow, ~GB) screenshot's client
+// timeout must not cancel the pull mid-stream and strand a half-image that
+// every subsequent call re-pulls from zero. The pull is instead bounded by
+// desktopImagePullTimeout; the first few starts return "not running yet" until
+// it lands, exactly like a normal cold boot. A transient (non-not-found)
+// inspect error is left for ContainerCreate to surface rather than forcing a
+// needless pull.
+func (p *LocalSidecarProvisioner) ensureImage(ctx context.Context) error {
+	if _, err := p.cli.ImageInspect(ctx, p.image); err == nil {
+		return nil
+	} else if !isImageNotFound(err) {
+		return nil
+	}
+	log.Printf("desktop: image %q not present — pulling (one-time, up to %s)", p.image, desktopImagePullTimeout)
+	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), desktopImagePullTimeout)
+	defer cancel()
+	rc, err := p.cli.ImagePull(pctx, p.image, dockerimage.PullOptions{})
+	if err != nil {
+		return fmt.Errorf("pull desktop image %q: %w", p.image, err)
+	}
+	defer func() { _ = rc.Close() }()
+	// Drain the progress stream to completion — the pull is not finished until
+	// the reader hits EOF; discarding is fine, we only need the image local.
+	if _, err := io.Copy(io.Discard, rc); err != nil {
+		return fmt.Errorf("pull desktop image %q (stream): %w", p.image, err)
+	}
+	log.Printf("desktop: image %q pulled", p.image)
+	return nil
+}
+
+// isImageNotFound reports whether a Docker error means the image genuinely is
+// not present locally, versus a transient daemon error. Same string-match
+// rationale as isContainerNotFound (avoids an errdefs dependency; the message
+// is stable across daemon versions and is what the Docker CLI itself matches).
+func isImageNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "No such image") || strings.Contains(s, "not found")
+}
+
 func (p *LocalSidecarProvisioner) StartDesktop(ctx context.Context, cfg WorkspaceConfig) (DesktopHandle, error) {
-	if running, _ := p.DesktopRunning(ctx, cfg.WorkspaceID); running {
+	name := DesktopContainerName(cfg.WorkspaceID)
+
+	// ONE up-front inspect yields BOTH existence and liveness (previously
+	// DesktopRunning + containerExists each inspected — two round-trips on the hot
+	// loop; now one).
+	insp, inspErr := p.cli.ContainerInspect(ctx, name)
+	if inspErr != nil && !isNoSuchContainer(inspErr) {
+		return DesktopHandle{}, fmt.Errorf("inspect desktop sidecar: %w", inspErr)
+	}
+	exists := inspErr == nil
+	running := exists && insp.State != nil && insp.State.Running
+
+	if running {
 		// Already-running fast path. RECONCILE the egress plumbing best-effort —
 		// the egress proxy is RestartPolicy "no", so it can die while the sidecar
 		// keeps running, and the platform's network attachment can be lost. But
@@ -260,107 +358,145 @@ func (p *LocalSidecarProvisioner) StartDesktop(ctx context.Context, cfg Workspac
 		// running desktop. reconcileEgressBestEffort logs-and-continues and is
 		// throttled to egressReconcileInterval so we don't pay 2 Docker round-trips
 		// per screenshot. (Verified 2026-07-28: a fatal reconcile here regressed
-		// the "agent can ALWAYS see" invariant.)
+		// the "agent can ALWAYS see" invariant.) Config reconciles (token/image
+		// drift, memory ceiling, self-heal) are DELIBERATELY not done here — they
+		// land on the next real cold-wake edge, never on the screenshot/input loop.
 		if net := p.perWorkspaceNetwork(cfg.WorkspaceID); net != "" {
 			p.reconcileEgressBestEffort(ctx, cfg.WorkspaceID, net)
 		}
 		return p.handle(cfg.WorkspaceID, true), nil
 	}
 
-	name := DesktopContainerName(cfg.WorkspaceID)
-
-	// Persistent profile volume (cookies / live logins) — survives
-	// scale-to-zero; only WipeProfile deletes it. Idempotent create.
-	if _, err := p.cli.VolumeCreate(ctx, volume.CreateOptions{
-		Name:   DesktopProfileVolumeName(cfg.WorkspaceID),
-		Labels: desktopManagedLabels(),
-	}); err != nil {
-		return DesktopHandle{}, fmt.Errorf("create desktop profile volume: %w", err)
-	}
-
-	// Clear any stale exited same-name container so ContainerCreate doesn't
-	// 409. Best-effort; a missing container is fine.
-	if err := p.cli.ContainerRemove(ctx, name, container.RemoveOptions{Force: true}); err != nil && !isNoSuchContainer(err) {
-		// Non-fatal: log-and-continue semantics — the create below will
-		// surface a real conflict if the stale container truly blocks it.
-		_ = err
-	}
-
-	hostCfg := &container.HostConfig{
-		Binds: []string{DesktopProfileVolumeName(cfg.WorkspaceID) + ":/home/desktop/profile"},
-		// "no": an on-demand sidecar must NOT resurrect after a graceful stop.
-		// "on-failure" would restart on the SIGTERM exit-143 the graceful stop
-		// produces; crash recovery is the platform re-calling StartDesktop
-		// (§10). Never "unless-stopped".
-		RestartPolicy: container.RestartPolicy{Name: "no"},
-		// B2 hardening (verified 2026-07-27, Docker 29.5.3): the sidecar runs
-		// untrusted web content, so it is locked to the minimum the browser's
-		// own userns sandbox needs. CapDrop ALL + no-new-privileges + the
-		// Chromium-tuned seccomp profile keep Chromium's sandbox ACTIVE (no
-		// --no-sandbox) WITHOUT granting the container CAP_SYS_ADMIN. Empirically
-		// confirmed: Chromium renders under exactly this config. See
-		// securityOpt() and seccomp/README.md.
-		CapDrop:     []string{"ALL"},
-		SecurityOpt: p.securityOpt(),
-	}
-	if p.memoryLimitBytes > 0 {
-		hostCfg.Memory = p.memoryLimitBytes
-		// Pin swap to the memory cap so the container cannot use ~2× the limit
-		// via swap — otherwise the OOM-shed guarantee below is only half real
-		// (reviewer B-nit). Equal Memory/MemorySwap = swap disabled for the
-		// container.
-		hostCfg.MemorySwap = p.memoryLimitBytes
-		// Shed the DESKTOP under memory pressure, never the tenant/agent (§10):
-		// a positive oom_score_adj makes the kernel prefer killing the sidecar.
-		hostCfg.OomScoreAdj = 500
-	}
-
-	netCfg := &network.NetworkingConfig{}
-	if net := p.perWorkspaceNetwork(cfg.WorkspaceID); net != "" {
-		// Create the DEDICATED per-workspace network as INTERNAL (no external
-		// route). Idempotent. This is the isolation boundary — the sidecar is on
-		// ONLY this network, so it has NO egress of its own and can reach nothing
-		// but the egress proxy below (§6.1, structural isolation).
-		if _, err := p.cli.NetworkCreate(ctx, net, network.CreateOptions{Labels: desktopManagedLabels(), Internal: true}); err != nil && !isNetworkExists(err) {
-			return DesktopHandle{}, fmt.Errorf("create per-workspace network: %w", err)
+	// §25.1 DRIFT RECONCILE (existing STOPPED container only): the control token
+	// and the image are baked at create and IMMUTABLE across a plain restart, so
+	// if either has drifted a ContainerStart can never deliver the fix — the
+	// rotated-secret sidecar would 401 forever, the patched image would never boot.
+	// Recreate on drift instead: the /home/desktop/profile volume (live logins) is
+	// preserved; only the writable-layer apt installs are discarded, which is the
+	// correct trade for a deliberate, rare token rotation / image upgrade.
+	if exists {
+		if reason := p.desktopDriftReason(ctx, insp, cfg.WorkspaceID); reason != "" {
+			log.Printf("desktop: recreating sidecar %s due to drift (%s) — /home/desktop/profile (logins) preserved on the profile volume; writable-layer apt installs discarded", name, reason)
+			if err := p.cli.ContainerRemove(ctx, name, container.RemoveOptions{Force: true}); err != nil && !isNoSuchContainer(err) {
+				return DesktopHandle{}, fmt.Errorf("recreate desktop sidecar (remove drifted): %w", err)
+			}
+			exists = false // route through the create branch below → created=true
 		}
-		netCfg.EndpointsConfig = map[string]*network.EndpointSettings{
-			net: {Aliases: []string{name}},
-		}
-		// Bring up the per-workspace egress proxy on this internal net (its only
-		// route out is the egress network; it DENIES private/link-local dsts). The
-		// sidecar's browser reaches the internet ONLY through it — structural
-		// isolation, no host firewall.
-		if err := p.ensureEgressProxy(ctx, cfg.WorkspaceID, net); err != nil {
+	}
+
+	// ContainerCreate does NOT pull. On self-host the desktop image is seeded by
+	// the deploy; on a CP/SaaS tenant it is not, so the FIRST create must pull it
+	// (design §5). Only gate this on the create path — a persisted restart runs the
+	// image the container was already built from, so it needs no ImageInspect/pull.
+	if !exists {
+		if err := p.ensureImage(ctx); err != nil {
 			return DesktopHandle{}, err
 		}
 	}
 
-	// Env the sidecar's control server + entrypoint REQUIRE (reviewer B1): the
-	// control server log.Fatals without DESKTOP_CONTROL_TOKEN, so an env-less
-	// container boots and dies immediately. The token is derived from the shared
-	// secret — identical to the gateway's TokenResolver — so the two agree with
-	// nothing stored. Geometry is pinned to the coordinate contract. DESKTOP_PROXY
-	// points Chromium at the per-workspace egress proxy (the sidecar's only way
-	// out; empty when no per-workspace network, i.e. tests).
-	env := []string{
-		"DESKTOP_CONTROL_TOKEN=" + DeriveDesktopControlToken(p.controlTokenSecret, cfg.WorkspaceID),
-		fmt.Sprintf("DESKTOP_WIDTH=%d", desktopWidth),
-		fmt.Sprintf("DESKTOP_HEIGHT=%d", desktopHeight),
+	// Per-workspace INTERNAL network + egress proxy — required whether we create or
+	// restart. Both are idempotent and are rebuilt each wake: StopDesktop tears the
+	// network + proxy down (§25.1 proper-lifecycle — the net's lifetime equals the
+	// desktop's RUNNING lifetime, never accumulating one idle net per ever-used
+	// workspace).
+	var netCfg *network.NetworkingConfig
+	if net := p.perWorkspaceNetwork(cfg.WorkspaceID); net != "" {
+		// The DEDICATED per-workspace network is INTERNAL (no external route) —
+		// the isolation boundary (§6.1): the sidecar is on ONLY this net, so it
+		// has NO egress of its own and can reach nothing but the egress proxy.
+		if _, err := p.cli.NetworkCreate(ctx, net, network.CreateOptions{Labels: desktopManagedLabels(), Internal: true}); err != nil && !isNetworkExists(err) {
+			return DesktopHandle{}, fmt.Errorf("create per-workspace network: %w", err)
+		}
+		// Bring up the per-workspace egress proxy on this internal net (its only
+		// route out is the egress network; it DENIES private/link-local dsts). The
+		// sidecar's browser + apt reach the internet ONLY through it — structural
+		// isolation, no host firewall.
+		if err := p.ensureEgressProxy(ctx, cfg.WorkspaceID, net); err != nil {
+			return DesktopHandle{}, err
+		}
+		netCfg = &network.NetworkingConfig{EndpointsConfig: map[string]*network.EndpointSettings{
+			net: {Aliases: []string{name}},
+		}}
 	}
-	if p.perWorkspaceNetwork(cfg.WorkspaceID) != "" {
-		env = append(env, fmt.Sprintf("DESKTOP_PROXY=http://%s:%d", DesktopProxyContainerName(cfg.WorkspaceID), desktopProxyPort))
+
+	// First-ever start OR drift-recreate: build the container (+ its profile
+	// volume) from the current image/env via the shared helper, guaranteeing an
+	// identical container on every create path. `created` is the sole coupling
+	// flag: a freshly-created container already has the net (via netCfg), the
+	// current memory ceiling, and a fresh image, so it SKIPS the memory reconcile,
+	// the restart net re-attach, and the self-heal probe below.
+	created := false
+	if !exists {
+		if err := p.createDesktopContainer(ctx, cfg, name, netCfg); err != nil {
+			return DesktopHandle{}, err
+		}
+		created = true
 	}
-	if _, err := p.cli.ContainerCreate(ctx, &container.Config{
-		Image:  p.image,
-		Env:    env,
-		Labels: desktopManagedLabels(),
-	}, hostCfg, netCfg, nil, name); err != nil {
-		return DesktopHandle{}, fmt.Errorf("create desktop sidecar: %w", err)
+
+	// §25.1 MEMORY RECONCILE (persisted restart only): the ceiling is baked at
+	// create, so a raised MOLECULE_DESKTOP_MEMORY_BYTES only reaches an existing
+	// desktop by updating it here — BEFORE ContainerStart, so the cgroup is created
+	// at the new ceiling from t=0 (verified: an update to a STOPPED container
+	// persists to the next start's memory.max). Set BOTH Memory and MemorySwap
+	// (equal = swap disabled). OomScoreAdj is create-only (not an UpdateConfig
+	// field) — it never changes, so leaving it at its create value is correct.
+	if !created && p.memoryLimitBytes > 0 {
+		if _, err := p.cli.ContainerUpdate(ctx, name, container.UpdateConfig{
+			Resources: container.Resources{Memory: p.memoryLimitBytes, MemorySwap: p.memoryLimitBytes},
+		}); err != nil {
+			return DesktopHandle{}, fmt.Errorf("reconcile desktop memory ceiling: %w", err)
+		}
 	}
+
+	// §25.1 RESTART NET RE-ATTACH (persisted restart only): StopDesktop removed the
+	// per-workspace net and with it this container's endpoint, so re-attach the
+	// freshly-created net while the container is still STOPPED — it then comes up
+	// already ON the internal net with its resolvable alias. (Verified: a container
+	// created with an endpoint but restarted with ZERO endpoints comes up
+	// loopback-only, NEVER on bridge — so even if this connect were skipped the
+	// sidecar can never leak onto bridge; isolation is structural.) A
+	// created/recreated container already got the net via netCfg at create.
+	if net := p.perWorkspaceNetwork(cfg.WorkspaceID); net != "" && !created {
+		if err := p.cli.NetworkConnect(ctx, net, name, &network.EndpointSettings{Aliases: []string{name}}); err != nil && !isAlreadyConnected(err) {
+			return DesktopHandle{}, fmt.Errorf("attach desktop sidecar to per-workspace network: %w", err)
+		}
+	}
+
+	// Start the container — the one just created, OR the persisted stopped one
+	// (§25.1). ContainerStart re-runs the entrypoint, so its boot invariants
+	// (stale-Singleton/X-lock cleanup, websockify heartbeat, proxy wiring) apply on
+	// every wake.
 	if err := p.cli.ContainerStart(ctx, name, container.StartOptions{}); err != nil {
 		return DesktopHandle{}, fmt.Errorf("start desktop sidecar: %w", err)
 	}
+
+	// §25.1 SELF-HEAL (persisted restart only): a persisted container whose
+	// writable layer is corrupt (half-finished apt, broken /etc) — or that hits a
+	// boot-precondition failure — exits IMMEDIATELY. Without recreation every wake
+	// restarts the same broken container and StartDesktop returns a healthy handle
+	// over a dead desktop; only a destructive manual WipeProfile recovered. Detect
+	// the immediate exit and recreate ONCE from the image. A just-created container
+	// (created==true) that crashes is an image bug, not a stale layer, so it is not
+	// re-healed here (the crash surfaces to the caller). Known limit: this cannot
+	// distinguish a corrupt layer from a transient boot-precondition failure, so a
+	// rare transient failure costs the (good) writable layer once — bounded, and
+	// the profile volume is always kept.
+	if !created && p.startedCrashed(ctx, name) {
+		log.Printf("desktop: sidecar %s exited immediately after start — recreating once (corrupt-layer self-heal; /home/desktop/profile kept)", name)
+		if err := p.cli.ContainerRemove(ctx, name, container.RemoveOptions{Force: true}); err != nil && !isNoSuchContainer(err) {
+			return DesktopHandle{}, fmt.Errorf("self-heal remove corrupt desktop sidecar: %w", err)
+		}
+		if err := p.ensureImage(ctx); err != nil {
+			return DesktopHandle{}, err
+		}
+		if err := p.createDesktopContainer(ctx, cfg, name, netCfg); err != nil {
+			return DesktopHandle{}, err
+		}
+		if err := p.cli.ContainerStart(ctx, name, container.StartOptions{}); err != nil {
+			return DesktopHandle{}, fmt.Errorf("start recreated desktop sidecar: %w", err)
+		}
+	}
+
 	// Attach the PLATFORM to the per-workspace network so the gateway + display
 	// proxy can reach the sidecar by its "wsdesk-<id>" name (reviewer B3). The
 	// sidecar stays OFF molecule-core-net — only the trusted platform joins the
@@ -377,6 +513,152 @@ func (p *LocalSidecarProvisioner) StartDesktop(ctx context.Context, cfg Workspac
 	h := p.handle(cfg.WorkspaceID, true)
 	h.ScaledUp = true
 	return h, nil
+}
+
+// createDesktopContainer creates the persistent profile volume + the sidecar
+// container from the CURRENT image/env/limits. It is the single create path —
+// used by the first-ever start, the drift-recreate, and the self-heal recreate —
+// so every create produces an identical container. netCfg attaches the
+// per-workspace internal network at create time (nil in tests without a network).
+func (p *LocalSidecarProvisioner) createDesktopContainer(ctx context.Context, cfg WorkspaceConfig, name string, netCfg *network.NetworkingConfig) error {
+	// The profile volume (cookies / live logins) is bind-mounted separately and
+	// SURVIVES a container recreate; only WipeProfile deletes it. Idempotent.
+	if _, err := p.cli.VolumeCreate(ctx, volume.CreateOptions{
+		Name:   DesktopProfileVolumeName(cfg.WorkspaceID),
+		Labels: desktopManagedLabels(),
+	}); err != nil {
+		return fmt.Errorf("create desktop profile volume: %w", err)
+	}
+
+	hostCfg := &container.HostConfig{
+		Binds: []string{DesktopProfileVolumeName(cfg.WorkspaceID) + ":/home/desktop/profile"},
+		// "no": an on-demand sidecar must NOT resurrect after a graceful stop.
+		// "on-failure" would restart on the SIGTERM exit-143 the graceful stop
+		// produces; crash recovery is the platform re-calling StartDesktop
+		// (§10). Never "unless-stopped".
+		RestartPolicy: container.RestartPolicy{Name: "no"},
+		// §25.3 — the desktop is a REAL computer: the agent/user can `sudo apt
+		// install` anything (persists on the writable layer). That needs Docker's
+		// DEFAULT cap set (dpkg wants CHOWN/DAC_OVERRIDE/FOWNER/SETUID/SETGID —
+		// cap-drop ALL breaks it) and NO no-new-privileges (it blocks sudo's
+		// setuid). We KEEP the Chromium-tuned seccomp profile so the browser's
+		// unprivileged userns sandbox stays active (no --no-sandbox, no
+		// CAP_SYS_ADMIN). The isolation boundary is UNCHANGED — the per-workspace
+		// INTERNAL network + egress proxy (§6.1); relaxing the in-container caps
+		// only lets the desktop modify its OWN rootfs, and daemon userns-remap
+		// (verified at startup, cmd/server/main.go) keeps container-root != host
+		// root. (The egress PROXY stays fully hardened — no-new-privileges +
+		// cap-drop ALL, see ensureEgressProxy — it never needs sudo.)
+		SecurityOpt: p.desktopSecurityOpt(),
+	}
+	if p.memoryLimitBytes > 0 {
+		hostCfg.Memory = p.memoryLimitBytes
+		// Pin swap to the memory cap so the container cannot use ~2× the limit
+		// via swap — otherwise the OOM-shed guarantee below is only half real
+		// (reviewer B-nit). Equal Memory/MemorySwap = swap disabled for the
+		// container.
+		hostCfg.MemorySwap = p.memoryLimitBytes
+		// Shed the DESKTOP under memory pressure, never the tenant/agent (§10):
+		// a positive oom_score_adj makes the kernel prefer killing the sidecar.
+		hostCfg.OomScoreAdj = 500
+	}
+
+	// Env the sidecar's control server + entrypoint REQUIRE (reviewer B1): the
+	// control server log.Fatals without DESKTOP_CONTROL_TOKEN, so an env-less
+	// container boots and dies immediately. The token is derived from the shared
+	// secret — identical to the gateway's TokenResolver — so the two agree with
+	// nothing stored. Geometry is pinned to the coordinate contract. DESKTOP_PROXY
+	// points Chromium+apt at the per-workspace egress proxy (the sidecar's only
+	// way out; empty when no per-workspace network, i.e. tests). Env is baked at
+	// create time; a control-token rotation is picked up by the drift-recreate in
+	// StartDesktop, not by mutating a running container.
+	env := []string{
+		"DESKTOP_CONTROL_TOKEN=" + DeriveDesktopControlToken(p.controlTokenSecret, cfg.WorkspaceID),
+		fmt.Sprintf("DESKTOP_WIDTH=%d", desktopWidth),
+		fmt.Sprintf("DESKTOP_HEIGHT=%d", desktopHeight),
+	}
+	if p.perWorkspaceNetwork(cfg.WorkspaceID) != "" {
+		env = append(env, fmt.Sprintf("DESKTOP_PROXY=http://%s:%d", DesktopProxyContainerName(cfg.WorkspaceID), desktopProxyPort))
+	}
+	if _, err := p.cli.ContainerCreate(ctx, &container.Config{
+		Image:  p.image,
+		Env:    env,
+		Labels: desktopManagedLabels(),
+	}, hostCfg, netCfg, nil, name); err != nil {
+		return fmt.Errorf("create desktop sidecar: %w", err)
+	}
+	return nil
+}
+
+// desktopDriftReason reports why a persisted sidecar must be RECREATED rather
+// than plain-restarted, or "" when a plain restart is correct (§25.1). Drift is
+// checked against config that is BAKED at create and cannot change on a restart:
+//   - control-token: a rotated shared secret changes the derived token; the old
+//     baked token would 401 the agent forever.
+//   - image: an operator re-tag/upgrade (security or entrypoint fix) never lands
+//     on a restart of the old image.
+// It is FAIL-SAFE: any missing field or transient inspect error returns "" so a
+// hiccup never destroys a good writable layer.
+func (p *LocalSidecarProvisioner) desktopDriftReason(ctx context.Context, insp container.InspectResponse, workspaceID string) string {
+	if insp.Config != nil {
+		if baked, ok := envValue(insp.Config.Env, "DESKTOP_CONTROL_TOKEN"); ok {
+			if want := DeriveDesktopControlToken(p.controlTokenSecret, workspaceID); baked != want {
+				return "control-token rotated"
+			}
+		}
+	}
+	// Compare the container's image ID to the ID the desired tag resolves to
+	// NOW. ImageInspect is a cheap LOCAL inspect (never a pull); a not-found /
+	// error → "" (fail-safe), so a manually-deleted image just plain-restarts.
+	if insp.ContainerJSONBase != nil && insp.Image != "" {
+		if desired, err := p.cli.ImageInspect(ctx, p.image); err == nil && desired.ID != "" && desired.ID != insp.Image {
+			return "image upgraded"
+		}
+	}
+	return ""
+}
+
+// envValue returns the value of the first "KEY=..." entry in a container env
+// slice, and whether it was present. nil-safe.
+func envValue(env []string, key string) (string, bool) {
+	prefix := key + "="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return strings.TrimPrefix(e, prefix), true
+		}
+	}
+	return "", false
+}
+
+// startedCrashed reports whether the just-started sidecar exited IMMEDIATELY (the
+// corrupt-layer / boot-precondition signature, §25.1 self-heal). It polls the
+// container state up to startupProbeWindow; a healthy container that stays
+// Running (or is merely slow to boot) returns false. OOMKilled is EXCLUDED: an
+// OOM is host memory pressure (the sidecar carries OomScoreAdj 500 to be shed
+// first), NOT layer corruption — recreating would discard a perfectly good layer.
+// A transient inspect error or ctx cancellation is treated as healthy (never
+// nuke a layer on a hiccup).
+func (p *LocalSidecarProvisioner) startedCrashed(ctx context.Context, name string) bool {
+	deadline := time.Now().Add(p.startupProbeWindow)
+	for {
+		insp, err := p.cli.ContainerInspect(ctx, name)
+		if err == nil && insp.State != nil && !insp.State.Running && !insp.State.OOMKilled {
+			switch {
+			case insp.State.Status == container.StateExited || insp.State.Status == container.StateDead:
+				return true
+			case insp.State.Status == container.StateCreated && insp.State.ExitCode != 0:
+				return true
+			}
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(p.startupProbeTick):
+		}
+	}
 }
 
 // egressNetworkName is the network the proxy uses for internet egress.
@@ -452,24 +734,28 @@ func (p *LocalSidecarProvisioner) stopEgressProxy(ctx context.Context, workspace
 	}
 }
 
-// StopDesktop gracefully tears the sidecar down: SIGTERM + a flush window so
-// Chrome/Xorg close their SQLite profile cleanly, THEN remove. It MUST NOT copy
-// the tenant's force-remove — a SIGKILL mid-write corrupts the profile and
-// silently breaks "logins persist" (§10). Safe because the sidecar is
-// RestartPolicy "no" (no resurrection race to beat). The profile volume
-// survives; only WipeProfile deletes it. Idempotent.
+// StopDesktop is scale-to-zero for the PERSISTENT desktop (§25.1): it gracefully
+// STOPS the sidecar (SIGTERM + a flush window so Chrome/Xorg close their SQLite
+// profile cleanly) but DELIBERATELY KEEPS the container. Its writable layer
+// (apt-installed apps, /home, /etc changes) is the workspace's state and must
+// survive to the next scale-up, which RESTARTS this same container. So StopDesktop
+// MUST NOT force-remove (a SIGKILL mid-write corrupts the profile) and MUST NOT
+// plain-remove either (that would discard the persistent rootfs — the whole point
+// of v3). Safe because the sidecar is RestartPolicy "no" (no resurrection race).
+// The stateless egress proxy AND the per-workspace network are torn down here
+// (proper lifecycle — net lifetime == desktop-RUNNING lifetime, no leaked idle
+// nets) and rebuilt + re-attached by StartDesktop on the next wake. Only
+// WipeProfile removes the container / volume. Idempotent.
 func (p *LocalSidecarProvisioner) StopDesktop(ctx context.Context, workspaceID string) error {
 	name := DesktopContainerName(workspaceID)
 	secs := int(p.stopTimeout.Seconds())
-	// Capture (do NOT early-return on) the sidecar stop/remove outcome. isGone is
-	// true only when the sidecar is actually down — the stop succeeded, or the
+	// Capture (do NOT early-return on) the sidecar stop outcome. isGone is true
+	// only when the sidecar is actually down — the stop succeeded, or the
 	// container was already absent. A genuine stop FAILURE leaves the sidecar
-	// RUNNING, and it still needs its egress proxy + network: tearing those down
-	// under a live sidecar would strand it egress-less and leak a network that
-	// NetworkRemove can't drop while the sidecar endpoint remains (verified
-	// 2026-07-28). So the proxy/network teardown below is gated on isGone; on a
-	// stop failure we surface the error and leave the plumbing for the caller's
-	// retry or a later sweep to reclaim.
+	// RUNNING, and it still needs its egress proxy: tearing that down under a live
+	// sidecar would strand it egress-less. So the proxy teardown below is gated on
+	// isGone; on a stop failure we surface the error and leave the plumbing for
+	// the caller's retry or a later sweep to reclaim.
 	var sidecarErr error
 	isGone := true
 	if err := p.cli.ContainerStop(ctx, name, container.StopOptions{Timeout: &secs}); err != nil {
@@ -477,24 +763,28 @@ func (p *LocalSidecarProvisioner) StopDesktop(ctx context.Context, workspaceID s
 			sidecarErr = fmt.Errorf("graceful stop desktop sidecar: %w", err)
 			isGone = false
 		}
-	} else if err := p.cli.ContainerRemove(ctx, name, container.RemoveOptions{}); err != nil && !isNoSuchContainer(err) {
-		// Not Force: the container is already stopped, so a plain remove suffices
-		// and there is no SIGKILL involved. The sidecar IS stopped (ContainerStop
-		// succeeded), so it is gone for egress purposes even if the remove lagged.
-		sidecarErr = fmt.Errorf("remove desktop sidecar: %w", err)
 	}
 	if !isGone {
 		// Sidecar still running after a failed stop — do NOT sever its egress.
 		return sidecarErr
 	}
-	// Sidecar is down. Tear down the egress proxy (it holds an endpoint on the
-	// per-workspace net, so it MUST go before NetworkRemove) and then the network.
+	// Sidecar is down (STOPPED, container KEPT — §25.1). Tear the per-workspace
+	// network down as PROPER LIFECYCLE (not a background reaper): its lifetime
+	// equals the desktop's RUNNING lifetime, so at most one idle net exists per
+	// RUNNING desktop — never one per ever-used workspace (which would exhaust
+	// Docker's address pool and block NEW desktops). Order is load-bearing:
+	// stopEgressProxy drops the proxy's endpoint, then disconnect the stopped
+	// sidecar's endpoint AND the platform's, then NetworkRemove the now-empty net.
+	// Verified: force-disconnecting a STOPPED sidecar and removing the emptied
+	// internal net both succeed. StartDesktop recreates net + proxy and re-attaches
+	// the persisted container on the next wake. A transient teardown failure is
+	// logged non-fatal and reclaimed on the next stop/WipeProfile lifecycle edge,
+	// never by a sweep.
 	p.stopEgressProxy(ctx, workspaceID)
-	// Best-effort: detach the platform, then remove the now-empty per-workspace
-	// network so it doesn't leak. The platform must leave first or NetworkRemove
-	// fails on a network that still has an endpoint. A network still holding an
-	// endpoint (slow teardown) is left for a later sweep; don't fail the stop.
 	if net := p.perWorkspaceNetwork(workspaceID); net != "" {
+		if err := p.cli.NetworkDisconnect(ctx, net, name, true); err != nil && !isNoSuchNetwork(err) && !isNoSuchContainer(err) {
+			_ = err
+		}
 		if p.selfContainerID != "" {
 			if err := p.cli.NetworkDisconnect(ctx, net, p.selfContainerID, true); err != nil && !isNoSuchNetwork(err) {
 				_ = err
@@ -519,15 +809,37 @@ func (p *LocalSidecarProvisioner) DesktopRunning(ctx context.Context, workspaceI
 	return insp.State != nil && insp.State.Running, nil
 }
 
-// WipeProfile destroys the persistent profile volume (cookies / live logins) —
-// the revoke/wipe path (§11). The sidecar should be stopped first so the
-// volume is not in use. Idempotent.
+// WipeProfile is the full revoke/wipe path (§11, §25.1). Under the persistent-
+// container model the desktop's OWN writable layer holds installed software and
+// system changes, so a wipe must destroy the CONTAINER (not just the profile
+// volume) — otherwise apt-installed apps and any tampering survive the revoke.
+// It removes: the container (force — it may still be running at revoke time), the
+// profile volume (cookies / live logins), the stateless egress proxy, and the
+// now-empty per-workspace network. Idempotent: any already-absent piece is fine.
 func (p *LocalSidecarProvisioner) WipeProfile(ctx context.Context, workspaceID string) error {
-	if err := p.cli.VolumeRemove(ctx, DesktopProfileVolumeName(workspaceID), true); err != nil {
-		if isNoSuchVolume(err) {
-			return nil
-		}
+	// Force-remove the persistent container FIRST — it holds the writable layer
+	// AND an endpoint on the per-workspace network (which must be empty before
+	// NetworkRemove). Force so a still-running desktop is torn down in one call.
+	if err := p.cli.ContainerRemove(ctx, DesktopContainerName(workspaceID), container.RemoveOptions{Force: true}); err != nil && !isNoSuchContainer(err) {
+		return fmt.Errorf("wipe desktop container: %w", err)
+	}
+	if err := p.cli.VolumeRemove(ctx, DesktopProfileVolumeName(workspaceID), true); err != nil && !isNoSuchVolume(err) {
 		return fmt.Errorf("wipe desktop profile volume: %w", err)
+	}
+	// Best-effort per-workspace infra teardown: the egress proxy (also holds a
+	// network endpoint) then the network. Leaving these on a wipe would leak an
+	// idle proxy + net per revoked workspace; a slow-teardown endpoint is left for
+	// a later sweep rather than failing the wipe.
+	p.stopEgressProxy(ctx, workspaceID)
+	if net := p.perWorkspaceNetwork(workspaceID); net != "" {
+		if p.selfContainerID != "" {
+			if err := p.cli.NetworkDisconnect(ctx, net, p.selfContainerID, true); err != nil && !isNoSuchNetwork(err) {
+				_ = err
+			}
+		}
+		if err := p.cli.NetworkRemove(ctx, net); err != nil && !isNoSuchNetwork(err) {
+			_ = err
+		}
 	}
 	return nil
 }

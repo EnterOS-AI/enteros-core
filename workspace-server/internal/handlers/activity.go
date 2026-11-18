@@ -15,6 +15,7 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/middleware"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/push"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -317,6 +318,13 @@ func (h *ActivityHandler) List(c *gin.Context) {
 	beforeTSStr := c.Query("before_ts") // optional RFC3339 — return rows strictly older than this timestamp
 	include := c.Query("include")       // comma-separated; today's only flag is "peer_info"
 	includePeerInfo := includeFlagSet(include, "peer_info")
+	// Enter OS Light (C3b): the rows one Light run wrote. Validated like the
+	// header that tagged them.
+	runID := c.Query("run_id")
+	if runID != "" && !middleware.ValidLightRunID(runID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "run_id must be 1-128 printable ASCII characters without spaces"})
+		return
+	}
 
 	// Validate peer_id as a UUID at the trust boundary so a malformed
 	// caller (the agent or a downstream MCP tool) can't smuggle SQL
@@ -495,6 +503,11 @@ func (h *ActivityHandler) List(c *gin.Context) {
 		// clearer to read and matches the rest of the builder.)
 		query += fmt.Sprintf(" AND ("+actCol+"source_id = $%d OR "+actCol+"target_id = $%d)", argIdx, argIdx)
 		args = append(args, peerID)
+		argIdx++
+	}
+	if runID != "" {
+		query += fmt.Sprintf(" AND "+actCol+"run_id = $%d", argIdx)
+		args = append(args, runID)
 		argIdx++
 	}
 	if usingBeforeTS {
@@ -1116,9 +1129,11 @@ func logActivityExec(ctx context.Context, exec activityExecutor, broadcaster eve
 
 	// Agent-Liveness RFC, Layer 3 (A2): write-through the activity timestamp
 	// onto the workspaces row IN THE SAME STATEMENT as the activity_logs
-	// INSERT, via a CTE. Every activity_logs write IS, by definition, the
-	// workspace doing something, so this is the single canonical point to
-	// stamp last_activity_at — the stall-watchdog sweeper
+	// INSERT, via a CTE. A row written here is the workspace doing something,
+	// so this is the single canonical point to stamp last_activity_at (rows
+	// other handlers INSERT directly, such as notifies and delegation records,
+	// never stamp it, and an Enter OS Light run's own rows are stored without
+	// the stamp, below) — the stall-watchdog sweeper
 	// (handlers/stall_watchdog.go) reads it to tell a busy-but-silently-hung
 	// workspace from one that's actively producing activity (the case the
 	// Redis TTL liveness monitor and the status='failed' watchdog both miss,
@@ -1141,26 +1156,24 @@ func logActivityExec(ctx context.Context, exec activityExecutor, broadcaster eve
 	// bubble). The conflict target only fires when message_id IS NOT NULL
 	// (idx_activity_logs_msg_id is partial); rows without message_id keep
 	// the original always-INSERT behavior.
-	if _, err := exec.ExecContext(ctx, `
-		WITH ins AS (
-			INSERT INTO activity_logs (workspace_id, activity_type, source_id, target_id, method, summary, request_body, response_body, tool_trace, duration_ms, status, error_detail, message_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12, $13)
-			ON CONFLICT (workspace_id, message_id) WHERE message_id IS NOT NULL
-			DO UPDATE SET
-				response_body = COALESCE(EXCLUDED.response_body, activity_logs.response_body),
-				status        = CASE WHEN activity_logs.response_body IS NOT NULL AND EXCLUDED.status = 'error'
-				                     THEN activity_logs.status ELSE EXCLUDED.status END,
-				duration_ms   = CASE WHEN activity_logs.response_body IS NOT NULL AND EXCLUDED.status = 'error'
-				                     THEN activity_logs.duration_ms ELSE COALESCE(EXCLUDED.duration_ms, activity_logs.duration_ms) END,
-				error_detail  = CASE WHEN activity_logs.response_body IS NOT NULL AND EXCLUDED.status = 'error'
-				                     THEN activity_logs.error_detail ELSE EXCLUDED.error_detail END,
-				tool_trace    = CASE WHEN EXCLUDED.tool_trace IS NOT NULL THEN EXCLUDED.tool_trace ELSE activity_logs.tool_trace END
-		)
-		UPDATE workspaces SET last_activity_at = now() WHERE id = $1
-	`, params.WorkspaceID, params.ActivityType, params.SourceID, params.TargetID,
+	// Enter OS Light (C3b): a row written by a Light run's request carries the
+	// run id. The run variants are used ONLY then, so the statement every other
+	// write issues is byte-identical to before. A row of the run's own
+	// workspace leaves last_activity_at alone (it is the agent's own activity);
+	// the peer-side row of a run's A2A is the peer's activity and stamps it.
+	args := []interface{}{params.WorkspaceID, params.ActivityType, params.SourceID, params.TargetID,
 		params.Method, params.Summary, reqStr, respStr, traceStr,
 		params.DurationMs, params.Status, params.ErrorDetail,
-		nilIfEmpty(params.MessageId)); err != nil {
+		nilIfEmpty(params.MessageId)}
+	stmt := activityInsertSQL
+	if runID := activityRunID(ctx, params.WorkspaceID, params.SourceID); runID != "" {
+		stmt = activityInsertWithRunSQL
+		if activityRunOwnsRow(ctx, params.WorkspaceID) {
+			stmt = activityInsertRunOwnSQL
+		}
+		args = append(args, runID)
+	}
+	if _, err := exec.ExecContext(ctx, stmt, args...); err != nil {
 		return nil, err
 	}
 
@@ -1244,4 +1257,84 @@ type ActivityParams struct {
 	// a duplicate. Empty for non-per-message activity (task_update, etc.).
 	MessageId   string
 	ErrorDetail *string
+}
+
+// activityInsertSQL is logActivityExec's statement: the activity row and, in
+// the same statement, the workspace's last_activity_at (see logActivityExec).
+const activityInsertSQL = `
+		WITH ins AS (
+			INSERT INTO activity_logs (workspace_id, activity_type, source_id, target_id, method, summary, request_body, response_body, tool_trace, duration_ms, status, error_detail, message_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12, $13)
+			ON CONFLICT (workspace_id, message_id) WHERE message_id IS NOT NULL
+			DO UPDATE SET
+				response_body = COALESCE(EXCLUDED.response_body, activity_logs.response_body),
+				status        = CASE WHEN activity_logs.response_body IS NOT NULL AND EXCLUDED.status = 'error'
+				                     THEN activity_logs.status ELSE EXCLUDED.status END,
+				duration_ms   = CASE WHEN activity_logs.response_body IS NOT NULL AND EXCLUDED.status = 'error'
+				                     THEN activity_logs.duration_ms ELSE COALESCE(EXCLUDED.duration_ms, activity_logs.duration_ms) END,
+				error_detail  = CASE WHEN activity_logs.response_body IS NOT NULL AND EXCLUDED.status = 'error'
+				                     THEN activity_logs.error_detail ELSE EXCLUDED.error_detail END,
+				tool_trace    = CASE WHEN EXCLUDED.tool_trace IS NOT NULL THEN EXCLUDED.tool_trace ELSE activity_logs.tool_trace END
+		)
+		UPDATE workspaces SET last_activity_at = now() WHERE id = $1
+	`
+
+// activityInsertWithRunSQL is activityInsertSQL for a row a Light run wrote
+// (C3b): it also stores run_id ($14), and a message_id conflict keeps the run
+// id the row already had. Used for the peer-side row of a run's A2A, which is
+// the peer's activity and stamps its last_activity_at.
+var activityInsertWithRunSQL = activityRunVariant(activityInsertSQL)
+
+// activityInsertRunOwnSQL is activityInsertWithRunSQL for a row of the run's
+// own workspace: the row is stored, but workspaces.last_activity_at is left
+// alone. That column stays the agent's own activity (a message to it, its
+// reply, its tool calls), which the Light auto-park window, a park's busy
+// check and the stall watchdog read; a run of the agent's last park may still
+// be going while the agent is open (review 21720 R-1).
+var activityInsertRunOwnSQL = activityRunOwnVariant(activityInsertWithRunSQL)
+
+// activityRunOwnVariant drops the last_activity_at stamp from a run variant.
+// The INSERT in its WITH clause still runs: Postgres executes a data-modifying
+// CTE whether or not the main statement reads it.
+func activityRunOwnVariant(base string) string {
+	const stamp = "UPDATE workspaces SET last_activity_at = now() WHERE id = $1"
+	if strings.Count(base, stamp) != 1 {
+		panic("activityRunOwnVariant: the activity insert changed shape; update the run variants")
+	}
+	return strings.Replace(base, stamp, "SELECT 1", 1)
+}
+
+// activityRunOwnsRow reports whether the request's Light run belongs to
+// workspaceID: the row is the run's own, not the peer-side row of its A2A.
+func activityRunOwnsRow(ctx context.Context, workspaceID string) bool {
+	_, runWorkspace, ok := middleware.LightRunFromContext(ctx)
+	return ok && runWorkspace == workspaceID
+}
+
+func activityRunVariant(base string) string {
+	for _, r := range []struct{ old, new string }{
+		{"error_detail, message_id)", "error_detail, message_id, run_id)"},
+		{"$12, $13)", "$12, $13, $14)"},
+		{"ELSE activity_logs.tool_trace END\n", "ELSE activity_logs.tool_trace END,\n\t\t\t\trun_id        = COALESCE(activity_logs.run_id, EXCLUDED.run_id)\n"},
+	} {
+		if strings.Count(base, r.old) != 1 {
+			panic("activityRunVariant: the activity insert changed shape; update the run variant (" + r.old + ")")
+		}
+		base = strings.Replace(base, r.old, r.new, 1)
+	}
+	return base
+}
+
+// activityRunID is the Light run that wrote a row, or "": the request's run
+// (middleware.LightRunID) when the row is that run's workspace's own, or the
+// run's workspace is its source (the peer-side row of a run's A2A).
+func activityRunID(ctx context.Context, workspaceID string, sourceID *string) string {
+	runID, runWorkspace, ok := middleware.LightRunFromContext(ctx)
+	if !ok {
+		return ""
+	}
+	if workspaceID == runWorkspace || (sourceID != nil && *sourceID == runWorkspace) {
+		return runID
+	}
+	return ""
 }

@@ -54,11 +54,19 @@ func expectWorkspaceLiveTokenCount(mock sqlmock.Sqlmock, count int) {
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(count))
 }
 
+// expectWorkspaceDeleteLookup models Delete's opening row read. parent_id is
+// part of it because the audit anchor for a delete is resolved BEFORE anything
+// is destroyed (see auditDeleteAnchor) — reading it afterwards would be too
+// late on the purge path.
 func expectWorkspaceDeleteLookup(mock sqlmock.Sqlmock, id, name string, activeTasks int, status string) {
-	mock.ExpectQuery(`SELECT name, COALESCE\(active_tasks, 0\), status FROM workspaces WHERE id = \$1`).
+	expectWorkspaceDeleteLookupWithParent(mock, id, name, activeTasks, status, nil)
+}
+
+func expectWorkspaceDeleteLookupWithParent(mock sqlmock.Sqlmock, id, name string, activeTasks int, status string, parentID interface{}) {
+	mock.ExpectQuery(`SELECT name, COALESCE\(active_tasks, 0\), status, parent_id FROM workspaces WHERE id = \$1`).
 		WithArgs(id).
-		WillReturnRows(sqlmock.NewRows([]string{"name", "active_tasks", "status"}).
-			AddRow(name, activeTasks, status))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "active_tasks", "status", "parent_id"}).
+			AddRow(name, activeTasks, status, parentID))
 }
 
 // ---------- State ----------
@@ -607,8 +615,8 @@ func TestUpdate_Runtime_RegisteredModelForRuntime_Passes(t *testing.T) {
 	// the MODEL workspace_secret (the SSOT), not the workspaces.model column.
 	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("moonshot/kimi-k2.6"), 0))
-	// The validation passes (moonshot/kimi-k2.6 is a registered model
+		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("minimax/MiniMax-M2.7"), 0))
+	// The validation passes (minimax/MiniMax-M2.7 is a registered model
 	// for claude-code in the harness's provider registry), so the
 	// UPDATE proceeds. The runtime UPDATE now runs inside the atomic tx
 	// (no model reset here, so the tx wraps only the UPDATE).
@@ -640,8 +648,11 @@ func TestUpdate_Runtime_RegisteredModelForRuntime_Passes(t *testing.T) {
 // runtime change is persisted (NO rollback). The response signals
 // model_was_reset:true + the new model.
 //
-// Repro shape from the bug report: model "moonshot/kimi-k2.6" (a claude-code
-// platform id, NOT registered for codex) + switch runtime to codex.
+// Repro shape from the bug report: model "kimi-for-coding" (a claude-code BYOK
+// id, NOT registered or routable for codex) + switch runtime to codex. (Was
+// "moonshot/kimi-k2.6"; sdk#203 withdrew that id, and the minimax platform ids
+// are shared across ALL runtimes so they can never be orphaned by a runtime
+// switch — this fixture needs a genuinely runtime-SPECIFIC model.)
 // Pre-fix: 422, runtime stays claude-code. Post-fix: model resets to
 // codex's default ("gpt-5.5"), runtime becomes codex.
 func TestUpdate_Runtime_IncompatibleModel_AutoResetsToDefault(t *testing.T) {
@@ -653,11 +664,11 @@ func TestUpdate_Runtime_IncompatibleModel_AutoResetsToDefault(t *testing.T) {
 	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1\)`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	// Current model = moonshot/kimi-k2.6 (a claude-code platform id). It is
-	// NOT registered for codex -> orphaned -> auto-reset fires.
+	// Current model = kimi-for-coding (a claude-code BYOK id). It is NOT
+	// registered or routable for codex -> orphaned -> auto-reset fires.
 	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("moonshot/kimi-k2.6"), 0))
+		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("kimi-for-coding"), 0))
 	// Auto-reset + runtime UPDATE are ONE atomic tx (CR2 review 13597): the
 	// model-reset INSERT and the runtime UPDATE commit-or-rollback together.
 	// codex's first registered model is "gpt-5.5"
@@ -771,7 +782,7 @@ func TestUpdate_Runtime_AutoReset_RuntimeUpdateFails_RollsBack(t *testing.T) {
 	// Orphaned model -> auto-reset to codex's default fires.
 	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("moonshot/kimi-k2.6"), 0))
+		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("kimi-for-coding"), 0))
 	mock.ExpectBegin()
 	// The model-reset INSERT succeeds...
 	mock.ExpectExec(`INSERT INTO workspace_secrets`).

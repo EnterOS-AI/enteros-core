@@ -54,6 +54,16 @@ func (c *captureCPProv) Start(_ context.Context, cfg provisioner.WorkspaceConfig
 }
 func (c *captureCPProv) Stop(_ context.Context, _ string) error         { return nil }
 func (c *captureCPProv) StopAndPrune(_ context.Context, _ string) error { return nil }
+
+// EnsureImage satisfies the core#5019 pull-before-stop seam. These stubs
+// predate it; answering "ready" keeps their pre-#5019 behaviour EXACTLY
+// (the guard allows, the restart proceeds) so this stub carries no opinion
+// about the new branch. Tests that exercise the DECLINE path use
+// prewarmCPProv in workspace_restart_pull_before_stop_test.go.
+func (c *captureCPProv) EnsureImage(_ context.Context, _ provisioner.EnsureImageRequest) (provisioner.EnsureImageResult, error) {
+	return provisioner.EnsureImageResult{Status: "ready"}, nil
+}
+
 func (c *captureCPProv) GetConsoleOutput(_ context.Context, _ string) (string, error) {
 	return "", nil
 }

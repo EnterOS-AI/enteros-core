@@ -76,6 +76,13 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "lookup failed"})
 		return
 	}
+	// Enter OS Light: its schedules and run pods live on the Kubernetes
+	// substrate of record; moving the agent would strand them (and wake a
+	// parked agent). The pre-claim below refuses a Light row too.
+	if ref := lightEnabledRefusal(ctx, id, "switch-provider", "disable Light first (POST /workspaces/:id/light/disable)"); ref != nil {
+		ref.write(c)
+		return
+	}
 
 	// Switching the cloud backend is a SaaS-only concept — a self-hosted Docker
 	// workspace has no cloud provider to switch. external/mock runtimes have no
@@ -136,7 +143,8 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 		SET status = $2, mcp_unloaded_since = NULL, updated_at = now()
 		WHERE id = $1
 		  AND status <> $2
-		  AND COALESCE(compute->>'provider', '') IS NOT DISTINCT FROM $3`,
+		  AND COALESCE(compute->>'provider', '') IS NOT DISTINCT FROM $3
+		  AND light_state IS NULL`,
 		id, models.StatusProvisioning, oldProvider)
 	if err != nil {
 		log.Printf("SwitchProvider: pre-claim failed for %s: %v", id, err)
