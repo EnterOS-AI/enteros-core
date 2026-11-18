@@ -72,7 +72,7 @@ func TestWorkspaceLifecycle_Staging(t *testing.T) {
 	// Restricted to the e2e model: this test is half of the staging deploy gate
 	// (staging-tenant-cd e2e-smoke), and its org's concierge would otherwise be
 	// seeded with the platform default.
-	orgID := adminCreateOrgWithLLMModels(t, cfg, slug, []string{e2eLLMModel(t)})
+	orgID := adminCreateOrg(t, cfg, slug, e2eLLMModel(t))
 	t.Logf("org created: org_id=%s", orgID)
 
 	// --- Step 1b: acquire tenant admin token + wait for tenant TLS ready ---
@@ -561,17 +561,13 @@ func e2eLLMModel(t *testing.T) string {
 // running (provisioning is async). Cleanup must be registered here rather than
 // by callers: a provisioning timeout calls t.Fatalf before this function
 // returns, so caller-owned cleanup would never be installed.
-func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string) (orgID string) {
-	t.Helper()
-	return adminCreateOrgWithLLMModels(t, cfg, slug, nil)
-}
-
-// adminCreateOrgWithLLMModels is adminCreateOrg for an org restricted to
-// llmModels (llm_allowed_models): the CP refuses any proxied call on another
-// model and serves the first one as the org's default, which its concierge
-// is seeded with. The deploy-gate tests pass the e2e model, so nothing in
-// the gate can spend on the platform default (molecule-controlplane#3076).
-func adminCreateOrgWithLLMModels(t *testing.T, cfg stagingCfg, slug string, llmModels []string) (orgID string) {
+//
+// llmModels, when given, restricts the org to those platform models
+// (llm_allowed_models): the CP refuses any proxied call on another model and
+// serves the first one as the org's default, which its concierge is seeded
+// with. The deploy-gate tests pass the e2e model, so nothing in the gate can
+// spend on the platform default (molecule-controlplane#3076).
+func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string, llmModels ...string) (orgID string) {
 	t.Helper()
 	// Compute backend for the throwaway tenant. Defaults to molecules-server (the local-docker
 	// backend) now that the AWS EC2 path is closed. The canonical cloudprovider SSOT wire id
@@ -584,7 +580,7 @@ func adminCreateOrgWithLLMModels(t *testing.T, cfg stagingCfg, slug string, llmM
 		t.Fatalf("AdminCreate org body: %v", err)
 	}
 	status, resp := doJSON(t, "POST", cfg.cpBase+"/cp/admin/orgs", cfg.adminToken, body)
-	if status == http.StatusBadRequest && len(llmModels) > 0 && strings.Contains(resp, "llm_allowed_models") {
+	if status == http.StatusBadRequest && len(llmModels) > 0 && strings.Contains(resp, "unknown field") && strings.Contains(resp, "llm_allowed_models") {
 		t.Fatalf("AdminCreate org: HTTP 400 on llm_allowed_models (%s). The control plane at %s predates "+
 			"molecule-controlplane#3076 (per-org model allowlist on admin create); this gate deliberately does "+
 			"not fall back to an unrestricted org, which would run its concierge on the platform default", resp, cfg.cpBase)
@@ -592,13 +588,13 @@ func adminCreateOrgWithLLMModels(t *testing.T, cfg stagingCfg, slug string, llmM
 	if status != http.StatusCreated && status != http.StatusOK {
 		t.Fatalf("AdminCreate org: HTTP %d: %s", status, resp)
 	}
-	if len(llmModels) > 0 {
-		t.Logf("org %s restricted to platform models %v (its default model: %s)", slug, llmModels, llmModels[0])
-	}
 	// A 200/201 means the server accepted the exact slug. Schedule targeted
 	// cleanup before parsing the response so a malformed success body still
 	// triggers a teardown attempt.
 	registerTenantCleanup(t, cfg, slug)
+	if len(llmModels) > 0 {
+		t.Logf("org %s restricted to platform models %v (its default model: %s)", slug, llmModels, llmModels[0])
+	}
 	id := jsonField(resp, "id")
 	if id == "" {
 		t.Fatalf("AdminCreate org: no id in response: %s", resp)

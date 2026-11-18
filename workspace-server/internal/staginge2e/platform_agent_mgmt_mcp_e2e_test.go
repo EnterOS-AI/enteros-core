@@ -138,7 +138,7 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 	// this test drives is seeded with Flash-Lite instead of the platform default,
 	// and refuses any call on another model (molecule-controlplane#3076).
 	e2eModel := e2eLLMModel(t)
-	orgID := adminCreateOrgWithLLMModels(t, cfg, slug, []string{e2eModel})
+	orgID := adminCreateOrg(t, cfg, slug, e2eModel)
 	t.Logf("org created: org_id=%s", orgID)
 
 	token := tenantAdminToken(t, cfg, slug)
