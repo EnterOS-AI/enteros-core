@@ -109,6 +109,10 @@ else
   PUBLISH_BIND="127.0.0.1"
 fi
 
+# e2e_platform_model_refusal (the Hydrogen/Carbon guard) and the e2e model.
+# shellcheck source=tests/e2e/lib/model_slug.sh
+. "$HERE/lib/model_slug.sh"
+
 rand_hex() { python3 -c 'import secrets;print(secrets.token_hex(32))'; }
 # 32 random bytes, base64-encoded (44 chars). REQUIRED for SECRETS_ENCRYPTION_KEY:
 # the tenant's parser (workspace-server/internal/crypto/aes.go loadKeyFromEnv)
@@ -123,6 +127,22 @@ require_boot_env() {
   : "${TENANT_IMAGE:?required — this PRs workspace-server/tenant image}"
   : "${CP_EPHEMERAL_SCRIPT:?required — path to pr-ephemeral-cp.sh}"
   [ -x "$CP_EPHEMERAL_SCRIPT" ] || { echo "FATAL: CP_EPHEMERAL_SCRIPT not executable: $CP_EPHEMERAL_SCRIPT" >&2; exit 2; }
+  require_platform_model
+}
+
+# require_platform_model: E2E_PLATFORM_MODEL becomes this CP's platform default,
+# so it is what the concierge (and every agent it creates) runs on. It must be
+# set, and must not be Gemini 4 Hydrogen or Carbon (lib/model_slug.sh
+# e2e_platform_model_refusal). Before 2026-11-18 an unset value only skipped
+# writing MOLECULE_LLM_DEFAULT_MODEL, and nothing kept this lane off Hydrogen
+# except that its pinned CP image happened to lack the migration that prices it.
+require_platform_model() {
+  local why
+  why="$(e2e_platform_model_refusal "${E2E_PLATFORM_MODEL:-}")"
+  if [ -n "$why" ]; then
+    echo "FATAL: E2E_PLATFORM_MODEL refused: $why. The workflow's creds step sets it per E2E_LLM_UPSTREAM (gemini: google/gemini-3.1-flash-lite)." >&2
+    exit 2
+  fi
 }
 
 # ── host_docker / pull_via_host: get an image into the CURRENT docker store
@@ -631,10 +651,11 @@ boot_cp() {
     # google/* through Google AI Studio (molecule-controlplane#3070).
     [ -n "${E2E_GEMINI_API_KEY:-}" ] && echo "GEMINI_API_KEY=${E2E_GEMINI_API_KEY}"
     # The lane's model (E2E_PLATFORM_MODEL, set per E2E_LLM_UPSTREAM by the
-    # workflow) is this CP's platform default, so the concierge seeds it. Explicit
-    # in every mode: a current CP's unset-value fallback is the gemini-4-hydrogen
-    # platform default, which no e2e lane may spend on.
-    [ -n "${E2E_PLATFORM_MODEL:-}" ] && echo "MOLECULE_LLM_DEFAULT_MODEL=${E2E_PLATFORM_MODEL}"
+    # workflow) is this CP's platform default, so the concierge seeds it. Always
+    # written: require_boot_env has refused an unset or Hydrogen/Carbon value,
+    # and a current CP's unset-value fallback is the gemini-4-hydrogen platform
+    # default, which no e2e lane may spend on.
+    echo "MOLECULE_LLM_DEFAULT_MODEL=${E2E_PLATFORM_MODEL}"
   } >> "$boot_env"
 
   echo "[proof] spinning up throwaway CP (baseline ${CP_IMAGE}) provisioning tenant ${TENANT_IMAGE} in ${NS}..." >&2
@@ -1653,6 +1674,7 @@ case "$CMD" in
     ;;
   scenario)
     load_state
+    require_platform_model
     # This trap is NOT optional. Bash makes an async command ignore SIGINT when
     # job control is off, so without it a Ctrl-C on the (advertised, run-it-many-
     # times) scenario loop kills this shell and leaves the collector polling

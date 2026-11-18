@@ -69,7 +69,10 @@ func TestWorkspaceLifecycle_Staging(t *testing.T) {
 	t.Logf("workspace-lifecycle: slug=%s", slug)
 
 	// --- Step 1: provision org via admin API ---
-	orgID := adminCreateOrg(t, cfg, slug)
+	// Restricted to the e2e model: this test is half of the staging deploy gate
+	// (staging-tenant-cd e2e-smoke), and its org's concierge would otherwise be
+	// seeded with the platform default.
+	orgID := adminCreateOrgWithLLMModels(t, cfg, slug, []string{e2eLLMModel(t)})
 	t.Logf("org created: org_id=%s", orgID)
 
 	// --- Step 1b: acquire tenant admin token + wait for tenant TLS ready ---
@@ -541,6 +544,18 @@ func e2eSlug(tag string) string {
 	return fmt.Sprintf("e2e-%s-%d", tag, time.Now().Unix()%100000000)
 }
 
+// e2eLLMModel is the model this lane provisions and calls: E2E_MODEL, else
+// Gemini 3.1 Flash-Lite (e2eLLMModelFrom). A platform-default-tier model fails
+// the test before anything is created.
+func e2eLLMModel(t *testing.T) string {
+	t.Helper()
+	model, refusal := e2eLLMModelFrom(os.Getenv("E2E_MODEL"))
+	if refusal != "" {
+		t.Fatalf("E2E_MODEL refused: %s", refusal)
+	}
+	return model
+}
+
 // adminCreateOrg provisions a throwaway org via the CP admin API, immediately
 // registers exact-slug cleanup, and then waits for its instance to reach
 // running (provisioning is async). Cleanup must be registered here rather than
@@ -548,16 +563,37 @@ func e2eSlug(tag string) string {
 // returns, so caller-owned cleanup would never be installed.
 func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string) (orgID string) {
 	t.Helper()
+	return adminCreateOrgWithLLMModels(t, cfg, slug, nil)
+}
+
+// adminCreateOrgWithLLMModels is adminCreateOrg for an org restricted to
+// llmModels (llm_allowed_models): the CP refuses any proxied call on another
+// model and serves the first one as the org's default, which its concierge
+// is seeded with. The deploy-gate tests pass the e2e model, so nothing in
+// the gate can spend on the platform default (molecule-controlplane#3076).
+func adminCreateOrgWithLLMModels(t *testing.T, cfg stagingCfg, slug string, llmModels []string) (orgID string) {
+	t.Helper()
 	// Compute backend for the throwaway tenant. Defaults to molecules-server (the local-docker
 	// backend) now that the AWS EC2 path is closed. The canonical cloudprovider SSOT wire id
 	// the CP org-create validates (IsValidRequest) and persists as organizations.provider
 	// "local" (PersistKey); an empty provider would fall back to the CP DefaultProvider (the
 	// closed AWS path). The e2e workflows export E2E_PROVIDER; envOr pins the local default.
 	provider := envOr("E2E_PROVIDER", "molecules-server")
-	body := fmt.Sprintf(`{"slug":%q,"name":%q,"owner_user_id":%q,"provider":%q}`, slug, "E2E Workspace Lifecycle", "e2e-runner:"+slug, provider)
+	body, err := adminCreateOrgBody(slug, "E2E Workspace Lifecycle", provider, llmModels)
+	if err != nil {
+		t.Fatalf("AdminCreate org body: %v", err)
+	}
 	status, resp := doJSON(t, "POST", cfg.cpBase+"/cp/admin/orgs", cfg.adminToken, body)
+	if status == http.StatusBadRequest && len(llmModels) > 0 && strings.Contains(resp, "llm_allowed_models") {
+		t.Fatalf("AdminCreate org: HTTP 400 on llm_allowed_models (%s). The control plane at %s predates "+
+			"molecule-controlplane#3076 (per-org model allowlist on admin create); this gate deliberately does "+
+			"not fall back to an unrestricted org, which would run its concierge on the platform default", resp, cfg.cpBase)
+	}
 	if status != http.StatusCreated && status != http.StatusOK {
 		t.Fatalf("AdminCreate org: HTTP %d: %s", status, resp)
+	}
+	if len(llmModels) > 0 {
+		t.Logf("org %s restricted to platform models %v (its default model: %s)", slug, llmModels, llmModels[0])
 	}
 	// A 200/201 means the server accepted the exact slug. Schedule targeted
 	// cleanup before parsing the response so a malformed success body still
@@ -890,7 +926,7 @@ func tenantCreateWorkspace(t *testing.T, cfg stagingCfg, host, token, orgID stri
 	return tenantCreateWorkspaceWithRuntime(
 		t, cfg, host, token, orgID, "core2332-life-e2e",
 		envOr("E2E_RUNTIME", "claude-code"),
-		envOr("E2E_MODEL", "google/gemini-3.1-flash-lite"),
+		e2eLLMModel(t),
 	)
 }
 

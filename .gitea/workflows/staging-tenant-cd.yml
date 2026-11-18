@@ -527,6 +527,13 @@ jobs:
       # presence-only. This is the deep "callable" proof that catches a
       # present-but-not-runnable verb (the flaw that let regressions reach prod).
       E2E_ASSERT_MGMT_MCP_CALLABLE: '1'
+      # The model both tests run on (owner 2026-11-17: the cheapest model for any
+      # e2e testing). Their throwaway orgs are created with
+      # llm_allowed_models=[E2E_MODEL] (molecule-controlplane#3076), so the CP
+      # seeds the concierge with it and refuses any call on another model; the
+      # mgmt-MCP test asserts the concierge reports it. Hydrogen/Carbon are
+      # refused by the tests themselves (e2eLLMModelFrom).
+      E2E_MODEL: google/gemini-3.1-flash-lite
       # REQUIRE-LIVE posture (mirrors CP serving-e2e SERVING_E2E_REQUIRE_LIVE).
       # requireStagingEnv SKIPs when STAGING_E2E/CP_BASE_URL/CP_ADMIN_API_TOKEN
       # are absent, and `go test` reports a skipped-only package as `ok` — so a

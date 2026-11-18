@@ -75,7 +75,8 @@
 #   MOLECULE_ADMIN_TOKEN   staging CP admin bearer from Infisical
 # Optional:
 #   E2E_SEO_TEMPLATE       default seo-agent
-#   E2E_EXPECTED_MODEL     default moonshot/kimi-k2.6
+#   E2E_EXPECTED_MODEL     default google/gemini-4-hydrogen (the seo-agent
+#                          template's declared model; B checks it is delivered)
 #   E2E_EXPECTED_PLUGIN    default molecule-ai-plugin-seo-ability
 #                          (install name = last path segment of the source
 #                           contract; no subpath ⇒ the repo name)
@@ -94,10 +95,11 @@ set -euo pipefail
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
 SEO_TEMPLATE="${E2E_SEO_TEMPLATE:-seo-agent}"
-# 2026-08-04: sdk#203 withdrew moonshot/* from every platform arm (suspended
-# vendor account), so the old default now 422s UNREGISTERED_MODEL_FOR_RUNTIME at
-# create. minimax/MiniMax-M3 is the SSOT default (MOLECULE_LLM_DEFAULT_MODEL).
-EXPECTED_MODEL="${E2E_EXPECTED_MODEL:-minimax/MiniMax-M2.7}"
+# The seo-agent template's declared model (its config.yaml `model:`), which
+# assertion B expects to be delivered: google/gemini-4-hydrogen since the
+# template's Hydrogen-default merge (2026-11-17). The workspace gets no A2A turn
+# here, so the lane spends nothing on it.
+EXPECTED_MODEL="${E2E_EXPECTED_MODEL:-google/gemini-4-hydrogen}"
 # The plugin the seo-agent template now DECLARES. Install name = last path
 # segment of the source contract; this source has NO subpath, so the name is the
 # repo name (workspace-server gitea resolver).
