@@ -222,9 +222,25 @@ func resolveWorkspaceForwardCreds(c *gin.Context, ctx context.Context, workspace
 		// invariant we actually want is "URL empty + not-push = no
 		// dispatch path, ever".
 		if !deliveryMode.Valid || deliveryMode.String != "push" {
+			// Name what was judged: the TARGET workspace's own row (never the
+			// caller's registration), its delivery_mode, and its empty URL. The
+			// 2026-11-13 reno-stars report read this 422 as "my token's
+			// workspace is poll-mode", when the platform-hosted target's row
+			// had been rewritten by a URL-less poll register.
+			mode := "unset"
+			if deliveryMode.Valid && deliveryMode.String != "" {
+				mode = deliveryMode.String
+			}
 			c.JSON(http.StatusUnprocessableEntity, gin.H{
-				"error":  "workspace has no callback URL — " + op + " requires push-mode + a public URL",
-				"detail": "This workspace registered without a publicly-reachable URL (delivery_mode is not 'push'). The platform cannot HTTP-forward to it. Re-register the workspace with a public URL in push mode (e.g. via ngrok / Cloudflare tunnel) to enable " + op + ".",
+				"error": "workspace has no callback URL — " + op + " requires push-mode + a public URL " +
+					"(judged from target workspace " + workspaceID + ": delivery_mode=" + mode + ", url empty)",
+				"detail": "Workspace " + workspaceID + " is registered with delivery_mode=" + mode + " and no URL, so the platform cannot HTTP-forward " + op +
+					" to it. This is decided by the target workspace's own registration, not by the caller's credential. " +
+					"For an external workspace, re-register it in push mode with a publicly-reachable URL (e.g. via ngrok / Cloudflare tunnel). " +
+					"For a platform-hosted workspace, its last /registry/register carried no URL (e.g. a poll-mode client registering with this workspace's ID); " +
+					"restart the workspace so it re-registers its platform URL, and register external peers under their own workspace IDs.",
+				"workspace_id":  workspaceID,
+				"delivery_mode": mode,
 			})
 			return "", "", false
 		}
