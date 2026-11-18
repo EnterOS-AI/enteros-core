@@ -79,12 +79,13 @@ failures:
   has no registered URL or does not answer.
 
 Cloudflare, in front of every tenant, replaces the body of a `502` or `504`
-with its own: an HTML or text page, or, for a client that accepts JSON, a
-problem document of its own (`"cloudflare_error": true`, no `error` or
-`code`, `Retry-After: 60`). So no refusal a client must act on uses those
-statuses; a `503` body reaches the client unchanged. A `5xx` without core's
-`error` sentence is a proxy's answer, not core's: retry an idempotent call
-(every Light route but `run`, every `GET`).
+with its own: an HTML or text page, or a JSON problem document of its own
+(`"cloudflare_error": true`, no `error` or `code`, `Retry-After: 60`). Which
+one depends on the client, not only on `Accept`: on staging Node's `fetch`
+got the document and `curl` a text page, both asking for JSON. So no refusal
+a client must act on uses those statuses; a `503` body reaches the client
+unchanged. A `5xx` without core's `error` sentence is a proxy's answer, not
+core's: retry an idempotent call (every Light route but `run`, every `GET`).
 
 ## Authentication
 
