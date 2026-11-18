@@ -1099,6 +1099,9 @@ jobs:
         name: Run E2E bash unit tests (no live infra)
         run: |
           bash tests/e2e/test_model_slug.sh
+          # The e2e tenant bundle's base templates are pinned to the lane's model
+          # (lib/pin_template_model.py, e2e-ephemeral-happy-path.yml).
+          python3 tests/e2e/test_pin_template_model_unit.py
           # E2E structured-observability lib (lib/obs.sh). Offline (no Loki /
           # network): proves JSON escaping, secret redaction, numeric fields,
           # and the FAIL-SOFT contract — with Loki unreachable AND `set -e`,

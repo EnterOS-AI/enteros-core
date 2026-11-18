@@ -882,16 +882,15 @@ func tenantAdminToken(t *testing.T, cfg stagingCfg, slug string) string {
 //
 // De-hardcode: the runtime + model FOLLOW the same KMS-injection pattern the
 // de-hardcode lanes use — E2E_RUNTIME / E2E_MODEL are exported by the e2e
-// workflows from the platform default SSOT (MOLECULE_DEFAULT_RUNTIME /
-// MOLECULE_LLM_DEFAULT_MODEL @ /shared/controlplane/llm). When unset (local runs),
-// envOr falls back to the CURRENT SSOT value (minimax/MiniMax-M2.7), NOT a
-// moonshot vendor const, so the local fallback tracks the SSOT default.
+// workflows. When unset (local runs and the ephemeral gate), the model falls back
+// to the e2e model, google/gemini-3.1-flash-lite: the cheapest platform Gemini
+// model, never the gemini-4-hydrogen platform default.
 func tenantCreateWorkspace(t *testing.T, cfg stagingCfg, host, token, orgID string) string {
 	t.Helper()
 	return tenantCreateWorkspaceWithRuntime(
 		t, cfg, host, token, orgID, "core2332-life-e2e",
 		envOr("E2E_RUNTIME", "claude-code"),
-		envOr("E2E_MODEL", "minimax/MiniMax-M2.7"),
+		envOr("E2E_MODEL", "google/gemini-3.1-flash-lite"),
 	)
 }
 

@@ -629,6 +629,444 @@ paths:
       summary: List pending user tasks across all workspaces
       tags:
       - user-tasks
+  /workspaces/{id}/light:
+    get:
+      description: light_state (null when not a Light agent), the schedules rendered
+        at the last park with core's suspension record, the work queued for the next
+        open/park cycle, and the last background failure.
+      parameters:
+      - description: Workspace ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: WORKSPACE_NOT_FOUND
+          schema:
+            additionalProperties: true
+            type: object
+      security:
+      - BearerAuth: []
+      summary: A workspace's Enter OS Light state
+      tags:
+      - light
+  /workspaces/{id}/light/disable:
+    post:
+      description: Deletes the control plane's Light objects (CronJobs, Jobs, Secret)
+        first, then revokes the run tokens, removes MOLECULE_LIGHT, restores the 24/7
+        setting (MOLECULE_CONTINUOUS) exactly as it was before enable, clears light_state
+        and wakes (or restarts) the agent. Works from any Light state.
+      parameters:
+      - description: Workspace ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: LIGHT_SELF_FORBIDDEN
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: WORKSPACE_NOT_FOUND
+          schema:
+            additionalProperties: true
+            type: object
+        "409":
+          description: LIGHT_TRANSITION_IN_PROGRESS
+          schema:
+            additionalProperties: true
+            type: object
+        "503":
+          description: LIGHT_BACKEND_UNAVAILABLE
+          schema:
+            additionalProperties: true
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Turn a Light agent back into an ordinary agent
+      tags:
+      - light
+  /workspaces/{id}/light/enable:
+    post:
+      description: Hermes agents on the Kubernetes substrate only. Stores MOLECULE_LIGHT=1
+        and MOLECULE_CONTINUOUS=false as workspace secrets, sets light_state=open
+        and restarts (or wakes) the agent so its env applies.
+      parameters:
+      - description: Workspace ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: LIGHT_SELF_FORBIDDEN
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: WORKSPACE_NOT_FOUND
+          schema:
+            additionalProperties: true
+            type: object
+        "409":
+          description: LIGHT_AGENT_PAUSED, LIGHT_TRANSITION_IN_PROGRESS
+          schema:
+            additionalProperties: true
+            type: object
+        "422":
+          description: LIGHT_RUNTIME_UNSUPPORTED, LIGHT_PLATFORM_AGENT
+          schema:
+            additionalProperties: true
+            type: object
+        "501":
+          description: LIGHT_UNSUPPORTED
+          schema:
+            additionalProperties: true
+            type: object
+        "503":
+          description: LIGHT_BACKEND_UNAVAILABLE
+          schema:
+            additionalProperties: true
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Make a workspace an Enter OS Light agent
+      tags:
+      - light
+  /workspaces/{id}/light/open:
+    post:
+      description: Pauses the agent's CronJobs (runs that had not started yet are
+        cancelled), then wakes its pod for chat. Answers 202; light_state goes opening
+        → open once the pod is up. A failed pause leaves the agent parked. Also recovers
+        a park stuck in parking for three minutes.
+      parameters:
+      - description: Workspace ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: already open or opening (the owner takes it over)
+          schema:
+            additionalProperties: true
+            type: object
+        "202":
+          description: '{\"light_state\":\"opening\",\"cancelled\":[...]}'
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: LIGHT_BAD_REQUEST
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: LIGHT_SELF_FORBIDDEN
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: WORKSPACE_NOT_FOUND, LIGHT_TENANT_NOT_FOUND
+          schema:
+            additionalProperties: true
+            type: object
+        "409":
+          description: LIGHT_NOT_ENABLED, LIGHT_TRANSITION_IN_PROGRESS
+          schema:
+            additionalProperties: true
+            type: object
+        "500":
+          description: LIGHT_FAILED
+          schema:
+            additionalProperties: true
+            type: object
+        "501":
+          description: LIGHT_UNSUPPORTED
+          schema:
+            additionalProperties: true
+            type: object
+        "502":
+          description: LIGHT_FAILED
+          schema:
+            additionalProperties: true
+            type: object
+        "503":
+          description: LIGHT_BACKEND_UNAVAILABLE
+          schema:
+            additionalProperties: true
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Open a parked Light agent
+      tags:
+      - light
+  /workspaces/{id}/light/park:
+    post:
+      description: Hands the agent's schedules to the control plane as CronJobs, stops
+        its pod and resumes the CronJobs. Answers 202 once the CronJobs are written;
+        light_state goes parking → parked in the background (poll GET /workspaces/{id}/light).
+        A refusal before the parking claim changes nothing; one after it returns the
+        agent to open and records last_error.
+      parameters:
+      - description: Workspace ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: already parked
+          schema:
+            additionalProperties: true
+            type: object
+        "202":
+          description: '{\"light_state\":\"parking\",\"schedules\":[...],\"removed\":[...]}'
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: LIGHT_BAD_REQUEST
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: LIGHT_SELF_FORBIDDEN
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: WORKSPACE_NOT_FOUND, LIGHT_TENANT_NOT_FOUND
+          schema:
+            additionalProperties: true
+            type: object
+        "409":
+          description: LIGHT_NOT_ENABLED, LIGHT_AGENT_NOT_AWAKE, LIGHT_AGENT_BUSY,
+            LIGHT_RESTART_REQUIRED, LIGHT_ENV_UNSUPPORTED, LIGHT_TRANSITION_IN_PROGRESS
+          schema:
+            additionalProperties: true
+            type: object
+        "413":
+          description: LIGHT_TOO_LARGE
+          schema:
+            additionalProperties: true
+            type: object
+        "422":
+          description: LIGHT_INVALID, LIGHT_RUNTIME_UNSUPPORTED
+          schema:
+            additionalProperties: true
+            type: object
+        "500":
+          description: LIGHT_FAILED
+          schema:
+            additionalProperties: true
+            type: object
+        "501":
+          description: LIGHT_UNSUPPORTED
+          schema:
+            additionalProperties: true
+            type: object
+        "502":
+          description: LIGHT_SCHEDULES_UNREADABLE, LIGHT_FAILED
+          schema:
+            additionalProperties: true
+            type: object
+        "503":
+          description: LIGHT_BACKEND_UNAVAILABLE
+          schema:
+            additionalProperties: true
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Park a Light agent
+      tags:
+      - light
+  /workspaces/{id}/light/run:
+    post:
+      consumes:
+      - application/json
+      description: Starts one run of the named schedule outside its cron times. Parked
+        agents only.
+      parameters:
+      - description: Workspace ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: '{\"run_id\":\"light-...\"}'
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: LIGHT_BAD_REQUEST
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: LIGHT_SELF_FORBIDDEN
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: WORKSPACE_NOT_FOUND, LIGHT_SCHEDULE_NOT_FOUND, LIGHT_TENANT_NOT_FOUND
+          schema:
+            additionalProperties: true
+            type: object
+        "409":
+          description: LIGHT_NOT_PARKED, LIGHT_RUN_ACTIVE, LIGHT_RUN_EXISTS, LIGHT_AGENT_AWAKE,
+            LIGHT_TENANT_SUSPENDED, LIGHT_TRANSITION_IN_PROGRESS
+          schema:
+            additionalProperties: true
+            type: object
+        "422":
+          description: LIGHT_INVALID
+          schema:
+            additionalProperties: true
+            type: object
+        "500":
+          description: LIGHT_FAILED
+          schema:
+            additionalProperties: true
+            type: object
+        "501":
+          description: LIGHT_UNSUPPORTED
+          schema:
+            additionalProperties: true
+            type: object
+        "502":
+          description: LIGHT_FAILED
+          schema:
+            additionalProperties: true
+            type: object
+        "503":
+          description: LIGHT_BACKEND_UNAVAILABLE
+          schema:
+            additionalProperties: true
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Run one schedule of a parked Light agent now
+      tags:
+      - light
+  /workspaces/{id}/light/runs:
+    get:
+      description: Each run with its outcome, output (last 64 KiB) and error, the
+        number of activity rows it wrote, and the activity path filtered to it. Page
+        with ?before=<next_before> (null on the last page).
+      parameters:
+      - description: Workspace ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: 1..100, default 20 (above 100 is capped)
+        in: query
+        name: limit
+        type: integer
+      - description: only this schedule's runs
+        in: query
+        name: schedule
+        type: string
+      - description: the previous page's next_before, or an RFC3339 time (runs recorded
+          strictly earlier)
+        in: query
+        name: before
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: LIGHT_BAD_REQUEST
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: WORKSPACE_NOT_FOUND
+          schema:
+            additionalProperties: true
+            type: object
+      security:
+      - BearerAuth: []
+      summary: A Light agent's runs, newest first
+      tags:
+      - light
+    post:
+      consumes:
+      - application/json
+      description: 'The run pod''s report, with the agent''s run token: phase "started"
+        (status running) and phase "finished" (succeeded|failed|timed_out). Upserts
+        on (workspace_id, run_id); a finished run never goes back to running.'
+      parameters:
+      - description: Workspace ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: '{\"ok\":true}'
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: LIGHT_INVALID_REPORT
+          schema:
+            additionalProperties: true
+            type: object
+        "403":
+          description: LIGHT_RUN_TOKEN_REQUIRED
+          schema:
+            additionalProperties: true
+            type: object
+        "409":
+          description: LIGHT_NOT_ENABLED, LIGHT_RUN_FINISHED
+          schema:
+            additionalProperties: true
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Record a Light run (called by the run pod)
+      tags:
+      - light
   /workspaces/{id}/requests:
     get:
       parameters:

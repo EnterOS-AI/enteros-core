@@ -36,12 +36,12 @@
 #   because the generated config.yaml lacked the derived `provider: platform`.
 #
 #   E2E_LLM_PATH=platform selects a platform-managed model id (slash-namespaced,
-#   no tenant key — Molecule owns billing via the CP LLM proxy). The default
-#   MIRRORS the SSOT default (minimax/MiniMax-M3) — see the constant below.
-#   It was "moonshot/kimi-k2.6" (the headline incident combo) until sdk#203
-#   withdrew every moonshot/* id from the platform arms on 2026-08-04 (suspended
-#   vendor account); that id now 422s at create. Override the specific
-#   platform model with E2E_MODEL_SLUG. The provision branch in
+#   no tenant key — Molecule owns billing via the CP LLM proxy). The default is
+#   the e2e model, google/gemini-3.1-flash-lite — see the constant below. It was
+#   the SSOT default (minimax/MiniMax-M3, before that moonshot/kimi-k2.6) until
+#   Gemini became the platform vendor on 2026-11-17; e2e lanes now run on the
+#   cheapest Gemini model and never on the gemini-4-hydrogen default. Override the
+#   specific platform model with E2E_MODEL_SLUG. The provision branch in
 #   test_staging_full_saas.sh sends NO secrets for this path (platform-managed
 #   needs none), so the workspace must boot online purely on the proxy env the
 #   control plane injects + the manifest-derived `provider: platform` that Fix A
@@ -57,19 +57,19 @@
 # authentication method" + the synth-E2E gate goes red without naming
 # the slug-format mismatch.
 
-# Default platform-managed model for the platform-boot regression path. This
-# MIRRORS the platform SSOT default (MOLECULE_LLM_DEFAULT_MODEL =
-# minimax/MiniMax-M3 in Infisical /shared/controlplane/llm), so the e2e
-# exercises the SAME default a fresh tenant resolves — not a stale literal. The
-# authoritative value is the env override E2E_DEFAULT_PLATFORM_MODEL (which the
-# CI injects from the staging KMS SSOT); this is only the baked fallback. Must
-# stay a member of the claude-code `platform` arm in
-# workspace-server/internal/providers/providers.yaml (the deterministic suite
-# TestEnsureDefaultConfig_StampsProviderForEverySSOTPlatformModel enforces every
-# member of that arm derives provider=platform). Resolved INSIDE pick_model_slug
-# via ${E2E_DEFAULT_PLATFORM_MODEL:-...} so callers can override it (or unset it)
-# without tripping `set -u`.
-E2E_DEFAULT_PLATFORM_MODEL_FALLBACK="minimax/MiniMax-M3"
+# Default platform-managed model for the platform-boot regression path: the e2e
+# model, google/gemini-3.1-flash-lite (owner 2026-11-17: "use its cheapest model
+# for any e2e testing"). It is deliberately NOT the platform SSOT default
+# (MOLECULE_LLM_DEFAULT_MODEL = google/gemini-4-hydrogen): no e2e lane spends on
+# Hydrogen or Carbon. The ephemeral gate passes its lane's model explicitly as
+# E2E_DEFAULT_PLATFORM_MODEL (E2E_PLATFORM_MODEL, per E2E_LLM_UPSTREAM); this is
+# only the baked fallback. Must stay a member of every runtime's `platform` arm
+# in the SDK registry (molecule-ai-sdk contracts/llm-registry; the deterministic
+# suite TestEnsureDefaultConfig_StampsProviderForEverySSOTPlatformModel enforces
+# every member of that arm derives provider=platform). Resolved INSIDE
+# pick_model_slug via ${E2E_DEFAULT_PLATFORM_MODEL:-...} so callers can override
+# it (or unset it) without tripping `set -u`.
+E2E_DEFAULT_PLATFORM_MODEL_FALLBACK="google/gemini-3.1-flash-lite"
 
 # Usage: pick_model_slug <runtime>
 #   stdout: the slug string
