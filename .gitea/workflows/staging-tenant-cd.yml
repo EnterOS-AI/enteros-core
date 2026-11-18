@@ -623,6 +623,38 @@ jobs:
           E2E_DEFAULT_RUNTIME="${MOLECULE_DEFAULT_RUNTIME:-hermes}"
           echo "CP_ADMIN_API_TOKEN=$CP_ADMIN_API_TOKEN" >> "$GITHUB_ENV"
           echo "E2E_DEFAULT_RUNTIME=$E2E_DEFAULT_RUNTIME" >> "$GITHUB_ENV"
+
+          # The model both tests run on (E2E_MODEL). Their throwaway orgs are
+          # created with llm_allowed_models=[E2E_MODEL] (molecule-controlplane#3076),
+          # so the CP seeds the concierge with it and refuses any call on another
+          # model. Owner decision 2026-11-18: the CI LLM gateway (no cost) when it
+          # is up, else Gemini 3.1 Flash-Lite. Staging's proxy routes minimax/* to
+          # the gateway (Infisical staging /shared/controlplane/llm
+          # MINIMAX_BASE_URL / MINIMAX_ANTHROPIC_BASE_URL, checked 2026-11-18), so
+          # a gateway run uses minimax/MiniMax-M3, and TestPlatformAgentMgmtMCP
+          # proves the routing before its LLM steps. Hydrogen/Carbon are refused
+          # by the tests themselves (e2eLLMModelFrom).
+          ci_llm_base=$(curl -fsS -A curl/8.4.0 "$BASE/api/v3/secrets/raw/CI_LLM_BASE_URL?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=%2Fshared%2Fci-llm" \
+            -H "Authorization: Bearer $TOK" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v.strip() if isinstance(v,str) else "")' || true)
+          while [ "${ci_llm_base%/}" != "$ci_llm_base" ]; do ci_llm_base="${ci_llm_base%/}"; done
+          ci_llm_health=000
+          url_re='^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)*$'
+          if [[ $ci_llm_base =~ $url_re ]]; then
+            ci_llm_health=$(curl -sS -A curl/8.4.0 -o /dev/null -w '%{http_code}' --max-time 10 "$ci_llm_base/health" 2>/dev/null || true)
+          fi
+          if [ "$ci_llm_health" = "200" ]; then
+            E2E_MODEL=minimax/MiniMax-M3
+            e2e_model_via="the CI LLM gateway ($ci_llm_base, staging routes minimax/* to it)"
+          else
+            E2E_MODEL=google/gemini-3.1-flash-lite
+            e2e_model_via="fallback: the CI LLM gateway's /health answered ${ci_llm_health:-000}"
+          fi
+          echo "E2E_MODEL=$E2E_MODEL" >> "$GITHUB_ENV"
+          echo "::notice::e2e-smoke model: $E2E_MODEL via $e2e_model_via"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            echo "**e2e-smoke model:** \`$E2E_MODEL\` via $e2e_model_via" >> "$GITHUB_STEP_SUMMARY" || true
+          fi
           echo "CP_ADMIN_API_TOKEN loaded from Infisical staging SSOT (len=${#CP_ADMIN_API_TOKEN})"
           echo "Expected concierge runtime resolved from Infisical staging SSOT: $E2E_DEFAULT_RUNTIME"
           rm -f "$runtime_body"

@@ -102,12 +102,30 @@ assert_eq "hermes + platform path → the e2e model (flash-lite)"    "$got" "goo
 got=$(unset E2E_MODEL_SLUG E2E_DEFAULT_PLATFORM_MODEL; E2E_LLM_PATH=platform E2E_MINIMAX_API_KEY="mx-stray" pick_model_slug claude-code)
 assert_eq "platform path beats a stray BYOK key (no mask)"         "$got" "google/gemini-3.1-flash-lite"
 
-# The e2e fallback is never the platform default (owner 2026-11-17: the
-# cheapest model for any e2e testing, Carbon for the default).
+# The e2e fallback is never the platform-default tier (owner 2026-11-17: the
+# cheapest model for any e2e testing; Gemini 4 Hydrogen is the default, Gemini 4
+# Carbon the one before it).
 case "$E2E_DEFAULT_PLATFORM_MODEL_FALLBACK" in
-  *carbon*) assert_eq "e2e fallback is not the Carbon default" "$E2E_DEFAULT_PLATFORM_MODEL_FALLBACK" "<not carbon>" ;;
-  *)        assert_eq "e2e fallback is not the Carbon default" "ok" "ok" ;;
+  *hydrogen*|*carbon*) assert_eq "e2e fallback is not Hydrogen or Carbon" "$E2E_DEFAULT_PLATFORM_MODEL_FALLBACK" "<not hydrogen/carbon>" ;;
+  *)                   assert_eq "e2e fallback is not Hydrogen or Carbon" "ok" "ok" ;;
 esac
+assert_eq "the fallback passes its own guard" "$(e2e_platform_model_refusal "$E2E_DEFAULT_PLATFORM_MODEL_FALLBACK")" ""
+
+# Behavioural guard: a Hydrogen/Carbon model from ANY variable is refused (rc 1,
+# empty stdout, the reason on stderr), not just a fallback constant that names it.
+for pricey in google/gemini-4-hydrogen google/Gemini-4-Carbon gemini-4-hydrogen; do
+  got=$(unset E2E_MODEL_SLUG; E2E_LLM_PATH=platform E2E_DEFAULT_PLATFORM_MODEL="$pricey" pick_model_slug hermes 2>/dev/null); rc=$?
+  assert_eq "platform path refuses E2E_DEFAULT_PLATFORM_MODEL=$pricey (rc)" "$rc" "1"
+  assert_eq "platform path refuses E2E_DEFAULT_PLATFORM_MODEL=$pricey (no slug)" "$got" ""
+  got=$(unset E2E_DEFAULT_PLATFORM_MODEL; E2E_MODEL_SLUG="$pricey" pick_model_slug codex 2>/dev/null); rc=$?
+  assert_eq "E2E_MODEL_SLUG=$pricey is refused (rc)" "$rc" "1"
+done
+why=$(unset E2E_MODEL_SLUG; E2E_LLM_PATH=platform E2E_DEFAULT_PLATFORM_MODEL=google/gemini-4-hydrogen pick_model_slug hermes 2>&1 >/dev/null)
+case "$why" in
+  *"platform-default-tier"*) assert_eq "the refusal names the reason" "ok" "ok" ;;
+  *)                         assert_eq "the refusal names the reason" "$why" "<names platform-default-tier>" ;;
+esac
+assert_eq "an empty model is refused" "$(e2e_platform_model_refusal "")" "no e2e model is set"
 
 got=$(unset E2E_MODEL_SLUG; E2E_LLM_PATH=platform E2E_DEFAULT_PLATFORM_MODEL="minimax/MiniMax-M2.7-highspeed" pick_model_slug claude-code)
 assert_eq "platform path honours E2E_DEFAULT_PLATFORM_MODEL"        "$got" "minimax/MiniMax-M2.7-highspeed"
