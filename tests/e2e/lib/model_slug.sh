@@ -71,22 +71,52 @@
 # it (or unset it) without tripping `set -u`.
 E2E_DEFAULT_PLATFORM_MODEL_FALLBACK="google/gemini-3.1-flash-lite"
 
+# e2e_platform_model_refusal <model> — print why <model> may not be an e2e
+# lane's model (nothing when it may): empty, or a platform-default-tier model
+# (Gemini 4 Hydrogen, the platform default, or Gemini 4 Carbon). This is the
+# behavioural guard: the constant above being Flash-Lite proves nothing if a
+# caller's E2E_DEFAULT_PLATFORM_MODEL / E2E_MODEL_SLUG / E2E_PLATFORM_MODEL
+# names Hydrogen. pick_model_slug and ephemeral_cp_happy_path.sh both call it.
+e2e_platform_model_refusal() {
+  local m
+  m="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$m" in
+    "") printf 'no e2e model is set' ;;
+    *hydrogen*|*carbon*)
+      printf '%s is a platform-default-tier model (Gemini 4 Hydrogen/Carbon); e2e lanes run on the cheapest model, %s' \
+        "$1" "$E2E_DEFAULT_PLATFORM_MODEL_FALLBACK" ;;
+  esac
+}
+
 # Usage: pick_model_slug <runtime>
 #   stdout: the slug string
 #   E2E_MODEL_SLUG (env): if set + non-empty, used as-is (operator override)
 #   E2E_LLM_PATH=platform (env): select the platform-managed model id
 #     (E2E_DEFAULT_PLATFORM_MODEL) instead of a BYOK slug. Takes precedence over
 #     the per-key BYOK branches; E2E_MODEL_SLUG still wins over everything.
+#   A Gemini 4 Hydrogen/Carbon slug from either variable is refused: stderr
+#   says why and the function returns 1 (e2e_platform_model_refusal).
 pick_model_slug() {
-  local runtime="${1:-}"
+  local runtime="${1:-}" why
   if [ -n "${E2E_MODEL_SLUG:-}" ]; then
+    why="$(e2e_platform_model_refusal "$E2E_MODEL_SLUG")"
+    if [ -n "$why" ]; then
+      echo "pick_model_slug: E2E_MODEL_SLUG refused: $why" >&2
+      return 1
+    fi
     printf '%s' "$E2E_MODEL_SLUG"
     return 0
   fi
   # Platform-managed path: the slash-namespaced platform model, no tenant key.
   # Exercises the arm the moonshot/kimi NOT_CONFIGURED bug shipped on.
   if [ "${E2E_LLM_PATH:-}" = "platform" ]; then
-    printf '%s' "${E2E_DEFAULT_PLATFORM_MODEL:-$E2E_DEFAULT_PLATFORM_MODEL_FALLBACK}"
+    local model="${E2E_DEFAULT_PLATFORM_MODEL:-$E2E_DEFAULT_PLATFORM_MODEL_FALLBACK}"
+    why="$(e2e_platform_model_refusal "$model")"
+    if [ -n "$why" ]; then
+      echo "pick_model_slug: E2E_DEFAULT_PLATFORM_MODEL refused: $why" >&2
+      return 1
+    fi
+    printf '%s' "$model"
     return 0
   fi
   case "$runtime" in
