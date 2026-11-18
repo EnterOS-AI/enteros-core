@@ -47,6 +47,7 @@
 #
 # Required env:
 #   MOLECULE_ADMIN_TOKEN   staging CP admin bearer from Infisical /shared/controlplane-admin
+#   E2E_INFRA_BACKEND      required: local-docker
 # Optional env:
 #   MOLECULE_CP_URL        default https://staging-api.moleculesai.app
 #   E2E_RUN_ID             slug suffix; CI passes ${GITHUB_RUN_ID}
@@ -93,6 +94,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/cp_purge_receipt.sh"
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
+e2e_cp_require_local_backend || exit 2
+e2e_cp_require_staging_origin "$CP_URL" || exit 2
 # RUN_ID_SUFFIX removed (core#2782 follow-up shellcheck): the slug
 # now comes from make_collision_proof_slug below; the old suffix
 # var is dead.

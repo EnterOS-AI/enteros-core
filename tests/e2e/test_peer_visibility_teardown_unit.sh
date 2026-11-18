@@ -320,6 +320,30 @@ else
 fi
 
 echo ""
+echo "── D. unset E2E_INFRA_BACKEND — preflight fails closed before any org creation ──"
+D="$WORK/d"
+mkdir -p "$D"
+env -u E2E_INFRA_BACKEND \
+  PATH="$SHIM:$PATH" \
+  FAKE_SCENARIO="transient-409" \
+  FAKE_STATE_DIR="$D" \
+  MOLECULE_CP_URL="https://staging-api.moleculesai.app" \
+  MOLECULE_ADMIN_TOKEN="fake-admin-token" \
+  E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=0 \
+  PV_PROVISION_MODE="external" \
+  PV_RUNTIMES="hermes" \
+  PV_TOKEN_DIAGNOSTIC_ONLY=1 \
+  E2E_RUN_ID="tdunit" \
+  bash "$TARGET" > "$D/stdout.txt" 2> "$D/stderr.txt"
+rc_d=$?
+out_d=$(tail -c 200000 "$D/stdout.txt" 2>/dev/null; tail -c 200000 "$D/stderr.txt" 2>/dev/null)
+creates_d=$(grep -c '^POST /cp/admin/orgs' "$D/calls.log" 2>/dev/null || true)
+creates_d="${creates_d:-0}"
+check "unset E2E_INFRA_BACKEND exits 2" "2" "$rc_d"
+check "zero POST /cp/admin/orgs calls made" "0" "$creates_d"
+check_contains "stderr reports unsupported E2E_INFRA_BACKEND" "unsupported E2E_INFRA_BACKEND=<unset>" "$out_d"
+
+echo ""
 echo "── RESULT: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
