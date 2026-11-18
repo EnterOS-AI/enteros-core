@@ -10,6 +10,8 @@ import { STATUS_CONFIG, TIER_CONFIG } from "@/lib/design-tokens";
 import { useOrgDeployState } from "@/components/canvas/useOrgDeployState";
 import { OrgCancelButton } from "@/components/canvas/OrgCancelButton";
 import { isExternalLikeRuntime } from "@/lib/externalRuntimes";
+import { LightBadge } from "@/components/light/LightBadge";
+import { isParkedStatus, PARKED_STATUS_TOOLTIP } from "@/lib/light";
 
 /** How long a freshly-online workspace may render the "warming / composing
  *  greeting" state before the UI falls back to "ready". Bounds the greeting-
@@ -85,12 +87,18 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
     return () => window.clearTimeout(t);
   }, [shouldWarm]);
   const isWarming = shouldWarm && !warmTimedOut;
+  // Enter OS Light: a parked agent's pod is hibernated on purpose; it reads
+  // "Parked" (asleep between its scheduled runs), not as a stopped agent.
+  const lightState = data.lightState ?? null;
+  const isParked = isParkedStatus(data.status, lightState);
 
   const effectiveStatus = isMisconfigured
     ? "not_configured"
     : isWarming
       ? "warming"
-      : data.status;
+      : isParked
+        ? "parked"
+        : data.status;
   const statusCfg = STATUS_CONFIG[effectiveStatus] || STATUS_CONFIG.offline;
   const tierCfg = TIER_CONFIG[data.tier] || { label: `T${data.tier}`, color: "text-ink-mid bg-surface-card border border-line" };
   const tooltipExtra = isMisconfigured && configurationError
@@ -148,7 +156,9 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
           ? `${data.name} workspace — agent not configured: ${configurationError}`
           : isWarming
             ? `${data.name} workspace — online, composing greeting`
-            : `${data.name} workspace — ${data.status}`
+            : isParked
+              ? `${data.name} workspace — parked, ${PARKED_STATUS_TOOLTIP.toLowerCase()}`
+              : `${data.name} workspace — ${data.status}`
       }
       title={isMisconfigured && configurationError ? `Agent not configured: ${configurationError}` : undefined}
       aria-pressed={isSelected}
@@ -319,9 +329,10 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
           const isRemote = !!runtime && isExternalLikeRuntime(runtime);
           const isPlatformRoot = !data.parentId && hasChildren;
           const roleLabel = isPlatformRoot ? "PLATFORM · ROOT" : (data.role || null);
-          if (!roleLabel && !isRemote) return null;
+          if (!roleLabel && !isRemote && !lightState) return null;
           return (
-            <div className="mb-2.5 flex items-center gap-1.5">
+            <div className="mb-2.5 flex flex-wrap items-center gap-1.5">
+              {lightState && <LightBadge workspaceId={id} lightState={lightState} />}
               {roleLabel && (
                 <span className="max-w-[220px] truncate text-[10px] font-mono uppercase tracking-[0.04em] px-2 py-1 rounded-md text-accent bg-accent/12 border border-accent/35">
                   {roleLabel}
@@ -342,14 +353,19 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
         {/* Status line (concept) — uppercase status, "· N AGENTS" for parents,
             with a queued pill on the right. */}
         <div className="mb-2 flex items-center justify-between gap-2">
-          <span className={`text-[11px] font-mono uppercase tracking-[0.04em] ${
-            isOnline ? "text-good"
-              : effectiveStatus === "failed" ? "text-bad"
-              : (effectiveStatus === "provisioning" || effectiveStatus === "degraded") ? "text-warm"
-              : "text-ink-soft"
-          }`}>
-            {statusCfg.label}{hasChildren ? ` · ${descendantCount} agents` : ""}
-          </span>
+          {(() => {
+            const statusText = (
+              <span className={`text-[11px] font-mono uppercase tracking-[0.04em] ${
+                isOnline ? "text-good"
+                  : effectiveStatus === "failed" ? "text-bad"
+                  : (effectiveStatus === "provisioning" || effectiveStatus === "degraded") ? "text-warm"
+                  : "text-ink-soft"
+              }`}>
+                {statusCfg.label}{hasChildren ? ` · ${descendantCount} agents` : ""}
+              </span>
+            );
+            return isParked ? <Tooltip text={PARKED_STATUS_TOOLTIP}>{statusText}</Tooltip> : statusText;
+          })()}
           {data.activeTasks > 0 && (
             <span className="shrink-0 text-[11px] font-mono px-2 py-1 rounded-md text-ink-mid bg-surface-card border border-line">
               ≡ {data.activeTasks} queued

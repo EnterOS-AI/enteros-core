@@ -436,6 +436,11 @@ export interface WorkspaceData {
    *  greeted (no warming). */
   greeted?: boolean;
   compute?: WorkspaceCompute;
+  /** Enter OS Light state (docs/api-protocol/light-api.md): open, parking,
+   *  parked or opening; null for an ordinary agent. Absent on servers older
+   *  than the field — treated as null. Live changes arrive as
+   *  WORKSPACE_UPDATED {"light_state": ...}. */
+  light_state?: string | null;
 }
 
 export interface WorkspaceCompute {

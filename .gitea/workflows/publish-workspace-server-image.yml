@@ -5,23 +5,15 @@ name: publish-workspace-server-image
 # `staging-*` strings below are artifact-tag names retained for compatibility,
 # not evidence of a staging Git branch.
 #
-# CURRENT ORDERING
-# ----------------
-#   publish-workspace-server-image   (THIS FILE)  — build the tenant image
-#        push :staging-<sha> + :staging-latest
-#        dispatch redeploy-tenants-on-main.yml (best effort)
-#        wait for CI, then promote the candidate to :latest
+# Release ordering:
+#   publish-workspace-server-image builds :staging-<sha> + :staging-latest.
+#   staging-tenant-cd awaits that exact artifact and qualifies it end to end.
+#   promote-prod-tenant-pin manually promotes the qualified digest and rolls
+#   production. Image publication never dispatches a production operation.
 #
-# The redeploy workflow pulls molecule-tenant:latest. Because the best-effort
-# dispatch and the sibling push-trigger can both run before promote-latest moves
-# that tag, either run may pull the previous image. No post-promotion redeploy is
-# guaranteed by this workflow. A green publish therefore proves the artifact;
-# it does not by itself prove that any running tenant consumed that artifact.
-#
-# Before this file existed, the redeploy workflow triggered on
-# `workspace-server/**` / `canvas/**` pushes but NOTHING rebuilt the tenant
-# image, so a merged fix never produced a deployable artifact. This workflow
-# closes the artifact gap; the ordering gap described above remains open.
+# The legacy :latest alias remains a CI-green build alias behind the existing
+# freeze. Production releases consume the qualified immutable digest, not this
+# moving alias. See docs/operations/tenant-release.md.
 #
 # molecules-server (local-docker) era — NOT ECR
 # ---------------------------------------------
@@ -53,7 +45,7 @@ name: publish-workspace-server-image
 #   :latest         — most recent CI-GREEN build. Only moved by promote-latest
 #                     (main only, after green push CI, and only when the
 #                     production freeze PROD_AUTO_DEPLOY_DISABLED is lifted).
-#                     What the local-Docker main redeploy pulls.
+#                     Retained as a legacy build alias; not a release pin.
 #
 # The tenant image bakes BOTH the Go platform (workspace-server) AND the canvas
 # Next.js UI (workspace-server/Dockerfile.tenant, stage 2 at /canvas), which is
@@ -360,38 +352,6 @@ jobs:
           fi
           exit 0
 
-      # Best-effort dispatch after the candidate tags exist. The redeploy pulls
-      # :latest, which promote-latest moves only in the later job below, so this
-      # dispatch can still pull the prior image. The sibling push-trigger has
-      # the same race; neither path guarantees a post-promotion redeploy.
-      - name: Trigger matching redeploy after candidate push (best-effort; ordering not guaranteed)
-        if: github.event_name == 'push'
-        env:
-          DISPATCH_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
-          REPO: ${{ github.repository }}
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          set -uo pipefail
-          case "$REF_NAME" in
-            main)    wf="redeploy-tenants-on-main.yml" ;;
-            staging) wf="redeploy-tenants-on-staging.yml" ;;
-            *)       echo "::notice::no redeploy mapping for ref ${REF_NAME} — skipping"; exit 0 ;;
-          esac
-          if [ -z "${DISPATCH_TOKEN:-}" ]; then
-            echo "::notice::no dispatch token — relying on the redeploy push-trigger"; exit 0
-          fi
-          code=$(curl -sS -o /dev/null -w "%{http_code}" \
-            -X POST \
-            -H "Authorization: token ${DISPATCH_TOKEN}" \
-            -H "Content-Type: application/json" \
-            "https://git.moleculesai.app/api/v1/repos/${REPO}/actions/workflows/${wf}/dispatches" \
-            -d "{\"ref\":\"${REF_NAME}\"}") || code="000"
-          if [ "$code" = "204" ] || [ "$code" = "201" ] || [ "$code" = "200" ]; then
-            echo "::notice::dispatched ${wf} on ${REF_NAME} (HTTP ${code})"
-          else
-            echo "::warning::dispatch of ${wf} returned HTTP ${code} (non-fatal; the sibling push-trigger still makes a best-effort redeploy attempt, but neither path guarantees a post-promotion rollout)"
-          fi
-
   # bp-exempt: post-merge prod :latest promote side effect; gated on green push
   # CI for this SHA AND the PROD_AUTO_DEPLOY_DISABLED production freeze.
   promote-latest:
@@ -405,10 +365,8 @@ jobs:
     env:
       GITEA_HOST: git.moleculesai.app
       CI_STATUS_TIMEOUT_SECONDS: "3600"
-      # Reuses the production kill-switch: while local-Docker auto-redeploy is
-      # frozen, the :latest promote pauses too. This keeps that moving tag and
-      # the labeled local-Docker subset on their prior image until an operator
-      # lifts the freeze; it makes no claim about other provider paths.
+      # Preserve the existing freeze on the legacy :latest build alias. The
+      # manual production workflow consumes a staging-qualified digest.
       PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}
     steps:
       - name: Prepare writable HOME + Docker config

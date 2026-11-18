@@ -48,7 +48,9 @@
 # Deliberately NOT keyed on org_instances.status. That column is known to drift:
 # it reads 'running' for orgs that have no tenant pod at all. A roller keyed on a
 # status column inherits the column's lies; a roller keyed on live workloads
-# reports the drift instead (see the `no-workload` classification below).
+# reports the drift separately. A missing workload at discovery is inventory
+# drift, not a failed deployment. Existing targets are snapshotted before any
+# mutation; a target that disappears or fails during rollout is a release failure.
 #
 # Usage:
 #   redeploy-tenant-fleet-k8s.sh --digest sha256:<hex>  # PREFERRED for prod: re-pin every
@@ -321,38 +323,44 @@ sha_matches() {
   return 1
 }
 
-ELIGIBLE=0 ; ROLLED=0 ; SKIPPED=0 ; FAILED=0
+ELIGIBLE=0 ; ROLLED=0 ; SKIPPED=0 ; FAILED=0 ; MISSING=0
 REPORT=()   # slug|namespace|before|after|outcome
 
 record() { REPORT+=("$1|$2|$3|$4|$5"); }
 
 TENANT_SELECTOR="molecule.component=tenant,molecule.managed-by=controlplane"
 
+# Discover the complete target set before mutating any workload. A failed API
+# read must never be interpreted as an absent tenant, and a target disappearing
+# after this snapshot must fail the rollout rather than become inventory drift.
+LOCATIONS=()
 for i in "${!SEL_SLUGS[@]}"; do
   slug="${SEL_SLUGS[$i]}" ; orgid="${SEL_ORGIDS[$i]}"
   sel="${TENANT_SELECTOR},molecule.org-id=${orgid}"
-
-  # Locate the workload by CP identity (org-id label), cluster-wide. No name
-  # derivation: if the object is not labelled with this org's id, it is not this
-  # org's tenant, whatever it is called.
-  loc="$($KUBECTL get deploy -A -l "$sel" \
-          -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}' 2>/dev/null || true)"
+  if ! loc="$($KUBECTL get deploy -A -l "$sel" \
+          -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}')"; then
+    err "${slug}: workload discovery failed; refusing to treat an unread cluster as missing inventory"
+    exit 1
+  fi
+  LOCATIONS+=("$loc")
   nmatch="$(printf '%s' "$loc" | grep -c . || true)"
-
   if [ "$nmatch" -eq 0 ]; then
-    # CP says this org is on k8s, but no tenant Deployment carries its id. This is
-    # real drift and must be loud: the CP's org_instances.status column is known to
-    # read 'running' for orgs in exactly this state.
-    err "${slug}: control plane says substrate=k8s (instance_id='${SEL_INSTIDS[$i]}') but NO tenant Deployment carries molecule.org-id=${orgid}"
-    err "${slug}: control-plane state and cluster reality disagree — not silently skipping"
-    record "$slug" "-" "-" "-" "FAIL:no-workload"
-    FAILED=$((FAILED+1)); continue
+    printf '::warning::%s: no workload at discovery (org-id=%s, instance_id=%s); inventory reconciliation required, excluded from release targets\n' \
+      "$slug" "$orgid" "${SEL_INSTIDS[$i]}" >&2
+    record "$slug" "-" "-" "-" "DRIFT:no-workload"
+    MISSING=$((MISSING+1))
   fi
   if [ "$nmatch" -gt 1 ]; then
     err "${slug}: ${nmatch} Deployments carry molecule.org-id=${orgid} — ambiguous, refusing to roll"
-    record "$slug" "-" "-" "-" "FAIL:ambiguous"
-    FAILED=$((FAILED+1)); continue
+    exit 1
   fi
+done
+
+for i in "${!SEL_SLUGS[@]}"; do
+  loc="${LOCATIONS[$i]}"
+  [ -n "$loc" ] || continue
+  slug="${SEL_SLUGS[$i]}" ; orgid="${SEL_ORGIDS[$i]}"
+  sel="${TENANT_SELECTOR},molecule.org-id=${orgid}"
 
   ns="$(printf '%s' "$loc" | cut -f1)"
   dep="$(printf '%s' "$loc" | cut -f2)"
@@ -493,14 +501,12 @@ short() {
   printf '\n'
 } >&2
 
-log "SUMMARY found=${FOUND} eligible=${ELIGIBLE} rolled=${ROLLED} skipped=${SKIPPED} failed=${FAILED} target=${TARGET_LABEL}"
+log "SUMMARY found=${FOUND} eligible=${ELIGIBLE} rolled=${ROLLED} skipped=${SKIPPED} failed=${FAILED} missing=${MISSING} target=${TARGET_LABEL}"
 
 if [ "$DRY_RUN" = "1" ]; then
   log "DRY-RUN complete — zero mutations performed"
-  # A dry run still DISCOVERS. If discovery itself found drift (a CP org on the
-  # k8s substrate with no workload carrying its id, or an ambiguous match), the
-  # plan is not executable and saying so only in the table would let a --dry-run
-  # gate go green over a fleet it could not actually roll.
+  # Existing workloads must be executable targets. Missing inventory is
+  # reported above and has no bearing on whether these targets can roll.
   if [ "$FAILED" -gt 0 ]; then
     err "DRY-RUN found ${FAILED} tenant(s) that could not even be resolved to a rollable workload — the plan is not executable"
     exit 1
@@ -531,4 +537,4 @@ if [ "$FAILED" -gt 0 ]; then
   exit 1
 fi
 
-log "k8s fleet roll complete: ${ROLLED}/${FOUND} tenant(s) verified live on ${TARGET_DIGEST:-$TARGET_LABEL}"
+log "k8s fleet roll complete: ${ROLLED}/${ELIGIBLE} target(s) verified live on ${TARGET_DIGEST:-$TARGET_LABEL}; missing inventory=${MISSING}"

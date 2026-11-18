@@ -164,6 +164,21 @@ type WorkspaceHandler struct {
 	// it via SetWakeReEmitter to WakeReEmitter(greeter). Exactly-once safety is the
 	// re-emission path's own (has_greeted CAS / queue dedup), never re-drive's.
 	wakeReEmit func(ctx context.Context, workspaceID string, kind WakeKind, idempotencyKey string, generation int64) error
+
+	// lightAPI is the control plane's Enter OS Light surface (contract C4). nil
+	// on a tenant platform without a control plane (self-host): the Light
+	// endpoints then answer 501 LIGHT_UNSUPPORTED. main.go wires it from the
+	// CP provisioner via SetLightAPI.
+	lightAPI provisioner.LightAPI
+	// lightScheduleReader is a test seam for the park's read of the agent's
+	// schedule grid; nil = the schedules proxy (light_park.go).
+	lightScheduleReader func(ctx context.Context, workspaceID string) ([]volumeEntry, error)
+}
+
+// SetLightAPI wires the control plane's Light routes (C4). Called once from
+// main.go when a CP provisioner exists.
+func (h *WorkspaceHandler) SetLightAPI(api provisioner.LightAPI) {
+	h.lightAPI = api
 }
 
 // SetWakeHooks wires the wake-lifecycle desired-state owner into this handler's
@@ -630,6 +645,17 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// providers.yaml (P2-A artifact); the check stays in sync with the SSOT
 	// via the verify-providers-gen + sync-providers-yaml CI gates.
 	if !isExternal {
+		if isAutoModel(payload.Model) {
+			secretKeys := make([]string, 0, len(payload.Secrets))
+			for k := range payload.Secrets {
+				secretKeys = append(secretKeys, k)
+			}
+			if anyDirectVendorKey(secretKeys) || tenantHoldsDirectVendorKey(c.Request.Context()) {
+				log.Printf("Create: 422 %s (runtime=%q model=%q)", autoRequiresPlatformCreditsCode, payload.Runtime, payload.Model)
+				respondAutoRequiresPlatformCredits(c, payload.Runtime, payload.Model)
+				return
+			}
+		}
 		if ok, why := validateRegisteredModelForRuntime(payload.Runtime, payload.Model); !ok {
 			log.Printf("Create: 422 UNREGISTERED_MODEL_FOR_RUNTIME (runtime=%q model=%q): %s [internal#718 P4 PR-2 hard-reject]", payload.Runtime, payload.Model, why)
 			c.JSON(http.StatusUnprocessableEntity, gin.H{
@@ -1554,7 +1580,7 @@ func (h *WorkspaceHandler) ProvisionTimeoutSecondsForRuntime(runtime string) int
 func scanWorkspaceRow(rows interface {
 	Scan(dest ...interface{}) error
 }) (map[string]interface{}, error) {
-	var id, name, role, status, url, sampleError, currentTask, runtime, workspaceDir, kind string
+	var id, name, role, status, url, sampleError, currentTask, runtime, workspaceDir, kind, lightState string
 	var computeRaw, loadedMCPToolsRaw, mcpSurfaceRaw []byte
 	var tier, activeTasks, maxConcurrentTasks, uptimeSeconds int
 	var errorRate, x, y float64
@@ -1568,7 +1594,7 @@ func scanWorkspaceRow(rows interface {
 		&parentID, &activeTasks, &maxConcurrentTasks, &errorRate, &sampleError, &uptimeSeconds,
 		&currentTask, &runtime, &workspaceDir, &x, &y, &collapsed,
 		&budgetLimit, &monthlySpend, &broadcastEnabled, &talkToUserEnabled, &computeRaw, &kind,
-		&loadedMCPToolsRaw, &mcpSurfaceRaw)
+		&loadedMCPToolsRaw, &mcpSurfaceRaw, &lightState)
 	if err != nil {
 		return nil, err
 	}
@@ -1657,6 +1683,16 @@ func scanWorkspaceRow(rows interface {
 		ws["mcp_surface"] = nil
 	}
 
+	// Enter OS Light (docs/api-protocol/light-api.md): the agent's Light state
+	// (open, parking, parked, opening), null for an ordinary agent. The canvas
+	// renders the Light badge and the Light-aware tabs from it; live changes
+	// arrive as WORKSPACE_UPDATED {"light_state": ...}.
+	if lightState != "" {
+		ws["light_state"] = lightState
+	} else {
+		ws["light_state"] = nil
+	}
+
 	return ws, nil
 }
 
@@ -1674,7 +1710,8 @@ const workspaceListQuery = `
 		   COALESCE(w.compute, '{}'::jsonb),
 		   COALESCE(w.kind, 'workspace'),
 		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb),
-		   COALESCE(w.mcp_surface::text, '')
+		   COALESCE(w.mcp_surface::text, ''),
+		   COALESCE(w.light_state, '')
 	FROM workspaces w
 	LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 	WHERE w.status != 'removed'
@@ -1778,7 +1815,8 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 			   COALESCE(w.compute, '{}'::jsonb),
 		   COALESCE(w.kind, 'workspace'),
 		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb),
-		   COALESCE(w.mcp_surface::text, '')
+		   COALESCE(w.mcp_surface::text, ''),
+		   COALESCE(w.light_state, '')
 		FROM workspaces w
 		LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 		WHERE w.id = $1

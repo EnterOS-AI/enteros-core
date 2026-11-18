@@ -53,6 +53,26 @@ beforeEach(() => {
 });
 
 describe("ContainerConfigTab", () => {
+  it("a parked Light agent's container status reads Parked, with the tooltip", () => {
+    render(
+      <ContainerConfigTab
+        workspaceId="ws-parked"
+        data={{
+          runtime: "hermes",
+          status: "hibernated",
+          lightState: "parked",
+          needsRestart: false,
+          activeTasks: 0,
+          maxConcurrentTasks: null,
+          workspaceAccess: "none",
+          deliveryMode: "push",
+          compute: undefined,
+        }}
+      />,
+    );
+    expect(screen.getByText("Parked").getAttribute("title")).toBe("Asleep between scheduled runs");
+  });
+
   it("defaults missing compute to the cost-efficient headless profile", () => {
     render(
       <ContainerConfigTab

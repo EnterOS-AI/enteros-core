@@ -54,13 +54,13 @@ run_test "claude-code → OAuth/default alias"                      claude-code 
 # bare resolves to provider=minimax BYOK. Pinned by the matrix test's
 # colon-vs-slash-vs-bare triple in derive_provider_matrix_test.go.
 got=$(unset E2E_MODEL_SLUG E2E_ANTHROPIC_API_KEY; E2E_MINIMAX_API_KEY="mx-test" pick_model_slug claude-code)
-assert_eq "claude-code + MiniMax key → bare registered MiniMax model" "$got" "MiniMax-M2.7"
+assert_eq "claude-code + MiniMax key → bare registered MiniMax model" "$got" "MiniMax-M3"
 
 got=$(unset E2E_MODEL_SLUG E2E_MINIMAX_API_KEY; E2E_ANTHROPIC_API_KEY="sk-ant-test" pick_model_slug claude-code)
 assert_eq "claude-code + Anthropic API key → Anthropic API model" "$got" "claude-sonnet-4-6"
 
 got=$(unset E2E_MODEL_SLUG; E2E_MINIMAX_API_KEY="mx-priority" E2E_ANTHROPIC_API_KEY="sk-ant-loser" pick_model_slug claude-code)
-assert_eq "claude-code + both keys → MiniMax priority (bare)"     "$got" "MiniMax-M2.7"
+assert_eq "claude-code + both keys → MiniMax priority (bare)"     "$got" "MiniMax-M3"
 
 # ── seo-agent (hermes template variant, platform-proxy models only) ──
 # Since seo-agent template #29 the variant runs on hermes and registers only
@@ -84,26 +84,36 @@ run_test "unknown runtime → slash-form fallback"                   gemini     
 run_test "empty runtime → slash-form fallback"                     ""          "openai/gpt-4o"
 
 # ── Platform-managed path (E2E_LLM_PATH=platform) ──
-# Selects the slash-namespaced platform model, defaulting to the shared platform
-# SSOT default (minimax/MiniMax-M2.7 — MOLECULE_LLM_DEFAULT_MODEL), takes
-# precedence over the per-key BYOK branches, and is itself overridden by
-# E2E_MODEL_SLUG. These pins guard the harness's ability to drive the platform
-# arm with the SAME default a fresh tenant resolves.
+# Selects the slash-namespaced platform model, defaulting to the e2e model
+# (google/gemini-3.1-flash-lite, the cheapest platform Gemini model — never the
+# gemini-4-hydrogen platform default), takes precedence over the per-key BYOK
+# branches, and is itself overridden by E2E_MODEL_SLUG and
+# E2E_DEFAULT_PLATFORM_MODEL.
 echo
 echo "Test: pick_model_slug — platform-managed path (E2E_LLM_PATH=platform)"
 echo
 
 got=$(unset E2E_MODEL_SLUG E2E_DEFAULT_PLATFORM_MODEL; E2E_LLM_PATH=platform pick_model_slug claude-code)
-assert_eq "claude-code + platform path → shared SSOT default model" "$got" "minimax/MiniMax-M2.7"
+assert_eq "claude-code + platform path → the e2e model (flash-lite)" "$got" "google/gemini-3.1-flash-lite"
+
+got=$(unset E2E_MODEL_SLUG E2E_DEFAULT_PLATFORM_MODEL; E2E_LLM_PATH=platform pick_model_slug hermes)
+assert_eq "hermes + platform path → the e2e model (flash-lite)"    "$got" "google/gemini-3.1-flash-lite"
 
 got=$(unset E2E_MODEL_SLUG E2E_DEFAULT_PLATFORM_MODEL; E2E_LLM_PATH=platform E2E_MINIMAX_API_KEY="mx-stray" pick_model_slug claude-code)
-assert_eq "platform path beats a stray BYOK key (no mask)"         "$got" "minimax/MiniMax-M2.7"
+assert_eq "platform path beats a stray BYOK key (no mask)"         "$got" "google/gemini-3.1-flash-lite"
 
-got=$(unset E2E_MODEL_SLUG; E2E_LLM_PATH=platform E2E_DEFAULT_PLATFORM_MODEL="minimax/MiniMax-M3" pick_model_slug claude-code)
-assert_eq "platform path honours E2E_DEFAULT_PLATFORM_MODEL"        "$got" "minimax/MiniMax-M3"
+# The e2e fallback is never the platform default (owner 2026-11-17: the
+# cheapest model for any e2e testing, Carbon for the default).
+case "$E2E_DEFAULT_PLATFORM_MODEL_FALLBACK" in
+  *carbon*) assert_eq "e2e fallback is not the Carbon default" "$E2E_DEFAULT_PLATFORM_MODEL_FALLBACK" "<not carbon>" ;;
+  *)        assert_eq "e2e fallback is not the Carbon default" "ok" "ok" ;;
+esac
 
-got=$(unset E2E_DEFAULT_PLATFORM_MODEL; E2E_MODEL_SLUG="minimax/MiniMax-M3" E2E_LLM_PATH=platform pick_model_slug claude-code)
-assert_eq "E2E_MODEL_SLUG still wins over platform path"            "$got" "minimax/MiniMax-M3"
+got=$(unset E2E_MODEL_SLUG; E2E_LLM_PATH=platform E2E_DEFAULT_PLATFORM_MODEL="minimax/MiniMax-M2.7-highspeed" pick_model_slug claude-code)
+assert_eq "platform path honours E2E_DEFAULT_PLATFORM_MODEL"        "$got" "minimax/MiniMax-M2.7-highspeed"
+
+got=$(unset E2E_DEFAULT_PLATFORM_MODEL; E2E_MODEL_SLUG="minimax/MiniMax-M2.7-highspeed" E2E_LLM_PATH=platform pick_model_slug claude-code)
+assert_eq "E2E_MODEL_SLUG still wins over platform path"            "$got" "minimax/MiniMax-M2.7-highspeed"
 
 # ── Override via E2E_MODEL_SLUG ──
 # When the operator sets E2E_MODEL_SLUG, the per-runtime dispatch is

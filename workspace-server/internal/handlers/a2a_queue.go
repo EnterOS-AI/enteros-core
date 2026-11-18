@@ -24,6 +24,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/messagestore"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/textutil"
 )
 
@@ -725,6 +726,15 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 		log.Printf("A2AQueue drain: workspace %s has a restart-context boot turn in flight — deferring drain to the next heartbeat", workspaceID)
 		return
 	}
+	if holdQueueAfterRestart(ctx, workspaceID) {
+		log.Printf("A2AQueue drain: workspace %s was restarted and has not stayed ready for %s yet — holding its queue", workspaceID, restartQueueHoldGrace)
+		return
+	}
+	// Enter OS Light (C5): a parking or parked Light agent's queue is not
+	// drained — its items wait, untouched, for the agent to be opened.
+	if ref := lightWakeRefusal(ctx, workspaceID, "queue-drain"); ref != nil {
+		return
+	}
 	// The agent URL is CONSTANT for this workspace across the whole drain call, so
 	// evict+resolve it exactly ONCE (finding [8]) — lazily, on the first dequeued
 	// item, so an empty queue does no DB read and the resolve keeps its original
@@ -1237,6 +1247,7 @@ func (h *WorkspaceHandler) sweepA2AQueue(ctx context.Context) {
 		WHERE q.status = 'queued'
 		  AND (q.expires_at IS NULL OR q.expires_at > now())
 		  AND w.status IN ('online', 'degraded')
+		  AND `+models.LightWakeAllowedSQLFor("w")+`
 		GROUP BY q.workspace_id, w.max_concurrent_tasks
 	`)
 	if err != nil {

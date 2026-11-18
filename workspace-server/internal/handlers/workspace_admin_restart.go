@@ -87,6 +87,9 @@ func (h *WorkspaceHandler) AdminRestart(c *gin.Context) {
 		return
 	}
 
+	// A deliberate restart: automatic restarts get their full budget back.
+	resetAutoRestarts(id)
+
 	// Fire the restart ASYNC — same pattern as the user-facing
 	// POST /workspaces/:id/restart handler. The actual restart runs
 	// in a goroutine; we return 202 Accepted immediately so the

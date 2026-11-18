@@ -282,7 +282,7 @@ func TestIntegration_AutoRestartCycle_DeclineIsRecordedByTheCycleItself(t *testi
 	stub := &prewarmCPProv{ensureErr: errors.New("manifest unknown: sha256:93dfaf12")}
 	h := &WorkspaceHandler{cpProv: stub, broadcaster: newTestBroadcaster()}
 
-	h.runRestartCycle(id)
+	h.runRestartCycle(id, "")
 	h.waitAsyncForTest()
 
 	for _, c := range stub.calls {

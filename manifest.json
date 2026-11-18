@@ -28,12 +28,12 @@
     {"name": "lark-channel", "repo": "molecule-ai/lark-channel-molecule", "ref": "973a35b70d17694c6412b40fe963689fae2a353f"}
   ],
   "workspace_templates": [
-    {"name": "claude-code-default", "repo": "molecule-ai/molecule-ai-workspace-template-claude-code", "ref": "950d39a490c12ba0f355ed8ca03b23fda9884823"},
+    {"name": "claude-code-default", "repo": "molecule-ai/molecule-ai-workspace-template-claude-code", "ref": "631a04e506c3af537c343bfe8b8cbe9ba958940d"},
     {"name": "platform-agent", "repo": "molecule-ai/molecule-ai-workspace-template-platform-agent", "ref": "c61e905dd6fd322a75aab85ad7e8855608241c31", "runtime": "claude-code"},
-    {"name": "hermes", "repo": "molecule-ai/molecule-ai-workspace-template-hermes", "ref": "57737761288d85b6c381f1060e6f4d626db8170e"},
-    {"name": "openclaw", "repo": "molecule-ai/molecule-ai-workspace-template-openclaw", "ref": "0e76a281e93d338f05ed7468cf95047a9d87bae4"},
+    {"name": "hermes", "repo": "molecule-ai/molecule-ai-workspace-template-hermes", "ref": "d559ae35c61328174e741626ae8be97869d5ab6e"},
+    {"name": "openclaw", "repo": "molecule-ai/molecule-ai-workspace-template-openclaw", "ref": "bd8fdb9ad2abbbfd33a5418e45b4db4bd9dd2921"},
     {"name": "codex", "repo": "molecule-ai/molecule-ai-workspace-template-codex", "ref": "070447a0afdf66ae6f2bb166ac3e2b2884456951"},
-    {"name": "seo-agent", "repo": "molecule-ai/molecule-ai-workspace-template-seo-agent", "ref": "34a1bd853f7de2e6021f18f40153ba0f47fc0b50", "runtime": "hermes", "private": true}
+    {"name": "seo-agent", "repo": "molecule-ai/molecule-ai-workspace-template-seo-agent", "ref": "d9e7304271a1afd8f767d05a835bada1c9791ed4", "runtime": "hermes", "private": true}
   ],
   "org_templates": [
     {"name": "mini-company", "repo": "molecule-ai/molecule-ai-org-template-mini-company", "ref": "33088ca03a5dca5f4ebd7c3014254a81a81faeed"},

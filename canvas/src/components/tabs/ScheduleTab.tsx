@@ -3,6 +3,14 @@
 import { useState, useEffect, useCallback, useId } from "react";
 import { api } from "@/lib/api";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { cronToHuman } from "@/lib/cron-human";
+import type { LightState } from "@/lib/light";
+import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
+import { LightCard } from "@/components/light/LightCard";
+import { LightRunsList } from "@/components/light/LightRunsList";
+import { LightScheduleList } from "@/components/light/LightScheduleList";
+import { useLightInfo } from "@/components/light/useLightInfo";
+import { useSingleFlight } from "@/components/light/useSingleFlight";
 
 export interface Schedule {
   id: string;
@@ -22,20 +30,9 @@ export interface Schedule {
 
 interface Props {
   workspaceId: string;
-}
-
-function cronToHuman(expr: string): string {
-  const parts = expr.trim().split(/\s+/);
-  if (parts.length !== 5) return expr;
-  const [min, hour, dom, mon, dow] = parts;
-  if (min === "*" && hour === "*") return `Every minute`;
-  if (min.startsWith("*/")) return `Every ${min.slice(2)} minutes`;
-  if (hour.startsWith("*/") && min === "0") return `Every ${hour.slice(2)} hours`;
-  if (dom === "*" && mon === "*" && dow === "*" && !hour.startsWith("*/"))
-    return `Daily at ${hour.padStart(2, "0")}:${min.padStart(2, "0")} UTC`;
-  if (dom === "*" && mon === "*" && dow === "1-5" && !hour.startsWith("*/"))
-    return `Weekdays at ${hour.padStart(2, "0")}:${min.padStart(2, "0")} UTC`;
-  return expr;
+  /** The workspace's node data. With it the tab adds the Enter OS Light card
+   *  and runs list; without it (older hosts) it is the schedule list alone. */
+  data?: WorkspaceNodeData;
 }
 
 function relativeTime(iso: string | null): string {
@@ -54,7 +51,27 @@ function relativeTime(iso: string | null): string {
   return `${Math.round(diff / 86400000)}d ago`;
 }
 
-export function ScheduleTab({ workspaceId }: Props) {
+export function ScheduleTab({ workspaceId, data }: Props) {
+  // Enter OS Light (docs/api-protocol/light-api.md). The node's light_state
+  // decides whether to poll GET /light; once polled, GET /light's answer is
+  // the state the tab renders, and it corrects a node that missed an event.
+  const nodeLightState = data?.lightState ?? null;
+  const onLightState = useCallback(
+    (state: LightState | null) => {
+      const store = useCanvasStore.getState();
+      const node = store.nodes.find((n) => n.id === workspaceId);
+      if (node && (node.data.lightState ?? null) !== state) store.updateNodeData(workspaceId, { lightState: state });
+    },
+    [workspaceId],
+  );
+  const light = useLightInfo(workspaceId, nodeLightState, data !== undefined && nodeLightState !== null, onLightState);
+  const lightState: LightState | null = data === undefined ? null : light.info ? light.info.light_state : nodeLightState;
+  // Parked, parking or opening: the agent is asleep (or not up yet), so its
+  // own schedule API is never called; the list comes from GET /light.
+  const asleep = lightState === "parked" || lightState === "parking" || lightState === "opening";
+  const { busy, run } = useSingleFlight();
+  const [runsKey, setRunsKey] = useState(0);
+
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
@@ -86,10 +103,11 @@ export function ScheduleTab({ workspaceId }: Props) {
   }, [workspaceId]);
 
   useEffect(() => {
+    if (asleep) return;
     fetchSchedules();
     const interval = setInterval(fetchSchedules, 10000);
     return () => clearInterval(interval);
-  }, [fetchSchedules]);
+  }, [fetchSchedules, asleep]);
 
   const resetForm = () => {
     setFormName("");
@@ -163,6 +181,9 @@ export function ScheduleTab({ workspaceId }: Props) {
   };
 
   const handleRunNow = async (sched: Schedule) => {
+    // The agent's own run path wakes nothing, but a parked agent's runs go
+    // through Light (its own list is not shown then); never post to it.
+    if (asleep) return;
     try {
       const result = await api.post<{ prompt?: string; fired_by?: string }>(
         `/workspaces/${workspaceId}/schedules/${sched.id}/run`,
@@ -191,12 +212,62 @@ export function ScheduleTab({ workspaceId }: Props) {
     }
   };
 
+  const lightCard = data ? (
+    <LightCard
+      workspaceId={workspaceId}
+      data={data}
+      state={lightState}
+      info={light.info}
+      loadError={light.error}
+      busy={busy}
+      run={run}
+      onState={light.applyState}
+    />
+  ) : null;
+  // Shown for a Light agent, or an ordinary one with run history (an agent
+  // that was a Light agent keeps its runs after disable).
+  const runsList = data ? (
+    <LightRunsList
+      workspaceId={workspaceId}
+      isLight={lightState !== null}
+      scheduleNames={(light.info?.schedules ?? []).map((s) => s.name)}
+      refreshKey={runsKey}
+    />
+  ) : null;
+
+  if (asleep && lightState) {
+    return (
+      <div className="flex flex-col min-h-full">
+        {lightCard}
+        {light.info ? (
+          <LightScheduleList
+            workspaceId={workspaceId}
+            state={lightState}
+            schedules={light.info.schedules}
+            busy={busy}
+            run={run}
+            onRunStarted={() => setRunsKey((k) => k + 1)}
+          />
+        ) : (
+          <div className="p-4 text-[10px] text-ink-mid">Loading schedules...</div>
+        )}
+        {runsList}
+      </div>
+    );
+  }
+
   if (loading) {
-    return <div className="p-4 text-[10px] text-ink-mid">Loading schedules...</div>;
+    return (
+      <div className="flex flex-col min-h-full">
+        {lightCard}
+        <div className="p-4 text-[10px] text-ink-mid">Loading schedules...</div>
+      </div>
+    );
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col min-h-full">
+      {lightCard}
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-line/50">
         <span className="text-[10px] font-semibold text-ink-mid uppercase tracking-wider">
@@ -319,8 +390,9 @@ export function ScheduleTab({ workspaceId }: Props) {
         </div>
       )}
 
-      {/* Schedule List */}
-      <div className="flex-1 overflow-y-auto">
+      {/* Schedule List — the tab panel scrolls, so the runs list below
+          follows the schedules instead of sitting under a second scroller. */}
+      <div className="flex-1">
         {schedules.length === 0 && !showForm ? (
           <div className="p-6 text-center">
             <div className="text-2xl mb-2">⏲</div>
@@ -413,6 +485,8 @@ export function ScheduleTab({ workspaceId }: Props) {
           ))
         )}
       </div>
+
+      {runsList}
 
       <ConfirmDialog
         open={!!pendingDelete}

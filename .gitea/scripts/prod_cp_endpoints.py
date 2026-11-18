@@ -33,6 +33,8 @@ half-parsed endpoint table silently drops a control plane.
 
 from __future__ import annotations
 
+import argparse
+import re
 import sys
 
 # The Infisical environment SLUGS. `production` is NOT one of them: a promote
@@ -58,6 +60,8 @@ def parse_endpoints(spec: str) -> list[tuple[str, str, str]]:
         label, base, env = (p.strip() for p in parts)
         if not label or not base or not env:
             raise ValueError(f"endpoint {entry!r} has an empty field")
+        if not re.fullmatch(r"[a-zA-Z0-9_-]+", label):
+            raise ValueError("endpoint label must contain only letters, digits, underscores or hyphens")
         if not base.startswith(("http://", "https://")):
             raise ValueError(f"endpoint {entry!r} base url must be http(s)://")
         if env not in VALID_ENVS:
@@ -74,14 +78,16 @@ def parse_endpoints(spec: str) -> list[tuple[str, str, str]]:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print(
-            "usage: prod_cp_endpoints.py '<label>=<url>=<env>[,...]'",
-            file=sys.stderr,
-        )
-        return 2
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("spec")
+    parser.add_argument("--env", choices=sorted(VALID_ENVS))
+    args = parser.parse_args(argv[1:])
     try:
-        rows = parse_endpoints(argv[1])
+        rows = parse_endpoints(args.spec)
+        if args.env:
+            rows = [row for row in rows if row[2] == args.env]
+            if not rows:
+                raise ValueError(f"endpoint table contains no {args.env} control plane")
     except ValueError as exc:
         print(f"::error::{exc}", file=sys.stderr)
         return 2

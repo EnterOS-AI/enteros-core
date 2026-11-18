@@ -202,6 +202,8 @@ var ensureInstallFn = installPlatformAgent
 // (maybeMarkContainerDead / preflightContainerHealth), not for config-driven
 // ensures; coalescing (preserved by the mutation variant) still bounds thrash.
 func (h *WorkspaceHandler) triggerPlatformProvision(id string) {
+	// The repair button is a deliberate recovery: full automatic-restart budget again.
+	resetAutoRestarts(id)
 	if h.provisionTriggerOverride != nil {
 		h.provisionTriggerOverride(id)
 		return
