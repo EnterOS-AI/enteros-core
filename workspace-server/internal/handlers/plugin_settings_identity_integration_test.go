@@ -52,9 +52,11 @@ func installPlugin(t *testing.T, conn *sql.DB, ws, name string) {
 
 func uninstallPlugin(t *testing.T, conn *sql.DB, ws, name string) {
 	t.Helper()
-	// EXACTLY what PluginsHandler.Uninstall does (plugins_tracking.go): it
-	// removes the INSTALLED row and leaves the DECLARED row alone. It does not
-	// touch workspace_plugin_settings — which is the decision under test.
+	// EXACTLY what the push paths of PluginsHandler.Uninstall (docker exec,
+	// EIC) do (plugins_tracking.go): they remove the INSTALLED row and leave the
+	// DECLARED row alone. The pull path (uninstallByPull) deletes the declared
+	// row too; plugins_uninstall_pull_integration_test.go covers it. Neither
+	// touches workspace_plugin_settings — which is the decision under test.
 	if _, err := conn.ExecContext(context.Background(),
 		`DELETE FROM workspace_plugins WHERE workspace_id = $1 AND plugin_name = $2`,
 		ws, name); err != nil {
