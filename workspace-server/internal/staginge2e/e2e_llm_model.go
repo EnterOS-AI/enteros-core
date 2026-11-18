@@ -65,6 +65,27 @@ func adminCreateOrgBody(slug, name, provider string, llmModels []string) (string
 	return string(b), nil
 }
 
+// servedThroughCIGateway reports whether an OpenAI chat completion returned for
+// requested ("vendor/model") came from the CI LLM gateway rather than that
+// vendor. The gateway rewrites any requested model and answers with its own
+// served model ("huihui-ai/Qwen3-VL-30B-A3B-Instruct-abliterated" on
+// 2026-11-18), never the vendor's, so a reply that names the vendor, or no
+// model at all, is not the gateway. served is what the reply named.
+func servedThroughCIGateway(requested, body string) (served string, ok bool) {
+	var r struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal([]byte(body), &r) != nil {
+		return "", false
+	}
+	served = strings.TrimSpace(r.Model)
+	vendor, _, _ := strings.Cut(requested, "/")
+	if served == "" || (vendor != "" && strings.Contains(strings.ToLower(served), strings.ToLower(vendor))) {
+		return served, false
+	}
+	return served, true
+}
+
 // workspaceModelFromBody reads GET /workspaces/:id/model ({"model","source"}).
 func workspaceModelFromBody(body string) (model, source string) {
 	var r struct {

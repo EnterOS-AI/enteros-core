@@ -60,3 +60,20 @@ func TestWorkspaceModelFromBody(t *testing.T) {
 		t.Fatalf("got %q %q", m, s)
 	}
 }
+
+func TestServedThroughCIGateway(t *testing.T) {
+	const req = "minimax/MiniMax-M3"
+	if served, ok := servedThroughCIGateway(req, `{"id":"x","model":"huihui-ai/Qwen3-VL-30B-A3B-Instruct-abliterated","choices":[]}`); !ok || served == "" {
+		t.Fatalf("a gateway reply was not recognised (served %q)", served)
+	}
+	for _, body := range []string{
+		`{"id":"x","model":"MiniMax-M3","choices":[]}`,
+		`{"id":"x","model":"minimax/MiniMax-M3"}`,
+		`{"id":"x","choices":[]}`,
+		`not json`,
+	} {
+		if served, ok := servedThroughCIGateway(req, body); ok {
+			t.Fatalf("%s was taken as the gateway (served %q)", body, served)
+		}
+	}
+}

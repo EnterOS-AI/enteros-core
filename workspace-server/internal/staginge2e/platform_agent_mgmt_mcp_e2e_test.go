@@ -304,6 +304,12 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 	// seed. A concierge on any other model would have every turn below refused
 	// by the org allowlist, so this is asserted first, with its own message.
 	assertWorkspaceModel(t, host, token, orgID, platformID, "platform agent (concierge)", e2eModel, true)
+	// On the CI LLM gateway's model (staging-tenant-cd picks minimax/MiniMax-M3
+	// when the gateway is up), prove staging really serves it through the
+	// gateway before the LLM steps below run on it.
+	if strings.HasPrefix(e2eModel, "minimax/") {
+		assertServedThroughCIGateway(t, cfg, token, e2eModel)
+	}
 
 	// The CALLABLE proof (Guard B core): drive a REAL A2A tool-use turn asking the
 	// concierge to actually RUN provision_workspace, and assert the deterministic
@@ -335,6 +341,27 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 	}
 	t.Logf("Guard B gate GREEN for fresh org %s (runtime=%q expected=%q present=%s tools=[%s] callable_armed=%v require_live=%v): %s",
 		slug, probe.ObservedRuntime, expectedRuntime, lastPresent, lastTools, assertCallable, requireCallable, reason)
+}
+
+// assertServedThroughCIGateway sends one max_tokens=1 completion through the
+// staging CP proxy as this org (free on the gateway) and fails if the reply
+// did not come from the CI LLM gateway: staging would then be sending model to
+// its vendor, and this gate would spend there. A non-200 only logs (the gate's
+// own LLM steps report the real failure).
+func assertServedThroughCIGateway(t *testing.T, cfg stagingCfg, token, model string) {
+	t.Helper()
+	body := fmt.Sprintf(`{"model":%q,"max_tokens":1,"messages":[{"role":"user","content":"ping"}]}`, model)
+	status, resp := doJSON(t, "POST", cfg.cpBase+"/cp/internal/llm/openai/v1/chat/completions", token, body)
+	if status != http.StatusOK {
+		t.Logf("WARNING: routing probe for %s answered HTTP %d; not asserting where staging sends it this run", model, status)
+		return
+	}
+	served, ok := servedThroughCIGateway(model, resp)
+	if !ok {
+		t.Fatalf("staging served %s as %q, not through the CI LLM gateway: its upstream for that vendor is no longer "+
+			"the gateway, and this gate would spend there. Repoint staging's MINIMAX_*_BASE_URL or pick another E2E_MODEL", model, served)
+	}
+	t.Logf("routing: staging serves %s through the CI LLM gateway (served model %s)", model, served)
 }
 
 // assertWorkspaceModel reads GET /workspaces/<id>/model until it reports a
