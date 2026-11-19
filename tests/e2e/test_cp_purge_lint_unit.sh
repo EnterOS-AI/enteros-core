@@ -65,7 +65,7 @@ for sub in tests scripts .gitea; do
 done
 
 fresh_copy() {  # <name> -> echoes the new root
-  local name="$1" root="$WORK/$1"
+  local root="$WORK/$1"
   rm -rf "$root"
   cp -R "$PRISTINE" "$root"
   printf '%s' "$root"
