@@ -29,7 +29,7 @@
   ],
   "workspace_templates": [
     {"name": "claude-code-default", "repo": "molecule-ai/molecule-ai-workspace-template-claude-code", "ref": "631a04e506c3af537c343bfe8b8cbe9ba958940d"},
-    {"name": "platform-agent", "repo": "molecule-ai/molecule-ai-workspace-template-platform-agent", "ref": "c61e905dd6fd322a75aab85ad7e8855608241c31", "runtime": "claude-code"},
+    {"name": "platform-agent", "repo": "molecule-ai/molecule-ai-workspace-template-platform-agent", "ref": "357067c65aca1e68e4fe50824f7f00f8416a4a69", "runtime": "claude-code"},
     {"name": "hermes", "repo": "molecule-ai/molecule-ai-workspace-template-hermes", "ref": "d559ae35c61328174e741626ae8be97869d5ab6e"},
     {"name": "openclaw", "repo": "molecule-ai/molecule-ai-workspace-template-openclaw", "ref": "bd8fdb9ad2abbbfd33a5418e45b4db4bd9dd2921"},
     {"name": "codex", "repo": "molecule-ai/molecule-ai-workspace-template-codex", "ref": "070447a0afdf66ae6f2bb166ac3e2b2884456951"},
