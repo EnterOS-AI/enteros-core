@@ -2067,6 +2067,12 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 	// returned via an unlogged path."
 	log.Printf("CPProvisioner: goroutine entered for %s (runtime=%s, mode=cp)", workspaceID, payload.Runtime)
 	defer h.logProvisionPanic(workspaceID, "cp")
+	// On the in-flight list from here until this function returns, so a delete
+	// can wait for it (workspace_cp_inflight_provision.go). BEFORE the
+	// removed-check below: a delete marks its rows removed and then looks at
+	// this list, so either this provision sees the removed row, or the delete
+	// sees this provision.
+	defer trackCPProvision(workspaceID)()
 
 	// CP-mode ctx bounds the pinned-image pre-flight + cpProv.Start. Derived
 	// from the CP provision budget (cpProvisionTimeout, floored at
@@ -2099,6 +2105,18 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 	// with a reason, instead of minutes later with none.
 	if reason := h.ensurePinnedImageBeforeProvision(ctx, workspaceID, payload, budget); reason != "" {
 		h.markProvisionFailed(ctx, workspaceID, reason, nil)
+		return
+	}
+
+	// THE WORKSPACE MAY HAVE BEEN DELETED while this goroutine was preparing
+	// (the image pre-flight above can take minutes). A delete has already torn
+	// down what existed and will not look again, so nothing may be created for
+	// it now: no token, no instance. The Docker start makes the same check
+	// right before ContainerCreate (provisioner.SetWorkspaceRemovedCheck). A
+	// lookup error answers "not removed": a DB blip must not kill a legitimate
+	// provision.
+	if WorkspaceIsRemoved(ctx, workspaceID) {
+		log.Printf("CPProvisioner: workspace %s was deleted before its provision reached the control plane — nothing was created", workspaceID)
 		return
 	}
 

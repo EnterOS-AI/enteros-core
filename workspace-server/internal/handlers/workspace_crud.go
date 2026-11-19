@@ -1087,6 +1087,11 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 	// teardown and creates ws-<id> anyway, which then crash-looped on an empty
 	// config volume with nothing left to stop it.
 	h.cancelInflightProvisions(allIDs)
+	// The control-plane backend's half of the same protocol: its provision
+	// cannot be cancelled, so the delete waits (bounded) for the ones in flight
+	// to return. A teardown sent while the control plane is still creating the
+	// instance finds nothing to stop (workspace_cp_inflight_provision.go).
+	h.waitInflightCPProvisions(allIDs)
 	// cleanupCtx is the non-cancelable, time-bounded teardown context: detached
 	// from the request ctx via context.WithoutCancel so a canceled / timed-out
 	// DELETE still runs the stop → remove-volume → broadcast sequence to
