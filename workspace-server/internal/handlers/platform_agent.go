@@ -379,6 +379,10 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 	// 1. Platform-MCP env (org-admin token + platform URL + org id + self id).
 	//    WS-C: the concierge authenticates with a MANAGED, rotated org token
 	//    (revocable/audited), not the raw break-glass ADMIN_TOKEN.
+	//    The default model for workspaces it creates is asked of the control
+	//    plane first (conciergeDefaultModelEnv); conciergePlatformMCPEnv then
+	//    falls back to what this tenant process holds.
+	conciergeDefaultModelEnv(ctx, workspaceID, envVars)
 	conciergePlatformMCPEnv(envVars, workspaceID, resolveConciergeAdminCredential(ctx, workspaceID))
 
 	// 2. Compose the concierge's /configs from its ACTUAL (switchable) runtime's
@@ -982,23 +986,60 @@ const platformDefaultModelFallback = "google/gemini-4-hydrogen"
 // tenantPlatformDefaultModel is the platform default model this tenant already
 // holds, without a network call: MOLECULE_LLM_DEFAULT_MODEL from the server's
 // own env. On a SaaS tenant that value is the control plane's (the Infisical
-// SSOT /shared/controlplane/llm), applied at boot by refreshEnvFromCP
-// (cmd/server/cp_config.go) — a managed tenant does not start without that
-// fetch, and every tenant restart (each image update) refreshes it. On a
-// self-hosted tenant it is the operator's env. When the env is unset it is the
-// one shared platformDefaultModelFallback, the same value
+// SSOT /shared/controlplane/llm), applied by the boot-time config fetch
+// (cmd/server/cp_config.go) and refreshed by every tenant restart (each image
+// update). On a self-hosted tenant it is the operator's env. When the env is
+// unset it is the one shared platformDefaultModelFallback, the same value
 // defaultResolveConciergeModel seeds a self-hosted concierge with.
 //
-// It is the default for workspaces OTHER agents create: the concierge's
-// management MCP receives it as MOLECULE_LLM_DEFAULT_MODEL
-// (conciergePlatformMCPEnv), and GET /admin/llm/offered-models reports it as
-// default_model. It is never the concierge's own model, which may be a BYOK
-// pick or an older platform default.
+// The env can be unset on a SaaS tenant: a freshly provisioned tenant boots on
+// the env its Deployment carries when its first config fetch loses the
+// org_instances row-commit race, and the fetch then lands in the background
+// (fillEnvFromCPInBackground). Until it does this returns the fallback, which
+// is why a concierge's provision asks the control plane itself
+// (conciergeDefaultModelEnv) instead of trusting this value alone.
+//
+// It is the default for workspaces OTHER agents create: GET
+// /admin/llm/offered-models reports it as default_model, and the concierge's
+// management MCP receives it as MOLECULE_LLM_DEFAULT_MODEL when the control
+// plane could not be asked (conciergePlatformMCPEnv). It is never the
+// concierge's own model, which may be a BYOK pick or an older platform default.
 func tenantPlatformDefaultModel() string {
 	if v := strings.TrimSpace(os.Getenv("MOLECULE_LLM_DEFAULT_MODEL")); v != "" {
 		return v
 	}
 	return platformDefaultModelFallback
+}
+
+// conciergeDefaultModelEnv sets MOLECULE_LLM_DEFAULT_MODEL in a concierge's
+// provision env to the platform default the control plane holds for this org
+// NOW, before conciergePlatformMCPEnv falls back to tenantPlatformDefaultModel.
+//
+// Why ask at provision time: the tenant's own copy comes from one fetch at
+// tenant boot. It is missing on a fresh tenant whose fetch lost the row-commit
+// race, and it is stale after the default changes until the tenant restarts.
+// On 2026-11-19 a new staging org whose default was minimax/MiniMax-M3 got a
+// google/gemini-4-hydrogen member that way: its concierge had been handed the
+// code fallback. conciergeModelResolver is the call that seeds and reconciles
+// the concierge's own model in this same provision, so both come from one
+// source.
+//
+// A value already in env wins (an operator or control-plane override). When the
+// resolver fails or names nothing the key stays unset and
+// conciergePlatformMCPEnv applies the tenant's own value, as before.
+func conciergeDefaultModelEnv(ctx context.Context, workspaceID string, env map[string]string) {
+	const key = "MOLECULE_LLM_DEFAULT_MODEL"
+	if _, ok := env[key]; ok {
+		return
+	}
+	model, err := conciergeModelResolver(ctx)
+	if err != nil {
+		log.Printf("Provisioner: concierge %s default model for new workspaces: the control plane did not answer (%v) — using the tenant's own value %q", workspaceID, err, tenantPlatformDefaultModel())
+		return
+	}
+	if model = strings.TrimSpace(model); model != "" {
+		env[key] = model
+	}
 }
 
 // conciergeModelResolver resolves the concierge's seed model at provision time.
