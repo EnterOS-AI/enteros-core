@@ -96,6 +96,11 @@ jobs:
       E2E_REGISTER_TIMEOUT_SECS: '300'
       E2E_A2A_TIMEOUT_SECS: '120'
       MOLECULE_CP_URL: ${{ vars.STAGING_CP_URL || 'https://staging-api.moleculesai.app' }}
+      # Required by the SSOT teardown helper (tests/e2e/lib/cp_purge_receipt.sh),
+      # which this job's harness now routes its tenant DELETE through. It refuses
+      # to run against any other backend rather than guessing — local-docker is
+      # the only active one. Declared here so the harness never has to assume it.
+      E2E_INFRA_BACKEND: local-docker
       # MOLECULE_ADMIN_TOKEN now arrives via $GITHUB_ENV from the "Fetch platform
       # runtime + admin token from KMS SSOT" step below (wave-B staging
       # consumers migration extends that same fetch). It is sourced from Infisical

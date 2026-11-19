@@ -102,11 +102,21 @@ case "${1:-}" in
   *) exit 0;;
 esac
 case "${1:-}" in
+  ns|namespace|namespaces)
+    # get ns -l molecule.org-id=<org>: the namespaces that carry the org's label.
+    shift; org="$(org_of_sel "$*")"
+    awk -F'\t' -v o="$org" '$4==o {print $1}' "$K8RT/deploys" | sort -u;;
   deploy|deployment|deployments)
     shift; sel="$*"
     if printf '%s' "$sel" | grep -q -- '-A'; then
+      # The roller's credential is fenced to its environment's tenant namespaces
+      # (molecule-controlplane#3037): a cluster-wide list is refused, as on the cluster.
+      echo 'Error from server (Forbidden): deployments.apps is forbidden: User "system:serviceaccount:controlplane-staging:controlplane" cannot list resource "deployments" in API group "apps" at the cluster scope' >&2
+      exit 1
+    elif printf '%s' "$sel" | grep -q -- 'molecule\.org-id='; then
+      # -n <ns> get deploy -l <selector>: the tenant Deployment(s) of one namespace.
       org="$(org_of_sel "$sel")"
-      awk -F'\t' -v o="$org" '$4==o {printf "%s\t%s\t%s\n",$1,$2,$3}' "$K8RT/deploys"
+      awk -F'\t' -v o="$org" -v ns="$ns" '$1==ns && $4==o {printf "%s\t%s\t%s\n",$1,$2,$3}' "$K8RT/deploys"
     else
       name="$1"
       awk -F'\t' -v n="$name" -v ns="$ns" '$1==ns && $2==n {printf "%s",$5}' "$K8RT/deploys"

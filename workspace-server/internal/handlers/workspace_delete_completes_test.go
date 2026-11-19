@@ -121,3 +121,80 @@ func TestTrackCPProvision_RegistersUnderTheCanonicalID(t *testing.T) {
 		t.Errorf("found %d provision(s) after it returned, want 0", n)
 	}
 }
+
+// The same id in upper case is the same workspace to Postgres, but not to the
+// control plane: its ledger and the labels on the workspace's objects carry
+// the canonical text. MEASURED on the staging canary 2026-11-19 (core
+// 48043804): DELETE /workspaces/5020EE69-...?confirm=true&purge=true answered
+// 500 "workspace marked removed, but 1 stop call(s) failed", the pod kept
+// running until the orphan sweeper stopped it, its volume, seed Secret and
+// Service stayed, and a retry answered 410. The handler has to speak to the
+// control plane in the canonical id whatever the caller typed.
+func TestDelete_SpeaksInTheCanonicalIDWhateverTheCallerTyped(t *testing.T) {
+	for _, typed := range []string{
+		"DDDDDDDD-000A-0000-0000-000000000000",
+		"{dddddddd-000a-0000-0000-000000000000}",
+		"urn:uuid:dddddddd-000a-0000-0000-000000000000",
+		"dddddddd000a00000000000000000000",
+	} {
+		t.Run(typed, func(t *testing.T) {
+			mock := setupTestDB(t)
+			setupTestRedis(t)
+			handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+			cp := &trackingCPProv{}
+			handler.SetCPProvisioner(cp)
+
+			// Every statement is scripted with the CANONICAL id: a handler that
+			// passes on what it was given fails the first lookup.
+			expectWorkspaceDeleteLookup(mock, deleteEraseWS, "Erase Me", 0, "online")
+			mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
+				WithArgs(deleteEraseWS).
+				WillReturnRows(sqlmock.NewRows([]string{"id", "name"}))
+			mock.ExpectQuery("WITH RECURSIVE descendants").
+				WithArgs(deleteEraseWS).
+				WillReturnRows(sqlmock.NewRows([]string{"id"}))
+			mock.ExpectExec("UPDATE workspaces SET status =").
+				WillReturnResult(sqlmock.NewResult(1, 1))
+			mock.ExpectExec(`DELETE FROM workspaces WHERE id = ANY`).
+				WillReturnResult(sqlmock.NewResult(1, 1))
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Params = gin.Params{{Key: "id", Value: typed}}
+			c.Request = httptest.NewRequest(http.MethodDelete, "/workspaces/x?confirm=true&purge=true", nil)
+			c.Request.Header.Set("X-Confirm-Name", "Erase Me")
+
+			handler.Delete(c)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("DELETE by %q = %d: %s", typed, w.Code, w.Body.String())
+			}
+			if len(cp.pruned) != 1 || cp.pruned[0] != deleteEraseWS {
+				t.Errorf("the control plane was asked to erase %v, want [%s]: it knows the workspace only by its canonical id", cp.pruned, deleteEraseWS)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet sqlmock expectations: %v", err)
+			}
+		})
+	}
+}
+
+func TestCascadeDelete_SpeaksInTheCanonicalID(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	cp := &trackingCPProv{}
+	handler.SetCPProvisioner(cp)
+	mock.ExpectQuery("WITH RECURSIVE descendants").
+		WithArgs(deleteEraseWS).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectExec("UPDATE workspaces SET status =").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	if _, stopErrs, err := handler.CascadeDelete(context.Background(), "DDDDDDDD-000A-0000-0000-000000000000", true); err != nil || len(stopErrs) != 0 {
+		t.Fatalf("CascadeDelete: %v, stop errors %v", err, stopErrs)
+	}
+	if len(cp.pruned) != 1 || cp.pruned[0] != deleteEraseWS {
+		t.Errorf("the control plane was asked to erase %v, want [%s]", cp.pruned, deleteEraseWS)
+	}
+}

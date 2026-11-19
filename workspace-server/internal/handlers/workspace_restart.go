@@ -526,6 +526,21 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	// note in restart_context.go).
 	h.fireRestartContextIfBooted(ctx, id, restartData)
 
+	// `config_dir` reports WHICH TEMPLATE was overlaid onto /configs for this
+	// restart — "existing-volume" (the default) means no template overlay, the
+	// volume's own contents stand. It says NOTHING about plugins, and callers
+	// have read it as if it did (molecule-core#5071: a client saw
+	// "existing-volume" and concluded a restart could not re-deliver a plugin,
+	// so they asked for a full reprovision that would have changed nothing).
+	//
+	// Plugins are re-delivered on EVERY boot regardless of this label: the
+	// runtime's boot materializer (molecule_runtime.plugin_sources) rebuilds
+	// /configs/plugins from MOLECULE_DECLARED_PLUGINS into a staging dir and
+	// atomically swaps it — no dir-presence skip, no ref comparison. So the
+	// version a workspace runs is decided by the DECLARED SET
+	// (workspace_declared_plugins ∪ workspace_plugins, see desiredPluginSources),
+	// never by whether this volume is fresh. Change the declaration — via
+	// POST /workspaces/:id/plugins — and the next restart lands it.
 	c.JSON(http.StatusOK, gin.H{"status": "provisioning", "config_dir": configLabel, "reset_session": resetClaudeSession})
 }
 

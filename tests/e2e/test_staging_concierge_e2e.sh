@@ -225,11 +225,33 @@ print('')" 2>/dev/null || echo "")
     fail "Tenant provisioning failed for $SLUG after ${provision_attempt} attempt(s) — persistent provisioning failure, not a transient hiccup"
   fi
   log "⚠ Tenant provisioning FAILED for $SLUG (attempt ${provision_attempt}/${PROVISION_ATTEMPTS}) — rare transient CP/host hiccup; purging the dead org and re-provisioning a FRESH one"
-  # Best-effort fire-and-forget purge of the dead org (it never served). If it
-  # lingers, the sweep-stale-e2e-orgs janitor reaps it; the eventual successful
-  # org is torn down by the EXIT trap. Then mint a FRESH slug (never reuse one
-  # the CP may still be deprovisioning) and loop.
-  admin_call DELETE "/cp/admin/tenants/$SLUG" -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1 || true
+  # Purge the dead org (it never served) through the SSOT helper — the same
+  # contract this script's own EXIT trap uses. This retry path is the ONE
+  # hand-rolled DELETE that survived when the trap above was migrated, and it is
+  # the WORST place to hand-roll one: an org whose provision just FAILED is
+  # exactly the org most likely to still be holding a lifecycle lease, so
+  # claimOrgPurge answers an immediate 409 "organization has an active lifecycle
+  # operation". The old single fire-and-forget DELETE with its status discarded
+  # (`>/dev/null 2>&1 || true`) could never re-issue it, so every transient
+  # provisioning failure leaked a dead tenant that only the janitor would ever
+  # reap. The helper's bounded 409 retry actually completes the purge.
+  #
+  # Still deliberately NON-fatal: this is mid-run recovery, not the run's
+  # teardown. A purge we cannot prove must not abort the re-provision attempt —
+  # the EXIT trap (helper-backed, fail-closed) and sweep-stale-e2e-orgs remain
+  # the backstops. But the outcome is now REPORTED instead of thrown away.
+  if [ "$ORG_CREATION_VERIFIED" = "1" ]; then
+    retry_purge_rc=0
+    e2e_cp_delete_and_verify_purge "$CP_URL" "$ADMIN_TOKEN" "$SLUG" "$ORG_ID" \
+      || retry_purge_rc=$?
+    if [ "$retry_purge_rc" = "0" ]; then
+      log "    dead org $SLUG provably purged before re-provisioning"
+    else
+      log "    ⚠ dead org $SLUG was NOT provably purged (rc=$retry_purge_rc) — sweep-stale-e2e-orgs is the backstop; continuing with a fresh slug"
+    fi
+  fi
+  # Then mint a FRESH slug (never reuse one the CP may still be deprovisioning)
+  # and loop.
   ORG_ID=""
   ORG_CREATION_VERIFIED=0
   SLUG="e2e-cncrg-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" 10)"

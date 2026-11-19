@@ -10,6 +10,7 @@
 #
 # Required env matches test_peer_visibility_mcp_staging.sh:
 #   MOLECULE_ADMIN_TOKEN
+#   E2E_INFRA_BACKEND      required: local-docker
 # Optional:
 #   MOLECULE_CP_URL, E2E_RUN_ID, PV_RUNTIMES, E2E_KEEP_ORG,
 #   E2E_MINIMAX_API_KEY / E2E_ANTHROPIC_API_KEY / E2E_OPENAI_API_KEY
