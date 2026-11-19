@@ -666,9 +666,51 @@ them all. The monitor reports itself as `light-monitor` in
 
 ## Deleting a Light agent
 
+Use one call, and ask for the purge:
+
+```
+DELETE /workspaces/{id}?confirm=true&purge=true
+X-Confirm-Name: <the agent's name>
+```
+
+It answers `200 {"status":"purged"}` and leaves nothing behind. Do not disable
+Light first: a disable restarts the agent, and the delete then has to wait for
+that restart.
+
+What the three forms of the call do:
+
+| Query | Row | Light objects (CronJobs, run Secret) | Volume, seed Secret, Service, pods |
+|---|---|---|---|
+| `confirm=true` | kept, `status: removed` | deleted | **kept** |
+| `confirm=true&erase_data=true` | kept, `status: removed` | deleted | deleted |
+| `confirm=true&purge=true` | deleted, with its runs, tokens and logs | deleted | deleted |
+
+**A plain delete keeps the agent's volume, and nothing in this API removes it
+afterwards.** The volume counts against the tenant's volume quota (25 by
+default) for good. A removed agent answers `410` to every later delete, including one with
+`purge=true`, so the choice has to be made on the first call. An integration
+that creates agents should always purge the ones it deletes.
+
+Answers:
+
+| Status | Body | Meaning |
+|---|---|---|
+| `200` | `{"status":"purged"}` or `{"status":"removed"}` | done |
+| `400` | `{"error":"destructive_action_requires_confirmation", "hint": …}` | `X-Confirm-Name` is missing or is not the agent's name |
+| `404` | `{"error":"workspace not found"}` | no such agent; also the answer to a second purge, so treat it as already deleted |
+| `409` | `{"status":"confirmation_required", "children": …}` | the agent has sub-workspaces and `confirm=true` was not sent |
+| `410` | `{"error":"workspace removed"}` | the agent was deleted without a purge earlier |
+| `500` | `{"error": …}` | a teardown step failed. The agent is already marked removed, so a retry answers `410`; the platform stops any compute that is left within about five minutes, and the volume stays until an operator removes it |
+
+Timing. The delete is safe at any moment, including while the agent is being
+enabled, parked, opened or restarted, and while one of its runs is in progress
+(the run's pod is stopped). It waits up to 10 seconds for a Light operation on
+the agent to finish and up to 15 seconds for a start or restart that is in
+flight, so allow it 60 seconds before timing out. It finishes even if the
+caller disconnects.
+
 `DELETE /workspaces/{id}` deletes the agent's control-plane Light objects
-before it stops any compute; it waits up to 10 seconds for a Light operation
-on the agent to finish first, and a park that finds its workspace deleted
-deletes what it wrote. If the deletion fails, the delete answers `500` like
-any other teardown failure, and the workspace keeps `light_state`; the monitor
-retries the deletion until the objects are gone.
+before it stops any compute, and a park that finds its workspace deleted
+deletes what it wrote. If the deletion of the Light objects fails, the delete
+answers `500` like any other teardown failure, and the workspace keeps
+`light_state`; the monitor retries the deletion until the objects are gone.

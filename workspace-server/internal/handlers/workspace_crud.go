@@ -793,12 +793,29 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 	// A PURGE ALWAYS ERASES. ?purge=true hard-deletes the row below, and with
 	// the row gone nothing can ever attach this workspace's volume again (a new
 	// workspace gets a new id and a new volume), so a purge that kept the volume
-	// did not keep the data for anyone: it leaked it. On Kubernetes that is an
+	// did not keep the data for anyone: it leaked it. The one workspace whose id
+	// is not new is the org's concierge (platform_agent_ensure.go derives it
+	// from the org), which is re-created under the same id: purging it now also
+	// erases the memory it would otherwise have come back with. That is what a
+	// purge asks for, and it is a change from before 2026-11-19. On Kubernetes that is an
 	// identity claim counting against the namespace's persistentvolumeclaims
 	// quota for good (molecule-core#5193; measured on the staging canary
 	// 2026-11-19, workspace_delete_erase_test.go). The audit row's erase_data
 	// field records this effective value.
 	erase := c.Query("erase_data") == "true" || c.Query("purge") == "true"
+
+	// FROM HERE THE DELETE FINISHES WHETHER OR NOT THE CLIENT IS STILL THERE.
+	// CascadeDelete marks the rows removed before it tears anything down, and a
+	// removed row answers 410 to a retry (above), so a delete abandoned half way
+	// can never be completed through this API: the orphan sweeper later stops
+	// the workspace keep-state, and its volume, seed Secret and Service stay for
+	// good. Every step below ran on the request context, so a caller that gave
+	// up (an SDK timeout while the delete waited for an in-flight provision, a
+	// closed tab) cancelled the teardown and the purge. The context keeps the
+	// request's values and gets its own bound instead.
+	ctx, cancelDelete := context.WithTimeout(context.WithoutCancel(ctx), deleteCompletionBudget)
+	defer cancelDelete()
+
 	descendantIDs, stopErrs, err := h.CascadeDelete(ctx, id, erase)
 	if err != nil {
 		// Audit 2026-05-09 (Core-Security): raw `err.Error()` here was
@@ -954,6 +971,14 @@ func (h *WorkspaceHandler) clearWorkspaceInstanceIDAfterStop(ctx context.Context
 		log.Printf("CascadeDelete %s clear instance_id failed: %v — leaving row for orphan sweeper", wsID, err)
 	}
 }
+
+// deleteCompletionBudget bounds a delete from the moment it starts tearing the
+// workspace down. The delete no longer ends when the client hangs up (see
+// Delete), so it needs a bound of its own: generous next to its slowest honest
+// path (15 s for an in-flight provision, 10 s for a Light operation, the stop
+// retries of a cascade, the purge), short enough that a wedged dependency does
+// not hold the request's goroutine for long.
+const deleteCompletionBudget = 3 * time.Minute
 
 // inflightProvisionWait bounds how long a delete waits, in total, for cancelled
 // in-flight provisions to unwind. Past it the teardown proceeds; the start's own
