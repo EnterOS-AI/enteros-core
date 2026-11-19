@@ -57,6 +57,20 @@ type CPOrphanReaper interface {
 // which has never been approached even during the worst leak windows.
 const cpSweepLimit = 100
 
+// cpSweepRemovedGrace is how long a workspace must have been 'removed' before
+// the sweeper will touch it.
+//
+// A delete marks its rows removed first and stops (and, when asked, erases)
+// them afterwards. A sweep landing in between stops the workspace keep-state
+// and clears instance_id; the delete's own StopAndPrune then finds no instance
+// id and does nothing, so the API answers "purged" while the identity claim,
+// the seed Secret and the Service stay with no row left to find them by. The
+// grace hands every freshly removed row to the delete that removed it. It only
+// has to outlast the slowest delete (15 s for an in-flight provision, 10 s for
+// a Light operation, 30 s of teardown); the price is that an instance leaked by
+// a failed inline stop keeps running this long before the sweeper stops it.
+const cpSweepRemovedGrace = 5 * time.Minute
+
 // StartCPOrphanSweeper runs the SaaS-mode reconcile loop until ctx is
 // cancelled. nil reaper makes the loop a no-op (matches the Docker
 // sweeper's nil-tolerant pattern).
@@ -101,9 +115,10 @@ func cpSweepOnce(parent context.Context, reaper CPOrphanReaper) {
 		 WHERE status = 'removed'
 		   AND instance_id IS NOT NULL
 		   AND instance_id != ''
+		   AND updated_at < now() - make_interval(secs => $2)
 		 ORDER BY updated_at DESC
 		 LIMIT $1
-	`, cpSweepLimit)
+	`, cpSweepLimit, cpSweepRemovedGrace.Seconds())
 	if err != nil {
 		log.Printf("CP orphan sweeper: DB query failed: %v", err)
 		return

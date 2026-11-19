@@ -5,6 +5,8 @@ import { parseA2AResponse } from "@/components/tabs/chat/a2a-response";
 import { appendBootLog, mergeBootStep, parseBootStepWire } from "./boot-telemetry";
 import type { BootStepWire } from "./boot-telemetry";
 import { WS_EVENTS } from "@/lib/ws-events";
+import { parseLightState } from "@/lib/light";
+import { showToast } from "@/components/Toaster";
 
 // ---------------------------------------------------------------------------
 // Monotonically increasing counter used to assign grid positions.
@@ -105,11 +107,34 @@ export function handleCanvasEvent(
 
   switch (msg.event) {
     case WS_EVENTS.WorkspaceUpdated: {
-      const { name } = msg.payload;
-      if (typeof name !== "string" || !name.trim()) break;
+      // Each key applies on its own: a rename carries only `name`, an Enter
+      // OS Light transition only `light_state`. A missing or malformed key
+      // changes nothing, and a payload with neither leaves the node as it was.
+      const payload = msg.payload;
+      const patch: Partial<WorkspaceNodeData> = {};
+      const { name } = payload;
+      if (typeof name === "string" && name.trim()) patch.name = name;
+      if (Object.prototype.hasOwnProperty.call(payload, "light_state")) {
+        const raw = payload.light_state;
+        const lightState = parseLightState(raw);
+        // null clears it (Light disabled); a value this canvas does not know
+        // is ignored rather than read as "not a Light agent".
+        if (raw === null || lightState !== null) patch.lightState = lightState;
+      }
+      // Core suspends a schedule after three failed runs in a row; when the
+      // agent may not message the user, this event is the only notice.
+      const suspended = payload.light_schedule_suspended;
+      if (typeof suspended === "string" && suspended !== "") {
+        const agent = nodes.find((n) => n.id === msg.workspace_id)?.data.name ?? "a Light agent";
+        showToast(
+          `Light: the schedule "${suspended}" of ${agent} is suspended after three failed runs in a row. Open the agent, fix the cause, then park it to resume the schedule.`,
+          "error",
+        );
+      }
+      if (Object.keys(patch).length === 0) break;
       set({
         nodes: nodes.map((node) => node.id === msg.workspace_id
-          ? { ...node, data: { ...node.data, name } }
+          ? { ...node, data: { ...node.data, ...patch } }
           : node),
       });
       break;

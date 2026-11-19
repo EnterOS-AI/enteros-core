@@ -154,19 +154,55 @@ def test_advance_pin_publishes_the_digests_the_k8s_arm_rolls_to():
         )
 
 
-def test_the_fleet_jobs_run_where_kubectl_and_the_staging_daemon_are():
-    """`docker-host` is outside k3s and is not the staging tenant daemon.
-
-    Moving either job back there silently restores the original defect: no
-    kubectl means no census and no k8s roll, and the docker arm enumerates a CI
-    build daemon instead of the daemon the staging provisioner mutates.
-    """
+def test_the_fleet_jobs_run_where_kubectl_is():
+    """`docker-host` is outside k3s: no kubectl, no census, no k8s roll."""
     for jk in ("redeploy-fleet", "rollback-pin"):
         assert _job(jk).get("runs-on") == "local-deploy", (
-            f"`{jk}` must run on `local-deploy`: it is the only runner with a "
-            f"route to the cluster AND the operator-configured mTLS endpoint for "
-            f"the staging tenant daemon."
+            f"`{jk}` must run on `local-deploy`: it is the only runner with "
+            f"kubectl and a route to the cluster."
         )
+
+
+def test_every_fleet_roll_in_the_lane_is_k8s_only():
+    """No runner in this lane reaches a Docker daemon any more.
+
+    A roll without --k8s-only starts with `docker info`, so it fails every run
+    on a runner with no Docker endpoint, and its rollback fails the same way.
+    """
+    calls = []
+    for jk, job in _doc()["jobs"].items():
+        for step in job.get("steps") or []:
+            for line in (step.get("run") or "").splitlines():
+                stripped = line.strip()
+                if not stripped.startswith("#") and "redeploy-staging-fleet.sh" in stripped:
+                    calls.append((jk, stripped))
+    assert calls, "the lane no longer invokes redeploy-staging-fleet.sh at all"
+    offenders = [f"{jk} :: {line}" for jk, line in calls if "--k8s-only" not in line]
+    assert not offenders, "fleet roll without --k8s-only:\n    " + "\n    ".join(offenders)
+
+
+@pytest.mark.parametrize(
+    ("rows", "expect_rc", "needle"),
+    [
+        ("alpha\tid-a\tk8s\tns-a\nbeta\tid-b\tk8s\tns-b\n", 0, "every tenant is on the k8s substrate"),
+        ("alpha\tid-a\tk8s\tns-a\nlegacy\tid-l\tdocker\tmol-x\n", 1, "tenant legacy is on substrate docker"),
+        ("", 1, "FLEET_CENSUS_TSV is unset or empty"),
+    ],
+)
+def test_the_roll_refuses_a_census_row_it_cannot_roll(tmp_path: Path, rows, expect_rc, needle):
+    body = _render(_step("redeploy-fleet", "Refuse a census with a tenant")["run"])
+    census = tmp_path / "census.tsv"
+    census.write_text(rows, encoding="utf-8")
+    r = _run_body(body, tmp_path, {"FLEET_CENSUS_TSV": str(census)})
+    assert r.returncode == expect_rc, f"{r.stdout}{r.stderr}"
+    assert needle in (r.stdout + r.stderr)
+
+
+def test_the_census_refusal_runs_before_the_roll():
+    names = [str(step.get("name", "")) for step in _job("redeploy-fleet").get("steps") or []]
+    refuse = next(i for i, n in enumerate(names) if n.startswith("Refuse a census"))
+    roll = next(i for i, n in enumerate(names) if n.startswith("Roll the staging tenant fleet"))
+    assert refuse < roll, "the census refusal must run before the first mutation"
 
 
 def test_the_roll_step_passes_a_digest_and_an_exclusion_list():
@@ -264,7 +300,7 @@ def test_the_roll_body_runs_the_fleet_script_once_the_census_is_wired(tmp_path: 
     )
     assert r.returncode == 0, f"{r.stdout}{r.stderr}"
     assert marker.exists(), "the fleet script was never invoked"
-    assert "--tag staging-0badc0de" in marker.read_text(encoding="utf-8")
+    assert "--k8s-only --tag staging-0badc0de" in marker.read_text(encoding="utf-8")
 
 
 def test_the_census_body_refuses_a_resolver_that_succeeds_and_writes_nothing(tmp_path: Path):
@@ -358,7 +394,6 @@ def test_the_revert_body_restores_the_pin_even_when_the_cluster_is_unreachable(t
     _fake_scripts(
         tmp_path,
         advance_staging_tenant_pin_sh=f'printf "%s\\n" "$*" > "{pin_marker.as_posix()}"\nexit 0\n',
-        require_local_deploy_daemon_sh="exit 0\n",
         require_deploy_toolchain_sh='printf "KUBECTL=/bin/true\\nDEPLOY_PYTHON3=/bin/true\\n"\n',
         # The credential the operator has not seeded yet.
         resolve_k8s_fleet_census_sh="exit 1\n",
@@ -411,7 +446,6 @@ def test_the_revert_body_rolls_the_fleet_back_when_the_cluster_is_reachable(tmp_
     _fake_scripts(
         tmp_path,
         advance_staging_tenant_pin_sh="exit 0\n",
-        require_local_deploy_daemon_sh="exit 0\n",
         require_deploy_toolchain_sh='printf "KUBECTL=/bin/true\\nDEPLOY_PYTHON3=/bin/true\\n"\n',
         resolve_k8s_fleet_census_sh=(
             'out=""\n'
@@ -449,6 +483,7 @@ def test_the_revert_body_rolls_the_fleet_back_when_the_cluster_is_reachable(tmp_
         "the revert did not hand the k8s arm the PREVIOUS digest, so the k8s "
         "tenants would have been left on the failed candidate:\n" + rolled
     )
+    assert "args=--k8s-only --image" in rolled, rolled
 
 
 def test_the_revert_refuses_when_there_is_no_previous_digest(tmp_path: Path):
@@ -466,7 +501,6 @@ def test_the_revert_refuses_when_there_is_no_previous_digest(tmp_path: Path):
     _fake_scripts(
         tmp_path,
         advance_staging_tenant_pin_sh="exit 0\n",
-        require_local_deploy_daemon_sh="exit 0\n",
         require_deploy_toolchain_sh='printf "KUBECTL=/bin/true\\nDEPLOY_PYTHON3=/bin/true\\n"\n',
         resolve_k8s_fleet_census_sh=(
             'out=""\n'

@@ -5,6 +5,7 @@ import { useCanvasStore } from "@/store/canvas";
 import { StatusDot } from "./StatusDot";
 import { WorkspacePanelTabs } from "./WorkspacePanelTabs";
 import { summarizeWorkspaceCapabilities } from "@/store/canvas";
+import { workspaceStatusLabel } from "@/lib/light";
 
 const SIDEPANEL_WIDTH_KEY = "molecule:sidepanel-width";
 const SIDEPANEL_DEFAULT_WIDTH = 480;
@@ -115,6 +116,8 @@ export function SidePanel() {
   if (!selectedNodeId || !node) return null;
 
   const isOnline = node.data.status === "online";
+  // A parked Enter OS Light agent reads "Parked", not its hibernated pod.
+  const statusLabel = workspaceStatusLabel(node.data.status, node.data.lightState);
   const capability = summarizeWorkspaceCapabilities(node.data);
 
   return (
@@ -181,7 +184,7 @@ export function SidePanel() {
           <MetaPill label="Tier" value={`T${node.data.tier}`} />
           <MetaPill label="Runtime" value={capability.runtime || "unknown"} />
           <MetaPill label="Skills" value={capability.skillCount > 0 ? `${capability.skillCount}` : "none"} />
-          <MetaPill label="Status" value={node.data.status} tone={isOnline ? "emerald" : "zinc"} />
+          <MetaPill label="Status" value={statusLabel.label} title={statusLabel.tooltip} tone={isOnline ? "emerald" : "zinc"} />
         </div>
       </div>
 
@@ -202,7 +205,7 @@ export function SidePanel() {
   );
 }
 
-function MetaPill({ label, value, tone = "zinc" }: { label: string; value: string; tone?: "zinc" | "emerald" | "amber" }) {
+function MetaPill({ label, value, tone = "zinc", title }: { label: string; value: string; tone?: "zinc" | "emerald" | "amber"; title?: string }) {
   const toneClasses = {
     zinc: "border-line/50 bg-surface-sunken/70 text-ink-mid",
     emerald: "border-emerald-500/20 bg-emerald-950/20 text-good",
@@ -210,7 +213,7 @@ function MetaPill({ label, value, tone = "zinc" }: { label: string; value: strin
   }[tone];
 
   return (
-    <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-1 text-[9px] ${toneClasses}`}>
+    <span title={title} className={`inline-flex items-center gap-1 rounded-full border px-2 py-1 text-[9px] ${toneClasses}`}>
       <span className="uppercase tracking-[0.18em] text-[8px] opacity-70">{label}</span>
       <span className="font-medium">{value}</span>
     </span>

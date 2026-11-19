@@ -42,8 +42,8 @@ func TestCPSweepOnce_StopSucceeds_ClearsInstanceID(t *testing.T) {
 	mock := setupTestDB(t)
 	reaper := &fakeCPReaper{}
 
-	mock.ExpectQuery(`(?s)^\s*SELECT id::text\s+FROM workspaces\s+WHERE status = 'removed'\s+AND instance_id IS NOT NULL\s+AND instance_id != ''\s+ORDER BY updated_at DESC\s+LIMIT \$1`).
-		WithArgs(cpSweepLimit).
+	mock.ExpectQuery(`(?s)^\s*SELECT id::text\s+FROM workspaces\s+WHERE status = 'removed'\s+AND instance_id IS NOT NULL\s+AND instance_id != ''\s+AND updated_at < now\(\) - make_interval\(secs => \$2\)\s+ORDER BY updated_at DESC\s+LIMIT \$1`).
+		WithArgs(cpSweepLimit, cpSweepRemovedGrace.Seconds()).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("ws-uuid-1"))
 	mock.ExpectExec(`UPDATE workspaces SET instance_id = NULL, updated_at = now\(\) WHERE id = \$1`).
 		WithArgs("ws-uuid-1").
@@ -69,7 +69,7 @@ func TestCPSweepOnce_StopFails_KeepsInstanceID(t *testing.T) {
 	}
 
 	mock.ExpectQuery(`(?s)^\s*SELECT id::text\s+FROM workspaces`).
-		WithArgs(cpSweepLimit).
+		WithArgs(cpSweepLimit, cpSweepRemovedGrace.Seconds()).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("ws-uuid-1"))
 	// No ExpectExec for the UPDATE — sqlmock fails the test if the
 	// UPDATE fires.
@@ -91,7 +91,7 @@ func TestCPSweepOnce_NoOrphans(t *testing.T) {
 	reaper := &fakeCPReaper{}
 
 	mock.ExpectQuery(`(?s)^\s*SELECT id::text\s+FROM workspaces`).
-		WithArgs(cpSweepLimit).
+		WithArgs(cpSweepLimit, cpSweepRemovedGrace.Seconds()).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}))
 
 	cpSweepOnce(context.Background(), reaper)
@@ -131,7 +131,7 @@ func TestCPSweepOnce_DoesNotReapFailedWorkspace(t *testing.T) {
 	// critical predicate so a future widening to include 'failed' (which
 	// would terminate boot-failed boxes mid-rescue) fails this test.
 	mock.ExpectQuery(`(?s)WHERE status = 'removed'\s+AND instance_id IS NOT NULL`).
-		WithArgs(cpSweepLimit).
+		WithArgs(cpSweepLimit, cpSweepRemovedGrace.Seconds()).
 		WillReturnRows(sqlmock.NewRows([]string{"id"})) // failed row excluded by predicate
 
 	cpSweepOnce(context.Background(), reaper)
@@ -162,7 +162,7 @@ func TestCPSweepOnce_MultipleOrphans(t *testing.T) {
 	}
 
 	mock.ExpectQuery(`(?s)^\s*SELECT id::text\s+FROM workspaces`).
-		WithArgs(cpSweepLimit).
+		WithArgs(cpSweepLimit, cpSweepRemovedGrace.Seconds()).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).
 			AddRow("ws-uuid-1").
 			AddRow("ws-uuid-2").
@@ -194,7 +194,7 @@ func TestCPSweepOnce_QueryError(t *testing.T) {
 	reaper := &fakeCPReaper{}
 
 	mock.ExpectQuery(`(?s)^\s*SELECT id::text\s+FROM workspaces`).
-		WithArgs(cpSweepLimit).
+		WithArgs(cpSweepLimit, cpSweepRemovedGrace.Seconds()).
 		WillReturnError(errors.New("connection refused"))
 
 	cpSweepOnce(context.Background(), reaper)
@@ -216,7 +216,7 @@ func TestCPSweepOnce_UpdateError_LogsButContinues(t *testing.T) {
 	reaper := &fakeCPReaper{}
 
 	mock.ExpectQuery(`(?s)^\s*SELECT id::text\s+FROM workspaces`).
-		WithArgs(cpSweepLimit).
+		WithArgs(cpSweepLimit, cpSweepRemovedGrace.Seconds()).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).
 			AddRow("ws-uuid-1").
 			AddRow("ws-uuid-2"))
@@ -285,14 +285,14 @@ func TestStartCPOrphanSweeper_RunsOnceImmediatelyAndOnTick(t *testing.T) {
 	// so assert "at least one immediate sweep" and let cancel close
 	// the loop.
 	mock.ExpectQuery(`(?s)^\s*SELECT id::text\s+FROM workspaces`).
-		WithArgs(cpSweepLimit).
+		WithArgs(cpSweepLimit, cpSweepRemovedGrace.Seconds()).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	// The ticker may or may not fire in the test window depending on
 	// scheduler; tolerate both shapes by registering a second optional
 	// expectation. sqlmock fails on UNREGISTERED queries, so register
 	// one more then accept either 1 or 2 fires.
 	mock.ExpectQuery(`(?s)^\s*SELECT id::text\s+FROM workspaces`).
-		WithArgs(cpSweepLimit).
+		WithArgs(cpSweepLimit, cpSweepRemovedGrace.Seconds()).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}))
 
 	ctx, cancel := context.WithCancel(context.Background())

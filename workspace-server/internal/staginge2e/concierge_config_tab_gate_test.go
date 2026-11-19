@@ -35,6 +35,20 @@ func TestClassifyConciergeConfigTabResponse(t *testing.T) {
 			want:       conciergeConfigTabExpectedOffline,
 		},
 		{
+			name:       "the coded offline response (WORKSPACE_NOT_READY) is expected while unbooted",
+			tab:        "schedules",
+			statusCode: http.StatusServiceUnavailable,
+			body:       `{"code":"WORKSPACE_NOT_READY","error":"workspace url not registered yet"}`,
+			want:       conciergeConfigTabExpectedOffline,
+		},
+		{
+			name:       "the offline response with another code is not exact",
+			tab:        "schedules",
+			statusCode: http.StatusServiceUnavailable,
+			body:       `{"code":"SOMETHING_ELSE","error":"workspace url not registered yet"}`,
+			want:       conciergeConfigTabRejected,
+		},
+		{
 			name:       "insignificant JSON whitespace preserves exact offline response",
 			tab:        "schedules",
 			statusCode: http.StatusServiceUnavailable,

@@ -7,6 +7,7 @@ import { createMessage, type ChatMessage, type ChatAttachment } from "../types";
 import { parseA2AResponse, type A2APart, type A2AResponse } from "../a2a-response";
 export { extractReplyText } from "../a2a-response";
 import { getConversationId } from "./chatContext";
+import { lightErrorSentence, parseLightError, parseLightState, type LightState } from "@/lib/light";
 
 /** Map a thrown error from `uploadChatFiles` to the user-facing reason
  *  shown in the chat error banner.
@@ -57,6 +58,21 @@ export function mapUploadErrorToReason(e: unknown): string {
 export interface UseChatSendOptions {
   onUserMessage?: (msg: ChatMessage) => void;
   onAgentMessage?: (msg: ChatMessage) => void;
+  /** Enter OS Light: the send answered 409 LIGHT_AGENT_PARKED or
+   *  LIGHT_AGENT_PARKING (the agent is parked or being parked). The message
+   *  was not delivered; the caller shows its Light banner instead of the
+   *  generic "unreachable" error, with the state the refusal named. */
+  onLightRefused?: (lightState: LightState | null) => void;
+}
+
+/** The Light state a 409 LIGHT_AGENT_PARKED / LIGHT_AGENT_PARKING refusal of
+ *  POST /a2a names, or undefined for any other error. */
+export function lightRefusalOf(err: unknown): LightState | null | undefined {
+  const p = parseLightError(err);
+  if (p.status !== 409) return undefined;
+  if (p.code === "LIGHT_AGENT_PARKED") return parseLightState(p.body.light_state) ?? "parked";
+  if (p.code === "LIGHT_AGENT_PARKING") return parseLightState(p.body.light_state) ?? "parking";
+  return undefined;
 }
 
 /** Deterministic, window-free id for the agent's push-mode reply to a specific
@@ -453,6 +469,18 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
               // Non-JSON 503 body — not the warming shape.
             }
           }
+          // ENTER OS LIGHT 409: a parked (or parking) Light agent refuses chat
+          // without waking. Not "unreachable": hand the refusal to the
+          // caller's Light banner (Open it to chat) instead of the error.
+          const lightRefusal = lightRefusalOf(e);
+          if (lightRefusal !== undefined) {
+            finishSendToken(myToken);
+            const onLightRefused = optionsRef.current.onLightRefused;
+            if (onLightRefused) onLightRefused(lightRefusal);
+            else setError(lightErrorSentence(e));
+            return;
+          }
+
           if (isWarming && warmingRetriesLeft > 0) {
             warmingRetriesLeft--;
             const hinted = parseInt(apiErr?.retryAfter ?? "", 10);

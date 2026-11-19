@@ -122,6 +122,13 @@ describe("DetailsTab — view mode", () => {
     expect(screen.getByText("root")).toBeTruthy();
   });
 
+  it("a parked Light agent's status reads Parked, with the tooltip, not hibernated", () => {
+    render(<DetailsTab workspaceId="ws-1" data={data({ status: "hibernated", lightState: "parked" })} />);
+    const status = screen.getByText("Parked");
+    expect(status.getAttribute("title")).toBe("Asleep between scheduled runs");
+    expect(screen.queryByText("hibernated")).toBeNull();
+  });
+
   it("renders Edit button", () => {
     render(<DetailsTab workspaceId="ws-1" data={data()} />);
     expect(screen.getByRole("button", { name: /edit/i })).toBeTruthy();

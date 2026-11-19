@@ -213,7 +213,6 @@ def readiness_workflow(*, runner="local-deploy", action=None, rollback_readiness
             timeout-minutes: 30
 {SENTINEL_OUTPUTS}            steps:
 {SENTINEL_BEGIN}              - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-              - run: bash scripts/deploy/require-local-deploy-daemon.sh
               - env:
                   CP_BASE_URL: https://staging-api.moleculesai.app
                   INFISICAL_BASE: https://key.moleculesai.app
@@ -221,6 +220,8 @@ def readiness_workflow(*, runner="local-deploy", action=None, rollback_readiness
                   INFISICAL_CLIENT_ID: ${{{{ secrets.INFISICAL_CI_CLIENT_ID }}}}
                   INFISICAL_CLIENT_SECRET: ${{{{ secrets.INFISICAL_CI_CLIENT_SECRET }}}}
                   INFISICAL_PROJECT_ID: ${{{{ secrets.INFISICAL_CI_PROJECT_ID }}}}
+                  REG_USER: ${{{{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}}}
+                  REG_TOKEN: ${{{{ secrets.MOLECULE_REGISTRY_TOKEN }}}}
                 run: {action}
 {SENTINEL_END}          e2e-smoke:
             needs: [redeploy-fleet, runtime-image-readiness]
@@ -292,19 +293,35 @@ def test_runtime_readiness_cannot_redirect_to_production_cp(tmp_path: Path):
     result = run_lint(workflow)
 
     assert result.returncode == 1
-    assert "exact staging CP + Infisical SSOT mapping" in result.stdout
+    assert "exact staging CP + Infisical SSOT + registry credential mapping" in result.stdout
 
 
-def test_runtime_readiness_cannot_skip_daemon_guard(tmp_path: Path):
+def test_runtime_readiness_cannot_swap_the_registry_credential(tmp_path: Path):
     body = readiness_workflow().replace(
-        "bash scripts/deploy/require-local-deploy-daemon.sh", "true"
+        "REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}",
+        "REG_TOKEN: ${{ secrets.SOME_OTHER_TOKEN }}",
     )
     workflow = write_workflow(tmp_path, body)
 
     result = run_lint(workflow)
 
     assert result.returncode == 1
-    assert "require-local-deploy-daemon.sh" in result.stdout
+    assert "registry credential mapping" in result.stdout
+
+
+def test_runtime_readiness_cannot_add_a_step_before_the_action(tmp_path: Path):
+    body = readiness_workflow().replace(
+        "              - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd\n",
+        "              - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd\n"
+        "              - run: echo 'export PATH=/tmp/evil:$PATH' >> \"$GITHUB_ENV\"\n",
+        1,
+    )
+    workflow = write_workflow(tmp_path, body)
+
+    result = run_lint(workflow)
+
+    assert result.returncode == 1
+    assert "must have exactly ran-sentinel BEGIN" in result.stdout
 
 
 def test_rollback_directly_covers_runtime_readiness(tmp_path: Path):
@@ -349,7 +366,7 @@ def test_always_bridge_cannot_replace_direct_readiness_gate(tmp_path: Path):
     assert "does not directly `needs:` `runtime-image-readiness`" in result.stdout
 
 
-def test_runtime_readiness_cannot_override_daemon_endpoint_at_job_scope(tmp_path: Path):
+def test_runtime_readiness_cannot_set_job_scope_env(tmp_path: Path):
     body = readiness_workflow().replace(
         "          runtime-image-readiness:\n            needs: [advance-pin]\n",
         "          runtime-image-readiness:\n"
@@ -383,7 +400,7 @@ def test_workflow_defaults_cannot_syntax_check_instead_of_execute_guard(tmp_path
     assert "defaults.run.shell" in result.stdout
 
 
-def test_workflow_env_cannot_replace_runner_owned_daemon_endpoint(tmp_path: Path):
+def test_workflow_env_cannot_set_a_docker_endpoint(tmp_path: Path):
     body = readiness_workflow().replace(
         "        jobs:\n",
         "        env:\n"
@@ -396,7 +413,7 @@ def test_workflow_env_cannot_replace_runner_owned_daemon_endpoint(tmp_path: Path
     result = run_lint(workflow)
 
     assert result.returncode == 1
-    assert "trusted Docker endpoint values" in result.stdout
+    assert "forbidden execution/endpoint key" in result.stdout
 
 
 def test_workflow_env_cannot_redirect_infisical_credentials(tmp_path: Path):

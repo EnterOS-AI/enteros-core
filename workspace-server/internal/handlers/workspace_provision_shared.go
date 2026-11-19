@@ -316,6 +316,16 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		}
 	}
 
+	// Claude Code's subagent, small/fast and alias model tiers follow THIS
+	// workspace's model on the platform proxy. Derived here, after every
+	// model-setting path above (the concierge's model is seeded or reconciled
+	// only in applyConciergeProvisionConfig), so the tiers match the model the
+	// container runs. BYOK workspaces talk to their vendor directly and keep
+	// Claude Code's own tier defaults.
+	if llmRes.RoutedToPlatform {
+		applyClaudeCodeHarnessModelEnv(envVars, workspaceID, payload.Runtime, effectiveModelForBilling("", envVars))
+	}
+
 	// SELF-HOST TENANT-IDENTITY DEFAULTS (2026-07-19 operator decision): a
 	// template that hard-requires TENANT_* identity vars (seo-agent's
 	// TENANT_NAME/DOMAIN/TIMEZONE...) must NEVER fail first boot on a

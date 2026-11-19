@@ -53,6 +53,18 @@ type restartState struct {
 	// dropped so a probe firing during the EC2-pending window can't
 	// re-trigger a fresh full cycle on the just-launched instance.
 	restartStartedAt time.Time
+
+	// Crash-loop breaker (auto_restart_breaker.go): when the automatic
+	// restarts counted against it stopped the container, oldest first, and
+	// whether it has tripped. Only resetAutoRestarts clears either.
+	autoRestarts       []time.Time
+	autoRestartsHalted bool
+
+	// Post-restart queue hold (restart_queue_hold.go): when an automatic
+	// restart last stopped the container (zero = no hold), and the heartbeat
+	// at which the drain first saw its replacement ready (zero = not yet).
+	queueHeldSince      time.Time
+	queueReadyHeartbeat time.Time
 }
 
 // restartStates is a per-workspace map of *restartState. Each workspace gets
@@ -337,6 +349,13 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
 		return
 	}
+	// Enter OS Light (C5): a parking or parked Light agent is not restarted —
+	// open it (POST /light/open). markProvisioningForRestart's claim below
+	// refuses the row too if this read fails.
+	if ref := lightWakeRefusal(ctx, id, "restart"); ref != nil {
+		ref.write(c)
+		return
+	}
 	// Block restart if any ancestor is paused — must resume parent first
 	if paused, parentName := isParentPaused(ctx, id); paused {
 		c.JSON(http.StatusConflict, gin.H{"error": "parent workspace \"" + parentName + "\" is paused — resume it first"})
@@ -409,8 +428,23 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	// the Config tab which writes through to both the DB and the container).
 	containerRuntime := h.restartRuntimeFromConfig(ctx, id, wsName, dbRuntime, body.ApplyTemplate)
 
-	// Reset to provisioning
-	markProvisioningForRestart(ctx, id)
+	// Reset to provisioning. The claim refuses a parking or parked Light agent
+	// (the guard read above failed open) and a row deleted meanwhile: nothing
+	// is dispatched for either, and the answer says which.
+	if !markProvisioningForRestart(ctx, id) {
+		state, stateErr := readLightState(ctx, id)
+		switch {
+		case errors.Is(stateErr, sql.ErrNoRows):
+			c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
+		case stateErr == nil && models.LightBlocksWake(state):
+			lightParkedRefusal(state).write(c)
+		default:
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "the workspace changed state before the restart could start; re-check its status before retrying",
+			})
+		}
+		return
+	}
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), id, map[string]interface{}{
 		"name":    wsName,
 		"tier":    tier,
@@ -454,6 +488,9 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	// Capture restart-context data BEFORE provisionWorkspaceOpts flips
 	// last_heartbeat_at with the new session. Issue #19 Layer 1.
 	restartData := loadRestartContextData(ctx, id)
+
+	// The owner has taken over: automatic restarts get their full budget back.
+	resetAutoRestarts(id)
 
 	// Dispatch through the SoT restart dispatcher. RestartWorkspaceAutoOpts
 	// owns "which backend for stop" + "which backend for provision" and
@@ -509,16 +546,28 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 //
 // Extracted so the restart entry points and the tests that pin this share ONE
 // statement rather than three copies that can drift a column apart.
-func markProvisioningForRestart(ctx context.Context, workspaceID string) {
-	if _, err := db.DB.ExecContext(ctx,
+//
+// Enter OS Light: the claim carries models.LightWakeAllowedSQL, so it matches
+// no parking or parked Light agent; claimed is false then (or when the row is
+// gone) and the caller must dispatch nothing. A database error keeps today's
+// behaviour — logged, and the restart proceeds (claimed true).
+func markProvisioningForRestart(ctx context.Context, workspaceID string) (claimed bool) {
+	res, err := db.DB.ExecContext(ctx,
 		// Clear mcp_unloaded_since so the concierge warming clock (EV2 warm-fail +
 		// online not-ready grace, registry.go) starts fresh for this new provisioning
 		// episode — a stale stamp from a prior online-degrade would instantly re-degrade
 		// the box on its first post-restart beat (core#4457 cluster-2).
-		`UPDATE workspaces SET status = $1, mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2`,
-		models.StatusProvisioning, workspaceID); err != nil {
+		`UPDATE workspaces SET status = $1, mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2 AND `+models.LightWakeAllowedSQL,
+		models.StatusProvisioning, workspaceID)
+	if err != nil {
 		log.Printf("Restart: failed to set provisioning status for %s: %v", workspaceID, err)
+		return true
 	}
+	if n, raErr := res.RowsAffected(); raErr == nil && n == 0 {
+		log.Printf("Restart: provisioning claim for %s matched no row (a parking or parked Light agent, or a deleted row) — nothing dispatched", workspaceID)
+		return false
+	}
+	return true
 }
 
 // clearWorkspaceRouting drops everything that points callers at the container
@@ -750,6 +799,15 @@ func (h *WorkspaceHandler) Hibernate(c *gin.Context) {
 	id := c.Param("id")
 	ctx := c.Request.Context()
 
+	// Enter OS Light: a Light agent is parked, never hibernated by hand — a
+	// plain hibernate would leave its schedules paused with nothing to resume
+	// them. Checked before the status-filtered SELECT so a parked agent is told
+	// why rather than 404.
+	if ref := lightEnabledRefusal(ctx, id, "hibernate", "park it with POST /workspaces/:id/light/park"); ref != nil {
+		ref.write(c)
+		return
+	}
+
 	var wsName string
 	var tier, activeTasks int
 	err := db.DB.QueryRowContext(ctx,
@@ -962,8 +1020,11 @@ func (h *WorkspaceHandler) WakeWorkspace(workspaceID string) {
 	ctx := context.Background()
 
 	// Atomic claim — only one concurrent wake transitions hibernated→provisioning.
+	// Enter OS Light: the predicate makes a parking or parked Light agent
+	// unclaimable, so no caller can wake it (open wakes it after setting
+	// 'opening', which the predicate allows).
 	res, err := db.DB.ExecContext(ctx,
-		`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2 AND status = 'hibernated'`,
+		`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2 AND status = 'hibernated' AND `+models.LightWakeAllowedSQL,
 		models.StatusProvisioning, workspaceID)
 	if err != nil {
 		log.Printf("Wake: claim failed for %s: %v", workspaceID, err)
@@ -1017,15 +1078,15 @@ func (h *WorkspaceHandler) RestartByID(workspaceID string) {
 //
 // It intentionally bypasses RestartByID's self-fire debounce while preserving
 // coalescing and the provision gate. Probe/reactive callers must keep using
-// RestartByID so container-health self-fire loops still drop inside the
-// debounce window.
+// the debounced path (AutoRestartByID) so container-health self-fire loops
+// still drop inside the debounce window.
 func (h *WorkspaceHandler) RestartByIDAfterMutation(workspaceID string) {
 	h.restartByID(workspaceID, false)
 }
 
 func (h *WorkspaceHandler) restartByID(workspaceID string, useSelfFireDebounce bool) {
 	restartByIDWithCycle(workspaceID, h.HasProvisioner(), useSelfFireDebounce, func() {
-		h.runRestartCycle(workspaceID)
+		h.runRestartCycle(workspaceID, "")
 	})
 }
 
@@ -1523,7 +1584,10 @@ func (h *WorkspaceHandler) workspaceIsRunning(ctx context.Context, workspaceID s
 // closes the second class of race (manual + programmatic, or two
 // distinct programmatic entry points firing near-simultaneously) that
 // the pending-flag didn't cover.
-func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
+//
+// autoTrigger is non-empty when this cycle is an automatic crash-recovery
+// restart (AutoRestartByID); only those count against the crash-loop breaker.
+func (h *WorkspaceHandler) runRestartCycle(workspaceID, autoTrigger string) {
 	ctx := context.Background()
 
 	// Per-workspace restart/provision gate. The same gate is acquired
@@ -1538,10 +1602,20 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 
 	var wsName, status, dbRuntime, dbTemplate, dbKind string
 	var tier int
+	// Enter OS Light: the predicate keeps a parking or parked Light agent out
+	// of every programmatic restart (secrets, model, 24/7 switch, plugins, file
+	// writes, AdminRestart, the crash probes).
 	err := db.DB.QueryRowContext(ctx,
-		`SELECT name, status, tier, COALESCE(runtime, 'claude-code'), COALESCE(template, ''), COALESCE(kind, 'workspace') FROM workspaces WHERE id = $1 AND status NOT IN ('removed', 'paused', 'hibernated')`, workspaceID,
+		`SELECT name, status, tier, COALESCE(runtime, 'claude-code'), COALESCE(template, ''), COALESCE(kind, 'workspace') FROM workspaces WHERE id = $1 AND status NOT IN ('removed', 'paused', 'hibernated') AND `+models.LightWakeAllowedSQL, workspaceID,
 	).Scan(&wsName, &status, &tier, &dbRuntime, &dbTemplate, &dbKind)
 	if err != nil {
+		// A restart a mutation asked for (autoTrigger "": a secret, plugin or
+		// config change) on a parking or parked Light agent becomes a refresh:
+		// the monitor opens it and parks it again, so the control plane's env
+		// snapshot picks the change up. A crash probe's restart does nothing.
+		if errors.Is(err, sql.ErrNoRows) && autoTrigger == "" {
+			queueLightRefreshIfBlocked(ctx, workspaceID, "restart")
+		}
 		return // includes paused/hibernated — don't auto-restart those
 	}
 
@@ -1589,6 +1663,14 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 		}
 	}
 
+	// Checked past every filter above, so a restart that was going to be
+	// skipped (external, dormant, paused parent, warming) never trips it, and
+	// before anything below touches the container.
+	if autoTrigger != "" && autoRestartHalted(workspaceID, time.Now()) {
+		h.haltAutoRestarts(workspaceID, autoTrigger)
+		return
+	}
+
 	// If still provisioning, brief wait so container exists for Stop()
 	if status == "provisioning" {
 		log.Printf("Auto-restart: interrupting provisioning for %s (%s)", wsName, workspaceID)
@@ -1630,11 +1712,32 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 		return
 	}
 
-	if _, err := db.DB.ExecContext(ctx,
+	// An automatic restart counts against the crash-loop breaker only now that
+	// it has stopped the failed container — a declined one, above, left it as
+	// it was. Its replacement may fail the same way, so queued turns wait until
+	// it has stayed up (restart_queue_hold.go).
+	if autoTrigger != "" {
+		recordAutoRestart(workspaceID, time.Now())
+		armRestartQueueHold(workspaceID)
+	}
+
+	// Enter OS Light: the provisioning write carries the predicate too. The
+	// SELECT above saw the agent open, but the stop can take tens of seconds,
+	// and a park may have claimed it meanwhile; a parking or parked agent is not
+	// re-provisioned (its schedules run as the control plane's CronJobs). A
+	// mutation-driven cycle leaves a refresh instead, as the SELECT branch does.
+	if res, err := db.DB.ExecContext(ctx,
 		// Clear mcp_unloaded_since — fresh warming clock for the new provisioning
 		// episode (core#4457 cluster-2; see Restart path above).
-		`UPDATE workspaces SET status = $1, url = '', mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2`, models.StatusProvisioning, workspaceID); err != nil {
+		`UPDATE workspaces SET status = $1, url = '', mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2 AND `+models.LightWakeAllowedSQL,
+		models.StatusProvisioning, workspaceID); err != nil {
 		log.Printf("Auto-restart: failed to set provisioning status for %s: %v", workspaceID, err)
+	} else if n, raErr := res.RowsAffected(); raErr == nil && n == 0 {
+		log.Printf("Auto-restart: %s (%s) was parked (or deleted) while it restarted — not re-provisioned", wsName, workspaceID)
+		if autoTrigger == "" {
+			queueLightRefreshIfBlocked(ctx, workspaceID, "restart")
+		}
+		return
 	}
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), workspaceID, map[string]interface{}{
 		"name": wsName, "tier": tier, "runtime": dbRuntime, "template": dbTemplate,
@@ -1774,8 +1877,16 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "lookup failed"})
 		return
 	}
+	// Enter OS Light (C5): a parking or parked Light agent is not paused (a
+	// later Resume would re-provision it). Its schedules keep firing; open it to
+	// stop them.
+	if ref := lightWakeRefusal(ctx, id, "pause"); ref != nil {
+		ref.write(c)
+		return
+	}
 
-	// Collect this workspace + all descendants to pause
+	// Collect this workspace + all descendants to pause. A parking or parked
+	// Light descendant is left out (the walk still descends through it).
 	toPause := []struct{ id, name string }{{id, wsName}}
 	var descendantList []gin.H
 	rows, err := db.DB.QueryContext(ctx,
@@ -1783,7 +1894,7 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 			SELECT id, name FROM workspaces WHERE parent_id = $1 AND status NOT IN ('removed', 'paused')
 			UNION ALL
 			SELECT w.id, w.name FROM workspaces w JOIN descendants d ON w.parent_id = d.id WHERE w.status NOT IN ('removed', 'paused')
-		) SELECT id, name FROM descendants`, id)
+		) SELECT d.id, d.name FROM descendants d JOIN workspaces w ON w.id = d.id WHERE `+models.LightWakeAllowedSQLFor("w"), id)
 	if err != nil {
 		log.Printf("Pause: descendant query failed for %s: %v", id, err)
 	}
@@ -1905,7 +2016,7 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 		// property Hibernate's atomic claim buys, without inventing a 'pausing'
 		// status (see the PR body for why that is deliberately out of scope).
 		res, err := db.DB.ExecContext(opCtx,
-			`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2 AND status NOT IN ('removed', 'paused')`,
+			`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2 AND status NOT IN ('removed', 'paused') AND `+models.LightWakeAllowedSQL,
 			models.StatusPaused, ws.id)
 		// stage "mark_paused" = the container IS stopped and the row still says
 		// online. That state does NOT sit still, and a reader who assumes it does
@@ -1913,8 +2024,8 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 		// to be online, which is exactly what the liveness/health sweeps hunt.
 		// StartHealthSweep and StartLivenessMonitor (neither gated on prov, so
 		// both run in CP/SaaS) and StartCPInstanceReconciler all call
-		// onWorkspaceOffline, which ends in `go wh.RestartByID(workspaceID)` —
-		// and RestartByID's dormant-state guard skips 'paused'/'hibernated' but
+		// onWorkspaceOffline, which ends in `go wh.AutoRestartByID(...)` — and
+		// the restart cycle's dormant-state guard skips 'paused'/'hibernated' but
 		// NOT 'online', so it proceeds. The platform therefore AUTO-REPROVISIONS
 		// the workspace within a sweep interval. The user asked for a pause and
 		// gets a running workspace back; that is a self-healing outcome rather
@@ -2066,6 +2177,14 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 	id := c.Param("id")
 	ctx := c.Request.Context()
 
+	// Enter OS Light (C5): a parking or parked Light agent is not resumed —
+	// open it. Checked before the status='paused' SELECT so it is told why
+	// rather than 404.
+	if ref := lightWakeRefusal(ctx, id, "resume"); ref != nil {
+		ref.write(c)
+		return
+	}
+
 	var wsName, dbRuntime, dbTemplate string
 	var tier int
 	err := db.DB.QueryRowContext(ctx,
@@ -2106,7 +2225,7 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 			SELECT id, name, tier, COALESCE(runtime, 'claude-code') AS runtime, COALESCE(template, '') AS template FROM workspaces WHERE parent_id = $1 AND status = 'paused'
 			UNION ALL
 			SELECT w.id, w.name, w.tier, COALESCE(w.runtime, 'claude-code'), COALESCE(w.template, '') FROM workspaces w JOIN descendants d ON w.parent_id = d.id WHERE w.status = 'paused'
-		) SELECT id, name, tier, runtime, template FROM descendants`, id)
+		) SELECT d.id, d.name, d.tier, d.runtime, d.template FROM descendants d JOIN workspaces w ON w.id = d.id WHERE `+models.LightWakeAllowedSQLFor("w"), id)
 	if err != nil {
 		log.Printf("Resume: descendant query failed for %s: %v", id, err)
 	}
@@ -2218,7 +2337,7 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 		// provisioning); a stale warming stamp here is exactly the cluster-2
 		// false-degrade the EV2 review flagged (core#4457).
 		res, err := db.DB.ExecContext(opCtx,
-			`UPDATE workspaces SET status = $1, mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2 AND status = 'paused'`,
+			`UPDATE workspaces SET status = $1, mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2 AND status = 'paused' AND `+models.LightWakeAllowedSQL,
 			models.StatusProvisioning, ws.id)
 		if err != nil {
 			note("mark_provisioning", err)
@@ -2242,6 +2361,7 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 		// telling them the canvas may be stale, not a 500 implying nothing
 		// happened.
 		resumedCount++
+		resetAutoRestarts(ws.id) // a deliberate recovery: full automatic-restart budget again
 		if err := h.broadcaster.RecordAndBroadcast(opCtx, string(events.EventWorkspaceProvisioning), ws.id, map[string]interface{}{
 			"name": ws.name, "tier": ws.tier, "runtime": ws.runtime, "template": ws.template,
 		}); err != nil {

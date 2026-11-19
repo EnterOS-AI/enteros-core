@@ -1,7 +1,10 @@
 # Platform model default
 
-The platform default is `minimax/MiniMax-M3` (MiniMax M3). The slash form
-selects Molecule's metered proxy. The upstream model ID is `MiniMax-M3`.
+The platform default is `google/gemini-4-hydrogen` (Gemini 4 Hydrogen). The
+slash form selects Molecule's metered proxy, which serves `google/*` through
+Google AI Studio with the platform key. The upstream model ID is
+`gemini-4-hydrogen`. The default before it was `google/gemini-4-carbon` (Gemini
+4 Carbon, still selectable), and before that `minimax/MiniMax-M3`.
 
 For managed installations, `MOLECULE_LLM_DEFAULT_MODEL` in Infisical at
 `/shared/controlplane/llm` is authoritative. The control plane loads it at boot
@@ -12,15 +15,46 @@ application image or change the production release freeze.
 
 Fresh concierges inherit this selector. Existing platform-managed concierges
 reconcile it on their next provision; BYOK concierges retain their chosen model.
+
+Workspaces an agent creates without naming a model get the selector too. Core
+gives the concierge's management MCP the selector the tenant holds (its own
+`MOLECULE_LLM_DEFAULT_MODEL`, from `/cp/tenants/config` at boot) as
+`MOLECULE_LLM_DEFAULT_MODEL`, never the concierge's own model, and
+`GET /admin/llm/offered-models?runtime=<rt>` reports it as `default_model` when
+that runtime offers it. `provision_workspace` and `light_create_agent` use one of
+the two and fail with `INVALID_ARGUMENTS` when neither is available; a
+`provision_workspace` call that names a template keeps the template's declared
+model.
+
+On a platform-managed Claude Code workspace, each provision sets Claude Code's
+other model tiers (`ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`,
+`ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`,
+`CLAUDE_CODE_SUBAGENT_MODEL`) to that workspace's own model, and
+`ENABLE_TOOL_SEARCH=false`, unless the model is served by Anthropic. Subagents
+such as Explore, WebFetch and background calls then stay on the workspace's
+model instead of a built-in `claude-*` ID the proxy would send to Anthropic. A
+workspace or org secret with one of those names overrides it.
 This setting does not bulk-edit worker workspace model secrets. A worker's
 explicit model takes precedence over its template default. Claude Code,
-Hermes, and OpenClaw templates default to platform M3; Codex retains its native
-model because its Responses API transport has a separate compatibility contract.
+Hermes, and OpenClaw templates default to platform Hydrogen; Codex retains its
+native model because its Responses API transport has a separate compatibility
+contract (the proxy's Responses surface serves only OpenAI models).
+
+End-to-end lanes never run on the default. They use
+`google/gemini-3.1-flash-lite`, the cheapest Gemini model that serves a tool
+call: `E2E_LLM_UPSTREAM: gemini` in the e2e workflows gives the throwaway control
+plane the platform Gemini key and that model as its `MOLECULE_LLM_DEFAULT_MODEL`,
+pins the bundled base templates' default to it, and every harness that picks a
+platform model (`tests/e2e/lib/model_slug.sh`, `tests/harness`, the canvas
+staging setup) falls back to it. `ci-llm` and `vendor` stay selectable.
 
 For self-hosted installations, set `MOLECULE_LLM_DEFAULT_MODEL` to a model
 registered for the chosen runtime and supply its credential. For example,
-Claude Code uses bare `MiniMax-M3` with `MINIMAX_API_KEY` for direct MiniMax
-access. A platform slash ID requires the platform proxy configuration. Empty
+Hermes uses `gemini/gemini-4-hydrogen` with `GEMINI_API_KEY` for direct Gemini
+access (Claude Code has no direct Gemini route; it reaches Gemini only through
+the platform proxy), and Claude Code uses bare `MiniMax-M3` with
+`MINIMAX_API_KEY` for direct MiniMax access. A platform slash ID requires the
+platform proxy configuration. Empty
 self-hosted configuration still waits for onboarding; changing the fallback
 does not configure credentials.
 

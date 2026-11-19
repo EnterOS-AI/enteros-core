@@ -161,6 +161,23 @@ func (h *ChatFilesHandler) WithPendingUploads(storage pendinguploads.Storage, br
 // the runtime cost is zero.
 var chatUploadMaxBytes = uploads.DefaultUploadLimits().PerRequestBytes
 
+// workspaceNotReadyCode is the code of the 503 a forward to a workspace's
+// agent answers while the agent is not registered or not reachable yet (it is
+// starting, or a restart is replacing its pod): retry after Retry-After
+// seconds. Cloudflare passes a 503's body through (it replaces an origin's 502
+// and 504 pages), so clients behind it still see the code.
+const workspaceNotReadyCode = "WORKSPACE_NOT_READY"
+
+// workspaceNotReadyRetryAfter is the Retry-After of a WORKSPACE_NOT_READY 503.
+const workspaceNotReadyRetryAfter = "10"
+
+// writeWorkspaceNotReady answers 503 WORKSPACE_NOT_READY with Retry-After;
+// message is the sentence (kept as each forward has always worded it).
+func writeWorkspaceNotReady(c *gin.Context, message string) {
+	c.Header("Retry-After", workspaceNotReadyRetryAfter)
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": message, "code": workspaceNotReadyCode})
+}
+
 // resolveWorkspaceForwardCreds resolves the workspace's URL +
 // platform_inbound_secret for an /internal/* forward, applying
 // lazy-heal on a missing inbound secret (RFC #2312 backfill — the
@@ -204,8 +221,9 @@ func resolveWorkspaceForwardCreds(c *gin.Context, ctx context.Context, workspace
 		//
 		//  push-mode → URL just isn't on the row yet (workspace
 		//    restart in progress, or first /registry/register hasn't
-		//    landed). 503 + "not registered yet" is correct — retry
-		//    after the next heartbeat (~30s) will likely succeed.
+		//    landed). 503 WORKSPACE_NOT_READY + "not registered yet"
+		//    + Retry-After is correct — a retry once the new pod has
+		//    registered succeeds.
 		//
 		//  anything else (poll-mode, NULL, empty string) → URL is
 		//    structurally absent. The platform never dispatches to a
@@ -222,13 +240,29 @@ func resolveWorkspaceForwardCreds(c *gin.Context, ctx context.Context, workspace
 		// invariant we actually want is "URL empty + not-push = no
 		// dispatch path, ever".
 		if !deliveryMode.Valid || deliveryMode.String != "push" {
+			// Name what was judged: the TARGET workspace's own row (never the
+			// caller's registration), its delivery_mode, and its empty URL. The
+			// 2026-11-13 reno-stars report read this 422 as "my token's
+			// workspace is poll-mode", when the platform-hosted target's row
+			// had been rewritten by a URL-less poll register.
+			mode := "unset"
+			if deliveryMode.Valid && deliveryMode.String != "" {
+				mode = deliveryMode.String
+			}
 			c.JSON(http.StatusUnprocessableEntity, gin.H{
-				"error":  "workspace has no callback URL — " + op + " requires push-mode + a public URL",
-				"detail": "This workspace registered without a publicly-reachable URL (delivery_mode is not 'push'). The platform cannot HTTP-forward to it. Re-register the workspace with a public URL in push mode (e.g. via ngrok / Cloudflare tunnel) to enable " + op + ".",
+				"error": "workspace has no callback URL — " + op + " requires push-mode + a public URL " +
+					"(judged from target workspace " + workspaceID + ": delivery_mode=" + mode + ", url empty)",
+				"detail": "Workspace " + workspaceID + " is registered with delivery_mode=" + mode + " and no URL, so the platform cannot HTTP-forward " + op +
+					" to it. This is decided by the target workspace's own registration, not by the caller's credential. " +
+					"For an external workspace, re-register it in push mode with a publicly-reachable URL (e.g. via ngrok / Cloudflare tunnel). " +
+					"For a platform-hosted workspace, its last /registry/register carried no URL (e.g. a poll-mode client registering with this workspace's ID); " +
+					"restart the workspace so it re-registers its platform URL, and register external peers under their own workspace IDs.",
+				"workspace_id":  workspaceID,
+				"delivery_mode": mode,
 			})
 			return "", "", false
 		}
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "workspace url not registered yet"})
+		writeWorkspaceNotReady(c, "workspace url not registered yet")
 		return "", "", false
 	}
 	// Defense-in-depth for #2316: workspaces.url is validated at

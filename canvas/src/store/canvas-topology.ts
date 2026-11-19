@@ -2,6 +2,7 @@ import type { Node, Edge } from "@xyflow/react";
 import type { WorkspaceData } from "./socket";
 import type { WorkspaceNodeData } from "./canvas";
 import { WORKSPACE_KIND } from "@/lib/workspace-kind";
+import { parseLightState } from "@/lib/light";
 import { bootStateFromWire } from "./boot-telemetry";
 
 /** Thrown when workspace parent chains contain a cycle. Catching this at
@@ -586,6 +587,9 @@ export function buildNodesAndEdges(
         // view hides the platform root (it's the undeletable org anchor) via
         // stripPlatformRootForMap; the shell home tree keeps it as ROOT.
         kind: ws.kind ?? WORKSPACE_KIND.Workspace,
+        // Enter OS Light state; null for an ordinary agent, an older server
+        // without the field, or a value this canvas does not know.
+        lightState: parseLightState(ws.light_state),
         ...(bootState
           ? { bootSteps: bootState.bootSteps, bootLog: bootState.bootLog }
           : {}),
