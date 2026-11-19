@@ -1585,6 +1585,22 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	if testBusyActiveTasksHook != nil {
 		activeTasks = testBusyActiveTasksHook(payload.WorkspaceID, activeTasks)
 	}
+	// A HEARTBEAT FROM A POD BEING STOPPED. A restart (runRestartCycle) stops
+	// the old compute, clears workspaces.url, sets 'provisioning' and starts
+	// the new compute. The control plane's stop returns as soon as the old pod
+	// is told to go (Kubernetes: the Deployment is deleted, the pod keeps
+	// running through its termination grace period), so that pod can still
+	// heartbeat after the row went 'provisioning'. Its heartbeat must not
+	// promote the row to 'online': nothing would reach it (its Service
+	// endpoint is gone) and the new pod has not registered, so every caller
+	// that waits for online (a Light park, a schedule edit) would act on an
+	// agent that is not there; observed 2026-11-18 as 'online' with an empty
+	// URL for up to a minute. Registration is what writes the URL (the
+	// provisioner pre-stores it on Docker), so a provisioning row without one
+	// has not been registered by its current pod, and the inline CASE below
+	// promotes only a row that has a URL. A pod whose boot registration
+	// failed for good stays 'provisioning' until it registers (or the
+	// provision timeout marks it failed); it was undialable either way.
 	var err error
 	if payload.MonthlySpend > 0 {
 		_, err = db.DB.ExecContext(ctx, `
@@ -1603,7 +1619,9 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				-- provision_workspace is loaded. Excluding platform here is what makes
 				-- "online" mean verified-by-construction. Non-platform keeps today's
 				-- fast first-heartbeat flip. kind is NOT NULL so the CASE is safe.
-				status            = (CASE WHEN status = 'provisioning' AND kind <> 'platform' THEN 'online' ELSE status END)::workspace_status,
+				-- Only a row with a URL is promoted: see "A HEARTBEAT FROM A POD
+				-- BEING STOPPED" above.
+				status            = (CASE WHEN status = 'provisioning' AND kind <> 'platform' AND COALESCE(url, '') <> '' THEN 'online' ELSE status END)::workspace_status,
 				updated_at        = now()
 			WHERE id = $1 AND status != 'removed' AND `+models.LightWakeAllowedSQL+`
 		`, payload.WorkspaceID, payload.ErrorRate, payload.SampleError,
@@ -1625,7 +1643,9 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				-- provision_workspace is loaded. Excluding platform here is what makes
 				-- "online" mean verified-by-construction. Non-platform keeps today's
 				-- fast first-heartbeat flip. kind is NOT NULL so the CASE is safe.
-				status            = (CASE WHEN status = 'provisioning' AND kind <> 'platform' THEN 'online' ELSE status END)::workspace_status,
+				-- Only a row with a URL is promoted: see "A HEARTBEAT FROM A POD
+				-- BEING STOPPED" above.
+				status            = (CASE WHEN status = 'provisioning' AND kind <> 'platform' AND COALESCE(url, '') <> '' THEN 'online' ELSE status END)::workspace_status,
 				updated_at        = now()
 			WHERE id = $1 AND status != 'removed' AND `+models.LightWakeAllowedSQL+`
 		`, payload.WorkspaceID, payload.ErrorRate, payload.SampleError,
@@ -3355,19 +3375,31 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	// heartbeat handler itself (on prevStatus=='provisioning'), NOT only here —
 	// see the fireReconcileOnline call right after the main UPDATE. Do not rely
 	// on this branch as the reconcile trigger; it does not fire for new boxes.
+	//
+	// Like the inline CASE, it promotes only a row with a URL (see "A HEARTBEAT
+	// FROM A POD BEING STOPPED" in Heartbeat): a provisioning row without one
+	// is waiting for its new pod to register, and the heartbeat came from the
+	// pod a restart is stopping (or from a pod that never registered).
 	if currentStatus == "provisioning" {
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'provisioning'`, models.StatusOnline, payload.WorkspaceID); err != nil {
+		res, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'provisioning' AND COALESCE(url, '') <> ''`, models.StatusOnline, payload.WorkspaceID)
+		promoted := false
+		if err != nil {
 			log.Printf("Heartbeat: failed to transition %s from provisioning to online: %v", payload.WorkspaceID, err)
-		} else {
+		} else if n, raErr := res.RowsAffected(); raErr == nil && n > 0 {
+			promoted = true
 			log.Printf("Heartbeat: transitioned %s from provisioning to online (heartbeat received)", payload.WorkspaceID)
+		} else {
+			log.Printf("Heartbeat: %s stays provisioning: no registered URL (a heartbeat from a pod that has not registered, e.g. the one a restart is stopping)", payload.WorkspaceID)
 		}
-		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{
-			"recovered_from": currentStatus,
-		})
-		// RFC#2843: reconcile declared plugins on transition-to-online. This
-		// is the primary path for a freshly-provisioned workspace's first
-		// boot — provisioning→online is the only transition a new box makes.
-		h.fireReconcileOnline(ctx, payload.WorkspaceID)
+		if promoted {
+			h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{
+				"recovered_from": currentStatus,
+			})
+			// RFC#2843: reconcile declared plugins on transition-to-online. This
+			// is the primary path for a freshly-provisioned workspace's first
+			// boot — provisioning→online is the only transition a new box makes.
+			h.fireReconcileOnline(ctx, payload.WorkspaceID)
+		}
 	}
 
 	// Auto-recovery from awaiting_agent: external workspaces are flipped

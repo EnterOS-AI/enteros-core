@@ -715,7 +715,7 @@ type lightParkScheduleView struct {
 // Park handles POST /workspaces/:id/light/park.
 //
 //	@Summary	Park a Light agent
-//	@Description	Hands the agent's schedules to the control plane as CronJobs, stops its pod and resumes the CronJobs. Answers 202 once the CronJobs are written; light_state goes parking → parked in the background (poll GET /workspaces/{id}/light). A refusal before the parking claim changes nothing; one after it returns the agent to open and records last_error.
+//	@Description	Hands the agent's schedules to the control plane as CronJobs, stops its pod and resumes the CronJobs. Answers 202 once the CronJobs are written; light_state goes parking → parked in the background (poll GET /workspaces/{id}/light). The agent must answer its schedule list first: an agent being restarted is waited for up to a minute, then refused 409 LIGHT_AGENT_NOT_READY with Retry-After. A refusal before the parking claim changes nothing; one after it returns the agent to open and records last_error.
 //	@Tags		light
 //	@Produce	json
 //	@Param		id	path		string	true	"Workspace ID"
@@ -724,12 +724,12 @@ type lightParkScheduleView struct {
 //	@Failure	400	{object}	map[string]interface{}	"LIGHT_BAD_REQUEST"
 //	@Failure	403	{object}	map[string]interface{}	"LIGHT_SELF_FORBIDDEN"
 //	@Failure	404	{object}	map[string]interface{}	"WORKSPACE_NOT_FOUND, LIGHT_TENANT_NOT_FOUND"
-//	@Failure	409	{object}	map[string]interface{}	"LIGHT_NOT_ENABLED, LIGHT_AGENT_NOT_AWAKE, LIGHT_AGENT_BUSY, LIGHT_RESTART_REQUIRED, LIGHT_ENV_UNSUPPORTED, LIGHT_TRANSITION_IN_PROGRESS"
+//	@Failure	409	{object}	map[string]interface{}	"LIGHT_NOT_ENABLED, LIGHT_AGENT_NOT_AWAKE, LIGHT_AGENT_NOT_READY (Retry-After), LIGHT_AGENT_BUSY, LIGHT_RESTART_REQUIRED, LIGHT_ENV_UNSUPPORTED, LIGHT_TRANSITION_IN_PROGRESS"
 //	@Failure	413	{object}	map[string]interface{}	"LIGHT_TOO_LARGE"
-//	@Failure	422	{object}	map[string]interface{}	"LIGHT_INVALID, LIGHT_RUNTIME_UNSUPPORTED"
+//	@Failure	422	{object}	map[string]interface{}	"LIGHT_INVALID, LIGHT_RUNTIME_UNSUPPORTED, LIGHT_SCHEDULES_UNREADABLE"
 //	@Failure	500	{object}	map[string]interface{}	"LIGHT_FAILED"
 //	@Failure	501	{object}	map[string]interface{}	"LIGHT_UNSUPPORTED"
-//	@Failure	502	{object}	map[string]interface{}	"LIGHT_SCHEDULES_UNREADABLE, LIGHT_FAILED"
+//	@Failure	502	{object}	map[string]interface{}	"LIGHT_FAILED"
 //	@Failure	503	{object}	map[string]interface{}	"LIGHT_BACKEND_UNAVAILABLE"
 //	@Router		/workspaces/{id}/light/park [post]
 //	@Security	BearerAuth

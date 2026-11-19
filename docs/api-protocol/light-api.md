@@ -57,6 +57,36 @@ needs about 30 s to stop); an open takes as long as the agent's boot. If a
 background step fails, `last_error` says why, and core retries it (see
 [What core does in the background](#what-core-does-in-the-background)).
 
+### When the agent is ready
+
+Enable restarts the agent, and an open boots it. Until its new pod has
+registered, the agent cannot be parked and its schedules cannot be read or
+edited. The agent is ready when `GET /workspaces/{id}` shows `status`
+`online` (or `degraded`) **and** a non-empty `url`: a restart clears `url`,
+and only the new pod's registration writes it again. A heartbeat from the pod
+a restart is stopping no longer moves `status` from `provisioning` to
+`online` (before 2026-11-18 it could, so `online` with an empty `url` was a
+pod that was going away).
+
+A pod that has just registered can still take a few seconds before it
+serves. Calls made in that window are refused as retryable, never as
+failures:
+
+- `POST /light/park` waits up to a minute for the agent to answer, then
+  answers `409 LIGHT_AGENT_NOT_READY` with `Retry-After` (nothing is changed).
+- The schedule routes (`/workspaces/{id}/schedules...`) answer
+  `503 {"code": "WORKSPACE_NOT_READY"}` with `Retry-After` while the agent
+  has no registered URL or does not answer.
+
+Cloudflare, in front of every tenant, replaces the body of a `502` or `504`
+with its own: an HTML or text page, or a JSON problem document of its own
+(`"cloudflare_error": true`, no `error` or `code`, `Retry-After: 60`). Which
+one depends on the client, not only on `Accept`: on staging Node's `fetch`
+got the document and `curl` a text page, both asking for JSON. So no refusal
+a client must act on uses those statuses; a `503` body reaches the client
+unchanged. A `5xx` without core's `error` sentence is a proxy's answer, not
+core's: retry an idempotent call (every Light route but `run`, every `GET`).
+
 ## Authentication
 
 Every route sits behind `WorkspaceAuth`: the owner's session, an org API
@@ -231,10 +261,14 @@ A refusal writes nothing.
 
 Parks an open Light agent. No body.
 
-Core checks the agent, claims `parking`, reads the agent's schedules from the
-agent itself (the same list as `GET /workspaces/{id}/schedules`, up to 8 MiB),
-mints a new run token, and hands the set to the control plane, which writes one
-CronJob per schedule. Then, in the background, it stops the agent's pod and
+Core checks the agent and reads its schedules from the agent itself (the same
+list as `GET /workspaces/{id}/schedules`, up to 8 MiB). An agent that does not
+answer (it is restarting: no registered URL yet, a transport failure, or a
+`5xx`) is tried again for up to a minute, 1, 2, 4 and then 8 seconds apart;
+between tries core reads the workspace again, and stops waiting when it was
+deleted, is no longer online, or took a task. Then core claims `parking`,
+reads the schedules again (the set it sends), mints a new run token, and hands
+the set to the control plane, which writes one CronJob per schedule. Then, in the background, it stops the agent's pod and
 resumes the CronJobs. A schedule core suspended after failed runs stays
 suspended unless this park is the owner's (this call resumes every suspended
 schedule) or the schedule's definition changed.
@@ -280,8 +314,11 @@ stays as it was and `last_error` is not touched.
 | 409 | `LIGHT_NOT_ENABLED` | not a Light agent (`light_state` is `null`) |
 | 409 | `LIGHT_TRANSITION_IN_PROGRESS` | the agent is `opening` (`light_state` says so), or another Light operation is running |
 | 409 | `LIGHT_AGENT_NOT_AWAKE` | the agent is not online; `status` gives its status. It is not reachable until it is online again |
+| 409 | `LIGHT_AGENT_NOT_READY` | the agent did not answer its schedule list for a minute (it is starting or restarting); `status` gives its status, `Retry-After` the seconds to wait. Retry |
 | 409 | `LIGHT_AGENT_BUSY` | the agent is working; `active_tasks` and `is_busy` say how |
 | 409 | `LIGHT_RESTART_REQUIRED` | the agent's `MOLECULE_LIGHT` secret is missing; call enable again |
+| 413 | `LIGHT_TOO_LARGE` | the agent's schedules are over 8 MiB |
+| 422 | `LIGHT_SCHEDULES_UNREADABLE` | the agent answered, but not with a list of schedules (another status than `200` below `500`, malformed JSON, or no `schedules` list). Not retried: fix the agent |
 | 422 | `LIGHT_RUNTIME_UNSUPPORTED` | not a hermes agent; `runtime` names its runtime |
 | 501 | `LIGHT_UNSUPPORTED` | the tenant has no control plane |
 | 500 | `LIGHT_FAILED` | core could not read the agent or its Light secret, or claim the park |
@@ -291,8 +328,9 @@ again, its CronJobs still paused) and records the code in `last_error`:
 
 | Status | `code` | When |
 |---|---|---|
-| 413 | `LIGHT_TOO_LARGE` | the schedules are over 8 MiB (core's read), or over the control plane's size limit |
-| 502 | `LIGHT_SCHEDULES_UNREADABLE` | the agent's schedules could not be read |
+| 413 | `LIGHT_TOO_LARGE` | the schedules are over 8 MiB (core's read after the claim), or over the control plane's size limit |
+| 422 | `LIGHT_SCHEDULES_UNREADABLE` | the read after the claim got something that is not a list of schedules |
+| 409 | `LIGHT_AGENT_NOT_READY` | the agent stopped answering between the two reads (10 s of tries after the claim); `Retry-After` as above |
 | 422 | `LIGHT_INVALID` | some schedules are invalid; `invalid` lists `{"schedule", "field", "reason"}` for each |
 | 409 | `LIGHT_ENV_UNSUPPORTED` | the agent's env has a value the control plane cannot copy; `key` names it |
 | 409 | `LIGHT_RESTART_REQUIRED` | the agent runs without `MOLECULE_LIGHT=1`; restart it, then park |
@@ -584,7 +622,9 @@ A monitor in core, every 30 s:
   heartbeat (`active_tasks`, `is_busy`) whatever it logs. Auto-park exists so
   schedules cannot stay paused by mistake, and it keeps core's schedule
   suspensions. A refused auto-park records its code in `last_error` and is not
-  retried for 10 minutes.
+  retried for 10 minutes. The monitor's parks wait only five seconds for an
+  agent that does not answer (`LIGHT_AGENT_NOT_READY`), so one restarting
+  agent does not hold up the sweep.
 - **Refresh.** A change that would restart a parked agent (a secret, its
   model, a plugin), including one made while a park is under way, queues a
   `refresh`. Core opens the agent, and parks it again once it is online, idle
