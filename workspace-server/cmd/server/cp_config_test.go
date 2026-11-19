@@ -536,3 +536,190 @@ func TestAssertSaaSTenantHasAdminToken(t *testing.T) {
 		})
 	}
 }
+
+// withFastBackgroundFill shrinks fillEnvFromCPInBackground's window and longest
+// pause for a test and restores them.
+func withFastBackgroundFill(t *testing.T, window, maxInterval time.Duration) {
+	t.Helper()
+	savedW, savedI := cpEnvBackgroundFillWindow, cpEnvBackgroundFillMaxInterval
+	cpEnvBackgroundFillWindow, cpEnvBackgroundFillMaxInterval = window, maxInterval
+	t.Cleanup(func() { cpEnvBackgroundFillWindow, cpEnvBackgroundFillMaxInterval = savedW, savedI })
+}
+
+// joinBackgroundEnvFill makes ensureManagedTenantLLMEnv start its background
+// fill where the test can wait for it. The returned channel closes when the fill
+// returns; started counts how often it was started.
+func joinBackgroundEnvFill(t *testing.T) (done <-chan struct{}, started *int32) {
+	t.Helper()
+	ch := make(chan struct{})
+	var n int32
+	saved := startBackgroundEnvFill
+	startBackgroundEnvFill = func(firstErr error) {
+		atomic.AddInt32(&n, 1)
+		go func() {
+			defer close(ch)
+			fillEnvFromCPInBackground(firstErr)
+		}()
+	}
+	t.Cleanup(func() { startBackgroundEnvFill = saved })
+	return ch, &n
+}
+
+// TestEnsureManagedTenantLLMEnv_FetchFailsWithLLMEnvPresent_FillsTheRest: the
+// 2026-11-19 staging defect. A fresh tenant on the Kubernetes substrate already
+// carries the four required LLM names in its Deployment env, so when its first
+// config fetch lost the org_instances row-commit race (401) it booted at once
+// and never asked again: MOLECULE_LLM_DEFAULT_MODEL stayed unset, the tenant
+// reported the code fallback as its platform default, and the concierge handed
+// that to the workspaces it created. Boot must still not wait, but the fetch
+// must be retried, and it must only FILL: a name that has a value keeps it.
+func TestEnsureManagedTenantLLMEnv_FetchFailsWithLLMEnvPresent_FillsTheRest(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The row commits after the second miss.
+		if atomic.AddInt32(&calls, 1) < 3 {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"MOLECULE_LLM_USAGE_TOKEN":"from-cp","MOLECULE_LLM_DEFAULT_MODEL":"minimax/MiniMax-M3"}`)
+	}))
+	defer srv.Close()
+
+	t.Setenv("MOLECULE_ORG_ID", "org-fresh")
+	t.Setenv("ADMIN_TOKEN", "admin-tok")
+	t.Setenv("MOLECULE_CP_URL", srv.URL)
+	t.Setenv("MOLECULE_CP_CONFIG_RETRY_WINDOW", "")
+	for _, k := range requiredLLMEnvVars {
+		t.Setenv(k, "baked-"+k) // what the provisioner wrote into the Deployment
+	}
+	t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "") // not in the Deployment env
+	withFastRetry(t, 30*time.Second, 10*time.Millisecond)
+	withFastBackgroundFill(t, 10*time.Second, 20*time.Millisecond)
+	done, started := joinBackgroundEnvFill(t)
+
+	start := time.Now()
+	if err := ensureManagedTenantLLMEnv(); err != nil {
+		t.Fatalf("a tenant with its LLM env present must boot when the fetch fails, got: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("boot must not wait for the control plane when the LLM env is present; took %v", elapsed)
+	}
+	if got := atomic.LoadInt32(started); got != 1 {
+		t.Fatalf("the failed fetch must be retried in the background; fills started = %d, want 1", got)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(8 * time.Second):
+		t.Fatal("the background fill did not finish after the control plane started answering")
+	}
+	if got := os.Getenv("MOLECULE_LLM_DEFAULT_MODEL"); got != "minimax/MiniMax-M3" {
+		t.Errorf("MOLECULE_LLM_DEFAULT_MODEL = %q after the background fill, want the control plane's minimax/MiniMax-M3", got)
+	}
+	if got := os.Getenv("MOLECULE_LLM_USAGE_TOKEN"); got != "baked-MOLECULE_LLM_USAGE_TOKEN" {
+		t.Errorf("a fill after boot must not change a value already in use: MOLECULE_LLM_USAGE_TOKEN = %q", got)
+	}
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Errorf("want 3 config fetches (boot 401, retry 401, retry 200) and none after the answer, got %d", got)
+	}
+}
+
+// TestEnsureManagedTenantLLMEnv_FetchSucceeds_NoBackgroundFill: a fetch that
+// answered is applied in full at boot, so nothing is left to retry.
+func TestEnsureManagedTenantLLMEnv_FetchSucceeds_NoBackgroundFill(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"MOLECULE_LLM_DEFAULT_MODEL":"minimax/MiniMax-M3"}`)
+	}))
+	defer srv.Close()
+
+	t.Setenv("MOLECULE_ORG_ID", "org-ok")
+	t.Setenv("ADMIN_TOKEN", "admin-tok")
+	t.Setenv("MOLECULE_CP_URL", srv.URL)
+	for _, k := range requiredLLMEnvVars {
+		t.Setenv(k, "baked-"+k)
+	}
+	t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "google/gemini-4-hydrogen") // an older value in the Deployment
+	_, started := joinBackgroundEnvFill(t)
+
+	if err := ensureManagedTenantLLMEnv(); err != nil {
+		t.Fatalf("expected nil, got: %v", err)
+	}
+	if got := atomic.LoadInt32(started); got != 0 {
+		t.Errorf("a fetch that answered needs no background fill; started = %d", got)
+	}
+	// At boot the control plane's value replaces the older one, as before.
+	if got := os.Getenv("MOLECULE_LLM_DEFAULT_MODEL"); got != "minimax/MiniMax-M3" {
+		t.Errorf("MOLECULE_LLM_DEFAULT_MODEL = %q, want the control plane's value applied at boot", got)
+	}
+}
+
+// TestFillEnvFromCPInBackground_GivesUpAfterWindow: a control plane that never
+// answers must not be asked forever, and nothing is set.
+func TestFillEnvFromCPInBackground_GivesUpAfterWindow(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	t.Setenv("MOLECULE_ORG_ID", "org-never")
+	t.Setenv("ADMIN_TOKEN", "admin-tok")
+	t.Setenv("MOLECULE_CP_URL", srv.URL)
+	t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
+	withFastRetry(t, 30*time.Second, 10*time.Millisecond)
+	withFastBackgroundFill(t, 150*time.Millisecond, 40*time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fillEnvFromCPInBackground(fmt.Errorf("cp returned 401"))
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the background fill did not give up after its window")
+	}
+	if got := atomic.LoadInt32(&calls); got < 2 {
+		t.Errorf("want more than one retry inside the window, got %d", got)
+	}
+	if got := os.Getenv("MOLECULE_LLM_DEFAULT_MODEL"); got != "" {
+		t.Errorf("nothing must be set when the control plane never answered, got %q", got)
+	}
+}
+
+// TestApplyCPTenantConfig_OnlyUnset pins the fill rule: unset names are set, and
+// a name that has a value, an empty CP value, an empty key and an oversized
+// value are all left alone.
+func TestApplyCPTenantConfig_OnlyUnset(t *testing.T) {
+	t.Setenv("CPFILL_HAS_VALUE", "kept")
+	t.Setenv("CPFILL_UNSET", "")
+	t.Setenv("CPFILL_EMPTY_FROM_CP", "")
+	t.Setenv("CPFILL_OVERSIZED", "")
+	cfg := map[string]string{
+		"CPFILL_HAS_VALUE":     "from-cp",
+		"CPFILL_UNSET":         "from-cp",
+		"CPFILL_EMPTY_FROM_CP": "",
+		"CPFILL_OVERSIZED":     strings.Repeat("x", 4<<10+1),
+		"":                     "no-name",
+	}
+	if n := applyCPTenantConfig(cfg, true); n != 1 {
+		t.Errorf("filled %d value(s), want exactly 1 (CPFILL_UNSET)", n)
+	}
+	for name, want := range map[string]string{
+		"CPFILL_HAS_VALUE":     "kept",
+		"CPFILL_UNSET":         "from-cp",
+		"CPFILL_EMPTY_FROM_CP": "",
+		"CPFILL_OVERSIZED":     "",
+	} {
+		if got := os.Getenv(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+	// The boot-time apply still replaces a value: that is what a rotated secret needs.
+	if n := applyCPTenantConfig(map[string]string{"CPFILL_HAS_VALUE": "rotated"}, false); n != 1 || os.Getenv("CPFILL_HAS_VALUE") != "rotated" {
+		t.Errorf("boot-time apply must replace a value: n=%d CPFILL_HAS_VALUE=%q", n, os.Getenv("CPFILL_HAS_VALUE"))
+	}
+}

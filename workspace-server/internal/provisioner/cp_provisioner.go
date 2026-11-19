@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -852,7 +853,37 @@ func (p *CPProvisioner) stopInternal(ctx context.Context, workspaceID string, pr
 	if err != nil {
 		return fmt.Errorf("cp provisioner: stop: resolve provider: %w", err)
 	}
+	return p.deleteInstance(ctx, workspaceID, instanceID, provider, prune)
+}
 
+// StopPurgedInstance tears down, with erase, a provider instance whose
+// workspace row no longer exists.
+//
+// Stop and StopAndPrune read the instance id (and the provider) from the
+// workspace row, so for a workspace that was purged while its provision was in
+// flight they find nothing and answer "nothing to do", while the instance that
+// provision created keeps running with no row left to find it by. The caller
+// of this method holds the instance id Start just returned.
+//
+// It always erases: a purged workspace's data can never be attached again. No
+// provider is sent (the row that names it is gone); the control plane routes
+// an omitted provider to its own default backend.
+func (p *CPProvisioner) StopPurgedInstance(ctx context.Context, workspaceID, instanceID string) error {
+	if p == nil {
+		return ErrNoBackend
+	}
+	if strings.TrimSpace(instanceID) == "" {
+		return nil
+	}
+	if p.httpClient == nil {
+		return ErrNoBackend
+	}
+	return p.deleteInstance(ctx, workspaceID, instanceID, "", true)
+}
+
+// deleteInstance issues the control plane's workspace teardown for one named
+// instance: DELETE /cp/workspaces/:id?instance_id=...[&provider=...][&prune=true].
+func (p *CPProvisioner) deleteInstance(ctx context.Context, workspaceID, instanceID, provider string, prune bool) error {
 	q := url.Values{}
 	q.Set("instance_id", instanceID)
 	if provider != "" {
@@ -980,31 +1011,62 @@ func (p *CPProvisioner) IsRunning(ctx context.Context, workspaceID string) (bool
 	if p == nil {
 		return false, ErrNoBackend
 	}
+	state, err := p.instanceState(ctx, workspaceID)
+	switch {
+	case errors.Is(err, ErrNoBackend):
+		return false, ErrNoBackend
+	case err != nil:
+		return true, err
+	case state == "":
+		// No instance recorded: a clean "not running" (see instanceState).
+		return false, nil
+	}
+	return state == "running", nil
+}
+
+// InstanceStarting reports whether the control plane reports the workspace's
+// instance as still coming up: "provisioning" (Kubernetes: the Deployment
+// exists, its pod is not Ready yet) or "pending" (EC2: launching). IsRunning
+// answers false for those, and a Kubernetes pod registers, so its row reads
+// online, before it is Ready; a caller that would restart a workspace on
+// IsRunning's false asks this first. Any error is (false, err).
+func (p *CPProvisioner) InstanceStarting(ctx context.Context, workspaceID string) (bool, error) {
+	if p == nil {
+		return false, ErrNoBackend
+	}
+	state, err := p.instanceState(ctx, workspaceID)
+	if err != nil {
+		return false, err
+	}
+	return state == "provisioning" || state == "pending", nil
+}
+
+// instanceState asks the control plane for the state word of the workspace's
+// instance; "" with a nil error when no instance is recorded (also on a
+// zero-valued provisioner: the instance lookup goes through the package-level
+// db, not p.httpClient). ErrNoBackend when an instance is recorded but no
+// HTTP client is wired.
+func (p *CPProvisioner) instanceState(ctx context.Context, workspaceID string) (string, error) {
 	instanceID, err := resolveInstanceID(ctx, workspaceID)
 	if err != nil {
-		// Treat DB errors the same as transport errors — (true, err) keeps
-		// a2a_proxy on the alive path and logs the signal.
-		return true, fmt.Errorf("cp provisioner: status: resolve instance_id: %w", err)
+		// Treat DB errors the same as transport errors — IsRunning's
+		// (true, err) keeps a2a_proxy on the alive path and logs the signal.
+		return "", fmt.Errorf("cp provisioner: status: resolve instance_id: %w", err)
 	}
 	if instanceID == "" {
-		// No instance recorded. Report "not running" cleanly (no error)
-		// so restart cascades can trigger a fresh provision. This path
-		// is reached even on a zero-valued provisioner (no httpClient
-		// wired) — that's intentional; the resolveInstanceID lookup
-		// goes through the package-level db var, not p.httpClient, so
-		// a no-instance workspace gets a clean answer regardless of
-		// HTTP wiring state.
-		return false, nil
+		// No instance recorded. IsRunning reports "not running" cleanly (no
+		// error) so restart cascades can trigger a fresh provision.
+		return "", nil
 	}
 	if p.httpClient == nil {
 		// HTTP wiring missing but we have an instance_id to query —
 		// can't proceed without a client. Report ErrNoBackend so the
 		// caller can branch (a2a_proxy keeps alive, healthsweep skips).
-		return false, ErrNoBackend
+		return "", ErrNoBackend
 	}
 	provider, err := resolveProvider(ctx, workspaceID)
 	if err != nil {
-		return true, fmt.Errorf("cp provisioner: status: resolve provider: %w", err)
+		return "", fmt.Errorf("cp provisioner: status: resolve provider: %w", err)
 	}
 	q := url.Values{}
 	q.Set("instance_id", instanceID)
@@ -1016,17 +1078,17 @@ func (p *CPProvisioner) IsRunning(ctx context.Context, workspaceID string) (bool
 	u := fmt.Sprintf("%s/cp/workspaces/%s/status?%s", p.baseURL, workspaceID, q.Encode())
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
-		return true, fmt.Errorf("cp provisioner: status: build request: %w", err)
+		return "", fmt.Errorf("cp provisioner: status: build request: %w", err)
 	}
 	p.provisionAuthHeaders(req)
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return true, fmt.Errorf("cp provisioner: status: %w", err)
+		return "", fmt.Errorf("cp provisioner: status: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Don't leak the body — upstream errors may echo headers.
-		return true, fmt.Errorf("cp provisioner: status: unexpected %d", resp.StatusCode)
+		return "", fmt.Errorf("cp provisioner: status: unexpected %d", resp.StatusCode)
 	}
 	var result struct {
 		State string `json:"state"`
@@ -1036,9 +1098,9 @@ func (p *CPProvisioner) IsRunning(ctx context.Context, workspaceID string) (bool
 	// memory in this hot path (called reactively per-request from
 	// a2a_proxy and periodically from healthsweep).
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&result); err != nil {
-		return true, fmt.Errorf("cp provisioner: status decode: %w", err)
+		return "", fmt.Errorf("cp provisioner: status decode: %w", err)
 	}
-	return result.State == "running", nil
+	return result.State, nil
 }
 
 // GetConsoleOutput proxies a call to the CP's

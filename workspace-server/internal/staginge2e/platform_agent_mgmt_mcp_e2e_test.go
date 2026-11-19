@@ -133,7 +133,12 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 	t.Logf("platform-agent-mgmt-mcp: slug=%s", slug)
 
 	// --- Fresh org via the admin API (the same org-create path the UI drives) ---
-	orgID := adminCreateOrg(t, cfg, slug)
+	// Restricted to the e2e model (owner rule 2026-11-17: the cheapest model for
+	// any e2e testing). The CP serves it as the org's default, so the concierge
+	// this test drives is seeded with Flash-Lite instead of the platform default,
+	// and refuses any call on another model (molecule-controlplane#3076).
+	e2eModel := e2eLLMModel(t)
+	orgID := adminCreateOrg(t, cfg, slug, e2eModel)
 	t.Logf("org created: org_id=%s", orgID)
 
 	token := tenantAdminToken(t, cfg, slug)
@@ -295,6 +300,17 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 	// — exactly what a hard gate is for. A flag would make this a phantom gate.
 	assertBootInstallReportLanded(t, host, token, orgID, platformID, "platform agent (concierge)")
 
+	// The concierge runs on the e2e model: the org's per-org default reached its
+	// seed. A concierge on any other model would have every turn below refused
+	// by the org allowlist, so this is asserted first, with its own message.
+	assertWorkspaceModel(t, host, token, orgID, platformID, "platform agent (concierge)", e2eModel, true)
+	// On the CI LLM gateway's model (staging-tenant-cd picks minimax/MiniMax-M3
+	// when the gateway is up), prove staging really serves it through the
+	// gateway before the LLM steps below run on it.
+	if strings.HasPrefix(e2eModel, "minimax/") {
+		assertServedThroughCIGateway(t, cfg, token, e2eModel)
+	}
+
 	// The CALLABLE proof (Guard B core): drive a REAL A2A tool-use turn asking the
 	// concierge to actually RUN provision_workspace, and assert the deterministic
 	// side effect — a genuine kind='workspace' row with the requested name appears.
@@ -306,6 +322,14 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 		t.Logf("concierge self-report: observed=%v claims_created=%v published_ids=[%s] row_id=%q",
 			probe.Claim.Observed, probe.Claim.ClaimsCreated,
 			strings.Join(probe.Claim.ClaimedWorkspaceIDs, ","), probe.ProvisionedWorkspaceID)
+		// The member's model is whatever the concierge's provision_workspace call
+		// chose (the MCP default falls back to the concierge's own model). Logged
+		// and warned on, not failed: an LLM that names a model in its tool call is
+		// not a deploy-candidate defect, and the org allowlist refuses any call the
+		// member would make on another model.
+		if probe.ProvisionedWorkspaceID != "" {
+			assertWorkspaceModel(t, host, token, orgID, probe.ProvisionedWorkspaceID, "team member", e2eModel, false)
+		}
 	}
 
 	// One verdict, computed by the SAME pure logic the fail-before unit test proves
@@ -317,6 +341,67 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 	}
 	t.Logf("Guard B gate GREEN for fresh org %s (runtime=%q expected=%q present=%s tools=[%s] callable_armed=%v require_live=%v): %s",
 		slug, probe.ObservedRuntime, expectedRuntime, lastPresent, lastTools, assertCallable, requireCallable, reason)
+}
+
+// assertServedThroughCIGateway sends one max_tokens=1 completion through the
+// staging CP proxy as this org (free on the gateway) and fails if the reply
+// did not come from the CI LLM gateway: staging would then be sending model to
+// its vendor, and this gate would spend there. A non-200 only logs (the gate's
+// own LLM steps report the real failure).
+func assertServedThroughCIGateway(t *testing.T, cfg stagingCfg, token, model string) {
+	t.Helper()
+	body := fmt.Sprintf(`{"model":%q,"max_tokens":1,"messages":[{"role":"user","content":"ping"}]}`, model)
+	status, resp := doJSON(t, "POST", cfg.cpBase+"/cp/internal/llm/openai/v1/chat/completions", token, body)
+	if status != http.StatusOK {
+		t.Logf("WARNING: routing probe for %s answered HTTP %d; not asserting where staging sends it this run", model, status)
+		return
+	}
+	served, ok := servedThroughCIGateway(model, resp)
+	if !ok {
+		t.Fatalf("staging served %s as %q, not through the CI LLM gateway: its upstream for that vendor is no longer "+
+			"the gateway, and this gate would spend there. Repoint staging's MINIMAX_*_BASE_URL or pick another E2E_MODEL", model, served)
+	}
+	t.Logf("routing: staging serves %s through the CI LLM gateway (served model %s)", model, served)
+}
+
+// assertWorkspaceModel reads GET /workspaces/<id>/model until it reports a
+// resolved model (up to 2 minutes) and compares it to want. hard: a different
+// model, or none, fails the test; otherwise it is logged as a WARNING. Either
+// way the observed model is logged as the run's evidence.
+func assertWorkspaceModel(t *testing.T, host, token, orgID, workspaceID, label, want string, hard bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Minute)
+	var got, source, last string
+	for {
+		hs, body := doTenantJSONTimeout(t, "GET", "https://"+host+"/workspaces/"+workspaceID+"/model",
+			token, orgID, "", conciergePollReadTimeout)
+		if hs == http.StatusOK {
+			got, source = workspaceModelFromBody(body)
+			if got != "" {
+				break
+			}
+			last = fmt.Sprintf("HTTP 200, no model resolved yet (source=%q)", source)
+		} else {
+			last = fmt.Sprintf("HTTP %d", hs)
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Second)
+	}
+	switch {
+	case got == want:
+		t.Logf("%s %s model = %s (source %s): the org's allowlisted e2e model", label, workspaceID, got, source)
+	case !hard:
+		t.Logf("WARNING: %s %s model = %q (source %q; last read: %s), want %s. Its calls on any other model are "+
+			"refused by the org allowlist, so nothing is spent on it.", label, workspaceID, got, source, last, want)
+	case got == "":
+		t.Fatalf("%s %s reported no model within 2m (last read: %s), want %s", label, workspaceID, last, want)
+	default:
+		t.Fatalf("%s %s model = %s (source %s), want %s: the org's per-org default model (CP /cp/tenants/config "+
+			"MOLECULE_LLM_DEFAULT_MODEL for an allowlisted org, molecule-controlplane#3076) did not reach its seed",
+			label, workspaceID, got, source, want)
+	}
 }
 
 // assertTenantBuildIsCandidate enforces the ORDERING FIX: when the deploy path

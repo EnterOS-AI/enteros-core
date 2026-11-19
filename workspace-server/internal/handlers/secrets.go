@@ -20,6 +20,12 @@ import (
 
 var uuidRegex = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
+// platformManagedDirectLLMBypassKeys are the direct vendor LLM credentials a
+// platform-managed workspace must not hold: provisioning strips them, the
+// Secrets API refuses to store them, and BYOK provisioning accepts one of them
+// (when the resolved provider lists it in auth_env) as the workspace's own
+// credential. Both Gemini key names are listed: the registry's google and
+// byok-gemini arms accept GEMINI_API_KEY and GOOGLE_API_KEY alike.
 var platformManagedDirectLLMBypassKeys = map[string]struct{}{
 	"AI_GATEWAY_API_KEY":      {},
 	"ANTHROPIC_API_KEY":       {},
@@ -31,6 +37,7 @@ var platformManagedDirectLLMBypassKeys = map[string]struct{}{
 	"DEEPSEEK_API_KEY":        {},
 	"GEMINI_API_KEY":          {},
 	"GLM_API_KEY":             {},
+	"GOOGLE_API_KEY":          {},
 	"HERMES_CUSTOM_API_KEY":   {},
 	"HERMES_CUSTOM_BASE_URL":  {},
 	"HF_TOKEN":                {},

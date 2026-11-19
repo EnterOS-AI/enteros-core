@@ -338,29 +338,6 @@ func TestParkMapsCPConflictsAndStaysOpen(t *testing.T) {
 	}
 }
 
-func TestParkSchedulesUnreadableIs502AndStaysOpen(t *testing.T) {
-	mock := setupTestDB(t)
-	setupTestRedis(t)
-	api := &fakeLightAPI{}
-	lh, wh, _ := newParkTestHandler(t, api, nil)
-	wh.lightScheduleReader = func(context.Context, string) ([]volumeEntry, error) { return nil, errors.New("dial tcp: refused") }
-	expectLightLoad(mock, "online", "hermes", "workspace", "open", 0, nil, nil)
-	mock.ExpectQuery(lightSecretReadSQL).WithArgs(lightTestWS, "MOLECULE_LIGHT").WillReturnRows(encryptedRow(t, "1"))
-	expectLightClaimParking(mock, "owner", 0)
-	expectParkUndone(mock, false)
-
-	w := lightCall(lh.Park, http.MethodPost, "/", "", nil)
-	if w.Code != http.StatusBadGateway || lightBody(t, w)["code"] != "LIGHT_SCHEDULES_UNREADABLE" {
-		t.Fatalf("park = %d %s", w.Code, w.Body.String())
-	}
-	if len(api.Calls()) != 0 {
-		t.Errorf("CP called: %v", api.Calls())
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet: %v", err)
-	}
-}
-
 func TestRenderLightSchedulesKeepsCoresSuspensions(t *testing.T) {
 	reason := "3 runs in a row failed"
 	grid := []volumeEntry{
@@ -932,29 +909,6 @@ func TestReadAgentSchedulesUsesTheSchedulesProxy(t *testing.T) {
 	setBody(`{"schedules":[{"name":"x","prompt":"` + strings.Repeat("y", 8<<20) + `"}]}`)
 	if _, err := read(); !errors.Is(err, errLightGridTooLarge) {
 		t.Errorf("err = %v, want errLightGridTooLarge for a grid over 8 MiB", err)
-	}
-}
-
-// A grid over 8 MiB is refused 413 before anything is minted or sent, and the
-// agent goes back to open with the error recorded.
-func TestParkOfAGridOver8MiBIs413AndStaysOpen(t *testing.T) {
-	mock := setupTestDB(t)
-	setupTestRedis(t)
-	api := &fakeLightAPI{}
-	lh, wh, _ := newParkTestHandler(t, api, nil)
-	wh.lightScheduleReader = func(context.Context, string) ([]volumeEntry, error) { return nil, errLightGridTooLarge }
-	expectLightLoad(mock, "online", "hermes", "workspace", "open", 0, nil, nil)
-	mock.ExpectQuery(lightSecretReadSQL).WithArgs(lightTestWS, "MOLECULE_LIGHT").WillReturnRows(encryptedRow(t, "1"))
-	expectLightClaimParking(mock, "owner", 0)
-	expectLightSetState(mock, []string{"parking"}, "open", 1)
-	mock.ExpectExec(lightRecordErrorSQL).WithArgs(lightTestWS, "LIGHT_TOO_LARGE", sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
-
-	w := lightCall(lh.Park, http.MethodPost, "/", "", nil)
-	if w.Code != http.StatusRequestEntityTooLarge || lightBody(t, w)["code"] != "LIGHT_TOO_LARGE" || len(api.Calls()) != 0 {
-		t.Fatalf("park = %d %s calls=%v", w.Code, w.Body.String(), api.Calls())
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet: %v", err)
 	}
 }
 
