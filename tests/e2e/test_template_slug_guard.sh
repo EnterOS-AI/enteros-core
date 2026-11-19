@@ -32,6 +32,8 @@ FAIL=0
 # closed port so an ACCEPTED slug fails fast at preflight instead of touching
 # real infrastructure. Prints the exit code; stderr is captured to $STDERR_TMP.
 run_guard() {  # $1=slug
+  E2E_INFRA_BACKEND="local-docker" \
+  E2E_CP_ALLOW_EPHEMERAL_LOOPBACK="1" \
   MOLECULE_ADMIN_TOKEN="dummy-not-a-real-token" \
   MOLECULE_CP_URL="http://127.0.0.1:9" \
   E2E_TMPL_SLUG="$1" \
