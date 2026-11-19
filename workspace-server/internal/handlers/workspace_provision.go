@@ -2132,9 +2132,10 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 	// last_sample_error so an operator/reaper can reconcile later. The running
 	// provider compute is NOT terminated — it may contain valuable state. (#1)
 	var persistErr error
+	var persisted sql.Result
 	delay := instanceIDPersistRetryBaseDelay
 	for attempt := 1; attempt <= instanceIDPersistRetryAttempts; attempt++ {
-		_, persistErr = db.DB.ExecContext(ctx,
+		persisted, persistErr = db.DB.ExecContext(ctx,
 			`UPDATE workspaces SET instance_id = $2, updated_at = now() WHERE id = $1`,
 			workspaceID, machineID)
 		if persistErr == nil {
@@ -2159,5 +2160,76 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 		return
 	}
 
+	// THE ROW MAY BE GONE. A delete with ?purge=true that lands while this
+	// provision is in flight stops what was on file, removes the row, and
+	// returns; the control plane then finishes creating the instance. The
+	// UPDATE above matches no row and reports no error, so without this check
+	// the instance runs for good with nothing that knows about it: not the
+	// delete path, not the orphan sweeper (both read instance_id from the row).
+	// Its pod also registers, which re-creates a row for the purged id.
+	// Reproduced on the staging canary 2026-11-19 (restart, then purge two
+	// seconds later); see workspace_provision_purged_test.go.
+	//
+	// Only the purge removes rows, so "no row" means exactly that. A row that
+	// is merely status='removed' still matches, and the orphan sweeper stops
+	// its instance as before.
+	if n, raErr := persisted.RowsAffected(); raErr == nil && n == 0 {
+		h.stopInstanceOfPurgedWorkspace(workspaceID, machineID)
+		return
+	}
+
 	log.Printf("CPProvisioner: workspace %s started as machine %s via control plane", workspaceID, machineID)
+}
+
+// purgedInstanceStopper is the control-plane capability provisionWorkspaceCP
+// uses to stop an instance whose workspace row is gone. Optional on the
+// interface so the many CPProvisionerAPI test doubles need no new method; the
+// production type must keep implementing it, hence the compile-time pin (a
+// rename would make the type assertion fail silently and the leak return).
+type purgedInstanceStopper interface {
+	StopPurgedInstance(ctx context.Context, workspaceID, instanceID string) error
+}
+
+var _ purgedInstanceStopper = (*provisioner.CPProvisioner)(nil)
+
+// purgedInstanceStopTimeout bounds the teardown of a purged workspace's
+// instance, retries included.
+const purgedInstanceStopTimeout = 60 * time.Second
+
+// stopInstanceOfPurgedWorkspace tears down the instance a provision created for
+// a workspace that was purged while the provision ran. Nothing else can: the
+// row is gone, so the delete path, the orphan sweeper and Stop all find no
+// instance id. Bounded retry, as on every other stop; a teardown that still
+// fails is logged with the LEAK-SUSPECT prefix and the instance id, which is
+// the only record of it left.
+func (h *WorkspaceHandler) stopInstanceOfPurgedWorkspace(workspaceID, instanceID string) {
+	stopper, ok := h.cpProv.(purgedInstanceStopper)
+	if !ok {
+		log.Printf("LEAK-SUSPECT CPProvisioner: workspace %s was purged while it was being provisioned; provider instance %s is RUNNING and UNTRACKED, and this control-plane client cannot stop an instance by id",
+			workspaceID, instanceID)
+		return
+	}
+	// Detached from the provision's context: that one is the provision's
+	// budget, and the teardown must run even when it is spent.
+	ctx, cancel := context.WithTimeout(context.Background(), purgedInstanceStopTimeout)
+	defer cancel()
+	var lastErr error
+	delay := cpStopRetryBaseDelay
+	for attempt := 1; attempt <= cpStopRetryAttempts; attempt++ {
+		if lastErr = stopper.StopPurgedInstance(ctx, workspaceID, instanceID); lastErr == nil {
+			log.Printf("CPProvisioner: workspace %s was purged while it was being provisioned; tore down the instance that provision created (%s)",
+				workspaceID, instanceID)
+			return
+		}
+		if attempt == cpStopRetryAttempts || ctx.Err() != nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(delay):
+		}
+		delay *= 2
+	}
+	log.Printf("LEAK-SUSPECT CPProvisioner: workspace %s was purged while it was being provisioned; tearing down provider instance %s FAILED (%v) — it is RUNNING and UNTRACKED",
+		workspaceID, instanceID, lastErr)
 }

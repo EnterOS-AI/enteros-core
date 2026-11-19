@@ -853,7 +853,37 @@ func (p *CPProvisioner) stopInternal(ctx context.Context, workspaceID string, pr
 	if err != nil {
 		return fmt.Errorf("cp provisioner: stop: resolve provider: %w", err)
 	}
+	return p.deleteInstance(ctx, workspaceID, instanceID, provider, prune)
+}
 
+// StopPurgedInstance tears down, with erase, a provider instance whose
+// workspace row no longer exists.
+//
+// Stop and StopAndPrune read the instance id (and the provider) from the
+// workspace row, so for a workspace that was purged while its provision was in
+// flight they find nothing and answer "nothing to do", while the instance that
+// provision created keeps running with no row left to find it by. The caller
+// of this method holds the instance id Start just returned.
+//
+// It always erases: a purged workspace's data can never be attached again. No
+// provider is sent (the row that names it is gone); the control plane routes
+// an omitted provider to its own default backend.
+func (p *CPProvisioner) StopPurgedInstance(ctx context.Context, workspaceID, instanceID string) error {
+	if p == nil {
+		return ErrNoBackend
+	}
+	if strings.TrimSpace(instanceID) == "" {
+		return nil
+	}
+	if p.httpClient == nil {
+		return ErrNoBackend
+	}
+	return p.deleteInstance(ctx, workspaceID, instanceID, "", true)
+}
+
+// deleteInstance issues the control plane's workspace teardown for one named
+// instance: DELETE /cp/workspaces/:id?instance_id=...[&provider=...][&prune=true].
+func (p *CPProvisioner) deleteInstance(ctx context.Context, workspaceID, instanceID, provider string, prune bool) error {
 	q := url.Values{}
 	q.Set("instance_id", instanceID)
 	if provider != "" {
