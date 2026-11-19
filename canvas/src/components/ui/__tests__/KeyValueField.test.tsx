@@ -26,12 +26,12 @@ describe("KeyValueField — rendering", () => {
 
   it("disables the input when disabled=true", () => {
     render(<KeyValueField value="secret" onChange={vi.fn()} disabled />);
-    expect(screen.getByLabelText("Secret value").disabled).toBe(true);
+    expect(screen.getByLabelText<HTMLInputElement>("Secret value").disabled).toBe(true);
   });
 
   it("renders with the current value", () => {
     render(<KeyValueField value="sk-test-key-123" onChange={vi.fn()} />);
-    expect(screen.getByLabelText("Secret value").value).toBe("sk-test-key-123");
+    expect(screen.getByLabelText<HTMLInputElement>("Secret value").value).toBe("sk-test-key-123");
   });
 
   it("renders with the placeholder text", () => {
@@ -113,20 +113,21 @@ describe("KeyValueField — auto-hide timer setup", () => {
 
   it("clears existing timer when a new toggle happens before auto-hide fires", () => {
     const clearTimeoutSpy = vi.spyOn(global, "clearTimeout");
-    const timerObj = {}; // fake timer ID
-    vi.spyOn(global, "setTimeout").mockImplementation((fn: () => void, delay: number) => {
-      return timerObj;
-    });
+    const setTimeoutSpy = vi.spyOn(global, "setTimeout");
     render(<KeyValueField value="secret" onChange={vi.fn()} />);
 
     // First toggle — reveal
     act(() => { fireEvent.click(screen.getByRole("button")); });
 
+    const timerResult = setTimeoutSpy.mock.results.at(-1);
+    expect(timerResult?.type).toBe("return");
+
     // Second toggle — hide (should clear the timer from first toggle)
     act(() => { fireEvent.click(screen.getByRole("button")); });
 
     // clearTimeout was called with the timer object
-    expect(clearTimeoutSpy).toHaveBeenCalledWith(timerObj);
+    expect(clearTimeoutSpy).toHaveBeenCalledWith(timerResult?.value);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("clears timer on unmount", () => {

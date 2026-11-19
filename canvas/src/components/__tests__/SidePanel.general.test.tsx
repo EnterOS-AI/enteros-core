@@ -54,12 +54,12 @@ const BASE_NODE = {
   id: "ws-1",
   data: {
     name: "Test Workspace",
-    status: "online" as const,
+    status: "online",
     tier: 2,
     role: "Engineer",
     parentId: null,
     needsRestart: false,
-    currentTask: null,
+    currentTask: "",
     agentCard: null,
   },
 };
@@ -171,6 +171,14 @@ describe("SidePanel — meta pills", () => {
     expect(screen.getByText("claude-code")).toBeTruthy();
   });
 
+  it("a parked Light agent's Status pill reads Parked with the tooltip", () => {
+    storeState.nodes = [{ ...BASE_NODE, data: { ...BASE_NODE.data, status: "hibernated", lightState: "parked" } as typeof BASE_NODE.data }];
+    render(<SidePanel />);
+    const value = screen.getByText("Parked");
+    expect(value.closest("span[title]")?.getAttribute("title")).toBe("Asleep between scheduled runs");
+    expect(screen.queryByText("hibernated")).toBeNull();
+  });
+
   it("shows skill count in meta pill", () => {
     render(<SidePanel />);
     expect(screen.getByText("3")).toBeTruthy();
@@ -264,7 +272,7 @@ describe("SidePanel — resize handle", () => {
 
 describe("SidePanel — needs-restart banner", () => {
   it("shows banner when needsRestart=true and no currentTask", () => {
-    storeState.nodes = [{ ...BASE_NODE, data: { ...BASE_NODE.data, needsRestart: true, currentTask: null } }];
+    storeState.nodes = [{ ...BASE_NODE, data: { ...BASE_NODE.data, needsRestart: true, currentTask: "" } }];
     render(<SidePanel />);
     expect(screen.getByText(/config changed/i)).toBeTruthy();
     expect(screen.getByRole("button", { name: /restart now/i })).toBeTruthy();
@@ -277,7 +285,7 @@ describe("SidePanel — needs-restart banner", () => {
   });
 
   it("Restart Now button calls restartWorkspace(selectedNodeId)", () => {
-    storeState.nodes = [{ ...BASE_NODE, data: { ...BASE_NODE.data, needsRestart: true, currentTask: null } }];
+    storeState.nodes = [{ ...BASE_NODE, data: { ...BASE_NODE.data, needsRestart: true, currentTask: "" } }];
     render(<SidePanel />);
     fireEvent.click(screen.getByRole("button", { name: /restart now/i }));
     expect(mockRestartWorkspace).toHaveBeenCalledWith("ws-1");

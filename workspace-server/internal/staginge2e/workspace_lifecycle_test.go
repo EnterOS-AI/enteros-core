@@ -69,7 +69,10 @@ func TestWorkspaceLifecycle_Staging(t *testing.T) {
 	t.Logf("workspace-lifecycle: slug=%s", slug)
 
 	// --- Step 1: provision org via admin API ---
-	orgID := adminCreateOrg(t, cfg, slug)
+	// Restricted to the e2e model: this test is half of the staging deploy gate
+	// (staging-tenant-cd e2e-smoke), and its org's concierge would otherwise be
+	// seeded with the platform default.
+	orgID := adminCreateOrg(t, cfg, slug, e2eLLMModel(t))
 	t.Logf("org created: org_id=%s", orgID)
 
 	// --- Step 1b: acquire tenant admin token + wait for tenant TLS ready ---
@@ -290,24 +293,41 @@ func waitForWorkspaceStatus(t *testing.T, host, token, orgID, wsID, want string,
 
 // waitForWorkspaceOnlineRoutable polls until status=online AND url is non-empty.
 // A routable url is the real "the agent is reachable" signal the SDK uses — an
-// online row without a url is not yet serveable.
+// online row without a url is not yet serveable. It ends the moment the control
+// plane publishes a terminal verdict instead of polling out the whole budget
+// (readiness_terminal_signal.go).
+//
+// This loop is where the defect was FIRST visible: because it logs every status
+// transition it recorded, nine times in retention, the exact shape the Guard B
+// loop hid — `provisioning` at t+0, `failed` at ~t+93s, then thirteen and a half
+// more minutes of polling a row that had already been written off. Now the same
+// observation ends the wait and the row's own last_sample_error is quoted.
 func waitForWorkspaceOnlineRoutable(t *testing.T, host, token, orgID, wsID string, timeout time.Duration, why string) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	var lastStatus, lastURL string
-	for time.Now().Before(deadline) {
-		_, st, url := workspaceStatusAndURL(t, host, token, orgID, wsID)
-		if st != lastStatus || (url != "") != (lastURL != "") {
-			t.Logf("    [%s] status=%q routable=%v", why, st, url != "")
-			lastStatus, lastURL = st, url
+	watch := DeployWorkspaceOnlineRoutableWatch(why, timeout)
+	for {
+		hs, body := doTenantJSON(t, "GET", "https://"+host+"/workspaces/"+wsID, token, orgID, "")
+		st := topLevelString(body, "status")
+		url := topLevelString(body, "url")
+		step := watch.Observe(time.Now(), Obs{
+			ReadOK:     hs == http.StatusOK,
+			Status:     st,
+			Detail:     topLevelString(body, "last_sample_error"),
+			Extra:      url != "",
+			ExtraLabel: fmt.Sprintf("routable=%v", url != ""),
+		})
+		if step.Transitioned && step.Message != "" {
+			t.Logf("    %s", step.Message)
 		}
-		if st == "online" && url != "" {
+		switch step.Decision {
+		case WaitReady:
+			return
+		case WaitFailTerminal, WaitFailBudget, WaitFailMisconfigured:
+			t.Fatalf("%s: workspace %s — %s", why, wsID, step.Message)
 			return
 		}
 		time.Sleep(10 * time.Second)
 	}
-	t.Fatalf("%s: workspace %s never reached online+routable within %s (last status=%q, url-set=%v)",
-		why, wsID, timeout, lastStatus, lastURL != "")
 }
 
 // assertURLCleared asserts the canvas GET reports an empty url within timeout.
@@ -524,12 +544,30 @@ func e2eSlug(tag string) string {
 	return fmt.Sprintf("e2e-%s-%d", tag, time.Now().Unix()%100000000)
 }
 
+// e2eLLMModel is the model this lane provisions and calls: E2E_MODEL, else
+// Gemini 3.1 Flash-Lite (e2eLLMModelFrom). A platform-default-tier model fails
+// the test before anything is created.
+func e2eLLMModel(t *testing.T) string {
+	t.Helper()
+	model, refusal := e2eLLMModelFrom(os.Getenv("E2E_MODEL"))
+	if refusal != "" {
+		t.Fatalf("E2E_MODEL refused: %s", refusal)
+	}
+	return model
+}
+
 // adminCreateOrg provisions a throwaway org via the CP admin API, immediately
 // registers exact-slug cleanup, and then waits for its instance to reach
 // running (provisioning is async). Cleanup must be registered here rather than
 // by callers: a provisioning timeout calls t.Fatalf before this function
 // returns, so caller-owned cleanup would never be installed.
-func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string) (orgID string) {
+//
+// llmModels, when given, restricts the org to those platform models
+// (llm_allowed_models): the CP refuses any proxied call on another model and
+// serves the first one as the org's default, which its concierge is seeded
+// with. The deploy-gate tests pass the e2e model, so nothing in the gate can
+// spend on the platform default (molecule-controlplane#3076).
+func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string, llmModels ...string) (orgID string) {
 	t.Helper()
 	// Compute backend for the throwaway tenant. Defaults to molecules-server (the local-docker
 	// backend) now that the AWS EC2 path is closed. The canonical cloudprovider SSOT wire id
@@ -537,8 +575,16 @@ func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string) (orgID string) {
 	// "local" (PersistKey); an empty provider would fall back to the CP DefaultProvider (the
 	// closed AWS path). The e2e workflows export E2E_PROVIDER; envOr pins the local default.
 	provider := envOr("E2E_PROVIDER", "molecules-server")
-	body := fmt.Sprintf(`{"slug":%q,"name":%q,"owner_user_id":%q,"provider":%q}`, slug, "E2E Workspace Lifecycle", "e2e-runner:"+slug, provider)
+	body, err := adminCreateOrgBody(slug, "E2E Workspace Lifecycle", provider, llmModels)
+	if err != nil {
+		t.Fatalf("AdminCreate org body: %v", err)
+	}
 	status, resp := doJSON(t, "POST", cfg.cpBase+"/cp/admin/orgs", cfg.adminToken, body)
+	if status == http.StatusBadRequest && len(llmModels) > 0 && strings.Contains(resp, "unknown field") && strings.Contains(resp, "llm_allowed_models") {
+		t.Fatalf("AdminCreate org: HTTP 400 on llm_allowed_models (%s). The control plane at %s predates "+
+			"molecule-controlplane#3076 (per-org model allowlist on admin create); this gate deliberately does "+
+			"not fall back to an unrestricted org, which would run its concierge on the platform default", resp, cfg.cpBase)
+	}
 	if status != http.StatusCreated && status != http.StatusOK {
 		t.Fatalf("AdminCreate org: HTTP %d: %s", status, resp)
 	}
@@ -546,30 +592,66 @@ func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string) (orgID string) {
 	// cleanup before parsing the response so a malformed success body still
 	// triggers a teardown attempt.
 	registerTenantCleanup(t, cfg, slug)
+	if len(llmModels) > 0 {
+		t.Logf("org %s restricted to platform models %v (its default model: %s)", slug, llmModels, llmModels[0])
+	}
 	id := jsonField(resp, "id")
 	if id == "" {
 		t.Fatalf("AdminCreate org: no id in response: %s", resp)
 	}
-	deadline := time.Now().Add(7 * time.Minute)
+	// TERMINAL-SIGNAL WAIT (see readiness_terminal_signal.go). The admin list
+	// already carries org_instances.last_error alongside instance_status, so a
+	// provision the control plane has already declared dead is answered in
+	// seconds with ITS reason instead of 7 minutes of polling and a stopwatch.
+	// A terminal status must persist past the CP's own self-heal window before
+	// it is believed, so this can never out-run a retry the CP is running.
+	watch := DeployOrgInstanceRunningWatch(slug)
 	var lastListStatus int
 	lastInstance := "<never observed>"
-	for time.Now().Before(deadline) {
+	for {
 		st, list := doJSON(t, "GET", cfg.cpBase+"/cp/admin/orgs", cfg.adminToken, "")
 		lastListStatus = st
+		obs := Obs{}
 		if st == http.StatusOK {
-			if seen := orgInstanceStatus(list, slug); seen != "" {
-				lastInstance = seen
-			} else if strings.Contains(list, `"slug":"`+slug+`"`) {
-				lastInstance = "<row present, instance_status omitted>"
-			} else {
+			seen, lastErr, present := orgInstanceRow(list, slug)
+			switch {
+			case !present:
 				lastInstance = "<org row absent from admin list>"
+				obs = Obs{ReadOK: true, Status: "<org row absent from admin list>"}
+			case seen == "":
+				lastInstance = "<row present, instance_status omitted>"
+				obs = Obs{ReadOK: true, Status: "<instance_status omitted>"}
+			default:
+				lastInstance = seen
+				obs = Obs{ReadOK: true, Status: seen, Detail: lastErr}
 			}
 		}
-		if st == http.StatusOK && strings.Contains(list, `"slug":"`+slug+`"`) &&
-			orgInstanceStatus(list, slug) == "running" {
-			return id
+		step := watch.Observe(time.Now(), obs)
+		if step.Transitioned && step.Message != "" {
+			t.Logf("    %s", step.Message)
 		}
-		time.Sleep(15 * time.Second)
+		switch step.Decision {
+		case WaitReady:
+			return id
+		case WaitFailTerminal, WaitFailMisconfigured:
+			// The control plane published a verdict (or this wait is unsound).
+			// Either way, waiting out the rest of the budget adds nothing.
+			t.Fatalf("%s\n"+
+				"  CP tenant diagnostics: %s\n"+
+				"  CP boot-events:        %s",
+				step.Message,
+				bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/diagnostics"),
+				bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/boot-events?limit=20"))
+			return ""
+		case WaitFailBudget:
+			// Nothing was ever published — fall through to the (unchanged)
+			// self-diagnosing timeout below, which is the right report for a
+			// genuinely STUCK provision.
+		default:
+			time.Sleep(15 * time.Second)
+			continue
+		}
+		break
 	}
 	// SELF-DIAGNOSING TIMEOUT (Guard B operability).
 	//
@@ -589,11 +671,12 @@ func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string) (orgID string) {
 	// exactly this question and put them IN the failure. Both are best-effort —
 	// a diagnostics fetch that itself fails must never replace the real verdict,
 	// only annotate it.
-	t.Fatalf("org %s did not reach instance_status=running within 7m "+
+	t.Fatalf("org %s did not reach instance_status=running within %s AND the control plane never "+
+		"published a terminal verdict about it (it is STUCK, not FAILED) "+
 		"(last admin-list HTTP %d, last instance_status=%q).\n"+
 		"  CP tenant diagnostics: %s\n"+
 		"  CP boot-events:        %s",
-		slug, lastListStatus, lastInstance,
+		slug, orgProvisionBudget, lastListStatus, lastInstance,
 		bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/diagnostics"),
 		bestEffortAdminGet(cfg.cpBase, cfg.adminToken, "/cp/admin/tenants/"+slug+"/boot-events?limit=20"))
 	return ""
@@ -831,16 +914,15 @@ func tenantAdminToken(t *testing.T, cfg stagingCfg, slug string) string {
 //
 // De-hardcode: the runtime + model FOLLOW the same KMS-injection pattern the
 // de-hardcode lanes use — E2E_RUNTIME / E2E_MODEL are exported by the e2e
-// workflows from the platform default SSOT (MOLECULE_DEFAULT_RUNTIME /
-// MOLECULE_LLM_DEFAULT_MODEL @ /shared/controlplane/llm). When unset (local runs),
-// envOr falls back to the CURRENT SSOT value (minimax/MiniMax-M2.7), NOT a
-// moonshot vendor const, so the local fallback tracks the SSOT default.
+// workflows. When unset (local runs and the ephemeral gate), the model falls back
+// to the e2e model, google/gemini-3.1-flash-lite: the cheapest platform Gemini
+// model, never the gemini-4-hydrogen platform default.
 func tenantCreateWorkspace(t *testing.T, cfg stagingCfg, host, token, orgID string) string {
 	t.Helper()
 	return tenantCreateWorkspaceWithRuntime(
 		t, cfg, host, token, orgID, "core2332-life-e2e",
 		envOr("E2E_RUNTIME", "claude-code"),
-		envOr("E2E_MODEL", "minimax/MiniMax-M2.7"),
+		e2eLLMModel(t),
 	)
 }
 

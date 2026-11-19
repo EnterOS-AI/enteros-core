@@ -252,6 +252,94 @@ class TestGrepFailMarkers(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# 3b. grep_fail_markers on REAL act_runner logs — every line carries an
+# RFC3339 timestamp prefix. The cases above use bare lines, which is why
+# the `::group::Run` skip could be dead for two months without a test
+# noticing. These pin the timestamped shape.
+# --------------------------------------------------------------------------
+TS = "2026-09-03T21:07:36.4496366Z "
+
+
+def _ts(*lines: str) -> str:
+    return "\n".join(TS + line for line in lines)
+
+
+class TestGrepFailMarkersTimestampedLogs(unittest.TestCase):
+    def test_script_source_echo_inside_run_group_is_skipped(self):
+        """The documented heuristic, on the log shape it actually receives."""
+        log = _ts(
+            "::group::Run bash scan.sh",
+            "bash scan.sh",
+            'echo "::error::would fail here"',
+            "::endgroup::",
+            "scan clean",
+        )
+        self.assertEqual(lpfc.grep_fail_markers(log), [])
+
+    def test_pr_body_env_dump_is_not_a_failure(self):
+        """Regression: run 693558.
+
+        `lint-mask-pr-atomicity` passes the PR description through the
+        step's `env:` as PR_BODY, and act_runner echoes that dump inside
+        the `::group::Run` block. A PR whose PROSE mentions `::error::`
+        or a failing job was being read as a masked failure in a job that
+        was green, blocking an unrelated continue-on-error flip.
+        """
+        log = _ts(
+            "::group::Run python3 .gitea/scripts/lint_mask_pr_atomicity.py",
+            "python3 .gitea/scripts/lint_mask_pr_atomicity.py",
+            "env:",
+            "  BASE_SHA: 6f3e6a4a2381b4fa99427fb1086596c5d206b290",
+            "  PR_BODY: ## What broke\\n\\nthe redeploy-k8s job FAIL ed on the push "
+            "that merged it, and printed ::error::no such file",
+            "::endgroup::",
+            "::notice::ci.yml touched but neither predicate fired",
+            "Job succeeded",
+        )
+        self.assertEqual(lpfc.grep_fail_markers(log), [])
+
+    def test_real_failure_after_endgroup_still_caught(self):
+        """RED control — the skip must not swallow actual step output."""
+        log = _ts(
+            "::group::Run pytest -q",
+            "pytest -q",
+            "::endgroup::",
+            "--- FAIL: TestBar (0.01s)",
+            "::error::2 test(s) failed",
+        )
+        matches = lpfc.grep_fail_markers(log)
+        self.assertEqual(len(matches), 2)
+        self.assertIn("--- FAIL: TestBar", matches[0])
+        self.assertIn("::error::2 test(s) failed", matches[1])
+
+    def test_nested_group_does_not_end_the_run_block_early(self):
+        """`actions/setup-python` opens `::group::Installed versions` INSIDE
+        the Run block; its `::endgroup::` must not un-skip the remainder."""
+        log = _ts(
+            "::group::Run actions/setup-python",
+            "::group::Installed versions",
+            "  CPython 3.12.7",
+            "::endgroup::",
+            '  echo "::error::still script source"',
+            "::endgroup::",
+            "setup complete",
+        )
+        self.assertEqual(lpfc.grep_fail_markers(log), [])
+
+    def test_group_outside_a_run_block_is_still_scanned(self):
+        """Only `::group::Run` blocks are script source. A plain group is
+        ordinary output and must keep being read."""
+        log = _ts(
+            "::group::Test results",
+            "--- FAIL: TestBaz (0.02s)",
+            "::endgroup::",
+        )
+        matches = lpfc.grep_fail_markers(log)
+        self.assertEqual(len(matches), 1)
+        self.assertIn("--- FAIL: TestBaz", matches[0])
+
+
+# --------------------------------------------------------------------------
 # 4. verify_flip — single-flip verdict assembly (network surface stubbed)
 # --------------------------------------------------------------------------
 def _stub_status(context: str, state: str, target_url: str = "/owner/repo/actions/runs/1/jobs/0") -> dict:

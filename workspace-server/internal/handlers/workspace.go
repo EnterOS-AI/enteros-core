@@ -164,6 +164,21 @@ type WorkspaceHandler struct {
 	// it via SetWakeReEmitter to WakeReEmitter(greeter). Exactly-once safety is the
 	// re-emission path's own (has_greeted CAS / queue dedup), never re-drive's.
 	wakeReEmit func(ctx context.Context, workspaceID string, kind WakeKind, idempotencyKey string, generation int64) error
+
+	// lightAPI is the control plane's Enter OS Light surface (contract C4). nil
+	// on a tenant platform without a control plane (self-host): the Light
+	// endpoints then answer 501 LIGHT_UNSUPPORTED. main.go wires it from the
+	// CP provisioner via SetLightAPI.
+	lightAPI provisioner.LightAPI
+	// lightScheduleReader is a test seam for the park's read of the agent's
+	// schedule grid; nil = the schedules proxy (light_park.go).
+	lightScheduleReader func(ctx context.Context, workspaceID string) ([]volumeEntry, error)
+}
+
+// SetLightAPI wires the control plane's Light routes (C4). Called once from
+// main.go when a CP provisioner exists.
+func (h *WorkspaceHandler) SetLightAPI(api provisioner.LightAPI) {
+	h.lightAPI = api
 }
 
 // SetWakeHooks wires the wake-lifecycle desired-state owner into this handler's
@@ -630,6 +645,17 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// providers.yaml (P2-A artifact); the check stays in sync with the SSOT
 	// via the verify-providers-gen + sync-providers-yaml CI gates.
 	if !isExternal {
+		if isAutoModel(payload.Model) {
+			secretKeys := make([]string, 0, len(payload.Secrets))
+			for k := range payload.Secrets {
+				secretKeys = append(secretKeys, k)
+			}
+			if anyDirectVendorKey(secretKeys) || tenantHoldsDirectVendorKey(c.Request.Context()) {
+				log.Printf("Create: 422 %s (runtime=%q model=%q)", autoRequiresPlatformCreditsCode, payload.Runtime, payload.Model)
+				respondAutoRequiresPlatformCredits(c, payload.Runtime, payload.Model)
+				return
+			}
+		}
 		if ok, why := validateRegisteredModelForRuntime(payload.Runtime, payload.Model); !ok {
 			log.Printf("Create: 422 UNREGISTERED_MODEL_FOR_RUNTIME (runtime=%q model=%q): %s [internal#718 P4 PR-2 hard-reject]", payload.Runtime, payload.Model, why)
 			c.JSON(http.StatusUnprocessableEntity, gin.H{
@@ -892,17 +918,31 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// are the atomic-byok-create shape and are allowed; platform-resolving
 	// creates keep the full guard.
 	allowVendorKeysForByokCreate := false
+	// createKeyDecision describes the CREATE inputs for the refusal message only
+	// (the verdict below is unchanged): the stored-state read cannot see
+	// payload.Model yet, so a refusal built from it would misreport "MODEL is
+	// not set" for a create that named a platform (slash-form) model.
+	createKeyDecision := vendorKeyGuardDecision{blocked: true, runtime: payload.Runtime, model: strings.TrimSpace(payload.Model), reason: "registry_unavailable"}
 	if m, regErr := providerRegistry(); regErr == nil && m != nil {
 		keys := make([]string, 0, len(payload.Secrets))
 		for k := range payload.Secrets {
 			keys = append(keys, k)
 		}
-		if prov, dErr := m.DeriveProvider(payload.Runtime, strings.TrimSpace(payload.Model), keys); dErr == nil && !prov.IsPlatform() {
+		prov, dErr := m.DeriveProvider(payload.Runtime, strings.TrimSpace(payload.Model), keys)
+		switch {
+		case dErr == nil && !prov.IsPlatform():
 			allowVendorKeysForByokCreate = true
+		case dErr == nil:
+			createKeyDecision.provider, createKeyDecision.reason = prov.Name, "platform_model"
+		case createKeyDecision.model == "":
+			createKeyDecision.reason = "model_unset"
+		default:
+			createKeyDecision.reason = "model_unregistered"
 		}
 	}
 	for k, v := range payload.Secrets {
-		if !allowVendorKeysForByokCreate && rejectPlatformManagedDirectLLMBypassForWorkspace(c, id, k) {
+		if !allowVendorKeysForByokCreate && isPlatformManagedDirectLLMBypassKey(k) && platformManagedLLMModeForWorkspace(c, id) {
+			writeVendorKeyRefusal(c, id, k, createKeyDecision)
 			tx.Rollback() //nolint:errcheck
 			return
 		}
@@ -1554,8 +1594,8 @@ func (h *WorkspaceHandler) ProvisionTimeoutSecondsForRuntime(runtime string) int
 func scanWorkspaceRow(rows interface {
 	Scan(dest ...interface{}) error
 }) (map[string]interface{}, error) {
-	var id, name, role, status, url, sampleError, currentTask, runtime, workspaceDir, kind string
-	var computeRaw, loadedMCPToolsRaw []byte
+	var id, name, role, status, url, sampleError, currentTask, runtime, workspaceDir, kind, lightState string
+	var computeRaw, loadedMCPToolsRaw, mcpSurfaceRaw []byte
 	var tier, activeTasks, maxConcurrentTasks, uptimeSeconds int
 	var errorRate, x, y float64
 	var collapsed, broadcastEnabled, talkToUserEnabled bool
@@ -1568,7 +1608,7 @@ func scanWorkspaceRow(rows interface {
 		&parentID, &activeTasks, &maxConcurrentTasks, &errorRate, &sampleError, &uptimeSeconds,
 		&currentTask, &runtime, &workspaceDir, &x, &y, &collapsed,
 		&budgetLimit, &monthlySpend, &broadcastEnabled, &talkToUserEnabled, &computeRaw, &kind,
-		&loadedMCPToolsRaw)
+		&loadedMCPToolsRaw, &mcpSurfaceRaw, &lightState)
 	if err != nil {
 		return nil, err
 	}
@@ -1639,6 +1679,34 @@ func scanWorkspaceRow(rows interface {
 	}
 	ws["loaded_mcp_tools"] = loadedMCPTools
 
+	// core#5137: mcp_surface is the CONSUMER-side corroboration of the count
+	// above — how many of those reported ids sit in a namespace this workspace's
+	// model has actually been observed dispatching from (see
+	// registry.go's recordMCPSurfaceCorroboration). It is emitted NEXT TO
+	// loaded_mcp_tools, never in place of it: the raw list stays exactly as the
+	// runtime reported it so the claim remains auditable.
+	//
+	// null means "core has not evaluated this row yet" — NOT "no evidence
+	// available" and NOT "fine". Unlike loaded_mcp_tools this is deliberately
+	// NOT defaulted to an empty object: an empty object would read as a
+	// zero-count verdict, which is a claim, and a row core has never classified
+	// has made no claim.
+	if len(mcpSurfaceRaw) > 0 && string(mcpSurfaceRaw) != "null" {
+		ws["mcp_surface"] = json.RawMessage(mcpSurfaceRaw)
+	} else {
+		ws["mcp_surface"] = nil
+	}
+
+	// Enter OS Light (docs/api-protocol/light-api.md): the agent's Light state
+	// (open, parking, parked, opening), null for an ordinary agent. The canvas
+	// renders the Light badge and the Light-aware tabs from it; live changes
+	// arrive as WORKSPACE_UPDATED {"light_state": ...}.
+	if lightState != "" {
+		ws["light_state"] = lightState
+	} else {
+		ws["light_state"] = nil
+	}
+
 	return ws, nil
 }
 
@@ -1655,7 +1723,9 @@ const workspaceListQuery = `
 		   w.broadcast_enabled, w.talk_to_user_enabled,
 		   COALESCE(w.compute, '{}'::jsonb),
 		   COALESCE(w.kind, 'workspace'),
-		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb)
+		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb),
+		   COALESCE(w.mcp_surface::text, ''),
+		   COALESCE(w.light_state, '')
 	FROM workspaces w
 	LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 	WHERE w.status != 'removed'
@@ -1758,7 +1828,9 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 			   w.broadcast_enabled, w.talk_to_user_enabled,
 			   COALESCE(w.compute, '{}'::jsonb),
 		   COALESCE(w.kind, 'workspace'),
-		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb)
+		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb),
+		   COALESCE(w.mcp_surface::text, ''),
+		   COALESCE(w.light_state, '')
 		FROM workspaces w
 		LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 		WHERE w.id = $1

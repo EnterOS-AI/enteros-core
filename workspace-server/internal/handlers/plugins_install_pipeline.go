@@ -495,6 +495,35 @@ func (h *PluginsHandler) reMaterialize(workspaceID, pluginName string, suppressR
 	return false, nil
 }
 
+// pullUninstall is the uninstall counterpart of reMaterialize, used only where
+// there is no push target (see Uninstall / uninstallByPull). It removes the
+// plugin from BOTH the installed set (workspace_plugins) and the declared set
+// (workspace_declared_plugins), so desiredPluginSources (declared ∪ installed)
+// no longer emits it, then schedules a restart. The next provision stamps
+// MOLECULE_DECLARED_PLUGINS without the plugin and the runtime's boot
+// materializer drops its directory (uninstallByPull documents how, and where
+// that stops).
+//
+// Both deletes are load-bearing here, unlike the docker/EIC paths where the
+// container rm is the real removal and the row delete is best-effort cleanup:
+// on the pull path the DB IS the uninstall, so a delete failure is returned to
+// the caller rather than swallowed — a surviving row would re-materialize the
+// plugin on the next boot. Returns whether a restart was scheduled.
+func (h *PluginsHandler) pullUninstall(ctx context.Context, workspaceID, pluginName string) (bool, error) {
+	if err := deleteWorkspacePluginRow(ctx, workspaceID, pluginName); err != nil {
+		return false, fmt.Errorf("pullUninstall: delete installed row: %w", err)
+	}
+	if err := deleteDeclaredPluginRow(ctx, workspaceID, pluginName); err != nil {
+		return false, fmt.Errorf("pullUninstall: delete declared row: %w", err)
+	}
+	if h.restartFunc != nil {
+		wsID := workspaceID
+		globalGoAsync(func() { h.restartFunc(wsID) })
+		return true, nil
+	}
+	return false, nil
+}
+
 // deliverViaDocker copies the staged plugin dir into containerName via docker
 // CopyToContainer, chowns it for the agent user (uid 1000), and triggers a
 // restart unless the change is skill-content-only or the caller suppressed

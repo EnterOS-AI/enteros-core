@@ -21,8 +21,17 @@ import (
 // expectAllowlistAllowAll programs the package-shared withMockDB sqlmock
 // so the org-allowlist gate (org_plugin_allowlist.go) returns "allow-all"
 // for the duration of one Install call. The gate fires three queries —
-// resolveOrgID, allowlist EXISTS, allowlist COUNT — and we satisfy each
-// with the empty/zero shape that means "no allowlist configured."
+// resolveOrgID (the org_chain CTE in org_scope.go), allowlist EXISTS,
+// allowlist COUNT — and we satisfy each with the shape that means "no
+// allowlist configured."
+//
+// The org root returned here must be NON-EMPTY: an empty root makes
+// checkOrgPluginAllowlist return before the EXISTS/COUNT queries, leaving
+// two expectations unconsumed for any test that asserts
+// ExpectationsWereMet. This helper used to expect the retired
+// `SELECT parent_id` lookup, which nothing runs any more; the unmatched
+// CTE then errored, the gate failed open, and the install still passed —
+// so only tests that assert ExpectationsWereMet could see the drift.
 //
 // Without this, tests that exercise the full Install flow panic on a
 // nil DB. The handlers package already ships withMockDB in
@@ -30,8 +39,8 @@ import (
 // expectations on top.
 func expectAllowlistAllowAll(mock sqlmock.Sqlmock) {
 	mock.MatchExpectationsInOrder(false)
-	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
-		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow("ws-org-root"))
 	mock.ExpectQuery(`SELECT EXISTS`).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM org_plugin_allowlist`).
@@ -442,11 +451,25 @@ func TestPluginUninstall_SaaS_PropagatesEICError(t *testing.T) {
 	}
 }
 
-func TestPluginUninstall_NoBackends_Returns503(t *testing.T) {
+// TestPluginUninstall_NoBackends_DeliversByPull — no container + empty
+// instance_id (pre-provision / unknown backend): the uninstall delivers by PULL,
+// symmetric with Install's empty-instance errNoPushTarget path. It drops BOTH DB
+// rows and (with a restartFunc wired) bounces the box; EIC is never called. This
+// replaces the old 503 dead-end, so a plugin that Install delivered here can
+// also be removed. FAILS on main (503).
+func TestPluginUninstall_NoBackends_DeliversByPull(t *testing.T) {
 	stubUninstallPluginViaEIC(t, func(ctx context.Context, instanceID, runtime, pluginName string) error {
 		t.Errorf("EIC uninstall must not be called with empty instance_id")
 		return nil
 	})
+
+	mock := setupTestDB(t)
+	mock.ExpectExec(`DELETE FROM workspace_plugins WHERE workspace_id`).
+		WithArgs("ws-1", "browser-automation").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`DELETE FROM workspace_declared_plugins WHERE workspace_id`).
+		WithArgs("ws-1", "browser-automation").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	h := NewPluginsHandler(t.TempDir(), nil, nil).
 		WithRuntimeLookup(func(string) (string, error) { return "claude-code", nil }).
@@ -461,9 +484,16 @@ func TestPluginUninstall_NoBackends_Returns503(t *testing.T) {
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/ws-1/plugins/browser-automation", nil)
 
 	h.Uninstall(c)
+	drainTestAsync()
 
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("expected 503, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 (pull uninstall), got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"delivery":"pull"`) {
+		t.Errorf("expected pull delivery, got: %s", w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("both DB rows must be deleted: %v", err)
 	}
 }
 

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef } from "react";
 import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
 import { useSocketEvent } from "@/hooks/useSocketEvent";
 import { createMessage, type ChatMessage, type ChatAttachment } from "../types";
+import { parseA2AResponse } from "../a2a-response";
 
 export interface UseChatSocketCallbacks {
   onAgentMessage?: (msg: ChatMessage) => void;
@@ -88,11 +89,9 @@ export function useChatSocket(
           if (status === "ok" && durationMs) {
             const sec = Math.round(durationMs / 1000);
             line = `← ${targetName} responded (${sec}s)`;
-            const own = (targetId || msg.workspace_id) === workspaceId;
-            if (own) {
-              const messageId = typeof p.message_id === "string" ? p.message_id : undefined;
-              callbacksRef.current.onSendComplete?.(messageId);
-            }
+            // Transport activity arrives before the reply body. Only an
+            // actual reply can complete the send; this event may precede a
+            // JSON-RPC error or an empty HTTP 200 response.
           } else if (status === "ok" && !durationMs) {
             // Task #227 — poll-mode (external/MCP workspace) queued receipt.
             // ws-server `logA2AReceiveQueued` writes a "received but no
@@ -117,7 +116,6 @@ export function useChatSocket(
             const own = (targetId || msg.workspace_id) === workspaceId;
             if (own) {
               const messageId = typeof p.message_id === "string" ? p.message_id : undefined;
-              callbacksRef.current.onSendComplete?.(messageId);
               // internal#212 — surface the actionable, secret-safe
               // failure reason (provider HTTP status + error code +
               // human-readable message) the ws-server now puts on
@@ -148,6 +146,16 @@ export function useChatSocket(
 
         if (line) {
           callbacksRef.current.onActivityLog?.(line);
+        }
+      } else if (
+        msg.event === "A2A_RESPONSE" &&
+        msg.workspace_id === workspaceId &&
+        (!msg.payload?.method || msg.payload.method === "message/send")
+      ) {
+        const { error } = parseA2AResponse(msg.payload?.response_body);
+        if (error) {
+          const messageId = typeof msg.payload?.message_id === "string" ? msg.payload.message_id : undefined;
+          callbacksRef.current.onSendError?.(error, messageId);
         }
       } else if (
         msg.event === "TASK_UPDATED" &&

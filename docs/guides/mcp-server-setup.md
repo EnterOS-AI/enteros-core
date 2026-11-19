@@ -38,7 +38,7 @@ For production/SaaS deployments, set `MOLECULE_URL` to your tenant URL:
 
 ### 3. Verify
 
-Once configured, your MCP client should show 87 Molecule AI tools. Test with:
+Once configured, your MCP client should list the tools for its selected registry. Test with:
 ```
 list_workspaces
 ```
@@ -52,6 +52,20 @@ list_workspaces
 ## Tool Reference
 
 ### Workspace Management
+
+The concierge runs the management registry (`MOLECULE_MCP_MODE=management`).
+Starting with MCP server 1.10.0 it exposes `rename_workspace` with
+`workspace_id` and `name`. Use `list_workspaces` to resolve the existing UUID,
+then rename in place. The regular workspace registry uses `update_workspace`
+for the same `PATCH /workspaces/:id` operation.
+
+Renaming preserves the workspace UUID, files, configuration, chat history,
+and running agent. The API trims surrounding whitespace, rejects blank or
+invalid names, and returns HTTP 409 if a sibling already has that name.
+On success it returns the saved `workspace_id` and `name` and broadcasts
+`WORKSPACE_UPDATED` so open Canvas pages update immediately. Renaming does
+not require a restart. A workspace bearer may rename itself; the concierge
+uses its org credential to manage other workspaces in that org.
 
 | MCP Tool | API Route | Method | Description |
 |----------|-----------|--------|-------------|

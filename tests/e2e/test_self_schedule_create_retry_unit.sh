@@ -180,7 +180,7 @@ self_schedule_target_capability_ready
 rc=$?
 assert_eq "OWN container without a live tick is not ready" 1 "$rc"
 assert_eq "readiness probes only the OWN container" \
-  "exec own-container sh -c cat /configs/schedules/schedule-health.json 2>/dev/null" \
+  "exec own-container sh -c ${TRIGGER_STATE_DIR_SH}cat \"\$TSD\"/schedule-health.json 2>/dev/null" \
   "$(<"$DOCKER_CALL_FILE")"
 
 _SS_CAP_EVIDENCE=""

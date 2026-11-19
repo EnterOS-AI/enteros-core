@@ -376,10 +376,19 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+# The import PROVISIONS the re-imported workspace in a detached goroutine — on
+# the CI lane a real ws-<id> container on the runner's shared docker daemon (the
+# bundle carries no runtime, so it comes back as the default one) — and the
+# delete at the end of this test usually lands while that provision is still in
+# flight. That delete-vs-provision race left crash-looping ws-* orphans on the
+# CI hosts for months (RC09). The platform now cancels an in-flight provision
+# when its workspace is deleted and re-checks before it creates a container, so
+# this test deliberately keeps the race rather than waiting it out; the e2e
+# job's instance-scoped teardown would remove anything it still left behind.
+
 # Verify re-imported workspace exists by name — status may be "provisioning",
-# "online", or "failed" depending on runtime availability in the environment
-# (CI has no Docker, so runtime containers never come up). The
-# round-trip assertion is about bundle fidelity, not provisioning success.
+# "online", or "failed" depending on runtime availability in the environment.
+# The round-trip assertion is about bundle fidelity, not provisioning success.
 R=$(curl -s "$BASE/workspaces/$NEW_ID")
 check "Re-imported workspace exists" "\"id\":\"$NEW_ID\"" "$R"
 

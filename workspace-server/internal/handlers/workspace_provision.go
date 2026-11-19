@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -219,6 +220,13 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 	h.mintWorkspaceSecrets(ctx, workspaceID, &cfg)
 
 	url, err := h.provisioner.Start(ctx, cfg)
+	if errors.Is(err, provisioner.ErrWorkspaceRemoved) {
+		// RC09: deleted while this provision was in flight. Start already tore
+		// down what it made; the row is 'removed' and must stay that way —
+		// markProvisionFailed would resurrect it as 'failed'.
+		log.Printf("Provisioner: workspace %s was deleted while provisioning — start abandoned: %v", workspaceID, err)
+		return
+	}
 	if err != nil {
 		// F1086 / #1206: persist a generic message so the canvas and
 		// GET /workspaces/:id expose something actionable without leaking
@@ -1234,6 +1242,15 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 		// slug prefix (minimax/…, anthropic/…, openai/…, etc.) when the
 		// provider isn't explicitly set.
 		envVars["HERMES_DEFAULT_MODEL"] = model
+		// The platform registry uses minimax:Model for BYOK; Hermes's
+		// provider/bridge input uses minimax/Model. Project only the native
+		// setting: MODEL and MOLECULE_MODEL must keep the canonical id so
+		// provider selection and billing still distinguish BYOK from platform.
+		// Without this, the custom-provider bridge forwards the colon prefix
+		// to MiniMax, which rejects it as an unknown model.
+		if strings.HasPrefix(model, "minimax:") {
+			envVars["HERMES_DEFAULT_MODEL"] = "minimax/" + strings.TrimPrefix(model, "minimax:")
+		}
 	}
 }
 
@@ -2050,14 +2067,56 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 	// returned via an unlogged path."
 	log.Printf("CPProvisioner: goroutine entered for %s (runtime=%s, mode=cp)", workspaceID, payload.Runtime)
 	defer h.logProvisionPanic(workspaceID, "cp")
+	// On the in-flight list from here until this function returns, so a delete
+	// can wait for it (workspace_cp_inflight_provision.go). BEFORE the
+	// removed-check below: a delete marks its rows removed and then looks at
+	// this list, so either this provision sees the removed row, or the delete
+	// sees this provision.
+	defer trackCPProvision(workspaceID)()
 
-	ctx, cancel := context.WithTimeout(context.Background(), provisioner.ProvisionTimeout)
+	// CP-mode ctx bounds the pinned-image pre-flight + cpProv.Start. Derived
+	// from the CP provision budget (cpProvisionTimeout, floored at
+	// provisioner.CPProvisionCeiling), NOT the fixed 3-min
+	// provisioner.ProvisionTimeout: the control plane resolves the pin at
+	// provision time and may have to obtain a multi-GB image before it can
+	// answer, and a ctx shorter than the provision client's own budget cancels
+	// that pull mid-flight — the control plane logs `pull failed: context
+	// canceled` and the workspace is marked terminally failed. See
+	// cp_provision_budget.go. Mirrors the Docker-mode migration above.
+	budget := h.cpProvisionTimeout(payload.Runtime)
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
+	log.Printf("CPProvisioner: cp-mode provision ctx for %s bounded at %s (runtime=%s, provision-client budget=%s)",
+		workspaceID, budget, payload.Runtime, provisioner.CPProvisionCeiling())
 
 	prepared, abort := h.prepareProvisionContext(ctx, workspaceID, templatePath, configFiles, payload, false)
 	if prepared == nil {
 		log.Printf("CPProvisioner: prepare failed for %s: %s", workspaceID, abort.Msg)
 		h.markProvisionFailed(ctx, workspaceID, abort.Msg, abort.Extra)
+		return
+	}
+
+	// core#5019, create half: PULL BEFORE PROVISIONING. EnsureImage was wired
+	// only on the restart path; a fresh org's first workspace — the path a new
+	// customer takes, and the one the control plane labels
+	// stage=create_workspace in these failures — never asked. Ask now, so the
+	// provision that follows is a cache hit rather than the thing that has to
+	// wait for 6.89GB. A refusal the control plane MEANT fails here, fast and
+	// with a reason, instead of minutes later with none.
+	if reason := h.ensurePinnedImageBeforeProvision(ctx, workspaceID, payload, budget); reason != "" {
+		h.markProvisionFailed(ctx, workspaceID, reason, nil)
+		return
+	}
+
+	// THE WORKSPACE MAY HAVE BEEN DELETED while this goroutine was preparing
+	// (the image pre-flight above can take minutes). A delete has already torn
+	// down what existed and will not look again, so nothing may be created for
+	// it now: no token, no instance. The Docker start makes the same check
+	// right before ContainerCreate (provisioner.SetWorkspaceRemovedCheck). A
+	// lookup error answers "not removed": a DB blip must not kill a legitimate
+	// provision.
+	if WorkspaceIsRemoved(ctx, workspaceID) {
+		log.Printf("CPProvisioner: workspace %s was deleted before its provision reached the control plane — nothing was created", workspaceID)
 		return
 	}
 
@@ -2069,10 +2128,15 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 
 	machineID, err := h.cpProv.Start(ctx, prepared.Config)
 	if err != nil {
-		// F1086 / #1206: CP errors can include machine type, AMI IDs, VPC
-		// paths — use generic message for broadcast and last_sample_error.
+		// F1086 / #1206 still holds: CP errors can include machine type, AMI
+		// IDs and VPC paths, and none of it may reach a tenant-visible column.
+		// What changed is HOW: the error is CLASSIFIED into one of a closed set
+		// of compile-time constants (cpProvisionFailureReason) instead of being
+		// collapsed to one. Publishing a single constant is why five weeks of
+		// post-promote image failures were invisible to the gate AND to the
+		// customer's canvas. The full error is logged here, exactly as before.
 		log.Printf("CPProvisioner: workspace start failed for %s: %v", workspaceID, err)
-		h.markProvisionFailed(ctx, workspaceID, "provisioning failed", nil)
+		h.markProvisionFailed(ctx, workspaceID, cpProvisionFailureReason(err), nil)
 		return
 	}
 
@@ -2086,9 +2150,10 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 	// last_sample_error so an operator/reaper can reconcile later. The running
 	// provider compute is NOT terminated — it may contain valuable state. (#1)
 	var persistErr error
+	var persisted sql.Result
 	delay := instanceIDPersistRetryBaseDelay
 	for attempt := 1; attempt <= instanceIDPersistRetryAttempts; attempt++ {
-		_, persistErr = db.DB.ExecContext(ctx,
+		persisted, persistErr = db.DB.ExecContext(ctx,
 			`UPDATE workspaces SET instance_id = $2, updated_at = now() WHERE id = $1`,
 			workspaceID, machineID)
 		if persistErr == nil {
@@ -2113,5 +2178,76 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 		return
 	}
 
+	// THE ROW MAY BE GONE. A delete with ?purge=true that lands while this
+	// provision is in flight stops what was on file, removes the row, and
+	// returns; the control plane then finishes creating the instance. The
+	// UPDATE above matches no row and reports no error, so without this check
+	// the instance runs for good with nothing that knows about it: not the
+	// delete path, not the orphan sweeper (both read instance_id from the row).
+	// Its pod also registers, which re-creates a row for the purged id.
+	// Reproduced on the staging canary 2026-11-19 (restart, then purge two
+	// seconds later); see workspace_provision_purged_test.go.
+	//
+	// Only the purge removes rows, so "no row" means exactly that. A row that
+	// is merely status='removed' still matches, and the orphan sweeper stops
+	// its instance as before.
+	if n, raErr := persisted.RowsAffected(); raErr == nil && n == 0 {
+		h.stopInstanceOfPurgedWorkspace(workspaceID, machineID)
+		return
+	}
+
 	log.Printf("CPProvisioner: workspace %s started as machine %s via control plane", workspaceID, machineID)
+}
+
+// purgedInstanceStopper is the control-plane capability provisionWorkspaceCP
+// uses to stop an instance whose workspace row is gone. Optional on the
+// interface so the many CPProvisionerAPI test doubles need no new method; the
+// production type must keep implementing it, hence the compile-time pin (a
+// rename would make the type assertion fail silently and the leak return).
+type purgedInstanceStopper interface {
+	StopPurgedInstance(ctx context.Context, workspaceID, instanceID string) error
+}
+
+var _ purgedInstanceStopper = (*provisioner.CPProvisioner)(nil)
+
+// purgedInstanceStopTimeout bounds the teardown of a purged workspace's
+// instance, retries included.
+const purgedInstanceStopTimeout = 60 * time.Second
+
+// stopInstanceOfPurgedWorkspace tears down the instance a provision created for
+// a workspace that was purged while the provision ran. Nothing else can: the
+// row is gone, so the delete path, the orphan sweeper and Stop all find no
+// instance id. Bounded retry, as on every other stop; a teardown that still
+// fails is logged with the LEAK-SUSPECT prefix and the instance id, which is
+// the only record of it left.
+func (h *WorkspaceHandler) stopInstanceOfPurgedWorkspace(workspaceID, instanceID string) {
+	stopper, ok := h.cpProv.(purgedInstanceStopper)
+	if !ok {
+		log.Printf("LEAK-SUSPECT CPProvisioner: workspace %s was purged while it was being provisioned; provider instance %s is RUNNING and UNTRACKED, and this control-plane client cannot stop an instance by id",
+			workspaceID, instanceID)
+		return
+	}
+	// Detached from the provision's context: that one is the provision's
+	// budget, and the teardown must run even when it is spent.
+	ctx, cancel := context.WithTimeout(context.Background(), purgedInstanceStopTimeout)
+	defer cancel()
+	var lastErr error
+	delay := cpStopRetryBaseDelay
+	for attempt := 1; attempt <= cpStopRetryAttempts; attempt++ {
+		if lastErr = stopper.StopPurgedInstance(ctx, workspaceID, instanceID); lastErr == nil {
+			log.Printf("CPProvisioner: workspace %s was purged while it was being provisioned; tore down the instance that provision created (%s)",
+				workspaceID, instanceID)
+			return
+		}
+		if attempt == cpStopRetryAttempts || ctx.Err() != nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(delay):
+		}
+		delay *= 2
+	}
+	log.Printf("LEAK-SUSPECT CPProvisioner: workspace %s was purged while it was being provisioned; tearing down provider instance %s FAILED (%v) — it is RUNNING and UNTRACKED",
+		workspaceID, instanceID, lastErr)
 }

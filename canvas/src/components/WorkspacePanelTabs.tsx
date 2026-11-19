@@ -205,7 +205,7 @@ export function WorkspacePanelTabs({ node, activeTab, onTabChange, defaultTab = 
           <ContainerConfigTab key={workspaceId} workspaceId={workspaceId} data={data} />
         )}
         {tab === "config" && <ConfigTab key={workspaceId} workspaceId={workspaceId} />}
-        {tab === "schedule" && <ScheduleTab key={workspaceId} workspaceId={workspaceId} />}
+        {tab === "schedule" && <ScheduleTab key={workspaceId} workspaceId={workspaceId} data={data} />}
         {tab === "channels" && <ChannelsTab key={workspaceId} workspaceId={workspaceId} />}
         {tab === "files" && <FilesTab key={workspaceId} workspaceId={workspaceId} data={data} />}
         {tab === "memory" && <MemoryInspectorPanel key={workspaceId} workspaceId={workspaceId} />}

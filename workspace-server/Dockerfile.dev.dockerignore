@@ -1,0 +1,13 @@
+# Limit the development build context, including on checkouts with large
+# node_modules, worktrees, logs, and local credentials.
+**
+!workspace-server/
+!workspace-server/**
+workspace-server/.env*
+workspace-server/**/.git
+workspace-server/tmp/
+workspace-server/server
+workspace-server/*.exe
+workspace-server/*.log
+workspace-server/**/node_modules/
+workspace-server/workspace-configs-templates/

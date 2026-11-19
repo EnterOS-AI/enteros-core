@@ -11,7 +11,10 @@
 # adapter start, TLS to the LLM endpoint, first prompt, first token.
 #
 # The PARENT leg routes through a2a_send_or_poll_queue and overrides the timeout
-# to 90s for exactly that reason. The DELEGATION leg is raw curl, deliberately,
+# for exactly that reason: to 90s originally, now to A2A_BUSY_WAIT_SECS, because a
+# hermes agent mid-turn answers only after the turn ahead (and its settle window).
+# 90s, one cold turn, stays the floor this guard enforces. The DELEGATION leg is
+# raw curl, deliberately,
 # because it authenticates as the PARENT WORKSPACE token rather than the tenant
 # admin — and in being hand-rolled it silently inherited CURL_COMMON's generic
 # --max-time 30. That took a REQUIRED gate red twice on 2026-07-30:
@@ -72,7 +75,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # DELEG_GUARD_TARGET exists so the mutation matrix in the PR body can point this
 # guard at a mutated COPY of the harness. CI passes nothing and gets the real one.
 SAAS="${DELEG_GUARD_TARGET:-$HERE/test_staging_full_saas.sh}"
-PARENT_LEG_BUDGET=90   # a2a_send_or_poll_queue's --max-time for the parent leg
+PARENT_LEG_BUDGET=90   # one cold agent turn: the least either A2A leg may allow
 CURL_COMMON_BUDGET=30  # the generic cap the delegation leg must NOT inherit
 MAX_ATTEMPTS=12        # the harness's cold-start retry ceiling
 
@@ -176,7 +179,7 @@ probe() {
   {
     printf '%s\n' 'set -uo pipefail'
     # Assert the CHECKED-IN default, not whatever the ambient env happens to say.
-    printf '%s\n' 'unset E2E_DELEG_A2A_TIMEOUT_SECS'
+    printf '%s\n' 'unset E2E_DELEG_A2A_TIMEOUT_SECS A2A_BUSY_WAIT_SECS'
     printf '%s\n' "$cc"
     cat <<'STUBS'
 TENANT_ROUTE_HDRS=(-H "Host: stub.invalid")

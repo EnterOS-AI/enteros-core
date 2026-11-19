@@ -36,11 +36,19 @@ name: E2E Chat
 # (623210 ✗, 623299 ✓, 623425 ✗, 622625 ✓).
 #
 # `next build` emits immutable, content-hashed CSS files that are NAMED by
-# the initial document — this one as `<link rel="preload" as="style">` plus
-# an RSC-payload stylesheet entry React inserts at hydration. (Checked
-# against a real build: the only plain `<link rel="stylesheet">` tags in the
-# initial HTML are the two LAYOUT sheets.) There is no on-demand chunk
-# compilation left, which removes the COMPILATION mechanism behind the flake.
+# the initial document. There is no on-demand chunk compilation left, which
+# removes the COMPILATION mechanism behind the flake.
+#
+# This paragraph used to add that the React Flow sheet arrives "as `<link
+# rel="preload" as="style">` plus an RSC-payload stylesheet entry React
+# inserts at hydration". That was true when written and is FALSE NOW: #5105
+# moved the import into the layout stylesheet precisely so the sheet is a
+# plain, render-blocking `<link rel="stylesheet">` in the initial document,
+# and the preflight below ASSERTS that shape and fails the job if it ever
+# regresses. Left corrected rather than deleted because a stale claim about
+# how an asset is delivered is not inert — it is what a future investigator
+# reasons from, and core#5106 has now been misdirected twice by exactly that
+# (see the note on the diagnostic in canvas/e2e/helpers/canvas.ts).
 #
 # It does NOT remove every mechanism, and this file will not pretend
 # otherwise. A stylesheet request that is merely SLOW makes React suspend the
@@ -79,9 +87,9 @@ name: E2E Chat
 # `MOLECULE_ENV=development` the specs DO assert on belongs to the Go
 # platform-server and is untouched by this change.
 #
-# Parallel-safety: same pattern as e2e-api.yml — per-run container names
-# and ephemeral host ports so concurrent jobs on the host-network runner
-# don't collide.
+# Parallel-safety: per-run containers and ephemeral loopback ports. Chromium
+# has its own bridge network namespace: host Docker churn cannot invalidate
+# browser sockets (core#5106). Playwright forwards client loopback destinations.
 
 on:
   # ALWAYS RUNS — 2026-07-14. No paths filter, no detect-changes job, no no-op arm.
@@ -159,6 +167,7 @@ jobs:
     env:
       PG_CONTAINER: pg-e2e-chat-${{ github.run_id }}-${{ github.run_attempt }}
       REDIS_CONTAINER: redis-e2e-chat-${{ github.run_id }}-${{ github.run_attempt }}
+      PLAYWRIGHT_CONTAINER: browser-e2e-chat-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       -
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -200,16 +209,16 @@ jobs:
             cts=$(date -u -d "$created" +%s 2>/dev/null) || continue
             if [ $(( now - cts )) -gt 7200 ]; then
               echo "sweeping stale e2e-chat container $c (created $created)"
-              timeout 30 docker rm -f "$c" >/dev/null 2>&1 || true
+              timeout 30 docker rm -fv "$c" >/dev/null 2>&1 || true
             fi
           done
 
       - name: Start Postgres (docker)
         run: |
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$PG_CONTAINER" \
+          # tmpfs PGDATA + run label + `rm -fv` pre-clean: see the script header.
+          bash .gitea/scripts/ci-service-container.sh postgres "$PG_CONTAINER" postgres:16 \
             -e POSTGRES_USER=dev -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=molecule \
-            -p 127.0.0.1::5432 postgres:16 >/dev/null
+            -p 127.0.0.1::5432 >/dev/null
           PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           if [ -z "$PG_PORT" ]; then
             PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | head -1 | awk -F: '{print $NF}')
@@ -233,8 +242,7 @@ jobs:
 
       - name: Start Redis (docker)
         run: |
-          docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$REDIS_CONTAINER" -p 127.0.0.1::6379 redis:7 >/dev/null
+          bash .gitea/scripts/ci-service-container.sh redis "$REDIS_CONTAINER" redis:7 -p 127.0.0.1::6379 >/dev/null
           REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           if [ -z "$REDIS_PORT" ]; then
             REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | head -1 | awk -F: '{print $NF}')
@@ -346,16 +354,11 @@ jobs:
         working-directory: canvas
         run: npm ci
 
-      - name: Install Playwright browsers
-        working-directory: canvas
+      - name: Start isolated Playwright browser
         run: |
-          PREBAKED_PLAYWRIGHT=/ms-playwright
-          if [ -d "${PREBAKED_PLAYWRIGHT}" ] && find "${PREBAKED_PLAYWRIGHT}" -maxdepth 3 -type f -name 'chrome' | grep -q .; then
-            echo "Using prebaked Playwright Chromium from ${PREBAKED_PLAYWRIGHT}"
-            echo "PLAYWRIGHT_BROWSERS_PATH=${PREBAKED_PLAYWRIGHT}" >> "$GITHUB_ENV"
-            exit 0
-          fi
-          npx playwright install --with-deps chromium
+          set -euo pipefail
+          endpoint="$(bash .gitea/scripts/start-playwright-server.sh "$PLAYWRIGHT_CONTAINER")"
+          echo "PLAYWRIGHT_WS_ENDPOINT=$endpoint" >> "$GITHUB_ENV"
 
       - name: Build canvas (production bundle)
         working-directory: canvas
@@ -438,8 +441,24 @@ jobs:
           # lane already uses (Postgres/Redis/platform all bind 127.0.0.1);
           # `localhost` resolves to it on this runner, which is exactly how
           # the dev server was being reached before.
+          #
+          # --require the core#5106 server probe. On the one captured
+          # recurrence (run 632484) this log contained four lines — the banner
+          # and "Ready in 85ms" — for the whole run, so it could establish that
+          # the server had not crashed and NOTHING else. It could not say
+          # whether the request for the stylesheet that died ever reached this
+          # process, nor whether this process was able to run at the time. The
+          # probe answers both (see canvas/e2e/support/server-probe.cjs) and is
+          # silent on the happy path. Absolute path: the server runs with
+          # cwd=.next/standalone, and a relative --require resolves against cwd.
+          PROBE="${PWD}/e2e/support/server-probe.cjs"
+          if [ ! -f "$PROBE" ]; then
+            echo "::error::server probe not found at ${PROBE} — refusing to start the canvas server without the instrument this lane's failures are diagnosed from."
+            exit 1
+          fi
           cd .next/standalone
-          PORT="${CANVAS_PORT}" HOSTNAME=127.0.0.1 node server.js > ../../canvas.log 2>&1 &
+          PORT="${CANVAS_PORT}" HOSTNAME=127.0.0.1 NODE_OPTIONS="--require ${PROBE}" \
+            node server.js > ../../canvas.log 2>&1 &
           echo $! > ../../canvas.pid
           cd ../..
           # Readiness is the real signal, not a sleep: poll the exact route
@@ -468,20 +487,38 @@ jobs:
             exit 1
           fi
 
-          # --- React Flow stylesheet: NAMED by the document, and SERVED ----
+          # The probe is only useful if it actually loaded, and a --require that
+          # silently no-ops (wrong path, NODE_OPTIONS stripped, a syntax error
+          # in the file) leaves a log that looks exactly like a healthy quiet
+          # run. That is the same shape as the failure being investigated, so
+          # assert the instrument is live rather than assuming it.
+          if ! grep -q '\[probe .*\] attached' canvas.log; then
+            echo "::error::the core#5106 server probe did not attach — canvas.log has no '[probe] attached' line, so a silent canvas.log would prove nothing. NODE_OPTIONS/--require did not take effect."
+            cat canvas.log || true
+            exit 1
+          fi
+          echo "Server probe attached (event-loop + static-asset instrumentation live)."
+
+          # --- React Flow stylesheet: RENDER-BLOCKING, and SERVED ----------
           #
-          # Read this as exactly what it checks, no more. Next does NOT emit
-          # this file as a plain `<link rel="stylesheet">` in the initial
-          # HTML — it emits `<link rel="preload" as="style">` plus an
-          # RSC-payload entry that React turns into a stylesheet during
-          # hydration. (The only plain stylesheet links in the initial
-          # document are the two LAYOUT sheets.) So these assertions prove
-          # AVAILABILITY: the document names the exact hashed asset, the
-          # server serves it, and it carries the rule. They do NOT prove the
-          # rule ends up APPLIED in the browser — a sheet that is named,
-          # fetched, and then never applied still passes here. What catches
-          # that is the suite itself, which cannot click the canvas when the
-          # rule is not in effect.
+          # This used to assert only that the document NAMED the asset. That
+          # was satisfied by a `<link rel="preload" as="style">`, and a
+          # preload is not a stylesheet: Next puts PAGE css behind a preload
+          # plus an RSC-payload entry that REACT inserts during hydration, so
+          # the rule was reliably absent for the first few hundred ms — and
+          # for ~5s under CPU contention, measured at 20x throttling on this
+          # exact build. That window is what produced "workspace node never
+          # became hittable" (runs 628513, 630140) and
+          # "<rect> from <svg data-testid=rf__background> subtree intercepts
+          # pointer events" (run 629224): a guard that passes while the page
+          # can still render unstyled is not a guard.
+          #
+          # So assert the property that actually removes the window: the
+          # initial document must carry a PLAIN `<link rel="stylesheet">`
+          # for the sheet that holds the rule. That only happens when the
+          # import lives in a LAYOUT stylesheet (canvas/src/app/globals.css),
+          # and it makes the browser block rendering on it — there is then no
+          # state in which the canvas exists and the rule does not.
           #
           # Non-empty first: grepping for the empty string matches every
           # file, so an empty RF_CSS_PATH would make the document check a
@@ -495,11 +532,17 @@ jobs:
           curl -s -o /tmp/canvas-rf.css -w '%{http_code}' "http://localhost:${CANVAS_PORT}${RF_CSS_PATH}" > /tmp/canvas-rf.code
           set -e
           RF_CODE=$(cat /tmp/canvas-rf.code 2>/dev/null || echo "000")
-          # Anchor on the full href, not the bare basename: that pins the
-          # match to the real preload link rather than any incidental
-          # occurrence of the hash.
-          if ! grep -qF 'href="'"${RF_CSS_PATH}"'"' /tmp/canvas-doc.html; then
-            echo "::error::The served /?m=chat document does not name ${RF_CSS_PATH} — the page would never fetch the React Flow stylesheet and the canvas background would swallow every click."
+          # Split the document into one <link ...> tag per line and require a
+          # SINGLE tag that is both rel="stylesheet" and points at this exact
+          # href. Attribute-order independent, and — unlike a bare
+          # `grep -F href="..."` — a preload of the same href cannot satisfy
+          # it. Anchoring on the full href (not the basename) keeps an
+          # incidental occurrence of the hash from matching.
+          grep -oE '<link[^>]*>' /tmp/canvas-doc.html > /tmp/canvas-links.txt || true
+          if ! grep -F 'rel="stylesheet"' /tmp/canvas-links.txt | grep -qF 'href="'"${RF_CSS_PATH}"'"'; then
+            echo "::error::The served /?m=chat document has no render-blocking <link rel=\"stylesheet\" href=\"${RF_CSS_PATH}\">. Found these link tags:"
+            cat /tmp/canvas-links.txt
+            echo "::error::@xyflow/react/dist/style.css must be imported from a LAYOUT stylesheet (canvas/src/app/globals.css), not from a client component such as Canvas.tsx. Imported from a component it lands in the PAGE css chunk, which Next ships as a preload that React only turns into a stylesheet during hydration — leaving a window in which the canvas renders unstyled, the background svg swallows every click, and node hit-testing is meaningless."
             exit 1
           fi
           if [ "$RF_CODE" != "200" ]; then
@@ -532,9 +575,24 @@ jobs:
           # here under `set -e`; passWithNoTests:false makes a zero-match selection
           # non-zero too. The assertions below are belt-and-braces.
           npx playwright test e2e/chat-desktop.spec.ts e2e/chat-mobile.spec.ts e2e/chat-separation.spec.ts \
+            e2e/local-entry.spec.ts e2e/concierge-chat-rendering.spec.ts \
             e2e/schedule-tab.spec.ts \
             e2e/boot-regression.spec.ts \
+            e2e/css-diagnostic.spec.ts \
+            e2e/net-evidence-guard.spec.ts \
             --reporter=list 2>&1 | tee /tmp/pw-chat.out
+          # net-evidence-guard.spec.ts is listed because a guard that is not
+          # SELECTED does not run, and this one is the thing that stops
+          # core#5106 recurring silently. It needs no platform and no canvas —
+          # it serves its own `/_next/static/**` on an ephemeral port — so it
+          # cannot add a dependency to this step.
+          #
+          # It contains ONE `test.fail()` (an expected-failure over a body that
+          # asserts nothing, so the only thing that can produce the failure is
+          # the guard firing in teardown — that is the mutation-proof). An
+          # expected-failure counts under `passed` and prints no `skipped`, so
+          # the two REQUIRE-LIVE assertions below are unaffected. Measured on
+          # @playwright/test 1.59.1: `11 passed`, zero skipped.
           # The guard used to be `grep -qE '[0-9]+ (passed|failed|skipped)'` — which
           # ACCEPTED `skipped` as proof of execution, while its own comment claimed
           # "a silent all-skip can never report green". It could: an all-skipped run
@@ -563,12 +621,27 @@ jobs:
         if: failure()
         run: cat canvas/canvas.log || true
 
-      - name: Upload Playwright report
+      - name: Dump browser log on failure
+        if: failure()
+        run: docker logs "$PLAYWRIGHT_CONTAINER" || true
+
+      # `--reporter=list` writes NO playwright-report/ directory — only the HTML
+      # reporter does — so this step has been finding nothing and warning
+      # "No files were found with the provided path" on every failure. It cost
+      # us the failure screenshot and error-context.md on run 632484, the one
+      # captured recurrence of core#5106, leaving the job log as the sole
+      # evidence. `test-results/` is where `screenshot: "only-on-failure"`
+      # actually puts them; keep the report path too so adding an HTML reporter
+      # later still uploads.
+      - name: Upload Playwright failure artifacts
         if: failure()
         uses: actions/upload-artifact@c6a366c94c3e0affe28c06c8df20a878f24da3cf # v3.2.2
         with:
           name: playwright-report-chat
-          path: canvas/playwright-report/
+          path: |
+            canvas/test-results/
+            canvas/playwright-report/
+            canvas/canvas.log
 
       - name: Stop canvas
         if: always()
@@ -589,5 +662,6 @@ jobs:
         run: |
           # timeout-wrap so a wedged docker daemon can't hang this always() step
           # (a hung rm here is one way containers leak in the first place).
-          timeout 30 docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          timeout 30 docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
+          timeout 30 docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
+          timeout 30 docker rm -fv "$REDIS_CONTAINER" 2>/dev/null || true
+          timeout 30 docker rm -fv "$PLAYWRIGHT_CONTAINER" 2>/dev/null || true

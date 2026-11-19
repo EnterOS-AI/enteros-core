@@ -4,9 +4,28 @@ name: design-token-drift
 # molecule-app/app/globals.css. Mirrors the app-side gate in
 # molecule-ai/molecule-app/.gitea/workflows/ci.yml.
 #
-# Phase 1 (advisory): continue-on-error: true and NOT in all-required. Once
-# the shared token set has been green for a week and APP_SSOT_READ_TOKEN is
-# provisioned, promote to required.
+# ENFORCING as of the mc#4602 close-out. This gate spent its whole life as a
+# no-op: `APP_SSOT_READ_TOKEN` was never provisioned on the repo or the org, so
+# check_app_token_drift.py always took its skip-on-missing-token branch and
+# returned 0 without fetching, parsing or comparing anything. The
+# `continue-on-error: true` above it therefore masked nothing at all — it was
+# guarding a check that could not fail because it could not run.
+#
+# Root fix, rather than a fourth renewal of the tracker:
+#   1. Source a credential that EXISTS. `DRIFT_BOT_TOKEN` (persona
+#      `mc-drift-bot`) is already provisioned, is already the token the other
+#      Tier 2 lints use, and does have read on the private molecule-app repo.
+#      It is read from the Infisical SSOT (prod /shared/drift-bot) via the CI
+#      machine identity, the same KMS wave-B pattern as local-provision-e2e.yml
+#      — no new Gitea Actions secret is introduced.
+#   2. The script no longer exits 0 on a missing token during a trusted run;
+#      DRIFT_GATE_REQUIRE_TOKEN=1 makes that case a loud red.
+#   3. `continue-on-error` removed. A drift now reds the context.
+#
+# Verified before flipping (not from the masked status rows, which cannot
+# distinguish "aligned" from "never ran"): running the script with a real
+# credential compares 15 shared tokens x {light, dark} = 30 values on each
+# side and reports 0 drift.
 
 concurrency:
   # Auto-cancel a superseded run: a newer commit/event supersedes the old
@@ -32,27 +51,63 @@ on:
 permissions:
   contents: read
 
-# bp-exempt: Phase 1 advisory gate; continue-on-error and not in all-required.
+# bp-exempt: not in .gitea/required-contexts.txt, so it is not presence-required
+# at merge time. It is no longer continue-on-error, so when it DOES post, a
+# drift reds the context (BP status_check_contexts is ['*'] — every posted
+# context must be success).
 jobs:
   drift:
     name: Canvas ↔ app design-token SSOT drift
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Phase-1 advisory gate (decision issue: mc#3089). Three prior renewal
-    # trackers aged past the 14d cap and were superseded; this is the current
-    # one. The 2026-07-25 review confirmed APP_SSOT_READ_TOKEN is still not
-    # provisioned on the repo or org, so the job can only loud-skip and the
-    # clean-window evidence cannot exist yet; the mask is re-tracked, not
-    # unmasked.
-    # (Do not put superseded tracker numbers within 2 lines of the directive:
-    # lint-continue-on-error-tracking matches the FIRST tracker in that window.)
-    continue-on-error: true  # mc#4602: 2026-07-25 renewal, expires 2026-08-08 — Phase 1 advisory design-token drift gate; promote to required (flip false) after 1w green + APP_SSOT_READ_TOKEN provisioned, else open a successor tracker (per mc#3089).
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: '3.12'
-      - name: Check canvas↔app token SSOT drift
+
+      # TRUSTED-REF GATING: molecule-core is a PUBLIC repo and this workflow
+      # runs on pull_request, so INFISICAL_CI_* must never be reachable from an
+      # untrusted-fork PR. This step runs only on protected-branch push,
+      # operator workflow_dispatch, or a same-repo (non-fork) PR. On a fork PR
+      # it skips, APP_SSOT_READ_TOKEN stays empty, DRIFT_GATE_REQUIRE_TOKEN
+      # stays 0, and the script emits a STATED skip. Same shape as the
+      # "Fetch staging MiniMax key from Infisical KMS" step in
+      # local-provision-e2e.yml.
+      - name: Fetch molecule-app read credential from Infisical KMS
+        id: kms_drift_bot
+        if: >-
+          github.event_name == 'push' ||
+          github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'pull_request' &&
+           github.event.pull_request.head.repo.fork == false)
         env:
-          APP_SSOT_READ_TOKEN: ${{ secrets.APP_SSOT_READ_TOKEN }}
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          if [ -z "$TOK" ]; then
+            echo "::error::Infisical accessToken empty - failing closed"; exit 1
+          fi
+          APP_TOKEN=$(curl -fsS "$BASE/api/v3/secrets/raw/DRIFT_BOT_TOKEN?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=%2Fshared%2Fdrift-bot" \
+            -H "Authorization: Bearer $TOK" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          echo "::add-mask::$APP_TOKEN"
+          if [ -z "$APP_TOKEN" ]; then
+            echo "::error::Infisical returned empty DRIFT_BOT_TOKEN at prod /shared/drift-bot — failing closed."
+            exit 1
+          fi
+          echo "APP_SSOT_READ_TOKEN=$APP_TOKEN" >> "$GITHUB_ENV"
+          # Tell the script this run IS credentialled, so a missing/empty token
+          # is a hard error rather than a silent exit 0.
+          echo "DRIFT_GATE_REQUIRE_TOKEN=1" >> "$GITHUB_ENV"
+          echo "molecule-app read credential loaded from Infisical prod SSOT (len=${#APP_TOKEN})"
+
+      - name: Check canvas↔app token SSOT drift
         run: python3 .gitea/scripts/check_app_token_drift.py

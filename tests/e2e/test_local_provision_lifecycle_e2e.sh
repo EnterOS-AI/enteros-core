@@ -197,6 +197,20 @@ if [ "$LIFECYCLE_LLM" = "minimax" ]; then
   [ "${RESTART_TIMEOUT_EXPLICIT:-0}" -eq 0 ] && RESTART_TIMEOUT=240
 fi
 
+# LIFECYCLE_LLM=none — the REAL claude-code template image (provisioner build,
+#   same as minimax mode) with NO model call: Step 5 asserts the runtime is
+#   reachable through the proxy, not a model reply. This is the workflow's
+#   E2E_LLM_UPSTREAM=gemini mode: this lane has no platform proxy, and its BYOK
+#   claude-code workspace speaks only the Anthropic protocol, which Google AI
+#   Studio does not serve, so it cannot reach Gemini (the Gemini round trip is
+#   the ephemeral happy path's, through the CP proxy). One fewer assertion than
+#   minimax mode (no result-envelope check on a model reply).
+if [ "$LIFECYCLE_LLM" = "none" ]; then
+  LIFECYCLE_PROVISIONER_BUILDS="1"
+  [ "$ONLINE_TIMEOUT_EXPLICIT" -eq 0 ] && ONLINE_TIMEOUT=180
+  [ "${RESTART_TIMEOUT_EXPLICIT:-0}" -eq 0 ] && RESTART_TIMEOUT=240
+fi
+
 # RESTART_TIMEOUT governs Step 4 (restart-survival poll). The default
 # initialization + _EXPLICIT probe happen ABOVE this block (alongside
 # ONLINE_TIMEOUT), so the LIFECYCLE_LLM=minimax override below can
@@ -540,6 +554,21 @@ if [ "$LIFECYCLE_LLM" = "minimax" ]; then
     -H "Authorization: Bearer $WTOKEN" -H "Content-Type: application/json" \
     -d '{"key":"MODEL_PROVIDER","value":"minimax"}')
   echo "  secret write (MODEL_PROVIDER): $(echo "$SECP" | head -c 120)"
+  # CI LLM upstream (the workflow's E2E_LLM_UPSTREAM=ci-llm switch, owner decision
+  # 2026-11-14): the claude-code adapter takes an operator-set ANTHROPIC_BASE_URL
+  # over the minimax provider's api.minimax.io/anthropic default, so this one
+  # secret points the workspace at the CI LLM gateway; MINIMAX_API_KEY above then
+  # holds the gateway's key. Unset = the vendor, exactly as before.
+  if [ -n "${LIFECYCLE_ANTHROPIC_BASE_URL:-}" ]; then
+    case "$LIFECYCLE_ANTHROPIC_BASE_URL" in
+      https://*) ;;
+      *) echo "FATAL: LIFECYCLE_ANTHROPIC_BASE_URL must be an https URL" >&2; exit 1 ;;
+    esac
+    SECU=$(curl -s -X POST "$BASE/workspaces/$WSID/secrets" \
+      -H "Authorization: Bearer $WTOKEN" -H "Content-Type: application/json" \
+      -d "{\"key\":\"ANTHROPIC_BASE_URL\",\"value\":\"$LIFECYCLE_ANTHROPIC_BASE_URL\"}")
+    echo "  secret write (ANTHROPIC_BASE_URL -> CI LLM gateway): $(echo "$SECU" | head -c 120)"
+  fi
 fi
 
 # #2851: override HOSTNAME in the workspace container so a runtime that computes

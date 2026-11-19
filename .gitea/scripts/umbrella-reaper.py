@@ -3,8 +3,11 @@
 
 Tracking: molecule-core#1780.
 
-Sibling to status-reaper.py (default-branch push-suffix compensation),
-but scoped to pull_request umbrellas instead of main-branch contexts.
+Was a sibling to status-reaper.py (default-branch push-suffix compensation);
+this one is scoped to pull_request umbrellas instead of main-branch contexts.
+status-reaper.py was REMOVED in chore/delete-uninstalled-status-reaper (it was
+dispatch-only, its cron host was decommissioned, and its only write forced a
+context green). This script is independent of it and is unaffected.
 
 What this script does, per `.gitea/workflows/umbrella-reaper.yml` invocation:
 
@@ -62,7 +65,8 @@ def _load_required_sub_jobs_from_ci_yml(workflows_dir: str) -> list[str]:
     if not ci_path.exists():
         raise RuntimeError(f"ci.yml not found at {ci_path}")
 
-    # PyYAML is installed by the workflow (same as status-reaper.py).
+    # PyYAML is installed by the workflow (as the removed status-reaper.py also did;
+    # status-reaper deleted in chore/delete-uninstalled-status-reaper).
     import yaml
 
     with ci_path.open() as f:

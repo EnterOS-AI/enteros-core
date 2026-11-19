@@ -152,6 +152,9 @@ func TestFirstBootGreeting_FallsBackWhenTurnFails(t *testing.T) {
 			t.Errorf("fallback greeting missing %q: %q", want, msg)
 		}
 	}
+	if !strings.Contains(msg, "A few things you can try:\n\n- ") || strings.Count(msg, "\n- ") != 3 {
+		t.Errorf("greeting examples must be a Markdown list: %q", msg)
+	}
 }
 
 func TestFirstBootGreeting_FallsBackOnErrorReply(t *testing.T) {

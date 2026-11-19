@@ -63,7 +63,23 @@ func TestNativeRegistry_SourcesByteIdenticalToRetiredConsts(t *testing.T) {
 		// --is-ancestor 07680a1 v0.2.3` is TRUE, and v0.2.3 resolves to 7441d9c
 		// whose scheduler.py defines lease_is_attributable.
 		// Reaching core via sdk#209 -> gen/go/molcontracts/native_plugins_gen.go.
-		{SchedulerPluginName, SchedulerPluginSource, "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.3"},
+		//
+		// v0.2.3 -> v0.2.4 (2026-10-13, deliberate): a schedule whose cron or
+		// timezone is edited in the grid kept its previously armed fire time
+		// (schedule-state.json stores only name -> ISO timestamp), so a weekly ->
+		// daily edit on a production tenant stayed armed for the old weekday until
+		// it fired once (sdk#215). v0.2.4 records, under the reserved
+		// `_armed_from` key, the cron and timezone each armed time was computed
+		// from, and re-arms a not-yet-due schedule whose definition changed.
+		// Verified by ancestry and content, not by name: v0.2.4 resolves to
+		// 516554a (the plugin #14 merge, tree identical to fcb7f13, rendered from
+		// the published SDK 0.6.2), its trigger_schedule.py evaluate_tick takes
+		// armed_from and its scheduler.py defines ARMED_FROM_KEY. The delivery
+		// watchdog is unchanged: classify_delivery_liveness, lease_is_attributable
+		// and _reported_absolute_cap are byte-identical to v0.2.3, and
+		// DEFAULT_DELIVERY_ABSOLUTE_CAP_SECONDS is still 3600.
+		// Reaching core via sdk#219 -> gen/go/molcontracts/native_plugins_gen.go.
+		{SchedulerPluginName, SchedulerPluginSource, "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.4"},
 		{conciergePlatformMCPName, conciergePlatformMCPSource, "gitea://molecule-ai/molecule-ai-plugin-molecule-platform-mcp#main"},
 	}
 	for _, c := range cases {

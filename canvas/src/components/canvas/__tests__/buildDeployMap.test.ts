@@ -41,25 +41,23 @@ type Projection = { id: string; parentId: string | null; status: string };
 
 function proj(
   id: string,
-  parentId: string | null,
+  parentId: string | null = null,
   status = "idle",
 ): Projection {
   return { id, parentId, status };
 }
 
-// expected maps node-id → partial state (includes `id` as a key)
+// Check a named node, or the only node when no id is supplied.
 function check(
   projections: Projection[],
   deletingIds: string[],
-  expected: Record<string, Partial<OrgDeployState>>,
+  expected: Partial<OrgDeployState> & { id?: string },
 ): void {
   const result = buildDeployMap(projections, new Set(deletingIds));
   expect(result.size).toBe(projections.length);
-  for (const [id, state] of result.entries()) {
-    if (id in expected) {
-      expect(state).toMatchObject(expected[id]);
-    }
-  }
+  const { id, ...state } = expected;
+  if (id === undefined) expect(projections).toHaveLength(1);
+  expect(result.get(id ?? projections[0].id)).toMatchObject(state);
 }
 
 // ─── §1–§5: Basic structure ──────────────────────────────────────────────────
@@ -106,7 +104,7 @@ describe("buildDeployMap — basic structure (§1–§5)", () => {
     // "orphan" is a root because its parent is absent from the projection list.
     check([proj("orphan", "ghost", "idle")], [], {
       id: "orphan",
-      isDeployingRoot: true,
+      isDeployingRoot: false,
       isLockedChild: false,
     });
   });
@@ -257,7 +255,7 @@ describe("buildDeployMap — provisioning counts + interactions (§12–§15)", 
         id: "provChild",
         isActivelyProvisioning: true,
         isDeployingRoot: false,
-        isLockedChild: false,
+        isLockedChild: true,
       },
     );
   });
@@ -365,7 +363,7 @@ describe("buildDeployMap — deep trees + edge cases (§16–§19)", () => {
         proj("node3", "node2", "idle"),
       ],
       [],
-      { id: "node1", isDeployingRoot: true },
+      { id: "node1", isDeployingRoot: false },
     );
     check(
       [
@@ -374,7 +372,7 @@ describe("buildDeployMap — deep trees + edge cases (§16–§19)", () => {
         proj("node3", "node2", "idle"),
       ],
       [],
-      { id: "node2", isDeployingRoot: true },
+      { id: "node2", isDeployingRoot: false },
     );
     check(
       [
@@ -383,7 +381,7 @@ describe("buildDeployMap — deep trees + edge cases (§16–§19)", () => {
         proj("node3", "node2", "idle"),
       ],
       [],
-      { id: "node3", isLockedChild: true },
+      { id: "node3", isLockedChild: false },
     );
   });
 });

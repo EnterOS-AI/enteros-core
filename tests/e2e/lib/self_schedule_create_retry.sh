@@ -10,13 +10,16 @@
 # that permits reinvocation: it proves core accepted the create into the retired
 # DB while its capability cache was stale. id==name is volume-routing evidence,
 # and any visible grid entry is authoritative, so both switch to poll-only.
+# shellcheck source=lib/trigger_state_dir.sh
+source "$(dirname "${BASH_SOURCE[0]}")/trigger_state_dir.sh"
+
 self_schedule_target_capability_ready() {
   local health
 
   _SS_CAP_EVIDENCE=""
   [ -n "${_SS_SELF_CID:-}" ] || return 1
   health=$(docker exec "$_SS_SELF_CID" sh -c \
-    'cat /configs/schedules/schedule-health.json 2>/dev/null' 2>/dev/null || true)
+    "${TRIGGER_STATE_DIR_SH}"'cat "$TSD"/schedule-health.json 2>/dev/null' 2>/dev/null || true)
   if printf '%s' "$health" \
       | grep -Eq '"last_tick"[[:space:]]*:[[:space:]]*"[^"]+"'; then
     _SS_CAP_EVIDENCE="$_SS_SELF_CID (schedule-health.json last_tick live)"
