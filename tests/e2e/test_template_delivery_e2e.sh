@@ -88,8 +88,11 @@
 #   E2E_PROVISION_TIMEOUT_SECS  default 900
 #   E2E_PLUGIN_INSTALL_TIMEOUT_SECS default 600 (online→reconcile→install→restart)
 #   E2E_KEEP_ORG           1 → skip teardown (debug)
+#   E2E_INFRA_BACKEND      required: local-docker (only active backend; the SSOT
+#                          teardown helper refuses to run against anything else)
 #
 # Exit: 0 pass | 1 assertion fail | 2 missing env | 3 provision timeout
+#     | 4 teardown could not prove the org was purged (leak risk)
 set -euo pipefail
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
@@ -164,6 +167,17 @@ if [[ ! "$SLUG" =~ ^e2e-tmpl-[a-f0-9]{8}$ ]]; then
 fi
 CURL_COMMON=(-sS --max-time 30)
 
+# SSOT teardown contract (e2e_cp_delete_and_verify_purge): exact purge receipt +
+# audit row + exact-org absence, INCLUDING the bounded retry for the CP's
+# transient 409 "organization has an active lifecycle operation". Sourced AFTER
+# the destructive-selector guard above so a bad E2E_TMPL_SLUG still exits 2
+# before anything can create or delete (pinned by test_template_slug_guard.sh).
+# shellcheck source=tests/e2e/lib/cp_purge_receipt.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib/cp_purge_receipt.sh"
+e2e_cp_require_local_backend || exit 2
+e2e_cp_require_staging_origin "$CP_URL" || exit 2
+
 log()  { echo "[$(date +%H:%M:%S)] $*" >&2; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*" >&2; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
@@ -172,19 +186,56 @@ admin_call() { local m="$1" p="$2"; shift 2; curl "${CURL_COMMON[@]}" -X "$m" "$
   -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" "$@"; }
 
 # ─── teardown trap (org delete) ──────────────────────────────────────────────
+# The DELETE goes through the SSOT helper e2e_cp_delete_and_verify_purge
+# (lib/cp_purge_receipt.sh) — the SAME teardown contract full_saas, the
+# concierge lanes and the peer-visibility gate use.
+#
+# The CP DeleteTenant handler REQUIRES a {"confirm":"<slug>"} body equal to the
+# URL slug (fat-finger / replay guard); the helper always sends it. This trap
+# already learned that lesson the hard way once — it used to send no body, the
+# resulting 400 was swallowed by `|| true`, and the org was never deprovisioned.
+# The fix added the body but kept the shape that HID the 400: one
+# fire-and-forget DELETE, status discarded (`>/dev/null 2>&1 || true`), no
+# verification that the org actually went away.
+#
+# That shape cannot survive the control plane's org-lifecycle fence.
+# claimOrgPurge answers an immediate HTTP 409 "organization has an active
+# lifecycle operation" while any org-scoped mutation lease is open — including
+# the CP's own asynchronous workspace provision for the org this run just
+# created — and a 409 writes NO purge audit row, so nothing converges and
+# nothing re-issues the DELETE. The org LEAKS and the run still reports its
+# original exit code, silently. Fixed once in the shared lib by 3dd3675e2
+# ("retry transient 409 'active lifecycle operation' on teardown DELETE") and
+# never propagated to this hand-rolled copy.
+#
+# The helper fails CLOSED — a persistent 409, any other non-200, a malformed or
+# mismatched receipt, or an org that survives its budget all exit 4 — and the
+# DELETE's status is now REPORTED rather than discarded. The workflow's always()
+# safety-net DELETE stays as the SIGKILL backstop this trap cannot cover.
+ORG_CREATION_VERIFIED=0
+CLEANUP_DONE=0
 cleanup_org() {
   local rc=$?
+  [ "$CLEANUP_DONE" = "1" ] && return $rc
+  CLEANUP_DONE=1
   if [ "${E2E_KEEP_ORG:-0}" = "1" ]; then
     log "E2E_KEEP_ORG=1 — leaving $SLUG; delete manually."; return $rc
   fi
+  if [ "$ORG_CREATION_VERIFIED" != "1" ]; then
+    log "teardown: no verified creation-returned org identity for $SLUG — nothing this run created to delete"
+    return $rc
+  fi
   log "teardown: DELETE tenant $SLUG"
-  # The CP DeleteTenant handler REQUIRES a {"confirm":"<slug>"} body that equals
-  # the URL slug (fat-finger / replay guard). Without it the DELETE 400s — which
-  # is exactly why this trap used to leak: it sent no body, the 400 was swallowed
-  # by `|| true`, and the org was never deprovisioned. Send the confirm body.
-  curl "${CURL_COMMON[@]}" --max-time 120 -X DELETE "$CP_URL/cp/admin/tenants/$SLUG" \
-    -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
-    -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1 || true
+  local purge_rc=0
+  e2e_cp_delete_and_verify_purge "$CP_URL" "$ADMIN_TOKEN" "$SLUG" "$ORG_ID" || purge_rc=$?
+  case "$purge_rc" in
+    0) ok "teardown verified: $SLUG provably purged" ;;
+    2) exit 2 ;;
+    *)
+      echo "::warning::[teardown] $SLUG was not provably purged — investigate now; the workflow always() net and sweep-stale-e2e-orgs are the outer backstops" >&2
+      [ "$rc" -eq 0 ] && exit 4
+      ;;
+  esac
   return $rc
 }
 trap cleanup_org EXIT INT TERM
@@ -207,6 +258,11 @@ CREATE=$(admin_call POST /cp/admin/orgs \
   -d "{\"slug\":\"$SLUG\",\"name\":\"E2E $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\"}")
 ORG_ID=$(echo "$CREATE" | python3 -c "import json,sys;print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
 [ -z "$ORG_ID" ] && fail "org create missing id: $CREATE"
+# The creation-returned id is the teardown's collision-safe authority: the helper
+# refuses to DELETE a slug whose current org id is not this one.
+e2e_cp_validate_org_id "$ORG_ID" \
+  || fail "org creation returned a non-UUID id ($ORG_ID) — refusing to arm a destructive teardown against it"
+ORG_CREATION_VERIFIED=1
 ok "org created id=$ORG_ID"
 # Publish the created org's slug + id to the CI env file the moment the org
 # (and its tenant container) exist — BEFORE the long provisioning waits — so the

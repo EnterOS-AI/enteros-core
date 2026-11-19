@@ -34,8 +34,28 @@ class MinimalBootCellContractTest(unittest.TestCase):
         self.assertIn("a2a_assert_real_completion", SCRIPT)
 
     def test_teardown_confirms_and_verifies_org_removal(self) -> None:
-        self.assertIn('-d "{\\"confirm\\":\\"${SLUG}\\"}"', SCRIPT)
+        # The {"confirm":"<slug>"} body the CP's DeleteTenant handler requires is
+        # now sent by the SSOT helper rather than hand-rolled here, so ratchet on
+        # the helper call itself. That is the STRONGER assertion: it also pins
+        # the bounded retry for the CP's transient 409 "organization has an
+        # active lifecycle operation", which a hand-rolled DELETE could never
+        # survive (a 409 writes no purge audit row, so the old roster poll had
+        # nothing to converge on and the tenant leaked).
+        self.assertIn("lib/cp_purge_receipt.sh", SCRIPT)
+        self.assertIn(
+            'e2e_cp_delete_and_verify_purge "$CP_URL" "$ADMIN_TOKEN" "$SLUG" "$ORG_ID"',
+            SCRIPT,
+        )
+        self.assertNotIn("-X DELETE", SCRIPT)
         self.assertIn('TEARDOWN_STATUS="leak_risk_org_present"', SCRIPT)
+
+    def test_slug_prefix_is_reapable_and_purgeable(self) -> None:
+        # `cp455-` was outside EVERY ephemeral-org policy at once: the
+        # sweep-stale-e2e-orgs reaper ("e2e-", "rt-e2e-"), the CP's IsEphemeral
+        # classifier, and the SSOT teardown helper's destructive-selector guard.
+        # An org this harness leaked was reachable by no backstop at all.
+        self.assertIn('SLUG_PREFIX="e2e-cp455-${RUNTIME}-"', SCRIPT)
+        self.assertNotIn('SLUG_PREFIX="cp455-', SCRIPT)
 
     def test_workflow_runs_contract_ratchet_with_sufficient_timeout(self) -> None:
         self.assertIn("- 'tests/test_minimal_boot_cell_contract.py'", WORKFLOW)
