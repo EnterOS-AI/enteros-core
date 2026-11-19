@@ -47,6 +47,13 @@ func expectAllowlistAllowAll(mock sqlmock.Sqlmock) {
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 }
 
+// expectDeclaredPluginRefresh programs the conditional workspace_declared_plugins
+// UPDATE that Install performs before delivery (molecule-core#5075 Option B).
+func expectDeclaredPluginRefresh(mock sqlmock.Sqlmock) {
+	mock.ExpectExec(`UPDATE workspace_declared_plugins`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+}
+
 // stagePluginRegistry creates a single-plugin registry under dir so the
 // install handler's local resolver can find it. Returns the path to the
 // plugin dir for any caller that wants to assert tar contents.
@@ -184,6 +191,7 @@ func TestPluginInstall_SaaS_DispatchesToEIC(t *testing.T) {
 	mock, cleanup := withMockDB(t)
 	defer cleanup()
 	expectAllowlistAllowAll(mock)
+	expectDeclaredPluginRefresh(mock)
 
 	h := NewPluginsHandler(registry, nil, nil).
 		WithRuntimeLookup(func(string) (string, error) { return "claude-code", nil }).

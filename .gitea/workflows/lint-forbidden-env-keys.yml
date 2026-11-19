@@ -209,9 +209,19 @@ jobs:
 
           echo "OK No forbidden operator-scope env key names hardcoded in writer paths."
 
-  # bp-exempt: advisory RFC#523 lint; PR review gate is review-driven, not BP-driven.
+  # NOT an exemption from branch protection. BP on main is
+  # `status_check_contexts: ['*']` (read from the API 2026-08-11): a wildcard
+  # matches every context on a commit it evaluates, so this job's
+  # (pull_request) status IS merge-blocking whenever it is red. The directive
+  # below is only a Tier 2g lint token recording that the context is not
+  # presence-required in `.gitea/required-contexts.txt`. See
+  # sweep-stale-e2e-orgs.yml for the outage this wording caused.
   # (Carried with the workflow-name rename in PR mc#1593 so the renamed
   # context emission satisfies lint_required_context_exists_in_bp Tier 2g.)
+  # The directive must stay within 3 lines of the job key — Tier 2g's
+  # window — so it goes LAST, below every explanatory line.
+  # bp-exempt: RFC#523 lint; not presence-required in required-contexts.txt.
+  # Review is not the only gate: under `['*']` this context blocks too.
   scan-tenant-token-write:
     name: Scan for repo-host token write into tenant workspace surface
     runs-on: ubuntu-latest

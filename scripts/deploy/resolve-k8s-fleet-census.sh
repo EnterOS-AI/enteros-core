@@ -90,7 +90,7 @@ case "$rc" in
   10)
     err "K8S_FLEET_KUBECONFIG DOES NOT EXIST at ${INFISICAL_SECRET_PATH} (environment '${INFISICAL_SECRET_ENV}') in the Infisical SSOT. This lane's cluster credential was never seeded, so it can neither census nor roll the k8s tenant fleet."
     err "OPERATOR STEP: seed K8S_FLEET_KUBECONFIG as the BASE64 of a kubeconfig body. Base64 is not decoration — the SSOT reader rejects any value containing a line break, so a raw multi-line kubeconfig cannot be stored under this key at all."
-    err "The credential must be able to (a) exec into ${CP_CENSUS_NAMESPACE}/${CP_CENSUS_DB_POD} and (b) get/patch tenant Deployments cluster-wide. The local-deploy pod's own ServiceAccount (ci:cp-deployer) has NEITHER."
+    err "The credential must be able to (a) exec into ${CP_CENSUS_NAMESPACE}/${CP_CENSUS_DB_POD} and (b) roll tenants in each tenant namespace — nothing cluster-wide (the exact grants are under LEAST PRIVILEGE in redeploy-tenant-fleet-k8s.sh). The local-deploy pod's own ServiceAccount (ci:cp-deployer) has NEITHER."
     exit 1 ;;
   *)
     err "reading K8S_FLEET_KUBECONFIG from the Infisical SSOT FAILED (reader exit ${rc}); the reader's own ::error:: above says why (auth, transport, or a value it refuses such as one containing a line break)."

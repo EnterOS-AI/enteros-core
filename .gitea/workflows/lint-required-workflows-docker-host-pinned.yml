@@ -46,7 +46,15 @@ env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 jobs:
-  # bp-exempt: informational lint enforcing docker-host/publish pin convention (internal#512), not a merge gate
+  # NOT an exemption from branch protection. BP on main is
+  # `status_check_contexts: ['*']` (read from the API 2026-08-11): a wildcard
+  # matches every context on a commit it evaluates, so this job's
+  # (pull_request) status IS merge-blocking whenever it is red. The directive
+  # below is only a Tier 2g lint token recording that the context is not
+  # presence-required in `.gitea/required-contexts.txt`. See
+  # sweep-stale-e2e-orgs.yml for the outage this wording caused.
+  # bp-exempt: docker-host/publish pin convention lint (internal#512); not
+  # presence-required in required-contexts.txt. Red still blocks the PR.
   lint-docker-host-pin:
     name: Lint docker-host pin on docker-touching workflows
     runs-on: docker-host

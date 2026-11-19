@@ -41,6 +41,8 @@ if ! CP_BASE_URL="$base" INFISICAL_ENV="$inf_env" \
   echo "::error::Production pin/boot-secret recovery failed; attempting workload recovery." >&2
   failed=1
 fi
+export REQUIRED_TENANT_NAMESPACES=
+unset ROLLER_SCOPE_NAMESPACES
 if ! EXPECTED_BUILD_SHA="$sha" bash scripts/deploy/redeploy-tenant-fleet-k8s.sh \
   --digest "$digest" --allow-empty; then
   echo "::error::Production workload recovery failed." >&2

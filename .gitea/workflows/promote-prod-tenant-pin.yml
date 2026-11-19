@@ -126,6 +126,8 @@ jobs:
             --target "${TENANT_IMAGE}@${TARGET_DIGEST}" --target-digest "$TARGET_DIGEST" \
             --needed-out "$RUNNER_TEMP/needed.txt" "${args[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
           bash scripts/deploy/rollback-production-release.sh "$RUNNER_TEMP" --validate-only
+          export REQUIRED_TENANT_NAMESPACES=
+          unset ROLLER_SCOPE_NAMESPACES
           bash scripts/deploy/redeploy-tenant-fleet-k8s.sh --digest "$TARGET_DIGEST" --dry-run --allow-empty
 
       - name: Decide plan vs apply
@@ -176,6 +178,8 @@ jobs:
           set -euo pipefail
           # Empty active inventory is a legitimate first deployment: the pin
           # controls fresh provisions. Counts still distinguish it from a roll.
+          export REQUIRED_TENANT_NAMESPACES=
+          unset ROLLER_SCOPE_NAMESPACES
           bash scripts/deploy/redeploy-tenant-fleet-k8s.sh --digest "$TARGET_DIGEST" --allow-empty \
             2>&1 | tee "$RUNNER_TEMP/production-roll.log"
           cat "$RUNNER_TEMP/production-roll.log" >> "$GITHUB_STEP_SUMMARY"

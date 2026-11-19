@@ -129,6 +129,32 @@ type DeclaredPlugin struct {
 // org/import time (org_import.go) for each merged plugin entry so the
 // post-online reconcile knows the DESIRED plugin set. Idempotent:
 // ON CONFLICT refreshes source_raw (a re-import with a moved ref updates it).
+func checkPrivilegedPluginEntitlement(ctx context.Context, caller, workspaceID, pluginName string) error {
+	// Entitlement gate (defense-in-depth) for the PRIVILEGED org-management MCP
+	// plugin. It carries the org-admin tool surface (create_workspace, …), so it
+	// may be declared ONLY on the org-root kind='platform' concierge. Core
+	// declares it exactly once, from the kind-gated applyConciergeProvisionConfig;
+	// every declaration path flows through this precheck (template seed,
+	// org_import, user-authored workspace.yaml, and push-leg repin), so refusing
+	// it here for a non-platform workspace closes the privilege-escalation vector
+	// regardless of declaration source. Fail-closed on a kind read error.
+	if pluginName != conciergePlatformMCPName {
+		return nil
+	}
+	if db.DB == nil {
+		return nil // nil in unit tests without a DB mock
+	}
+	var kind string
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(kind, 'workspace') FROM workspaces WHERE id = $1`, workspaceID).Scan(&kind); err != nil {
+		return fmt.Errorf("%s: kind precheck for privileged plugin %q on %s: %w", caller, pluginName, workspaceID, err)
+	}
+	if kind != models.KindPlatform {
+		return fmt.Errorf("%s: refusing to declare privileged plugin %q on non-platform workspace %s (kind=%s)", caller, pluginName, workspaceID, kind)
+	}
+	return nil
+}
+
 func recordDeclaredPlugin(ctx context.Context, workspaceID, pluginName, sourceRaw string) error {
 	if workspaceID == "" || pluginName == "" || sourceRaw == "" {
 		return errors.New("recordDeclaredPlugin: missing required field")
@@ -136,29 +162,39 @@ func recordDeclaredPlugin(ctx context.Context, workspaceID, pluginName, sourceRa
 	if db.DB == nil {
 		return nil // nil in unit tests; declaration is test-only there
 	}
-	// Entitlement gate (defense-in-depth) for the PRIVILEGED org-management MCP
-	// plugin. It carries the org-admin tool surface (create_workspace, …), so it
-	// may be declared ONLY on the org-root kind='platform' concierge. Core
-	// declares it exactly once, from the kind-gated applyConciergeProvisionConfig;
-	// this is the single chokepoint EVERY declaration path flows through (template
-	// seed, org_import, a user-authored workspace.yaml), so refusing it here for a
-	// non-platform workspace closes the privilege-escalation vector regardless of
-	// declaration source. Fail-closed on a kind read error.
-	if pluginName == conciergePlatformMCPName {
-		var kind string
-		if err := db.DB.QueryRowContext(ctx,
-			`SELECT COALESCE(kind, 'workspace') FROM workspaces WHERE id = $1`, workspaceID).Scan(&kind); err != nil {
-			return fmt.Errorf("recordDeclaredPlugin: kind precheck for privileged plugin %q on %s: %w", pluginName, workspaceID, err)
-		}
-		if kind != models.KindPlatform {
-			return fmt.Errorf("recordDeclaredPlugin: refusing to declare privileged plugin %q on non-platform workspace %s (kind=%s)", pluginName, workspaceID, kind)
-		}
+	if err := checkPrivilegedPluginEntitlement(ctx, "recordDeclaredPlugin", workspaceID, pluginName); err != nil {
+		return err
 	}
 	_, err := db.DB.ExecContext(ctx, `
 		INSERT INTO workspace_declared_plugins (workspace_id, plugin_name, source_raw)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (workspace_id, plugin_name)
 		DO UPDATE SET source_raw = EXCLUDED.source_raw, updated_at = NOW()
+	`, workspaceID, pluginName, sourceRaw)
+	return err
+}
+
+// refreshDeclaredPluginIfPresent updates workspace_declared_plugins ONLY when
+// the workspace already carries a declaration row for pluginName. Used on push-
+// leg installs (molecule-core#5075 Option B) so re-pinning an already-declared
+// plugin (template seed, org_import, or prior pull install) updates source_raw
+// instead of leaving a stale ref that ReconcileWorkspacePlugins later reverts,
+// without turning ad-hoc user-installed push plugins into declared ones (which
+// preserves push-leg Uninstall semantics).
+func refreshDeclaredPluginIfPresent(ctx context.Context, workspaceID, pluginName, sourceRaw string) error {
+	if workspaceID == "" || pluginName == "" || sourceRaw == "" {
+		return errors.New("refreshDeclaredPluginIfPresent: missing required field")
+	}
+	if db.DB == nil {
+		return nil // nil in unit tests; declaration is test-only there
+	}
+	if err := checkPrivilegedPluginEntitlement(ctx, "refreshDeclaredPluginIfPresent", workspaceID, pluginName); err != nil {
+		return err
+	}
+	_, err := db.DB.ExecContext(ctx, `
+		UPDATE workspace_declared_plugins
+		SET source_raw = $3, updated_at = NOW()
+		WHERE workspace_id = $1 AND plugin_name = $2
 	`, workspaceID, pluginName, sourceRaw)
 	return err
 }

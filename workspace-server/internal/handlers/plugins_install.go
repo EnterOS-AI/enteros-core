@@ -87,6 +87,15 @@ func (h *PluginsHandler) Install(c *gin.Context) {
 		return
 	}
 
+	// Enforce privileged-plugin entitlement BEFORE touching any runtime container or
+	// fallback delivery path. Executes zero SQL when pluginName !=
+	// conciergePlatformMCPName.
+	if err := checkPrivilegedPluginEntitlement(ctx, "Install", workspaceID, result.PluginName); err != nil {
+		log.Printf("Plugin install: refused privileged plugin %s on %s: %v", result.PluginName, workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin install failed"})
+		return
+	}
+
 	restartScheduled, err := h.deliverToContainer(ctx, workspaceID, result)
 	if errors.Is(err, errNoPushTarget) {
 		// Docker-less tenant (#206 / #230): the docker-push into the container is
@@ -124,6 +133,27 @@ func (h *PluginsHandler) Install(c *gin.Context) {
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin deliver failed"})
+		return
+	}
+
+	// Refresh any EXISTING declaration (workspace_declared_plugins) on push
+	// success — molecule-core#5075 Option B.
+	//
+	// Pull-leg installs (reMaterialize) upsert workspace_declared_plugins because the
+	// runtime pulls from that table on boot. Push-leg installs only update an already
+	// declared row here: if a template-seeded or previously declared plugin is re-pinned
+	// via POST /workspaces/:id/plugins, leaving workspace_declared_plugins at the old
+	// ref caused ReconcileWorkspacePlugins to revert the pin on the next fresh config
+	// volume. Conversely, NOT inserting a new declaration row for undeclared push-leg
+	// installs preserves push-leg Uninstall semantics (user-installed plugins do not
+	// resurrect after uninstall) while keeping template self-heal intact.
+	//
+	// Running after deliverToContainer succeeds keeps pull-leg and failed-push paths
+	// free of spurious UPDATE statements, and fails closed on DB error rather than
+	// returning 200 while a stale declaration silently reverts the pin later.
+	if err := refreshDeclaredPluginIfPresent(ctx, workspaceID, result.PluginName, result.Source.Raw()); err != nil {
+		log.Printf("Plugin install: failed to refresh declaration for %s (%s) on %s: %v", result.PluginName, result.Source.Raw(), workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin install failed"})
 		return
 	}
 
