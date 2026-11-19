@@ -55,6 +55,8 @@ jobs:
             echo "::error::production pin has no valid digest for the read-only inventory plan"
             exit 1
           fi
+          export REQUIRED_TENANT_NAMESPACES=
+          unset ROLLER_SCOPE_NAMESPACES
           bash scripts/deploy/fleet-drift-audit.sh --strict --digest "$digest"
       - name: Remove temporary cluster credentials
         if: always()

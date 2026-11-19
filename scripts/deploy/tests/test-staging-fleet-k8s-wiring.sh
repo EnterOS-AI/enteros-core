@@ -18,6 +18,17 @@
 #      and refuses any excluded slug that is not measurably drifted — which is
 #      what keeps EXCLUDE_SLUGS from becoming `--allow-empty` spelled
 #      differently.
+#   4. THE K8S ARM NEEDS NO MORE THAN A NAMESPACED CREDENTIAL. The fake kubectl
+#      refuses what that credential is not granted — any cluster-wide read, any
+#      exec other than the census's psql in the CP database namespace, any call
+#      in a namespace it holds no role in — and logs every call. A regression
+#      back to `exec` into a tenant pod or a cluster-wide Deployment list fails
+#      here, instead of at the first roll after the RBAC is tightened.
+#   5. THE CANARY IS PROVEN ON EVERY ROLL, AND ONLY BOUND TENANTS ARE TOUCHED.
+#      The roller's default REQUIRED_TENANT_NAMESPACES is the staging canary. A
+#      roll (forward or revert) that does not end with it rolled AND its
+#      /buildinfo verified fails. A tenant outside the roller's RoleBinding'd
+#      scope is skipped and reported, never failed and never touched.
 #
 # It drives the REAL shipped scripts against a fake docker + fake kubectl + fake
 # Infisical reader. Following test-managed-flags.sh and test-k8s-fleet-roller.sh:
@@ -66,7 +77,11 @@ chmod +x "$tmp/bin/docker"
 # ── fake kubectl ─────────────────────────────────────────────────────────────
 # Same fixture model as test-k8s-fleet-roller.sh: cluster state is a file, and
 # `set image` promotes the "after" fixture over the current one, so "the rollout
-# succeeded and nothing moved" is expressible with no cluster.
+# succeeded and nothing moved" is expressible with no cluster. It also plays the
+# same least-privilege credential (property 4). scope-ns, when present, is the
+# ONLY set of namespaces it holds a role in, and `auth can-i` answers from it.
+# proxy.fail makes pods/proxy unable to reach the pod, and calls.log records
+# every invocation as "ns=<ns> <args...>".
 cat > "$tmp/bin/kubectl" <<'FAKEK'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -79,20 +94,38 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 set -- "${args[@]:-}"
+printf 'ns=%s %s\n' "$ns" "$*" >> "$K8RT/calls.log"
 org_of_sel() { printf '%s' "${*}" | sed -n 's/.*molecule\.org-id=\([0-9a-f-]*\).*/\1/p'; }
+forbid() { echo "Error from server (Forbidden): $*" >&2; exit 1; }
+has_role() { [ ! -f "$K8RT/scope-ns" ] || grep -qxF -- "$1" "$K8RT/scope-ns"; }
+for a in "$@"; do
+  case "$a" in
+    -A|--all-namespaces) forbid "cannot list at the cluster scope (the roller's credential is namespaced only)";;
+  esac
+done
+# `auth can-i` (a SelfSubjectAccessReview, open to every identity) is answered
+# before the role check: "yes" exits 0, "no" exits 1.
+if [ "${1:-}" = "auth" ] && [ "${2:-}" = "can-i" ]; then
+  if has_role "$ns"; then echo yes; exit 0; fi
+  echo no; exit 1
+fi
+# The census namespace is not a tenant namespace, so its one exec is not
+# subject to the tenant scope list.
+[ -z "$ns" ] || [ "$ns" = "${FAKE_CENSUS_NS:-controlplane-staging}" ] || has_role "$ns" \
+  || forbid "the credential holds no role in namespace \"$ns\""
 case "${1:-}" in
   version) echo '{"clientVersion":{"gitVersion":"fake"}}'; exit 0;;
   config)  [ "${2:-}" = "current-context" ] && { echo "fake-ctx"; exit 0; }; exit 0;;
   exec)
-    # Two distinct exec shapes: the CENSUS (psql into the CP db pod) and the
-    # roller's /buildinfo probe (wget inside a tenant pod).
-    if printf '%s' "$*" | grep -q 'psql'; then
+    # The ONE exec this credential holds: the substrate CENSUS, psql inside the
+    # CP database pod. An exec anywhere else — a tenant pod above all — is
+    # refused: the roller reads /buildinfo through pods/proxy instead.
+    if [ "$ns" = "${FAKE_CENSUS_NS:-controlplane-staging}" ] && printf '%s' "$*" | grep -q 'psql'; then
       [ -f "$K8RT/census.fail" ] && { echo "permission denied for table org_substrates" >&2; exit 1; }
       cat "$K8RT/census.tsv" 2>/dev/null || true
       exit 0
     fi
-    printf '{"git_sha":"%s"}\n' "${FAKE_BUILDINFO_SHA:-deadbee}"
-    exit 0;;
+    forbid "cannot create resource \"pods/exec\" in namespace \"$ns\" (exec is granted only for the census)";;
   set)
     printf '%s\n' "$*" >> "$K8RT/set-image.log"
     [ -f "$K8RT/pods.after" ] && cp "$K8RT/pods.after" "$K8RT/pods"
@@ -102,21 +135,30 @@ case "${1:-}" in
   *) exit 0;;
 esac
 case "${1:-}" in
-  ns|namespace|namespaces)
-    # get ns -l molecule.org-id=<org>: the namespaces that carry the org's label.
-    shift; org="$(org_of_sel "$*")"
-    awk -F'\t' -v o="$org" '$4==o {print $1}' "$K8RT/deploys" | sort -u;;
+  --raw)
+    # The pods/proxy subresource: /api/v1/namespaces/<ns>/pods/<pod>:<port>/proxy/<path>
+    p="${2:-}"
+    case "$p" in
+      /api/v1/namespaces/*/pods/*/proxy/*) ;;
+      *) echo "Error from server (NotFound): the server could not find the requested resource" >&2; exit 1;;
+    esac
+    rest="${p#/api/v1/namespaces/}"; pns="${rest%%/*}"; rest="${rest#*/pods/}"
+    target="${rest%%/proxy/*}"; path="${rest#*/proxy/}"
+    pod="${target%%:*}"; port=""; [ "$target" = "$pod" ] || port="${target#*:}"
+    has_role "$pns" || forbid "cannot get resource \"pods/proxy\" in namespace \"$pns\""
+    awk -F'\t' -v n="$pns" -v p="$pod" '$1==n && $2==p {f=1} END {exit !f}' "$K8RT/pods" \
+      || { echo "Error from server (NotFound): pods \"$pod\" not found" >&2; exit 1; }
+    [ ! -f "$K8RT/proxy.fail" ] \
+      || { echo "Error from server (ServiceUnavailable): error trying to reach service: dial tcp ${pod}:${port}: connect: connection refused" >&2; exit 1; }
+    if [ "$port" != "8080" ] || [ "$path" != "buildinfo" ]; then
+      echo "Error from server (NotFound): the server could not find the requested resource" >&2; exit 1
+    fi
+    printf '{"git_sha":"%s"}\n' "${FAKE_BUILDINFO_SHA:-deadbee}";;
   deploy|deployment|deployments)
-    shift; sel="$*"
-    if printf '%s' "$sel" | grep -q -- '-A'; then
-      # The roller's credential is fenced to its environment's tenant namespaces
-      # (molecule-controlplane#3037): a cluster-wide list is refused, as on the cluster.
-      echo 'Error from server (Forbidden): deployments.apps is forbidden: User "system:serviceaccount:controlplane-staging:controlplane" cannot list resource "deployments" in API group "apps" at the cluster scope' >&2
-      exit 1
-    elif printf '%s' "$sel" | grep -q -- 'molecule\.org-id='; then
-      # -n <ns> get deploy -l <selector>: the tenant Deployment(s) of one namespace.
-      org="$(org_of_sel "$sel")"
-      awk -F'\t' -v o="$org" -v ns="$ns" '$1==ns && $4==o {printf "%s\t%s\t%s\n",$1,$2,$3}' "$K8RT/deploys"
+    shift
+    if [ "${1:-}" = "-l" ]; then
+      org="$(org_of_sel "${2:-}")"
+      awk -F'\t' -v o="$org" -v ns="$ns" '$1==ns && $4==o {printf "%s\t%s\n",$2,$3}' "$K8RT/deploys"
     else
       name="$1"
       awk -F'\t' -v n="$name" -v ns="$ns" '$1==ns && $2==n {printf "%s",$5}' "$K8RT/deploys"
@@ -135,20 +177,53 @@ chmod +x "$tmp/bin/kubectl"
 export PATH="$tmp/bin:$PATH"
 export KUBECTL="$tmp/bin/kubectl"
 
+# row <field>... — one TAB-separated fixture line.
+row() { local IFS=$'\t'; printf '%s\n' "$*"; }
+
+CANARY_NS="enteros-staging-canary-k8s"
+ORG_K="c0c0c0c0-0000-4000-8000-0000000000c0"
 reset_state() {
-  : > "$K8RT/set-image.log"; rm -f "$K8RT/rollout.fail" "$K8RT/pods.after" "$K8RT/census.fail"
+  : > "$K8RT/set-image.log"; : > "$K8RT/calls.log"
+  rm -f "$K8RT/rollout.fail" "$K8RT/pods.after" "$K8RT/census.fail" "$K8RT/scope-ns" "$K8RT/proxy.fail"
   printf '%s\n' "ns-alpha	enteros-tenant	1	$ORG_A	$REPO@$D_OLD" > "$K8RT/deploys"
   printf '%s\n' "ns-alpha	enteros-tenant-abc	$ORG_A	$REPO@$D_OLD" > "$K8RT/pods"
+  # The staging canary: the roller's DEFAULT required namespace, so every roll
+  # in this harness must roll it and verify its /buildinfo, as staging must.
+  row "$CANARY_NS" enteros-tenant 1 "$ORG_K" "$REPO@$D_OLD" >> "$K8RT/deploys"
+  row "$CANARY_NS" enteros-tenant-k "$ORG_K" "$REPO@$D_OLD" >> "$K8RT/pods"
   # alpha is a real, rollable tenant; ghost is control-plane/cluster DRIFT (the
   # CP places it on k8s, no Deployment carries its org-id).
   printf '%s\n' \
     "alpha	$ORG_A	k8s	ns-alpha" \
     "ghost	$ORG_G	k8s	" > "$K8RT/census.tsv"
+  row staging-canary-k8s "$ORG_K" k8s "$CANARY_NS" >> "$K8RT/census.tsv"
+}
+# after_new: alpha and the canary both serving the NEW digest once `set image` runs.
+after_new() {
+  {
+    row ns-alpha enteros-tenant-abc "$ORG_A" "$REPO@$D_NEW"
+    row "$CANARY_NS" enteros-tenant-k "$ORG_K" "$REPO@$D_NEW"
+  } > "$K8RT/pods.after"
 }
 
 say() { printf '\n== %s ==\n' "$*"; }
 ok()   { echo "ok: $1"; PASS=$((PASS+1)); }
 bad()  { echo "FAIL: $1"; printf '%s\n' "${2:-}" | sed 's/^/    /'; FAILED=$((FAILED+1)); }
+
+# logged <label> <fixed string>: some kubectl call contained exactly this.
+logged() {
+  if grep -qF -- "$2" "$K8RT/calls.log"; then ok "$1"
+  else bad "$1 — no kubectl call contains '$2'" "$(cat "$K8RT/calls.log")"; fi
+}
+# least_privileged <label>: no cluster-wide read, and no exec except the census's
+# psql in the CP database namespace.
+least_privileged() {
+  local wide execs
+  wide="$(grep -E -- '(^| )(-A|--all-namespaces)( |$)' "$K8RT/calls.log" || true)"
+  execs="$(grep -E '^ns=[^ ]* exec( |$)' "$K8RT/calls.log" | grep -v '^ns=controlplane-staging ' || true)"
+  if [ -z "$wide$execs" ]; then ok "$1"
+  else bad "$1" "$(printf '%s\n%s' "$wide" "$execs")"; fi
+}
 
 # run_docker_roller <expect_rc> <needle|-> <label> -- <env assignments...> -- <args...>
 drun() {
@@ -177,11 +252,12 @@ drun 1 "no k8s arm was" "the refusal NAMES the missing census wiring" \
 
 say "2. an armed roll with a healthy k8s fleet succeeds, and re-pins repo-relative"
 reset_state
-printf '%s\n' "ns-alpha	enteros-tenant-abc	$ORG_A	$REPO@$D_NEW" > "$K8RT/pods.after"
+after_new
 drun 0 "k8s arm OK" "census wired + healthy fleet => rolled" \
   env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" \
       SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
       K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
+      FAKE_BUILDINFO_SHA="0badc0de0123456789abcdef0123456789abcdef" \
       CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
       bash "$DOCKER_ROLLER" --tag staging-0badc0de
 if grep -qF "${REPO}@${D_NEW}" "$K8RT/set-image.log"; then
@@ -189,6 +265,112 @@ if grep -qF "${REPO}@${D_NEW}" "$K8RT/set-image.log"; then
 else
   bad "set image did not use the workload's existing repo" "$(cat "$K8RT/set-image.log")"
 fi
+logged "alpha was looked up inside ns-alpha, the namespace its census row records" \
+  "ns=ns-alpha get deploy -l "
+# The FORWARD roll passes --digest, so the k8s roller can only check /buildinfo
+# if the docker roller hands it the EXPECTED_BUILD_SHA it derived from
+# staging-<sha>. The required canary makes that check mandatory.
+logged "the forward roll verified the canary's /buildinfo through the pod proxy" \
+  "get --raw /api/v1/namespaces/$CANARY_NS/pods/enteros-tenant-k:8080/proxy/buildinfo"
+least_privileged "the forward roll made no cluster-wide read and no exec into a tenant pod"
+
+say "2b. the REVERT verifies /buildinfo through pods/proxy, never exec"
+# rollback-pin runs `EXPECTED_BUILD_SHA=<old sha> redeploy-staging-fleet.sh
+# --image <old image>` with K8S_TENANT_DIGEST=<old digest>. That is the lane
+# path on which the k8s arm checks /buildinfo as well as the digest, so it is the
+# one an exec-based probe breaks for every tenant once the credential stops
+# granting pods/exec.
+reset_state
+after_new
+drun 0 "k8s arm OK" "a revert whose pods report the expected git_sha is rolled and verified" \
+  env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" \
+      SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
+      K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
+      EXPECTED_BUILD_SHA="01dc0de" FAKE_BUILDINFO_SHA="01dc0de0123456789abcdef0123456789abcdef0" \
+      CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
+      bash "$DOCKER_ROLLER" --image "$REPO@$D_NEW"
+logged "the revert read /buildinfo with GET pods/proxy on the tenant API port" \
+  "get --raw /api/v1/namespaces/ns-alpha/pods/enteros-tenant-abc:8080/proxy/buildinfo"
+least_privileged "the revert made no cluster-wide read and no exec into a tenant pod"
+reset_state
+after_new
+drun 1 "k8s arm FAILED" "a revert whose pods report ANOTHER git_sha still FAILS" \
+  env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" \
+      SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
+      K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
+      EXPECTED_BUILD_SHA="01dc0de" FAKE_BUILDINFO_SHA="feedface0123456789abcdef0123456789abcdef" \
+      CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
+      bash "$DOCKER_ROLLER" --image "$REPO@$D_NEW"
+
+# The staging lane's DECLARED scope, exactly as staging-tenant-cd.yml sets it
+# on both redeploy-fleet and rollback-pin (section 7 pins those values).
+LANE_SCOPE=(ROLLER_SCOPE_NAMESPACES="$CANARY_NS" REQUIRED_TENANT_NAMESPACES="$CANARY_NS")
+
+say "2c. the staging scope is DECLARED: only its namespaces are rolled"
+# The roller's RBAC is RoleBindings in an explicit list of staging tenant
+# namespaces (today: the canary only), and the lane declares that list. Every
+# other tenant is skipped and reported, never failed and never touched.
+reset_state
+after_new
+printf '%s\n' "$CANARY_NS" > "$K8RT/scope-ns"
+drun 0 "skipped-out-of-scope" "a tenant outside the declared scope is skipped and reported; the canary still rolls" \
+  env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" "${LANE_SCOPE[@]}" \
+      SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
+      K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
+      FAKE_BUILDINFO_SHA="0badc0de0123456789abcdef0123456789abcdef" \
+      CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
+      bash "$DOCKER_ROLLER" --tag staging-0badc0de
+hits="$(grep '^ns=ns-alpha ' "$K8RT/calls.log" || true)"
+if [ -z "$hits" ]; then ok "the skipped namespace was not touched at all, not even by auth can-i"
+else bad "the skipped namespace saw kubectl calls" "$hits"; fi
+
+say "2d. the staging canary is REQUIRED: a roll that does not verify it FAILS"
+reset_state
+after_new
+grep -v '^staging-canary-k8s' "$K8RT/census.tsv" > "$K8RT/census.tmp"; mv "$K8RT/census.tmp" "$K8RT/census.tsv"
+drun 1 "required namespace '$CANARY_NS' is not in this run" "the canary missing from the census FAILS the staging roll" \
+  env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" "${LANE_SCOPE[@]}" \
+      SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
+      K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
+      FAKE_BUILDINFO_SHA="0badc0de0123456789abcdef0123456789abcdef" \
+      CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
+      bash "$DOCKER_ROLLER" --tag staging-0badc0de
+reset_state
+after_new
+printf '%s\n' ns-alpha > "$K8RT/scope-ns"   # the canary's RoleBinding is missing
+drun 1 "staging-canary-k8s is FAIL:scope-check" "a canary whose RoleBinding is missing FAILS the staging roll" \
+  env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" "${LANE_SCOPE[@]}" \
+      SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
+      K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
+      FAKE_BUILDINFO_SHA="0badc0de0123456789abcdef0123456789abcdef" \
+      CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
+      bash "$DOCKER_ROLLER" --tag staging-0badc0de
+
+say "2e. a REVERT to a pin with NO git sha is verified by digest, not failed"
+# rollback-pin's else-branch: `redeploy-staging-fleet.sh --image <old image>`,
+# with no EXPECTED_BUILD_SHA because the old pin recorded none. With no sha to
+# check /buildinfo against, the imageID digest of every serving pod is the
+# verification. Failing here, after the fleet verifiably went back, would report
+# a good rollback as a failed one.
+reset_state
+after_new
+printf '%s\n' "$CANARY_NS" > "$K8RT/scope-ns"
+drun 0 "verified by the imageID digest" "a no-sha revert verifies the canary by digest and succeeds, with a warning" \
+  env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" "${LANE_SCOPE[@]}" \
+      SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
+      K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
+      CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
+      bash "$DOCKER_ROLLER" --image "$REPO@$D_NEW"
+reset_state
+row ns-alpha enteros-tenant-abc "$ORG_A" "$REPO@$D_NEW" > "$K8RT/pods.after"
+row "$CANARY_NS" enteros-tenant-k "$ORG_K" "$REPO@$D_OLD" >> "$K8RT/pods.after"
+printf '%s\n' "$CANARY_NS" > "$K8RT/scope-ns"
+drun 1 "FAIL:digest-mismatch" "...but a no-sha revert whose canary did NOT move still FAILS" \
+  env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" "${LANE_SCOPE[@]}" \
+      SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
+      K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
+      CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
+      bash "$DOCKER_ROLLER" --image "$REPO@$D_NEW"
 
 say "2b. --k8s-only rolls the k8s fleet without ever contacting Docker"
 # The deploy runner has no reachable Docker endpoint, so ANY docker invocation
@@ -203,11 +385,12 @@ POISON
 chmod +x "$tmp/poison/docker"
 reset_state
 : > "$K8RT/docker.log"
-printf '%s\n' "ns-alpha	enteros-tenant-abc	$ORG_A	$REPO@$D_NEW" > "$K8RT/pods.after"
+after_new
 drun 0 "k8s arm OK" "--k8s-only + census wired + healthy fleet => rolled" \
   env PATH="$tmp/poison:$PATH" TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" \
       SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
       K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
+      FAKE_BUILDINFO_SHA="0badc0de0123456789abcdef0123456789abcdef" \
       CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
       bash "$DOCKER_ROLLER" --k8s-only --tag staging-0badc0de
 if [ -s "$K8RT/docker.log" ]; then
@@ -275,6 +458,11 @@ arun 0 "not a release target" "inventory drift does not block release targets" "
 arun 1 "inventory drift: 1 tenant record" "strict inventory audit stays red independently of release" "" --strict
 arun 1 "are NOT drifted: alpha" "excluding a HEALTHY tenant is REFUSED" "alpha"
 arun 1 "are NOT drifted" "excluding a tenant that does not exist at all is REFUSED" "no-such-org"
+# ghost's census row has an EMPTY instance_id, so the roller looked for it where
+# the control plane itself would: <prefix>-<slug>.
+logged "a drifted org with no recorded namespace was looked up in enteros-ghost" \
+  "ns=enteros-ghost get deploy -l "
+least_privileged "the drift audit made no cluster-wide read and no exec into a tenant pod"
 
 say "5b. a drift parse that matches nothing must not read as a clean fleet"
 # Point the auditor at a roller that fails WITHOUT emitting a report table. A
@@ -369,6 +557,36 @@ if [ -f "$WF" ]; then
   fi
 else
   bad "staging-tenant-cd.yml not found at $WF" ""
+fi
+
+say "8. the staging lane DECLARES its scope; production declares none"
+# Skipping is opt-in. Staging declares the roller's RoleBinding list on BOTH jobs
+# that run the roller (redeploy-fleet, rollback-pin), identical to
+# REQUIRED_TENANT_NAMESPACES. Production must never declare one: there a
+# deleted namespace or a missing binding has to FAIL, and must not read as
+# "out of scope".
+if [ -f "$WF" ]; then
+  nscope="$(grep -cE '^[[:space:]]+ROLLER_SCOPE_NAMESPACES: enteros-staging-canary-k8s$' "$WF" || true)"
+  nreq="$(grep -cE '^[[:space:]]+REQUIRED_TENANT_NAMESPACES: enteros-staging-canary-k8s$' "$WF" || true)"
+  others="$(grep -E '^[[:space:]]+(ROLLER_SCOPE|REQUIRED_TENANT)_NAMESPACES:' "$WF" | grep -vE ': enteros-staging-canary-k8s$' || true)"
+  if [ "$nscope" = "2" ] && [ "$nreq" = "2" ] && [ -z "$others" ]; then
+    ok "redeploy-fleet and rollback-pin both declare ROLLER_SCOPE_NAMESPACES = REQUIRED_TENANT_NAMESPACES = the canary"
+  else
+    bad "staging-tenant-cd.yml must declare ROLLER_SCOPE_NAMESPACES and REQUIRED_TENANT_NAMESPACES = enteros-staging-canary-k8s on both roller jobs (scope=${nscope}, required=${nreq})" "$others"
+  fi
+fi
+PWF="$here/../../../.gitea/workflows/redeploy-tenants-on-main.yml"
+if [ -f "$PWF" ]; then
+  live="$(sed 's/^[[:space:]]*//' "$PWF" | grep -v '^#' || true)"
+  if grep -qx 'unset ROLLER_SCOPE_NAMESPACES' <<< "$live" \
+     && ! grep -qE '(^|[^_A-Z])ROLLER_SCOPE_NAMESPACES[:=]' <<< "$live"; then
+    ok "the production lane unsets ROLLER_SCOPE_NAMESPACES and never declares one"
+  else
+    bad "redeploy-tenants-on-main.yml must unset ROLLER_SCOPE_NAMESPACES and must not declare it" \
+        "$(grep -n 'ROLLER_SCOPE_NAMESPACES' "$PWF" || true)"
+  fi
+else
+  bad "redeploy-tenants-on-main.yml not found at $PWF" ""
 fi
 
 echo

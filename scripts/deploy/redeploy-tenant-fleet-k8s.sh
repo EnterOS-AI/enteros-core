@@ -32,18 +32,37 @@
 #   * verification refuses to run "liveness-only". If neither a target digest nor
 #     an EXPECTED_BUILD_SHA is resolvable, the script fails rather than asserting
 #     something that cannot distinguish a landed roll from a no-op.
+#   * skipping is OPT-IN. Only when ROLLER_SCOPE_NAMESPACES declares the namespaces
+#     this credential is bound in is a tenant outside them reported as
+#     `skipped-out-of-scope`, and then it is not touched at all. A tenant inside
+#     the declared scope, or ANY tenant when no scope is declared, must pass
+#     `kubectl auth can-i patch deployments -n <ns>`. A "no" there is a FAILURE
+#     (FAIL:scope-check), never a skip, so a deleted namespace or a missing
+#     binding stays loud. A run in which NO tenant was in scope is an ERROR,
+#     however many it skipped.
+#   * every REQUIRED namespace must end the run ROLLED and verified. That means
+#     through its own /buildinfo when a git sha is known, and by the imageID digest
+#     of every serving pod when none is (with a ::warning:: saying so). The set is
+#     REQUIRED_TENANT_NAMESPACES (default: the staging canary) plus every declared
+#     ROLLER_SCOPE_NAMESPACES entry. Absent from the census, failed, scaled to
+#     zero, or a known sha that /buildinfo did not confirm are all ERRORS. In
+#     --dry-run it must at least be planned.
 #
 # ENUMERATION IS SUBSTRATE-DRIVEN, FROM THE CONTROL PLANE
 # ------------------------------------------------------
 # Targets are not guessed from namespace names and not taken from a status
 # column. The census asks the control plane which orgs are on which substrate
-# (org_substrates.substrate), then finds each k8s org's workload by the labels
-# the provisioner stamps on it:
+# (org_substrates.substrate) and where each k8s org lives
+# (org_substrates.instance_id, which for a k8s org IS its namespace), then finds
+# the org's workload INSIDE that namespace by the labels the provisioner stamps:
 #     molecule.component=tenant, molecule.managed-by=controlplane,
 #     molecule.org-id=<uuid>, molecule.org-slug=<slug>
 # Matching on molecule.org-id (the CP's own primary key) means the CP row and the
-# cluster object are joined on identity, not on a derived name — a namespace
-# rename cannot silently empty the target set.
+# cluster object are joined on identity, not on a name: a Deployment that does
+# not carry this org's id is not this org's tenant, whatever namespace it is in.
+# A tenant that is not in the namespace the control plane records is reported
+# (FAIL:no-workload, naming the namespace searched) — never hunted for
+# cluster-wide. See LEAST PRIVILEGE below.
 #
 # Deliberately NOT keyed on org_instances.status. That column is known to drift:
 # it reads 'running' for orgs that have no tenant pod at all. A roller keyed on a
@@ -76,25 +95,76 @@
 #                         staging-<sha> tag when not set)
 #   ROLLOUT_TIMEOUT       per-workload rollout wait (default 300s)
 #   TENANT_CONTAINER      container name inside the pod (default: tenant)
+#   TENANT_NAMESPACE_PREFIX  prefix for a census row whose instance_id is EMPTY
+#                         (default: enteros — the SDK's branding.ResourcePrefix,
+#                         from which the provisioner names every namespace)
+#   REQUIRED_TENANT_NAMESPACES  comma/space-separated namespaces that must be
+#                         rolled AND /buildinfo-verified (--dry-run: planned).
+#                         UNSET means enteros-staging-canary-k8s; set it EMPTY
+#                         (REQUIRED_TENANT_NAMESPACES=) to require none.
+#   ROLLER_SCOPE_NAMESPACES  comma/space-separated namespaces this credential is
+#                         bound in. SET: tenants outside it are skipped untouched,
+#                         and each listed namespace must be rolled and verified.
+#                         UNSET (production): no tenant is ever skipped. Set but
+#                         EMPTY is refused.
 #   EXCLUDE_SLUGS         same as --exclude, for CI env wiring
 #
 # SAFETY: --dry-run performs zero mutations. --exclude / EXCLUDE_SLUGS hard-skip
 # named slugs before any mutation. This script only ever issues `kubectl set
 # image` on a tenant Deployment; it never scales, drains, evicts, deletes or
 # restarts anything, and never touches a PVC, namespace or StatefulSet.
+#
+# LEAST PRIVILEGE: every cluster call is scoped to ONE tenant namespace, so the
+# credential needs, in each tenant namespace and nowhere else:
+#     deployments.apps  get, list, watch, patch  (label lookup, current image,
+#                                                 set image, rollout status)
+#     pods              list                     (serving pods and their imageIDs)
+#     pods/proxy        get                      (/buildinfo of each serving pod;
+#                                                 only when EXPECTED_BUILD_SHA applies)
+# No cluster-scoped grant and no pods/exec. `kubectl version` reads /version,
+# which any authenticated identity may. The census is not part of this: the
+# default one is psql, and a SUBSTRATE_CENSUS_CMD brings whatever it needs.
+#
+# SCOPE: a credential holding those grants only as RoleBindings in an explicit
+# list of tenant namespaces is run with that list DECLARED in
+# ROLLER_SCOPE_NAMESPACES. Only then are tenants outside it skipped, and without
+# a single call into their namespaces. For every tenant inside the declared
+# scope, or every tenant when no scope is declared, the roller first asks
+# `kubectl auth can-i patch deployments -n <ns>`. That is a
+# SelfSubjectAccessReview, which any authenticated identity may create, and
+# deployments are namespaced, so the namespaced answer is the real one.
+# Anything but a clean "yes" (exit 0, stdout "yes", nothing on stderr) is
+# FAIL:scope-check. A namespace that no longer exists and a binding that is
+# missing both answer "no", and neither may pass for a skip.
 set -euo pipefail
 
 log() { printf '>> [k8s-fleet] %s\n' "$*" >&2; }
+warn() { printf '::warning::%s\n' "$*" >&2; }
 err() { printf '::error::%s\n' "$*" >&2; }
+in_list() { local x="$1" y; shift; for y in "$@"; do [ "$y" = "$x" ] && return 0; done; return 1; }
 
 TENANT_IMAGE="${TENANT_IMAGE:-registry.moleculesai.app/molecule-ai/molecule-tenant}"
 KUBECTL="${KUBECTL:-kubectl}"
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-300s}"
 TENANT_CONTAINER="${TENANT_CONTAINER:-tenant}"
+TENANT_NAMESPACE_PREFIX="${TENANT_NAMESPACE_PREFIX:-enteros}"
+# `-` not `:-`: UNSET takes the default, while an explicitly EMPTY value is the
+# one way to require nothing (a caller must say so; it is logged below).
+REQUIRED_TENANT_NAMESPACES="${REQUIRED_TENANT_NAMESPACES-enteros-staging-canary-k8s}"
+read -r -a REQUIRED_NS <<< "$(printf '%s' "$REQUIRED_TENANT_NAMESPACES" | tr ',' ' ')"
+# SET declares the scope, and only a declared scope can skip anything. UNSET
+# puts every tenant in scope. Set-but-empty is refused below.
+SCOPE_DECLARED=0 ; SCOPE_NS=()
+if [ -n "${ROLLER_SCOPE_NAMESPACES+x}" ]; then
+  SCOPE_DECLARED=1
+  read -r -a SCOPE_NS <<< "$(printf '%s' "$ROLLER_SCOPE_NAMESPACES" | tr ',' ' ')"
+fi
 IMAGE="" ; TAG="" ; DIGEST="" ; DRY_RUN=0 ; ONLY="" ; ALLOW_EMPTY=0
 EXCLUDE="${EXCLUDE_SLUGS:-}"
 
-usage() { sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+# The whole header comment, however long it grows (a fixed line range silently
+# cut off Usage/Env as soon as a section was added above them).
+usage() { sed -n '2,/^set -euo pipefail$/{/^#/p;}' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --image)       IMAGE="$2"; shift 2;;
@@ -156,6 +226,32 @@ log "target image      = ${TARGET_LABEL}"
 [ -z "$TARGET_DIGEST" ]      || log "target digest     = ${TARGET_DIGEST}"
 [ -z "$EXPECTED_BUILD_SHA" ] || log "expected git_sha  = ${EXPECTED_BUILD_SHA}"
 log "dry_run=${DRY_RUN} allow_empty=${ALLOW_EMPTY}${ONLY:+ only='${ONLY}'}${EXCLUDE:+ exclude='${EXCLUDE}'}"
+if [ "${#REQUIRED_NS[@]}" -gt 0 ]; then
+  log "required namespace(s) = ${REQUIRED_NS[*]} (each must end ROLLED and verified; --dry-run: planned)"
+else
+  log "REQUIRED_TENANT_NAMESPACES is explicitly EMPTY — no namespace is required (a run with no tenant in scope still fails)"
+fi
+if [ "$SCOPE_DECLARED" = "1" ]; then
+  if [ "${#SCOPE_NS[@]}" -eq 0 ]; then
+    err "ROLLER_SCOPE_NAMESPACES is set but EMPTY. A declared scope with nothing in it would skip every tenant. Declare the namespaces this credential is bound in, or unset it to put every tenant in scope."
+    exit 2
+  fi
+  for rns in "${REQUIRED_NS[@]+"${REQUIRED_NS[@]}"}"; do
+    if ! in_list "$rns" "${SCOPE_NS[@]}"; then
+      err "required namespace '${rns}' is outside ROLLER_SCOPE_NAMESPACES (${SCOPE_NS[*]}). It would be skipped, which contradicts requiring it. Fix one list or the other."
+      exit 2
+    fi
+  done
+  log "scope: DECLARED = ${SCOPE_NS[*]} (tenants outside it are skipped without a single call; each of these must pass auth can-i and be rolled and verified)"
+else
+  log "scope: NOT declared (ROLLER_SCOPE_NAMESPACES unset) — every tenant is in scope, and an auth can-i 'no' FAILS"
+fi
+# MUST_NS: every namespace this run must end with ROLLED and verified (planned in
+# --dry-run): the required ones plus every declared scope entry.
+MUST_NS=()
+for x in "${REQUIRED_NS[@]+"${REQUIRED_NS[@]}"}" "${SCOPE_NS[@]+"${SCOPE_NS[@]}"}"; do
+  in_list "$x" "${MUST_NS[@]+"${MUST_NS[@]}"}" || MUST_NS+=("$x")
+done
 
 command -v "${KUBECTL%% *}" >/dev/null 2>&1 || { err "kubectl not found (KUBECTL='${KUBECTL}')"; exit 1; }
 $KUBECTL version -o json >/dev/null 2>&1 || { err "kubectl cannot reach a cluster (check KUBECONFIG)"; exit 1; }
@@ -226,14 +322,21 @@ done
 FOUND="${#SEL_SLUGS[@]}"
 log "found: ${FOUND} k8s tenant org(s) selected for roll"
 
-# ── THE ANTI-VACUOUS GATE (part 1 of 2) ──────────────────────────────────────
+# ── THE ANTI-VACUOUS GATE (part 1 of 3) ──────────────────────────────────────
 # An empty target set is the exact defect this script replaces. It is only ever
 # acceptable as an EXPLICIT operator assertion, never as a silent outcome.
 if [ "$FOUND" -eq 0 ]; then
-  if [ "$ALLOW_EMPTY" = "1" ]; then
+  if [ "$ALLOW_EMPTY" = "1" ] && [ "${#MUST_NS[@]}" -eq 0 ]; then
     log "found: 0 k8s tenants — accepted because --allow-empty was passed explicitly"
-    log "SUMMARY found=0 eligible=0 rolled=0 skipped=0 failed=0 (empty fleet asserted by operator)"
+    log "SUMMARY found=0 in_scope=0 out_of_scope=0 eligible=0 rolled=0 skipped=0 failed=0 (empty fleet asserted by operator)"
     exit 0
+  fi
+  if [ "$ALLOW_EMPTY" = "1" ]; then
+    # --allow-empty does not waive a REQUIRED namespace: "no tenant is expected"
+    # and "this tenant must be rolled" cannot both be true.
+    err "--allow-empty asserts that no k8s tenant is expected, but ${MUST_NS[*]} must be rolled and verified (REQUIRED_TENANT_NAMESPACES / ROLLER_SCOPE_NAMESPACES). Those claims contradict each other."
+    err "If nothing is genuinely required here, say that too: REQUIRED_TENANT_NAMESPACES= (empty) and no declared scope."
+    exit 1
   fi
   err "found: 0 k8s tenant orgs to roll — refusing to report success."
   err "This is the vacuous-pass failure mode: a fleet roll that enumerates nothing and"
@@ -241,6 +344,7 @@ if [ "$FOUND" -eq 0 ]; then
   err "If an empty k8s fleet is genuinely expected here, say so with --allow-empty."
   [ -z "$ONLY" ]    || err "  (a --only '${ONLY}' filter is active and may have excluded everything)"
   [ -z "$EXCLUDE" ] || err "  (an --exclude '${EXCLUDE}' filter is active and may have excluded everything)"
+  [ "${#MUST_NS[@]}" -eq 0 ] || err "  (so the required namespace(s) ${MUST_NS[*]} were not rolled either)"
   exit 1
 fi
 
@@ -308,10 +412,26 @@ converged_pods() {
   printf '%s' "$pods"; return 0
 }
 
+# buildinfo_sha <ns> <pod>: the git_sha the pod's own /buildinfo reports, read
+# through the API server's pod proxy (GET on pods/proxy) — NOT `kubectl exec`.
+# Reading a public build identifier must not need the power to run commands in
+# every tenant pod. 8080 is the tenant container's `api` port, the Go server
+# that serves /buildinfo and answers the pod's probes; the body is the same
+# {"git_sha":"<sha>"} the in-pod wget used to read, parsed the same way.
+#
+# Any failure yields an EMPTY sha, which the caller fails as
+# FAIL:buildinfo-mismatch; it can never pass. That includes the NETWORK half:
+# the API server dials the pod itself, and a tenant namespace is default-deny,
+# admitting ingress only from kube-system and same-namespace pods. Measured
+# 2026-10-11 on the k3s fleet: tenants on the API server's own node answered,
+# tenants on the worker nodes got a 502 from the proxy.
+#
+# </dev/null because the caller runs this inside `while read … <<< "$pods"`: a
+# KUBECTL wrapper that reads stdin (ssh does) would swallow the remaining pod
+# lines, and those replicas would never be probed at all.
 buildinfo_sha() {
   local ns="$1" pod="$2" body
-  body="$($KUBECTL -n "$ns" exec "$pod" -c "$TENANT_CONTAINER" -- \
-            wget -qO- http://localhost:8080/buildinfo 2>/dev/null || true)"
+  body="$($KUBECTL get --raw "/api/v1/namespaces/${ns}/pods/${pod}:8080/proxy/buildinfo" </dev/null 2>/dev/null || true)"
   printf '%s' "$body" | sed -n 's/.*"git_sha"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
 }
 
@@ -323,68 +443,124 @@ sha_matches() {
   return 1
 }
 
-ELIGIBLE=0 ; ROLLED=0 ; SKIPPED=0 ; FAILED=0 ; MISSING=0
+ELIGIBLE=0 ; ROLLED=0 ; SKIPPED=0 ; FAILED=0 ; IN_SCOPE=0 ; OUT_OF_SCOPE=0 ; MISSING=0
+VERIFIED_NS=" "   # namespaces that ended ROLLED with every serving pod's /buildinfo checked
 REPORT=()   # slug|namespace|before|after|outcome
 
 record() { REPORT+=("$1|$2|$3|$4|$5"); }
 
 TENANT_SELECTOR="molecule.component=tenant,molecule.managed-by=controlplane"
 
+# k8s_sanitize_org <slug>: the namespace segment the provisioner derives from a
+# slug — molecule-controlplane's k8sSanitizeOrg (kubernetes_names.go), mirrored:
+# lowercased, every run of characters outside [a-z0-9] collapsed to one '-',
+# leading/trailing '-' trimmed, capped at 40 and re-trimmed, "org" if empty.
+k8s_sanitize_org() {
+  local s
+  s="$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+        | LC_ALL=C sed -e 's/[^a-z0-9][^a-z0-9]*/-/g' -e 's/^-//' -e 's/-$//')"
+  s="$(printf '%s' "${s:0:40}" | sed -e 's/-$//')"
+  printf '%s' "${s:-org}"
+}
+
+# The namespaced lookup's stderr, so an API error can be told apart from "no
+# such workload" (see below).
+LOOKUP_ERR="$(mktemp)"
+# `|| true`: under set -e a failing EXIT-trap command becomes the script's exit
+# status, and cleanup must never turn a verified roll into a red one.
+trap 'rm -f "$LOOKUP_ERR" || true' EXIT
+
 # Discover the complete target set before mutating any workload. A failed API
-# read must never be interpreted as an absent tenant, and a target disappearing
-# after this snapshot must fail the rollout rather than become inventory drift.
-#
-# NO CLUSTER-WIDE WORKLOAD READ. The roller runs on its environment's
-# control-plane ServiceAccount. Since molecule-controlplane#3037 that account is
-# fenced to its own environment's tenant namespaces: it may list namespaces, and
-# read and patch workloads only inside the ones it owns. `get deploy -A` is
-# answered Forbidden for it (staging, 2026-11-19: every roll failed here once
-# the fence was applied). So the org's namespace is found by its label, and the
-# tenant Deployment is listed inside it. An org's label on a namespace this
-# credential does not own fails the read below, which is a refusal, not drift.
+# read or ambiguous match aborts before mutating any workload; absent workloads
+# after passing `auth can-i` are recorded as DRIFT:no-workload (and still fail
+# MUST_NS if required).
 LOCATIONS=()
+LOC_NS=()
+PRE_ROLL_ABORT=0
 for i in "${!SEL_SLUGS[@]}"; do
   slug="${SEL_SLUGS[$i]}" ; orgid="${SEL_ORGIDS[$i]}"
   sel="${TENANT_SELECTOR},molecule.org-id=${orgid}"
-  if ! org_namespaces="$($KUBECTL get ns -l "molecule.org-id=${orgid}" \
-          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"; then
-    err "${slug}: workload discovery failed; refusing to treat an unread cluster as missing inventory"
-    exit 1
+
+  inst="$(printf '%s' "${SEL_INSTIDS[$i]}" | tr -d '[:space:]')"
+  if [ -n "$inst" ]; then
+    ns="$inst"; ns_from="the namespace the control plane recorded as its census instance_id"
+  else
+    ns="${TENANT_NAMESPACE_PREFIX}-$(k8s_sanitize_org "$slug")"
+    ns_from="derived as ${TENANT_NAMESPACE_PREFIX}-<slug> because the census instance_id is EMPTY"
   fi
-  loc=""
-  while IFS= read -r tenant_ns; do
-    [ -n "$tenant_ns" ] || continue
-    if ! found="$($KUBECTL -n "$tenant_ns" get deploy -l "$sel" \
-            -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}')"; then
-      err "${slug}: workload discovery failed in namespace ${tenant_ns}; refusing to treat an unread cluster as missing inventory"
-      exit 1
+  LOC_NS+=("$ns")
+
+  # SCOPE. Skipping is opt-in: only a DECLARED scope can put a tenant out of
+  # scope, and then not one call goes into its namespace.
+  if [ "$SCOPE_DECLARED" = "1" ] && ! in_list "$ns" "${SCOPE_NS[@]}"; then
+    log "${slug}: '${ns}' is outside the declared ROLLER_SCOPE_NAMESPACES — skipped-out-of-scope, not touched"
+    record "$slug" "$ns" "-" "-" "skipped-out-of-scope"
+    OUT_OF_SCOPE=$((OUT_OF_SCOPE+1))
+    LOCATIONS+=("")
+    continue
+  fi
+  # In scope, so this credential MUST be able to roll it, and that is asked
+  # before any other call into the namespace. Anything but a clean "yes" fails.
+  src=0
+  scope="$($KUBECTL auth can-i patch deployments -n "$ns" 2>"$LOOKUP_ERR")" || src=$?
+  if [ "$src" -ne 0 ] || [ "$scope" != "yes" ] || [ -s "$LOOKUP_ERR" ]; then
+    cani_err="$(tr '\n' ' ' < "$LOOKUP_ERR" | cut -c1-300)"
+    err "${slug}: this credential cannot be shown to roll '${ns}' (auth can-i patch deployments: exit ${src}, answer '${scope:-<none>}'${cani_err:+, stderr: ${cani_err}})"
+    if [ "$SCOPE_DECLARED" = "1" ]; then
+      err "${slug}: '${ns}' is IN the declared ROLLER_SCOPE_NAMESPACES, so its binding must exist and work — a missing or broken RoleBinding here is a failure, never a skip"
+    else
+      err "${slug}: no ROLLER_SCOPE_NAMESPACES is declared, so every tenant is in scope: '${ns}' may have been deleted (control-plane state and cluster reality disagree), or this credential has no binding there"
     fi
-    [ -z "$found" ] || loc+="${found}"$'\n'
-  done <<< "$org_namespaces"
-  loc="${loc%$'\n'}"
-  LOCATIONS+=("$loc")
+    record "$slug" "$ns" "-" "-" "FAIL:scope-check"
+    FAILED=$((FAILED+1))
+    LOCATIONS+=("")
+    continue
+  fi
+  IN_SCOPE=$((IN_SCOPE+1))
+
+  # Locate the workload by CP identity (org-id label) INSIDE that namespace.
+  lrc=0
+  loc="$($KUBECTL -n "$ns" get deploy -l "$sel" \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}' 2>"$LOOKUP_ERR")" || lrc=$?
+  if [ "$lrc" -ne 0 ]; then
+    err "${slug}: workload discovery failed in namespace '${ns}', ${ns_from}; refusing to treat an unread cluster as missing inventory: $(tr '\n' ' ' < "$LOOKUP_ERR" | cut -c1-400)"
+    err "${slug}: that is a fault in this credential's access to '${ns}', not a statement about the tenant"
+    record "$slug" "$ns" "-" "-" "FAIL:lookup-error"
+    FAILED=$((FAILED+1))
+    PRE_ROLL_ABORT=1
+    LOCATIONS+=("")
+    continue
+  fi
   nmatch="$(printf '%s' "$loc" | grep -c . || true)"
   if [ "$nmatch" -eq 0 ]; then
-    printf '::warning::%s: no workload at discovery (org-id=%s, instance_id=%s); inventory reconciliation required, excluded from release targets\n' \
-      "$slug" "$orgid" "${SEL_INSTIDS[$i]}" >&2
-    record "$slug" "-" "-" "-" "DRIFT:no-workload"
+    printf '::warning::%s: no workload at discovery in namespace %s (org-id=%s, instance_id=%s); NO tenant Deployment in namespace '\''%s'\'' carries molecule.org-id=%s (%s; no other namespace is searched); inventory reconciliation required, excluded from release targets\n' \
+      "$slug" "$ns" "$orgid" "${SEL_INSTIDS[$i]}" "$ns" "$orgid" "$ns_from" >&2
+    record "$slug" "$ns" "-" "-" "DRIFT:no-workload"
     MISSING=$((MISSING+1))
+    LOCATIONS+=("")
+    continue
   fi
   if [ "$nmatch" -gt 1 ]; then
-    err "${slug}: ${nmatch} Deployments carry molecule.org-id=${orgid} — ambiguous, refusing to roll"
-    exit 1
+    err "${slug}: ${nmatch} Deployments in namespace '${ns}' carry molecule.org-id=${orgid} — ambiguous, refusing to roll"
+    record "$slug" "$ns" "-" "-" "FAIL:ambiguous"
+    FAILED=$((FAILED+1))
+    PRE_ROLL_ABORT=1
+    LOCATIONS+=("")
+    continue
   fi
+  LOCATIONS+=("$loc")
 done
 
 for i in "${!SEL_SLUGS[@]}"; do
+  [ "$PRE_ROLL_ABORT" -eq 0 ] || break
   loc="${LOCATIONS[$i]}"
   [ -n "$loc" ] || continue
   slug="${SEL_SLUGS[$i]}" ; orgid="${SEL_ORGIDS[$i]}"
+  ns="${LOC_NS[$i]}"
   sel="${TENANT_SELECTOR},molecule.org-id=${orgid}"
 
-  ns="$(printf '%s' "$loc" | cut -f1)"
-  dep="$(printf '%s' "$loc" | cut -f2)"
-  reps="$(printf '%s' "$loc" | cut -f3)"
+  dep="$(printf '%s' "$loc" | cut -f1)"
+  reps="$(printf '%s' "$loc" | cut -f2)"
   [ -n "$reps" ] || reps=0
 
   before="$(live_pods "$ns" "$sel" | pod_digests)"
@@ -480,6 +656,7 @@ for i in "${!SEL_SLUGS[@]}"; do
       got="$(buildinfo_sha "$ns" "$pod")"
       if ! sha_matches "$got" "$EXPECTED_BUILD_SHA"; then
         err "${slug}: ${pod} /buildinfo git_sha='${got:-<empty>}' does not match expected ${EXPECTED_BUILD_SHA}"
+        [ -n "$got" ] || err "${slug}: nothing came back through the pod proxy — this credential lacks get on pods/proxy in '${ns}', or the API server cannot reach ${pod}:8080 (see buildinfo_sha)"
         build_failed=1
       else
         log "  ${pod} /buildinfo git_sha=${got} matches ${EXPECTED_BUILD_SHA}"
@@ -495,6 +672,7 @@ for i in "${!SEL_SLUGS[@]}"; do
   log "  OK ${slug} rolled and VERIFIED live"
   record "$slug" "$ns" "$before" "$after" "ROLLED"
   ROLLED=$((ROLLED+1))
+  [ -z "$EXPECTED_BUILD_SHA" ] || VERIFIED_NS="${VERIFIED_NS}${ns} "
 done
 
 # ── Before/after report ──────────────────────────────────────────────────────
@@ -521,7 +699,59 @@ short() {
   printf '\n'
 } >&2
 
-log "SUMMARY found=${FOUND} eligible=${ELIGIBLE} rolled=${ROLLED} skipped=${SKIPPED} failed=${FAILED} missing=${MISSING} target=${TARGET_LABEL}"
+log "SUMMARY found=${FOUND} in_scope=${IN_SCOPE} out_of_scope=${OUT_OF_SCOPE} eligible=${ELIGIBLE} rolled=${ROLLED} skipped=${SKIPPED} failed=${FAILED} missing=${MISSING} target=${TARGET_LABEL}"
+
+# ── THE ANTI-VACUOUS GATE (part 3 of 3): scope and required namespaces ───────
+# Both modes. Reported here, in full, before either mode's own exits below.
+# must_status <ns>: "planned", "buildinfo" or "digest" when <ns> met the bar
+# (how it was verified), otherwise "FAIL:<why>".
+must_status() {
+  local want="$1" r rs rn rb ra ro seen=0 rows=""
+  for r in "${REPORT[@]}"; do
+    IFS='|' read -r rs rn rb ra ro <<< "$r"
+    [ "$rn" = "$want" ] || continue
+    seen=1
+    if [ "$DRY_RUN" = "1" ]; then
+      [ "$ro" = "DRYRUN:planned" ] || rows="${rows}${rows:+; }${rs} is ${ro}"
+    elif [ "$ro" != "ROLLED" ]; then
+      rows="${rows}${rows:+; }${rs} is ${ro}"
+    elif [ -n "$EXPECTED_BUILD_SHA" ]; then
+      case "$VERIFIED_NS" in
+        *" ${want} "*) ;;
+        *) rows="${rows}${rows:+; }${rs} rolled, but /buildinfo never confirmed the known git sha";;
+      esac
+    elif [ -z "$TARGET_DIGEST" ]; then
+      rows="${rows}${rows:+; }${rs} rolled with neither a git sha nor a target digest to verify it against"
+    fi
+  done
+  if [ "$seen" != "1" ]; then
+    printf 'FAIL:is not in this run: no selected census row resolves to it (missing from the census, or filtered out by --only/--exclude)'
+  elif [ -n "$rows" ]; then
+    printf 'FAIL:was not %s: %s' "$([ "$DRY_RUN" = "1" ] && echo planned || echo 'rolled and verified')" "$rows"
+  elif [ "$DRY_RUN" = "1" ]; then
+    printf 'planned'
+  elif [ -n "$EXPECTED_BUILD_SHA" ]; then
+    printf 'buildinfo'
+  else
+    printf 'digest'
+  fi
+}
+SCOPE_GATE_FAILED=0
+if [ "$IN_SCOPE" -eq 0 ]; then
+  err "found=${FOUND} k8s tenant(s) but NONE is inside this credential's scope (out_of_scope=${OUT_OF_SCOPE}, scope-check failures counted in failed=${FAILED}) — this run could roll nothing, so it rolled nothing. Refusing to report success."
+  SCOPE_GATE_FAILED=1
+fi
+for rns in "${MUST_NS[@]+"${MUST_NS[@]}"}"; do
+  st="$(must_status "$rns")"
+  case "$st" in
+    FAIL:*)    err "required namespace '${rns}' ${st#FAIL:}"; SCOPE_GATE_FAILED=1;;
+    planned)   log "required namespace '${rns}' is planned";;
+    buildinfo) log "required namespace '${rns}' was rolled and every serving pod's /buildinfo verified";;
+    digest)    warn "required namespace '${rns}' was rolled and verified by the imageID digest (${TARGET_DIGEST}) of every serving pod ONLY: no git sha is known for this target (no EXPECTED_BUILD_SHA), so its /buildinfo identity was not checked";;
+  esac
+done
+
+[ "$PRE_ROLL_ABORT" -eq 0 ] || exit 1
 
 if [ "$DRY_RUN" = "1" ]; then
   log "DRY-RUN complete — zero mutations performed"
@@ -535,11 +765,12 @@ if [ "$DRY_RUN" = "1" ]; then
     err "DRY-RUN: found=${FOUND} k8s tenant(s) but NONE are eligible to roll (skipped=${SKIPPED}) — a real run would deploy nothing"
     exit 1
   fi
+  [ "$SCOPE_GATE_FAILED" -eq 0 ] || exit 1
   exit 0
 fi
 
-# ── THE ANTI-VACUOUS GATE (part 2 of 2) ──────────────────────────────────────
-# Everything was in scope, nothing actually rolled. Distinct from found:0 and
+# ── THE ANTI-VACUOUS GATE (part 2 of 3) ──────────────────────────────────────
+# Tenants were eligible, nothing actually rolled. Distinct from found:0 and
 # just as dishonest to report green: e.g. every tenant sat at 0 replicas, so the
 # run "succeeded" while the running fleet is untouched.
 if [ "$ELIGIBLE" -gt 0 ] && [ "$ROLLED" -eq 0 ]; then
@@ -556,5 +787,6 @@ if [ "$FAILED" -gt 0 ]; then
   err "k8s fleet roll had ${FAILED} failure(s) — see the report above"
   exit 1
 fi
+[ "$SCOPE_GATE_FAILED" -eq 0 ] || exit 1
 
-log "k8s fleet roll complete: ${ROLLED}/${ELIGIBLE} target(s) verified live on ${TARGET_DIGEST:-$TARGET_LABEL}; missing inventory=${MISSING}"
+log "k8s fleet roll complete: ${ROLLED}/${IN_SCOPE} in-scope tenant(s) verified live on ${TARGET_DIGEST:-$TARGET_LABEL} (out of scope, not touched: ${OUT_OF_SCOPE}; missing inventory=${MISSING})"

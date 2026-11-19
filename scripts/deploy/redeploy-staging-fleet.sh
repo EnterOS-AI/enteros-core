@@ -61,7 +61,7 @@
 #                      (molecule-app), not the per-tenant canvas. See the
 #                      shared-canvas block below.
 #   EXPECTED_BUILD_SHA optional expected /buildinfo.git_sha. Defaults to the
-#                      suffix of --tag staging-<sha>.
+#                      suffix of --tag staging-<sha>. Handed to the k8s arm too.
 #   HEALTH_GATE_ATTEMPTS / HEALTH_GATE_SLEEP_SECS tune /buildinfo polling
 #                      (defaults: 20 attempts, 3s sleep).
 #
@@ -351,7 +351,11 @@ k8s_arm() {
   [ -z "$EXCLUDE" ] || args+=( --exclude "$EXCLUDE" )
   [ "$ALLOW_EMPTY" != "1" ] || args+=( --allow-empty )
   log "== dispatching k8s arm: $(basename "$K8S_ROLLER") ${args[*]} ${extra[*]} =="
-  bash "$K8S_ROLLER" "${args[@]}" "${extra[@]}"
+  # EXPECTED_BUILD_SHA is handed over explicitly. This script derives it (from
+  # a staging-<sha> tag, or the image's OCI revision label) without exporting
+  # it, and the k8s roller needs it to verify /buildinfo: it must do that for
+  # every REQUIRED namespace (the staging canary), or the roll fails.
+  EXPECTED_BUILD_SHA="$EXPECTED_BUILD_SHA" bash "$K8S_ROLLER" "${args[@]}" "${extra[@]}"
 }
 
 # ── EMPTY-FLEET GATE (the vacuous-pass fix) ──────────────────────────────────
