@@ -6,6 +6,8 @@
 # with required {"confirm":slug} body).
 #
 # Required: MOLECULE_ADMIN_TOKEN exported (CP admin bearer).
+#           E2E_INFRA_BACKEND=local-docker (the only active backend; the SSOT
+#           teardown helper refuses to run against anything else).
 # Optional:
 #   MOLECULE_CP_URL  default https://staging-api.moleculesai.app
 #   PARENT_RUNTIME   default claude-code
@@ -33,10 +35,20 @@ ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 # shellcheck source=lib/collision-proof-slug.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/collision-proof-slug.sh"
+# SSOT teardown contract (e2e_cp_delete_and_verify_purge): exact purge receipt +
+# audit row + exact-org absence, INCLUDING the bounded retry for the CP's
+# transient 409 "organization has an active lifecycle operation".
+# shellcheck source=tests/e2e/lib/cp_purge_receipt.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib/cp_purge_receipt.sh"
+e2e_cp_require_local_backend || exit 2
+e2e_cp_require_staging_origin "$CP_URL" || exit 2
 SLUG="e2e-2307-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" 9)"
 assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
 
 ORG_ID=""
+ORG_CREATION_VERIFIED=0
+CLEANUP_DONE=0
 TENANT_URL=""
 TENANT_TOKEN=""
 PARENT=""
@@ -62,35 +74,48 @@ tenant_call() {
         "$@"
 }
 
+# The DELETE goes through the SSOT helper e2e_cp_delete_and_verify_purge
+# (lib/cp_purge_receipt.sh) — the SAME teardown contract full_saas, the
+# concierge lanes and the peer-visibility gate use.
+#
+# This script used to hand-roll it: one fire-and-forget DELETE with its response
+# thrown away (`>/dev/null 2>&1`), then a 60s poll of the org ROSTER for the slug
+# to vanish. That shape is UNRECOVERABLE against the control plane's
+# org-lifecycle fence: claimOrgPurge answers an immediate HTTP 409 "organization
+# has an active lifecycle operation" while any org-scoped mutation lease is open
+# — including the CP's own asynchronous concierge/platform-agent workspace
+# provision for the org this run just created. A 409 writes NO purge audit row,
+# so the poll has nothing to converge on: nothing re-issues the DELETE, the org
+# LEAKS, and the poll burns its full budget before reporting a failure that is
+# not the failure. Fixed once in the shared lib by 3dd3675e2 ("retry transient
+# 409 'active lifecycle operation' on teardown DELETE") and never propagated to
+# this hand-rolled copy.
+#
+# The helper still fails CLOSED — a persistent 409, any other non-200, a
+# malformed or mismatched receipt, or an org that survives its budget all exit 4
+# — and it upgrades the assertion from "the roster page stopped listing it" to
+# "exact purge receipt + exact completed audit row + exact-org 404".
 teardown() {
     local rc=$?
     set +e
+    [ "$CLEANUP_DONE" = "1" ] && return 0
+    CLEANUP_DONE=1
     echo ""
+    if [ "$ORG_CREATION_VERIFIED" != "1" ]; then
+        echo "[teardown] no verified creation-returned org identity for $SLUG — nothing this run created to delete"
+        exit $rc
+    fi
     echo "[teardown] DELETE /cp/admin/tenants/$SLUG ..."
-    admin_call DELETE "/cp/admin/tenants/$SLUG" \
-        --max-time 120 \
-        -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1
-    # Poll up to 60s for purge
-    for j in $(seq 1 12); do
-        LIST=$(admin_call GET /cp/admin/orgs 2>/dev/null)
-        LEAK=$(echo "$LIST" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print(1); sys.exit(0)
-orgs = d if isinstance(d, list) else d.get('orgs', [])
-n = sum(1 for o in orgs if o.get('slug') == '$SLUG' and o.get('status') != 'purged')
-print(n)
-" 2>/dev/null || echo 1)
-        if [ "$LEAK" = "0" ]; then
-            echo "  ✓ tenant purged (after ${j}x5s)"
-            exit $rc
-        fi
-        sleep 5
-    done
-    echo "  ⚠ LEAK: $SLUG still in /cp/admin/orgs after 60s — manual cleanup needed"
-    [ $rc -eq 0 ] && rc=4
+    local purge_rc=0
+    e2e_cp_delete_and_verify_purge "$CP_URL" "$ADMIN_TOKEN" "$SLUG" "$ORG_ID" || purge_rc=$?
+    case "$purge_rc" in
+        0) echo "  ✓ tenant purged" ;;
+        2) exit 2 ;;
+        *)
+            echo "  ⚠ LEAK: $SLUG was not provably purged — manual cleanup needed" >&2
+            [ $rc -eq 0 ] && rc=4
+            ;;
+    esac
     exit $rc
 }
 trap teardown EXIT INT TERM
@@ -102,6 +127,11 @@ CREATE=$(admin_call POST /cp/admin/orgs \
 echo "  resp: $(echo "$CREATE" | head -c 300)"
 ORG_ID=$(echo "$CREATE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
 [ -n "$ORG_ID" ] || { echo "  ✗ org creation failed"; exit 1; }
+# The creation-returned id is the teardown's collision-safe authority: the helper
+# refuses to DELETE a slug whose current org id is not this one.
+e2e_cp_validate_org_id "$ORG_ID" \
+    || fail "org creation returned a non-UUID id ($ORG_ID) — refusing to arm a destructive teardown against it"
+ORG_CREATION_VERIFIED=1
 echo "  ✓ ORG_ID=$ORG_ID"
 
 # ─── 2. Wait for tenant ready ─────────────────────────────────────────
