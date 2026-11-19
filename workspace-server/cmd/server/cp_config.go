@@ -40,11 +40,25 @@ import (
 // Self-hosted deploys without MOLECULE_ORG_ID or ADMIN_TOKEN set
 // short-circuit silently so this function is a no-op there.
 func refreshEnvFromCP() error {
+	cfg, base, err := fetchCPTenantConfig()
+	if err != nil || cfg == nil {
+		return err
+	}
+	applied := applyCPTenantConfig(cfg, false)
+	log.Printf("CP env refresh: applied %d values from %s/cp/tenants/config", applied, base)
+	return nil
+}
+
+// fetchCPTenantConfig is the fetch half of refreshEnvFromCP: GET
+// /cp/tenants/config as this tenant. It returns (nil, "", nil) for a tenant that
+// is not managed (no MOLECULE_ORG_ID or ADMIN_TOKEN), and the CP base it asked
+// alongside the answer, for the caller's log line.
+func fetchCPTenantConfig() (map[string]string, string, error) {
 	orgID := os.Getenv("MOLECULE_ORG_ID")
 	adminToken := os.Getenv("ADMIN_TOKEN")
 	if orgID == "" || adminToken == "" {
 		// Not a SaaS tenant (self-hosted dev or not yet provisioned).
-		return nil
+		return nil, "", nil
 	}
 
 	// Resolve via the single CP-URL seam (internal/cpurl). Behavior is
@@ -59,7 +73,7 @@ func refreshEnvFromCP() error {
 
 	req, err := http.NewRequestWithContext(ctx, "GET", base+"/cp/tenants/config", nil)
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return nil, base, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+adminToken)
 	req.Header.Set("X-Molecule-Org-Id", orgID)
@@ -67,7 +81,7 @@ func refreshEnvFromCP() error {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("do request: %w", err)
+		return nil, base, fmt.Errorf("do request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -76,7 +90,7 @@ func refreshEnvFromCP() error {
 	// ever echoed back a gigabyte.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if err != nil {
-		return fmt.Errorf("read body: %w", err)
+		return nil, base, fmt.Errorf("read body: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -84,14 +98,26 @@ func refreshEnvFromCP() error {
 		// running under old user-data where admin_token on-disk hasn't
 		// had its corresponding row seeded. Don't treat as fatal — just
 		// log so operators can spot repeat offenders in logs.
-		return fmt.Errorf("cp returned %d", resp.StatusCode)
+		return nil, base, fmt.Errorf("cp returned %d", resp.StatusCode)
 	}
 
-	var cfg map[string]string
+	cfg := map[string]string{}
 	if err := json.Unmarshal(body, &cfg); err != nil {
-		return fmt.Errorf("decode: %w", err)
+		return nil, base, fmt.Errorf("decode: %w", err)
 	}
+	if cfg == nil {
+		// A literal `null` body: an answer, with nothing in it.
+		cfg = map[string]string{}
+	}
+	return cfg, base, nil
+}
 
+// applyCPTenantConfig is the apply half of refreshEnvFromCP: it sets the CP's
+// values in this process's env and returns how many it set. With onlyUnset it
+// leaves every name that already has a non-empty value alone, for a fetch that
+// lands after boot: code may already have read those, and a value must not
+// change under it.
+func applyCPTenantConfig(cfg map[string]string, onlyUnset bool) int {
 	// Apply only strings; reject oversized values defensively. An
 	// operator-supplied config should never exceed 4 KiB per key —
 	// workspace-server env vars are URLs, hex secrets, short identifiers.
@@ -101,14 +127,16 @@ func refreshEnvFromCP() error {
 		if k == "" || len(v) > maxValueBytes {
 			continue
 		}
+		if onlyUnset && (v == "" || os.Getenv(k) != "") {
+			continue
+		}
 		if err := os.Setenv(k, v); err != nil {
 			log.Printf("CP env refresh: setenv %s: %v", k, err)
 			continue
 		}
 		applied++
 	}
-	log.Printf("CP env refresh: applied %d values from %s/cp/tenants/config", applied, base)
-	return nil
+	return applied
 }
 
 // requiredLLMEnvVars is the set of LLM proxy env vars a managed SaaS
@@ -221,6 +249,70 @@ func resolveCPConfigRetryWindow() time.Duration {
 	return window
 }
 
+// cpEnvBackgroundFillWindow / cpEnvBackgroundFillMaxInterval bound
+// fillEnvFromCPInBackground: how long it keeps trying, and the longest pause
+// between two tries (the pause starts at cpConfigRetryInterval and doubles).
+// Package vars so tests can shrink them.
+var (
+	cpEnvBackgroundFillWindow      = 10 * time.Minute
+	cpEnvBackgroundFillMaxInterval = 30 * time.Second
+)
+
+// fillEnvFromCPInBackground retries the CP config fetch after a boot that did
+// not wait for it, and fills the names this process still has no value for.
+//
+// Why it exists: ensureManagedTenantLLMEnv only waits for the CP while the four
+// required LLM names are missing. On the Kubernetes substrate the provisioner
+// writes those into the tenant's own env, so a fresh tenant whose first fetch
+// lost the org_instances row-commit race (401) booted at once and never asked
+// again. Everything else the CP delivers stayed unset until the tenant's next
+// restart. MOLECULE_LLM_DEFAULT_MODEL is one of those: without it the tenant
+// reported the code's fallback as its platform default, and a concierge handed
+// that to every workspace it created (staging 2026-11-19: an org whose default
+// was minimax/MiniMax-M3 got a google/gemini-4-hydrogen member).
+//
+// It only FILLS (applyCPTenantConfig onlyUnset): this runs while the server is
+// already serving, so a name that has a value keeps it. One answer ends it. A CP
+// that never answers within the window is logged and left to the next restart.
+func fillEnvFromCPInBackground(firstErr error) {
+	window := cpEnvBackgroundFillWindow
+	log.Printf("CP env refresh: first fetch failed (%v) with the required LLM env already present — boot continues; retrying in the background for up to %s", firstErr, window)
+	deadline := time.Now().Add(window)
+	lastErr := firstErr
+	pause := cpConfigRetryInterval
+	if pause <= 0 {
+		pause = time.Second // a zero interval must not become a busy loop
+	}
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		if pause > remaining {
+			pause = remaining // never sleep past the window
+		}
+		time.Sleep(pause)
+		cfg, base, err := fetchCPTenantConfig()
+		if err == nil && cfg == nil {
+			return // no longer a managed tenant's env: nothing to ask for
+		}
+		if err == nil {
+			filled := applyCPTenantConfig(cfg, true)
+			log.Printf("CP env refresh: background retry filled %d unset value(s) from %s/cp/tenants/config", filled, base)
+			return
+		}
+		lastErr = err
+		if pause *= 2; pause > cpEnvBackgroundFillMaxInterval {
+			pause = cpEnvBackgroundFillMaxInterval
+		}
+	}
+	log.Printf("CP env refresh: background retry gave up after %s (%v) — CP-delivered values this tenant lacks stay unset until its next restart", window, lastErr)
+}
+
+// startBackgroundEnvFill starts fillEnvFromCPInBackground without blocking the
+// caller. A variable so a test can run the fill where it can wait for it.
+var startBackgroundEnvFill = func(firstErr error) { go fillEnvFromCPInBackground(firstErr) }
+
 // ensureManagedTenantLLMEnv fetches the CP-delivered env (refreshEnvFromCP) and,
 // for a MANAGED SaaS tenant whose required LLM-proxy env is still missing,
 // RETRIES the fetch — but ONLY while it keeps FAILING (401 / network), which is
@@ -244,13 +336,26 @@ func resolveCPConfigRetryWindow() time.Duration {
 // listener starts — the cp#469 fail-loud contract requires the LLM env present
 // before serving). Non-managed / self-host tenants (no MOLECULE_ORG_ID or
 // ADMIN_TOKEN) return nil on the first assertion and never enter the loop.
+//
+// A managed tenant that ALREADY has the required LLM env when the first fetch
+// fails does not block either: it boots, and fillEnvFromCPInBackground keeps
+// asking so the rest of what the CP delivers still arrives.
 func ensureManagedTenantLLMEnv() error {
 	ferr := refreshEnvFromCP()
 	if ferr != nil {
 		log.Printf("CP env refresh: %v", ferr)
 	}
 	if assertManagedTenantHasLLMEnv() == nil {
-		return nil // fast path (self-host: the assertion is a no-op → nil)
+		// Fast path (self-host: the assertion is a no-op → nil, and its fetch
+		// never fails, so it never reaches the retry below).
+		if ferr != nil {
+			// A managed tenant whose required LLM env is already present (the
+			// provisioner writes it into the tenant's own env) but whose fetch
+			// FAILED. Boot does not wait for the CP, but the fetch delivers
+			// more than those four names, so it is retried off the boot path.
+			startBackgroundEnvFill(ferr)
+		}
+		return nil
 	}
 	if ferr == nil {
 		// CP answered 200 but the required LLM env is still missing → deterministic
@@ -292,4 +397,3 @@ func ensureManagedTenantLLMEnv() error {
 	// Window elapsed with the fetch never succeeding — fatal with the real cause.
 	return fmt.Errorf("CP config fetch did not succeed within %s: %w", window, lastErr)
 }
-
