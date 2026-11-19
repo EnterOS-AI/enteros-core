@@ -38,6 +38,8 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // cpInflightProvisionWait bounds, in total, how long a delete waits for
@@ -56,10 +58,24 @@ var cpInflight = struct {
 	byWorkspace map[string][]chan struct{}
 }{byWorkspace: map[string][]chan struct{}{}}
 
+// inflightKey is the form of a workspace id the in-flight list is keyed by. A
+// request may spell one id several ways (upper case, braces, urn:uuid:, 32 hex
+// digits: validateWorkspaceID accepts whatever uuid.Parse does, and Postgres
+// compares them as equal), while a provision carries the canonical text the
+// database returned. Keyed by the raw string, a delete spelled differently
+// would not find the provision it is racing and would not wait for it.
+func inflightKey(workspaceID string) string {
+	if u, err := uuid.Parse(workspaceID); err == nil {
+		return u.String()
+	}
+	return workspaceID
+}
+
 // trackCPProvision puts a control-plane provision of workspaceID on the
 // in-flight list. The returned func takes it off again and must be called
 // exactly when the provision returns (defer it).
 func trackCPProvision(workspaceID string) (done func()) {
+	workspaceID = inflightKey(workspaceID)
 	ch := make(chan struct{})
 	cpInflight.Lock()
 	cpInflight.byWorkspace[workspaceID] = append(cpInflight.byWorkspace[workspaceID], ch)
@@ -89,6 +105,7 @@ func trackCPProvision(workspaceID string) (done func()) {
 // inflightCPProvisions is a snapshot of workspaceID's in-flight provisions:
 // each channel closes when its provision returns.
 func inflightCPProvisions(workspaceID string) []<-chan struct{} {
+	workspaceID = inflightKey(workspaceID)
 	cpInflight.Lock()
 	defer cpInflight.Unlock()
 	out := make([]<-chan struct{}, 0, len(cpInflight.byWorkspace[workspaceID]))

@@ -115,9 +115,10 @@ func cpSweepOnce(parent context.Context, reaper CPOrphanReaper) {
 		 WHERE status = 'removed'
 		   AND instance_id IS NOT NULL
 		   AND instance_id != ''
+		   AND updated_at < now() - make_interval(secs => $2)
 		 ORDER BY updated_at DESC
 		 LIMIT $1
-	`, cpSweepLimit)
+	`, cpSweepLimit, cpSweepRemovedGrace.Seconds())
 	if err != nil {
 		log.Printf("CP orphan sweeper: DB query failed: %v", err)
 		return
