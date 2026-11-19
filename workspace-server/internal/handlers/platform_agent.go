@@ -242,6 +242,14 @@ func conciergePlatformMCPEnv(env map[string]string, workspaceID, orgAdminCred st
 	}
 	setIfAbsent("MOLECULE_API_URL", apiURL)
 	setIfAbsent("MOLECULE_ORG_ID", os.Getenv("MOLECULE_ORG_ID"))
+	// The model a workspace this concierge creates gets when nobody names one
+	// (provision_workspace / light_create_agent with the model omitted): the
+	// platform default the tenant holds, never the concierge's own model (a
+	// BYOK pick, or a platform default from before the last change). The
+	// runtime forwards it into the management MCP's own env (privileged_mcp_env
+	// org audience), which some runtimes (hermes) build from an allowlist
+	// rather than inherit.
+	setIfAbsent("MOLECULE_LLM_DEFAULT_MODEL", tenantPlatformDefaultModel())
 
 	// Authenticate the on-box plugin boot-install's gitea fetch (core#3065).
 	// The concierge declares its management MCP as a gitea:// plugin
@@ -971,6 +979,28 @@ func conciergeDefaultRuntime() string {
 // Studio; Gemini 4 Carbon, the default before it, stays selectable).
 const platformDefaultModelFallback = "google/gemini-4-hydrogen"
 
+// tenantPlatformDefaultModel is the platform default model this tenant already
+// holds, without a network call: MOLECULE_LLM_DEFAULT_MODEL from the server's
+// own env. On a SaaS tenant that value is the control plane's (the Infisical
+// SSOT /shared/controlplane/llm), applied at boot by refreshEnvFromCP
+// (cmd/server/cp_config.go) — a managed tenant does not start without that
+// fetch, and every tenant restart (each image update) refreshes it. On a
+// self-hosted tenant it is the operator's env. When the env is unset it is the
+// one shared platformDefaultModelFallback, the same value
+// defaultResolveConciergeModel seeds a self-hosted concierge with.
+//
+// It is the default for workspaces OTHER agents create: the concierge's
+// management MCP receives it as MOLECULE_LLM_DEFAULT_MODEL
+// (conciergePlatformMCPEnv), and GET /admin/llm/offered-models reports it as
+// default_model. It is never the concierge's own model, which may be a BYOK
+// pick or an older platform default.
+func tenantPlatformDefaultModel() string {
+	if v := strings.TrimSpace(os.Getenv("MOLECULE_LLM_DEFAULT_MODEL")); v != "" {
+		return v
+	}
+	return platformDefaultModelFallback
+}
+
 // conciergeModelResolver resolves the concierge's seed model at provision time.
 // It is a variable so tests can stub it. The default implementation fetches the
 // model authoritatively from the CP on SaaS tenants, reads the operator env on
@@ -990,13 +1020,10 @@ var conciergeModelResolver = defaultResolveConciergeModel
 // ensureConciergeModel refuses to seed and the universal MISSING_MODEL gate fails
 // closed rather than masking a CP outage with a fabricated default.
 func defaultResolveConciergeModel(ctx context.Context) (string, error) {
-	// Self-hosted / local dev: the operator's env is the SSOT.
+	// Self-hosted / local dev: the operator's env is the SSOT; unset → the one
+	// shared fallback.
 	if os.Getenv("MOLECULE_ORG_ID") == "" || os.Getenv("ADMIN_TOKEN") == "" {
-		if v := strings.TrimSpace(os.Getenv("MOLECULE_LLM_DEFAULT_MODEL")); v != "" {
-			return v, nil
-		}
-		// SSOT unset on a self-hosted/local boot → the one shared fallback.
-		return platformDefaultModelFallback, nil
+		return tenantPlatformDefaultModel(), nil
 	}
 
 	cpModel, err := fetchCPDefaultModel(ctx)

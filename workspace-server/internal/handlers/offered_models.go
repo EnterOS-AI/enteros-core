@@ -9,7 +9,10 @@ package handlers
 // The payload is derived entirely from the embedded provider registry (the
 // providers.yaml SSOT chain) — no new vocabulary: per model id it reports the
 // owning provider, whether it is platform-billed (no key), and which auth env
-// names a BYOK pick requires.
+// names a BYOK pick requires. default_model names the platform default the
+// tenant holds (tenantPlatformDefaultModel) when the runtime offers it: the
+// model a caller uses when nobody chose one (the management MCP's
+// provision_workspace / light_create_agent with the model omitted).
 
 import (
 	"net/http"
@@ -26,6 +29,15 @@ type OfferedModel struct {
 	// needed. False = BYOK: the workspace (or org) must hold one of AuthEnv.
 	PlatformBilled bool     `json:"platform_billed"`
 	AuthEnv        []string `json:"auth_env,omitempty"`
+}
+
+// OfferedModels is the GET /admin/llm/offered-models response.
+type OfferedModels struct {
+	Runtime string `json:"runtime"`
+	// DefaultModel is the platform default model (tenantPlatformDefaultModel)
+	// when it is one of Models; omitted when this runtime does not offer it.
+	DefaultModel string         `json:"default_model,omitempty"`
+	Models       []OfferedModel `json:"models"`
 }
 
 // ListOfferedModels handles GET /admin/llm/offered-models?runtime=<rt>.
@@ -52,7 +64,8 @@ func ListOfferedModels(c *gin.Context) {
 		return
 	}
 	sort.Strings(models)
-	out := make([]OfferedModel, 0, len(models))
+	resp := OfferedModels{Runtime: runtime, Models: make([]OfferedModel, 0, len(models))}
+	platformDefault := tenantPlatformDefaultModel()
 	for _, id := range models {
 		// nil auth context = the registry's deterministic default arm for
 		// the id (exact-id ownership; first-declared arm on a tie) — the
@@ -65,7 +78,10 @@ func ListOfferedModels(c *gin.Context) {
 		if !p.IsPlatform() {
 			entry.AuthEnv = append(entry.AuthEnv, p.AuthEnv...)
 		}
-		out = append(out, entry)
+		if id == platformDefault {
+			resp.DefaultModel = id
+		}
+		resp.Models = append(resp.Models, entry)
 	}
-	c.JSON(http.StatusOK, gin.H{"runtime": runtime, "models": out})
+	c.JSON(http.StatusOK, resp)
 }
