@@ -17,9 +17,9 @@ import (
 	"sync"
 	"time"
 
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/envx"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 	"github.com/gin-gonic/gin"
 )
 
