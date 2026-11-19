@@ -75,13 +75,31 @@ case "${1:-}" in
 esac
 
 case "${1:-}" in
+  ns|namespace|namespaces)
+    # get ns -l molecule.org-id=<org>: the namespaces that carry the org's label.
+    shift
+    [ ! -f "$K8RT/discovery.fail" ] || exit 1
+    org="$(org_of_sel "$*")"
+    awk -F'\t' -v o="$org" '$4==o {print $1}' "$K8RT/deploys" | sort -u
+    ;;
   deploy|deployment|deployments)
     shift
     sel="$*"
     if printf '%s' "$sel" | grep -q -- '-A'; then
+      # The roller runs on its environment's control-plane ServiceAccount, which is
+      # fenced to that environment's tenant namespaces (molecule-controlplane#3037,
+      # rolled out on staging 2026-11-19 14:11Z). A cluster-wide list is answered
+      # exactly as the cluster answers it. The attempt is logged so a case can
+      # assert that none was made.
+      printf '%s\n' "get deploy $sel" >> "$K8RT/cluster-scope.log"
+      echo 'Error from server (Forbidden): deployments.apps is forbidden: User "system:serviceaccount:controlplane-staging:controlplane" cannot list resource "deployments" in API group "apps" at the cluster scope' >&2
+      exit 1
+    elif printf '%s' "$sel" | grep -q -- 'molecule\.org-id='; then
+      # -n <ns> get deploy -l <selector>: the tenant Deployment(s) of one namespace.
       [ ! -f "$K8RT/discovery.fail" ] || exit 1
+      [ -n "$ns" ] || { echo "error: a list by selector needs a namespace" >&2; exit 1; }
       org="$(org_of_sel "$sel")"
-      awk -F'\t' -v o="$org" '$4==o {printf "%s\t%s\t%s\n",$1,$2,$3}' "$K8RT/deploys"
+      awk -F'\t' -v o="$org" -v ns="$ns" '$1==ns && $4==o {printf "%s\t%s\t%s\n",$1,$2,$3}' "$K8RT/deploys"
     else
       # -o go-template asking for the current image of one deployment
       name="$1"
@@ -123,6 +141,7 @@ export PATH="$tmp/bin:$PATH"
 reset_state() {
   : > "$K8RT/exec.log"
   : > "$K8RT/set-image.log"; rm -f "$K8RT/rollout.fail" "$K8RT/pods.after" "$K8RT/discovery.fail" "$K8RT/set-image.fail"
+  : > "$K8RT/cluster-scope.log"
   # alpha: 1 replica, serving the OLD digest. zero: 0 replicas, no pods.
   printf '%s\n' \
     "ns-alpha	enteros-tenant	1	$ORG_A	$REPO@$D_OLD" \
@@ -213,6 +232,16 @@ check "set image + rollout succeed but pods still run the OLD digest => fatal" 1
 reset_state
 printf '%s\n' "ns-alpha	enteros-tenant-abc	$ORG_A	$REPO@$D_NEW" > "$K8RT/pods.after"
 check "pods on the new digest => ROLLED" 0 "ROLLED" "$CENSUS_A" --digest "$D_NEW"
+# MEASURED 2026-11-19 14:21Z, staging-tenant-cd run 859513: after the staging
+# control plane's ServiceAccount lost its cluster-wide rights (#3037), the roller's
+# `kubectl get deploy -A -l molecule.org-id=...` was answered Forbidden and every
+# staging roll failed at "workload discovery failed". A whole roll has to succeed
+# without one cluster-wide list.
+if [ -s "$K8RT/cluster-scope.log" ]; then
+  echo "FAIL: a successful roll listed Deployments at the cluster scope: $(head -1 "$K8RT/cluster-scope.log")"; FAILED=$((FAILED+1))
+else
+  echo "ok: a roll lists Deployments only inside the tenant's own namespace"; PASS=$((PASS+1))
+fi
 # Fresh state: the previous check already promoted pods.after, so without this
 # the "before" would be the NEW digest and the assertion would prove nothing.
 reset_state
