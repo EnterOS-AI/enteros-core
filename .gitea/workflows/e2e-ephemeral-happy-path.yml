@@ -205,8 +205,8 @@ jobs:
     #     no cost and no rate limit). When the gateway's GET /health is not 200 at
     #     job start the run falls back to `gemini` by itself, and the creds step
     #     says which one it used (log, ::notice::, step summary). The 10g DELIVER
-    #     leg is on: it was off only because qwen3:4b on the owner's PC could not
-    #     do it.
+    #     leg is OFF in this mode (see the creds step): the Spark model fails it
+    #     too. The gemini fallback keeps it on.
     #   `gemini` (2026-11-17): Gemini is the platform vendor and every e2e lane
     #     runs on its cheapest model. The throwaway CP gets the platform Gemini key
     #     (Infisical /shared/controlplane/llm GEMINI_API_KEY, staging) and serves
@@ -323,12 +323,20 @@ jobs:
               # health-checked above) into MINIMAX_BASE_URL / MINIMAX_ANTHROPIC_BASE_URL.
               MINIMAX_API_KEY=$(read_secret CI_LLM_API_KEY %2Fshared%2Fci-llm)
               echo "E2E_LLM_BASE_URL=$E2E_LLM_BASE_URL" >> "$GITHUB_ENV"
-              echo "LLM upstream: CI LLM gateway (${E2E_LLM_BASE_URL}); 10g DELIVER on"
-              # 10g DELIVER (the model calls send_message_to_user from a long
-              # scheduled session) was switched off in this mode while the gateway
-              # ran qwen3:4b on the owner's PC, which failed it 0/10 on a replayed
-              # 10g request. Since 2026-11-18 the gateway is Qwen3-VL-30B-A3B on the
-              # DGX Spark, so the leg is back on, as in every other mode.
+              echo "LLM upstream: CI LLM gateway (${E2E_LLM_BASE_URL}); 10g DELIVER off"
+              # 10g DELIVER needs the model to call send_message_to_user from a long
+              # scheduled session. The gateway's model does not do that reliably:
+              #   - qwen3:4b on the owner's PC (2026-11-14): 0/10 on a replayed 10g
+              #     request, 2 of 4 real runs.
+              #   - Qwen3-VL-30B-A3B on the DGX Spark (the gateway since 2026-11-18):
+              #     one real run passed, which is why the leg was switched back on,
+              #     then run 856943 fired the schedule 35 times in 30 minutes with no
+              #     delivery, and a replay of the captured request scored 0/10 (it
+              #     answers with a greeting instead of the tool call).
+              # So this mode turns off just that leg (its documented switch); the 10d
+              # FIRE half stays hard, and a failed DELIVER costs the 1800 s backstop
+              # on every run. `gemini` (the fallback) and `vendor` keep it on.
+              echo "E2E_SCHEDULE_DELIVER_CHECK=off" >> "$GITHUB_ENV"
               LLM_KEY="$MINIMAX_API_KEY"; LLM_KEY_DESC="CI_LLM_API_KEY(/shared/ci-llm)"
               E2E_PLATFORM_MODEL=minimax/MiniMax-M3
               ;;
