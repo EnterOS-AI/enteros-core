@@ -24,7 +24,7 @@ resolve_molecules_server_container() {
   fi
 
   printf '%s\n' "$docker_names" | awk -v suffix="-$ws_fragment" '
-    index($0, "mol-ws-") == 1 &&
+    (index($0, "mol-ws-") == 1 || index($0, "enteros-ws-") == 1) &&
     length($0) >= length(suffix) &&
     substr($0, length($0) - length(suffix) + 1) == suffix {
       print

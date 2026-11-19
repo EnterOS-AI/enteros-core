@@ -570,15 +570,18 @@ func TestWorkspaceList(t *testing.T) {
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
 		"mcp_surface",
+		"light_state",
 	}
 	rows := sqlmock.NewRows(columns).
 		AddRow("ws-1", "Agent One", "worker", 1, "online", []byte("null"), "http://localhost:8001",
 			nil, 0, 1, 0.0, "", 100, "", "claude-code", "", 10.0, 20.0, false, nil, int64(0), false, true, []byte(`{}`), "workspace", []byte(`[]`),
 			[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
+			"",          // light_state: NULL = not a Light agent
 		).
 		AddRow("ws-2", "Agent Two", "manager", 2, "provisioning", []byte("null"), "",
 			nil, 0, 1, 0.0, "", 0, "", "claude-code", "", 50.0, 60.0, false, nil, int64(0), false, true, []byte(`{}`), "workspace", []byte(`[]`),
 			[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
+			"",          // light_state: NULL = not a Light agent
 		)
 
 	mock.ExpectQuery("SELECT w.id, w.name").
@@ -1302,6 +1305,7 @@ func TestWorkspaceGet_CurrentTask(t *testing.T) {
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 		"loaded_mcp_tools",
 		"mcp_surface",
+		"light_state",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("dddddddd-0004-0000-0000-000000000000").
@@ -1310,6 +1314,7 @@ func TestWorkspaceGet_CurrentTask(t *testing.T) {
 			nil, 2, 1, 0.0, "", 300, "Analyzing document", "claude-code", "", 10.0, 20.0, false,
 			nil, int64(0), false, true, []byte(`{}`), "workspace", []byte(`[]`),
 			[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
+			"",          // light_state: NULL = not a Light agent
 		))
 
 	w := httptest.NewRecorder()

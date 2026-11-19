@@ -192,3 +192,125 @@ func mustContain(t *testing.T, haystack, needle string) {
 		t.Errorf("expected output to contain %q, got:\n%s", needle, haystack)
 	}
 }
+
+// ==================== at most one pending restart-context snapshot (core#5241) ====================
+
+// The two statements that keep one snapshot pending per workspace, pinned with
+// the JSON path they search: buildRestartA2APayload must write source_type
+// exactly there (TestBuildRestartA2APayload_SourceTypeIsWhereTheQueueSearches).
+const (
+	dropQueuedRestartContextSQL = `UPDATE a2a_queue\s+SET status = 'dropped',\s+last_error = 'superseded: a newer restart-context snapshot replaced it'\s+` +
+		`WHERE workspace_id = \$1\s+AND status = 'queued'\s+AND body #>> '\{params,message,metadata,source_type\}' = \$2`
+	restartContextDeliveringSQL = `SELECT EXISTS \(\s+SELECT 1 FROM a2a_queue\s+WHERE workspace_id = \$1\s+AND status = 'dispatched'\s+` +
+		`AND body #>> '\{params,message,metadata,source_type\}' = \$2`
+)
+
+func TestBuildRestartA2APayload_SourceTypeIsWhereTheQueueSearches(t *testing.T) {
+	body, err := buildRestartA2APayload("ws-test", "hello", "restart-context:ws-test")
+	if err != nil {
+		t.Fatalf("buildRestartA2APayload: %v", err)
+	}
+	var parsed struct {
+		Params struct {
+			Message struct {
+				Metadata map[string]any `json:"metadata"`
+			} `json:"message"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("payload is not valid JSON: %v", err)
+	}
+	if got := parsed.Params.Message.Metadata["source_type"]; got != restartContextSourceType {
+		t.Fatalf("params.message.metadata.source_type = %v, want %q — the queue finds pending snapshots by it", got, restartContextSourceType)
+	}
+}
+
+// A snapshot an earlier restart left queued is replaced, not joined: the stale
+// one is dropped and the new one queued in its place.
+func TestEnqueueRestartContext_ReplacesTheQueuedSnapshot(t *testing.T) {
+	mock := setupTestDB(t)
+	const wsID = "ws-rc-replace"
+	wantKey := "restart-context-" + wsID
+
+	mock.ExpectExec(dropQueuedRestartContextSQL).
+		WithArgs(wsID, restartContextSourceType).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(restartContextDeliveringSQL).
+		WithArgs(wsID, restartContextSourceType).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("UPDATE a2a_queue").
+		WithArgs(wsID, wantKey).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("INSERT INTO a2a_queue").
+		WithArgs(wsID, nil, 90, sqlmock.AnyArg(), "message/send", wantKey, sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("q-new"))
+	mock.ExpectQuery("SELECT COUNT").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	h := &WorkspaceHandler{}
+	h.enqueueRestartContext(context.Background(), wsID, restartContextData{RestartAt: time.Now()}, "unit test")
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("the queued snapshot was not replaced by the new one: %v", err)
+	}
+}
+
+// While the drain is handing a snapshot over, a new one is not queued next to
+// it — that would be the second pending snapshot.
+func TestEnqueueRestartContext_SkipsWhileASnapshotIsBeingDelivered(t *testing.T) {
+	mock := setupTestDB(t)
+	logs := captureLog(t)
+	const wsID = "ws-rc-in-flight"
+
+	mock.ExpectExec(dropQueuedRestartContextSQL).
+		WithArgs(wsID, restartContextSourceType).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(restartContextDeliveringSQL).
+		WithArgs(wsID, restartContextSourceType).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+	delivered := 0
+	h := &WorkspaceHandler{wakeMarkDelivered: func(context.Context, string, string) error {
+		delivered++
+		return nil
+	}}
+	h.enqueueRestartContext(context.Background(), wsID, restartContextData{RestartAt: time.Now()}, "unit test", "restart-context:"+wsID)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet: %v", err)
+	}
+	if out := logs.String(); !strings.Contains(out, "not queueing a second") || strings.Contains(out, "queued for heartbeat drain") {
+		t.Fatalf("a second snapshot was queued next to the one being delivered; log:\n%s", out)
+	}
+	if delivered != 0 {
+		t.Fatalf("the wake was marked delivered %d time(s) for a snapshot that was never queued", delivered)
+	}
+}
+
+// A snapshot pushed straight to the agent supersedes one an earlier restart
+// left queued; otherwise the drain would deliver the stale one afterwards.
+func TestSendRestartContext_DropsTheQueuedSnapshotBeforePushing(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	const wsID = "ws-rc-push"
+	h := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, h)
+
+	mock.ExpectQuery(`SELECT status FROM workspaces WHERE id =`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("online"))
+	mock.ExpectQuery(`SELECT url, last_heartbeat_at FROM workspaces WHERE id =`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"url", "last_heartbeat_at"}).AddRow("http://ws-rc-push.example:8000", time.Now()))
+	mock.ExpectExec(dropQueuedRestartContextSQL).
+		WithArgs(wsID, restartContextSourceType).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// The push itself is left unmocked: it fails fast, and the drop above is
+	// what this test is about.
+
+	h.sendRestartContext(wsID, restartContextData{RestartAt: time.Now().Add(-time.Minute)})
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("the stale queued snapshot was not dropped before the push: %v", err)
+	}
+}

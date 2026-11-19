@@ -67,7 +67,9 @@
 # Deliberately NOT keyed on org_instances.status. That column is known to drift:
 # it reads 'running' for orgs that have no tenant pod at all. A roller keyed on a
 # status column inherits the column's lies; a roller keyed on live workloads
-# reports the drift instead (see the `no-workload` classification below).
+# reports the drift separately. A missing workload at discovery is inventory
+# drift, not a failed deployment. Existing targets are snapshotted before any
+# mutation; a target that disappears or fails during rollout is a release failure.
 #
 # Usage:
 #   redeploy-tenant-fleet-k8s.sh --digest sha256:<hex>  # PREFERRED for prod: re-pin every
@@ -441,7 +443,7 @@ sha_matches() {
   return 1
 }
 
-ELIGIBLE=0 ; ROLLED=0 ; SKIPPED=0 ; FAILED=0 ; IN_SCOPE=0 ; OUT_OF_SCOPE=0
+ELIGIBLE=0 ; ROLLED=0 ; SKIPPED=0 ; FAILED=0 ; IN_SCOPE=0 ; OUT_OF_SCOPE=0 ; MISSING=0
 VERIFIED_NS=" "   # namespaces that ended ROLLED with every serving pod's /buildinfo checked
 REPORT=()   # slug|namespace|before|after|outcome
 
@@ -468,19 +470,17 @@ LOOKUP_ERR="$(mktemp)"
 # status, and cleanup must never turn a verified roll into a red one.
 trap 'rm -f "$LOOKUP_ERR" || true' EXIT
 
+# Discover the complete target set before mutating any workload. A failed API
+# read or ambiguous match aborts before mutating any workload; absent workloads
+# after passing `auth can-i` are recorded as DRIFT:no-workload (and still fail
+# MUST_NS if required).
+LOCATIONS=()
+LOC_NS=()
+PRE_ROLL_ABORT=0
 for i in "${!SEL_SLUGS[@]}"; do
   slug="${SEL_SLUGS[$i]}" ; orgid="${SEL_ORGIDS[$i]}"
   sel="${TENANT_SELECTOR},molecule.org-id=${orgid}"
 
-  # WHICH NAMESPACE: the control plane's record, never a search. For a k8s org
-  # the census instance_id IS the namespace — the provisioner returns the
-  # Namespace name as the InstanceID and the control plane stamps it into
-  # org_substrates.instance_id (molecule-controlplane migration 068;
-  # Kubernetes.resolveNamespace decodes it the same way). So a tenant recorded
-  # under an older brand prefix (mol-<slug>) is looked for where it really is.
-  # Only an EMPTY instance_id — a substrate flip blanks it until the next
-  # provision stamps it — falls back to the control plane's own derivation,
-  # K8sNamespaceName: <TENANT_NAMESPACE_PREFIX>-<sanitised slug>.
   inst="$(printf '%s' "${SEL_INSTIDS[$i]}" | tr -d '[:space:]')"
   if [ -n "$inst" ]; then
     ns="$inst"; ns_from="the namespace the control plane recorded as its census instance_id"
@@ -488,20 +488,19 @@ for i in "${!SEL_SLUGS[@]}"; do
     ns="${TENANT_NAMESPACE_PREFIX}-$(k8s_sanitize_org "$slug")"
     ns_from="derived as ${TENANT_NAMESPACE_PREFIX}-<slug> because the census instance_id is EMPTY"
   fi
+  LOC_NS+=("$ns")
 
   # SCOPE. Skipping is opt-in: only a DECLARED scope can put a tenant out of
   # scope, and then not one call goes into its namespace.
   if [ "$SCOPE_DECLARED" = "1" ] && ! in_list "$ns" "${SCOPE_NS[@]}"; then
     log "${slug}: '${ns}' is outside the declared ROLLER_SCOPE_NAMESPACES — skipped-out-of-scope, not touched"
     record "$slug" "$ns" "-" "-" "skipped-out-of-scope"
-    OUT_OF_SCOPE=$((OUT_OF_SCOPE+1)); continue
+    OUT_OF_SCOPE=$((OUT_OF_SCOPE+1))
+    LOCATIONS+=("")
+    continue
   fi
   # In scope, so this credential MUST be able to roll it, and that is asked
   # before any other call into the namespace. Anything but a clean "yes" fails.
-  # A namespace that no longer exists and a binding that is missing both answer
-  # "no", and so does kubectl's own fallback when it cannot resolve the
-  # resource. That fallback announces itself only on stderr, which is why any
-  # stderr fails too.
   src=0
   scope="$($KUBECTL auth can-i patch deployments -n "$ns" 2>"$LOOKUP_ERR")" || src=$?
   if [ "$src" -ne 0 ] || [ "$scope" != "yes" ] || [ -s "$LOOKUP_ERR" ]; then
@@ -513,44 +512,52 @@ for i in "${!SEL_SLUGS[@]}"; do
       err "${slug}: no ROLLER_SCOPE_NAMESPACES is declared, so every tenant is in scope: '${ns}' may have been deleted (control-plane state and cluster reality disagree), or this credential has no binding there"
     fi
     record "$slug" "$ns" "-" "-" "FAIL:scope-check"
-    FAILED=$((FAILED+1)); continue
+    FAILED=$((FAILED+1))
+    LOCATIONS+=("")
+    continue
   fi
   IN_SCOPE=$((IN_SCOPE+1))
 
   # Locate the workload by CP identity (org-id label) INSIDE that namespace.
-  # Deliberately no cluster-wide fallback: the credential holds no cluster-wide
-  # list, and "look everywhere" would quietly roll a tenant that is not where the
-  # control plane believes it is.
   lrc=0
   loc="$($KUBECTL -n "$ns" get deploy -l "$sel" \
           -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}' 2>"$LOOKUP_ERR")" || lrc=$?
   if [ "$lrc" -ne 0 ]; then
-    # An API error is an ACCESS fault — most often no role in this namespace —
-    # not evidence that the tenant is missing. Calling it no-workload would send
-    # the operator after control-plane drift that does not exist.
-    err "${slug}: could not list Deployments in namespace '${ns}', ${ns_from}: $(tr '\n' ' ' < "$LOOKUP_ERR" | cut -c1-400)"
+    err "${slug}: workload discovery failed in namespace '${ns}', ${ns_from}; refusing to treat an unread cluster as missing inventory: $(tr '\n' ' ' < "$LOOKUP_ERR" | cut -c1-400)"
     err "${slug}: that is a fault in this credential's access to '${ns}', not a statement about the tenant"
     record "$slug" "$ns" "-" "-" "FAIL:lookup-error"
-    FAILED=$((FAILED+1)); continue
+    FAILED=$((FAILED+1))
+    PRE_ROLL_ABORT=1
+    LOCATIONS+=("")
+    continue
   fi
   nmatch="$(printf '%s' "$loc" | grep -c . || true)"
-
   if [ "$nmatch" -eq 0 ]; then
-    # CP says this org is on k8s, but no tenant Deployment in its namespace
-    # carries its id. This is real drift and must be loud: the CP's
-    # org_instances.status column is known to read 'running' for orgs in
-    # exactly this state.
-    err "${slug}: control plane says substrate=k8s (instance_id='${SEL_INSTIDS[$i]}') but NO tenant Deployment in namespace '${ns}' carries molecule.org-id=${orgid}"
-    err "${slug}: '${ns}' is ${ns_from}; no other namespace is searched"
-    err "${slug}: control-plane state and cluster reality disagree — not silently skipping"
-    record "$slug" "$ns" "-" "-" "FAIL:no-workload"
-    FAILED=$((FAILED+1)); continue
+    printf '::warning::%s: no workload at discovery in namespace %s (org-id=%s, instance_id=%s); NO tenant Deployment in namespace '\''%s'\'' carries molecule.org-id=%s (%s; no other namespace is searched); inventory reconciliation required, excluded from release targets\n' \
+      "$slug" "$ns" "$orgid" "${SEL_INSTIDS[$i]}" "$ns" "$orgid" "$ns_from" >&2
+    record "$slug" "$ns" "-" "-" "DRIFT:no-workload"
+    MISSING=$((MISSING+1))
+    LOCATIONS+=("")
+    continue
   fi
   if [ "$nmatch" -gt 1 ]; then
     err "${slug}: ${nmatch} Deployments in namespace '${ns}' carry molecule.org-id=${orgid} — ambiguous, refusing to roll"
     record "$slug" "$ns" "-" "-" "FAIL:ambiguous"
-    FAILED=$((FAILED+1)); continue
+    FAILED=$((FAILED+1))
+    PRE_ROLL_ABORT=1
+    LOCATIONS+=("")
+    continue
   fi
+  LOCATIONS+=("$loc")
+done
+
+for i in "${!SEL_SLUGS[@]}"; do
+  [ "$PRE_ROLL_ABORT" -eq 0 ] || break
+  loc="${LOCATIONS[$i]}"
+  [ -n "$loc" ] || continue
+  slug="${SEL_SLUGS[$i]}" ; orgid="${SEL_ORGIDS[$i]}"
+  ns="${LOC_NS[$i]}"
+  sel="${TENANT_SELECTOR},molecule.org-id=${orgid}"
 
   dep="$(printf '%s' "$loc" | cut -f1)"
   reps="$(printf '%s' "$loc" | cut -f2)"
@@ -692,28 +699,10 @@ short() {
   printf '\n'
 } >&2
 
-log "SUMMARY found=${FOUND} in_scope=${IN_SCOPE} out_of_scope=${OUT_OF_SCOPE} eligible=${ELIGIBLE} rolled=${ROLLED} skipped=${SKIPPED} failed=${FAILED} target=${TARGET_LABEL}"
+log "SUMMARY found=${FOUND} in_scope=${IN_SCOPE} out_of_scope=${OUT_OF_SCOPE} eligible=${ELIGIBLE} rolled=${ROLLED} skipped=${SKIPPED} failed=${FAILED} missing=${MISSING} target=${TARGET_LABEL}"
 
 # ── THE ANTI-VACUOUS GATE (part 3 of 3): scope and required namespaces ───────
 # Both modes. Reported here, in full, before either mode's own exits below.
-#
-#  * NO tenant in scope: the census found tenants and this credential may roll
-#    none of them. That run rolls nothing whatever else it reports, which is the
-#    found:0 defect again one level down.
-#  * A REQUIRED namespace (REQUIRED_TENANT_NAMESPACES plus every declared scope
-#    entry) must end ROLLED and verified, or in --dry-run at least planned.
-#    "Not in the census", "failed the scope check", "scaled to zero" and "a known
-#    git sha that /buildinfo did not confirm" all fail it: each is a run that
-#    did not prove a tenant it promised to prove.
-#  * WHEN NO GIT SHA IS KNOWN (no EXPECTED_BUILD_SHA, e.g. a revert to a pin
-#    recorded without one), a ROLLED namespace is accepted as verified by the
-#    imageID digest of every serving pod, with a ::warning:: that says so. That
-#    digest IS the identity check, and the strongest one this script has (see
-#    TARGET_DIGEST). /buildinfo can only add a build-sha cross-check when there
-#    is a sha to cross-check against. Failing a revert that verifiably landed,
-#    only because its old pin carries no sha, would report a good rollback as a
-#    failed one. This relaxes missing METADATA only: a sha that IS known and
-#    that /buildinfo fails to confirm (mismatch, proxy unreachable) still fails.
 # must_status <ns>: "planned", "buildinfo" or "digest" when <ns> met the bar
 # (how it was verified), otherwise "FAIL:<why>".
 must_status() {
@@ -762,12 +751,12 @@ for rns in "${MUST_NS[@]+"${MUST_NS[@]}"}"; do
   esac
 done
 
+[ "$PRE_ROLL_ABORT" -eq 0 ] || exit 1
+
 if [ "$DRY_RUN" = "1" ]; then
   log "DRY-RUN complete — zero mutations performed"
-  # A dry run still DISCOVERS. If discovery itself found drift (a CP org on the
-  # k8s substrate with no workload carrying its id, or an ambiguous match), the
-  # plan is not executable and saying so only in the table would let a --dry-run
-  # gate go green over a fleet it could not actually roll.
+  # Existing workloads must be executable targets. Missing inventory is
+  # reported above and has no bearing on whether these targets can roll.
   if [ "$FAILED" -gt 0 ]; then
     err "DRY-RUN found ${FAILED} tenant(s) that could not even be resolved to a rollable workload — the plan is not executable"
     exit 1
@@ -800,4 +789,4 @@ if [ "$FAILED" -gt 0 ]; then
 fi
 [ "$SCOPE_GATE_FAILED" -eq 0 ] || exit 1
 
-log "k8s fleet roll complete: ${ROLLED}/${IN_SCOPE} in-scope tenant(s) verified live on ${TARGET_DIGEST:-$TARGET_LABEL} (out of scope, not touched: ${OUT_OF_SCOPE})"
+log "k8s fleet roll complete: ${ROLLED}/${IN_SCOPE} in-scope tenant(s) verified live on ${TARGET_DIGEST:-$TARGET_LABEL} (out of scope, not touched: ${OUT_OF_SCOPE}; missing inventory=${MISSING})"

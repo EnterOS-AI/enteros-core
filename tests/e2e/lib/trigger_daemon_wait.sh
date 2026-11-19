@@ -44,7 +44,7 @@
 # gains exactly one entry per FINISHED delivery attempt, and every terminal path
 # in scheduler.py writes one — `_commit` for fired / unknown / deferred / error,
 # and `check_watchdog`'s `_record_history` for a cancellation, each with a
-# machine-readable `cause`. Read at v0.2.3 (see
+# machine-readable `cause`. Read at v0.2.4 (see
 # `trigger_daemon_scheduler_version_validated`), there is no path that finishes
 # an attempt without appending. That makes the log a TRUE forward-progress
 # signal for the delivery lane specifically:
@@ -131,12 +131,15 @@ export TRIGGER_DAEMON_PROGRESS_SAMPLES="${TRIGGER_DAEMON_PROGRESS_SAMPLES:-0}"
 export TRIGGER_DAEMON_PROGRESS_TRANSITIONS="${TRIGGER_DAEMON_PROGRESS_TRANSITIONS:-0}"
 export TRIGGER_DAEMON_PROGRESS_AGE="${TRIGGER_DAEMON_PROGRESS_AGE:-}"
 
-# Path of the daemon heartbeat inside the workspace container.
-TRIGGER_DAEMON_HEALTH_PATH="${TRIGGER_DAEMON_HEALTH_PATH:-/configs/schedules/schedule-health.json}"
+# Path of the daemon heartbeat inside the workspace container. $TSD is the
+# trigger-state dir, resolved in the container by lib/trigger_state_dir.sh.
+# shellcheck source=lib/trigger_state_dir.sh
+source "$(dirname "${BASH_SOURCE[0]}")/trigger_state_dir.sh"
+TRIGGER_DAEMON_HEALTH_PATH="${TRIGGER_DAEMON_HEALTH_PATH:-\$TSD/schedule-health.json}"
 
 # Path of the daemon's durable ATTEMPT LOG inside the workspace container — the
 # delivery-lane progress signal. scheduler.py HISTORY_FILENAME.
-TRIGGER_DAEMON_HISTORY_PATH="${TRIGGER_DAEMON_HISTORY_PATH:-/configs/schedules/schedule-history.json}"
+TRIGGER_DAEMON_HISTORY_PATH="${TRIGGER_DAEMON_HISTORY_PATH:-\$TSD/schedule-history.json}"
 
 # Age of the last heartbeat in whole seconds, or "" when it is absent or
 # unreadable. Absent is deliberately NOT reported as stale: a daemon that has
@@ -149,7 +152,7 @@ trigger_daemon_tick_age_secs() {
   if [ -n "${TRIGGER_DAEMON_HEALTH_CMD:-}" ]; then
     health=$($TRIGGER_DAEMON_HEALTH_CMD "$container" 2>/dev/null) || health=""
   else
-    health=$(docker exec "$container" sh -c "cat $TRIGGER_DAEMON_HEALTH_PATH 2>/dev/null" 2>/dev/null) || health=""
+    health=$(docker exec "$container" sh -c "${TRIGGER_STATE_DIR_SH:-}cat $TRIGGER_DAEMON_HEALTH_PATH 2>/dev/null" 2>/dev/null) || health=""
   fi
   [ -n "$health" ] || { printf ''; return 0; }
 
@@ -203,7 +206,7 @@ trigger_daemon_progress_digest() {
   if [ -n "${TRIGGER_DAEMON_PROGRESS_CMD:-}" ]; then
     blob=$($TRIGGER_DAEMON_PROGRESS_CMD "$container" 2>/dev/null) || blob=""
   else
-    blob=$(docker exec "$container" sh -c "cat $TRIGGER_DAEMON_HISTORY_PATH 2>/dev/null" 2>/dev/null) || blob=""
+    blob=$(docker exec "$container" sh -c "${TRIGGER_STATE_DIR_SH:-}cat $TRIGGER_DAEMON_HISTORY_PATH 2>/dev/null" 2>/dev/null) || blob=""
   fi
   [ -n "$blob" ] || { printf ''; return 0; }
 
@@ -406,8 +409,9 @@ trigger_daemon_stale_secs() {
 #
 # WHAT THIS NUMBER IS at the PINNED scheduler, and what it is NOT. There is no
 # daemon-side `MOLECULE_TRIGGER_DELIVERY_WATCHDOG_SECONDS` to mirror: v0.2.2
-# retired it, and core pins v0.2.3 (workspace-server/internal/handlers/
-# plugin_registry_test.go). v0.2.3's watchdog is ACTIVITY-AWARE — each tick it
+# retired it, and core pins v0.2.4 (workspace-server/internal/handlers/
+# plugin_registry_test.go). Its watchdog, unchanged since v0.2.3, is
+# ACTIVITY-AWARE — each tick it
 # reads the runtime's turn-lease snapshot and `classify_delivery_liveness`
 # returns one of four dispositions:
 #
@@ -596,7 +600,7 @@ trigger_daemon_progress_stall_secs() {
 # unit test compares this against core's live pin and REDS on a bump, forcing a
 # re-read rather than letting the derivation rot in place.
 trigger_daemon_scheduler_version_validated() {
-  printf '%s' 'v0.2.3'
+  printf '%s' 'v0.2.4'
 }
 
 # The backstop is a never-hit safety net, so it must EXCEED the delivery cancel

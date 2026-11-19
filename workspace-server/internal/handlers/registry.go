@@ -353,6 +353,122 @@ func (h *RegistryHandler) fireReconcileMCPRecovery(ctx context.Context, workspac
 // as "no row yet, default to push" — that's the first-register flow,
 // and at that point we don't know the runtime yet so push is the
 // historical compatible default.
+// pollRegisterPrecheck is the Go-side (explicit 409) half of the poll-register
+// guard. A package var only so an integration test can disable it and prove
+// the SQL arm (pollRegisterKeepsProvisionedRowSQL) holds on its own.
+var pollRegisterPrecheck = (*RegistryHandler).refusePollRegisterOnProvisionedWorkspace
+
+// refusePollRegisterOnProvisionedWorkspace answers 409 (and returns true) when
+// a poll-mode /registry/register targets a workspace that
+//
+//   - the PLATFORM provisioned (workspaceIsPlatformProvisioned: instance_id set
+//     by the CP provisioner, or the self-host docker provisioner's host-port
+//     URL on a non-external runtime), AND
+//   - is STORED as push (or has no stored mode).
+//
+// Why only stored-push: a platform-hosted box may legitimately run poll — the
+// runtime takes it from MOLECULE_DELIVERY_MODE / config.a2a.delivery_mode,
+// declares it in every register and starts its inbox poller, and
+// POST /workspaces stores delivery_mode=poll at create. Such a row is stored
+// poll and its own poll register goes through unchanged. What must not happen
+// is a poll register FLIPPING a push box: that wipes its platform URL (poll
+// stores the payload url unvalidated, often none) and parks its A2A for a
+// poller the box is not running. Live 2026-11-13 (reno-stars, ca17a092,
+// claude-code, stored push): an external client registered the workspace poll
+// with no url via the ingress (04:50–06:06Z); every URL forward (schedules,
+// chat files) then 422'd "no callback URL" for ~4.5h while the box served at
+// its platform URL, until a restart re-registered it.
+//
+// The discriminator is NOT runtime alone: /registry/register inserts unknown
+// ids without a runtime, so register-created external peers carry the column
+// default ('hermes') and look exactly like hosted workspaces by runtime.
+//
+// A 409 (not a silent keep) so a misconfigured client fails loudly instead of
+// believing it is now the workspace's poller. The 409 does NOT stamp
+// last_register_failure_at (see Register's deferred stamp): the box was not the
+// caller, and a looping rogue client must not flap it to degraded. Fail-open on
+// a lookup error is deliberate — the SQL arm (pollRegisterKeepsProvisionedRowSQL)
+// still keeps the row.
+func (h *RegistryHandler) refusePollRegisterOnProvisionedWorkspace(ctx context.Context, c *gin.Context, workspaceID string) bool {
+	var instanceID, storedMode, storedURL, runtime sql.NullString
+	err := db.DB.QueryRowContext(ctx,
+		`SELECT instance_id, delivery_mode, url, runtime FROM workspaces WHERE id = $1`, workspaceID,
+	).Scan(&instanceID, &storedMode, &storedURL, &runtime)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			log.Printf("Registry register: provisioned-workspace check failed for %s: %v (falling through)", workspaceID, err)
+		}
+		return false
+	}
+	if storedMode.Valid && storedMode.String != "" && storedMode.String != models.DeliveryModePush {
+		return false // already stored poll: the box's own poll register (supported config)
+	}
+	if !workspaceIsPlatformProvisioned(instanceID.String, storedURL.String, runtime.String) {
+		return false
+	}
+	log.Printf("Registry register: REFUSED poll-mode register for platform-provisioned push workspace %s — it would detach the running box from its platform URL", workspaceID)
+	c.JSON(http.StatusConflict, gin.H{
+		"error": "workspace " + workspaceID + " is platform-hosted and registered in push mode (its compute was provisioned by the platform and is reached at its platform URL); " +
+			"a poll-mode registration would detach it. Register external peers under their own workspace ids " +
+			"(create one with POST /workspaces runtime=external) instead of reusing this workspace's id and token.",
+		"code":         "POLL_REGISTER_ON_PLATFORM_HOSTED_WORKSPACE",
+		"workspace_id": workspaceID,
+		// The mode the row KEEPS — never the one the caller asked for.
+		"delivery_mode": models.DeliveryModePush,
+	})
+	return true
+}
+
+// workspaceIsPlatformProvisioned is the Go form of the provisioned-row half of
+// pollRegisterKeepsProvisionedRowSQL. The two MUST agree; the integration
+// tests drive both (409 from this, row kept by the SQL).
+//
+// Backends:
+//   - CP (EC2 / k8s / CP local-docker): instance_id, persisted right after
+//     cpProv.Start returns (workspace_provision.go UPDATE … SET instance_id) —
+//     before the box's first register in practice, and never cleared by
+//     stop / pause / hibernate (only by delete, switch-provider and the
+//     removed-row orphan sweeper).
+//   - Self-host local docker (h.provisioner.Start): does NOT write
+//     instance_id. It writes the host-port URL it advertises
+//     (http://localhost:<port> / 127.0.0.1:<port>, port != 8000) — the same
+//     shape the upsert's existing CASE already treats as provisioner-owned —
+//     so that URL is the discriminator for this backend, EXCEPT on an
+//     external-like runtime (a self-host peer created with runtime=external
+//     that once registered push at a localhost port must still be able to
+//     switch to poll).
+func workspaceIsPlatformProvisioned(instanceID, url, runtime string) bool {
+	if strings.TrimSpace(instanceID) != "" {
+		return true
+	}
+	return isProvisionerHostPortURL(url) && !isExternalLikeRuntime(runtime)
+}
+
+// pollRegisterKeepsProvisionedRowSQL is the ATOMIC half of the poll-register
+// guard, evaluated on the upsert's UPDATE arm against the PRE-update row: a
+// poll register never rewrites url or delivery_mode of a platform-provisioned
+// row STORED AS PUSH (or with no stored mode). A row already stored poll (a box
+// legitimately running poll) is not touched by this arm. The Go 409
+// (refusePollRegisterOnProvisionedWorkspace) gives the explicit error; this arm
+// makes the protection hold even if the Go check is raced (instance_id
+// persisted between the check and the upsert) or fails open on a lookup error.
+// Built from the externalLikeRuntimes SSOT (constants, never request data).
+var pollRegisterKeepsProvisionedRowSQL = func() string {
+	quoted := make([]string, len(externalLikeRuntimes))
+	for i, r := range externalLikeRuntimes {
+		quoted[i] = "'" + strings.ReplaceAll(r, "'", "''") + "'"
+	}
+	return `(EXCLUDED.delivery_mode = 'poll'
+				     AND COALESCE(NULLIF(workspaces.delivery_mode, ''), 'push') = 'push'
+				     AND ((workspaces.instance_id IS NOT NULL AND workspaces.instance_id <> '')
+				          OR (workspaces.url IS NOT NULL
+				              AND (workspaces.url LIKE 'http://127.0.0.1:%'
+				                   OR workspaces.url LIKE 'http://localhost:%')
+				              AND substring(workspaces.url FROM ':([0-9]+)$') IS NOT NULL
+				              AND CAST(substring(workspaces.url FROM ':([0-9]+)$') AS int) <> 8000
+				              AND COALESCE(workspaces.runtime, '') NOT IN (` + strings.Join(quoted, ", ") + `))))`
+}()
+
 func (h *RegistryHandler) resolveDeliveryMode(ctx context.Context, workspaceID, payloadMode string) (string, error) {
 	if payloadMode != "" {
 		// Validated by IsValidDeliveryMode in the caller.
@@ -742,6 +858,10 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// client timeout / unreachable $PLATFORM_URL.
 	registerStart := time.Now()
 	authOK := false
+	// skipFailureStamp: set for a refusal that is about the CALLER, not the
+	// workspace (the poll-register 409). Stamping it would let a looping rogue
+	// client flap a healthy box to degraded via the heartbeat failure window.
+	skipFailureStamp := false
 	defer func(wsID string) {
 		if status := c.Writer.Status(); status != http.StatusOK {
 			log.Printf("Registry register: workspace=%s boot_register_failed status=%d duration=%s", wsID, status, time.Since(registerStart))
@@ -751,7 +871,7 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 			// mutate workspace state — otherwise anyone can POST /registry/register
 			// without a bearer and force a false-degraded status via the heartbeat
 			// 5-minute failure window.
-			if authOK {
+			if authOK && !skipFailureStamp {
 				if _, err := db.DB.ExecContext(context.Background(), `UPDATE workspaces SET last_register_failure_at = now() WHERE id = $1`, wsID); err != nil {
 					log.Printf("Registry register: failed to record failure timestamp for %s: %v", wsID, err)
 				}
@@ -811,6 +931,14 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	if err := h.requireWorkspaceToken(ctx, c, payload.ID); err != nil {
 		return // 401 response already written by requireWorkspaceToken
 	}
+	// Enter OS Light (C5): a parking or parked Light agent registers nothing.
+	// Placed BEFORE authOK so the deferred failure stamp
+	// (last_register_failure_at) is not written either; the upsert below
+	// carries the predicate too.
+	if ref := lightWakeRefusal(ctx, payload.ID, "register"); ref != nil {
+		ref.write(c)
+		return
+	}
 	authOK = true
 
 	// SECURITY (privilege-escalation fix): the public register path must never
@@ -850,6 +978,16 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 		log.Printf("Registry register: resolveDeliveryMode failed for %s: %v", payload.ID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "registration failed"})
 		return
+	}
+
+	// A poll-mode register must not detach a PLATFORM-PROVISIONED workspace.
+	// See refusePollRegisterOnProvisionedWorkspace for the predicate and the
+	// 2026-11-13 incident.
+	if effectiveMode == models.DeliveryModePoll {
+		if refused := pollRegisterPrecheck(h, ctx, c, payload.ID); refused {
+			skipFailureStamp = true
+			return
+		}
 	}
 
 	// Issue #2970: fail CLOSED if a platform agent reaches registration without
@@ -1130,6 +1268,8 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 				          OR workspaces.url LIKE 'http://localhost:%')
 				     AND CAST(substring(workspaces.url FROM ':([0-9]+)$') AS int) <> 8000
 				THEN workspaces.url
+				WHEN `+pollRegisterKeepsProvisionedRowSQL+`
+				THEN workspaces.url
 				ELSE EXCLUDED.url
 			END,
 			agent_card = EXCLUDED.agent_card,
@@ -1141,10 +1281,14 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 			-- row value — correct for re-register. Non-platform keeps fast online.
 			status = (CASE WHEN workspaces.kind = 'platform' THEN workspaces.status ELSE 'online' END)::workspace_status,
 			last_heartbeat_at = now(),
-			delivery_mode = EXCLUDED.delivery_mode,
+			delivery_mode = CASE
+				WHEN `+pollRegisterKeepsProvisionedRowSQL+`
+				THEN workspaces.delivery_mode
+				ELSE EXCLUDED.delivery_mode
+			END,
 			kind = COALESCE(NULLIF($6, ''), workspaces.kind),
 			updated_at = now()
-		WHERE workspaces.status NOT IN ('removed', 'paused', 'hibernated')
+		WHERE workspaces.status NOT IN ('removed', 'paused', 'hibernated') AND `+models.LightWakeAllowedSQLFor("workspaces")+`
 	`, payload.ID, payload.ID, urlForUpsert, agentCardStr, modeForUpsert, payload.Kind)
 	if err != nil {
 		if isPlatformRootViolation(err) {
@@ -1329,6 +1473,21 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 		return // response already written
 	}
 
+	// Enter OS Light (C5): a parking or parked Light agent's heartbeat writes
+	// nothing — no last_heartbeat_at, active_tasks, Redis liveness key or URL
+	// cache — and is answered 409. Its pod is being (or has been) stopped; a run
+	// pod never heartbeats. The UPDATEs below carry the predicate too.
+	if ref := lightWakeRefusal(ctx, payload.WorkspaceID, "heartbeat"); ref != nil {
+		if ref.code() == "LIGHT_AGENT_PARKING" {
+			// A park is in flight and the pod is still up: record whether it is
+			// busy, and nothing else, so the park sees a turn that started around
+			// its claim and is undone instead of stopping the agent mid-turn.
+			recordLightParkingBusy(ctx, payload.WorkspaceID, payload.ActiveTasks, payload.IsBusy)
+		}
+		ref.write(c)
+		return
+	}
+
 	// Read previous current_task + status to detect changes (before the UPDATE).
 	//
 	// prevStatus is load-bearing for the RFC#2843 #32 plugin reconcile: the
@@ -1426,6 +1585,22 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	if testBusyActiveTasksHook != nil {
 		activeTasks = testBusyActiveTasksHook(payload.WorkspaceID, activeTasks)
 	}
+	// A HEARTBEAT FROM A POD BEING STOPPED. A restart (runRestartCycle) stops
+	// the old compute, clears workspaces.url, sets 'provisioning' and starts
+	// the new compute. The control plane's stop returns as soon as the old pod
+	// is told to go (Kubernetes: the Deployment is deleted, the pod keeps
+	// running through its termination grace period), so that pod can still
+	// heartbeat after the row went 'provisioning'. Its heartbeat must not
+	// promote the row to 'online': nothing would reach it (its Service
+	// endpoint is gone) and the new pod has not registered, so every caller
+	// that waits for online (a Light park, a schedule edit) would act on an
+	// agent that is not there; observed 2026-11-18 as 'online' with an empty
+	// URL for up to a minute. Registration is what writes the URL (the
+	// provisioner pre-stores it on Docker), so a provisioning row without one
+	// has not been registered by its current pod, and the inline CASE below
+	// promotes only a row that has a URL. A pod whose boot registration
+	// failed for good stays 'provisioning' until it registers (or the
+	// provision timeout marks it failed); it was undialable either way.
 	var err error
 	if payload.MonthlySpend > 0 {
 		_, err = db.DB.ExecContext(ctx, `
@@ -1444,9 +1619,11 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				-- provision_workspace is loaded. Excluding platform here is what makes
 				-- "online" mean verified-by-construction. Non-platform keeps today's
 				-- fast first-heartbeat flip. kind is NOT NULL so the CASE is safe.
-				status            = (CASE WHEN status = 'provisioning' AND kind <> 'platform' THEN 'online' ELSE status END)::workspace_status,
+				-- Only a row with a URL is promoted: see "A HEARTBEAT FROM A POD
+				-- BEING STOPPED" above.
+				status            = (CASE WHEN status = 'provisioning' AND kind <> 'platform' AND COALESCE(url, '') <> '' THEN 'online' ELSE status END)::workspace_status,
 				updated_at        = now()
-			WHERE id = $1 AND status != 'removed'
+			WHERE id = $1 AND status != 'removed' AND `+models.LightWakeAllowedSQL+`
 		`, payload.WorkspaceID, payload.ErrorRate, payload.SampleError,
 			activeTasks, payload.UptimeSeconds, payload.CurrentTask,
 			payload.MonthlySpend, payload.IsBusy)
@@ -1466,9 +1643,11 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				-- provision_workspace is loaded. Excluding platform here is what makes
 				-- "online" mean verified-by-construction. Non-platform keeps today's
 				-- fast first-heartbeat flip. kind is NOT NULL so the CASE is safe.
-				status            = (CASE WHEN status = 'provisioning' AND kind <> 'platform' THEN 'online' ELSE status END)::workspace_status,
+				-- Only a row with a URL is promoted: see "A HEARTBEAT FROM A POD
+				-- BEING STOPPED" above.
+				status            = (CASE WHEN status = 'provisioning' AND kind <> 'platform' AND COALESCE(url, '') <> '' THEN 'online' ELSE status END)::workspace_status,
 				updated_at        = now()
-			WHERE id = $1 AND status != 'removed'
+			WHERE id = $1 AND status != 'removed' AND `+models.LightWakeAllowedSQL+`
 		`, payload.WorkspaceID, payload.ErrorRate, payload.SampleError,
 			activeTasks, payload.UptimeSeconds, payload.CurrentTask,
 			payload.IsBusy)
@@ -3196,19 +3375,31 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	// heartbeat handler itself (on prevStatus=='provisioning'), NOT only here —
 	// see the fireReconcileOnline call right after the main UPDATE. Do not rely
 	// on this branch as the reconcile trigger; it does not fire for new boxes.
+	//
+	// Like the inline CASE, it promotes only a row with a URL (see "A HEARTBEAT
+	// FROM A POD BEING STOPPED" in Heartbeat): a provisioning row without one
+	// is waiting for its new pod to register, and the heartbeat came from the
+	// pod a restart is stopping (or from a pod that never registered).
 	if currentStatus == "provisioning" {
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'provisioning'`, models.StatusOnline, payload.WorkspaceID); err != nil {
+		res, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'provisioning' AND COALESCE(url, '') <> ''`, models.StatusOnline, payload.WorkspaceID)
+		promoted := false
+		if err != nil {
 			log.Printf("Heartbeat: failed to transition %s from provisioning to online: %v", payload.WorkspaceID, err)
-		} else {
+		} else if n, raErr := res.RowsAffected(); raErr == nil && n > 0 {
+			promoted = true
 			log.Printf("Heartbeat: transitioned %s from provisioning to online (heartbeat received)", payload.WorkspaceID)
+		} else {
+			log.Printf("Heartbeat: %s stays provisioning: no registered URL (a heartbeat from a pod that has not registered, e.g. the one a restart is stopping)", payload.WorkspaceID)
 		}
-		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{
-			"recovered_from": currentStatus,
-		})
-		// RFC#2843: reconcile declared plugins on transition-to-online. This
-		// is the primary path for a freshly-provisioned workspace's first
-		// boot — provisioning→online is the only transition a new box makes.
-		h.fireReconcileOnline(ctx, payload.WorkspaceID)
+		if promoted {
+			h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{
+				"recovered_from": currentStatus,
+			})
+			// RFC#2843: reconcile declared plugins on transition-to-online. This
+			// is the primary path for a freshly-provisioned workspace's first
+			// boot — provisioning→online is the only transition a new box makes.
+			h.fireReconcileOnline(ctx, payload.WorkspaceID)
+		}
 	}
 
 	// Auto-recovery from awaiting_agent: external workspaces are flipped
@@ -3308,6 +3499,12 @@ func (h *RegistryHandler) UpdateCard(c *gin.Context) {
 	if err := h.requireWorkspaceToken(c.Request.Context(), c, payload.WorkspaceID); err != nil {
 		return // response already written
 	}
+	// Enter OS Light (C5): a run of a parked Light agent (update_agent_card
+	// from a run pod) must not rewrite the parked agent's card.
+	if ref := lightWakeRefusal(c.Request.Context(), payload.WorkspaceID, "update-card"); ref != nil {
+		ref.write(c)
+		return
+	}
 
 	// Validate agent_card.url if present — prevents SSRF via transcript proxy
 	// (issue #2130). An attacker who compromises a workspace token could
@@ -3326,7 +3523,7 @@ func (h *RegistryHandler) UpdateCard(c *gin.Context) {
 
 	agentCardStr := string(payload.AgentCard)
 	_, err := db.DB.ExecContext(c.Request.Context(), `
-		UPDATE workspaces SET agent_card = $2::jsonb, updated_at = now() WHERE id = $1
+		UPDATE workspaces SET agent_card = $2::jsonb, updated_at = now() WHERE id = $1 AND `+models.LightWakeAllowedSQL+`
 	`, payload.WorkspaceID, agentCardStr)
 	if err != nil {
 		log.Printf("UpdateCard error: %v", err)

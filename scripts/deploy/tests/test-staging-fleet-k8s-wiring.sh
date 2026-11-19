@@ -372,6 +372,49 @@ drun 1 "FAIL:digest-mismatch" "...but a no-sha revert whose canary did NOT move 
       CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
       bash "$DOCKER_ROLLER" --image "$REPO@$D_NEW"
 
+say "2b. --k8s-only rolls the k8s fleet without ever contacting Docker"
+# The deploy runner has no reachable Docker endpoint, so ANY docker invocation
+# on this path is a hard failure there. A poisoned docker earlier in PATH makes
+# one a hard failure here too.
+mkdir -p "$tmp/poison"
+cat > "$tmp/poison/docker" <<'POISON'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8RT/docker.log"
+exit 98
+POISON
+chmod +x "$tmp/poison/docker"
+reset_state
+: > "$K8RT/docker.log"
+after_new
+drun 0 "k8s arm OK" "--k8s-only + census wired + healthy fleet => rolled" \
+  env PATH="$tmp/poison:$PATH" TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" \
+      SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
+      K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
+      FAKE_BUILDINFO_SHA="0badc0de0123456789abcdef0123456789abcdef" \
+      CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
+      bash "$DOCKER_ROLLER" --k8s-only --tag staging-0badc0de
+if [ -s "$K8RT/docker.log" ]; then
+  bad "--k8s-only invoked docker" "$(cat "$K8RT/docker.log")"
+else
+  ok "--k8s-only made zero docker invocations"
+fi
+reset_state
+touch "$K8RT/rollout.fail"
+drun 1 "k8s arm FAILED" "--k8s-only still fails a rollout that never completes" \
+  env PATH="$tmp/poison:$PATH" TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" \
+      SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
+      K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
+      CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
+      bash "$DOCKER_ROLLER" --k8s-only --tag staging-0badc0de
+reset_state
+drun 1 "needs the k8s roller and a substrate census source" "--k8s-only without a census source is REFUSED" \
+  env -u SUBSTRATE_CENSUS_CMD -u CP_DATABASE_URL PATH="$tmp/poison:$PATH" TENANT_FLAGS="" \
+      bash "$DOCKER_ROLLER" --k8s-only --tag staging-0badc0de
+drun 1 "never contacts" "--k8s-only refuses a Docker canvas container it would silently skip" \
+  env PATH="$tmp/poison:$PATH" TENANT_FLAGS="" STAGING_CANVAS_APP_CONTAINER=shared-canvas \
+      SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
+      bash "$DOCKER_ROLLER" --k8s-only --tag staging-0badc0de
+
 say "3. a genuinely FAILED k8s roll still fails the whole roll"
 reset_state
 touch "$K8RT/rollout.fail"
@@ -398,10 +441,11 @@ say "5. fleet-drift-audit: drift is REPORTED, and an exclusion must be EARNED"
 reset_state
 arun() { # arun <expect_rc> <needle|-> <label> <exclude>
   local exp="$1" needle="$2" label="$3" exc="${4:-}"
+  shift 4
   local out rc=0
   out="$(KUBECTL="$tmp/bin/kubectl" SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
          K8S_ROLLER="$K8S_ROLLER" CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
-         bash "$AUDITOR" --digest "$D_NEW" --exclude "$exc" 2>&1)" || rc=$?
+         bash "$AUDITOR" --digest "$D_NEW" --exclude "$exc" "$@" 2>&1)" || rc=$?
   if [ "$rc" != "$exp" ]; then bad "$label — exit $rc, expected $exp" "$out"; return; fi
   if [ "$needle" != "-" ] && ! printf '%s' "$out" | grep -qF -- "$needle"; then
     bad "$label — output missing '$needle'" "$out"; return
@@ -410,7 +454,8 @@ arun() { # arun <expect_rc> <needle|-> <label> <exclude>
 }
 arun 0 "::warning::fleet drift: org ghost" "drift is named as a warning even when excluded" "ghost"
 arun 0 "::warning::fleet drift: org ghost" "drift is named as a warning when NOT excluded" ""
-arun 0 "WILL fail on it" "unexcluded drift is announced as a coming roll failure" ""
+arun 0 "not a release target" "inventory drift does not block release targets" ""
+arun 1 "inventory drift: 1 tenant record" "strict inventory audit stays red independently of release" "" --strict
 arun 1 "are NOT drifted: alpha" "excluding a HEALTHY tenant is REFUSED" "alpha"
 arun 1 "are NOT drifted" "excluding a tenant that does not exist at all is REFUSED" "no-such-org"
 # ghost's census row has an EMPTY instance_id, so the roller looked for it where
@@ -452,13 +497,14 @@ PYEOF
 PY="$(command -v python3 || command -v python)"
 rrun() { # rrun <expect_rc> <needle> <label> <reader-mode>
   local exp="$1" needle="$2" label="$3" mode="$4"
+  shift 4
   mk_reader "$mode"
   local out rc=0
   out="$(KUBECTL="$tmp/bin/kubectl" DEPLOY_PYTHON3="$PY" \
          INFISICAL_READER="$tmp/bin/reader.py" \
          CP_CENSUS_NAMESPACE=controlplane-staging CP_CENSUS_DB_POD=db-0 \
          CP_CENSUS_DB_USER=cps CP_CENSUS_DB_NAME=cp_staging \
-         bash "$RESOLVER" --env-out "$tmp/work/out.env" --work-dir "$tmp/work" 2>&1)" || rc=$?
+         bash "$RESOLVER" --env-out "$tmp/work/out.env" --work-dir "$tmp/work" "$@" 2>&1)" || rc=$?
   if [ "$rc" != "$exp" ]; then bad "$label — exit $rc, expected $exp" "$out"; return; fi
   if [ "$needle" != "-" ] && ! printf '%s' "$out" | grep -qF -- "$needle"; then
     bad "$label — output missing '$needle'" "$out"; return
@@ -486,12 +532,14 @@ done
 reset_state
 : > "$K8RT/census.tsv"
 rrun 1 "returned ZERO rows" "a census with no rows is a broken query, not an empty fleet" good
+rrun 0 "rows=0 k8s=0" "production can explicitly accept a readable empty census" good --allow-empty
 reset_state
 printf '%s\n' "dockerorg	dddddddd-0000-4000-8000-0000000000dd	docker	mol-x" > "$K8RT/census.tsv"
 rrun 1 "NONE on the k8s substrate" "a census with no k8s row refuses rather than rolling nothing" good
 reset_state
 touch "$K8RT/census.fail"
 rrun 1 "census FAILED" "a census that errors names all four coordinates" good
+rrun 1 "census FAILED" "allow-empty cannot hide a failed census read" good --allow-empty
 
 # ─────────────────────────────────────────────────────────────────────────────
 say "7. the lane never asserts an empty fleet"

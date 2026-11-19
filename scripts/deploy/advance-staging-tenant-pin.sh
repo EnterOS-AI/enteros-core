@@ -198,7 +198,18 @@ resolve_digest() {
     echo "FATAL: cannot pull $IMAGE on this runner for digest resolution" >&2
     return 1
   fi
-  docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null | head -1
+  # .Id can be a local config digest, depending on the Docker image store.
+  # Only a repository manifest digest is a pullable release identity.
+  docker image inspect "$IMAGE" --format '{{json .RepoDigests}}' | python3 -c '
+import json, sys
+image = sys.argv[1]
+repo = image.rsplit(":", 1)[0] if ":" in image.rsplit("/", 1)[-1] else image
+refs = json.load(sys.stdin)
+matches = {ref.split("@", 1)[1] for ref in (refs or []) if ref.startswith(repo + "@")}
+if len(matches) != 1:
+    raise SystemExit("FATAL: pulled image must have exactly one manifest digest for " + repo)
+print(matches.pop())
+' "$IMAGE"
 }
 
 DIGEST="$(resolve_digest | tr '[:upper:]' '[:lower:]' | xargs)"
@@ -477,7 +488,7 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
   } >> "$GITHUB_OUTPUT"
 fi
 
-if [ "$OLD_DIGEST" = "$DIGEST" ] && [ "${OLD_GIT_SHA:-}" = "${GIT_SHA:-}" ]; then
+if [ "$OLD_DIGEST" = "$DIGEST" ] && [ "${OLD_GIT_SHA:-}" = "${GIT_SHA:-}" ] && [ -z "${GITHUB_RUN_ID:-}" ]; then
   # DB pin is already at target, but the boot-default SSOT drifts INDEPENDENTLY
   # (it is exactly the state staging is in now: pin current, LOCAL_TENANT_IMAGE
   # stale). Reconcile it here too — write_ssot_pin no-ops if already correct.
@@ -486,6 +497,11 @@ if [ "$OLD_DIGEST" = "$DIGEST" ] && [ "${OLD_GIT_SHA:-}" = "${GIT_SHA:-}" ]; the
   echo "OLD_IMAGE=${OLD_IMAGE}"; echo "NEW_IMAGE=${IMAGE}"
   exit 0
 fi
+
+# CI retries must bind the pin to this run even when the image is unchanged.
+# Otherwise a successful retry after a partial write retains the failed run's
+# stamp and can never qualify for production. Non-CI boot reconciliation above
+# still leaves the database pin untouched.
 
 if [ "$DRY_RUN" = "1" ]; then
   log "DRY-RUN: would promote $TEMPLATE_NAME ${OLD_DIGEST:-<unset>} -> $DIGEST"

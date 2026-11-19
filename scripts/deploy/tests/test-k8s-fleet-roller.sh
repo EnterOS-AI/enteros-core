@@ -109,6 +109,7 @@ case "${1:-}" in
   set)
     # set image deployment/<name> <container>=<ref>
     printf '%s\n' "$*" >> "$K8RT/set-image.log"
+    [ ! -f "$K8RT/set-image.fail" ] || exit 1
     [ -f "$K8RT/pods.after" ] && cp "$K8RT/pods.after" "$K8RT/pods"
     exit 0;;
   rollout)
@@ -146,6 +147,7 @@ case "${1:-}" in
     shift
     if [ "${1:-}" = "-l" ]; then
       # namespaced list by label selector -> name \t replicas
+      [ ! -f "$K8RT/discovery.fail" ] || forbid "workload discovery disabled by test fixture"
       ! cannot_list "$ns" || forbid "cannot list resource \"deployments\" in API group \"apps\" in the namespace \"$ns\""
       org="$(org_of_sel "${2:-}")"
       awk -F'\t' -v o="$org" -v ns="$ns" '$1==ns && $4==o {printf "%s\t%s\n",$2,$3}' "$K8RT/deploys"
@@ -202,8 +204,8 @@ ORG_K="c0c0c0c0-0000-4000-8000-0000000000c0"
 row() { local IFS=$'\t'; printf '%s\n' "$*"; }
 
 reset_state() {
-  : > "$K8RT/set-image.log"; : > "$K8RT/calls.log"; : > "$K8RT/buildinfo.log"
-  rm -f "$K8RT/rollout.fail" "$K8RT/pods.after" "$K8RT/proxy.fail" \
+  : > "$K8RT/set-image.log"; : > "$K8RT/calls.log"; : > "$K8RT/buildinfo.log"; : > "$K8RT/exec.log"
+  rm -f "$K8RT/rollout.fail" "$K8RT/pods.after" "$K8RT/proxy.fail" "$K8RT/discovery.fail" "$K8RT/set-image.fail" \
         "$K8RT/scope-ns" "$K8RT/nolist-ns" "$K8RT/cani.fail" "$K8RT/cani.reason" "$K8RT/cani.stderr"
   # alpha: 1 replica, serving the OLD digest. zero: 0 replicas, no pods.
   printf '%s\n' \
@@ -258,10 +260,42 @@ printf '%s\n' "ns-alpha	enteros-tenant-abc	$ORG_A	$REPO@$D_NEW" > "$K8RT/pods.af
 check "0-replica tenant is reported SKIP:scaled-to-zero, not ROLLED" 0 "SKIP:scaled-to-zero" \
       "$CENSUS_AB" --digest "$D_NEW"
 
-echo "== control-plane/cluster drift is reported, not skipped =="
+echo "== missing inventory is separate from release targets =="
 reset_state
-check "org on k8s substrate with no matching workload is fatal" 1 "FAIL:no-workload" \
+check "missing-only fleet cannot claim to have rolled a tenant" 1 "DRIFT:no-workload" \
       "$CENSUS_GHOST" --digest "$D_NEW"
+check "production pin-only release counts missing tenants without claiming a roll" 0 "eligible=0 rolled=0 skipped=0 failed=0 missing=1" \
+      "$CENSUS_GHOST" --digest "$D_NEW" --allow-empty
+reset_state
+printf '%b\n' "ns-alpha\tenteros-tenant-abc\t$ORG_A\t$REPO@$D_NEW" > "$K8RT/pods.after"
+CENSUS_MIXED="printf 'alpha\t$ORG_A\tk8s\tns-alpha\nghost\t$ORG_C\tk8s\tns-ghost\n'"
+check "missing inventory does not fail a successful release" 0 "rolled=1 skipped=0 failed=0 missing=1" \
+      "$CENSUS_MIXED" --digest "$D_NEW"
+reset_state
+check "plan reports missing inventory and retains existing targets" 0 "eligible=1 rolled=0 skipped=0 failed=0 missing=1" \
+      "$CENSUS_MIXED" --digest "$D_NEW" --dry-run
+reset_state
+touch "$K8RT/discovery.fail"
+check "API failure is never classified as missing inventory" 1 "workload discovery failed" \
+      "$CENSUS_MIXED" --digest "$D_NEW"
+if [ -s "$K8RT/set-image.log" ]; then
+  echo "FAIL: discovery failure mutated a workload"; FAILED=$((FAILED+1))
+else
+  echo "ok: discovery failure performs no mutation"; PASS=$((PASS+1))
+fi
+reset_state
+touch "$K8RT/set-image.fail"
+check "target lost after discovery is still a release failure" 1 "FAIL:set-image" \
+      "$CENSUS_MIXED" --digest "$D_NEW"
+reset_state
+printf '%b\n' "ns-zero\tduplicate\t1\t$ORG_B\t$REPO@$D_OLD" >> "$K8RT/deploys"
+check "ambiguous inventory fails before rolling any target" 1 "ambiguous" \
+      "$CENSUS_AB" --digest "$D_NEW"
+if [ -s "$K8RT/set-image.log" ]; then
+  echo "FAIL: ambiguous discovery mutated a workload"; FAILED=$((FAILED+1))
+else
+  echo "ok: ambiguous discovery performs no mutation"; PASS=$((PASS+1))
+fi
 
 echo "== verification is against the pods, not the command's exit code =="
 reset_state
@@ -550,10 +584,10 @@ else
   echo "FAIL: expected 5 FAIL:scope-check rows and no skip, got ${n}"; FAILED=$((FAILED+1))
 fi
 reset_state; replay_fixture; rm -f "$K8RT/scope-ns"   # CONTROL: a cluster-wide grant
-check "replay CONTROL: with a cluster-wide grant the same five are FAIL:no-workload" 1 \
-  "FAIL:no-workload" "$CENSUS_PROD" --digest "$D_NEW" --dry-run
-saw "...the same five, and the same verdict" \
-  "found=9 in_scope=9 out_of_scope=0 eligible=4 rolled=0 skipped=0 failed=5"
+check "replay CONTROL: with a cluster-wide grant the same five become DRIFT:no-workload instead of scope-check" 0 \
+  "DRIFT:no-workload" "$CENSUS_PROD" --digest "$D_NEW" --dry-run
+saw "...all five are DRIFT:no-workload with missing=5 and eligible=4" \
+  "found=9 in_scope=9 out_of_scope=0 eligible=4 rolled=0 skipped=0 failed=0 missing=5"
 
 reset_state; canary_fixture; after_new "$SHA_OK"
 printf '%s\n' ns-alpha > "$K8RT/scope-ns"   # a LIVE tenant whose binding is missing

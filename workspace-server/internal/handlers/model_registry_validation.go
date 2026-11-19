@@ -258,14 +258,9 @@ func validateBYOKCredentialSatisfiable(ctx context.Context, runtime, model strin
 		}
 	}
 	return false, fmt.Sprintf(
-		// The example MUST name a model that is actually on a platform arm today,
-		// or this message sends the user straight into a 422. Refreshed
-		// 2026-08-04 off moonshot/kimi-k2.6, which sdk#203 withdrew when the
-		// platform's Moonshot vendor account was suspended; minimax/MiniMax-M2.7
-		// is the SSOT default (MOLECULE_LLM_DEFAULT_MODEL) and is on every
-		// runtime's platform arm.
-		"model %q resolves to BYOK provider %q but no credential it accepts (%s) exists at workspace or org scope — the workspace would be created and then fail provisioning with MISSING_BYOK_CREDENTIAL. Add one of those secrets first, or pick a platform-billed model (the vendor/model slash form, e.g. minimax/MiniMax-M2.7 — no key needed).",
-		model, prov.Name, strings.Join(prov.AuthEnv, ", "))
+		// Use the shared registered fallback so the suggested model tracks defaults.
+		"model %q resolves to BYOK provider %q but no credential it accepts (%s) exists at workspace or org scope — the workspace would be created and then fail provisioning with MISSING_BYOK_CREDENTIAL. Add one of those secrets first, or pick a platform-billed model (the vendor/model slash form, e.g. %s — no key needed).",
+		model, prov.Name, strings.Join(prov.AuthEnv, ", "), platformDefaultModelFallback)
 }
 
 // defaultModelForRuntime returns the runtime's DEFAULT registered model — the

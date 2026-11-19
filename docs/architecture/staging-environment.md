@@ -53,8 +53,8 @@ A green image build or pin write alone is insufficient. The staging gate must
 show:
 
 - the exact image is pullable and the deployed build identity matches;
-- every promoted pinnable runtime digest is already present and verified on the
-  local-Docker provisioner daemon before a workspace create starts;
+- the registry serves every promoted pinnable runtime digest, with manifest
+  bytes that hash to that digest, before a workspace create starts;
 - a throwaway tenant/workspace reaches the expected state;
 - the selected runtime registers and serves a real A2A turn;
 - management-MCP tools are present and callable where required;

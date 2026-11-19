@@ -23,6 +23,7 @@ import {
   TopologyCycleError,
 } from "./canvas-topology";
 import { mergeBootTelemetry } from "./boot-telemetry";
+import type { LightState } from "@/lib/light";
 
 /**
  * Walk every parent node and bump its width/height (if explicitly set)
@@ -182,6 +183,11 @@ export interface WorkspaceNodeData extends Record<string, unknown> {
    *  cannot make across server/client clocks. Absent until a replay
    *  carrying one is adopted. */
   bootGen?: string;
+  /** Enter OS Light state (docs/api-protocol/light-api.md): null/absent for
+   *  an ordinary agent. Hydrated from GET /workspaces `light_state` and kept
+   *  current by WORKSPACE_UPDATED {"light_state": ...}. While "parked" or
+   *  "parking", chat, restart, pause and resume answer 409. */
+  lightState?: LightState | null;
 }
 
 /** One rendered watchdog-log line (see WorkspaceNodeData.bootLog). */

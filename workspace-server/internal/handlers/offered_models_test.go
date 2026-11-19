@@ -407,3 +407,76 @@ func TestListOfferedModels_AmbiguousModelSkipped(t *testing.T) {
 		}
 	})
 }
+
+// callOfferedModelsJSON issues the request and decodes the body into a raw map
+// (so a test can tell an omitted key from an empty one) plus the typed form.
+func callOfferedModelsJSON(t *testing.T, query string) (map[string]json.RawMessage, OfferedModels) {
+	t.Helper()
+	w := callListOfferedModels(t, query)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("raw parse: %v", err)
+	}
+	var resp OfferedModels
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	return raw, resp
+}
+
+// default_model names the platform default the tenant holds
+// (MOLECULE_LLM_DEFAULT_MODEL) when the runtime offers it — what the
+// management MCP uses for a workspace whose model nobody named.
+func TestListOfferedModels_DefaultModelWhenOffered(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "mike")
+	withSwappedProviderRegistry(t, offeredModelsTestManifest(), nil, func() {
+		_, resp := callOfferedModelsJSON(t, "runtime=claude-code")
+		if resp.DefaultModel != "mike" {
+			t.Errorf("default_model = %q, want the tenant's platform default \"mike\"", resp.DefaultModel)
+		}
+	})
+}
+
+// A runtime that does not offer the platform default gets no default_model
+// key at all (never a model the runtime cannot run).
+func TestListOfferedModels_DefaultModelOmittedWhenNotOffered(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "mike")
+	withSwappedProviderRegistry(t, offeredModelsTestManifest(), nil, func() {
+		raw, _ := callOfferedModelsJSON(t, "runtime=hermes")
+		if v, has := raw["default_model"]; has {
+			t.Errorf("hermes does not offer \"mike\"; default_model must be omitted, got %s", string(v))
+		}
+	})
+}
+
+// With MOLECULE_LLM_DEFAULT_MODEL unset the default is the one shared
+// platformDefaultModelFallback — the same value a self-hosted concierge is
+// seeded with.
+func TestListOfferedModels_DefaultModelFallbackWhenEnvUnset(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
+	m := offeredModelsTestManifest()
+	cc := m.Runtimes["claude-code"]
+	cc.Providers[0].Models = append(cc.Providers[0].Models, platformDefaultModelFallback)
+	m.Runtimes["claude-code"] = cc
+	withSwappedProviderRegistry(t, m, nil, func() {
+		_, resp := callOfferedModelsJSON(t, "runtime=claude-code")
+		if resp.DefaultModel != platformDefaultModelFallback {
+			t.Errorf("default_model = %q, want the shared fallback %q", resp.DefaultModel, platformDefaultModelFallback)
+		}
+	})
+}
+
+// The real registry offers the current platform default on every runtime a
+// concierge creates members on, so default_model is always there for them.
+func TestListOfferedModels_RealRegistryOffersPlatformDefault(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
+	for _, runtime := range []string{"claude-code", "codex", "hermes", "openclaw"} {
+		_, resp := callOfferedModelsJSON(t, "runtime="+runtime)
+		if resp.DefaultModel != platformDefaultModelFallback {
+			t.Errorf("runtime %s: default_model = %q, want %q", runtime, resp.DefaultModel, platformDefaultModelFallback)
+		}
+	}
+}

@@ -487,9 +487,9 @@ func setConciergeModelResolver(t *testing.T, model string, err error) {
 // TestConciergeRuntimeGeneralization_Defaults is the PROVE-FAIL gate for the P3b
 // model + template + runtime defaults (items 1, 2, 3).
 func TestConciergeRuntimeGeneralization_Defaults(t *testing.T) {
-	t.Run("the ONE shared platform-default fallback model is minimax/MiniMax-M2.7 (CTO P3b)", func(t *testing.T) {
-		if platformDefaultModelFallback != "minimax/MiniMax-M2.7" {
-			t.Fatalf("platformDefaultModelFallback = %q, want %q — the single shared platform-default model (used only when the MOLECULE_LLM_DEFAULT_MODEL SSOT is unset) is MiniMax", platformDefaultModelFallback, "minimax/MiniMax-M2.7")
+	t.Run("the ONE shared platform-default fallback model is google/gemini-4-hydrogen (owner 2026-11-17)", func(t *testing.T) {
+		if platformDefaultModelFallback != "google/gemini-4-hydrogen" {
+			t.Fatalf("platformDefaultModelFallback = %q, want %q — the single shared platform-default model (used only when the MOLECULE_LLM_DEFAULT_MODEL SSOT is unset) is Gemini 4 Hydrogen", platformDefaultModelFallback, "google/gemini-4-hydrogen")
 		}
 	})
 
@@ -541,7 +541,7 @@ func TestConciergeRuntimeGeneralization_Defaults(t *testing.T) {
 		}
 	})
 
-	// CROSS-RUNTIME PARITY (gap CLOSED): the shared default minimax/MiniMax-M2.7
+	// CROSS-RUNTIME PARITY (gap CLOSED): the shared default google/gemini-4-hydrogen
 	// MUST derive to the platform-managed `platform` arm on EVERY concierge-capable
 	// runtime, so a fresh concierge on any of them runs the shared default
 	// proxy-billed (no tenant MINIMAX_API_KEY). This was historically a registry
@@ -764,6 +764,139 @@ func TestConciergePlatformMCPEnv(t *testing.T) {
 		conciergePlatformMCPEnv(env, "ws-self-1", "admintok")
 		if env[conciergePluginRegistryEnvVar] != "https://box-preset" {
 			t.Errorf("%s overwritten to %q, want box preset preserved", conciergePluginRegistryEnvVar, env[conciergePluginRegistryEnvVar])
+		}
+	})
+}
+
+// TestConciergePlatformMCPEnv_DefaultModel: the management MCP's default for a
+// workspace nobody named a model for is the platform default the TENANT holds
+// (MOLECULE_LLM_DEFAULT_MODEL in the tenant server's env, from the control
+// plane on SaaS) — never the concierge's own model, which may be a BYOK pick or
+// an older platform default.
+func TestConciergePlatformMCPEnv_DefaultModel(t *testing.T) {
+	t.Run("carries the tenant's platform default, not the concierge's model", func(t *testing.T) {
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "google/gemini-4-hydrogen")
+		env := map[string]string{
+			"MODEL":          "minimax/MiniMax-M2.7", // the concierge's own (stale) model
+			"MOLECULE_MODEL": "minimax/MiniMax-M2.7",
+		}
+		conciergePlatformMCPEnv(env, "ws-self-1", "admintok")
+		if got := env["MOLECULE_LLM_DEFAULT_MODEL"]; got != "google/gemini-4-hydrogen" {
+			t.Errorf("MOLECULE_LLM_DEFAULT_MODEL = %q, want the tenant's google/gemini-4-hydrogen", got)
+		}
+		if env["MODEL"] != "minimax/MiniMax-M2.7" {
+			t.Errorf("the concierge's own MODEL must be left alone, got %q", env["MODEL"])
+		}
+	})
+
+	t.Run("unset tenant env falls back to the shared platform default", func(t *testing.T) {
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
+		env := map[string]string{}
+		conciergePlatformMCPEnv(env, "ws-self-1", "admintok")
+		if got := env["MOLECULE_LLM_DEFAULT_MODEL"]; got != platformDefaultModelFallback {
+			t.Errorf("MOLECULE_LLM_DEFAULT_MODEL = %q, want %q", got, platformDefaultModelFallback)
+		}
+	})
+
+	t.Run("does not clobber a value already on the box env", func(t *testing.T) {
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "google/gemini-4-hydrogen")
+		env := map[string]string{"MOLECULE_LLM_DEFAULT_MODEL": "google/gemini-3.1-flash-lite"}
+		conciergePlatformMCPEnv(env, "ws-self-1", "admintok")
+		if got := env["MOLECULE_LLM_DEFAULT_MODEL"]; got != "google/gemini-3.1-flash-lite" {
+			t.Errorf("MOLECULE_LLM_DEFAULT_MODEL overwritten to %q, want the preset kept", got)
+		}
+	})
+}
+
+// TestConciergeDefaultModelEnv: at provision time the default a concierge hands
+// to the workspaces it creates is the CONTROL PLANE's current answer for the
+// org, and only then the tenant's own copy.
+//
+// The 2026-11-19 staging defect: a fresh tenant booted without
+// MOLECULE_LLM_DEFAULT_MODEL in its env (its first config fetch lost the
+// row-commit race), so the concierge of an org whose default was
+// minimax/MiniMax-M3 was handed the code fallback and created a
+// google/gemini-4-hydrogen member. Each subtest runs the two calls in the order
+// applyConciergeProvisionConfig makes them.
+func TestConciergeDefaultModelEnv(t *testing.T) {
+	provisionEnv := func(t *testing.T, env map[string]string) string {
+		t.Helper()
+		conciergeDefaultModelEnv(context.Background(), "ws-concierge", env)
+		conciergePlatformMCPEnv(env, "ws-concierge", "admintok")
+		return env["MOLECULE_LLM_DEFAULT_MODEL"]
+	}
+
+	t.Run("fresh tenant with no default in its env: the control plane's answer, not the fallback", func(t *testing.T) {
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
+		setConciergeModelResolver(t, "minimax/MiniMax-M3", nil)
+		if got := provisionEnv(t, map[string]string{}); got != "minimax/MiniMax-M3" {
+			t.Errorf("MOLECULE_LLM_DEFAULT_MODEL = %q, want the control plane's minimax/MiniMax-M3 (fallback is %q)", got, platformDefaultModelFallback)
+		}
+	})
+
+	t.Run("a default changed since the tenant booted: the control plane's answer, not the stale env", func(t *testing.T) {
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "google/gemini-4-carbon")
+		setConciergeModelResolver(t, "google/gemini-4-hydrogen", nil)
+		if got := provisionEnv(t, map[string]string{}); got != "google/gemini-4-hydrogen" {
+			t.Errorf("MOLECULE_LLM_DEFAULT_MODEL = %q, want the control plane's google/gemini-4-hydrogen", got)
+		}
+	})
+
+	t.Run("the answer is trimmed", func(t *testing.T) {
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
+		setConciergeModelResolver(t, "  minimax/MiniMax-M3\n", nil)
+		if got := provisionEnv(t, map[string]string{}); got != "minimax/MiniMax-M3" {
+			t.Errorf("MOLECULE_LLM_DEFAULT_MODEL = %q, want it trimmed", got)
+		}
+	})
+
+	t.Run("control plane unreachable: the tenant's own value", func(t *testing.T) {
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "google/gemini-4-carbon")
+		setConciergeModelResolver(t, "", fmt.Errorf("cp returned 503"))
+		if got := provisionEnv(t, map[string]string{}); got != "google/gemini-4-carbon" {
+			t.Errorf("MOLECULE_LLM_DEFAULT_MODEL = %q, want the tenant's google/gemini-4-carbon", got)
+		}
+	})
+
+	t.Run("control plane unreachable and nothing in the tenant env: the shared fallback", func(t *testing.T) {
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
+		setConciergeModelResolver(t, "", fmt.Errorf("cp returned 503"))
+		if got := provisionEnv(t, map[string]string{}); got != platformDefaultModelFallback {
+			t.Errorf("MOLECULE_LLM_DEFAULT_MODEL = %q, want %q", got, platformDefaultModelFallback)
+		}
+	})
+
+	t.Run("the control plane names nothing: the tenant's own value", func(t *testing.T) {
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "google/gemini-4-carbon")
+		setConciergeModelResolver(t, "   ", nil)
+		if got := provisionEnv(t, map[string]string{}); got != "google/gemini-4-carbon" {
+			t.Errorf("MOLECULE_LLM_DEFAULT_MODEL = %q, want the tenant's google/gemini-4-carbon", got)
+		}
+	})
+
+	t.Run("a value already in the provision env is kept and the control plane is not asked", func(t *testing.T) {
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "google/gemini-4-carbon")
+		old := conciergeModelResolver
+		conciergeModelResolver = func(context.Context) (string, error) {
+			t.Error("the control plane must not be asked when the provision env already names a default")
+			return "minimax/MiniMax-M3", nil
+		}
+		t.Cleanup(func() { conciergeModelResolver = old })
+		env := map[string]string{"MOLECULE_LLM_DEFAULT_MODEL": "google/gemini-3.1-flash-lite"}
+		if got := provisionEnv(t, env); got != "google/gemini-3.1-flash-lite" {
+			t.Errorf("MOLECULE_LLM_DEFAULT_MODEL = %q, want the preset kept", got)
+		}
+	})
+
+	t.Run("the concierge's own model is not what its members get", func(t *testing.T) {
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
+		setConciergeModelResolver(t, "minimax/MiniMax-M3", nil)
+		env := map[string]string{"MODEL": "anthropic/claude-byok", "MOLECULE_MODEL": "anthropic/claude-byok"}
+		if got := provisionEnv(t, env); got != "minimax/MiniMax-M3" {
+			t.Errorf("MOLECULE_LLM_DEFAULT_MODEL = %q, want the platform default minimax/MiniMax-M3", got)
+		}
+		if env["MODEL"] != "anthropic/claude-byok" || env["MOLECULE_MODEL"] != "anthropic/claude-byok" {
+			t.Errorf("the concierge's own model must be left alone, got MODEL=%q MOLECULE_MODEL=%q", env["MODEL"], env["MOLECULE_MODEL"])
 		}
 	})
 }
@@ -1149,6 +1282,8 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 		}
 		setConciergeModelResolver(t, resolvedModel, nil)
 		t.Setenv("MOLECULE_DEFAULT_RUNTIME", "claude-code")
+		// A fresh tenant whose boot-time config fetch failed: nothing in its own env.
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
 
 		mock := setupTestDB(t)
 		mock.ExpectQuery(kindQuery).WithArgs("ws-resolved").
@@ -1184,6 +1319,12 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 		}
 		if env["LLM_PROVIDER"] != conciergeProvider {
 			t.Errorf("resolved platform-managed model did not pin LLM_PROVIDER=%q; got %q", conciergeProvider, env["LLM_PROVIDER"])
+		}
+		// The provision itself must ask the control plane for the default its
+		// members get (conciergeDefaultModelEnv is wired in): with nothing in the
+		// tenant's own env, anything else here is the code fallback.
+		if got := env["MOLECULE_LLM_DEFAULT_MODEL"]; got != resolvedModel {
+			t.Errorf("provision env MOLECULE_LLM_DEFAULT_MODEL = %q, want the control plane's %q (the fallback is %q)", got, resolvedModel, platformDefaultModelFallback)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("unmet sqlmock expectations (resolved model/provider not persisted): %v", err)
@@ -1338,7 +1479,7 @@ func TestEnsureConciergeModel_ReconcilesPlatformManagedToSSOT(t *testing.T) {
 	h := &WorkspaceHandler{}
 	const modelSelQuery = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`
 	const secretInsert = `INSERT INTO workspace_secrets`
-	const ssot = "minimax/MiniMax-M2.7"
+	const ssot = "google/gemini-4-hydrogen"
 
 	t.Run("platform-managed default reconciles to the SSOT (the M-bump propagates)", func(t *testing.T) {
 		setConciergeModelResolver(t, ssot, nil)
@@ -1461,7 +1602,7 @@ func TestApplyConciergeProvisionConfig_MoleculeModelResolvesMinimaxNotMoonshot(t
 	const declaredInsert = `INSERT INTO workspace_declared_plugins`
 	const secretInsert = `INSERT INTO workspace_secrets`
 
-	const ssot = "minimax/MiniMax-M2.7"
+	const ssot = "google/gemini-4-hydrogen"
 	// The STALE pin under test. Originally the dead moonshot/kimi-k2.6 template
 	// pin; sdk#203 WITHDREW that id, and an unroutable stored id no longer takes
 	// the platform-managed reconcile path (see reconcileExistingConciergeModel's

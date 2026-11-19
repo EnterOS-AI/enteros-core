@@ -70,7 +70,8 @@ const E2E_PROVIDER = process.env.E2E_PROVIDER || "molecules-server";
 // niche runtime that can't come online. Env-overridable so the SSOT default can
 // drive it (E2E_RUNTIME/E2E_MODEL, same knobs as the lifecycle e2e).
 const E2E_WS_RUNTIME = process.env.E2E_RUNTIME || "claude-code";
-const E2E_WS_MODEL = process.env.E2E_MODEL || "minimax/MiniMax-M2.7";
+// The e2e model: the cheapest platform Gemini model, never the Carbon default.
+const E2E_WS_MODEL = process.env.E2E_MODEL || "google/gemini-3.1-flash-lite";
 const E2E_WS_PROVIDER = process.env.E2E_WS_PROVIDER || "platform";
 const E2E_WS_TIER = Number(process.env.E2E_TIER || "1");
 
