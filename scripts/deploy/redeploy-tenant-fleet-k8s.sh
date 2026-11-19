@@ -333,15 +333,35 @@ TENANT_SELECTOR="molecule.component=tenant,molecule.managed-by=controlplane"
 # Discover the complete target set before mutating any workload. A failed API
 # read must never be interpreted as an absent tenant, and a target disappearing
 # after this snapshot must fail the rollout rather than become inventory drift.
+#
+# NO CLUSTER-WIDE WORKLOAD READ. The roller runs on its environment's
+# control-plane ServiceAccount. Since molecule-controlplane#3037 that account is
+# fenced to its own environment's tenant namespaces: it may list namespaces, and
+# read and patch workloads only inside the ones it owns. `get deploy -A` is
+# answered Forbidden for it (staging, 2026-11-19: every roll failed here once
+# the fence was applied). So the org's namespace is found by its label, and the
+# tenant Deployment is listed inside it. An org's label on a namespace this
+# credential does not own fails the read below, which is a refusal, not drift.
 LOCATIONS=()
 for i in "${!SEL_SLUGS[@]}"; do
   slug="${SEL_SLUGS[$i]}" ; orgid="${SEL_ORGIDS[$i]}"
   sel="${TENANT_SELECTOR},molecule.org-id=${orgid}"
-  if ! loc="$($KUBECTL get deploy -A -l "$sel" \
-          -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}')"; then
+  if ! org_namespaces="$($KUBECTL get ns -l "molecule.org-id=${orgid}" \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"; then
     err "${slug}: workload discovery failed; refusing to treat an unread cluster as missing inventory"
     exit 1
   fi
+  loc=""
+  while IFS= read -r tenant_ns; do
+    [ -n "$tenant_ns" ] || continue
+    if ! found="$($KUBECTL -n "$tenant_ns" get deploy -l "$sel" \
+            -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}')"; then
+      err "${slug}: workload discovery failed in namespace ${tenant_ns}; refusing to treat an unread cluster as missing inventory"
+      exit 1
+    fi
+    [ -z "$found" ] || loc+="${found}"$'\n'
+  done <<< "$org_namespaces"
+  loc="${loc%$'\n'}"
   LOCATIONS+=("$loc")
   nmatch="$(printf '%s' "$loc" | grep -c . || true)"
   if [ "$nmatch" -eq 0 ]; then

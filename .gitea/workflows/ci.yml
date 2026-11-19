@@ -1290,6 +1290,34 @@ jobs:
           # is surfaced on the first try — the retry can never mask a real
           # create regression, only absorb the cold-origin write window.
           bash tests/e2e/test_workspace_create_retry_unit.sh
+          # peer-visibility teardown vs the CP's org-lifecycle fence. The gate
+          # reds on main AFTER printing "GATE PASSED": claimOrgPurge answers an
+          # immediate 409 "organization has an active lifecycle operation" while
+          # the org's own async concierge provision is in flight, and the old
+          # hand-rolled teardown issued ONE fire-and-forget DELETE — a 409 writes
+          # no purge audit row, so the poll could never converge and the tenant
+          # LEAKED (runs 578856 / 578755). Drives the REAL script against a mocked
+          # CP: transient 409 → retried and provably purged; persistent 409 → still
+          # fails closed with exit 4. Offline: no docker, no creds.
+          bash tests/e2e/test_peer_visibility_teardown_unit.sh
+          # THE CLASS GUARD. lint_cleanup_traps.sh now fails when any
+          # `DELETE /cp/admin/tenants` does not route through the SSOT helper
+          # e2e_cp_delete_and_verify_purge. A lint nobody has watched go RED is
+          # indistinguishable from one that matches nothing — which is exactly
+          # how this class survived 12 days after 3dd3675e2 fixed it in the
+          # shared lib and nowhere else. This MUTATES a throwaway copy of the
+          # tree (reinstating a hand-rolled teardown in shell, in a workflow,
+          # and split across line-continuations) and asserts the REAL lint reds
+          # NAMING the file and line — plus a green control, a no-false-positive
+          # case, and RED on a stale allowlist entry or a renamed SSOT helper.
+          # Offline: no docker, no network, no creds.
+          bash tests/e2e/test_cp_purge_lint_unit.sh
+          # Fail-direction proof that the eight migrated teardowns actually
+          # survive the CP org-lifecycle fence. Drives each REAL script against
+          # a mocked CP that answers the first DELETE with 409 "organization has
+          # an active lifecycle operation": transient 409 -> retried and provably
+          # purged; persistent 409 -> still fails closed. Offline.
+          bash tests/e2e/test_teardown_409_class_unit.sh
 
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Drift guard — KI-013 container/volume naming (SEV #2499)

@@ -687,12 +687,14 @@ func validateWorkspaceDir(dir string) error {
 // If the workspace has children (is a team), cascade deletes all sub-workspaces.
 // Use ?confirm=true to actually delete (otherwise returns children list for confirmation).
 func (h *WorkspaceHandler) Delete(c *gin.Context) {
-	id := c.Param("id")
 	ctx := c.Request.Context()
 	confirm := c.Query("confirm") == "true"
 
-	// #687: reject non-UUID IDs before hitting the DB.
-	if err := validateWorkspaceID(id); err != nil {
+	// #687: reject non-UUID IDs before hitting the DB. From here on the id is
+	// the one the rest of the platform knows, whatever the caller typed (see
+	// canonicalWorkspaceID).
+	id, err := canonicalWorkspaceID(c.Param("id"))
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace ID"})
 		return
 	}
@@ -1059,7 +1061,8 @@ func WorkspaceIsRemoved(ctx context.Context, workspaceID string) bool {
 // the user's choice, the org-import reconcile passes false (a reconcile is not
 // a user-erase).
 func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase bool) ([]string, []error, error) {
-	if err := validateWorkspaceID(id); err != nil {
+	id, err := canonicalWorkspaceID(id)
+	if err != nil {
 		return nil, nil, err
 	}
 
@@ -1394,6 +1397,27 @@ func validateWorkspaceID(id string) error {
 		return fmt.Errorf("invalid workspace id")
 	}
 	return nil
+}
+
+// canonicalWorkspaceID returns id in the canonical form (lower case, hyphenated)
+// the rest of the platform uses for it, or an error for anything that is not a
+// UUID.
+//
+// uuid.Parse accepts upper case, braces, urn:uuid: and 32 bare hex digits, and
+// Postgres compares all of them as equal, so a handler that only validates its
+// id works against the database with whatever the caller typed. The control
+// plane does not: its resource ledger and the labels on a workspace's objects
+// carry the canonical text. A delete that passed the typed id on marked the
+// workspace removed, then failed its control-plane stop (500), left the pod
+// running until the orphan sweeper stopped it, kept the volume, the seed Secret
+// and the Service, and answered 410 to the retry (measured on the staging
+// canary 2026-11-19 with an upper-case id).
+func canonicalWorkspaceID(id string) (string, error) {
+	u, err := uuid.Parse(id)
+	if err != nil {
+		return "", fmt.Errorf("invalid workspace id")
+	}
+	return u.String(), nil
 }
 
 // yamlSpecialChars is the set of YAML-special characters banned from workspace
