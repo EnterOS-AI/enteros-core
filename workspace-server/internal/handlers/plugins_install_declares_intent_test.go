@@ -78,58 +78,137 @@ func driveInstallPush(t *testing.T, body string) *httptest.ResponseRecorder {
 	return w
 }
 
-// TestInstallPushLeg_DeclaresIntent — the core regression. A push-delivered
-// install must upsert workspace_declared_plugins with the EXACT source the
-// caller asked for, keyed by the derived install name (the same key
-// listDeclaredPlugins and the reconcile read back).
-func TestInstallPushLeg_DeclaresIntent(t *testing.T) {
-	mock, cleanup := withMockDB(t)
-	defer cleanup()
-	expectAllowlistAllowAll(mock)
+// TestInstallPushLeg_RefreshesExistingDeclarationOnly — Option B
+// (molecule-core#5075): push-leg Install issues an UPDATE on
+// workspace_declared_plugins BEFORE delivery (so re-pinning an already
+// declared plugin updates its source_raw and never reverts on reconcile),
+// while NOT inserting a new declaration row for an undeclared plugin (so
+// push-leg Uninstall removes workspace_plugins cleanly without resurrecting
+// ad-hoc user-installed plugins).
+func TestInstallPushLeg_RefreshesExistingDeclarationOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		rowsAffected int64
+	}{
+		{name: "undeclared_zero_rows", rowsAffected: 0},
+		{name: "declared_repin_one_row", rowsAffected: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock, cleanup := withMockDB(t)
+			defer cleanup()
+			expectAllowlistAllowAll(mock)
 
-	// The load-bearing expectation. WithArgs pins workspace+name+source, so a
-	// handler that declared a different ref, or filed it under a different
-	// key, still fails.
-	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).
-		WithArgs(repinWorkspace, repinPlugin, repinSource).
-		WillReturnResult(sqlmock.NewResult(1, 1))
-	// The observed-install row is written too; leaving it unprogrammed would
-	// make this test fail for the wrong reason.
-	mock.ExpectExec(`INSERT INTO workspace_plugins`).
-		WithArgs(repinWorkspace, repinPlugin, repinSource, sqlmock.AnyArg(), sqlmock.AnyArg()).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+			mock.ExpectExec(`UPDATE workspace_declared_plugins`).
+				WithArgs(repinWorkspace, repinPlugin, repinSource).
+				WillReturnResult(sqlmock.NewResult(0, tc.rowsAffected))
+			mock.ExpectExec(`INSERT INTO workspace_plugins`).
+				WithArgs(repinWorkspace, repinPlugin, repinSource, sqlmock.AnyArg(), sqlmock.AnyArg()).
+				WillReturnResult(sqlmock.NewResult(1, 1))
 
-	w := driveInstallPush(t, `{"source":"`+repinSource+`"}`)
-	if w.Code != http.StatusOK {
-		t.Fatalf("install returned %d, want 200: %s", w.Code, w.Body.String())
-	}
-	// ExpectationsWereMet is the assertion that FAILS on the old handler: an
-	// unfulfilled ExpectExec means the declare never happened. (An UNEXPECTED
-	// statement only surfaces as a returned error the old code swallowed, so a
-	// negative assertion here would have proved nothing — sqlmock cannot prove
-	// a write did NOT occur.)
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("push-leg install did not record the declared intent: %v", err)
+			w := driveInstallPush(t, `{"source":"`+repinSource+`"}`)
+			if w.Code != http.StatusOK {
+				t.Fatalf("install returned %d, want 200: %s", w.Code, w.Body.String())
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("push-leg install did not satisfy DB expectations: %v", err)
+			}
+		})
 	}
 }
 
-// TestInstallFailsWhenDeclareFails — the declare is NOT best-effort. If the
-// intent cannot be recorded we cannot promise the change sticks, so the install
-// must fail loudly rather than answer 200 over a workspace that will revert on
-// its next reconcile. (recordDeclaredPlugin also carries the privileged-plugin
-// entitlement gate, which must never be swallowed.)
-func TestInstallFailsWhenDeclareFails(t *testing.T) {
+// TestInstallPushLeg_FailsWhenRefreshFails — if refreshing an existing
+// declaration fails after container push, push-leg Install fails loudly rather
+// than answering 200 while a stale declaration silently reverts the pin later.
+func TestInstallPushLeg_FailsWhenRefreshFails(t *testing.T) {
 	mock, cleanup := withMockDB(t)
 	defer cleanup()
 	expectAllowlistAllowAll(mock)
 
-	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).
+	mock.ExpectExec(`UPDATE workspace_declared_plugins`).
 		WillReturnError(errDeclareBoom)
 
 	w := driveInstallPush(t, `{"source":"`+repinSource+`"}`)
 	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("install returned %d, want 500 on a failed declare — a silent revert must not be reported as success: %s",
-			w.Code, w.Body.String())
+		t.Fatalf("install returned %d, want 500 on failed refresh: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestInstallPushLeg_RefusesPrivilegedPluginBeforeDelivery — Option B keeps the
+// entitlement gate in checkPrivilegedPluginEntitlement ahead of push delivery.
+func TestInstallPushLeg_RefusesPrivilegedPluginBeforeDelivery(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+	expectAllowlistAllowAll(mock)
+
+	mock.ExpectQuery(`SELECT COALESCE\(kind, 'workspace'\) FROM workspaces`).
+		WithArgs(repinWorkspace).
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("workspace"))
+
+	registry := t.TempDir()
+	stagePluginRegistry(t, registry, conciergePlatformMCPName)
+	eicCalled := false
+	stubInstallPluginViaEIC(t, func(context.Context, string, string, string, string) error {
+		eicCalled = true
+		return nil
+	})
+
+	h := NewPluginsHandler(registry, nil, func(string) {}).
+		WithRuntimeLookup(func(string) (string, error) { return "claude-code", nil }).
+		WithInstanceIDLookup(func(string) (string, error) { return "i-0e0951a3cfd9bbf75", nil })
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: repinWorkspace}}
+	c.Request = httptest.NewRequest("POST", "/workspaces/"+repinWorkspace+"/plugins", bytes.NewBufferString(`{"source":"local://`+conciergePlatformMCPName+`"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.Install(c)
+	drainTestAsync()
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("install returned %d, want 500 on non-platform privileged plugin: %s", w.Code, w.Body.String())
+	}
+	if eicCalled {
+		t.Fatalf("EIC delivery ran despite privileged-plugin entitlement refusal")
+	}
+}
+
+// TestInstallPullLeg_StillDeclaresViaUpsert — on errNoPushTarget, reMaterialize
+// still upserts workspace_declared_plugins via recordDeclaredPlugin so boot-install
+// materializes the plugin without firing a redundant UPDATE first.
+func TestInstallPullLeg_StillDeclaresViaUpsert(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+	expectAllowlistAllowAll(mock)
+
+	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).
+		WithArgs(repinWorkspace, repinPlugin, repinSource).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`INSERT INTO workspace_plugins`).
+		WithArgs(repinWorkspace, repinPlugin, repinSource, sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	registry := t.TempDir()
+	stagePluginRegistry(t, registry, repinPlugin)
+
+	h := NewPluginsHandler(registry, nil, func(string) {}).
+		WithRuntimeLookup(func(string) (string, error) { return "claude-code", nil }).
+		WithInstanceIDLookup(func(string) (string, error) { return "", nil })
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: repinWorkspace}}
+	c.Request = httptest.NewRequest("POST", "/workspaces/"+repinWorkspace+"/plugins", bytes.NewBufferString(`{"source":"`+repinSource+`"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.Install(c)
+	drainTestAsync()
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("pull-leg install returned %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("pull-leg install did not upsert declaration: %v", err)
 	}
 }
 

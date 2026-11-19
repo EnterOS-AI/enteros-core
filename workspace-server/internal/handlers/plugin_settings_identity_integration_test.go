@@ -19,6 +19,8 @@ import (
 	"database/sql"
 	"errors"
 	"testing"
+
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 // The two names of ONE plugin. Both are real, both are live at once, and only
@@ -345,4 +347,82 @@ func TestIntegration_PluginSettings_UnsafeNameRefusedBeforeLookup(t *testing.T) 
 			t.Fatalf("unsafe name %q must fail on shape, not on lookup", bad)
 		}
 	}
+}
+
+// TestIntegration_PluginInstallOptionB_UninstallAndRepin verifies Option B
+// (molecule-core#5075) against a real Postgres database:
+//  1. Push-leg install of an undeclared plugin does NOT insert a row into
+//     workspace_declared_plugins, so push-leg Uninstall leaves desiredPluginSources
+//     empty (no resurrection on next boot).
+//  2. Push-leg repin of an already-declared plugin updates workspace_declared_plugins
+//     to the new ref so desiredPluginSources keeps the new ref even when
+//     workspace_plugins is empty (no revert on fresh config volume reconcile).
+func TestIntegration_PluginInstallOptionB_UninstallAndRepin(t *testing.T) {
+	conn := settingsTestDB(t)
+	ctx := context.Background()
+	prevDB := db.DB
+	db.DB = conn
+	t.Cleanup(func() { db.DB = prevDB })
+
+	t.Run("undeclared_push_install_then_uninstall_leaves_desired_empty", func(t *testing.T) {
+		ws := seedSettingsWorkspace(t, conn)
+		const pluginName = "optb-adhoc-plugin"
+		const src = "gitea://molecule-ai/optb-adhoc-plugin#v1.0.0"
+
+		if err := refreshDeclaredPluginIfPresent(ctx, ws, pluginName, src); err != nil {
+			t.Fatalf("refreshDeclaredPluginIfPresent: %v", err)
+		}
+		if err := recordWorkspacePluginInstall(ctx, ws, pluginName, src, "none", ""); err != nil {
+			t.Fatalf("recordWorkspacePluginInstall: %v", err)
+		}
+
+		declared, err := listDeclaredPlugins(ctx, ws)
+		if err != nil {
+			t.Fatalf("listDeclaredPlugins: %v", err)
+		}
+		if len(declared) != 0 {
+			t.Fatalf("expected 0 declared rows for undeclared push install, got %d", len(declared))
+		}
+
+		if err := deleteWorkspacePluginRow(ctx, ws, pluginName); err != nil {
+			t.Fatalf("deleteWorkspacePluginRow: %v", err)
+		}
+		desired, err := desiredPluginSources(ctx, ws)
+		if err != nil {
+			t.Fatalf("desiredPluginSources: %v", err)
+		}
+		if len(desired) != 0 {
+			t.Fatalf("expected desiredPluginSources empty after push-leg uninstall, got %v", desired)
+		}
+	})
+
+	t.Run("declared_push_repin_updates_declaration_and_survives_reconcile", func(t *testing.T) {
+		ws := seedSettingsWorkspace(t, conn)
+		const pluginName = "optb-template-plugin"
+		const oldSrc = "gitea://molecule-ai/optb-template-plugin#oldref"
+		const newSrc = "gitea://molecule-ai/optb-template-plugin#newref"
+
+		if err := recordDeclaredPlugin(ctx, ws, pluginName, oldSrc); err != nil {
+			t.Fatalf("seed recordDeclaredPlugin: %v", err)
+		}
+		if err := refreshDeclaredPluginIfPresent(ctx, ws, pluginName, newSrc); err != nil {
+			t.Fatalf("refreshDeclaredPluginIfPresent repin: %v", err)
+		}
+		if err := recordWorkspacePluginInstall(ctx, ws, pluginName, newSrc, "none", ""); err != nil {
+			t.Fatalf("recordWorkspacePluginInstall repin: %v", err)
+		}
+
+		// Simulate fresh config volume / reconcile where workspace_plugins is cleared:
+		// desiredPluginSources must still yield newSrc (never revert to oldSrc).
+		if err := deleteWorkspacePluginRow(ctx, ws, pluginName); err != nil {
+			t.Fatalf("deleteWorkspacePluginRow: %v", err)
+		}
+		desired, err := desiredPluginSources(ctx, ws)
+		if err != nil {
+			t.Fatalf("desiredPluginSources: %v", err)
+		}
+		if len(desired) != 1 || desired[0] != newSrc {
+			t.Fatalf("desiredPluginSources = %v, want [%s]", desired, newSrc)
+		}
+	})
 }
