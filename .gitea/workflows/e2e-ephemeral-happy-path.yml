@@ -199,18 +199,24 @@ jobs:
     # which becomes the throwaway CP's MOLECULE_LLM_DEFAULT_MODEL (the concierge's
     # model), the scenario's platform model, and the default of the base templates
     # bundled into the tenant image.
-    #   `gemini` (owner decision 2026-11-17, the default): Gemini is the platform
-    #     vendor and every e2e lane runs on its cheapest model. The throwaway CP gets
-    #     the platform Gemini key (Infisical /shared/controlplane/llm GEMINI_API_KEY,
-    #     staging) and serves google/gemini-3.1-flash-lite through Google AI Studio;
-    #     never the gemini-4-hydrogen platform default. The 10g DELIVER leg is on.
-    #   `ci-llm` (2026-11-14): minimax/MiniMax-M3, with the CP's minimax traffic sent
-    #     to the CI LLM gateway on the owner's PC (Infisical /shared/ci-llm); 10g off.
+    #   `ci-llm` (owner decision 2026-11-18, the default): minimax/MiniMax-M3, with
+    #     the CP's minimax traffic sent to the CI LLM gateway (Infisical
+    #     /shared/ci-llm; since 2026-11-18 the DGX Spark, SGLang Qwen3-VL-30B-A3B,
+    #     no cost and no rate limit). When the gateway's GET /health is not 200 at
+    #     job start the run falls back to `gemini` by itself, and the creds step
+    #     says which one it used (log, ::notice::, step summary). The 10g DELIVER
+    #     leg is OFF in this mode (see the creds step): the Spark model fails it
+    #     too. The gemini fallback keeps it on.
+    #   `gemini` (2026-11-17): Gemini is the platform vendor and every e2e lane
+    #     runs on its cheapest model. The throwaway CP gets the platform Gemini key
+    #     (Infisical /shared/controlplane/llm GEMINI_API_KEY, staging) and serves
+    #     google/gemini-3.1-flash-lite through Google AI Studio; never the
+    #     gemini-4-hydrogen platform default. The 10g DELIVER leg is on.
     #   `vendor`: minimax/MiniMax-M3 with the real MiniMax key and api.minimax.io.
     # The CP's proxy, token lookup, credit reservation, routing and settlement, the
     # tenant and the workspace runtime run for real in every mode.
     env:
-      E2E_LLM_UPSTREAM: gemini
+      E2E_LLM_UPSTREAM: ci-llm
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -277,7 +283,30 @@ jobs:
               | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
           }
           MINIMAX_API_KEY=""; E2E_GEMINI_API_KEY=""
-          case "${E2E_LLM_UPSTREAM:-vendor}" in
+          # ci-llm is the default only while the gateway is up: the Spark is on
+          # Wi-Fi and can be down. Its health is checked once, here, at job start;
+          # a gateway that is not answering 200 sends this run to gemini, which is
+          # logged, annotated and put in the step summary below.
+          upstream="${E2E_LLM_UPSTREAM:-vendor}"
+          upstream_note=""
+          if [ "$upstream" = "ci-llm" ]; then
+            E2E_LLM_BASE_URL=$(read_secret CI_LLM_BASE_URL %2Fshared%2Fci-llm)
+            while [ "${E2E_LLM_BASE_URL%/}" != "$E2E_LLM_BASE_URL" ]; do E2E_LLM_BASE_URL="${E2E_LLM_BASE_URL%/}"; done
+            # Whole-string match ([[ =~ ]], not grep -x, which passes a value whose
+            # FIRST line matches and smuggles a second line into $GITHUB_ENV).
+            url_re='^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)*$'
+            if ! [[ $E2E_LLM_BASE_URL =~ $url_re ]]; then
+              echo "::error::E2E_LLM_UPSTREAM=ci-llm but Infisical /shared/ci-llm CI_LLM_BASE_URL is empty or not a plain https URL; refusing to send the gateway key anywhere else."
+              exit 1
+            fi
+            health=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$E2E_LLM_BASE_URL/health" 2>/dev/null || true)
+            if [ "$health" != "200" ]; then
+              upstream=gemini
+              upstream_note=" (fallback: the CI LLM gateway's /health answered ${health:-000})"
+              E2E_LLM_BASE_URL=""
+            fi
+          fi
+          case "$upstream" in
             gemini)
               # The platform Gemini key (the staging copy, the path and environment
               # this CI identity already reads in boot-to-registration-e2e.yml). It
@@ -290,29 +319,23 @@ jobs:
               ;;
             ci-llm)
               # The gateway's key rides the CP's MINIMAX_API_KEY slot; the script turns
-              # E2E_LLM_BASE_URL into MINIMAX_BASE_URL / MINIMAX_ANTHROPIC_BASE_URL.
+              # E2E_LLM_BASE_URL (read, validated as a plain https URL and
+              # health-checked above) into MINIMAX_BASE_URL / MINIMAX_ANTHROPIC_BASE_URL.
               MINIMAX_API_KEY=$(read_secret CI_LLM_API_KEY %2Fshared%2Fci-llm)
-              E2E_LLM_BASE_URL=$(read_secret CI_LLM_BASE_URL %2Fshared%2Fci-llm)
-              # Strict https only: the CP sends the gateway key with every turn, and
-              # the value lands in $GITHUB_ENV (no newline can get through this).
-              while [ "${E2E_LLM_BASE_URL%/}" != "$E2E_LLM_BASE_URL" ]; do E2E_LLM_BASE_URL="${E2E_LLM_BASE_URL%/}"; done
-              # Whole-string match ([[ =~ ]], not grep -x, which passes a value whose
-              # FIRST line matches and smuggles a second line into $GITHUB_ENV).
-              url_re='^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)*$'
-              if ! [[ $E2E_LLM_BASE_URL =~ $url_re ]]; then
-                echo "::error::E2E_LLM_UPSTREAM=ci-llm but Infisical /shared/ci-llm CI_LLM_BASE_URL is empty or not a plain https URL; refusing to send the gateway key anywhere else."
-                exit 1
-              fi
               echo "E2E_LLM_BASE_URL=$E2E_LLM_BASE_URL" >> "$GITHUB_ENV"
-              echo "LLM upstream: CI LLM gateway (${E2E_LLM_BASE_URL})"
+              echo "LLM upstream: CI LLM gateway (${E2E_LLM_BASE_URL}); 10g DELIVER off"
               # 10g DELIVER needs the model to call send_message_to_user from a long
-              # scheduled session. The CI model does that only when the session is
-              # short: replaying a captured 10g request (118 messages, 61 tools),
-              # qwen3:4b answered with the marker as text 0/10 at temperature 0.7 and
-              # 1.0, and llama3.1:8b / qwen3:8b failed it too. It passed in 2 of 4
-              # runs, so the plumbing works; the leg is a model-capability coin flip
-              # here. ci-llm turns off just that leg (its documented switch); the
-              # 10d FIRE half stays hard. `vendor` mode keeps it on.
+              # scheduled session. The gateway's model does not do that reliably:
+              #   - qwen3:4b on the owner's PC (2026-11-14): 0/10 on a replayed 10g
+              #     request, 2 of 4 real runs.
+              #   - Qwen3-VL-30B-A3B on the DGX Spark (the gateway since 2026-11-18):
+              #     one real run passed, which is why the leg was switched back on,
+              #     then run 856943 fired the schedule 35 times in 30 minutes with no
+              #     delivery, and a replay of the captured request scored 0/10 (it
+              #     answers with a greeting instead of the tool call).
+              # So this mode turns off just that leg (its documented switch); the 10d
+              # FIRE half stays hard, and a failed DELIVER costs the 1800 s backstop
+              # on every run. `gemini` (the fallback) and `vendor` keep it on.
               echo "E2E_SCHEDULE_DELIVER_CHECK=off" >> "$GITHUB_ENV"
               LLM_KEY="$MINIMAX_API_KEY"; LLM_KEY_DESC="CI_LLM_API_KEY(/shared/ci-llm)"
               E2E_PLATFORM_MODEL=minimax/MiniMax-M3
@@ -326,6 +349,11 @@ jobs:
             *) echo "::error::unknown E2E_LLM_UPSTREAM=${E2E_LLM_UPSTREAM} (want gemini, ci-llm or vendor)"; exit 1 ;;
           esac
           echo "E2E_PLATFORM_MODEL=$E2E_PLATFORM_MODEL" >> "$GITHUB_ENV"
+          echo "E2E_LLM_UPSTREAM_USED=$upstream" >> "$GITHUB_ENV"
+          echo "::notice::e2e LLM upstream used: ${upstream}${upstream_note}, model ${E2E_PLATFORM_MODEL} (requested ${E2E_LLM_UPSTREAM:-vendor})"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            echo "**e2e LLM upstream:** \`${upstream}\`${upstream_note}, model \`${E2E_PLATFORM_MODEL}\` (requested \`${E2E_LLM_UPSTREAM:-vendor}\`)" >> "$GITHUB_STEP_SUMMARY" || true
+          fi
           AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils)
 
           # FAIL CLOSED on an empty secret VALUE, not just a failed login.

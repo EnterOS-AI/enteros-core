@@ -15,6 +15,25 @@ application image or change the production release freeze.
 
 Fresh concierges inherit this selector. Existing platform-managed concierges
 reconcile it on their next provision; BYOK concierges retain their chosen model.
+
+Workspaces an agent creates without naming a model get the selector too. Core
+gives the concierge's management MCP the selector the tenant holds (its own
+`MOLECULE_LLM_DEFAULT_MODEL`, from `/cp/tenants/config` at boot) as
+`MOLECULE_LLM_DEFAULT_MODEL`, never the concierge's own model, and
+`GET /admin/llm/offered-models?runtime=<rt>` reports it as `default_model` when
+that runtime offers it. `provision_workspace` and `light_create_agent` use one of
+the two and fail with `INVALID_ARGUMENTS` when neither is available; a
+`provision_workspace` call that names a template keeps the template's declared
+model.
+
+On a platform-managed Claude Code workspace, each provision sets Claude Code's
+other model tiers (`ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`,
+`ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`,
+`CLAUDE_CODE_SUBAGENT_MODEL`) to that workspace's own model, and
+`ENABLE_TOOL_SEARCH=false`, unless the model is served by Anthropic. Subagents
+such as Explore, WebFetch and background calls then stay on the workspace's
+model instead of a built-in `claude-*` ID the proxy would send to Anthropic. A
+workspace or org secret with one of those names overrides it.
 This setting does not bulk-edit worker workspace model secrets. A worker's
 explicit model takes precedence over its template default. Claude Code,
 Hermes, and OpenClaw templates default to platform Hydrogen; Codex retains its

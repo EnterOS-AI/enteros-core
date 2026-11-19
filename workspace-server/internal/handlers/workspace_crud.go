@@ -687,12 +687,14 @@ func validateWorkspaceDir(dir string) error {
 // If the workspace has children (is a team), cascade deletes all sub-workspaces.
 // Use ?confirm=true to actually delete (otherwise returns children list for confirmation).
 func (h *WorkspaceHandler) Delete(c *gin.Context) {
-	id := c.Param("id")
 	ctx := c.Request.Context()
 	confirm := c.Query("confirm") == "true"
 
-	// #687: reject non-UUID IDs before hitting the DB.
-	if err := validateWorkspaceID(id); err != nil {
+	// #687: reject non-UUID IDs before hitting the DB. From here on the id is
+	// the one the rest of the platform knows, whatever the caller typed (see
+	// canonicalWorkspaceID).
+	id, err := canonicalWorkspaceID(c.Param("id"))
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace ID"})
 		return
 	}
@@ -789,7 +791,33 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 	// data on its volume for the orphan-sweeper grace. Only a genuine
 	// permanent-delete reaches here (restart/reconcile use other paths), so this
 	// is the one place prune may be requested.
-	erase := c.Query("erase_data") == "true"
+	//
+	// A PURGE ALWAYS ERASES. ?purge=true hard-deletes the row below, and with
+	// the row gone nothing can ever attach this workspace's volume again (a new
+	// workspace gets a new id and a new volume), so a purge that kept the volume
+	// did not keep the data for anyone: it leaked it. The one workspace whose id
+	// is not new is the org's concierge (platform_agent_ensure.go derives it
+	// from the org), which is re-created under the same id: purging it now also
+	// erases the memory it would otherwise have come back with. That is what a
+	// purge asks for, and it is a change from before 2026-11-19. On Kubernetes that is an
+	// identity claim counting against the namespace's persistentvolumeclaims
+	// quota for good (molecule-core#5193; measured on the staging canary
+	// 2026-11-19, workspace_delete_erase_test.go). The audit row's erase_data
+	// field records this effective value.
+	erase := c.Query("erase_data") == "true" || c.Query("purge") == "true"
+
+	// FROM HERE THE DELETE FINISHES WHETHER OR NOT THE CLIENT IS STILL THERE.
+	// CascadeDelete marks the rows removed before it tears anything down, and a
+	// removed row answers 410 to a retry (above), so a delete abandoned half way
+	// can never be completed through this API: the orphan sweeper later stops
+	// the workspace keep-state, and its volume, seed Secret and Service stay for
+	// good. Every step below ran on the request context, so a caller that gave
+	// up (an SDK timeout while the delete waited for an in-flight provision, a
+	// closed tab) cancelled the teardown and the purge. The context keeps the
+	// request's values and gets its own bound instead.
+	ctx, cancelDelete := context.WithTimeout(context.WithoutCancel(ctx), deleteCompletionBudget)
+	defer cancelDelete()
+
 	descendantIDs, stopErrs, err := h.CascadeDelete(ctx, id, erase)
 	if err != nil {
 		// Audit 2026-05-09 (Core-Security): raw `err.Error()` here was
@@ -946,6 +974,14 @@ func (h *WorkspaceHandler) clearWorkspaceInstanceIDAfterStop(ctx context.Context
 	}
 }
 
+// deleteCompletionBudget bounds a delete from the moment it starts tearing the
+// workspace down. The delete no longer ends when the client hangs up (see
+// Delete), so it needs a bound of its own: generous next to its slowest honest
+// path (15 s for an in-flight provision, 10 s for a Light operation, the stop
+// retries of a cascade, the purge), short enough that a wedged dependency does
+// not hold the request's goroutine for long.
+const deleteCompletionBudget = 3 * time.Minute
+
 // inflightProvisionWait bounds how long a delete waits, in total, for cancelled
 // in-flight provisions to unwind. Past it the teardown proceeds; the start's own
 // removed-check (provisioner.SetWorkspaceRemovedCheck) discards anything it
@@ -1025,7 +1061,8 @@ func WorkspaceIsRemoved(ctx context.Context, workspaceID string) bool {
 // the user's choice, the org-import reconcile passes false (a reconcile is not
 // a user-erase).
 func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase bool) ([]string, []error, error) {
-	if err := validateWorkspaceID(id); err != nil {
+	id, err := canonicalWorkspaceID(id)
+	if err != nil {
 		return nil, nil, err
 	}
 
@@ -1078,6 +1115,11 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 	// teardown and creates ws-<id> anyway, which then crash-looped on an empty
 	// config volume with nothing left to stop it.
 	h.cancelInflightProvisions(allIDs)
+	// The control-plane backend's half of the same protocol: its provision
+	// cannot be cancelled, so the delete waits (bounded) for the ones in flight
+	// to return. A teardown sent while the control plane is still creating the
+	// instance finds nothing to stop (workspace_cp_inflight_provision.go).
+	h.waitInflightCPProvisions(allIDs)
 	// cleanupCtx is the non-cancelable, time-bounded teardown context: detached
 	// from the request ctx via context.WithoutCancel so a canceled / timed-out
 	// DELETE still runs the stop → remove-volume → broadcast sequence to
@@ -1355,6 +1397,27 @@ func validateWorkspaceID(id string) error {
 		return fmt.Errorf("invalid workspace id")
 	}
 	return nil
+}
+
+// canonicalWorkspaceID returns id in the canonical form (lower case, hyphenated)
+// the rest of the platform uses for it, or an error for anything that is not a
+// UUID.
+//
+// uuid.Parse accepts upper case, braces, urn:uuid: and 32 bare hex digits, and
+// Postgres compares all of them as equal, so a handler that only validates its
+// id works against the database with whatever the caller typed. The control
+// plane does not: its resource ledger and the labels on a workspace's objects
+// carry the canonical text. A delete that passed the typed id on marked the
+// workspace removed, then failed its control-plane stop (500), left the pod
+// running until the orphan sweeper stopped it, kept the volume, the seed Secret
+// and the Service, and answered 410 to the retry (measured on the staging
+// canary 2026-11-19 with an upper-case id).
+func canonicalWorkspaceID(id string) (string, error) {
+	u, err := uuid.Parse(id)
+	if err != nil {
+		return "", fmt.Errorf("invalid workspace id")
+	}
+	return u.String(), nil
 }
 
 // yamlSpecialChars is the set of YAML-special characters banned from workspace

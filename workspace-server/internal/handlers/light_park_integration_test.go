@@ -189,9 +189,15 @@ func TestIntegration_LightPark_ChangeDuringAParkStaysQueued(t *testing.T) {
 	wh.SetCPProvisioner(&trackingCPProv{})
 	wh.stopFnOverride = func(context.Context, string) {}
 	queued := false
-	wh.lightScheduleReader = func(context.Context, string) ([]volumeEntry, error) {
-		// Change B lands now: its restart is refused for a 'parking' agent and
-		// turned into a refresh (workspace_restart.go).
+	wh.lightScheduleReader = func(rctx context.Context, _ string) ([]volumeEntry, error) {
+		// The park reads the grid twice: before its claim (the agent must
+		// answer) and after it (the set it sends). Change B lands during the
+		// second read, after the claim and before the control plane snapshots
+		// the env: its restart is refused for a 'parking' agent and turned into
+		// a refresh (workspace_restart.go).
+		if state, _, err := readLightRow(rctx, ws); err != nil || state != models.LightParking {
+			return lightIntegrationGrid(), nil
+		}
 		before := lightUnappliedRefreshes(t, conn, ws)
 		wh.runRestartCycle(ws, "")
 		queued = lightUnappliedRefreshes(t, conn, ws) > before
