@@ -41,7 +41,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # bp-exempt: standalone soak-then-promote drift gate; not in branch protection yet.
+  # NOT an exemption from branch protection. BP on main is
+  # `status_check_contexts: ['*']` (read from the API 2026-08-11): a wildcard
+  # matches every context on a commit it evaluates, so this job's
+  # (pull_request) status IS merge-blocking whenever it is red. The directive
+  # below is only a Tier 2g lint token recording that the context is not
+  # presence-required in `.gitea/required-contexts.txt`. See
+  # sweep-stale-e2e-orgs.yml for the outage this wording caused.
+  # bp-exempt: standalone soak-then-promote drift gate; not listed in
+  # required-contexts.txt. It is NOT outside branch protection: red blocks.
   compare:
     name: Verify vendored cron fixtures are byte-identical to the molecule-ai-sdk SSOT
     runs-on: ubuntu-latest

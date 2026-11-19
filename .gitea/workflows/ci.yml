@@ -186,14 +186,22 @@ jobs:
           TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
             -H 'Content-Type: application/json' \
             -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")' || echo "")
+          if [ -z "$TOK" ]; then
+            # Reachable ONLY because the capture above now has a fallback. Without
+            # it the step died on curl's exit status and this diagnosis never
+            # printed - the log showed a raw JSONDecodeError from the python3 that
+            # was handed an empty stdin, which names the symptom, not the cause.
+            echo "::error::Infisical universal-auth login returned no accessToken (transport, DNS or auth failure reaching $BASE) - failing closed."
+            exit 1
+          fi
           read_secret() {
             curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
               -H "Authorization: Bearer $TOK" \
               | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
           }
-          AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils)
-          echo "::add-mask::$AUTO_SYNC_TOKEN"
+          AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils || echo "")
+          if [ -n "$AUTO_SYNC_TOKEN" ]; then echo "::add-mask::$AUTO_SYNC_TOKEN"; fi
           if [ -z "$AUTO_SYNC_TOKEN" ]; then
             echo "::error::Infisical returned empty for AUTO_SYNC_TOKEN at /shared/dev-utils"
             exit 1
@@ -1300,6 +1308,24 @@ jobs:
           # CP: transient 409 → retried and provably purged; persistent 409 → still
           # fails closed with exit 4. Offline: no docker, no creds.
           bash tests/e2e/test_peer_visibility_teardown_unit.sh
+          # THE CLASS GUARD. lint_cleanup_traps.sh now fails when any
+          # `DELETE /cp/admin/tenants` does not route through the SSOT helper
+          # e2e_cp_delete_and_verify_purge. A lint nobody has watched go RED is
+          # indistinguishable from one that matches nothing — which is exactly
+          # how this class survived 12 days after 3dd3675e2 fixed it in the
+          # shared lib and nowhere else. This MUTATES a throwaway copy of the
+          # tree (reinstating a hand-rolled teardown in shell, in a workflow,
+          # and split across line-continuations) and asserts the REAL lint reds
+          # NAMING the file and line — plus a green control, a no-false-positive
+          # case, and RED on a stale allowlist entry or a renamed SSOT helper.
+          # Offline: no docker, no network, no creds.
+          bash tests/e2e/test_cp_purge_lint_unit.sh
+          # Fail-direction proof that the eight migrated teardowns actually
+          # survive the CP org-lifecycle fence. Drives each REAL script against
+          # a mocked CP that answers the first DELETE with 409 "organization has
+          # an active lifecycle operation": transient 409 -> retried and provably
+          # purged; persistent 409 -> still fails closed. Offline.
+          bash tests/e2e/test_teardown_409_class_unit.sh
 
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Drift guard — KI-013 container/volume naming (SEV #2499)

@@ -49,8 +49,12 @@
 #   E2E_SIMULATE_LEAK      ""(default) | container | volume | network — inject ONE
 #                          tagged resource AFTER teardown to PROVE the VERIFY bites.
 #   E2E_RUN_ID             slug suffix seed (CI: ${GITHUB_RUN_ID}-${RUN_ATTEMPT}).
+#   E2E_INFRA_BACKEND      defaults to local-docker here (this wrapper IS the
+#                          local-docker teardown gate). Any other value makes the
+#                          SSOT purge helper refuse rather than guess.
 #
-# Exit: 0 pass / honest skip-loud; 1 VERIFY-FAIL (leak) or assertion failure; 2 bad env.
+# Exit: 0 pass / honest skip-loud; 1 VERIFY-FAIL (leak), an unproven product
+#       teardown, or an assertion failure; 2 bad env.
 set -euo pipefail
 
 source "$(dirname "$0")/_lib.sh"
@@ -58,6 +62,12 @@ source "$(dirname "$0")/_lib.sh"
 source "$(dirname "$0")/lib/run_footprint.sh"
 # shellcheck source=lib/collision-proof-slug.sh
 source "$(dirname "$0")/lib/collision-proof-slug.sh"
+# SSOT teardown contract (e2e_cp_delete_and_verify_purge): exact purge receipt +
+# audit row + exact-org absence, INCLUDING the bounded retry for the CP's
+# transient 409 "organization has an active lifecycle operation".
+# shellcheck source=lib/cp_purge_receipt.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib/cp_purge_receipt.sh"
 
 CP_URL="${MOLECULE_CP_URL:-https://localhost:8090}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}"
@@ -66,6 +76,12 @@ CONCIERGE_ONLINE_SECS="${E2E_CONCIERGE_ONLINE_SECS:-300}"
 AGENT_ACT_SECS="${E2E_AGENT_ACT_SECS:-300}"
 DRIVE_CONCIERGE="${E2E_DRIVE_CONCIERGE:-1}"
 SIMULATE_LEAK="${E2E_SIMULATE_LEAK:-}"
+# This wrapper IS the local-docker teardown gate — that is what it exists to
+# verify — so it supplies the SSOT helper's backend default rather than making
+# every caller repeat it. An explicit E2E_INFRA_BACKEND still wins, and a
+# non-local value still makes the helper refuse (rc=2) rather than guess.
+: "${E2E_INFRA_BACKEND:=local-docker}"
+export E2E_INFRA_BACKEND
 
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
@@ -78,6 +94,18 @@ if [ "${E2E_CP_INSECURE:-}" = "1" ] || echo "$CP_URL" | grep -qE '://(localhost|
   CURL_K=(-k)
 fi
 CURL_COMMON=(-sS --max-time 30 "${CURL_K[@]}")
+# Thread the SAME loopback trust decision into the SSOT teardown helper: it
+# refuses to send the admin bearer outside the staging origin unless the caller
+# opts into a literal loopback test origin, and it will not relax TLS
+# verification without E2E_CP_INSECURE. Both are scoped to the loopback dev CP
+# this script already targets — neither can widen anything against staging.
+CP_PURGE_INSECURE=0
+if [ "${#CURL_K[@]}" -gt 0 ]; then
+  CP_PURGE_INSECURE=1
+fi
+if echo "$CP_URL" | grep -qE '^https?://(localhost|127\.0\.0\.1):[0-9]+$'; then
+  export E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1
+fi
 
 # Collision-proof, sweeper-/reaper-covered slug. THIS is the RUN_ID.
 SLUG="e2e-clv-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" 12)"
@@ -106,6 +134,8 @@ ORG_ID=""
 NETWORK_NAME=""
 PROVISIONED=0
 CP_TEARDOWN_DONE=0
+CP_TEARDOWN_RC=0
+CP_TEARDOWN_STATE="not_run"
 export RF_CAPTURED_VOLS=""
 export RF_WORKER_IDS=""
 
@@ -115,25 +145,53 @@ admin_call() {  # METHOD PATH [curl args…]
     -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" "$@"
 }
 
-cp_teardown() {  # the product's OWN teardown — CP admin tenant delete cascade
+# The product's OWN teardown — CP admin tenant delete cascade.
+#
+# This wrapper is UNLIKE every other caller of the SSOT helper: here the DELETE
+# is the SUBJECT UNDER TEST, not a cleanup convenience. So this function must
+# never abort the run — the five-stage contract requires VERIFY (stage 3) to run
+# next and NAME the surviving container / volume / network / DB row. An early
+# exit here would replace a precise leak report with a bare teardown error.
+# The helper's own rc is therefore RECORDED (CP_TEARDOWN_RC / CP_TEARDOWN_STATE)
+# and reported, then VERIFY renders the verdict.
+#
+# What the helper changes: the DELETE used to be hand-rolled as one
+# fire-and-forget call with its status discarded (`>/dev/null 2>&1 || log ...`),
+# followed by a 120s roster poll. Against the control plane's org-lifecycle
+# fence that produces a FALSE RED here — claimOrgPurge answers an immediate HTTP
+# 409 "organization has an active lifecycle operation" while any org-scoped
+# mutation lease is open (including the concierge workspace this very wrapper
+# just drove into existence at stage 2), a 409 writes NO purge audit row, and
+# nothing re-issues the DELETE. VERIFY then correctly reports leaked resources
+# and blames the PRODUCT's teardown for a purge the harness never actually
+# asked for a second time. Fixed once in the shared lib by 3dd3675e2 and never
+# propagated to this hand-rolled copy.
+#
+# E2E_CP_INSECURE is threaded through so the helper trusts the same self-signed
+# localhost dev CP this script already talks to via CURL_K.
+cp_teardown() {
   [ -z "$ORG_ID" ] && return 0
   [ "$CP_TEARDOWN_DONE" = "1" ] && return 0
   CP_TEARDOWN_DONE=1
   log "🧹 CP teardown: DELETE /cp/admin/tenants/$SLUG (executeOrgPurge cascade)…"
-  admin_call DELETE "/cp/admin/tenants/$SLUG" --max-time 200 \
-    -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1 || \
-    log "  (delete returned non-2xx — may be mid-cascade / already gone)"
-  # Eventual-consistency: wait for the org row to disappear from the admin list.
-  local gone=0
-  for _ in $(seq 1 24); do
-    if ! admin_call GET "/cp/admin/orgs" 2>/dev/null \
-        | python3 -c "import json,sys
-d=json.load(sys.stdin); sys.exit(0 if any(o.get('slug')=='$SLUG' and o.get('status')!='purged' for o in d.get('orgs',[])) else 1)" 2>/dev/null; then
-      gone=1; break
-    fi
-    sleep 5
-  done
-  [ "$gone" = "1" ] && log "  org row gone from admin list" || log "  org row still present (the VERIFY/db scan will surface it)"
+  CP_TEARDOWN_RC=0
+  E2E_CP_INSECURE="$CP_PURGE_INSECURE" \
+    e2e_cp_delete_and_verify_purge "$CP_URL" "$ADMIN_TOKEN" "$SLUG" "$ORG_ID" \
+    || CP_TEARDOWN_RC=$?
+  case "$CP_TEARDOWN_RC" in
+    0)
+      CP_TEARDOWN_STATE="purged"
+      log "  exact purge receipt + audit row + exact-org absence confirmed"
+      ;;
+    2)
+      CP_TEARDOWN_STATE="refused_bad_env"
+      log "  ⚠ teardown REFUSED on a bad-env precondition (backend/origin/slug/token) — see [cp-purge] above; VERIFY will still scan"
+      ;;
+    *)
+      CP_TEARDOWN_STATE="not_proven"
+      log "  ⚠ purge NOT proven (rc=$CP_TEARDOWN_RC) — the VERIFY scan below will name whatever survived"
+      ;;
+  esac
 }
 
 finalize() {
@@ -170,6 +228,9 @@ ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys
 try: print(json.load(sys.stdin).get('id',''))
 except Exception: print('')" 2>/dev/null || echo "")
 [ -z "$ORG_ID" ] && fail "org create returned no id: $(echo "$CREATE_RESP" | head -c 300)"
+# The creation-returned id is the teardown's collision-safe authority: the helper
+# refuses to DELETE a slug whose current org id is not this one.
+e2e_cp_validate_org_id "$ORG_ID"   || fail "org create returned a non-UUID id ($ORG_ID) — refusing to arm a destructive teardown against it"
 PROVISIONED=1
 NETWORK_NAME="mol-$(echo "$ORG_ID" | tr -d - | cut -c1-12)"
 ok "Org created id=$ORG_ID  (derived docker network=$NETWORK_NAME)"
@@ -317,6 +378,15 @@ fi
 log "5/5 VERIFY — zero-leftover assertion across all resource classes…"
 if ! rf_verify "$ORG_ID" "$RUN_ID" "$NETWORK_NAME" "$SLUG"; then
   fail "ZERO-LEFTOVER VERIFY FAILED — the CP/MCP teardown leaked the resource(s) named above. This is a product teardown gap (the reaper would have hidden it). Failing the gate."
+fi
+# VERIFY passing is necessary but NOT sufficient. A teardown the helper could not
+# prove (persistent 409, non-200, bad receipt, surviving org) must fail this gate
+# even when the resource scan happens to come back clean — several scan classes
+# legitimately SKIP (no docker daemon, no RF_DB_EXEC, no RF_CF_*), so "nothing
+# found" can mean "nothing looked". Deferred to HERE, after VERIFY, precisely so
+# the leak report is printed first and diagnosis is never misdirected.
+if [ "$CP_TEARDOWN_STATE" != "purged" ]; then
+  fail "the product's OWN teardown was never PROVEN for $SLUG (state=$CP_TEARDOWN_STATE rc=$CP_TEARDOWN_RC) — the zero-leftover scan above found nothing, but a scan that skipped its classes cannot substitute for an exact purge receipt + audit row + exact-org absence. Failing the gate."
 fi
 ok "═══ CLEANUP-VERIFICATION PASSED ═══  the CP/MCP teardown removed the ENTIRE run footprint; the reaper stays a true backstop."
 # finalize (EXIT trap) runs the FINALLY safety belt — a no-op on a clean run.

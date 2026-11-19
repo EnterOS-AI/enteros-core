@@ -594,13 +594,13 @@ jobs:
           TOK=$(curl -fsS -A curl/8.4.0 -X POST "$BASE/api/v1/auth/universal-auth/login" \
             -H 'Content-Type: application/json' \
             -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")' || echo "")
           if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
-          echo "::add-mask::$TOK"
+          if [ -n "$TOK" ]; then echo "::add-mask::$TOK"; fi
           CP_ADMIN_API_TOKEN=$(curl -fsS -A curl/8.4.0 "$BASE/api/v3/secrets/raw/CP_ADMIN_API_TOKEN?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=%2Fshared%2Fcontrolplane-admin" \
             -H "Authorization: Bearer $TOK" \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")')
-          echo "::add-mask::$CP_ADMIN_API_TOKEN"
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")' || echo "")
+          if [ -n "$CP_ADMIN_API_TOKEN" ]; then echo "::add-mask::$CP_ADMIN_API_TOKEN"; fi
           if [ -z "$CP_ADMIN_API_TOKEN" ]; then
             echo "::error::Infisical returned empty CP_ADMIN_API_TOKEN at staging /shared/controlplane-admin — failing closed."
             exit 1
@@ -611,10 +611,32 @@ jobs:
           # compiled Hermes product fallback; transport/auth/server failures are
           # not equivalent to "unset" and fail the deploy gate closed.
           runtime_body=$(mktemp)
-          trap 'rm -f "$runtime_body"' EXIT
-          runtime_status=$(curl -sS -A curl/8.4.0 -o "$runtime_body" -w "%{http_code}" \
+          runtime_code=$(mktemp)
+          trap 'rm -f "$runtime_body" "$runtime_code"' EXIT
+          # A STATUS capture, so the remedy is NOT the `|| echo ""` used on the
+          # token captures above: `-w` writes the code to stdout BEFORE curl
+          # returns non-zero, so an or-else inside this subshell would append a
+          # SECOND code and produce "000000" — the pollution rule 1 of
+          # lint-curl-status-capture.py exists to forbid. Status to a FILE, then
+          # read the file, is that lint's own fix template.
+          #
+          # It has to change at all because the `case` below is a fail-closed
+          # guard that names the HTTP status, and on a transport failure it was
+          # unreachable: curl exits 7 having written nothing, the bare
+          # assignment inherits that, and -e killed the step with only
+          # `curl: (7)` on stderr and no ::error:: at all. Verdict unchanged —
+          # this failed the deploy gate before and fails it now — but "000"
+          # lands in the `*)` arm and the operator is told which lookup died.
+          set +e
+          curl -sS -A curl/8.4.0 -o "$runtime_body" -w "%{http_code}" \
             "$BASE/api/v3/secrets/raw/MOLECULE_DEFAULT_RUNTIME?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=%2Fshared%2Fcontrolplane" \
-            -H "Authorization: Bearer $TOK")
+            -H "Authorization: Bearer $TOK" > "$runtime_code"
+          set -e
+          runtime_status=$(cat "$runtime_code" 2>/dev/null || echo "000")
+          # `[ -n ] ||` and never `[ -z ] &&`: the AND-list's status is 1 when
+          # its test is false, and as the last line of a step that becomes the
+          # SCRIPT's exit status (measured: rc=1 with no shell flags at all).
+          [ -n "$runtime_status" ] || runtime_status="000"
           case "$runtime_status" in
             200)
               MOLECULE_DEFAULT_RUNTIME=$(python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v.strip() if isinstance(v,str) else "")' < "$runtime_body")
@@ -648,7 +670,10 @@ jobs:
           # by the tests themselves (e2eLLMModelFrom).
           ci_llm_base=$(curl -fsS -A curl/8.4.0 "$BASE/api/v3/secrets/raw/CI_LLM_BASE_URL?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=%2Fshared%2Fci-llm" \
             -H "Authorization: Bearer $TOK" \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v.strip() if isinstance(v,str) else "")' || true)
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v.strip() if isinstance(v,str) else "")' || echo "")
+          if [ -z "$ci_llm_base" ]; then
+            echo "::warning::Infisical CI_LLM_BASE_URL lookup returned empty (or transport failed); falling back to google/gemini-3.1-flash-lite"
+          fi
           while [ "${ci_llm_base%/}" != "$ci_llm_base" ]; do ci_llm_base="${ci_llm_base%/}"; done
           ci_llm_health=000
           url_re='^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)*$'

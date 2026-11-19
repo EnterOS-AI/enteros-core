@@ -275,12 +275,12 @@ jobs:
           TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
             -H 'Content-Type: application/json' \
             -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")' || echo "")
           [ -n "$TOK" ] || { echo "::error::Infisical login returned empty accessToken"; exit 1; }
           read_secret() {
             curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=${3:-prod}&secretPath=$2" \
               -H "Authorization: Bearer $TOK" \
-              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")' || echo ""
           }
           MINIMAX_API_KEY=""; E2E_GEMINI_API_KEY=""
           # ci-llm is the default only while the gateway is up: the Spark is on
@@ -547,8 +547,22 @@ jobs:
           # STILL merge green. Pinned by test_concierge_lane_is_merge_blocking.py.
           E2E_EPHEMERAL_EXTRA_GATING: peer_visibility,concierge_creates_workspace,concierge_platform_agent
         run: |
-          bash tests/e2e/ephemeral_cp_happy_path.sh
+          # Stamp the arm BEFORE running the gate, not after.
+          #
+          # This step and the sentinel below answer two DIFFERENT questions.
+          # The sentinel asks "did any arm RUN?" — it exists to catch a job whose
+          # every step skipped and would otherwise post SUCCESS on a required
+          # context having proved nothing. It does NOT ask "did the gate PASS";
+          # this step's own exit code already answers that and fails the job.
+          #
+          # With the stamp after the command, `set -e` skipped it on any gate
+          # failure, so a genuine gate red ALSO printed "::error::NO ARM RAN.
+          # … Some `if:` condition is wrong" — sending the reader hunting a
+          # phantom workflow-conditional bug instead of reading the gate output
+          # directly above it. Never a false green (the step still failed), but
+          # misdirected diagnosis is expensive on this gate.
           echo "GATE_ARM=proof" >> "$GITHUB_ENV"
+          bash tests/e2e/ephemeral_cp_happy_path.sh
 
       # Atomic teardown: one `docker rm -fv` destroys the entire nested topology
       # (CP, PG, tenants, workspaces, volumes, networks, built images). A

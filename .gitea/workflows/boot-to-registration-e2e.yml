@@ -96,6 +96,11 @@ jobs:
       E2E_REGISTER_TIMEOUT_SECS: '300'
       E2E_A2A_TIMEOUT_SECS: '120'
       MOLECULE_CP_URL: ${{ vars.STAGING_CP_URL || 'https://staging-api.moleculesai.app' }}
+      # Required by the SSOT teardown helper (tests/e2e/lib/cp_purge_receipt.sh),
+      # which this job's harness now routes its tenant DELETE through. It refuses
+      # to run against any other backend rather than guessing — local-docker is
+      # the only active one. Declared here so the harness never has to assume it.
+      E2E_INFRA_BACKEND: local-docker
       # MOLECULE_ADMIN_TOKEN now arrives via $GITHUB_ENV from the "Fetch platform
       # runtime + admin token from KMS SSOT" step below (wave-B staging
       # consumers migration extends that same fetch). It is sourced from Infisical
@@ -136,14 +141,14 @@ jobs:
           TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
             -H 'Content-Type: application/json' \
             -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; v=json.load(sys.stdin).get("accessToken"); sys.stdout.write(v if isinstance(v,str) else "")')
+            | python3 -c 'import sys,json; v=json.load(sys.stdin).get("accessToken"); sys.stdout.write(v if isinstance(v,str) else "")' || echo "")
           if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
           read_secret() {
             curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=$2" \
               -H "Authorization: Bearer $TOK" \
               | python3 -c 'import sys,json; v=json.load(sys.stdin).get("secret",{}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) else "")'
           }
-          E2E_RUNTIME=$(read_secret MOLECULE_DEFAULT_RUNTIME %2Fshared%2Fcontrolplane%2Fllm)
+          E2E_RUNTIME=$(read_secret MOLECULE_DEFAULT_RUNTIME %2Fshared%2Fcontrolplane%2Fllm || echo "")
           if [ -z "$E2E_RUNTIME" ]; then
             echo "::error::Infisical returned empty for MOLECULE_DEFAULT_RUNTIME at staging /shared/controlplane/llm - a required boot gate must not run with an empty platform default runtime."
             exit 1
@@ -151,14 +156,14 @@ jobs:
           # Wave-B: staging CP admin bearer (CP_ADMIN_API_TOKEN @ staging
           # /shared/controlplane-admin) -> MOLECULE_ADMIN_TOKEN, replacing the
           # duplicated CP_STAGING_ADMIN_API_TOKEN Gitea Actions secret.
-          MOLECULE_ADMIN_TOKEN=$(read_secret CP_ADMIN_API_TOKEN %2Fshared%2Fcontrolplane-admin)
-          echo "::add-mask::$MOLECULE_ADMIN_TOKEN"
+          MOLECULE_ADMIN_TOKEN=$(read_secret CP_ADMIN_API_TOKEN %2Fshared%2Fcontrolplane-admin || echo "")
+          if [ -n "$MOLECULE_ADMIN_TOKEN" ]; then echo "::add-mask::$MOLECULE_ADMIN_TOKEN"; fi
           if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
             echo "::error::Infisical returned empty CP_ADMIN_API_TOKEN at staging /shared/controlplane-admin — failing closed."
             exit 1
           fi
           # The runtime id is not a secret, but mask defensively before export.
-          echo "::add-mask::$E2E_RUNTIME"
+          if [ -n "$E2E_RUNTIME" ]; then echo "::add-mask::$E2E_RUNTIME"; fi
           {
             echo "E2E_RUNTIME=$E2E_RUNTIME"
             echo "MOLECULE_ADMIN_TOKEN=$MOLECULE_ADMIN_TOKEN"

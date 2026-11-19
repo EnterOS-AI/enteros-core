@@ -74,7 +74,16 @@ jobs:
   #   3. Add "Lint forbidden hand-written mcp__ tool-id literals / scan" to the
   #      CI required-contexts set (and ci.yml all-required needs: list per the
   #      sentinel pattern) in a follow-up PR, with its own pool review.
-  # bp-exempt: advisory RFC #3285 §8 cheap-80% lint; not a branch-protection gate on introduction.
+  # NOT an exemption from branch protection. BP on main is
+  # `status_check_contexts: ['*']` (read from the API 2026-08-11): a wildcard
+  # matches every context on a commit it evaluates, so this job's
+  # (pull_request) status IS merge-blocking whenever it is red. The directive
+  # below is only a Tier 2g lint token recording that the context is not
+  # presence-required in `.gitea/required-contexts.txt`. See
+  # sweep-stale-e2e-orgs.yml for the outage this wording caused.
+  # bp-exempt: RFC #3285 §8 cheap-80% lint; not presence-required in
+  # required-contexts.txt. "Advisory" describes its INTENT, not its effect:
+  # under `['*']` a red here blocks the PR.
   scan:
     name: Scan for hand-written mcp__ tool-id literals
     runs-on: ubuntu-latest

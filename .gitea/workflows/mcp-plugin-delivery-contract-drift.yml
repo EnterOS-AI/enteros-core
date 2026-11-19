@@ -87,14 +87,22 @@ jobs:
           TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
             -H 'Content-Type: application/json' \
             -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")' || echo "")
+          if [ -z "$TOK" ]; then
+            # Reachable ONLY because the capture above now has a fallback. Without
+            # it the step died on curl's exit status and this diagnosis never
+            # printed - the log showed a raw JSONDecodeError from the python3 that
+            # was handed an empty stdin, which names the symptom, not the cause.
+            echo "::error::Infisical universal-auth login returned no accessToken (transport, DNS or auth failure reaching $BASE) - failing closed."
+            exit 1
+          fi
           read_secret() {
             curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
               -H "Authorization: Bearer $TOK" \
               | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
           }
-          AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils)
-          echo "::add-mask::$AUTO_SYNC_TOKEN"
+          AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils || echo "")
+          if [ -n "$AUTO_SYNC_TOKEN" ]; then echo "::add-mask::$AUTO_SYNC_TOKEN"; fi
           if [ -z "$AUTO_SYNC_TOKEN" ]; then
             echo "::error::Infisical returned empty for AUTO_SYNC_TOKEN at /shared/dev-utils"
             exit 1

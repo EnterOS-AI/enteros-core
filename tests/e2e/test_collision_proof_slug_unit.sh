@@ -296,6 +296,53 @@ test_boot_cell_prefix_18_degrades_to_uuid() {
 
 test_boot_cell_prefix_18_degrades_to_uuid || failed=$((failed+1))
 
+# The boot-cell harness prefix is now `e2e-cp455-<runtime>-` (22 chars for the
+# default claude-code runtime), not the bare 18-char `cp455-<runtime>-` above.
+# The `e2e-` head is load-bearing: sweep-stale-e2e-orgs reaps only e2e-/rt-e2e-,
+# the CP's IsEphemeral classifier keys on the same head, and the SSOT teardown
+# helper refuses a destructive DELETE for any slug outside that set — so the old
+# prefix put every leaked boot-cell org beyond the reach of all three. This
+# pins the LIVE prefix against the cap: 22 leaves 32-22-9 = 1 < 8 chars of
+# context budget, so the helper must degrade to the bare uuid anchor and land
+# the full slug at 30, inside the CP's ^[a-z][a-z0-9-]{2,31}$ ceiling.
+test_boot_cell_e2e_prefix_22_degrades_to_uuid() {
+  local runtime="claude-code"
+  local prefix="e2e-cp455-${runtime}-"   # 22 chars
+  local s
+  s="${prefix}$(make_collision_proof_slug_suffix "cp455-3607-1" ${#prefix})"
+  if ! assert_collision_proof_slug "$s"; then
+    echo "FAIL: test_boot_cell_e2e_prefix_22_degrades_to_uuid — slug '$s' (len=${#s}) failed assert_collision_proof_slug"
+    return 1
+  fi
+  if [ "${#s}" -gt 32 ]; then
+    echo "FAIL: test_boot_cell_e2e_prefix_22_degrades_to_uuid — slug '$s' is ${#s} chars (want <= 32)"
+    return 1
+  fi
+  if ! printf '%s' "$s" | grep -q "^e2e-cp455-claude-code-"; then
+    echo "FAIL: test_boot_cell_e2e_prefix_22_degrades_to_uuid — prefix not preserved in '$s'"
+    return 1
+  fi
+  if ! printf '%s' "$s" | grep -qE '^[a-z][a-z0-9-]{2,31}$'; then
+    echo "FAIL: test_boot_cell_e2e_prefix_22_degrades_to_uuid — slug '$s' does NOT match CP regex ^[a-z][a-z0-9-]{2,31}\$"
+    return 1
+  fi
+  # Every runtime in the live matrix must also fit — a longer runtime label is
+  # the one way this prefix could silently blow the cap.
+  local rt p t
+  for rt in claude-code hermes openclaw codex kimi-cli; do
+    p="e2e-cp455-${rt}-"
+    t="${p}$(make_collision_proof_slug_suffix "cp455-3607-1" ${#p})"
+    if [ "${#t}" -gt 32 ] || ! assert_collision_proof_slug "$t"; then
+      echo "FAIL: test_boot_cell_e2e_prefix_22_degrades_to_uuid — runtime '$rt' yields invalid/oversized slug '$t' (len=${#t})"
+      return 1
+    fi
+  done
+  echo "PASS: test_boot_cell_e2e_prefix_22_degrades_to_uuid (slug=$s, len=${#s})"
+  return 0
+}
+
+test_boot_cell_e2e_prefix_22_degrades_to_uuid || failed=$((failed+1))
+
 if [ "$failed" -gt 0 ]; then
   echo "FAILED: $failed test(s)"
   exit 1
