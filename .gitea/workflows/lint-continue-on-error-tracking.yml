@@ -124,15 +124,15 @@ jobs:
           TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
             -H 'Content-Type: application/json' \
             -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; v=json.load(sys.stdin).get("accessToken"); sys.stdout.write(v if isinstance(v,str) else "")')
+            | python3 -c 'import sys,json; v=json.load(sys.stdin).get("accessToken"); sys.stdout.write(v if isinstance(v,str) else "")' || echo "")
           if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
           read_secret() {
             curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
               -H "Authorization: Bearer $TOK" \
               | python3 -c 'import sys,json; v=json.load(sys.stdin).get("secret",{}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) else "")'
           }
-          DRIFT_BOT_TOKEN=$(read_secret DRIFT_BOT_TOKEN %2Fshared%2Fdrift-bot)
-          echo "::add-mask::$DRIFT_BOT_TOKEN"
+          DRIFT_BOT_TOKEN=$(read_secret DRIFT_BOT_TOKEN %2Fshared%2Fdrift-bot || echo "")
+          if [ -n "$DRIFT_BOT_TOKEN" ]; then echo "::add-mask::$DRIFT_BOT_TOKEN"; fi
           if [ -z "$DRIFT_BOT_TOKEN" ]; then
             echo "::error::Infisical returned empty DRIFT_BOT_TOKEN at prod /shared/drift-bot — failing closed."
             exit 1

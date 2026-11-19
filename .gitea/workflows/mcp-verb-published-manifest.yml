@@ -159,7 +159,7 @@ jobs:
           TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
             -H 'Content-Type: application/json' \
             -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; v=json.load(sys.stdin).get("accessToken"); sys.stdout.write(v if isinstance(v,str) else "")')
+            | python3 -c 'import sys,json; v=json.load(sys.stdin).get("accessToken"); sys.stdout.write(v if isinstance(v,str) else "")' || echo "")
           if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
 
           read_secret() {
@@ -168,8 +168,8 @@ jobs:
               | python3 -c 'import json,sys; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); print(v if isinstance(v,str) and v else "")'
           }
 
-          MCP_SERVER_READPKG_TOKEN=$(read_secret MCP_SERVER_READPKG_TOKEN %2Fshared%2Fcontrolplane)
-          echo "::add-mask::$MCP_SERVER_READPKG_TOKEN"
+          MCP_SERVER_READPKG_TOKEN=$(read_secret MCP_SERVER_READPKG_TOKEN %2Fshared%2Fcontrolplane || echo "")
+          if [ -n "$MCP_SERVER_READPKG_TOKEN" ]; then echo "::add-mask::$MCP_SERVER_READPKG_TOKEN"; fi
           if [ -z "$MCP_SERVER_READPKG_TOKEN" ]; then
             echo "::error::Infisical returned empty for MCP_SERVER_READPKG_TOKEN at /shared/controlplane (prod) — cannot resolve the published mcp-server manifest. Failing closed on a trusted context."
             exit 1

@@ -59,6 +59,21 @@ jobs:
     continue-on-error: false
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Find curl ... -w '%{http_code}' ... || echo "000" subshells
+      - name: Scan for both curl-capture defects
+        # Prints `checked: N` and treats N == 0 as an ERROR. A scanner that
+        # examined nothing reports OK and is indistinguishable from a clean
+        # tree; that is this platform's signature failure and it must not be
+        # reachable here.
         run: |
           python3 .gitea/scripts/lint-curl-status-capture.py
+      - name: Run lint-curl-status-capture unit tests
+        # These tests existed and NOTHING RAN THEM. `on.paths` already listed
+        # tests/test_lint_curl_status_capture.py, so the file looked wired up
+        # while every sibling lint workflow (setup-go-cache, schedule-budget,
+        # no-coe-on-required, ...) actually invokes its suite and this one did
+        # not. Verifying that a rule matches is one rung below verifying that
+        # it EXECUTES. The suite carries the pre-fix sweep-stale-e2e-orgs text
+        # as a fixture, so this step is what keeps that regression red.
+        run: |
+          python -m pip install --quiet pytest
+          python3 -m pytest tests/test_lint_curl_status_capture.py -q
