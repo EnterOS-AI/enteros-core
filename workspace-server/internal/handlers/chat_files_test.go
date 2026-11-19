@@ -243,6 +243,11 @@ func TestChatUpload_NoURL(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "not registered yet") {
 		t.Errorf("expected transient-state error message, got: %s", w.Body.String())
 	}
+	// A stable code and a Retry-After, so a client (the Light SDK) retries
+	// a restart window instead of failing on a bare 503 sentence.
+	if !strings.Contains(w.Body.String(), `"code":"WORKSPACE_NOT_READY"`) || w.Header().Get("Retry-After") != workspaceNotReadyRetryAfter {
+		t.Errorf("expected code WORKSPACE_NOT_READY and Retry-After %s, got %s (Retry-After %q)", workspaceNotReadyRetryAfter, w.Body.String(), w.Header().Get("Retry-After"))
+	}
 }
 
 // TestChatUpload_PollModeEmptyURL pins the 422 distinguisher: a

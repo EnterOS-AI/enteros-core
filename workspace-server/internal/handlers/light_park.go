@@ -4,14 +4,16 @@ package handlers
 // run now.
 //
 // PARK (open → parking → parked). The synchronous part (parkLight) checks the
-// agent, claims 'parking', reads the agent's schedule grid through the
-// schedules proxy, renders it, mints a run token and PUTs the set to the
-// control plane (C4), which writes one CronJob per schedule, suspended and
-// paused. The asynchronous part (finishLightPark) hibernates the agent through
-// the ordinary hibernate path and resumes the CronJobs; the control plane
-// answers 409 LIGHT_AGENT_AWAKE until the agent's pod has stopped, so the
-// resume is retried. Any refusal before the pod stops puts the agent back to
-// 'open' (its CronJobs are still paused) and revokes the token it minted.
+// agent, waits until the agent answers its schedule grid (an agent being
+// restarted does not, for a while; readAgentSchedulesWhenReachable), claims
+// 'parking', reads the grid through the schedules proxy, renders it, mints a
+// run token and PUTs the set to the control plane (C4), which writes one
+// CronJob per schedule, suspended and paused. The asynchronous part
+// (finishLightPark) hibernates the agent through the ordinary hibernate path
+// and resumes the CronJobs; the control plane answers 409 LIGHT_AGENT_AWAKE
+// until the agent's pod has stopped, so the resume is retried. Any refusal
+// before the pod stops puts the agent back to 'open' (its CronJobs are still
+// paused) and revokes the token it minted.
 //
 // OPEN (parked → opening → open). The CronJobs pause FIRST, while the agent is
 // still 'parked' and every wake path still refuses it; only then is 'opening'
@@ -122,17 +124,41 @@ func lightSecretPresent(ctx context.Context, workspaceID string) (bool, error) {
 // fit). fetchScheduleAPI's 1 MiB cap would truncate such a grid.
 const lightGridLimit = 8 << 20
 
-// errLightGridTooLarge: the agent's grid is over lightGridLimit.
-var errLightGridTooLarge = errors.New("the agent's schedule grid is over 8 MiB")
+var (
+	// errLightGridTooLarge: the agent's grid is over lightGridLimit.
+	errLightGridTooLarge = errors.New("the agent's schedule grid is over 8 MiB")
+	// errLightAgentUnreachable: the agent did not answer the read. It has no
+	// registered URL, the request failed in transport, or the agent answered
+	// 5xx, 408 or 429. That is an agent being restarted (its old pod stopping,
+	// the new one not registered or not serving yet), which a later try may
+	// reach; see readAgentSchedulesWhenReachable.
+	errLightAgentUnreachable = errors.New("the agent is not reachable")
+	// errLightGridUnreadable: the agent answered, but not with a schedule
+	// grid: another status, malformed JSON, or no "schedules" list.
+	errLightGridUnreadable = errors.New("the agent did not answer with a schedule grid")
+)
+
+// lightTransientAgentStatus reports whether a status the agent's schedules API
+// answered means "not now" rather than "not this": a 5xx (the runtime, or
+// something in front of it, is starting or stopping), 408 or 429.
+func lightTransientAgentStatus(status int) bool {
+	return status >= 500 || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests
+}
 
 // readAgentSchedules reads the agent's schedule grid from the runtime's
 // /internal/schedules through the same SSRF-safe client and inbound secret
-// as the schedules proxy (or the test seam).
+// as the schedules proxy (or the test seam). A failure wraps
+// errLightAgentUnreachable (worth another try), errLightGridUnreadable or
+// errLightGridTooLarge; anything else is core's own (a database read).
 func (h *WorkspaceHandler) readAgentSchedules(ctx context.Context, workspaceID string) ([]volumeEntry, error) {
 	if h.lightScheduleReader != nil {
 		return h.lightScheduleReader(ctx, workspaceID)
 	}
 	wsURL, secret, err := resolveScheduleFanoutTarget(ctx, workspaceID)
+	if errors.Is(err, errScheduleNoCallbackURL) {
+		// A restart clears the URL; the new pod registers it again.
+		return nil, fmt.Errorf("%w: %v", errLightAgentUnreachable, err)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -149,31 +175,168 @@ func (h *WorkspaceHandler) readAgentSchedules(ctx context.Context, workspaceID s
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errLightAgentUnreachable, err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, lightGridLimit+1))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: reading the answer: %v", errLightAgentUnreachable, err)
 	}
 	if len(body) > lightGridLimit {
 		return nil, errLightGridTooLarge
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("the schedules API answered %d", resp.StatusCode)
+		if lightTransientAgentStatus(resp.StatusCode) {
+			return nil, fmt.Errorf("%w: the schedules API answered %d", errLightAgentUnreachable, resp.StatusCode)
+		}
+		return nil, fmt.Errorf("%w: the schedules API answered %d", errLightGridUnreadable, resp.StatusCode)
 	}
 	var payload struct {
 		Schedules []volumeEntry `json:"schedules"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, fmt.Errorf("malformed schedule grid: %w", err)
+		return nil, fmt.Errorf("%w: malformed JSON: %v", errLightGridUnreadable, err)
 	}
 	if payload.Schedules == nil {
 		// A grid without the key is not an empty grid: parking on it would
 		// delete every CronJob.
-		return nil, errors.New(`the schedule grid has no "schedules" list`)
+		return nil, fmt.Errorf(`%w: no "schedules" list`, errLightGridUnreadable)
 	}
 	return payload.Schedules, nil
+}
+
+// How long a park waits for an agent that does not answer its schedule grid.
+// An agent being restarted is unreachable for a while (its old pod stops
+// within its 30 s grace; the new one boots and registers), and its status can
+// read online meanwhile (a heartbeat of the stopping pod; registry.go now
+// refuses that heartbeat's promotion out of provisioning, but the status of a
+// pod that is stopping stays online until the stop). The owner's park waits up
+// to lightAgentReadBudget, well inside the 100 s a proxy in front of core
+// allows a request; the monitor's parks (auto-park, refresh, a continued park)
+// wait lightMonitorAgentReadBudget, because a sweep serves other agents and
+// the refusal it records holds the agent back for the 10-minute error
+// back-off. The wait between tries starts at lightAgentReadFirstWait and
+// doubles up to lightAgentReadMaxWait. A park reads the grid twice, before its
+// parking claim (so an agent that does not answer is refused with nothing
+// changed) and after it (the grid it sends, read within
+// lightParkRecheckBudget).
+var (
+	lightAgentReadBudget        = time.Minute
+	lightMonitorAgentReadBudget = 5 * time.Second
+	lightParkRecheckBudget      = 10 * time.Second
+	lightAgentReadFirstWait     = time.Second
+	lightAgentReadMaxWait       = 8 * time.Second
+)
+
+// lightAgentReadMinTry is the shortest timeout one try gets: a try near the
+// end of the budget still has time to connect.
+const lightAgentReadMinTry = 2 * time.Second
+
+// The clock readAgentSchedulesWhenReachable waits with (test seams).
+var (
+	lightAgentReadNow   = time.Now
+	lightAgentReadSleep = sleepCtx
+)
+
+// lightAgentNotReadyRetryAfter is the Retry-After of LIGHT_AGENT_NOT_READY.
+const lightAgentNotReadyRetryAfter = "10"
+
+// lightAwake reports whether a status is one a park reads the agent in.
+func lightAwake(status string) bool {
+	return status == string(models.StatusOnline) || status == string(models.StatusDegraded)
+}
+
+// lightAgentNotReadyRefusal is the 409 for an agent that did not answer within
+// the wait: retryable, with Retry-After. status is its last known status.
+func lightAgentNotReadyRefusal(status string) *lightRefusal {
+	r := newLightRefusal(http.StatusConflict, "LIGHT_AGENT_NOT_READY",
+		"the agent is not reachable yet (it is starting or restarting); nothing was parked, retry shortly",
+		gin.H{"status": status})
+	r.RetryAfter = lightAgentNotReadyRetryAfter
+	return r
+}
+
+// lightAgentReadRefusal maps a failed read that another try cannot fix to the
+// park's refusal; nil for an agent that did not answer (the caller retries).
+func lightAgentReadRefusal(workspaceID string, err error) *lightRefusal {
+	switch {
+	case errors.Is(err, errLightAgentUnreachable):
+		return nil
+	case errors.Is(err, errLightGridTooLarge):
+		return newLightRefusal(http.StatusRequestEntityTooLarge, "LIGHT_TOO_LARGE",
+			"the agent's schedules are over 8 MiB; shorten prompts or remove schedules", nil)
+	case errors.Is(err, errLightGridUnreadable):
+		log.Printf("light op=park ws=%s: the agent's schedule grid is unreadable: %v", workspaceID, err)
+		return newLightRefusal(http.StatusUnprocessableEntity, "LIGHT_SCHEDULES_UNREADABLE",
+			"the agent answered, but not with a list of schedules; it stays open", nil)
+	}
+	log.Printf("light op=park ws=%s: reading the schedule grid failed: %v", workspaceID, err)
+	return newLightRefusal(http.StatusInternalServerError, "LIGHT_FAILED", "failed to read the agent's schedules", nil)
+}
+
+// readAgentSchedulesWhenReachable reads the agent's grid, trying again with
+// backoff for up to budget while the agent does not answer
+// (errLightAgentUnreachable). Before each further try it reads the workspace
+// again: a deleted workspace ends the wait with 404 WORKSPACE_NOT_FOUND, an
+// agent no longer online with 409 LIGHT_AGENT_NOT_AWAKE (status), a light_state
+// other than wantState with 409 LIGHT_TRANSITION_IN_PROGRESS, and, before the
+// parking claim (wantState open), an agent that took a task with 409
+// LIGHT_AGENT_BUSY. An agent that still does not answer is 409
+// LIGHT_AGENT_NOT_READY with Retry-After. status is the agent's status as the
+// caller read it.
+func (h *WorkspaceHandler) readAgentSchedulesWhenReachable(ctx context.Context, workspaceID, wantState, status string, budget time.Duration) ([]volumeEntry, *lightRefusal) {
+	start := lightAgentReadNow()
+	deadline := start.Add(budget)
+	wait := lightAgentReadFirstWait
+	for try := 1; ; try++ {
+		tryFor := deadline.Sub(lightAgentReadNow())
+		if tryFor < lightAgentReadMinTry {
+			tryFor = lightAgentReadMinTry
+		}
+		tctx, cancel := context.WithTimeout(ctx, tryFor)
+		grid, err := h.readAgentSchedules(tctx, workspaceID)
+		cancel()
+		if err == nil {
+			if try > 1 {
+				log.Printf("light op=park ws=%s: the agent answered its schedule grid on try %d, after %s", workspaceID, try, lightAgentReadNow().Sub(start).Round(time.Millisecond))
+			}
+			return grid, nil
+		}
+		if ref := lightAgentReadRefusal(workspaceID, err); ref != nil {
+			return nil, ref
+		}
+		if ctx.Err() != nil || lightAgentReadNow().Add(wait).After(deadline) {
+			log.Printf("light op=park ws=%s status=%s: the agent did not answer its schedule grid in %d tries over %s: %v",
+				workspaceID, status, try, lightAgentReadNow().Sub(start).Round(time.Millisecond), err)
+			return nil, lightAgentNotReadyRefusal(status)
+		}
+		log.Printf("light op=park ws=%s status=%s: the agent did not answer its schedule grid (try %d): %v; trying again in %s",
+			workspaceID, status, try, err, wait)
+		if !lightAgentReadSleep(ctx, wait) {
+			return nil, lightAgentNotReadyRefusal(status)
+		}
+		if wait *= 2; wait > lightAgentReadMaxWait {
+			wait = lightAgentReadMaxWait
+		}
+		row, err := loadLightWorkspace(ctx, workspaceID)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return nil, newLightRefusal(http.StatusNotFound, "WORKSPACE_NOT_FOUND", "workspace not found", nil)
+		case err != nil:
+			log.Printf("light op=park ws=%s: workspace lookup failed: %v", workspaceID, err)
+			return nil, newLightRefusal(http.StatusInternalServerError, "LIGHT_FAILED", "failed to look up the workspace", nil)
+		case row.LightState != wantState:
+			return nil, newLightRefusal(http.StatusConflict, "LIGHT_TRANSITION_IN_PROGRESS",
+				"another Light operation on this agent is in progress; retry shortly", gin.H{"light_state": row.LightState})
+		case !lightAwake(row.Status):
+			return nil, newLightRefusal(http.StatusConflict, "LIGHT_AGENT_NOT_AWAKE",
+				"only an online agent can be parked; wait until it is online", gin.H{"status": row.Status})
+		case wantState == models.LightOpen && (row.ActiveTasks > 0 || row.IsBusy):
+			return nil, newLightRefusal(http.StatusConflict, "LIGHT_AGENT_BUSY",
+				"the agent is working on a task; park it once it is idle", gin.H{"active_tasks": row.ActiveTasks, "is_busy": row.IsBusy})
+		}
+		status = row.Status
+	}
 }
 
 // loadLightScheduleRows reads the stored set of the last park.
@@ -474,7 +637,7 @@ func (h *WorkspaceHandler) parkLight(ctx context.Context, c *gin.Context, worksp
 		log.Printf("light op=park ws=%s: workspace lookup failed: %v", workspaceID, err)
 		return res, newLightRefusal(http.StatusInternalServerError, "LIGHT_FAILED", "failed to look up the workspace", nil)
 	}
-	awake := row.Status == string(models.StatusOnline) || row.Status == string(models.StatusDegraded)
+	awake := lightAwake(row.Status)
 	continuing := false
 	switch row.LightState {
 	case "":
@@ -519,8 +682,19 @@ func (h *WorkspaceHandler) parkLight(ctx context.Context, c *gin.Context, worksp
 		return res, ref
 	}
 
+	// How long the park waits for an agent that does not answer (see
+	// lightAgentReadBudget): c is the owner's request, nil for the monitor.
+	budget := lightMonitorAgentReadBudget
+	if c != nil {
+		budget = lightAgentReadBudget
+	}
 	watermark := row.ParkWatermark
 	if !continuing {
+		// The agent must answer before anything is claimed, so an agent that
+		// is restarting is refused with nothing changed.
+		if _, ref := h.readAgentSchedulesWhenReachable(ctx, workspaceID, models.LightOpen, row.Status, budget); ref != nil {
+			return res, ref
+		}
 		wm, claimed, err := h.claimLightParking(ctx, workspaceID, trig)
 		if err != nil {
 			return res, newLightRefusal(http.StatusInternalServerError, "LIGHT_FAILED", "failed to start the park", nil)
@@ -530,17 +704,13 @@ func (h *WorkspaceHandler) parkLight(ctx context.Context, c *gin.Context, worksp
 				"another Light operation on this agent is in progress; retry shortly", nil)
 		}
 		watermark = wm
+		budget = lightParkRecheckBudget
 	}
 
-	grid, err := h.readAgentSchedules(ctx, workspaceID)
-	if errors.Is(err, errLightGridTooLarge) {
-		return undo(newLightRefusal(http.StatusRequestEntityTooLarge, "LIGHT_TOO_LARGE",
-			"the agent's schedules are over 8 MiB; shorten prompts or remove schedules", nil))
-	}
-	if err != nil {
-		log.Printf("light op=park ws=%s: reading the schedule grid failed: %v", workspaceID, err)
-		return undo(newLightRefusal(http.StatusBadGateway, "LIGHT_SCHEDULES_UNREADABLE",
-			"the agent's schedules could not be read; it stays open", nil))
+	// The grid this park sends, read after the claim.
+	grid, ref := h.readAgentSchedulesWhenReachable(ctx, workspaceID, models.LightParking, row.Status, budget)
+	if ref != nil {
+		return undo(ref)
 	}
 	stored, err := loadLightScheduleRows(ctx, workspaceID)
 	if err != nil {
@@ -779,7 +949,7 @@ func (h *WorkspaceHandler) openLight(ctx context.Context, workspaceID string, tr
 		return nil, true, row.LightState, nil
 	case models.LightParking:
 		stuck := row.StateAt.Valid && time.Since(row.StateAt.Time) >= lightParkStuckOpenAfter
-		awake := row.Status == string(models.StatusOnline) || row.Status == string(models.StatusDegraded)
+		awake := lightAwake(row.Status)
 		recoverable := awake || row.Status == string(models.StatusHibernated)
 		if !stuck || !recoverable {
 			return nil, false, "", newLightRefusal(http.StatusConflict, "LIGHT_TRANSITION_IN_PROGRESS",
