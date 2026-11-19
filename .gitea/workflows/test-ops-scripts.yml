@@ -31,6 +31,7 @@ on:
     branches: [main, staging]
     paths:
       - 'scripts/**'
+      - 'docker-compose*.yml'
       - '.gitea/scripts/**'
       # #4322: test_managed_flags_wiring.py asserts every workflow STEP rolling the
       # staging fleet wires STAGING_TENANT_FLAGS in — so ALL workflow files must run it,
@@ -65,10 +66,14 @@ on:
       # test_deploy_comment_accuracy.py; changes to either harness must run it.
       - 'tests/e2e/test_staging_concierge_creates_workspace_e2e.sh'
       - 'tests/e2e/test_staging_full_saas.sh'
+      # test_dind_self_reaping.py drives the per-job dind harness; a PR editing only
+      # the harness must still run the guard that pins its self-reaping.
+      - 'tests/harness/dind.sh'
   pull_request:
     branches: [main, staging]
     paths:
       - 'scripts/**'
+      - 'docker-compose*.yml'
       - '.gitea/scripts/**'
       # #4322: test_managed_flags_wiring.py asserts every workflow STEP rolling the
       # staging fleet wires STAGING_TENANT_FLAGS in — so ALL workflow files must run it,
@@ -103,6 +108,9 @@ on:
       # test_deploy_comment_accuracy.py; changes to either harness must run it.
       - 'tests/e2e/test_staging_concierge_creates_workspace_e2e.sh'
       - 'tests/e2e/test_staging_full_saas.sh'
+      # test_dind_self_reaping.py drives the per-job dind harness; a PR editing only
+      # the harness must still run the guard that pins its self-reaping.
+      - 'tests/harness/dind.sh'
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
@@ -213,6 +221,13 @@ jobs:
         # the logic into ci.yml) fails CI.
         run: bash .gitea/scripts/tests/test_all_required_check.sh
 
+      - name: E2E HTTP diagnostic sanitizer contract
+        # This required context runs for the E2E/workflow path shape changed by
+        # the redaction PR. Keep the behavioral test here as well as in ci.yml
+        # so a path-classifier decision cannot leave credential diagnostics
+        # locally green but unexecuted on the pull request.
+        run: python3 tests/e2e/test_sanitize_http_body.py
+
       - name: clone-manifest.sh tolerant-bootstrap contract (network-free)
         # Regression lock for the strict/best-effort split in clone-manifest.sh:
         # tokenless dev bootstrap must skip ONLY `private: true` repos and still
@@ -242,3 +257,8 @@ jobs:
         # usable, so dev-start.sh must wait for that path before starting
         # Langfuse and must not print the ready banner until Langfuse HTTP works.
         run: bash scripts/test-dev-start-langfuse-readiness.sh
+
+      - name: dev-start.sh platform startup behavior
+        run: |
+          node --test scripts/test-dev-port.cjs
+          bash scripts/test-dev-start-platform.sh

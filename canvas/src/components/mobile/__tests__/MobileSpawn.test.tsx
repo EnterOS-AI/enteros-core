@@ -139,7 +139,7 @@ describe("MobileSpawn — render", () => {
     apiGetSpy.mockResolvedValue(mockTemplates);
     render(<MobileSpawn dark={true} onClose={vi.fn()} />);
     const spawnBtn = Array.from(
-      document.querySelectorAll("button"),
+      document.querySelectorAll<HTMLButtonElement>("button"),
     ).find((b) => b.textContent?.includes("Spawn agent"));
     expect(spawnBtn).toBeTruthy();
   });
@@ -147,7 +147,7 @@ describe("MobileSpawn — render", () => {
   it("renders close button", () => {
     apiGetSpy.mockResolvedValue(mockTemplates);
     render(<MobileSpawn dark={true} onClose={vi.fn()} />);
-    const closeBtn = document.querySelector('button[aria-label="Close"]');
+    const closeBtn = document.querySelector<HTMLButtonElement>('button[aria-label="Close"]');
     expect(closeBtn).toBeTruthy();
   });
 });
@@ -160,9 +160,9 @@ describe("MobileSpawn — interaction", () => {
     const onClose = vi.fn();
     render(<MobileSpawn dark={true} onClose={onClose} />);
     await vi.waitFor(() => {
-      expect(document.querySelector('button[aria-label="Close"]')).toBeTruthy();
+      expect(document.querySelector<HTMLButtonElement>('button[aria-label="Close"]')).toBeTruthy();
     });
-    document.querySelector('button[aria-label="Close"]')!.click();
+    document.querySelector<HTMLButtonElement>('button[aria-label="Close"]')!.click();
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
@@ -175,11 +175,8 @@ describe("MobileSpawn — interaction", () => {
     });
     // Click on the outer dim backdrop (the dialog's outer div)
     const dialog = container.querySelector('[role="dialog"]')!;
-    dialog.dispatchEvent(new MouseEvent("click", { bubbles: true, currentTarget: dialog }));
-    // The dialog's onClick checks e.target === e.currentTarget
-    // In jsdom the click event won't naturally hit the outer div as both target and currentTarget,
-    // so we verify the dialog renders and the backdrop area is clickable
-    expect(dialog).toBeTruthy();
+    dialog.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 
   it("POST /workspaces with correct payload on spawn", async () => {
@@ -198,7 +195,7 @@ describe("MobileSpawn — interaction", () => {
 
     // Click spawn
     const spawnBtn = Array.from(
-      document.querySelectorAll("button"),
+      document.querySelectorAll<HTMLButtonElement>("button"),
     ).find((b) => b.textContent?.includes("Spawn agent"))!;
     spawnBtn.click();
 
@@ -220,7 +217,7 @@ describe("MobileSpawn — interaction", () => {
     });
 
     const spawnBtn = Array.from(
-      document.querySelectorAll("button"),
+      document.querySelectorAll<HTMLButtonElement>("button"),
     ).find((b) => b.textContent?.includes("Spawn agent"))!;
     spawnBtn.click();
 
@@ -240,7 +237,7 @@ describe("MobileSpawn — interaction", () => {
     });
 
     const spawnBtn = Array.from(
-      document.querySelectorAll("button"),
+      document.querySelectorAll<HTMLButtonElement>("button"),
     ).find((b) => b.textContent?.includes("Spawn agent"))!;
     spawnBtn.click();
 
@@ -259,13 +256,13 @@ describe("MobileSpawn — interaction", () => {
 
     // Default tier is T2 (Standard). Click T4 (Full Access).
     const t4Btn = Array.from(
-      document.querySelectorAll("button"),
+      document.querySelectorAll<HTMLButtonElement>("button"),
     ).find((b) => b.textContent?.includes("Full Access"))!;
     fireEvent.click(t4Btn);
 
     // Spawn with T4
     const spawnBtn = Array.from(
-      document.querySelectorAll("button"),
+      document.querySelectorAll<HTMLButtonElement>("button"),
     ).find((b) => b.textContent?.includes("Spawn agent"))!;
     spawnBtn.click();
 

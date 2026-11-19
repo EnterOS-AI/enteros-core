@@ -931,6 +931,20 @@ func TestApplyRuntimeModelEnv_SetsUniversalMODELForAllRuntimes(t *testing.T) {
 			wantHermesDefault: "minimax/MiniMax-M2.7",
 		},
 		{
+			name:              "hermes: BYOK selection projects to native syntax without changing canonical model",
+			runtime:           "hermes",
+			model:             "minimax:MiniMax-M2.7-highspeed",
+			wantMODEL:         "minimax:MiniMax-M2.7-highspeed",
+			wantHermesDefault: "minimax/MiniMax-M2.7-highspeed",
+		},
+		{
+			name:              "hermes: restart projects persisted BYOK model to native syntax",
+			runtime:           "hermes",
+			moleculeModelEnv:  "minimax:MiniMax-M2.7-highspeed",
+			wantMODEL:         "minimax:MiniMax-M2.7-highspeed",
+			wantHermesDefault: "minimax/MiniMax-M2.7-highspeed",
+		},
+		{
 			name:      "claude-code: picked model populates MODEL + MOLECULE_MODEL (no vendor-specific name)",
 			runtime:   "claude-code",
 			model:     "anthropic:claude-opus-4-7",

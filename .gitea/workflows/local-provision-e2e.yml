@@ -113,6 +113,11 @@ jobs:
       # hostnames (ws-<id>:8000). Force false so the proxy keeps using the
       # host-mapped 127.0.0.1:<ephemeral_port> URL, which IS reachable.
       MOLECULE_IN_DOCKER: false
+      # The platform this job starts provisions ws-<id> containers on the shared
+      # host daemon. Production keeps them unless-stopped; here one that outlives
+      # the run must exit once and stay collectable, not crash-loop on the runner
+      # host (RC09).
+      MOLECULE_WORKSPACE_RESTART_POLICY: "no"
       # core#5031: this job tags a STUB over
       # molecule-local/workspace-template-claude-code:<template-HEAD-sha>-<arch>
       # (+ :latest) — a name derived entirely from the world, so every process on
@@ -231,7 +236,16 @@ jobs:
           refs=$(grep -hoE 'image: [^ ]+@sha256:[a-f0-9]{64}' docker-compose.yml docker-compose.infra.yml | sed 's/^image: //' | sort -u)
           rc=0
           for ref in $refs; do
-            plats=$(docker buildx imagetools inspect "$ref" 2>/dev/null | grep -E '^[[:space:]]+Platform:' | awk '{print $2}')
+            # Inspect failures are caught explicitly. Previously, under the
+            # runner's `set -e -o pipefail`, an image that could not be
+            # inspected (removed upstream, auth wall) killed this step inside
+            # the `plats=$(...)` assignment with NO message (core#5208).
+            if ! out=$(docker buildx imagetools inspect "$ref" 2>&1); then
+              echo "::error::CANNOT INSPECT: $ref — $(printf '%s' "$out" | tail -1)"
+              rc=1
+              continue
+            fi
+            plats=$(printf '%s\n' "$out" | grep -E '^[[:space:]]+Platform:' | awk '{print $2}' || true)
             if ! printf '%s\n' "$plats" | grep -qx 'linux/amd64' \
                || ! printf '%s\n' "$plats" | grep -q '^linux/arm64'; then
               echo "::error::NOT MULTI-ARCH: $ref [$(printf '%s' "$plats" | tr '\n' ' ')]"
@@ -244,10 +258,10 @@ jobs:
 
       - name: Start Postgres (docker, ephemeral host port)
         run: |
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$PG_CONTAINER" \
+          # tmpfs PGDATA + run label + `rm -fv` pre-clean: see the script header.
+          bash .gitea/scripts/ci-service-container.sh postgres "$PG_CONTAINER" postgres:16 \
             -e POSTGRES_USER=dev -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=molecule \
-            -p 127.0.0.1::5432 postgres:16 >/dev/null
+            -p 127.0.0.1::5432 >/dev/null
           PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           [ -z "$PG_PORT" ] && PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | head -1 | awk -F: '{print $NF}')
           if [ -z "$PG_PORT" ]; then echo "::error::no host port for $PG_CONTAINER"; docker logs "$PG_CONTAINER" || true; exit 1; fi
@@ -260,8 +274,7 @@ jobs:
 
       - name: Start Redis (docker, ephemeral host port)
         run: |
-          docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$REDIS_CONTAINER" -p 127.0.0.1::6379 redis:7 >/dev/null
+          bash .gitea/scripts/ci-service-container.sh redis "$REDIS_CONTAINER" redis:7 -p 127.0.0.1::6379 >/dev/null
           REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           [ -z "$REDIS_PORT" ] && REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | head -1 | awk -F: '{print $NF}')
           if [ -z "$REDIS_PORT" ]; then echo "::error::no host port for $REDIS_CONTAINER"; docker logs "$REDIS_CONTAINER" || true; exit 1; fi
@@ -419,11 +432,43 @@ jobs:
         run: |
           [ -f workspace-server/platform.pid ] && kill "$(cat workspace-server/platform.pid)" 2>/dev/null || true
 
+      - name: Remove this run's workspace containers + volumes (platform-instance scoped)
+        # Positive identity, like the manifest teardown below, but for every
+        # container THIS run's platform provisioned — including ones no manifest
+        # knows about (a provision that raced a delete, RC09). They carry
+        # molecule.platform.instance=sha256(DATABASE_URL)[:16]; the DSN holds this
+        # run's own ephemeral PG port, so a concurrent run's workspaces never
+        # match. The listing is inside the reviewed script, filtered by that
+        # label only (test_ws_orphan_reap.py); this workflow still lists nothing.
+        # Volumes are derived from the containers (the bind-created ones carry no
+        # labels), so this runs BEFORE the manifest teardown removes them.
+        if: always()
+        run: |
+          if [ -z "${DATABASE_URL:-}" ]; then
+            echo "No DATABASE_URL — the platform never started; nothing to remove."
+            exit 0
+          fi
+          # "Stop platform" only signals it. Wait (bounded) until our own server
+          # has exited, so nothing it is still doing creates a container after
+          # the listing below. Not `kill -0`: the pid is the `timeout` wrapper,
+          # reparented to the job container's PID 1 (`sleep`, which reaps
+          # nothing), so once it exits it stays a zombie that `kill -0` still
+          # finds and the loop always ran its full 30s. Read the state instead.
+          PID="$(cat workspace-server/platform.pid 2>/dev/null || true)"
+          for _ in $(seq 1 30); do
+            [ -n "$PID" ] || break
+            st="$(awk '/^State:/ {print $2}' "/proc/$PID/status" 2>/dev/null || true)"
+            case "$st" in ''|Z|X) break ;; esac
+            sleep 1
+          done
+          bash .gitea/scripts/ws-orphan-reap.sh instance "$DATABASE_URL" \
+            || echo "::warning::instance-scoped workspace teardown did not complete — see above"
+
       - name: Stop service containers
         if: always()
         run: |
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$REDIS_CONTAINER" 2>/dev/null || true
 
       - name: Teardown OUR ws-* workspace containers (positive identity, #2883 / #4346)
         if: always()
@@ -460,6 +505,7 @@ jobs:
             [ -n "$wsid" ] || continue
             echo "removing our workspace container: ws-${wsid}"
             docker rm -f "ws-${wsid}" >/dev/null 2>&1 || true
+            docker volume rm -f "ws-${wsid}-configs" "ws-${wsid}-claude-sessions" "ws-${wsid}-workspace" >/dev/null 2>&1 || true
             removed=$((removed + 1))
           done < "$MANIFEST"
           echo "ws-* teardown removed $removed of $(wc -l < "$MANIFEST" | tr -d ' ') owned container(s)."
@@ -513,6 +559,25 @@ jobs:
     if: ${{ always() }}
     timeout-minutes: 30
     env:
+      # LLM UPSTREAM SWITCH, the same switch as the happy path's.
+      #   `ci-llm` (owner decision 2026-11-18, the default): the workspace is
+      #     pointed at the CI LLM gateway (Infisical /shared/ci-llm; an
+      #     ANTHROPIC_BASE_URL secret, which the claude-code adapter honours over its
+      #     minimax default), so the lane makes its real model call again. When the
+      #     gateway's GET /health is not 200 at job start the run falls back to
+      #     `gemini` by itself, and the KMS step says so (log, ::notice::, step
+      #     summary).
+      #   `gemini` (2026-11-17): this lane has no platform proxy, and its BYOK
+      #     claude-code workspace speaks only the Anthropic protocol, which Google AI
+      #     Studio does not serve, so it cannot reach Gemini. The real template image
+      #     still provisions, boots, survives a restart and answers through the
+      #     proxy, with no model call (LIFECYCLE_LLM=none, one assertion fewer). The
+      #     Gemini round trip is the ephemeral happy path's, through the CP proxy.
+      #     No key is read.
+      #   `vendor`: the real MiniMax key and api.minimax.io, as before.
+      # Later steps read the mode actually used, E2E_LLM_UPSTREAM_USED (set by the
+      # KMS step), falling back to this requested value when that step did not run.
+      E2E_LLM_UPSTREAM: ci-llm
       PG_CONTAINER: pg-lpe2e-real-${{ github.run_id }}-${{ github.run_attempt }}
       REDIS_CONTAINER: redis-lpe2e-real-${{ github.run_id }}-${{ github.run_attempt }}
       # Hard-code dev mode at the job level so the platform server ALWAYS sees it,
@@ -526,6 +591,11 @@ jobs:
       # host-network platform cannot resolve. Leave MOLECULE_IN_DOCKER=false so
       # the proxy uses the host-mapped port directly (same as lifecycle-stub).
       MOLECULE_IN_DOCKER: false
+      # The platform this job starts provisions ws-<id> containers on the shared
+      # host daemon. Production keeps them unless-stopped; here one that outlives
+      # the run must exit once and stay collectable, not crash-loop on the runner
+      # host (RC09).
+      MOLECULE_WORKSPACE_RESTART_POLICY: "no"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -593,7 +663,55 @@ jobs:
             echo "::error::Infisical login returned success with an empty accessToken — misconfiguration, failing closed."
             exit 1
           fi
-          SECRET_BODY=$(curl -fsS --max-time 30 "$BASE/api/v3/secrets/raw/MINIMAX_API_KEY?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=%2Fshared%2Fcontrolplane" \
+          # ci-llm is the default only while the gateway is up: the Spark is on
+          # Wi-Fi and can be down. Its health is checked once, here, at job start;
+          # a gateway that is not answering 200 sends this run to gemini.
+          upstream="${E2E_LLM_UPSTREAM:-vendor}"
+          upstream_note=""
+          if [ "$upstream" = "ci-llm" ]; then
+            URL_BODY=$(curl -fsS --max-time 30 "$BASE/api/v3/secrets/raw/CI_LLM_BASE_URL?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=%2Fshared%2Fci-llm" \
+              -H "Authorization: Bearer $TOK") || URL_RC=$?
+            if [ "${URL_RC:-0}" -ne 0 ]; then
+              echo "::warning::Infisical secret read unreachable (curl rc=${URL_RC}) — external dependency, recording a transient."
+              echo "infisical-unreachable read_curl_rc=${URL_RC}" >> "$TRANSIENT_LEDGER"
+              exit 0
+            fi
+            LLM_BASE=$(printf '%s' "$URL_BODY" | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+            while [ "${LLM_BASE%/}" != "$LLM_BASE" ]; do LLM_BASE="${LLM_BASE%/}"; done
+            # Strict https only: the workspace sends the gateway key with every
+            # call, and the value lands in $GITHUB_ENV.
+            # Whole-string match ([[ =~ ]], not grep -x, which passes a value whose
+            # FIRST line matches and smuggles a second line into $GITHUB_ENV).
+            url_re='^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)*$'
+            if ! [[ $LLM_BASE =~ $url_re ]]; then
+              echo "::error::E2E_LLM_UPSTREAM=ci-llm but Infisical staging /shared/ci-llm CI_LLM_BASE_URL is empty or not a plain https URL — failing closed."
+              exit 1
+            fi
+            health=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$LLM_BASE/health" 2>/dev/null || true)
+            if [ "$health" != "200" ]; then
+              upstream=gemini
+              upstream_note=" (fallback: the CI LLM gateway's /health answered ${health:-000})"
+            fi
+          fi
+          echo "E2E_LLM_UPSTREAM_USED=$upstream" >> "$GITHUB_ENV"
+          echo "::notice::local-provision LLM upstream used: ${upstream}${upstream_note} (requested ${E2E_LLM_UPSTREAM:-vendor})"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            echo "**local-provision LLM upstream:** \`${upstream}\`${upstream_note} (requested \`${E2E_LLM_UPSTREAM:-vendor}\`)" >> "$GITHUB_STEP_SUMMARY" || true
+          fi
+          case "$upstream" in
+            gemini)
+              echo "LLM upstream: none on this lane in gemini mode (real image, no model call); no key read."
+              exit 0
+              ;;
+            ci-llm)
+              SECRET_KEY=CI_LLM_API_KEY; SECRET_PATH=%2Fshared%2Fci-llm
+              echo "LIFECYCLE_ANTHROPIC_BASE_URL=${LLM_BASE}/anthropic" >> "$GITHUB_ENV"
+              echo "LLM upstream: CI LLM gateway (${LLM_BASE})"
+              ;;
+            vendor) SECRET_KEY=MINIMAX_API_KEY; SECRET_PATH=%2Fshared%2Fcontrolplane ;;
+            *) echo "::error::unknown E2E_LLM_UPSTREAM=${E2E_LLM_UPSTREAM} (want gemini, ci-llm or vendor)"; exit 1 ;;
+          esac
+          SECRET_BODY=$(curl -fsS --max-time 30 "$BASE/api/v3/secrets/raw/$SECRET_KEY?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=$SECRET_PATH" \
             -H "Authorization: Bearer $TOK") || READ_RC=$?
           READ_RC=${READ_RC:-0}
           if [ "$READ_RC" -ne 0 ]; then
@@ -604,7 +722,7 @@ jobs:
           MINIMAX_API_KEY=$(printf '%s' "$SECRET_BODY" | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")')
           echo "::add-mask::$MINIMAX_API_KEY"
           if [ -z "$MINIMAX_API_KEY" ]; then
-            echo "::error::Infisical returned empty MINIMAX_API_KEY at staging /shared/controlplane — failing closed."
+            echo "::error::Infisical returned an empty $SECRET_KEY at staging $SECRET_PATH — failing closed."
             exit 1
           fi
           echo "MINIMAX_API_KEY=$MINIMAX_API_KEY" >> "$GITHUB_ENV"
@@ -660,10 +778,10 @@ jobs:
 
       - name: Start Postgres (docker, ephemeral host port)
         run: |
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$PG_CONTAINER" \
+          # tmpfs PGDATA + run label + `rm -fv` pre-clean: see the script header.
+          bash .gitea/scripts/ci-service-container.sh postgres "$PG_CONTAINER" postgres:16 \
             -e POSTGRES_USER=dev -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=molecule \
-            -p 127.0.0.1::5432 postgres:16 >/dev/null
+            -p 127.0.0.1::5432 >/dev/null
           PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           [ -z "$PG_PORT" ] && PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | head -1 | awk -F: '{print $NF}')
           if [ -z "$PG_PORT" ]; then echo "::error::no host port"; docker logs "$PG_CONTAINER" || true; exit 1; fi
@@ -676,8 +794,7 @@ jobs:
 
       - name: Start Redis (docker, ephemeral host port)
         run: |
-          docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$REDIS_CONTAINER" -p 127.0.0.1::6379 redis:7 >/dev/null
+          bash .gitea/scripts/ci-service-container.sh redis "$REDIS_CONTAINER" redis:7 -p 127.0.0.1::6379 >/dev/null
           REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           [ -z "$REDIS_PORT" ] && REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | head -1 | awk -F: '{print $NF}')
           if [ -z "$REDIS_PORT" ]; then echo "::error::no host port"; docker logs "$REDIS_CONTAINER" || true; exit 1; fi
@@ -795,7 +912,8 @@ jobs:
           # having asserted nothing. That was harmless while the job was masked;
           # now that the lane gates, the guard step below turns any such
           # zero-assertion exit into a loud, named red.
-          LIFECYCLE_LLM: minimax
+          # gemini mode: `none` (real image, no model call; see the job env).
+          LIFECYCLE_LLM: ${{ (env.E2E_LLM_UPSTREAM_USED || env.E2E_LLM_UPSTREAM) != 'gemini' && 'minimax' || 'none' }}
           # The script appends every workspace id it provisions here, so the teardown can
           # delete OUR containers and only ours. See #4346 — this is the job whose live
           # container a concurrent run's teardown deleted mid-restart.
@@ -850,7 +968,9 @@ jobs:
           TRANSIENT_LEDGER: /tmp/lpe2e_transient_${{ github.run_id }}_${{ github.run_attempt }}.txt
           # Floor, not equality: adding a 19th assertion to the e2e must not red
           # this. 18 is what every one of the 279 logs sampled 2026-08-01..09 printed.
-          E2E_MIN_ASSERTIONS: '18'
+          # gemini mode (LIFECYCLE_LLM=none) makes one assertion fewer: no
+          # result-envelope check on a model reply.
+          E2E_MIN_ASSERTIONS: ${{ (env.E2E_LLM_UPSTREAM_USED || env.E2E_LLM_UPSTREAM) != 'gemini' && '18' || '17' }}
           # Space-separated. EXTERNAL-unreachable signatures only.
           E2E_TRANSIENT_CLASSES: 'infisical-unreachable a2a-connect-timeout'
           E2E_TRANSIENT_BUDGET: '1'
@@ -985,11 +1105,43 @@ jobs:
         run: |
           [ -f workspace-server/platform.pid ] && kill "$(cat workspace-server/platform.pid)" 2>/dev/null || true
 
+      - name: Remove this run's workspace containers + volumes (platform-instance scoped)
+        # Positive identity, like the manifest teardown below, but for every
+        # container THIS run's platform provisioned — including ones no manifest
+        # knows about (a provision that raced a delete, RC09). They carry
+        # molecule.platform.instance=sha256(DATABASE_URL)[:16]; the DSN holds this
+        # run's own ephemeral PG port, so a concurrent run's workspaces never
+        # match. The listing is inside the reviewed script, filtered by that
+        # label only (test_ws_orphan_reap.py); this workflow still lists nothing.
+        # Volumes are derived from the containers (the bind-created ones carry no
+        # labels), so this runs BEFORE the manifest teardown removes them.
+        if: always()
+        run: |
+          if [ -z "${DATABASE_URL:-}" ]; then
+            echo "No DATABASE_URL — the platform never started; nothing to remove."
+            exit 0
+          fi
+          # "Stop platform" only signals it. Wait (bounded) until our own server
+          # has exited, so nothing it is still doing creates a container after
+          # the listing below. Not `kill -0`: the pid is the `timeout` wrapper,
+          # reparented to the job container's PID 1 (`sleep`, which reaps
+          # nothing), so once it exits it stays a zombie that `kill -0` still
+          # finds and the loop always ran its full 30s. Read the state instead.
+          PID="$(cat workspace-server/platform.pid 2>/dev/null || true)"
+          for _ in $(seq 1 30); do
+            [ -n "$PID" ] || break
+            st="$(awk '/^State:/ {print $2}' "/proc/$PID/status" 2>/dev/null || true)"
+            case "$st" in ''|Z|X) break ;; esac
+            sleep 1
+          done
+          bash .gitea/scripts/ws-orphan-reap.sh instance "$DATABASE_URL" \
+            || echo "::warning::instance-scoped workspace teardown did not complete — see above"
+
       - name: Stop service containers
         if: always()
         run: |
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$REDIS_CONTAINER" 2>/dev/null || true
 
       - name: Teardown OUR ws-* workspace containers (positive identity, #2883 / #4346)
         if: always()
@@ -1026,6 +1178,7 @@ jobs:
             [ -n "$wsid" ] || continue
             echo "removing our workspace container: ws-${wsid}"
             docker rm -f "ws-${wsid}" >/dev/null 2>&1 || true
+            docker volume rm -f "ws-${wsid}-configs" "ws-${wsid}-claude-sessions" "ws-${wsid}-workspace" >/dev/null 2>&1 || true
             removed=$((removed + 1))
           done < "$MANIFEST"
           echo "ws-* teardown removed $removed of $(wc -l < "$MANIFEST" | tr -d ' ') owned container(s)."

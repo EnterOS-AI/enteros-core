@@ -77,17 +77,23 @@ def test_each_endpoint_carries_its_own_infisical_env():
     ], rows
 
 
-def test_the_shipped_default_pairs_staging_api_with_the_staging_env():
-    """The exact regression: staging-api must NOT be paired with `prod`."""
-    r = _run([_default_endpoints()])
+def test_production_default_does_not_mutate_staging():
+    r = _run([_default_endpoints(), "--env", "prod"])
     assert r.returncode == 0, r.stderr
-    by_base = {row.split("\t")[1]: row.split("\t")[2] for row in r.stdout.strip().splitlines()}
-    assert "https://staging-api.moleculesai.app" in by_base, by_base
-    assert by_base["https://staging-api.moleculesai.app"] == "staging", (
-        "staging-api is paired with Infisical env %r — writing the wrong "
-        "LOCAL_TENANT_IMAGE boot secret" % by_base["https://staging-api.moleculesai.app"]
-    )
-    assert by_base["https://api.moleculesai.app"] == "prod", by_base
+    assert r.stdout.strip().splitlines() == ["cp_prod\thttps://api.moleculesai.app\tprod"]
+
+
+def test_production_filter_excludes_legacy_staging_entries():
+    r = _run(["prod=https://prod.example=prod,stage=https://stage.example=staging", "--env", "prod"])
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "prod\thttps://prod.example\tprod"
+    absent = _run(["stage=https://stage.example=staging", "--env", "prod"])
+    assert absent.returncode != 0
+
+
+def test_endpoint_labels_cannot_escape_the_snapshot_directory():
+    r = _run(["../escape=https://prod.example=prod"])
+    assert r.returncode != 0
 
 
 def test_an_endpoint_without_an_explicit_env_is_rejected():
@@ -160,32 +166,15 @@ def test_plan_writes_a_machine_readable_verdict():
     assert "needed.txt" in body, body
 
 
-def test_apply_is_gated_on_the_plan_verdict():
-    """An armed dispatch with nothing to do must not mutate anything.
-
-    Arming is sticky and repo-scoped, and lint-workflow-yaml forbids dispatch
-    inputs, so there is no per-run confirmation: without this gate an armed
-    operator who dispatches wanting only a plan gets a fleet-global mutation.
-
-    Asserted structurally, not by keyword: the apply body must read the SAME
-    verdict file the plan writes, and must contain a non-mutating early exit that
-    precedes the promote invocation.
-    """
+def test_apply_requires_a_completed_plan_but_reconciles_an_already_current_pin():
     body = _apply_step()["run"]
-    assert "needed.txt" in body, (
-        "the Apply step never reads the plan's verdict file, so it promotes every "
-        "control plane even when the plan says all are already at the target digest"
-    )
-    assert "exit 0" in body, "the Apply step has no non-mutating early exit"
-    # Anchor on the INVOCATION (`./scripts/...`), not on the script's name, which
-    # also appears in the operator prose above it.
     invoke = body.index("./scripts/deploy/advance-staging-tenant-pin.sh")
-    assert body.index("needed.txt") < invoke, (
-        "the verdict is consulted AFTER the promote — that is not a gate"
-    )
-    assert body.index("exit 0") < invoke, (
-        "the early exit cannot short-circuit the promote it follows"
-    )
+    assert 'test -f "$RUNNER_TEMP/needed.txt"' in body
+    assert body.index('test -f "$RUNNER_TEMP/needed.txt"') < invoke
+    assert '--image "${TENANT_IMAGE}@${TARGET_DIGEST}"' in body
+    assert '--env prod' in body
+    # Empty needed.txt cannot skip boot-secret repair or a fleet retry.
+    assert "exit 0" not in body
 
 
 # --------------------------------------------------------------------------
@@ -253,15 +242,26 @@ def _ssot_harness(tmp_path: Path, initial: dict[str, str]) -> tuple[Path, Path]:
 import os, sys, json, urllib.parse
 S = os.environ["FAKE_STATE"]
 args = sys.argv[1:]
-method, body, url = "GET", "", ""
+method, body, url, wfmt = "GET", "", "", ""
 i = 0
 while i < len(args):
     a = args[i]
     if a == "-X": method = args[i+1]; i += 2; continue
     if a == "-d": body = args[i+1]; i += 2; continue
-    if a in ("-H", "--doh-url", "-A", "-o", "-w"): i += 2; continue
+    if a == "-w": wfmt = args[i+1]; i += 2; continue
+    if a in ("-H", "--doh-url", "-A", "-o"): i += 2; continue
     if a.startswith("http"): url = a
     i += 1
+
+def respond(payload, code=200):
+    # Emulate curl's -w. The CP client reads body AND status from one stdout
+    # stream; the Infisical calls pass no -w and get the bare body, exactly as
+    # the real curl would.
+    sys.stdout.write(payload)
+    if wfmt:
+        sys.stdout.write(wfmt.replace("%{http_code}", str(code)))
+    sys.exit(0)
+
 u = urllib.parse.urlparse(url)
 env = (urllib.parse.parse_qs(u.query).get("environment") or [""])[0]
 P = lambda f: os.path.join(S, f)
@@ -279,10 +279,10 @@ if "/api/v3/secrets/raw/LOCAL_TENANT_IMAGE" in url:
     except OSError: v = ""
     print(json.dumps({"secret": {"secretValue": v}})); sys.exit(0)
 if url.endswith("/cp/admin/runtime-image"):
-    print(json.dumps({"pins": [{"template_name": "molecule-tenant", "region": "global",
-                                "image_digest": open(P("pin_cp.test")).read(), "git_sha": "old"}]})); sys.exit(0)
+    respond(json.dumps({"pins": [{"template_name": "molecule-tenant", "region": "global",
+                                  "image_digest": open(P("pin_cp.test")).read(), "git_sha": "old"}]}))
 if url.endswith("/cp/admin/runtime-image/promote"):
-    open(P("pin_cp.test"), "w").write(json.loads(body)["image_digest"]); print("{}"); sys.exit(0)
+    open(P("pin_cp.test"), "w").write(json.loads(body)["image_digest"]); respond("{}")
 sys.exit(22)
 '''
     (tmp_path / "curl.py").write_text(body, encoding="utf-8")

@@ -59,6 +59,83 @@ def run_obj(run_id=606639, status="completed", conclusion="success"):
     return {"id": run_id, "status": status, "conclusion": conclusion}
 
 
+def stamp(when):
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+#: The REAL measured class-(C) job: molecule-core run 647884 / job 952902 on
+#: main 8a797665, 2026-08-12. Assigned to `molecule-runner-robot-2-5` at
+#: 02:38:26Z, force-closed 787s later at 02:51:33Z, with all five steps stamped
+#: at the stop time and zero elapsed. Values transcribed from the live
+#: `GET /actions/runs/647884/jobs` payload.
+UNEXECUTED_JOB_STARTED = datetime.datetime(2026, 8, 12, 2, 38, 26, tzinfo=datetime.timezone.utc)
+UNEXECUTED_JOB_STOPPED = datetime.datetime(2026, 8, 12, 2, 51, 33, tzinfo=datetime.timezone.utc)
+
+
+def unexecuted_job(
+    job_id=952902,
+    attempt=1,
+    conclusion="failure",
+    steps=5,
+    started=UNEXECUTED_JOB_STARTED,
+    stopped=UNEXECUTED_JOB_STOPPED,
+):
+    """A job whose steps were all stamped at the job's stop time (class C)."""
+    return {
+        "id": job_id,
+        "status": "completed",
+        "conclusion": conclusion,
+        "run_attempt": attempt,
+        "runner_name": "molecule-runner-robot-2-5",
+        "started_at": stamp(started),
+        "completed_at": stamp(stopped),
+        "steps": [
+            {
+                "number": n,
+                "status": "completed",
+                "conclusion": "failure",
+                "started_at": stamp(stopped),
+                "completed_at": stamp(stopped),
+            }
+            for n in range(steps)
+        ],
+    }
+
+
+def executed_job(job_id=952902, attempt=1, conclusion="failure", wall_seconds=787):
+    """A job that really ran: steps spread across the window from its START.
+
+    This is the mutation control for `unexecuted_job` — same duration, same
+    conclusion, same step count, but the steps carry real elapsed time anchored
+    at the job's start instead of being pinned to its stop.
+    """
+    started = UNEXECUTED_JOB_STARTED
+    stopped = started + datetime.timedelta(seconds=wall_seconds)
+    steps = []
+    cursor = started
+    for n in range(5):
+        step_end = cursor + datetime.timedelta(seconds=wall_seconds // 6)
+        steps.append(
+            {
+                "number": n,
+                "status": "completed",
+                "conclusion": "failure" if n == 4 else "success",
+                "started_at": stamp(cursor),
+                "completed_at": stamp(step_end),
+            }
+        )
+        cursor = step_end
+    return {
+        "id": job_id,
+        "status": "completed",
+        "conclusion": conclusion,
+        "run_attempt": attempt,
+        "started_at": stamp(started),
+        "completed_at": stamp(stopped),
+        "steps": steps,
+    }
+
+
 class Args:
     """Stand-in for the argparse namespace `sweep_sha` consumes."""
 
@@ -203,13 +280,29 @@ class TestClassifyContext(unittest.TestCase):
         self.assertEqual(verdict, "jobs-active")
 
     def test_already_terminal_context_is_a_noop(self):
-        for state in ("success", "failure", "error", "warning"):
+        # Green-ish terminal states short-circuit without ever looking at a run.
+        for state in ("success", "warning", "skipped"):
             verdict, _ = self.classify(
                 row(74, state, "nodup-lint / no-duplication"),
                 run_obj(),
                 [job()],
             )
             self.assertEqual(verdict, "terminal", state)
+
+    def test_red_terminal_context_is_still_never_healed(self):
+        # Red states now route through the class-(C) classifier (a red row is
+        # NOT self-evidently a verdict — see the module docstring), but the
+        # outcome for a red backed by a job that reported is unchanged: not
+        # stranded, never re-run.
+        for state in ("failure", "error"):
+            verdict, detail = self.classify(
+                row(74, state, "nodup-lint / no-duplication",
+                    description="Failing after 41s"),
+                run_obj(),
+                [executed_job(897893)],
+            )
+            self.assertEqual(verdict, "real-failure", state)
+            self.assertIn("genuine red", detail)
 
     def test_fresh_pending_is_within_grace(self):
         verdict, detail = self.classify(
@@ -298,15 +391,16 @@ class TestCancellationLatch(unittest.TestCase):
 
     # ---- direction 2: a REAL failure must STILL be red -------------------
     def test_genuine_failure_is_never_selected(self):
-        # The ordinary red. No cancellation description -> not even a candidate,
-        # and it costs no run lookup.
-        verdict, _ = self.classify(
+        # The ordinary red. No cancellation description, and a job that carries
+        # no proof it skipped execution -> declined by class (C) as a real red.
+        verdict, detail = self.classify(
             row(50, "failure", "CI / all-required (pull_request)", run=1, job=2,
                 description="Failing after 12s"),
             run_obj(1, conclusion="failure"),
             [job(2, conclusion="failure")],
         )
-        self.assertEqual(verdict, "terminal")
+        self.assertEqual(verdict, "real-failure", detail)
+        self.assertNotEqual(verdict, "stranded")
 
     def test_failure_whose_job_really_failed_is_never_selected(self):
         # THE load-bearing negative control. The description SAYS cancelled but
@@ -324,13 +418,16 @@ class TestCancellationLatch(unittest.TestCase):
 
     def test_description_match_is_exact_not_substring(self):
         # A real test failure whose name quotes the phrase must not be laundered.
-        verdict, _ = self.classify(
+        verdict, detail = self.classify(
             row(52, "failure", "CI / unit (pull_request)", run=1, job=2,
                 description="Has been cancelled by the user unexpectedly"),
             run_obj(1, conclusion="failure"),
             [job(2, conclusion="failure")],
         )
-        self.assertEqual(verdict, "terminal")
+        # Declined by BOTH red classes: the description is not an exact
+        # cancellation stamp, and the job shows no never-executed proof.
+        self.assertEqual(verdict, "real-failure", detail)
+        self.assertNotEqual(verdict, "stranded")
         self.assertFalse(
             janitor.looks_like_cancellation_stamp(
                 row(52, "failure", "CI / unit", description="has been cancelled!")
@@ -395,6 +492,229 @@ class TestCancellationLatch(unittest.TestCase):
         )
         self.assertEqual(verdict, "attempts-exhausted")
         self.assertIn("cap 4", detail)
+
+
+class TestJobNeverExecuted(unittest.TestCase):
+    """The class-(C) predicate, driven from the real measured job record.
+
+    Every test here is a MUTATION of the true incident fixture: flip exactly one
+    property of run 647884 / job 952902 and the predicate must stop firing. A
+    predicate that only ever answers True on one blob is indistinguishable from
+    `return True`, so each False case names the clause it kills.
+    """
+
+    def test_the_measured_incident_is_detected(self):
+        # molecule-core run 647884 / job 952902: 787s of job wall time, five
+        # steps, every one stamped at the stop time with zero elapsed.
+        self.assertTrue(janitor.job_never_executed(unexecuted_job()))
+
+    def test_a_job_that_really_ran_is_not_detected(self):
+        # Same duration, same conclusion, same step count — but the steps carry
+        # real elapsed time anchored at the job's START. This is the control
+        # that makes the predicate non-vacuous in the dangerous direction.
+        self.assertFalse(janitor.job_never_executed(executed_job()))
+
+    def test_the_healthy_rerun_of_the_same_job_is_not_detected(self):
+        # Attempt 2 of the very same job on runner molecule-runner-robot-2-4:
+        # 12 seconds, all steps green, real per-step timestamps. Transcribed
+        # from the live payload.
+        started = datetime.datetime(2026, 8, 13, 1, 1, 13, tzinfo=datetime.timezone.utc)
+        healthy = {
+            "id": 952902,
+            "status": "completed",
+            "conclusion": "success",
+            "run_attempt": 2,
+            "started_at": stamp(started),
+            "completed_at": stamp(started + datetime.timedelta(seconds=12)),
+            "steps": [
+                {"number": 0, "started_at": stamp(started + datetime.timedelta(seconds=3)),
+                 "completed_at": stamp(started + datetime.timedelta(seconds=10))},
+                {"number": 1, "started_at": stamp(started + datetime.timedelta(seconds=10)),
+                 "completed_at": stamp(started + datetime.timedelta(seconds=10))},
+                {"number": 2, "started_at": stamp(started + datetime.timedelta(seconds=10)),
+                 "completed_at": stamp(started + datetime.timedelta(seconds=10))},
+            ],
+        }
+        # Note steps 1 and 2 ARE zero-elapsed (a skip and a sub-second step) —
+        # so zero-elapsed steps alone must never be the trigger. What saves this
+        # job is that they are not stamped at the job's STOP time.
+        self.assertFalse(janitor.job_never_executed(healthy))
+
+    def test_a_job_with_no_step_records_proves_nothing(self):
+        blob = unexecuted_job()
+        blob["steps"] = []
+        self.assertFalse(janitor.job_never_executed(blob))
+        del blob["steps"]
+        self.assertFalse(janitor.job_never_executed(blob))
+
+    def test_a_short_job_is_below_the_floor(self):
+        # A job that failed in under a minute could show all-zero steps purely
+        # from one-second timestamp granularity. UNEXECUTED_MIN_JOB_SECONDS
+        # keeps it out.
+        short = unexecuted_job(
+            stopped=UNEXECUTED_JOB_STARTED + datetime.timedelta(seconds=30)
+        )
+        self.assertFalse(janitor.job_never_executed(short))
+        # ... and one second past the floor it is detected again, so the floor
+        # is a boundary and not a blanket refusal.
+        at_floor = unexecuted_job(
+            stopped=UNEXECUTED_JOB_STARTED
+            + datetime.timedelta(seconds=janitor.UNEXECUTED_MIN_JOB_SECONDS)
+        )
+        self.assertTrue(janitor.job_never_executed(at_floor))
+
+    def test_one_step_with_elapsed_time_disqualifies_the_whole_job(self):
+        blob = unexecuted_job()
+        blob["steps"][2]["completed_at"] = stamp(
+            UNEXECUTED_JOB_STOPPED + datetime.timedelta(seconds=1)
+        )
+        self.assertFalse(janitor.job_never_executed(blob))
+
+    def test_zero_elapsed_steps_stamped_at_the_job_start_are_not_the_shape(self):
+        # The fill-in fingerprint is stamp-at-STOP. Steps pinned to the job's
+        # start are a different animal and must not be swept up.
+        blob = unexecuted_job()
+        for step in blob["steps"]:
+            step["started_at"] = stamp(UNEXECUTED_JOB_STARTED)
+            step["completed_at"] = stamp(UNEXECUTED_JOB_STARTED)
+        self.assertFalse(janitor.job_never_executed(blob))
+
+    def test_epoch_start_belongs_to_the_cancellation_class(self):
+        blob = unexecuted_job(started=datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc))
+        self.assertFalse(janitor.job_never_executed(blob))
+
+    def test_unparseable_timestamps_answer_false(self):
+        blob = unexecuted_job()
+        blob["completed_at"] = None
+        self.assertFalse(janitor.job_never_executed(blob))
+        blob = unexecuted_job()
+        blob["steps"][0]["started_at"] = "not-a-timestamp"
+        self.assertFalse(janitor.job_never_executed(blob))
+
+
+class TestUnexecutedJobLatch(unittest.TestCase):
+    """`classify_context` end of class (C), including every refusal gate."""
+
+    def measured_row(self, minutes_ago=60, status="failure"):
+        return row(
+            145,
+            status,
+            "Secret scan / Scan diff for credential-shaped strings (push)",
+            minutes_ago=minutes_ago,
+            run=647884,
+            job=952902,
+            description="Failing after 13m7s",
+        )
+
+    def classify(self, status_row, run, jobs, min_age=15, max_attempts=4):
+        return janitor.classify_context(
+            status_row, run, jobs, NOW, min_age, max_attempts
+        )
+
+    def test_the_measured_incident_is_stranded(self):
+        verdict, detail = self.classify(
+            self.measured_row(),
+            run_obj(647884, conclusion="failure"),
+            [unexecuted_job()],
+        )
+        self.assertEqual(verdict, "stranded")
+        self.assertIn("NEVER EXECUTED A STEP", detail)
+
+    def test_a_genuine_red_of_the_same_shape_is_never_selected(self):
+        # The one-property mutation at classifier level: identical row, identical
+        # run, identical duration — only the step records differ.
+        verdict, detail = self.classify(
+            self.measured_row(),
+            run_obj(647884, conclusion="failure"),
+            [executed_job()],
+        )
+        self.assertEqual(verdict, "real-failure")
+        self.assertIn("executed steps", detail)
+
+    def test_error_state_is_caught_too(self):
+        verdict, _ = self.classify(
+            self.measured_row(status="error"),
+            run_obj(647884, conclusion="failure"),
+            [unexecuted_job()],
+        )
+        self.assertEqual(verdict, "stranded")
+
+    def test_success_is_never_touched(self):
+        verdict, _ = self.classify(
+            self.measured_row(status="success"),
+            run_obj(647884, conclusion="failure"),
+            [unexecuted_job()],
+        )
+        self.assertEqual(verdict, "terminal")
+
+    def test_a_fresh_red_is_within_grace(self):
+        verdict, detail = self.classify(
+            self.measured_row(minutes_ago=3),
+            run_obj(647884, conclusion="failure"),
+            [unexecuted_job()],
+        )
+        self.assertEqual(verdict, "too-fresh")
+        self.assertIn("grace", detail)
+
+    def test_a_red_without_target_url_is_never_healed(self):
+        blob = self.measured_row()
+        blob["target_url"] = ""
+        verdict, _ = self.classify(blob, None, [])
+        self.assertEqual(verdict, "terminal")
+
+    def test_phantom_job_id_refuses_to_act(self):
+        verdict, detail = self.classify(
+            self.measured_row(),
+            run_obj(647884, conclusion="failure"),
+            [unexecuted_job(job_id=999999)],
+        )
+        self.assertEqual(verdict, "phantom-job")
+        self.assertIn("not a member", detail)
+
+    def test_still_running_run_is_left_alone(self):
+        verdict, _ = self.classify(
+            self.measured_row(),
+            run_obj(647884, status="in_progress", conclusion=None),
+            [unexecuted_job()],
+        )
+        self.assertEqual(verdict, "run-active")
+
+    def test_sibling_job_still_in_flight_is_left_alone(self):
+        verdict, _ = self.classify(
+            self.measured_row(),
+            run_obj(647884, conclusion="failure"),
+            [unexecuted_job(), job(4242, status="in_progress", conclusion=None)],
+        )
+        self.assertEqual(verdict, "jobs-active")
+
+    def test_attempt_cap_applies_here_too(self):
+        verdict, detail = self.classify(
+            self.measured_row(),
+            run_obj(647884, conclusion="failure"),
+            [unexecuted_job(attempt=4)],
+        )
+        self.assertEqual(verdict, "attempts-exhausted")
+        self.assertIn("cap 4", detail)
+
+    def test_cancelled_conclusion_stays_with_the_cancellation_class(self):
+        # Disjointness: a job concluding `cancelled` is class (B)'s, and class
+        # (C) must decline it rather than double-handle it.
+        verdict, _ = self.classify(
+            self.measured_row(),
+            run_obj(647884, conclusion="cancelled"),
+            [unexecuted_job(conclusion="cancelled")],
+        )
+        self.assertEqual(verdict, "real-failure")
+
+    def test_unreadable_run_defers_to_the_lookup(self):
+        verdict, _ = self.classify(self.measured_row(), None, [])
+        self.assertEqual(verdict, "unknown-run")
+
+    def test_run_with_no_jobs_is_left_alone(self):
+        verdict, _ = self.classify(
+            self.measured_row(), run_obj(647884, conclusion="failure"), []
+        )
+        self.assertEqual(verdict, "no-jobs")
 
 
 class TestPlanReruns(unittest.TestCase):
@@ -468,7 +788,7 @@ class TestSweep(unittest.TestCase):
             },
             jobs={
                 644628: [job(949071, conclusion="cancelled", attempt=0)],
-                644630: [job(949080, conclusion="failure")],
+                644630: [executed_job(949080)],
             },
         )
         findings = janitor.sweep_sha(client, sha, NOW, Args(), label="PR #5156")
@@ -477,12 +797,14 @@ class TestSweep(unittest.TestCase):
             ["gitea-merge-queue / queue (pull_request_review)"],
         )
         self.assertEqual(findings[0]["run_id"], 644628)
-        # The genuine red cost no run lookup at all — the description
-        # pre-filter kept the sweep's cost contract intact.
+        # Both reds cost a run lookup — the genuine one because class (C) has no
+        # row-local discriminator and its steps are the only proof. The GREEN
+        # context still costs nothing, which is where the volume is.
         self.assertEqual(
             sorted({c[2] for c in client.calls if c[1] in ("run", "jobs")}),
-            [644628],
+            [644628, 644630],
         )
+        self.assertNotIn(644631, {c[2] for c in client.calls if c[1] in ("run", "jobs")})
 
     def test_sweep_leaves_a_cancellation_shaped_row_whose_job_really_failed(self):
         # Mutation control at sweep level: flip ONLY the job conclusion and the
@@ -498,9 +820,44 @@ class TestSweep(unittest.TestCase):
                 ]
             },
             runs={644628: run_obj(644628, conclusion="failure")},
-            jobs={644628: [job(949071, conclusion="failure")]},
+            jobs={644628: [executed_job(949071)]},
         )
         self.assertEqual(janitor.sweep_sha(client, sha, NOW, Args()), [])
+
+    def test_sweep_reconstructs_the_main_8a797665_incident(self):
+        # The real shape of the 22-hour merge-train freeze: 45 contexts on
+        # main's tip, 44 green and ONE red whose job never executed a step.
+        # Before this class existed the sweep reported nothing here and the
+        # train stayed frozen until a human noticed.
+        sha = "8a797665441be456df855e98dad301dba5988913"
+        greens = [
+            row(i, "success", "ctx-%02d / job" % i, minutes_ago=60, run=647800 + i, job=i)
+            for i in range(1, 45)
+        ]
+        client = FakeClient(
+            statuses={
+                sha: greens
+                + [
+                    row(145, "failure",
+                        "Secret scan / Scan diff for credential-shaped strings (push)",
+                        minutes_ago=60, run=647884, job=952902,
+                        description="Failing after 13m7s"),
+                ]
+            },
+            runs={647884: run_obj(647884, conclusion="failure")},
+            jobs={647884: [unexecuted_job()]},
+        )
+        findings = janitor.sweep_sha(client, sha, NOW, Args(), label="branch main")
+        self.assertEqual(
+            [f["context"] for f in findings],
+            ["Secret scan / Scan diff for credential-shaped strings (push)"],
+        )
+        self.assertEqual(findings[0]["run_id"], 647884)
+        self.assertIn("NEVER EXECUTED A STEP", findings[0]["detail"])
+        # 44 green contexts cost zero run lookups; only the red was inspected.
+        self.assertEqual(
+            sorted({c[2] for c in client.calls if c[1] in ("run", "jobs")}), [647884]
+        )
 
     def test_sweep_is_clean_when_everything_reached_a_verdict(self):
         sha = "8ed088a682debfa91284bedcf01c3138fa42833e"
@@ -516,17 +873,22 @@ class TestSweep(unittest.TestCase):
         )
         self.assertEqual(janitor.sweep_sha(client, sha, NOW, Args()), [])
 
-    def test_terminal_and_fresh_contexts_cost_no_run_lookups(self):
-        # A commit carries 40+ contexts and nearly all are already terminal.
+    def test_green_and_fresh_contexts_cost_no_run_lookups(self):
+        # A commit carries 40+ contexts and nearly all are already GREEN.
         # Looking up the run for each would be thousands of calls per pass.
+        # Red rows are the deliberate exception (class C has no row-local
+        # discriminator); they are rare, and any one of them already blocks the
+        # merge, so two API calls to tell a real red from a phantom one is cheap.
         sha = "beadfeed"
         client = FakeClient(
             statuses={
                 sha: [
                     row(1, "success", "a / a", minutes_ago=60),
-                    row(2, "failure", "b / b", minutes_ago=60),
+                    row(2, "warning", "b / b", minutes_ago=60),
+                    row(5, "skipped", "e / e", minutes_ago=60),
                     row(3, "pending", "c / c", minutes_ago=2),  # inside grace
                     row(4, "pending", "d / d", minutes_ago=60, run=None),  # orphan
+                    row(6, "failure", "f / f", minutes_ago=2),  # red inside grace
                 ]
             },
             runs={},
@@ -534,6 +896,22 @@ class TestSweep(unittest.TestCase):
         )
         self.assertEqual(janitor.sweep_sha(client, sha, NOW, Args()), [])
         self.assertEqual([c for c in client.calls if c[1] in ("run", "jobs")], [])
+
+    def test_an_aged_red_costs_exactly_one_run_and_one_jobs_lookup(self):
+        # The bounded cost this class buys. Pinned so a future change cannot
+        # quietly turn one red into an N-call fan-out.
+        sha = "beadfeed"
+        client = FakeClient(
+            statuses={
+                sha: [row(2, "failure", "b / b", minutes_ago=60, run=777, job=888)]
+            },
+            runs={777: run_obj(777, conclusion="failure")},
+            jobs={777: [executed_job(888)]},
+        )
+        self.assertEqual(janitor.sweep_sha(client, sha, NOW, Args()), [])
+        self.assertEqual(
+            [c[1] for c in client.calls if c[1] in ("run", "jobs")], ["run", "jobs"]
+        )
 
 
 class TestNeverFabricatesAStatus(unittest.TestCase):

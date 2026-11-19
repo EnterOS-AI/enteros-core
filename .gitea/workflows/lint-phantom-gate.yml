@@ -1,4 +1,14 @@
-# lint-phantom-gate — Guard F (regression-prevention-guards.md §Guard F).
+# lint-phantom-gate — Guard F (regression-prevention-guards.md §Guard F),
+# plus Guard G (disabled PR emitters) and Guard S (skippable enforced gates).
+#
+# The three answer three different ways an ENFORCED required context stops
+# being a gate while the board still reads green:
+#   Guard F — its producer WORKFLOW is toggled off, so it never posts.
+#   Guard G — a DISABLED workflow still fires on PR events, posting statuses
+#             that cannot be rerun (wedge).
+#   Guard S — its producer JOB is gone, or the job can be `skipped` because
+#             something in its `needs:` closure carries a job-level `if:`.
+#             `["*"]` branch protection treats `skipped` as PASSING.
 #
 # The META-guard that guards the gates. A `.gitea/required-contexts.txt` entry
 # declared ENFORCED (merge-blocking) whose PRODUCER workflow is toggled off
@@ -118,6 +128,31 @@ jobs:
       # succeeds.
       - name: Install PyYAML
         run: python -m pip install --quiet 'PyYAML==6.0.2'
+
+      # Guard S — runs FIRST and needs NO credentials.
+      #
+      # Guard F proves an ENFORCED context's producer WORKFLOW is active.
+      # Guard S proves the context can actually REACH A TERMINAL, NON-SKIPPED
+      # status: its producer JOB still exists, and no job in that job's
+      # transitive `needs:` closure carries a job-level `if:` (a false `if:`
+      # makes the job `skipped`, and Gitea does not start a dependent whose
+      # `needs:` was skipped — the skip propagates to the enforced context).
+      #
+      # Why that matters: branch protection here is
+      # `status_check_contexts: ["*"]`, which treats `skipped` as PASSING and
+      # cannot require a context that never posts. gitea-merge-queue.py is the
+      # only thing that fail-closes on `skipped` — and it performs a small
+      # minority of merges; everything merged through the UI/API is gated by
+      # `["*"]` alone. So a skippable required gate is a gate that enforces
+      # nothing on most merges.
+      #
+      # Placed BEFORE the Infisical fetch on purpose: Guard S reads only
+      # checked-in files, so an Infisical/KMS outage must not be able to stop
+      # it from running.
+      - name: Run Guard S — enforced gates must not be able to post `skipped`
+        env:
+          ENFORCED_CONTEXTS_FILE: .gitea/required-contexts.txt
+        run: python3 .gitea/scripts/ci-required-drift.py --skippable-gate-lint
       # KMS consolidation (mirrors ci-required-drift.yml / lint-required-no-paths.yml):
       # fetch the consolidated DRIFT_BOT_TOKEN from the Infisical SSOT (prod
       # /shared/drift-bot) via the CI machine identity. Reading the Actions API

@@ -120,57 +120,32 @@ PR_EVENTS = {"pull_request", "pull_request_target"}
 #   Harness Replays / Harness Replays
 #   Lint workflow YAML (repository compatibility policy) / Lint workflow YAML ...
 MASK_WAIVERS = {
-    # ── Blocked by the PRE-FLIP GATE, not by a red job ──────────────────
-    # The two below are PROVEN GREEN (see each workflow's inline comment),
-    # but lint_pre_flip_continue_on_error.py — which is itself an unmasked,
-    # merge-blocking required context — refuses to bless the flip, so
-    # un-masking them would red every PR. Left masked deliberately.
-    # (A third, `Harness Replays / detect-changes`, was in this bucket until
-    # #4521 unmasked it — see the note just below.)
+    # EMPTY, and that is the goal state. This register was a DEBT list of
+    # merge-blocking contexts allowed to keep a `continue-on-error` mask; it is
+    # meant to shrink, and as of the 2026-09-03 governance review there is no
+    # job-level `continue-on-error: true` left anywhere in .gitea/workflows.
     #
-    # `Harness Replays / detect-changes` was UNMASKED by #4521 (proven green
-    # 15/15 step-level, and still green on current main) — its waiver has been
-    # pruned from this register. The pre-flip-gate blind spot that kept it masked
-    # (lint_pre_flip_continue_on_error.py:426 reads the un-paginated
-    # `/commits/{sha}/status` combined endpoint, 30-status cap while the repo
-    # posts 60 contexts) is tracked separately in task #106.
+    # How the last entries went away:
+    #   - `Harness Replays / detect-changes` — unmasked by #4521 (proven green
+    #     15/15 step-level).
+    #   - `design-token-drift / ...` and `Local Provision Lifecycle E2E / ...` —
+    #     unmasked when mc#4602 / mc#4603 aged out rather than being renewed a
+    #     fourth time.
+    #   - `E2E Staging SaaS (full lifecycle) / Prune stale e2e DNS records` and
+    #     `Ops Scripts Tests / Ops scripts (unittest)` — masks removed by #4326
+    #     and #4325; the waivers had been reported prune-me ever since.
+    #   - `SECRET_PATTERNS drift lint / Detect SECRET_PATTERNS drift` — the mask
+    #     itself is already gone from secret-pattern-drift.yml (only a doc
+    #     comment names it), so this waiver was reported prune-me too.
+    #   - `lint-mask-pr-atomicity / lint-mask-pr-atomicity` — unmasked in the
+    #     2026-09-03 governance review. The pre-flip catch-22 that justified it
+    #     (mc#4344) was fixed on 2026-07-20 by fb426286, which taught the gate to
+    #     paginate commit statuses and to accept a paths-filtered workflow's
+    #     PR-event runs as proof. Decision record is inline in
+    #     .gitea/workflows/lint-mask-pr-atomicity.yml.
     #
-    # The next two are PATHS-FILTERED workflows: they essentially never run on a
-    # push to main, and the pre-flip gate only accepts main-PUSH runs from the
-    # last RECENT_COMMITS_N (=5) commits as proof. So they can NEVER satisfy it —
-    # a structural catch-22, not a red suite. FIX = let the pre-flip gate accept
-    # PR-event runs (or widen the window) for paths-filtered workflows.
-    "lint-mask-pr-atomicity / lint-mask-pr-atomicity":
-        "PROVEN GREEN locally (lint exit 0 + unit tests pass) but paths-filtered, so it "
-        "has no main-push runs for the pre-flip gate to read — structurally unverifiable "
-        "by that gate today. Follow-up filed.",
-    "SECRET_PATTERNS drift lint / Detect SECRET_PATTERNS drift":
-        "PROVEN GREEN locally (all consumers aligned, exit 0) but paths-filtered — same "
-        "pre-flip catch-22. PRIORITY: a credential-hygiene gate must not be unable to "
-        "fail. Follow-up filed.",
-    # In-flight: these masks are being removed by other open PRs. Waived here
-    # ONLY so this lint can land without a merge-order dead-lock against them.
-    # When those PRs merge, the waiver goes stale and is reported as prune-me.
-    "E2E Staging SaaS (full lifecycle) / Prune stale e2e DNS records":
-        "mask removed by PR #4326 (in flight) — prune this waiver once #4326 lands",
-    "Ops Scripts Tests / Ops scripts (unittest)":
-        "mask removed by PR #4325 (in flight) — prune this waiver once #4325 lands",
-    # `design-token-drift / Canvas ↔ app design-token SSOT drift` and
-    # `Local Provision Lifecycle E2E / ... (real image + MiniMax LLM, advisory)`
-    # were both in this register as "pre-existing debt, not yet proven green".
-    # Their masks were REMOVED when mc#4602 / mc#4603 aged out rather than being
-    # renewed a fourth time, so their waivers are pruned here in the same change
-    # (an entry that outlives its mask is reported as prune-me noise, and this
-    # register is meant to shrink).
-    #   - design-token: the mask was covering a gate that could not run at all —
-    #     APP_SSOT_READ_TOKEN was never provisioned, so the script always took
-    #     its skip branch. It now reads DRIFT_BOT_TOKEN from the Infisical SSOT
-    #     and compares 15 shared tokens x {light,dark} for real.
-    #   - lifecycle-real: promoted on 9 days of LOG evidence (279 runs,
-    #     278 x "18 passed, 0 failed", 0 skip-path exits, 1 cancelled-on-
-    #     superseded-head), which is what mc#2408 asked for. The "known-flaky
-    #     heartbeat (task #77)" note above it did not reproduce anywhere in
-    #     that window.
+    # A NEW entry here is a debt admission, not a formality: state the context,
+    # why the mask must survive, and what evidence would retire it.
 }
 
 

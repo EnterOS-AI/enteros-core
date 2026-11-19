@@ -55,7 +55,7 @@ function MarkdownBubble({
       remarkPlugins={[remarkGfm]}
       components={{
         p: ({ children }) => (
-          <div style={{ margin: "2px 0", lineHeight: "inherit" }}>{children}</div>
+          <div style={{ margin: "2px 0", lineHeight: "inherit", whiteSpace: "pre-wrap", overflowWrap: "break-word" }}>{children}</div>
         ),
         a: ({ href, children }) => (
           <a
@@ -238,6 +238,7 @@ export function MobileChat({
     error: sendError,
     clearError,
     releaseSendGuards,
+    failSend,
   } = useChatSend(agentId, {
     onUserMessage: appendMessageDeduped,
     onAgentMessage: appendMessageDeduped,
@@ -250,10 +251,11 @@ export function MobileChat({
       appendMessageDeduped(m);
       clearError();
     },
-    onSendComplete: () => {
-      releaseSendGuards();
+    onSendComplete: (messageId) => {
+      releaseSendGuards(messageId);
       clearError();
     },
+    onSendError: failSend,
   });
 
   // Restore draft + attachments when a genuine send error surfaces, so the

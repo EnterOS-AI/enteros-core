@@ -20,6 +20,11 @@ const (
 
 const conciergeSchedulesOfflineResponse = `{"error":"workspace url not registered yet"}`
 
+// conciergeSchedulesOfflineCodedResponse is the same answer from a core that
+// codes it (WORKSPACE_NOT_READY, with Retry-After). Both are accepted: the
+// gate can run against either core during a rollout.
+const conciergeSchedulesOfflineCodedResponse = `{"code":"WORKSPACE_NOT_READY","error":"workspace url not registered yet"}`
+
 // classifyConciergeConfigTabResponse keeps the auth sweep fail-closed while
 // recognizing the one boot-free schedules result produced before the platform
 // runtime registers its callback URL. Status, tab, and compact JSON body must
@@ -53,5 +58,6 @@ func exactSchedulesOfflineResponse(body string) bool {
 	if err := json.Compact(&compact, []byte(body)); err != nil {
 		return false
 	}
-	return compact.String() == conciergeSchedulesOfflineResponse
+	got := compact.String()
+	return got == conciergeSchedulesOfflineResponse || got == conciergeSchedulesOfflineCodedResponse
 }

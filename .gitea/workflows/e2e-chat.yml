@@ -87,9 +87,9 @@ name: E2E Chat
 # `MOLECULE_ENV=development` the specs DO assert on belongs to the Go
 # platform-server and is untouched by this change.
 #
-# Parallel-safety: same pattern as e2e-api.yml — per-run container names
-# and ephemeral host ports so concurrent jobs on the host-network runner
-# don't collide.
+# Parallel-safety: per-run containers and ephemeral loopback ports. Chromium
+# has its own bridge network namespace: host Docker churn cannot invalidate
+# browser sockets (core#5106). Playwright forwards client loopback destinations.
 
 on:
   # ALWAYS RUNS — 2026-07-14. No paths filter, no detect-changes job, no no-op arm.
@@ -167,6 +167,7 @@ jobs:
     env:
       PG_CONTAINER: pg-e2e-chat-${{ github.run_id }}-${{ github.run_attempt }}
       REDIS_CONTAINER: redis-e2e-chat-${{ github.run_id }}-${{ github.run_attempt }}
+      PLAYWRIGHT_CONTAINER: browser-e2e-chat-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       -
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -208,16 +209,16 @@ jobs:
             cts=$(date -u -d "$created" +%s 2>/dev/null) || continue
             if [ $(( now - cts )) -gt 7200 ]; then
               echo "sweeping stale e2e-chat container $c (created $created)"
-              timeout 30 docker rm -f "$c" >/dev/null 2>&1 || true
+              timeout 30 docker rm -fv "$c" >/dev/null 2>&1 || true
             fi
           done
 
       - name: Start Postgres (docker)
         run: |
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$PG_CONTAINER" \
+          # tmpfs PGDATA + run label + `rm -fv` pre-clean: see the script header.
+          bash .gitea/scripts/ci-service-container.sh postgres "$PG_CONTAINER" postgres:16 \
             -e POSTGRES_USER=dev -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=molecule \
-            -p 127.0.0.1::5432 postgres:16 >/dev/null
+            -p 127.0.0.1::5432 >/dev/null
           PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           if [ -z "$PG_PORT" ]; then
             PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | head -1 | awk -F: '{print $NF}')
@@ -241,8 +242,7 @@ jobs:
 
       - name: Start Redis (docker)
         run: |
-          docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$REDIS_CONTAINER" -p 127.0.0.1::6379 redis:7 >/dev/null
+          bash .gitea/scripts/ci-service-container.sh redis "$REDIS_CONTAINER" redis:7 -p 127.0.0.1::6379 >/dev/null
           REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           if [ -z "$REDIS_PORT" ]; then
             REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | head -1 | awk -F: '{print $NF}')
@@ -354,36 +354,11 @@ jobs:
         working-directory: canvas
         run: npm ci
 
-      - name: Install Playwright browsers
-        working-directory: canvas
-        # This step USED to open with a "use the prebaked browsers" fast path:
-        #
-        #   PREBAKED_PLAYWRIGHT=/ms-playwright
-        #   if [ -d "$PREBAKED_PLAYWRIGHT" ] && find ... -name 'chrome' | grep -q .; then
-        #       ... export PLAYWRIGHT_BROWSERS_PATH; exit 0
-        #   fi
-        #
-        # It could never match. /ms-playwright does not exist in this lane's
-        # runner image (runner-base:full-latest-cloudflared-goproxy-pipe) and
-        # PLAYWRIGHT_BROWSERS_PATH is unset, so `[ -d ... ]` was false on every
-        # run and the guard fell through 100% of the time. Verified on job
-        # 934478 (run 633420, main, GREEN, 2026-08-08): the string "Using
-        # prebaked Playwright Chromium" appears in that log exactly once — as
-        # the ECHOED SCRIPT SOURCE inside the `::group::Run` block — and never
-        # as output. What actually ran was the fallback below, downloading
-        # 170.4 MiB of Chromium + ffmpeg + chrome-headless-shell into
-        # /home/runner/.cache/ms-playwright in 24.9s (17:08:32.80→17:08:57.71),
-        # on every e2e job, every time.
-        #
-        # So the guard was pure decoration that read as an optimisation — the
-        # same "protection that cannot fire" class as the other defects fixed
-        # in this PR. Deleted rather than repaired: making it real means baking
-        # the browsers into runner-base at /ms-playwright, and runner-base is
-        # not built in this repository (no Dockerfile for it here) — that is a
-        # fleet-image change, out of scope for a test-harness PR. The ~25s /
-        # ~230MB per-job cost is UNCHANGED by this commit; it is simply now
-        # honest about being paid. Prebaking remains worth doing separately.
-        run: npx playwright install --with-deps chromium
+      - name: Start isolated Playwright browser
+        run: |
+          set -euo pipefail
+          endpoint="$(bash .gitea/scripts/start-playwright-server.sh "$PLAYWRIGHT_CONTAINER")"
+          echo "PLAYWRIGHT_WS_ENDPOINT=$endpoint" >> "$GITHUB_ENV"
 
       - name: Build canvas (production bundle)
         working-directory: canvas
@@ -600,6 +575,7 @@ jobs:
           # here under `set -e`; passWithNoTests:false makes a zero-match selection
           # non-zero too. The assertions below are belt-and-braces.
           npx playwright test e2e/chat-desktop.spec.ts e2e/chat-mobile.spec.ts e2e/chat-separation.spec.ts \
+            e2e/local-entry.spec.ts e2e/concierge-chat-rendering.spec.ts \
             e2e/schedule-tab.spec.ts \
             e2e/boot-regression.spec.ts \
             e2e/css-diagnostic.spec.ts \
@@ -645,6 +621,10 @@ jobs:
         if: failure()
         run: cat canvas/canvas.log || true
 
+      - name: Dump browser log on failure
+        if: failure()
+        run: docker logs "$PLAYWRIGHT_CONTAINER" || true
+
       # `--reporter=list` writes NO playwright-report/ directory — only the HTML
       # reporter does — so this step has been finding nothing and warning
       # "No files were found with the provided path" on every failure. It cost
@@ -682,5 +662,6 @@ jobs:
         run: |
           # timeout-wrap so a wedged docker daemon can't hang this always() step
           # (a hung rm here is one way containers leak in the first place).
-          timeout 30 docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          timeout 30 docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
+          timeout 30 docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
+          timeout 30 docker rm -fv "$REDIS_CONTAINER" 2>/dev/null || true
+          timeout 30 docker rm -fv "$PLAYWRIGHT_CONTAINER" 2>/dev/null || true

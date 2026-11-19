@@ -1204,6 +1204,223 @@ def test_critical_guard_allows_when_both_green():
     assert decision.action == "merge"
 
 
+# --------------------------------------------------------------------------
+# Gitea 1.27 filtered-workflow PLACEHOLDERS (CreateSkippedCommitStatusFor-
+# FilteredWorkflow). Row shapes are copied from live heads; see
+# FILTERED_WORKFLOW_PLACEHOLDER_DESCRIPTION in the script.
+# --------------------------------------------------------------------------
+
+
+def _placeholder(context, sid):
+    """A live Gitea 1.27 placeholder, verbatim (PR #5212 head, status id 13)."""
+    return {
+        "id": sid,
+        "context": context,
+        "status": "skipped",
+        "description": "Skipped",
+        "target_url": "",
+        "creator": None,
+    }
+
+
+_ACTIONS_DESCRIPTIONS = {
+    "success": "Successful in 2s",
+    "failure": "Failing after 58s",
+    "skipped": "Skipped",
+    "pending": "Waiting to run",
+}
+
+
+def _run_row(context, state, sid, job=1076641):
+    """A status the Actions engine wrote for a job that EXISTED (has its URL)."""
+    return {
+        "id": sid,
+        "context": context,
+        "status": state,
+        "description": _ACTIONS_DESCRIPTIONS[state],
+        "target_url": f"/molecule-ai/molecule-core/actions/runs/763155/jobs/{job}",
+        "creator": None,
+    }
+
+
+def test_placeholders_on_a_green_pr_head_do_not_block_the_merge():
+    # PR #5135 (head e99eb1e6aa): 41 real contexts, all success, plus 102
+    # placeholders -- among them the aggregator's own `(push)` flavour, because
+    # ci.yml only runs on push to main. The queue logged
+    #   CRITICAL required context(s) not green (fail-closed):
+    #   CI / all-required=skipped (critical context not green)
+    # and the PR was merged by hand. Without the fix this test fails the same way.
+    pr_status = {
+        "state": "success",
+        "statuses": [
+            _run_row("CI / all-required (pull_request)", "success", 230),
+            _run_row("CI / Platform (Go) (pull_request)", "success", 229, job=1076600),
+            _placeholder("CI / all-required (push)", 21),
+            _placeholder("CI / Platform (Go) (push)", 6),
+            _placeholder(
+                "Check migration collisions / Migration version collision check (pull_request)",
+                151,
+            ),
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(
+            pr_status=pr_status,
+            required_contexts=["*"],
+            required_approvals=1,
+            approvers={"claude-ceo-assistant"},
+        )
+    )
+    assert decision.action == "merge", decision.reason
+    assert decision.ready is True
+
+
+def test_a_real_skip_of_the_aggregator_still_blocks_beside_a_placeholder():
+    # PR #5212 (head 0c75646966): Platform (Go) failed, so all-required was
+    # SKIPPED by the engine (the core#1676 shape) -- a real job with an Actions
+    # URL. The placeholder next to it must not change the verdict.
+    pr_status = {
+        "state": "failure",
+        "statuses": [
+            _run_row("CI / Platform (Go) (pull_request)", "failure", 225, job=1076636),
+            _run_row("CI / all-required (pull_request)", "skipped", 227),
+            _placeholder("CI / all-required (push)", 13),
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(pr_status=pr_status, required_contexts=["*"])
+    )
+    assert decision.ready is False
+    assert decision.action == "wait"
+    assert "CRITICAL" in decision.reason
+    assert "CI / all-required=skipped" in decision.reason
+
+
+def test_a_placeholder_alone_never_proves_the_aggregator_green():
+    # Only the placeholder exists for the aggregator: nothing ran, so the
+    # step-0 guard must report it MISSING and block -- never pass.
+    pr_status = {
+        "state": "success",
+        "statuses": [
+            _run_row("CI / Platform (Go) (pull_request)", "success", 5),
+            _placeholder("CI / all-required (push)", 11),
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(pr_status=pr_status, required_contexts=["*"])
+    )
+    assert decision.ready is False
+    assert "CI / all-required=missing" in decision.reason
+
+
+def test_a_literal_requirement_met_only_by_a_placeholder_is_missing():
+    context = "Secret scan / Scan diff for credential-shaped strings (pull_request)"
+    latest = mq.latest_statuses_by_context([
+        _run_row("CI / all-required (pull_request)", "success", 2),
+        _placeholder(context, 3),
+    ])
+    ok, bad = mq.required_contexts_green(latest, [context])
+    assert ok is False
+    assert bad == [f"{context}=missing"]
+
+
+def test_wildcard_sweep_skips_placeholders_but_flags_a_real_skip():
+    latest = mq.latest_statuses_by_context([
+        _run_row("CI / all-required (pull_request)", "success", 30),
+        _placeholder("CI / all-required (push)", 11),
+        _placeholder("Harness Replays / Harness Replays (push)", 26),
+        _run_row("E2E Chat / E2E Chat (pull_request)", "skipped", 31, job=7),
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["E2E Chat / E2E Chat (pull_request)=skipped"]
+
+
+@pytest.mark.parametrize(
+    "mutate, expected",
+    [
+        pytest.param(lambda s: s, True, id="live-placeholder-shape"),
+        # A real job-level skip: the engine linked the job it skipped.
+        pytest.param(
+            lambda s: {**s, "target_url": "/o/r/actions/runs/1/jobs/2"}, False,
+            id="real-job-skip-has-actions-url",
+        ),
+        # Conductor-snapshot rows carry only context+status: cannot prove it.
+        pytest.param(
+            lambda s: {k: v for k, v in s.items() if k != "target_url"}, False,
+            id="no-target_url-field",
+        ),
+        pytest.param(
+            lambda s: {k: v for k, v in s.items() if k != "description"}, False,
+            id="no-description-field",
+        ),
+        pytest.param(lambda s: {**s, "target_url": None}, False, id="target_url-null"),
+        pytest.param(
+            lambda s: {**s, "description": "Has been skipped"}, False,
+            id="other-description",
+        ),
+        pytest.param(
+            lambda s: {**s, "description": "Skipped by a bot"}, False,
+            id="description-not-exact",
+        ),
+        # POSTed through the API by a user: never a placeholder.
+        pytest.param(
+            lambda s: {**s, "creator": {"login": "claude-status-reaper"}}, False,
+            id="api-user-creator",
+        ),
+        pytest.param(lambda s: {**s, "status": "success"}, False, id="state-success"),
+        pytest.param(lambda s: {**s, "status": "failure"}, False, id="state-failure"),
+    ],
+)
+def test_placeholder_recognition_needs_every_predicate(mutate, expected):
+    row = mutate(_placeholder("CI / all-required (push)", 11))
+    assert mq.is_filtered_workflow_placeholder(row) is expected
+
+
+def test_get_combined_status_never_lets_a_placeholder_mask_a_real_row(monkeypatch):
+    # Gitea dedupes a new workflow status only against an IDENTICAL latest row,
+    # so a placeholder can be written AFTER a real result for the same context
+    # (the same commit later pushed to a branch the workflow filters out). The
+    # server-reduced combined view then shows the placeholder; the real verdict
+    # underneath must still decide.
+    monkeypatch.setattr(mq, "OWNER", "o")
+    monkeypatch.setattr(mq, "NAME", "r")
+    monkeypatch.delenv("CONDUCTOR_SNAPSHOT_FILE", raising=False)
+    masked = "Harness Replays / Harness Replays (push)"
+    only_placeholder = "design-token-drift / Canvas design-token SSOT drift (push)"
+
+    def fake_api(method, path, *, query=None, **kw):
+        if path.endswith("/status"):
+            return 200, {
+                "state": "success",
+                "statuses": [
+                    _placeholder(masked, 40),
+                    _placeholder(only_placeholder, 41),
+                    _run_row("CI / all-required (push)", "success", 42),
+                ],
+            }
+        raise mq.ApiError(f"unexpected {path}")
+
+    monkeypatch.setattr(mq, "api", fake_api)
+    monkeypatch.setattr(mq, "api_paginated", lambda *a, **k: [
+        _run_row(masked, "pending", 9),
+        _run_row(masked, "failure", 12),
+        _placeholder(masked, 40),
+        _placeholder(only_placeholder, 41),
+        _run_row("CI / all-required (push)", "success", 42),
+    ])
+
+    combined = mq.get_combined_status("d" * 40)
+    latest = mq.latest_statuses_by_context(combined["statuses"])
+
+    assert latest[masked]["status"] == "failure"
+    assert latest[masked]["id"] == 12
+    assert only_placeholder not in latest
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == [f"{masked}=failure"]
+
+
 def test_unmergeable_pr_blocks():
     decision = mq.evaluate_merge_readiness(**_ready_kwargs(mergeable=False))
     assert decision.ready is False

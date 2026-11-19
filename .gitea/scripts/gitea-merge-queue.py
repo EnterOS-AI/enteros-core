@@ -357,6 +357,52 @@ _ACTIONS_TARGET_URL_RE = re.compile(
     r"\A(?:https?://[^/]+)?/[^/\s]+/[^/\s]+/actions/runs/[0-9]+/jobs/[0-9]+\Z"
 )
 
+# --------------------------------------------------------------------------
+# Gitea 1.27 FILTERED-WORKFLOW PLACEHOLDERS are not results
+# --------------------------------------------------------------------------
+# Gitea 1.27 posts a `skipped` commit status for every job of a workflow that
+# MATCHED the event but was excluded by its own `branches:` / `paths:` filter,
+# whenever the job's context matches a branch-protection pattern
+# (services/actions/commit_status.go, CreateSkippedCommitStatusForFilteredWorkflow).
+# No run is created, so the row is written with
+#
+#     state="skipped"  description="Skipped"  target_url=""  (Actions user)
+#
+# With status_check_contexts=["*"] every filtered job qualifies, so EVERY PR
+# head carries one per push-only job -- including `CI / all-required (push)`,
+# because ci.yml's push trigger is `branches: [main]`. One live head shows both
+# kinds of `skipped` side by side (PR #5212, head 0c75646966):
+#
+#   CI / Platform (Go) (pull_request)  failure  /actions/runs/763155/jobs/1076636
+#   CI / all-required (pull_request)   skipped  /actions/runs/763155/jobs/1076641  REAL skip
+#   CI / all-required (push)           skipped  ""                                 placeholder
+#
+# On PR #5135 (head e99eb1e6aa: 41 success + 102 placeholders, zero failures)
+# the queue logged `CRITICAL required context(s) not green (fail-closed):
+# CI / all-required=skipped` and the PR was merged by hand 29 s later. The
+# step-0 critical guard needs EVERY event flavour of the aggregator to be
+# success and the ["*"] sweep needs every posted context to be success, so on
+# Gitea 1.27 the queue could merge no PR at all.
+#
+# A placeholder records that NO run happened; it is not a verdict. It is
+# dropped BEFORE the newest-wins reduction -- what Gitea <= 1.26 did by never
+# writing it. Consequences, all deliberate:
+#   * a context that also has real rows is judged on its newest REAL row, so a
+#     placeholder written later (the same commit pushed to a filtered branch)
+#     can never mask an earlier real failure;
+#   * a context with ONLY placeholders is absent: a literal requirement reports
+#     `missing` and the step-0 guard reports `missing` -- both still block, so
+#     "did not run" is never "passed";
+#   * a REAL job-level skip (all-required skipped because a `needs:` failed --
+#     the core#1676 shape) carries its Actions job URL, is not a placeholder,
+#     and still blocks.
+# Recognition needs ALL of: state `skipped`, description exactly "Skipped",
+# a `target_url` field that is present and empty, and no creator (a row an API
+# user POSTed is never treated as one). Rows missing those fields -- the
+# conductor snapshot carries only context+status -- are never dropped, so a
+# change in Gitea's shape makes placeholders block again: visible, not silent.
+FILTERED_WORKFLOW_PLACEHOLDER_DESCRIPTION = "Skipped"
+
 SELF_STATUS_CONFIRM_ATTEMPTS = 5
 SELF_STATUS_CONFIRM_DELAY_SECONDS = 0.25
 MERGE_STATUS_RETRY_ATTEMPTS = 3
@@ -778,6 +824,28 @@ def _is_native_cancellation_artifact(status: dict) -> bool:
     return bool(_ACTIONS_TARGET_URL_RE.fullmatch(target_url.strip()))
 
 
+def is_filtered_workflow_placeholder(status: dict) -> bool:
+    """True only for Gitea 1.27's no-run `skipped` row for a filtered workflow.
+
+    See FILTERED_WORKFLOW_PLACEHOLDER_DESCRIPTION for the measured shapes. Every
+    predicate must hold; anything else -- including a real job-level skip,
+    which carries its Actions job URL -- is a status and is evaluated normally.
+    """
+    if not isinstance(status, dict) or status_state(status) != "skipped":
+        return False
+    if "target_url" not in status:
+        return False
+    target_url = status.get("target_url")
+    if not isinstance(target_url, str) or target_url.strip():
+        return False
+    description = status.get("description")
+    if not isinstance(description, str):
+        return False
+    if description.strip() != FILTERED_WORKFLOW_PLACEHOLDER_DESCRIPTION:
+        return False
+    return not status.get("creator")
+
+
 def self_status_is_uninformative(status: dict) -> bool:
     """True when the queue's OWN gate-runner status carries no verdict.
 
@@ -810,8 +878,14 @@ def latest_statuses_by_context(statuses: list[dict]) -> dict[str, dict]:
     # Gitea /statuses endpoint returns entries in ascending id order (oldest
     # first). We need the LAST occurrence of each context, so iterate in
     # reverse to prefer newer entries.
+    #
+    # Gitea 1.27 filtered-workflow placeholders are dropped before the
+    # reduction (FILTERED_WORKFLOW_PLACEHOLDER_DESCRIPTION): they record that no
+    # run happened, so they can neither pass nor fail a context.
     latest: dict[str, dict] = {}
     for status in reversed(statuses):
+        if is_filtered_workflow_placeholder(status):
+            continue
         context = status.get("context")
         if isinstance(context, str):
             latest[context] = status  # overwrite: reverse order → newest wins
@@ -1958,6 +2032,10 @@ def critical_contexts_block(
         canonical case — a skipped aggregator sentinel means nothing gated
         the required jobs.)
       * Only `success` clears a critical context.
+      * Gitea 1.27 filtered-workflow placeholders never reach this function
+        (latest_statuses_by_context drops them): the PR head's
+        `CI / all-required (push)` placeholder is not a flavour of the
+        aggregator that ran. A REAL skip keeps its Actions URL and blocks here.
 
     Each critical PREFIX must be matched by at least one observed context whose
     base name equals it AND that context must be `success`. If the prefix is
@@ -2263,12 +2341,22 @@ def get_combined_status(sha: str, *, prefer_live: bool = False) -> dict:
     # concurrent status writes can move page boundaries and surface an older
     # pending row before its newer success row.  Status ids are monotonic, so
     # sorting by id makes enrichment deterministic across page-order races.
+    #
+    # Gitea 1.27 filtered-workflow placeholders are skipped in BOTH passes, so
+    # a context whose server-reduced latest row is a placeholder falls through
+    # to its newest REAL row from the history (a placeholder must never mask
+    # an earlier real failure), and a placeholder-only context is absent. See
+    # FILTERED_WORKFLOW_PLACEHOLDER_DESCRIPTION.
     latest: dict[str, dict] = {}
     for status in sorted(combined_statuses, key=status_numeric_id, reverse=True):
+        if is_filtered_workflow_placeholder(status):
+            continue
         ctx = status.get("context")
         if isinstance(ctx, str) and ctx not in latest:
             latest[ctx] = status
     for status in sorted(all_statuses, key=status_numeric_id, reverse=True):
+        if is_filtered_workflow_placeholder(status):
+            continue
         ctx = status.get("context")
         if isinstance(ctx, str) and ctx not in latest:
             latest[ctx] = status

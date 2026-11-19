@@ -10,8 +10,9 @@ name: publish-canvas-image
 #     gates do not depend on Actions environments.
 #   - Workflow-level env.GITHUB_SERVER_URL pinned per
 #     feedback_act_runner_github_server_url.
-#   - Publication remains advisory for this pre-flip soak; clean post-main logs
-#     are the evidence required before internal#1038 removes continue-on-error.
+#   - Publication is FAIL-CLOSED as of 2026-09-03: the pre-flip soak ended once
+#     five consecutive clean post-main runs existed (see the decision record on
+#     the job below). A failed candidate build/push now reds the main push.
 #   - Image push targeted registry.moleculesai.app (our self-hosted OCI
 #     registry). GHCR was retired in the 2026-05-06 Gitea migration; ECR was
 #     retired with the AWS account (2026-06-27, no-AWS directive). The build now
@@ -20,9 +21,9 @@ name: publish-canvas-image
 #
 
 # Builds on robot-1 and publishes through the CF tunnel whenever Canvas or one
-# of this workflow's directly executed helpers changes. This pre-flip slice
-# publishes candidate selectors only so its post-main log can prove the hardened
-# path before internal#1038 makes the same job fail closed.
+# of this workflow's directly executed helpers changes. It publishes candidate
+# selectors only and never moves a production tag; internal#1038 still owns the
+# separate transactional-promotion work.
 #
 # Ordered registry publication (core#2226):
 #
@@ -86,13 +87,28 @@ jobs:
     # candidate selectors only; no production selector or live host is touched.
     runs-on: [docker-host, robot-1]
     timeout-minutes: 45
-    # Pre-flip soak mask. Release blocker: internal#1038 (transactional immutable
-    # promotion). That cross-link is stated HERE, four lines clear of the directive,
-    # and deliberately not on the two lines immediately above it:
-    # lint_continue_on_error_tracking.py sets WINDOW = 2 and takes the FIRST tracker
-    # scanning [line-2, line+2] ascending, so any number in that band would be
-    # resolved INSTEAD of the live one and red the gate.
-    continue-on-error: true  # mc#4960: 2026-07-30 renewal, expires 2026-08-13 — inspect clean post-main build-and-push logs, then flip false; successor tracker carries definition-of-done.
+    # UNMASKED 2026-09-03. Was `continue-on-error: true` under tracker mc#4960,
+    # a pre-flip soak mask whose own definition of done was "collect clean
+    # post-main build-and-push logs, then flip false".
+    #
+    # Those logs now exist. Governance review 2026-09-03 read every post-main run
+    # of this job since the last renewal: runs 631493, 632082, 632983, 633875
+    # (2026-08-08) and 647095 (2026-08-11). All five report "Job succeeded" and
+    # emit a proven immutable candidate digest plus a staging selector; the only
+    # `::error::` strings in those logs are the runner echoing unexecuted guard
+    # branches of the step scripts, not emitted errors.
+    #
+    # The failure the mask was actually covering is fixed. mc#4391's evidence
+    # comment (2026-07-18, run 543305) recorded this job failing closed on an
+    # Infisical HTTP 404 for MOLECULE_REGISTRY_TOKEN; c58c0a58 (2026-07-23) moved
+    # that read to Actions secrets, and every run since has been clean.
+    #
+    # mc#4391 stays OPEN as the P0 of record, and correctly so: it is about
+    # promotion advancing a stale mutable `:latest`, and the production rollout
+    # work is tracked cross-repo in internal#1038. This job does not promote —
+    # it publishes candidate selectors only and leaves `:latest` untouched — so
+    # the mask here was never what held that P0 back.
+    continue-on-error: false
     outputs:
       # Digest evidence is retained so the later fail-closed release gate can
       # consume the exact immutable candidate without rebuilding it.

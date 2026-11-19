@@ -55,7 +55,7 @@ function makeAttachment(name: string, size?: number): ChatAttachment {
 
 beforeEach(() => {
   mockIsPlatformAttachment.mockReturnValue(true);
-  mockResolveAttachmentHref.mockReturnValue(
+  mockResolveAttachmentHref.mockImplementation(
     (id: string, uri: string) => `https://api.moleculesai.app/attachments/${uri}`,
   );
 });
@@ -72,59 +72,18 @@ afterEach(() => {
  */
 function mockFetchText(completeText: string) {
   const encoder = new TextEncoder();
-  const chunks: Uint8Array[] = [];
-  // Yield in 50-byte chunks
-  let offset = 0;
-  while (offset < completeText.length) {
-    chunks.push(encoder.encode(completeText.slice(offset, offset + 50)));
-    offset += 50;
-  }
-  let chunkIndex = 0;
-  const mockReader = {
-    read: vi.fn<() => Promise<{ done: boolean; value?: Uint8Array }>>(
-      async () => {
-        if (chunkIndex < chunks.length) {
-          return { done: false, value: chunks[chunkIndex++] };
-        }
-        return { done: true };
-      },
-    ),
-    cancel: vi.fn(),
-  };
-  const mockBody = {
-    getReader: vi.fn(() => mockReader),
-  };
-  global.fetch = vi.fn(() =>
-    Promise.resolve({
-      ok: true,
-      status: 200,
-      body: mockBody,
-      headers: new Map([["content-type", "text/plain"]]),
-    }) as unknown as Response,
-  );
-  return mockReader;
+  global.fetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (let offset = 0; offset < completeText.length; offset += 50) {
+        controller.enqueue(encoder.encode(completeText.slice(offset, offset + 50)));
+      }
+      controller.close();
+    },
+  }), { headers: { "content-type": "text/plain" } }));
 }
 
 function mockFetchError() {
-  global.fetch = vi.fn(() =>
-    Promise.resolve({ ok: false, status: 500 }) as unknown as Response,
-  );
-}
-
-/**
- * Mock a fetch where body.getReader() returns null (no streaming body).
- */
-function mockFetchTextNoBody(text: string) {
-  const encoder = new TextEncoder();
-  global.fetch = vi.fn(() =>
-    Promise.resolve({
-      ok: true,
-      status: 200,
-      body: null,
-      text: () => Promise.resolve(text),
-      headers: new Map([["content-type", "text/plain"]]),
-    }) as unknown as Response,
-  );
+  global.fetch = vi.fn(async () => new Response(null, { status: 500 }));
 }
 
 // ─── Loading / idle state ─────────────────────────────────────────────────────
@@ -328,26 +287,13 @@ describe("AttachmentTextPreview — truncated", () => {
   it("shows truncated notice when file exceeds 256 KB", async () => {
     // Simulate a response where the reader yields chunks until MAX_FETCH_BYTES (256KB)
     const encoder = new TextEncoder();
-    const bytesNeeded = 256 * 1024;
-    const mockReader = {
-      read: vi.fn<() => Promise<{ done: boolean; value?: Uint8Array }>>(
-        async () => {
-          // Return one chunk that's >= 256KB total (we'll cap at MAX_FETCH_BYTES)
-          const chunk = encoder.encode("x".repeat(300 * 1024));
-          return { done: false, value: chunk };
-        },
-      ),
-      cancel: vi.fn(),
-    };
-    const mockBody = { getReader: vi.fn(() => mockReader) };
-    global.fetch = vi.fn(() =>
-      Promise.resolve({
-        ok: true,
-        status: 200,
-        body: mockBody,
-        headers: new Map([["content-type", "text/plain"]]),
-      }) as unknown as Response,
-    );
+    const cancel = vi.fn();
+    global.fetch = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(encoder.encode("x".repeat(300 * 1024)));
+      },
+      cancel,
+    }), { headers: { "content-type": "text/plain" } }));
     const att = makeAttachment("huge.log");
     render(
       <AttachmentTextPreview
@@ -366,6 +312,7 @@ describe("AttachmentTextPreview — truncated", () => {
       (b) => b.textContent?.includes("download full file"),
     );
     expect(truncatedNote).toBeTruthy();
+    expect(cancel).toHaveBeenCalledOnce();
   });
 });
 

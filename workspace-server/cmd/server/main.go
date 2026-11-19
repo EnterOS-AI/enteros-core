@@ -346,6 +346,11 @@ func main() {
 					"message":      message,
 				})
 			})
+			// Delete-vs-provision race (RC09): Start re-checks the row right
+			// before ContainerCreate and after ContainerStart, so a provision
+			// in flight when its workspace is deleted — by any caller,
+			// including the bundle importer — leaves no container behind.
+			p.SetWorkspaceRemovedCheck(handlers.WorkspaceIsRemoved)
 			prov = p
 			defer prov.Close()
 			log.Println("Provisioner: Docker")
@@ -397,6 +402,10 @@ func main() {
 		})
 	if cpProv != nil {
 		wh.SetCPProvisioner(cpProv)
+		// Enter OS Light (contract C4): the CP's Light routes ride the same
+		// provisioner client and auth. No CP (self-host) = no Light: the Light
+		// endpoints answer 501 LIGHT_UNSUPPORTED.
+		wh.SetLightAPI(cpProv)
 	}
 
 	// Desktop computer-use wiring (design decision B). ON BY DEFAULT wherever a
@@ -683,13 +692,17 @@ func main() {
 	wh.SetEnvMutators(envReg)
 	log.Printf("env-mutator chain: %v", envReg.Names())
 
-	// Offline handler: broadcast event + auto-restart the dead workspace
-	onWorkspaceOffline := func(innerCtx context.Context, workspaceID string) {
-		if err := broadcaster.RecordAndBroadcast(innerCtx, "WORKSPACE_OFFLINE", workspaceID, map[string]interface{}{}); err != nil {
-			log.Printf("Offline broadcast error for %s: %v", workspaceID, err)
+	// Offline handler: broadcast event + auto-restart the dead workspace.
+	// trigger names the sweep that found it, for the crash-loop breaker's log
+	// line and failure event.
+	onWorkspaceOffline := func(trigger string) registry.OfflineHandler {
+		return func(innerCtx context.Context, workspaceID string) {
+			if err := broadcaster.RecordAndBroadcast(innerCtx, "WORKSPACE_OFFLINE", workspaceID, map[string]interface{}{}); err != nil {
+				log.Printf("Offline broadcast error for %s: %v", workspaceID, err)
+			}
+			// Auto-restart: bring the workspace back automatically
+			go wh.AutoRestartByID(workspaceID, trigger)
 		}
-		// Auto-restart: bring the workspace back automatically
-		go wh.RestartByID(workspaceID)
 	}
 
 	// 2026-06-19 a2a RCA (#3057): wedged-agent handler. Initial
@@ -708,7 +721,7 @@ func main() {
 
 	// Start Liveness Monitor — Redis TTL expiry-based offline detection + auto-restart
 	go supervised.RunWithRecover(ctx, "liveness-monitor", func(c context.Context) {
-		registry.StartLivenessMonitor(c, onWorkspaceOffline)
+		registry.StartLivenessMonitor(c, onWorkspaceOffline("liveness-monitor"))
 	})
 
 	// Proactive health sweep — two passes per tick:
@@ -727,7 +740,7 @@ func main() {
 	// healthsweep.go has always handled nil checker correctly; only the
 	// orchestration was wrong. See #2392's CI failure for the trace.
 	go supervised.RunWithRecover(ctx, "health-sweep", func(c context.Context) {
-		registry.StartHealthSweep(c, prov, 15*time.Second, onWorkspaceOffline)
+		registry.StartHealthSweep(c, prov, 15*time.Second, onWorkspaceOffline("health-sweep"))
 	})
 
 	// 2026-06-19 a2a RCA (#3057): a separate monitor for the
@@ -789,7 +802,7 @@ func main() {
 			log.Fatalf("RestartDebounceWindow (%s) must be >= CP instance reconciler interval (%s) to prevent double-reprovision thrash (internal#544)", handlers.RestartDebounceWindow, reconcileInterval)
 		}
 		go supervised.RunWithRecover(ctx, "cp-instance-reconciler", func(c context.Context) {
-			registry.StartCPInstanceReconciler(c, cpProv, onWorkspaceOffline, reconcileInterval)
+			registry.StartCPInstanceReconciler(c, cpProv, onWorkspaceOffline("cp-instance-reconciler"), reconcileInterval)
 		})
 	}
 
@@ -868,6 +881,17 @@ func main() {
 		registry.StartHibernationMonitor(c, wh.HibernateWorkspace)
 	})
 
+	// Enter OS Light monitor: finishes interrupted parks and opens, parks idle
+	// Light agents (LIGHT_AUTO_PARK_IDLE_MINUTES, default 30), refreshes parked
+	// agents with queued work, records runs that never reported, suspends a
+	// schedule after three failed runs in a row. Light needs the control plane
+	// (Kubernetes substrate), so the monitor runs only with one; disable via
+	// LIGHT_MONITOR_DISABLED=true.
+	if handlers.LightMonitorEnabled(cpProv != nil) {
+		lightMonitor := handlers.NewLightMonitor(wh)
+		go supervised.RunWithRecover(ctx, "light-monitor", lightMonitor.Start)
+	}
+
 	// RFC #2829 PR-3: stuck-task sweeper for the durable delegations
 	// ledger. Marks deadline-exceeded rows as failed and heartbeat-stale
 	// in-flight rows as stuck. Both transitions go through the ledger's
@@ -903,12 +927,14 @@ func main() {
 	// status='failed' watchdog both miss — a workspace that is status='online'
 	// with active_tasks>0 but has produced NO activity for too long (the case
 	// that let JRS sit dead ~2.5h). Two-stage: probe via A2A, then soft-restart
-	// (existing-volume, wh.RestartByID — the same path POST /workspaces/:id/
-	// restart uses) if still silent past the grace window; anti-flap cooldown.
+	// (existing-volume, wh.AutoRestartByID — the restart cycle, behind the
+	// crash-loop breaker) if still silent past the grace window; anti-flap cooldown.
 	// Defaults: 3min sweep, 12min stale, 5min probe-grace, 30min cooldown;
 	// override via STALL_WATCHDOG_*_S. Disable via STALL_WATCHDOG_DISABLED=true.
 	if !strings.EqualFold(os.Getenv("STALL_WATCHDOG_DISABLED"), "true") {
-		stallWatchdog := handlers.NewStallWatchdog(nil, wh.RestartByID)
+		stallWatchdog := handlers.NewStallWatchdog(nil, func(workspaceID string) {
+			wh.AutoRestartByID(workspaceID, "stall-watchdog")
+		})
 		// Versioned-heartbeat GENERATION LOOP (PR-C): the stall probe is this PR's
 		// single live desired-generation bump point. Wiring the wake hooks makes a
 		// fired probe mint a wake_intent + bump desired_generation, which the

@@ -122,7 +122,10 @@ func (h *ScheduleHandler) forwardScheduleAPI(c *gin.Context, workspaceID, method
 	}
 	resp, err := h.forwardClient().Do(req)
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "schedule backend unreachable"})
+		// The agent did not answer: it is starting, or a restart is replacing
+		// its pod. A retryable 503 with a code, not a 502: Cloudflare replaces
+		// an origin's 502 body with its own page.
+		writeWorkspaceNotReady(c, "schedule backend unreachable")
 		return 0, nil, false
 	}
 	defer resp.Body.Close()
@@ -130,11 +133,16 @@ func (h *ScheduleHandler) forwardScheduleAPI(c *gin.Context, workspaceID, method
 	return resp.StatusCode, rb, true
 }
 
+// errScheduleNoCallbackURL: the workspace has no callback URL (poll mode, or a
+// push-mode agent that has not registered since its last restart cleared it).
+var errScheduleNoCallbackURL = errors.New("no callback URL (poll-mode / not registered)")
+
 // resolveScheduleFanoutTarget resolves the workspace URL + inbound secret for a
-// quiet (non-gin) schedule forward — the webhook poke fan-out and the admin
-// health aggregate, where one unreachable workspace must never fail the whole
-// surface. Mirrors armSchedulerPlugin's resolution; callers log-and-skip on a
-// non-nil error.
+// quiet (non-gin) schedule forward — the webhook poke fan-out, the admin
+// health aggregate and the Light park's grid read, where one unreachable
+// workspace must never fail the whole surface. Mirrors armSchedulerPlugin's
+// resolution; callers log-and-skip on a non-nil error (the park tells
+// errScheduleNoCallbackURL apart: a restarting agent).
 func resolveScheduleFanoutTarget(ctx context.Context, workspaceID string) (string, string, error) {
 	var wsURL string
 	if err := db.DB.QueryRowContext(ctx,
@@ -143,7 +151,7 @@ func resolveScheduleFanoutTarget(ctx context.Context, workspaceID string) (strin
 		return "", "", fmt.Errorf("workspace lookup: %w", err)
 	}
 	if wsURL == "" {
-		return "", "", errors.New("no callback URL (poll-mode / not registered)")
+		return "", "", errScheduleNoCallbackURL
 	}
 	if err := isSafeURL(wsURL); err != nil {
 		return "", "", fmt.Errorf("unsafe workspace URL rejected: %w", err)
@@ -252,11 +260,11 @@ func (h *ScheduleHandler) createVolume(c *gin.Context, ctx context.Context, work
 		}
 		if attempt >= createVolumeMaxRetries || ctx.Err() != nil {
 			log.Printf("createVolume %s: runtime not ready after %d attempt(s) (err=%v status=%d)", workspaceID, attempt+1, err, status)
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "scheduler starting, retry"})
+			writeWorkspaceNotReady(c, "scheduler starting, retry")
 			return
 		}
 		if !sleepCtx(ctx, createVolumeRetryBackoff) {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "scheduler starting, retry"})
+			writeWorkspaceNotReady(c, "scheduler starting, retry")
 			return
 		}
 	}
@@ -562,7 +570,13 @@ func relayScheduleError(c *gin.Context, status int, body []byte) {
 	if json.Unmarshal(body, &parsed) == nil && parsed.Error != "" {
 		msg = parsed.Error
 	}
-	// Normalize to statuses the Canvas client already handles.
+	// Normalize to statuses the Canvas client already handles. A gateway
+	// status means the runtime (or what is in front of it) is not serving yet:
+	// a retryable 503 WORKSPACE_NOT_READY, which passes a proxy untouched.
+	if isTransientForwardStatus(status) {
+		writeWorkspaceNotReady(c, msg)
+		return
+	}
 	switch status {
 	case http.StatusNotFound:
 		c.JSON(http.StatusNotFound, gin.H{"error": msg})

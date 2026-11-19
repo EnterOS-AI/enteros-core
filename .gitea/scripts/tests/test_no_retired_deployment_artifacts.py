@@ -212,7 +212,8 @@ def test_current_deployment_comments_do_not_overclaim_rollout() -> None:
     assert "fresh production provisions now resolve" not in tenant_publish
     assert "Production tenants now run as local Docker containers" not in local_redeploy
     assert "prod box" not in local_redeploy.lower()
-    assert "not an inventory or rollout of the entire production tenant set" in local_redeploy
+    assert "production inventory audit" in local_redeploy
+    assert "promote-prod-tenant-pin.yml" in local_redeploy
 
 
 def test_active_skill_and_runtime_guidance_matches_current_contracts() -> None:

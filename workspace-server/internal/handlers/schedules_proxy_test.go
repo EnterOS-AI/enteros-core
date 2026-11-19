@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -69,6 +70,11 @@ func TestRelayScheduleError_StatusMapping(t *testing.T) {
 		{http.StatusUnauthorized, http.StatusBadGateway},
 		{http.StatusForbidden, http.StatusBadGateway},
 		{http.StatusInternalServerError, http.StatusBadGateway},
+		// A gateway status: the runtime (or what is in front of it) is not
+		// serving yet. A retryable 503, which a proxy passes through.
+		{http.StatusBadGateway, http.StatusServiceUnavailable},
+		{http.StatusServiceUnavailable, http.StatusServiceUnavailable},
+		{http.StatusGatewayTimeout, http.StatusServiceUnavailable},
 	}
 	for _, tc := range cases {
 		w := httptest.NewRecorder()
@@ -77,5 +83,38 @@ func TestRelayScheduleError_StatusMapping(t *testing.T) {
 		if w.Code != tc.want {
 			t.Errorf("runtime %d → want %d, got %d", tc.runtime, tc.want, w.Code)
 		}
+		notReady := strings.Contains(w.Body.String(), `"code":"WORKSPACE_NOT_READY"`) && w.Header().Get("Retry-After") != ""
+		if notReady != (tc.want == http.StatusServiceUnavailable) {
+			t.Errorf("runtime %d → body %s Retry-After %q; only a not-ready 503 carries WORKSPACE_NOT_READY", tc.runtime, w.Body.String(), w.Header().Get("Retry-After"))
+		}
+	}
+}
+
+// A forward that gets no answer (the agent is starting, or a restart is
+// replacing its pod) is a retryable 503 WORKSPACE_NOT_READY with
+// Retry-After, not a 502: Cloudflare replaces an origin's 502 body.
+func TestForwardScheduleAPI_UnreachableIs503NotReady(t *testing.T) {
+	allowLoopbackForTest(t)
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+	const wsID = "44e59f01-0009-4000-8000-000000000009"
+	expectURLAndMode(mock, wsID, deadURL, "push")
+	expectInboundSecret(mock, wsID, "sched-secret")
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/workspaces/"+wsID+"/schedules", nil)
+	NewScheduleHandler().List(c)
+
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), `"code":"WORKSPACE_NOT_READY"`) ||
+		!strings.Contains(w.Body.String(), "schedule backend unreachable") || w.Header().Get("Retry-After") != workspaceNotReadyRetryAfter {
+		t.Fatalf("list of an unreachable agent = %d %s (Retry-After %q), want 503 WORKSPACE_NOT_READY", w.Code, w.Body.String(), w.Header().Get("Retry-After"))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
 	}
 }

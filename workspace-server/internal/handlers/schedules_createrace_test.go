@@ -235,6 +235,9 @@ func TestScheduleCreate_TerminalUnreachable_Returns503(t *testing.T) {
 	if body := w.Body.String(); !bytes.Contains([]byte(body), []byte("scheduler starting")) {
 		t.Errorf("503 body should say 'scheduler starting, retry', got %s", body)
 	}
+	if body := w.Body.String(); !bytes.Contains([]byte(body), []byte(`"code":"WORKSPACE_NOT_READY"`)) || w.Header().Get("Retry-After") == "" {
+		t.Errorf("503 should carry code WORKSPACE_NOT_READY and a Retry-After, got %s (Retry-After %q)", body, w.Header().Get("Retry-After"))
+	}
 }
 
 // TestScheduleCreate_RealBadRequest_NotRetried — a real 4xx from the runtime (a

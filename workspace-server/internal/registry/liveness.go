@@ -59,11 +59,16 @@ func StartLivenessMonitor(ctx context.Context, onOffline OfflineHandler) {
 			// the values — keeps the atomicity of the single UPDATE while
 			// pinning external→awaiting_agent and other→offline at compile
 			// time. $2 = external arm, $3 = non-external arm.
+			//
+			// Enter OS Light: a parking agent's heartbeats are refused (C5), so its
+			// liveness key may expire mid-park; the predicate keeps it from being
+			// flipped offline (the restart onOffline asks for is refused by
+			// runRestartCycle's own predicate).
 			_, err := db.DB.ExecContext(ctx, `
 				UPDATE workspaces
 				SET status = CASE WHEN runtime = 'external' THEN $2 ELSE $3 END,
 				    updated_at = now()
-				WHERE id = $1 AND status NOT IN ('removed', 'paused', 'hibernated')
+				WHERE id = $1 AND status NOT IN ('removed', 'paused', 'hibernated') AND `+models.LightWakeAllowedSQL+`
 			`, workspaceID, models.StatusAwaitingAgent, models.StatusOffline)
 			if err != nil {
 				log.Printf("Liveness: failed to mark %s offline: %v", workspaceID, err)

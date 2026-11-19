@@ -8,6 +8,12 @@ status-context emission, dispatch callers, and the existing compensating bots.
 The lint must describe that local compatibility policy, not claim the current
 server lacks features it now exposes.
 
+NOTE: `status-reaper` was REMOVED (chore/delete-uninstalled-status-reaper). It
+was workflow_dispatch-only, its cron had been decommissioned with the Hetzner
+operator host, and its sole write manufactured a green status. References to it
+below are retained as rule provenance only — the tool no longer exists, and the
+`/`-tokenizing rationale still holds for the remaining parsers.
+
 Rules (4 fatal + 1 fatal cross-file + 1 heuristic-warn):
   1. `workflow_dispatch.inputs:` block — legacy flat-dispatch policy retained
      pending a reviewed migration of dispatch callers and fixtures.

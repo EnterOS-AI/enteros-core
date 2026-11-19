@@ -21,6 +21,8 @@ import { useChatHistory } from "./chat/hooks/useChatHistory";
 import { rotateConversationId } from "./chat/hooks/chatContext";
 import { useChatSend } from "./chat/hooks/useChatSend";
 import { useChatSocket } from "./chat/hooks/useChatSocket";
+import { ChatLightBanner } from "@/components/light/ChatLightBanner";
+import { lightBlocksWake, type LightState } from "@/lib/light";
 
 export { extractReplyText } from "./chat/hooks/useChatSend";
 
@@ -153,12 +155,40 @@ function MyChatPanel({ workspaceId, data }: Props) {
   }, []);
   const pasteCounterRef = useRef(0);
 
+  // Enter OS Light: a parked or parking agent answers chat with 409 and is
+  // not woken by it. The banner replaces the composer's error state, and a
+  // send that still reaches the 409 (a stale node) shows the same banner.
+  const [lightRefused, setLightRefused] = useState<LightState | null>(null);
+  const nodeLightState = data.lightState ?? null;
+  useEffect(() => {
+    if (!lightBlocksWake(nodeLightState) && nodeLightState !== null) setLightRefused(null);
+  }, [nodeLightState]);
+  const lightBanner: LightState | null = lightBlocksWake(nodeLightState)
+    ? nodeLightState
+    : nodeLightState === "opening"
+      ? "opening"
+      : lightRefused;
+  // The composer takes input only from a reachable agent that Light lets chat.
+  const composerEnabled = agentReachable && lightBanner === null;
+  const syncNodeLightState = useCallback(
+    (state: LightState | null) => {
+      const store = useCanvasStore.getState();
+      const node = store.nodes?.find((n) => n.id === workspaceId);
+      if (node && (node.data.lightState ?? null) !== state) store.updateNodeData(workspaceId, { lightState: state });
+    },
+    [workspaceId],
+  );
+
   const history = useChatHistory(workspaceId, containerRef);
   const chatSend = useChatSend(workspaceId, {
     onUserMessage: (msg) => history.setMessages((prev) => [...prev, msg]),
     onAgentMessage: (msg) => history.setMessages((prev) => appendMessageDeduped(prev, msg)),
+    onLightRefused: (state) => {
+      setLightRefused(state ?? "parked");
+      syncNodeLightState(state);
+    },
   });
-  const { sending, uploading, sendMessage, error: sendError, clearError: clearSendError, releaseSendGuards, sendingFromAPIRef } = chatSend;
+  const { sending, uploading, sendMessage, error: sendError, clearError: clearSendError, releaseSendGuards, failSend, sendingFromAPIRef } = chatSend;
 
   // core#2598: if the WebSocket reconnects (or connects for the first
   // time after the tab opened), reconcile My Chat against the persisted
@@ -246,14 +276,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
       if (!sendingFromAPIRef.current) return;
       releaseSendGuards(messageId);
     },
-    onSendError: (err, messageId) => {
-      if (sendingFromAPIRef.current) {
-        // Per-send release: when the error broadcast carries a messageId,
-        // finish only that token. Legacy no-id path releases one token.
-        releaseSendGuards(messageId);
-        setError(err);
-      }
-    },
+    onSendError: failSend,
   });
 
   // Agent reachability
@@ -414,7 +437,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
     // what we want — but two distinct messages both go through.
     // `uploading` stays a gate because file uploads are sequential
     // at the wire level (same /chat/upload endpoint, race-prone).
-    if ((!text && files.length === 0) || !agentReachable || uploading) return;
+    if ((!text && files.length === 0) || !composerEnabled || uploading) return;
     setInput("");
     setPendingFiles([]);
     // Reset auto-grow height so the textarea returns to its baseline
@@ -473,6 +496,8 @@ function MyChatPanel({ workspaceId, data }: Props) {
   }, [workspaceId, history]);
 
   const stopTurn = useCallback(async () => {
+    // A parked Light agent has no turn to stop, and /a2a would only 409.
+    if (lightBlocksWake(nodeLightState)) return;
     setStopping(true);
     try {
       await api.post(`/workspaces/${workspaceId}/a2a`, {
@@ -485,7 +510,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
     } finally {
       setStopping(false);
     }
-  }, [workspaceId]);
+  }, [workspaceId, nodeLightState]);
 
   const removePendingFile = (index: number) =>
     setPendingFiles((prev) => prev.filter((_, i) => i !== index));
@@ -528,7 +553,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
     });
   };
 
-  const dropEnabled = agentReachable && !sending && !uploading;
+  const dropEnabled = composerEnabled && !sending && !uploading;
   const isFileDrag = (e: React.DragEvent) =>
     Array.from(e.dataTransfer.types || []).includes("Files");
 
@@ -610,6 +635,18 @@ function MyChatPanel({ workspaceId, data }: Props) {
             Enable
           </button>
         </div>
+      )}
+      {/* Enter OS Light: parked or being parked (chat answers 409 and does
+          not wake it), or opening. Replaces the error banner below. */}
+      {lightBanner && (
+        <ChatLightBanner
+          workspaceId={workspaceId}
+          state={lightBanner}
+          onOpened={(state) => {
+            setLightRefused(null);
+            syncNodeLightState(state);
+          }}
+        />
       )}
       {/* Messages */}
       <div className="flex items-center justify-end gap-2 px-3 py-1.5 border-b border-line/40 bg-surface-sunken shrink-0">
@@ -745,6 +782,9 @@ function MyChatPanel({ workspaceId, data }: Props) {
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
                     components={{
+                      // Chat line breaks are intentional (including older
+                      // greetings stored with Unicode bullets).
+                      p: ({ children }) => <p className="whitespace-pre-wrap break-words">{children}</p>,
                       // Default ReactMarkdown renders `<a href="...">`
                       // with no target and no scheme handling, so:
                       //
@@ -853,15 +893,17 @@ function MyChatPanel({ workspaceId, data }: Props) {
                   <span className="w-1.5 h-1.5 bg-zinc-500 rounded-full motion-safe:animate-bounce" style={{ animationDelay: "300ms" }} />
                 </span>
                 {thinkingElapsed}s
-                <button
-                  onClick={stopTurn}
-                  disabled={stopping}
-                  aria-label="Stop current agent turn"
-                  title="Stop current agent turn"
-                  className="ml-1 px-1.5 py-0.5 rounded border border-bad/40 bg-bad/10 text-bad hover:bg-bad/20 disabled:opacity-40 transition-colors text-[10px] font-medium"
-                >
-                  {stopping ? "Stopping…" : "Stop"}
-                </button>
+                {lightBanner === null && (
+                  <button
+                    onClick={stopTurn}
+                    disabled={stopping}
+                    aria-label="Stop current agent turn"
+                    title="Stop current agent turn"
+                    className="ml-1 px-1.5 py-0.5 rounded border border-bad/40 bg-bad/10 text-bad hover:bg-bad/20 disabled:opacity-40 transition-colors text-[10px] font-medium"
+                  >
+                    {stopping ? "Stopping…" : "Stop"}
+                  </button>
+                )}
               </div>
               {activityLog.length > 0 && (
                 <div data-testid="activity-log" className="mt-1.5 text-[9px] text-ink-mid space-y-0.5">
@@ -896,7 +938,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
         // While the agent is provisioning/starting (a normal transient
         // state, not a failure) we show the centered loader in the body
         // instead — don't surface the red error banner + Restart for it.
-        message={thinking || provisioning ? null : displayError}
+        message={thinking || provisioning || lightBanner ? null : displayError}
         isOnline={isOnline}
         onRestart={() => setConfirmRestart(true)}
       />
@@ -925,7 +967,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
           />
           <button
             onClick={() => fileInputRef.current?.click()}
-            disabled={!agentReachable || uploading}
+            disabled={!composerEnabled || uploading}
             aria-label="Attach file"
             title="Attach file"
             className="p-2 bg-surface-card hover:bg-surface-card border border-line rounded-lg text-ink-mid hover:text-ink transition-colors shrink-0 disabled:opacity-40"
@@ -976,14 +1018,20 @@ function MyChatPanel({ workspaceId, data }: Props) {
               }
             }}
             onPaste={onPasteIntoComposer}
-            placeholder={agentReachable ? "Send a message... (Shift+Enter for new line, paste images to attach)" : `Agent is ${data.status}`}
-            disabled={!agentReachable}
+            placeholder={
+              composerEnabled
+                ? "Send a message... (Shift+Enter for new line, paste images to attach)"
+                : lightBanner
+                  ? "Open the agent to chat"
+                  : `Agent is ${data.status}`
+            }
+            disabled={!composerEnabled}
             rows={1}
             className="flex-1 bg-surface-card border border-line rounded-lg px-3 py-2 text-xs text-ink placeholder-ink-soft dark:bg-zinc-800 dark:border-zinc-600 dark:placeholder-zinc-500 focus:outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-accent/40 resize-none disabled:opacity-50"
           />
           <button
             onClick={handleSend}
-            disabled={(!input.trim() && pendingFiles.length === 0) || !agentReachable || uploading}
+            disabled={(!input.trim() && pendingFiles.length === 0) || !composerEnabled || uploading}
             className="px-4 py-2 bg-accent-strong hover:bg-accent text-xs font-medium rounded-lg text-white disabled:opacity-30 transition-colors shrink-0"
           >
             {uploading ? "Uploading…" : "Send"}

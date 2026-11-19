@@ -24,14 +24,29 @@ SCRIPT = ROOT / "scripts" / "deploy" / "advance-staging-tenant-pin.sh"
 
 
 def _fake_curl_cp_only(bindir: Path, digest: str, git_sha: str) -> None:
-    """A curl stub answering only the CP pin read (the SKIP_SSOT_WRITE=1 path)."""
+    """A curl stub answering only the CP pin read (the SKIP_SSOT_WRITE=1 path).
+
+    It emulates curl's -w: the CP client reads the body AND the HTTP status from
+    ONE stdout stream (body, newline, %{http_code}). A stub that printed only the
+    body would hand the script an empty status, which it correctly refuses to
+    read as success.
+    """
     curl = bindir / "curl"
     payload = (
         '{"pins":[{"template_name":"molecule-tenant","region":"global",'
         f'"image_digest":"{digest}","git_sha":"{git_sha}"}}]}}'
     )
     curl.write_text(
-        "#!/bin/sh\ncat <<'JSON'\n" + payload + "\nJSON\n",
+        "#!/bin/sh\n"
+        'fmt=""\n'
+        'prev=""\n'
+        'for a in "$@"; do\n'
+        '  [ "$prev" = "-w" ] && fmt="$a"\n'
+        '  prev="$a"\n'
+        "done\n"
+        "printf '%s' '" + payload + "'\n"
+        "if [ -n \"$fmt\" ]; then printf '\\n200'; fi\n"
+        "exit 0\n",
         encoding="utf-8",
     )
     curl.chmod(0o755)
@@ -239,7 +254,7 @@ def test_default_digest_source_is_still_docker(tmp_path: Path):
         "#!/bin/sh\n"
         f'if [ "$1" = "pull" ]; then : > "{pulled}"; exit 0; fi\n'
         f'if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [ -f "{pulled}" ]; '
-        f'then echo "{digest}"; exit 0; fi\n'
+        f"then echo '[\"registry.test/molecule-tenant@{digest}\"]'; exit 0; fi\n"
         "exit 1\n",
         encoding="utf-8",
     )

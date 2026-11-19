@@ -2010,7 +2010,7 @@ func TestHandleA2ADispatchError_ContextDeadline(t *testing.T) {
 	// DeadlineExceeded → isUpstreamBusyError=true → EnqueueA2A attempted.
 	// Mock the INSERT INTO a2a_queue to fail so we fall through to 503.
 	mock.ExpectQuery(`INSERT INTO a2a_queue`).
-		WithArgs("ws-dl", nil, PriorityTask, "{}", "message/send", nil).
+		WithArgs("ws-dl", nil, PriorityTask, "{}", "message/send", nil, nil).
 		WillReturnError(fmt.Errorf("test: queue unavailable"))
 
 	_, _, perr := handler.handleA2ADispatchError(

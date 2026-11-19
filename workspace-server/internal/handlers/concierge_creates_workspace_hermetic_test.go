@@ -222,6 +222,7 @@ func TestConciergeCreatesWorkspace_Hermetic(t *testing.T) {
 			"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 			"loaded_mcp_tools",
 			"mcp_surface",
+			"light_state",
 		}
 		mock.ExpectQuery("SELECT w.id, w.name").
 			WithArgs(wsID).
@@ -231,7 +232,8 @@ func TestConciergeCreatesWorkspace_Hermetic(t *testing.T) {
 					"", 0.0, 0.0, false,
 					nil, 0, false, true, []byte(`{}`), "workspace",
 					[]byte(`["a2a","`+conciergePlatformMCPProvisionWorkspaceTool+`"]`),
-					[]byte(nil))) // core#5137 mcp_surface: NULL = core has not classified this row
+					[]byte(nil), // core#5137 mcp_surface: NULL = core has not classified this row
+					""))         // light_state: NULL = not a Light agent
 
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)

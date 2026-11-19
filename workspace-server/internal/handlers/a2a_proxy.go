@@ -816,6 +816,15 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		}
 	}
 
+	// Enter OS Light (C5): a parking or parked Light agent is never reached or
+	// woken by a message — from any caller, system and self included (a run pod
+	// holds the agent's own token). Placed before the ingest write below, so a
+	// refused message leaves no row; resolveAgentURL's auto-wake is further
+	// closed by WakeWorkspace's claim predicate if this read fails.
+	if ref := lightWakeRefusal(ctx, workspaceID, "a2a"); ref != nil {
+		return 0, nil, &proxyA2AError{Status: ref.Status, Response: ref.Body}
+	}
+
 	// #2560 (chat UX: persist in-flight exchange across leave/refresh):
 	// write the user message to activity_logs AT RECEIPT — before any of
 	// the downstream short-circuits (poll-mode, mock-runtime, push dispatch)
@@ -1302,16 +1311,12 @@ func (h *WorkspaceHandler) resolveAgentURL(ctx context.Context, workspaceID stri
 	// rewritten to the workspace container's Docker-bridge hostname.
 	// External runtimes are not managed containers; their local test/runtime
 	// URL is the target and must not be synthesized into ws-<id>:8000.
-	if strings.HasPrefix(agentURL, "http://127.0.0.1:") && h.provisioner != nil && platformInDocker {
-		var wsRuntime string
-		if err := db.DB.QueryRowContext(ctx,
-			`SELECT COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`,
-			workspaceID,
-		).Scan(&wsRuntime); err != nil {
-			log.Printf("ProxyA2A: runtime lookup before Docker URL rewrite failed for %s: %v", workspaceID, err)
-		}
-		if !isExternalLikeRuntime(wsRuntime) {
-			agentURL = provisioner.InternalURL(workspaceID)
+	agentURL, err = h.rewriteForDocker(ctx, agentURL, workspaceID)
+	if err != nil {
+		log.Printf("ProxyA2A: route lookup failed for %s: %v", workspaceID, err)
+		return "", &proxyA2AError{
+			Status:   http.StatusInternalServerError,
+			Response: gin.H{"error": "failed to resolve workspace route"},
 		}
 	}
 	// SSRF defence: reject private/metadata URLs before making outbound call.
@@ -1530,10 +1535,15 @@ func normalizeA2APayload(body []byte) ([]byte, string, *proxyA2AError) {
 // needs. The workspace id is a UUID (dash-delimited, no colons), so the
 // resulting id survives any runtime session-id sanitisation unchanged.
 //
-// Delegates to sessionid.DefaultContextID — the ONE authority for this
-// convention (the provisioner injects the SAME value into each workspace
-// container as MOLECULE_DEFAULT_SESSION_CONTEXT_ID, and the shared runtime
-// consumes it). The convention can only move in sessionid.
+// Delegates to sessionid.DefaultContextID — the platform-side authority for this
+// convention. It governs the id stamped as message.contextId on canvas /
+// restart-context / first-boot turns (those genuinely run in the user's
+// session). Runtime-internal self-wakes keep their OWN routing context_id and
+// converge only their Langfuse session_id runtime-side (tracing.TracingExecutor),
+// mirroring this same "canvas-<ws>" literal — there is deliberately NO
+// cross-container env handshake (an earlier MOLECULE_DEFAULT_SESSION_CONTEXT_ID
+// injection was removed; it let the runtime's id diverge from this one). Keep
+// the runtime's tracing literal in sync with sessionid if this ever moves.
 func canvasSessionContextID(workspaceID string) string {
 	return sessionid.DefaultContextID(workspaceID)
 }

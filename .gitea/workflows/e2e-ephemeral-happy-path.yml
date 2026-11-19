@@ -83,12 +83,19 @@ concurrency:
   # unconvergeable (a ghost can red a genuine pass) and, at volume, serialized
   # every open PR into a multi-hour backlog on one slot.
   #
-  # cancel-in-progress is now safe (it was not before): a superseded run's
-  # entire topology is one `docker rm -fv` of its dind, so a cancel cannot
-  # leak a half-torn-down namespace. A new push supersedes its own older run
-  # instead of queueing behind it (the RFC's finding-#2 shape).
+  # cancel-in-progress is FALSE, as in harness-replays.yml and
+  # template-delivery-e2e.yml. It was true, on the claim that a cancel cannot
+  # leak because the run's topology is one `docker rm -fv` of its dind. It did
+  # leak: that rm is the `if: always()` "Teardown dind" step, and the deployed
+  # act_runner skips always() steps on a cancelled job. Every superseded run's
+  # dind kept running until the host's harness-reaper `docker rm -f`'d it ~2h
+  # later — no -v — stranding its ~8 GB /var/lib/docker volume (~1 TB on one
+  # runner host; 189 of 190 reaped dinds were cancelled runs). dind.sh now also
+  # reaps a dind whose job container is gone, but nothing here cancels a run in
+  # the first place: a newer push queues behind its own PR's run. Keying stays
+  # per-PR, so the cross-PR queue #4122 removed does not come back.
   group: e2e-ephemeral-happy-path-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
@@ -111,7 +118,13 @@ env:
   # TO BUMP: `git ls-remote https://git.moleculesai.app/molecule-ai/molecule-controlplane.git refs/heads/main`
   # and paste the SHA here, in its own PR, so the CP change is reviewed as what it
   # is — a change to what gates core.
-  CP_EPHEMERAL_REF: 17b6988c37e63bc50a34fc916b97407c54c0f7d4
+  #
+  # 2026-11-17: moved from 17b6988c (2026-07-30) to CP main 7d79240c, the merge of
+  # molecule-controlplane#3070, together with the E2E_LLM_UPSTREAM=gemini default
+  # below. The gemini lane needs that CP: its proxy serves google/* through Google
+  # AI Studio with GEMINI_API_KEY and its migration 079 prices the e2e model; the
+  # July CP sends google/* to keyless Vertex and refuses the unpriced model 422.
+  CP_EPHEMERAL_REF: 7d79240c14a9c627e2e54c46efb377465f32a9cc
 
 jobs:
   # Emits no context listed in required-contexts.txt — but it DOES post
@@ -182,6 +195,28 @@ jobs:
     # 75 is what the staging BYOK lane it replaces already budgets. A too-tight
     # timeout would surface as a timeout, not as the honest failure underneath.
     timeout-minutes: 75
+    # LLM UPSTREAM SWITCH. Each mode sets the lane's model (E2E_PLATFORM_MODEL),
+    # which becomes the throwaway CP's MOLECULE_LLM_DEFAULT_MODEL (the concierge's
+    # model), the scenario's platform model, and the default of the base templates
+    # bundled into the tenant image.
+    #   `ci-llm` (owner decision 2026-11-18, the default): minimax/MiniMax-M3, with
+    #     the CP's minimax traffic sent to the CI LLM gateway (Infisical
+    #     /shared/ci-llm; since 2026-11-18 the DGX Spark, SGLang Qwen3-VL-30B-A3B,
+    #     no cost and no rate limit). When the gateway's GET /health is not 200 at
+    #     job start the run falls back to `gemini` by itself, and the creds step
+    #     says which one it used (log, ::notice::, step summary). The 10g DELIVER
+    #     leg is OFF in this mode (see the creds step): the Spark model fails it
+    #     too. The gemini fallback keeps it on.
+    #   `gemini` (2026-11-17): Gemini is the platform vendor and every e2e lane
+    #     runs on its cheapest model. The throwaway CP gets the platform Gemini key
+    #     (Infisical /shared/controlplane/llm GEMINI_API_KEY, staging) and serves
+    #     google/gemini-3.1-flash-lite through Google AI Studio; never the
+    #     gemini-4-hydrogen platform default. The 10g DELIVER leg is on.
+    #   `vendor`: minimax/MiniMax-M3 with the real MiniMax key and api.minimax.io.
+    # The CP's proxy, token lookup, credit reservation, routing and settlement, the
+    # tenant and the workspace runtime run for real in every mode.
+    env:
+      E2E_LLM_UPSTREAM: ci-llm
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -206,7 +241,8 @@ jobs:
       # Per-job DISPOSABLE dind (tests/harness/dind.sh — the harness-replays
       # pattern, task#78): the WHOLE topology (PG, CP, tenants, workspaces,
       # image builds) lives inside a nested daemon and dies with one atomic
-      # `docker rm -fv`, even on cancel. This is the structural fix for the
+      # `docker rm -fv` (the Teardown step, or on cancel the dind's own owner
+      # watchdog). This is the structural fix for the
       # shared docker-host interference that killed the gate's first CI runs
       # (host-loopback docker-proxy dying mid-run with every container healthy;
       # mc#4081) AND for cross-run tenant leaks (an early `down` implementation
@@ -242,12 +278,83 @@ jobs:
             | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")' || echo "")
           [ -n "$TOK" ] || { echo "::error::Infisical login returned empty accessToken"; exit 1; }
           read_secret() {
-            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=${3:-prod}&secretPath=$2" \
               -H "Authorization: Bearer $TOK" \
-              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")' || echo ""
           }
-          MINIMAX_API_KEY=$(read_secret MINIMAX_API_KEY %2Fshared%2Fcontrolplane || echo "")
-          AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils || echo "")
+          MINIMAX_API_KEY=""; E2E_GEMINI_API_KEY=""
+          # ci-llm is the default only while the gateway is up: the Spark is on
+          # Wi-Fi and can be down. Its health is checked once, here, at job start;
+          # a gateway that is not answering 200 sends this run to gemini, which is
+          # logged, annotated and put in the step summary below.
+          upstream="${E2E_LLM_UPSTREAM:-vendor}"
+          upstream_note=""
+          if [ "$upstream" = "ci-llm" ]; then
+            E2E_LLM_BASE_URL=$(read_secret CI_LLM_BASE_URL %2Fshared%2Fci-llm)
+            while [ "${E2E_LLM_BASE_URL%/}" != "$E2E_LLM_BASE_URL" ]; do E2E_LLM_BASE_URL="${E2E_LLM_BASE_URL%/}"; done
+            # Whole-string match ([[ =~ ]], not grep -x, which passes a value whose
+            # FIRST line matches and smuggles a second line into $GITHUB_ENV).
+            url_re='^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)*$'
+            if ! [[ $E2E_LLM_BASE_URL =~ $url_re ]]; then
+              echo "::error::E2E_LLM_UPSTREAM=ci-llm but Infisical /shared/ci-llm CI_LLM_BASE_URL is empty or not a plain https URL; refusing to send the gateway key anywhere else."
+              exit 1
+            fi
+            health=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$E2E_LLM_BASE_URL/health" 2>/dev/null || true)
+            if [ "$health" != "200" ]; then
+              upstream=gemini
+              upstream_note=" (fallback: the CI LLM gateway's /health answered ${health:-000})"
+              E2E_LLM_BASE_URL=""
+            fi
+          fi
+          case "$upstream" in
+            gemini)
+              # The platform Gemini key (the staging copy, the path and environment
+              # this CI identity already reads in boot-to-registration-e2e.yml). It
+              # becomes the throwaway CP's GEMINI_API_KEY; the script writes it into
+              # the boot env. The model is the cheapest Gemini one, never Carbon.
+              E2E_GEMINI_API_KEY=$(read_secret GEMINI_API_KEY %2Fshared%2Fcontrolplane%2Fllm staging)
+              LLM_KEY="$E2E_GEMINI_API_KEY"; LLM_KEY_DESC="GEMINI_API_KEY(staging /shared/controlplane/llm)"
+              E2E_PLATFORM_MODEL=google/gemini-3.1-flash-lite
+              echo "LLM upstream: Google AI Studio (${E2E_PLATFORM_MODEL}); 10g DELIVER on"
+              ;;
+            ci-llm)
+              # The gateway's key rides the CP's MINIMAX_API_KEY slot; the script turns
+              # E2E_LLM_BASE_URL (read, validated as a plain https URL and
+              # health-checked above) into MINIMAX_BASE_URL / MINIMAX_ANTHROPIC_BASE_URL.
+              MINIMAX_API_KEY=$(read_secret CI_LLM_API_KEY %2Fshared%2Fci-llm)
+              echo "E2E_LLM_BASE_URL=$E2E_LLM_BASE_URL" >> "$GITHUB_ENV"
+              echo "LLM upstream: CI LLM gateway (${E2E_LLM_BASE_URL}); 10g DELIVER off"
+              # 10g DELIVER needs the model to call send_message_to_user from a long
+              # scheduled session. The gateway's model does not do that reliably:
+              #   - qwen3:4b on the owner's PC (2026-11-14): 0/10 on a replayed 10g
+              #     request, 2 of 4 real runs.
+              #   - Qwen3-VL-30B-A3B on the DGX Spark (the gateway since 2026-11-18):
+              #     one real run passed, which is why the leg was switched back on,
+              #     then run 856943 fired the schedule 35 times in 30 minutes with no
+              #     delivery, and a replay of the captured request scored 0/10 (it
+              #     answers with a greeting instead of the tool call).
+              # So this mode turns off just that leg (its documented switch); the 10d
+              # FIRE half stays hard, and a failed DELIVER costs the 1800 s backstop
+              # on every run. `gemini` (the fallback) and `vendor` keep it on.
+              echo "E2E_SCHEDULE_DELIVER_CHECK=off" >> "$GITHUB_ENV"
+              LLM_KEY="$MINIMAX_API_KEY"; LLM_KEY_DESC="CI_LLM_API_KEY(/shared/ci-llm)"
+              E2E_PLATFORM_MODEL=minimax/MiniMax-M3
+              ;;
+            vendor)
+              MINIMAX_API_KEY=$(read_secret MINIMAX_API_KEY %2Fshared%2Fcontrolplane)
+              LLM_KEY="$MINIMAX_API_KEY"; LLM_KEY_DESC="MINIMAX_API_KEY(/shared/controlplane)"
+              E2E_PLATFORM_MODEL=minimax/MiniMax-M3
+              echo "LLM upstream: vendor (api.minimax.io)"
+              ;;
+            *) echo "::error::unknown E2E_LLM_UPSTREAM=${E2E_LLM_UPSTREAM} (want gemini, ci-llm or vendor)"; exit 1 ;;
+          esac
+          echo "E2E_PLATFORM_MODEL=$E2E_PLATFORM_MODEL" >> "$GITHUB_ENV"
+          echo "E2E_LLM_UPSTREAM_USED=$upstream" >> "$GITHUB_ENV"
+          echo "::notice::e2e LLM upstream used: ${upstream}${upstream_note}, model ${E2E_PLATFORM_MODEL} (requested ${E2E_LLM_UPSTREAM:-vendor})"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            echo "**e2e LLM upstream:** \`${upstream}\`${upstream_note}, model \`${E2E_PLATFORM_MODEL}\` (requested \`${E2E_LLM_UPSTREAM:-vendor}\`)" >> "$GITHUB_STEP_SUMMARY" || true
+          fi
+          AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils)
 
           # FAIL CLOSED on an empty secret VALUE, not just a failed login.
           #
@@ -261,18 +368,19 @@ jobs:
           #
           # A gate that cannot observe its subject must not report success.
           missing=""
-          [ -n "$MINIMAX_API_KEY" ]  || missing="$missing MINIMAX_API_KEY(/shared/controlplane)"
+          [ -n "$LLM_KEY" ]          || missing="$missing $LLM_KEY_DESC"
           [ -n "$AUTO_SYNC_TOKEN" ]  || missing="$missing AUTO_SYNC_TOKEN(/shared/dev-utils)"
           if [ -n "$missing" ]; then
             echo "::error::Infisical returned an EMPTY value for:$missing — refusing to report success on a gate that cannot run. Check the key name/secretPath in the Infisical SSOT; do NOT re-add a skip-guard."
             exit 1
           fi
 
-          if [ -n "$MINIMAX_API_KEY" ]; then echo "::add-mask::$MINIMAX_API_KEY"; fi
-          if [ -n "$AUTO_SYNC_TOKEN" ]; then echo "::add-mask::$AUTO_SYNC_TOKEN"; fi
-          echo "MINIMAX_API_KEY=$MINIMAX_API_KEY" >> "$GITHUB_ENV"
+          echo "::add-mask::$LLM_KEY"
+          echo "::add-mask::$AUTO_SYNC_TOKEN"
+          if [ -n "$MINIMAX_API_KEY" ]; then echo "MINIMAX_API_KEY=$MINIMAX_API_KEY" >> "$GITHUB_ENV"; fi
+          if [ -n "$E2E_GEMINI_API_KEY" ]; then echo "E2E_GEMINI_API_KEY=$E2E_GEMINI_API_KEY" >> "$GITHUB_ENV"; fi
           echo "AUTO_SYNC_TOKEN=$AUTO_SYNC_TOKEN" >> "$GITHUB_ENV"
-          echo "creds loaded (minimax len=${#MINIMAX_API_KEY}, sync len=${#AUTO_SYNC_TOKEN})"
+          echo "creds loaded (llm key len=${#LLM_KEY}, sync len=${#AUTO_SYNC_TOKEN}, model=$E2E_PLATFORM_MODEL)"
 
       # The shared spin-up plumbing (RFC §04): pr-ephemeral-cp.sh lives in the CP
       # repo today; fetch it read-only AT THE PINNED SHA (see CP_EPHEMERAL_REF).
@@ -320,6 +428,20 @@ jobs:
             .tenant-bundle-deps/plugins
           echo "manifest deps cloned"
 
+      # The base templates' shipped default is the gemini-4-hydrogen platform default.
+      # A workspace created from a template without a model takes that default; in
+      # this gate that is the member concierge_creates_workspace's concierge
+      # provisions. Pin the bundled copies to the lane's model so no e2e run spends
+      # on Carbon and a ci-llm/vendor run stays servable (only the cloned tree is
+      # touched; manifest.json still pins what ships).
+      - name: Pin the bundled base templates to the lane's model
+        if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
+        run: |
+          set -euo pipefail
+          python3 tests/e2e/lib/pin_template_model.py \
+            .tenant-bundle-deps/workspace-configs-templates "${E2E_PLATFORM_MODEL:?set by the creds step}" \
+            claude-code-default hermes openclaw
+
       # Build THIS PR's tenant image (the UNDER-TEST side of the substitution).
       - name: Build PR tenant image
         if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
@@ -364,6 +486,8 @@ jobs:
           TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
           CP_EPHEMERAL_SCRIPT: ${{ github.workspace }}/.cp-ephemeral/scripts/deploy/pr-ephemeral-cp.sh
           MINIMAX_API_KEY: ${{ env.MINIMAX_API_KEY }}
+          E2E_GEMINI_API_KEY: ${{ env.E2E_GEMINI_API_KEY }}
+          E2E_PLATFORM_MODEL: ${{ env.E2E_PLATFORM_MODEL }}
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           E2E_RUNTIME: hermes
@@ -404,16 +528,35 @@ jobs:
           # GREEN. Listing them here fails THIS gate on their failure regardless of the
           # soak; external_runtime + reconciler_heals_terminated stay advisory (not yet
           # reliable — separate promotion once soaked green).
-          E2E_EPHEMERAL_EXTRA_GATING: peer_visibility,concierge_creates_workspace
+          #
+          # concierge_platform_agent GRADUATED: it asserts the platform-agent install
+          # + identity + kind + discovery-peers authz, and has run on EVERY PR under the
+          # ADVISORY soak — so a regression to the concierge lane merged GREEN. That is
+          # exactly what happened: a concierge shipped with NO persona (its config
+          # declared prompt_files: [prompts/concierge.md] while the file was never
+          # materialized) and nothing pre-merge could block it.
+          #
+          # COVERAGE THIS STILL DOES NOT GIVE: this scenario is DB/handler state —
+          # "no boot". It never starts a runtime, builds a system prompt, registers an
+          # MCP, or makes a model call. The present+CALLABLE half
+          # (TestPlatformAgentMgmtMCP_Staging — a real concierge boot driven over A2A to
+          # actually RUN provision_workspace) still runs ONLY post-merge in
+          # staging-tenant-cd, because the real-runtime matrix it needs
+          # (E2E_EPHEMERAL_REAL_RUNTIME_MATRIX) is referenced in comments but was never
+          # implemented. Until it is, a concierge that boots without an identity can
+          # STILL merge green. Pinned by test_concierge_lane_is_merge_blocking.py.
+          E2E_EPHEMERAL_EXTRA_GATING: peer_visibility,concierge_creates_workspace,concierge_platform_agent
         run: |
           bash tests/e2e/ephemeral_cp_happy_path.sh
           echo "GATE_ARM=proof" >> "$GITHUB_ENV"
 
-      # Atomic teardown: one rm destroys the entire nested topology (CP, PG,
-      # tenants, workspaces, volumes, networks, built images) — even after a
-      # cancel that skipped every other cleanup. Leaks structurally impossible.
+      # Atomic teardown: one `docker rm -fv` destroys the entire nested topology
+      # (CP, PG, tenants, workspaces, volumes, networks, built images). A
+      # cancelled job never reaches this step (act_runner skips always() steps
+      # on cancel); that dind reaps itself — and its volume — via dind.sh's
+      # owner watchdog once this job's container is gone.
       - name: Teardown dind
-        # always() so a cancelled/failed run still reaps its dind — but gated on
+        # always() so a failed run still reaps its dind — but gated on
         # the same non-fork condition as the start step (an ungated always()
         # step on the fork no-op path was exactly the template-delivery chdir
         # failure, core#4057).

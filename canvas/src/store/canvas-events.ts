@@ -1,9 +1,12 @@
 import type { Node, Edge } from "@xyflow/react";
 import type { WSMessage } from "./socket";
 import type { WorkspaceNodeData, BootStep } from "./canvas";
-import { extractResponseText, extractFilesFromTask } from "@/components/tabs/chat/message-parser";
+import { parseA2AResponse } from "@/components/tabs/chat/a2a-response";
 import { appendBootLog, mergeBootStep, parseBootStepWire } from "./boot-telemetry";
 import type { BootStepWire } from "./boot-telemetry";
+import { WS_EVENTS } from "@/lib/ws-events";
+import { parseLightState } from "@/lib/light";
+import { showToast } from "@/components/Toaster";
 
 // ---------------------------------------------------------------------------
 // Monotonically increasing counter used to assign grid positions.
@@ -103,6 +106,39 @@ export function handleCanvasEvent(
   const { nodes, edges, selectedNodeId } = get();
 
   switch (msg.event) {
+    case WS_EVENTS.WorkspaceUpdated: {
+      // Each key applies on its own: a rename carries only `name`, an Enter
+      // OS Light transition only `light_state`. A missing or malformed key
+      // changes nothing, and a payload with neither leaves the node as it was.
+      const payload = msg.payload;
+      const patch: Partial<WorkspaceNodeData> = {};
+      const { name } = payload;
+      if (typeof name === "string" && name.trim()) patch.name = name;
+      if (Object.prototype.hasOwnProperty.call(payload, "light_state")) {
+        const raw = payload.light_state;
+        const lightState = parseLightState(raw);
+        // null clears it (Light disabled); a value this canvas does not know
+        // is ignored rather than read as "not a Light agent".
+        if (raw === null || lightState !== null) patch.lightState = lightState;
+      }
+      // Core suspends a schedule after three failed runs in a row; when the
+      // agent may not message the user, this event is the only notice.
+      const suspended = payload.light_schedule_suspended;
+      if (typeof suspended === "string" && suspended !== "") {
+        const agent = nodes.find((n) => n.id === msg.workspace_id)?.data.name ?? "a Light agent";
+        showToast(
+          `Light: the schedule "${suspended}" of ${agent} is suspended after three failed runs in a row. Open the agent, fix the cause, then park it to resume the schedule.`,
+          "error",
+        );
+      }
+      if (Object.keys(patch).length === 0) break;
+      set({
+        nodes: nodes.map((node) => node.id === msg.workspace_id
+          ? { ...node, data: { ...node.data, ...patch } }
+          : node),
+      });
+      break;
+    }
     case "WORKSPACE_ONLINE": {
       const existing = nodes.find((n) => n.id === msg.workspace_id);
       const nodeName = existing?.data.name ?? (msg.payload.name as string) ?? "Workspace";
@@ -606,10 +642,10 @@ export function handleCanvasEvent(
       // which delivery path raced to completion first).
       const responseBody = msg.payload.response_body as Record<string, unknown> | undefined;
       if (responseBody) {
-        const text = extractResponseText(responseBody);
-        const attachments = extractFilesFromTask(
-          (responseBody.result ?? responseBody) as Record<string, unknown>,
-        );
+        const { text, attachments, pending, error } = parseA2AResponse(responseBody);
+        // Failures are handled by useChatSocket, never buffered as successful
+        // replies (which would clear the error banner and complete the send).
+        if (pending || error) break;
         if (text || attachments.length > 0) {
           const { agentMessages, agentMessageConsumers } = get();
           // Same live-hand-off rule as AGENT_MESSAGE above: no mounted chat

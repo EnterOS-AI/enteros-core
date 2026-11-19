@@ -11,8 +11,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import React from "react";
 
-import { FilesTab } from "../../FilesTab.tsx";
-import { FilesToolbar } from "../FilesToolbar.tsx";
+import { FilesTab } from "../../FilesTab";
+import { FilesToolbar } from "../FilesToolbar";
 import type { FileEntry } from "../../FilesTab/tree";
 
 // ─── Mock ──────────────────────────────────────────────────────────────────
@@ -30,13 +30,19 @@ afterEach(() => {
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
 const emptyFileList: FileEntry[] = [];
+const workspaceData: React.ComponentProps<typeof FilesTab>["data"] = {
+  name: "Test", runtime: "claude-code", status: "online", tier: 0,
+  agentCard: null, activeTasks: 0, collapsed: false, role: "agent",
+  lastErrorRate: 0, lastSampleError: "", url: "", parentId: null,
+  currentTask: "", needsRestart: false, budgetLimit: null,
+};
 
 /** Render FilesTab with a non-external runtime (triggers PlatformOwnedFilesTab). */
 function renderPlatformTab(extraProps: Partial<React.ComponentProps<typeof FilesTab>> = {}) {
   return render(
     <FilesTab
       workspaceId="ws-1"
-      data={{ id: "ws-1", name: "Test", runtime: "claude-code", status: "online", tier: 0, skills: [], created_at: "" }}
+      data={workspaceData}
       {...extraProps}
     />,
   );
@@ -67,7 +73,7 @@ describe("FilesTab — NotAvailablePanel", () => {
     render(
       <FilesTab
         workspaceId="ws-1"
-        data={{ id: "ws-1", name: "Test", runtime: "external", status: "online", tier: 0, skills: [], created_at: "" }}
+        data={{ ...workspaceData, runtime: "external" }}
       />,
     );
     expect(screen.getByText(/Files not available/i)).toBeTruthy();
@@ -78,7 +84,7 @@ describe("FilesTab — NotAvailablePanel", () => {
     render(
       <FilesTab
         workspaceId="ws-1"
-        data={{ id: "ws-1", name: "Test", runtime: "external", status: "online", tier: 0, skills: [], created_at: "" }}
+        data={{ ...workspaceData, runtime: "external" }}
       />,
     );
     expect(screen.getByText(/external/i)).toBeTruthy();
@@ -88,7 +94,7 @@ describe("FilesTab — NotAvailablePanel", () => {
     render(
       <FilesTab
         workspaceId="ws-1"
-        data={{ id: "ws-1", name: "Test", runtime: "external", status: "online", tier: 0, skills: [], created_at: "" }}
+        data={{ ...workspaceData, runtime: "external" }}
       />,
     );
     expect(_mockGet).not.toHaveBeenCalled();
