@@ -789,7 +789,16 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 	// data on its volume for the orphan-sweeper grace. Only a genuine
 	// permanent-delete reaches here (restart/reconcile use other paths), so this
 	// is the one place prune may be requested.
-	erase := c.Query("erase_data") == "true"
+	//
+	// A PURGE ALWAYS ERASES. ?purge=true hard-deletes the row below, and with
+	// the row gone nothing can ever attach this workspace's volume again (a new
+	// workspace gets a new id and a new volume), so a purge that kept the volume
+	// did not keep the data for anyone: it leaked it. On Kubernetes that is an
+	// identity claim counting against the namespace's persistentvolumeclaims
+	// quota for good (molecule-core#5193; measured on the staging canary
+	// 2026-11-19, workspace_delete_erase_test.go). The audit row's erase_data
+	// field records this effective value.
+	erase := c.Query("erase_data") == "true" || c.Query("purge") == "true"
 	descendantIDs, stopErrs, err := h.CascadeDelete(ctx, id, erase)
 	if err != nil {
 		// Audit 2026-05-09 (Core-Security): raw `err.Error()` here was
