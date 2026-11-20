@@ -848,6 +848,11 @@ jobs:
           STAGING_FLEET_EXCLUDE_SLUGS: ${{ env.STAGING_FLEET_EXCLUDE_SLUGS }}
           TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
           TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE }}
+          # Resolve the prior pin digest via the registry HTTP API (no docker daemon
+          # reachable on local-deploy; internal#1261).
+          DIGEST_SOURCE: registry
+          REG_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
+          REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
           # Roll BACK with the same declared flag state we roll FORWARD with, or a
           # failed candidate would ALSO (invisibly) end an in-flight burn-in.
           # In `env:`, not `export ... ${{ }}` in the body — see the roll step above.
