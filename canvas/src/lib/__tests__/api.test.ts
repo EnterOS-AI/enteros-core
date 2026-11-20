@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 const mockFetch = vi.fn();
 globalThis.fetch = mockFetch;
 
-import { api, PlatformUnavailableError } from "../api";
+import { api, PlatformUnavailableError, toUtf8ByteString } from "../api";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -252,6 +252,27 @@ describe("api.del", () => {
   it("throws on non-ok response", async () => {
     mockFailure(404, "Not Found");
     await expect(api.del("/workspaces/missing")).rejects.toThrow("404");
+  });
+
+  it("encodes non-ASCII caller headers as UTF-8 ByteStrings while leaving ASCII unchanged", async () => {
+    expect(toUtf8ByteString("My Agent")).toBe("My Agent");
+
+    mockSuccess({ status: "purged" });
+    await api.del("/workspaces/ws-1?confirm=true", {
+      headers: { "X-Confirm-Name": "review 西温店 助手" },
+    });
+    const [, optionsCJK] = mockFetch.mock.calls[0];
+    const expectedCJK = Array.from(new TextEncoder().encode("review 西温店 助手"), (b) =>
+      String.fromCharCode(b),
+    ).join("");
+    expect(optionsCJK.headers["X-Confirm-Name"]).toBe(expectedCJK);
+
+    mockSuccess({ status: "purged" });
+    await api.del("/workspaces/ws-2?confirm=true", {
+      headers: { "X-Confirm-Name": "Café" },
+    });
+    const [, optionsLatin1] = mockFetch.mock.calls[1];
+    expect(optionsLatin1.headers["X-Confirm-Name"]).toBe("Caf\xC3\xA9");
   });
 });
 

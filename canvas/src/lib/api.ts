@@ -78,6 +78,24 @@ export function platformAuthHeaders(): Record<string, string> {
   return headers;
 }
 
+export function toUtf8ByteString(value: string): string {
+  for (let i = 0; i < value.length; i++) {
+    if (value.charCodeAt(i) > 0x7f) {
+      return Array.from(new TextEncoder().encode(value), (b) => String.fromCharCode(b)).join("");
+    }
+  }
+  return value;
+}
+
+function encodeCallerHeaders(headers?: Record<string, string>): Record<string, string> {
+  if (!headers) return {};
+  const encoded: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    encoded[key] = toUtf8ByteString(value);
+  }
+  return encoded;
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -90,7 +108,7 @@ async function request<T>(
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...platformAuthHeaders(),
-    ...(options?.headers ?? {}),
+    ...encodeCallerHeaders(options?.headers),
   };
   // Re-read slug locally for the 401 handler below — `headers` already
   // has it, but the 401 branch needs the bare value to gate the
