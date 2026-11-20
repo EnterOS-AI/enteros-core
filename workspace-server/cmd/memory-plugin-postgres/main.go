@@ -67,7 +67,7 @@ func run() error {
 		return fmt.Errorf("config: %w", err)
 	}
 
-	db, err := openDB(cfg.DatabaseURL)
+	db, err := openDBWithRetry(cfg.DatabaseURL, openDB, dbConnectWait, dbConnectInterval, time.Now, time.Sleep)
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
 	}
@@ -123,6 +123,45 @@ func run() error {
 	return srv.Shutdown(ctx)
 }
 
+// How long the boot keeps trying to reach Postgres, and how often.
+//
+// The tenant entrypoint (entrypoint-tenant.sh) gives the sidecar about 30 s
+// to answer /v1/health, then fails the boot (MEMORY_PLUGIN_REQUIRED) or
+// serves without memory. A new tenant pod's first connection to its own
+// Postgres can be refused for a moment after a roll (molecule-core#5303:
+// every roll on node robot-1), and the same database accepts a connection
+// seconds later. Exiting on that first refusal cost one tenant its memory
+// until the next roll, and crashed the others once. So the boot keeps
+// trying for most of the entrypoint's window. A database that stays
+// unreachable still fails the boot, inside that window. Variables only so
+// tests can shorten them.
+var (
+	dbConnectWait     = 25 * time.Second
+	dbConnectInterval = time.Second
+)
+
+// openDBWithRetry calls open until it succeeds, pausing interval between
+// attempts, and gives up when the next attempt would start at or after
+// wait from the first one. The error then wraps the last attempt's error
+// and says how many attempts were made. now and sleep are injected for tests.
+func openDBWithRetry(databaseURL string, open func(string) (*sql.DB, error), wait, interval time.Duration, now func() time.Time, sleep func(time.Duration)) (*sql.DB, error) {
+	deadline := now().Add(wait)
+	for attempt := 1; ; attempt++ {
+		db, err := open(databaseURL)
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("memory-plugin-postgres: database reachable on attempt %d", attempt)
+			}
+			return db, nil
+		}
+		if !now().Add(interval).Before(deadline) {
+			return nil, fmt.Errorf("after %d attempt(s) over %s: %w", attempt, wait, err)
+		}
+		log.Printf("memory-plugin-postgres: database not reachable yet (attempt %d), retrying in %s: %v", attempt, interval, err)
+		sleep(interval)
+	}
+}
+
 type config struct {
 	DatabaseURL string
 	ListenAddr  string
@@ -156,6 +195,7 @@ func openDB(databaseURL string) (*sql.DB, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close() // a failed attempt must not leave its pool behind; the boot may try again
 		return nil, fmt.Errorf("ping: %w", err)
 	}
 	return db, nil
