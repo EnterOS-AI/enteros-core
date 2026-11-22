@@ -104,5 +104,92 @@ class TestGiteaGetUserAgent(unittest.TestCase):
         )
 
 
+class TestOpenPrPeerContainedInHead(unittest.TestCase):
+    """Regression: a merge-train PR carries the queued PR's commits, and the
+    queued PR is still open while the train runs. Its migration is the same
+    change, not a race, so it must not count as a collision. Before the fix
+    every train of a migration-bearing PR went red here (core#5308,
+    2026-11-22: eight train attempts, all `Migration version collision
+    check` failures against #5308 itself). A peer whose head is NOT in this
+    PR's head (a genuine race), or whose head cannot be resolved, still
+    counts.
+    """
+
+    MIG = "workspace-server/migrations/20261121120000_x.up.sql"
+
+    def setUp(self):
+        import json
+        self._json = json
+        self._orig_get = ccm._gitea_get
+        self._orig_anc = ccm.is_ancestor
+
+    def tearDown(self):
+        ccm._gitea_get = self._orig_get
+        ccm.is_ancestor = self._orig_anc
+
+    def _fake_api(self, peers):
+        def fake_get(path, params=None):
+            if path.endswith("/pulls"):
+                return self._json.dumps([
+                    {"number": n, "head": {"ref": f"b{n}", "sha": sha}}
+                    for n, sha in peers
+                ]).encode()
+            return self._json.dumps([{"filename": self.MIG}]).encode()
+        ccm._gitea_get = fake_get
+
+    def test_peer_contained_in_head_is_not_a_collision(self):
+        self._fake_api([(5308, "aaa")])
+        ccm.is_ancestor = lambda sha, ref: sha == "aaa" and ref == "TRAIN"
+        got = ccm.open_prs_with_migration_prefix(
+            "o/r", 20261121120000, exclude_pr=5331, head_ref="TRAIN")
+        assert got == [], got
+
+    def test_peer_that_contains_head_is_not_a_collision(self):
+        # The mirror case: the queued PR's own check re-runs while a train PR
+        # that carries it is open.
+        self._fake_api([(5331, "train")])
+        ccm.is_ancestor = lambda sha, ref: sha == "PRHEAD" and ref == "train"
+        got = ccm.open_prs_with_migration_prefix(
+            "o/r", 20261121120000, exclude_pr=5308, head_ref="PRHEAD")
+        assert got == [], got
+
+    def test_peer_not_contained_is_still_a_collision(self):
+        self._fake_api([(5400, "bbb")])
+        ccm.is_ancestor = lambda sha, ref: False
+        got = ccm.open_prs_with_migration_prefix(
+            "o/r", 20261121120000, exclude_pr=5331, head_ref="TRAIN")
+        assert [p["number"] for p in got] == [5400], got
+
+    def test_peer_without_head_sha_is_still_a_collision(self):
+        self._fake_api([(5400, "")])
+        ccm.is_ancestor = lambda sha, ref: True
+        got = ccm.open_prs_with_migration_prefix(
+            "o/r", 20261121120000, exclude_pr=5331, head_ref="TRAIN")
+        assert [p["number"] for p in got] == [5400], got
+
+    def test_is_ancestor_on_a_real_repo(self):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            def git(*a):
+                return subprocess.run(
+                    ["git", "-C", d, "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                    check=True, capture_output=True, text=True).stdout.strip()
+            git("init", "-q")
+            git("commit", "-q", "--allow-empty", "-m", "a")
+            a = git("rev-parse", "HEAD")
+            git("commit", "-q", "--allow-empty", "-m", "b")
+            b = git("rev-parse", "HEAD")
+            cwd = __import__("os").getcwd()
+            __import__("os").chdir(d)
+            try:
+                assert ccm.is_ancestor(a, b) is True
+                assert ccm.is_ancestor(b, a) is False
+                # unknown object: fail closed (not contained)
+                assert ccm.is_ancestor("0" * 40, b) is False
+            finally:
+                __import__("os").chdir(cwd)
+
+
 if __name__ == "__main__":
     unittest.main()
