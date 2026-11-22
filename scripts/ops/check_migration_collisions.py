@@ -163,8 +163,19 @@ def migrations_on_ref(ref: str) -> set[int]:
     return prefixes
 
 
+def is_ancestor(sha: str, ref: str) -> bool:
+    """True when commit `sha` is contained in `ref`. False when it is not, or
+    when git cannot resolve either side (unknown object): the caller then
+    treats the peer as a collision, so this fails closed."""
+    result = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", sha, ref],
+        capture_output=True, text=True,
+    )
+    return result.returncode == 0
+
+
 def open_prs_with_migration_prefix(
-    repo: str, prefix: int, exclude_pr: int
+    repo: str, prefix: int, exclude_pr: int, head_ref: str = ""
 ) -> list[dict]:
     """Return open PRs (other than `exclude_pr`) that add a migration with
     `prefix`. Walks open PRs via Gitea's `/repos/{owner}/{repo}/pulls` and
@@ -192,6 +203,16 @@ def open_prs_with_migration_prefix(
         # GitHub CLI's --json headRefName flattens it. Normalize on
         # the way out so callers see the historical shape.
         head_ref_name = (pr.get("head") or {}).get("ref", "")
+        # A peer whose head is contained in this PR's head, or that contains
+        # it, carries the same change, not a race: the merge train's PR holds
+        # the queued PR's commits while that PR is still open. Counting it made
+        # every train of a migration-bearing PR fail against itself
+        # (core#5308), and the queued PR's own check fail while a train is open.
+        peer_sha = (pr.get("head") or {}).get("sha", "")
+        if head_ref and peer_sha and (
+            is_ancestor(peer_sha, head_ref) or is_ancestor(head_ref, peer_sha)
+        ):
+            continue
         files_body = _gitea_get(f"repos/{repo}/pulls/{num}/files", {"limit": "100"})
         if files_body is None:
             continue
@@ -271,7 +292,7 @@ def main() -> int:
     # Collision check 2: another open PR claims the same prefix.
     open_pr_collisions: dict[int, list[dict]] = {}
     for prefix in added:
-        peers = open_prs_with_migration_prefix(repo, prefix, pr_number)
+        peers = open_prs_with_migration_prefix(repo, prefix, pr_number, head_ref)
         if peers:
             open_pr_collisions[prefix] = peers
 
