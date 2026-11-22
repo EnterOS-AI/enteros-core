@@ -1780,6 +1780,10 @@ func TestMigrateVolumeIfNeeded_ExistingTruncatedVolume(t *testing.T) {
 	}
 
 	p := &Provisioner{cli: cli, alpineImage: "alpine"}
+	// The seed and read containers below are created with ContainerCreate, which
+	// never pulls: make sure the daemon has the image (a CI VM fresh from its
+	// weekly reset does not; operator-config#1116).
+	requireTestImage(t, ctx, cli, "alpine")
 
 	// legacyConfigVolumeName TRUNCATES the workspace ID to 12 chars, so the
 	// nonce must live in the FIRST 12 characters or it is discarded. The old ID
