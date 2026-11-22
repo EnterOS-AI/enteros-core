@@ -41,8 +41,9 @@
 #     binding stays loud. A run in which NO tenant was in scope is an ERROR,
 #     however many it skipped.
 #   * every REQUIRED namespace must end the run ROLLED and verified. That means
-#     through its own /buildinfo when a git sha is known, and by the imageID digest
-#     of every serving pod when none is (with a ::warning:: saying so). The set is
+#     by the imageID digest of every serving pod whenever a target digest is known
+#     (every pipeline caller passes one), and through each pod's own /buildinfo only
+#     for a digest-less --tag/--image roll (see IDENTITY below). The set is
 #     REQUIRED_TENANT_NAMESPACES (default: the staging canary) plus every declared
 #     ROLLER_SCOPE_NAMESPACES entry. Absent from the census, failed, scaled to
 #     zero, or a known sha that /buildinfo did not confirm are all ERRORS. In
@@ -92,14 +93,16 @@
 #                         future CP admin endpoint can be swapped in without
 #                         touching the roll/verify logic.
 #   EXPECTED_BUILD_SHA    expected /buildinfo git_sha (auto-derived from a
-#                         staging-<sha> tag when not set)
+#                         staging-<sha> tag when not set). Checked against the pods
+#                         ONLY for a digest-less roll; with a digest it is logged
+#                         as the commit the caller bound to that digest.
 #   ROLLOUT_TIMEOUT       per-workload rollout wait (default 300s)
 #   TENANT_CONTAINER      container name inside the pod (default: tenant)
 #   TENANT_NAMESPACE_PREFIX  prefix for a census row whose instance_id is EMPTY
 #                         (default: enteros — the SDK's branding.ResourcePrefix,
 #                         from which the provisioner names every namespace)
 #   REQUIRED_TENANT_NAMESPACES  comma/space-separated namespaces that must be
-#                         rolled AND /buildinfo-verified (--dry-run: planned).
+#                         rolled AND verified (--dry-run: planned).
 #                         UNSET means enteros-staging-canary-k8s; set it EMPTY
 #                         (REQUIRED_TENANT_NAMESPACES=) to require none.
 #   ROLLER_SCOPE_NAMESPACES  comma/space-separated namespaces this credential is
@@ -119,11 +122,24 @@
 #     deployments.apps  get, list, watch, patch  (label lookup, current image,
 #                                                 set image, rollout status)
 #     pods              list                     (serving pods and their imageIDs)
-#     pods/proxy        get                      (/buildinfo of each serving pod;
-#                                                 only when EXPECTED_BUILD_SHA applies)
+#     pods/proxy        get                      (ONLY for a digest-less --tag/--image
+#                                                 roll: /buildinfo of each serving pod)
 # No cluster-scoped grant and no pods/exec. `kubectl version` reads /version,
 # which any authenticated identity may. The census is not part of this: the
 # default one is psql, and a SUBSTRATE_CENSUS_CMD brings whatever it needs.
+#
+# IDENTITY: with a target digest (--digest, or an @sha256: ref) the roll is
+# proven by the kubelet-reported imageID of every serving pod. That names the
+# exact bytes that are executing, so the git sha those bytes report is fixed by
+# the digest; re-reading it from each pod adds no identity, it only adds a
+# privileged path into every tenant. Which commit a digest holds is bound by the
+# caller BEFORE the roll (staging: the digest advance-pin resolved from the
+# staging-<sha> tag, then the staging gate reads /buildinfo through the public
+# ingress; production: the digest staging qualified, re-checked against the
+# registry tag). So no digest roll needs pods/proxy, and no tenant NetworkPolicy
+# has to admit the API server's node address (internal#1335). Only a digest-less
+# --tag/--image roll falls back to /buildinfo through the pod proxy; no pipeline
+# uses that mode, and where the grant is absent it fails closed.
 #
 # SCOPE: a credential holding those grants only as RoleBindings in an explicit
 # list of tenant namespaces is run with that list DECLARED in
@@ -220,11 +236,22 @@ if [ -z "$TARGET_DIGEST" ] && [ -z "$EXPECTED_BUILD_SHA" ]; then
   err "Pass a digest ref (…@sha256:…), or set EXPECTED_BUILD_SHA, or use --tag <env>-<sha>."
   exit 2
 fi
+# BUILDINFO_CHECK: read each serving pod's /buildinfo through pods/proxy. Only a
+# digest-less roll needs it; with a digest the imageID already names the bytes
+# (see IDENTITY in the header).
+BUILDINFO_CHECK=0
+[ -n "$TARGET_DIGEST" ] || BUILDINFO_CHECK=1
 
 TARGET_LABEL="${IMAGE:-<per-tenant repo>@${DIGEST}}"
 log "target image      = ${TARGET_LABEL}"
 [ -z "$TARGET_DIGEST" ]      || log "target digest     = ${TARGET_DIGEST}"
-[ -z "$EXPECTED_BUILD_SHA" ] || log "expected git_sha  = ${EXPECTED_BUILD_SHA}"
+if [ -n "$EXPECTED_BUILD_SHA" ]; then
+  if [ "$BUILDINFO_CHECK" = "1" ]; then
+    log "expected git_sha  = ${EXPECTED_BUILD_SHA} (no digest: checked on every serving pod's /buildinfo through pods/proxy)"
+  else
+    log "expected git_sha  = ${EXPECTED_BUILD_SHA} (bound to the target digest by the caller; pods are verified by imageID, not pods/proxy)"
+  fi
+fi
 log "dry_run=${DRY_RUN} allow_empty=${ALLOW_EMPTY}${ONLY:+ only='${ONLY}'}${EXCLUDE:+ exclude='${EXCLUDE}'}"
 if [ "${#REQUIRED_NS[@]}" -gt 0 ]; then
   log "required namespace(s) = ${REQUIRED_NS[*]} (each must end ROLLED and verified; --dry-run: planned)"
@@ -414,6 +441,7 @@ converged_pods() {
 
 # buildinfo_sha <ns> <pod>: the git_sha the pod's own /buildinfo reports, read
 # through the API server's pod proxy (GET on pods/proxy) — NOT `kubectl exec`.
+# Used ONLY for a digest-less roll (BUILDINFO_CHECK=1, see IDENTITY above).
 # Reading a public build identifier must not need the power to run commands in
 # every tenant pod. 8080 is the tenant container's `api` port, the Go server
 # that serves /buildinfo and answers the pod's probes; the body is the same
@@ -650,7 +678,7 @@ for i in "${!SEL_SLUGS[@]}"; do
     record "$slug" "$ns" "$before" "$after" "FAIL:missing-imageID"
     FAILED=$((FAILED+1)); continue
   fi
-  if [ -n "$EXPECTED_BUILD_SHA" ]; then
+  if [ "$BUILDINFO_CHECK" = "1" ]; then
     build_failed=0
     while IFS=$'\t' read -r pod _; do
       got="$(buildinfo_sha "$ns" "$pod")"
@@ -672,7 +700,7 @@ for i in "${!SEL_SLUGS[@]}"; do
   log "  OK ${slug} rolled and VERIFIED live"
   record "$slug" "$ns" "$before" "$after" "ROLLED"
   ROLLED=$((ROLLED+1))
-  [ -z "$EXPECTED_BUILD_SHA" ] || VERIFIED_NS="${VERIFIED_NS}${ns} "
+  [ "$BUILDINFO_CHECK" != "1" ] || VERIFIED_NS="${VERIFIED_NS}${ns} "
 done
 
 # ── Before/after report ──────────────────────────────────────────────────────
@@ -715,7 +743,7 @@ must_status() {
       [ "$ro" = "DRYRUN:planned" ] || rows="${rows}${rows:+; }${rs} is ${ro}"
     elif [ "$ro" != "ROLLED" ]; then
       rows="${rows}${rows:+; }${rs} is ${ro}"
-    elif [ -n "$EXPECTED_BUILD_SHA" ]; then
+    elif [ "$BUILDINFO_CHECK" = "1" ]; then
       case "$VERIFIED_NS" in
         *" ${want} "*) ;;
         *) rows="${rows}${rows:+; }${rs} rolled, but /buildinfo never confirmed the known git sha";;
@@ -730,7 +758,7 @@ must_status() {
     printf 'FAIL:was not %s: %s' "$([ "$DRY_RUN" = "1" ] && echo planned || echo 'rolled and verified')" "$rows"
   elif [ "$DRY_RUN" = "1" ]; then
     printf 'planned'
-  elif [ -n "$EXPECTED_BUILD_SHA" ]; then
+  elif [ "$BUILDINFO_CHECK" = "1" ]; then
     printf 'buildinfo'
   else
     printf 'digest'
@@ -747,7 +775,11 @@ for rns in "${MUST_NS[@]+"${MUST_NS[@]}"}"; do
     FAIL:*)    err "required namespace '${rns}' ${st#FAIL:}"; SCOPE_GATE_FAILED=1;;
     planned)   log "required namespace '${rns}' is planned";;
     buildinfo) log "required namespace '${rns}' was rolled and every serving pod's /buildinfo verified";;
-    digest)    warn "required namespace '${rns}' was rolled and verified by the imageID digest (${TARGET_DIGEST}) of every serving pod ONLY: no git sha is known for this target (no EXPECTED_BUILD_SHA), so its /buildinfo identity was not checked";;
+    digest)    if [ -n "$EXPECTED_BUILD_SHA" ]; then
+                 log "required namespace '${rns}' was rolled and every serving pod runs the target digest (${TARGET_DIGEST}), which the caller bound to git sha ${EXPECTED_BUILD_SHA}"
+               else
+                 warn "required namespace '${rns}' was rolled and verified by the imageID digest (${TARGET_DIGEST}) of every serving pod ONLY: no git sha is known for this target (no EXPECTED_BUILD_SHA), so which commit it holds was not stated"
+               fi;;
   esac
 done
 

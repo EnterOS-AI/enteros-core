@@ -267,40 +267,42 @@ else
 fi
 logged "alpha was looked up inside ns-alpha, the namespace its census row records" \
   "ns=ns-alpha get deploy -l "
-# The FORWARD roll passes --digest, so the k8s roller can only check /buildinfo
-# if the docker roller hands it the EXPECTED_BUILD_SHA it derived from
-# staging-<sha>. The required canary makes that check mandatory.
-logged "the forward roll verified the canary's /buildinfo through the pod proxy" \
-  "get --raw /api/v1/namespaces/$CANARY_NS/pods/enteros-tenant-k:8080/proxy/buildinfo"
+# The FORWARD roll passes --digest: the canary is verified by the imageID digest
+# of its serving pods, and the k8s roller must not read /buildinfo through the
+# pod proxy at all (internal#1335). The staging gate reads /buildinfo through the
+# public ingress instead.
+no_pod_proxy() {
+  if grep -q '/proxy/' "$K8RT/calls.log"; then
+    bad "$1" "$(grep '/proxy/' "$K8RT/calls.log")"
+  else
+    ok "$1"
+  fi
+}
+no_pod_proxy "the forward roll verified the canary by digest, with no pods/proxy call"
 least_privileged "the forward roll made no cluster-wide read and no exec into a tenant pod"
 
-say "2b. the REVERT verifies /buildinfo through pods/proxy, never exec"
+say "2b. the REVERT is verified by digest, never through pods/proxy or exec"
 # rollback-pin runs `EXPECTED_BUILD_SHA=<old sha> redeploy-staging-fleet.sh
-# --image <old image>` with K8S_TENANT_DIGEST=<old digest>. That is the lane
-# path on which the k8s arm checks /buildinfo as well as the digest, so it is the
-# one an exec-based probe breaks for every tenant once the credential stops
-# granting pods/exec.
+# --image <old image>` with K8S_TENANT_DIGEST=<old digest>. The digest names the
+# bytes, so the sha is only reported; a pod that would report another sha cannot
+# be running that digest.
 reset_state
 after_new
-drun 0 "k8s arm OK" "a revert whose pods report the expected git_sha is rolled and verified" \
-  env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" \
-      SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
-      K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
-      EXPECTED_BUILD_SHA="01dc0de" FAKE_BUILDINFO_SHA="01dc0de0123456789abcdef0123456789abcdef0" \
-      CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
-      bash "$DOCKER_ROLLER" --image "$REPO@$D_NEW"
-logged "the revert read /buildinfo with GET pods/proxy on the tenant API port" \
-  "get --raw /api/v1/namespaces/ns-alpha/pods/enteros-tenant-abc:8080/proxy/buildinfo"
-least_privileged "the revert made no cluster-wide read and no exec into a tenant pod"
-reset_state
-after_new
-drun 1 "k8s arm FAILED" "a revert whose pods report ANOTHER git_sha still FAILS" \
+drun 0 "k8s arm OK" "a revert onto the old digest is rolled and verified" \
   env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl" \
       SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv" \
       K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost" \
       EXPECTED_BUILD_SHA="01dc0de" FAKE_BUILDINFO_SHA="feedface0123456789abcdef0123456789abcdef" \
       CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0 \
       bash "$DOCKER_ROLLER" --image "$REPO@$D_NEW"
+no_pod_proxy "the revert made no pods/proxy call"
+least_privileged "the revert made no cluster-wide read and no exec into a tenant pod"
+reset_state
+{
+  row ns-alpha enteros-tenant-abc "$ORG_A" "$REPO@$D_OLD"
+  row "$CANARY_NS" enteros-tenant-k "$ORG_K" "$REPO@$D_NEW"
+} > "$K8RT/pods.after"
+drun 1 "k8s arm FAILED" "a revert whose pods still run ANOTHER digest still FAILS"   env TENANT_FLAGS="" KUBECTL="$tmp/bin/kubectl"       SUBSTRATE_CENSUS_CMD="cat $K8RT/census.tsv"       K8S_TENANT_DIGEST="$D_NEW" EXCLUDE_SLUGS="ghost"       EXPECTED_BUILD_SHA="01dc0de"       CONVERGE_ATTEMPTS=1 CONVERGE_SLEEP=0       bash "$DOCKER_ROLLER" --image "$REPO@$D_NEW"
 
 # The staging lane's DECLARED scope, exactly as staging-tenant-cd.yml sets it
 # on both redeploy-fleet and rollback-pin (section 7 pins those values).
