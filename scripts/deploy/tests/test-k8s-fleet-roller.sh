@@ -318,14 +318,27 @@ touch "$K8RT/rollout.fail"
 check "rollout that never completes => fatal" 1 "FAIL:rollout-timeout" "$CENSUS_A" --digest "$D_NEW"
 
 echo "== digest and build checks use the same serving replicas =="
-reset_state
-printf '%s\n' \
-  "ns-alpha	draining-old	$ORG_A	$REPO@$D_OLD	2026-10-11T00:00:00Z	Running	true	0badc0de" \
-  "ns-alpha	pending-old	$ORG_A	$REPO@$D_OLD		Pending	false	0badc0de" \
-  "ns-alpha	unready-new	$ORG_A	$REPO@$D_NEW		Running	false	cafe1234" \
-  "ns-alpha	serving-a	$ORG_A	$REPO@$D_NEW		Running	true	cafe1234" \
-  "ns-alpha	serving-b	$ORG_A	$REPO@$D_NEW		Running	true	cafe1234" > "$K8RT/pods.after"
+stale_roll_pods() {
+  printf '%s\n' \
+    "ns-alpha	draining-old	$ORG_A	$REPO@$D_OLD	2026-10-11T00:00:00Z	Running	true	0badc0de" \
+    "ns-alpha	pending-old	$ORG_A	$REPO@$D_OLD		Pending	false	0badc0de" \
+    "ns-alpha	unready-new	$ORG_A	$REPO@$D_NEW		Running	false	cafe1234" \
+    "ns-alpha	serving-a	$ORG_A	$REPO@$D_NEW		Running	true	cafe1234" \
+    "ns-alpha	serving-b	$ORG_A	$REPO@$D_NEW		Running	true	cafe1234" > "$K8RT/pods.after"
+}
+reset_state; stale_roll_pods
+# A digest roll is proven by imageID alone. It must not reach into any tenant
+# through pods/proxy (internal#1335), even when the caller states the git sha.
 EXPECTED_BUILD_SHA=cafe1234 check "rollback ignores a draining old pod listed first" 0 "ROLLED" "$CENSUS_A" --digest "$D_NEW"
+if [ -s "$K8RT/buildinfo.log" ] || grep -q 'proxy' "$K8RT/calls.log"; then
+  echo "FAIL: a digest roll read /buildinfo through pods/proxy"; cat "$K8RT/buildinfo.log"; FAILED=$((FAILED+1))
+else
+  echo "ok: a digest roll never touches pods/proxy"; PASS=$((PASS+1))
+fi
+saw "a digest roll names the caller-bound sha without re-reading it" "bound to the target digest by the caller"
+# Digest-less roll: /buildinfo is then the only identity, read from the serving set.
+reset_state; stale_roll_pods
+check "a digest-less roll ignores a draining old pod listed first" 0 "ROLLED" "$CENSUS_A" --tag staging-cafe1234
 if [ "$(sort "$K8RT/buildinfo.log")" = $'serving-a\nserving-b' ]; then
   echo "ok: buildinfo probed every serving replica and no stragglers"; PASS=$((PASS+1))
 else
@@ -335,7 +348,7 @@ reset_state
 printf '%s\n' \
   "ns-alpha	serving-a	$ORG_A	$REPO@$D_NEW		Running	true	cafe1234" \
   "ns-alpha	serving-b	$ORG_A	$REPO@$D_NEW		Running	true	0badc0de" > "$K8RT/pods.after"
-EXPECTED_BUILD_SHA=cafe1234 check "a second replica with stale buildinfo fails" 1 "FAIL:buildinfo-mismatch" "$CENSUS_A" --digest "$D_NEW"
+check "a second replica with stale buildinfo fails a digest-less roll" 1 "FAIL:buildinfo-mismatch" "$CENSUS_A" --tag staging-cafe1234
 reset_state
 printf '%s\n' \
   "ns-alpha	serving-a	$ORG_A	$REPO@$D_NEW" \
