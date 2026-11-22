@@ -881,6 +881,34 @@ func (p *CPProvisioner) StopPurgedInstance(ctx context.Context, workspaceID, ins
 	return p.deleteInstance(ctx, workspaceID, instanceID, "", true)
 }
 
+// EraseKeptState erases what a keep-state teardown of a removed workspace left
+// behind (on Kubernetes: the identity claim, the config seed Secret and the
+// Service), for the kept-state reaper (registry/cp_kept_state_reaper.go,
+// molecule-core#5193).
+//
+// The row's instance_id was cleared when the compute stopped, so the caller
+// passes the stopped instance's id (workspaces.kept_state_instance_id). The
+// control plane's ledger records that instance as torn down, so the teardown
+// does not touch compute again; with prune=true it erases the workspace's
+// remaining state in the org's namespace and answers 200. The provider is read
+// from the row as Stop does.
+func (p *CPProvisioner) EraseKeptState(ctx context.Context, workspaceID, instanceID string) error {
+	if p == nil {
+		return ErrNoBackend
+	}
+	if strings.TrimSpace(instanceID) == "" {
+		return nil
+	}
+	if p.httpClient == nil {
+		return ErrNoBackend
+	}
+	provider, err := resolveProvider(ctx, workspaceID)
+	if err != nil {
+		return fmt.Errorf("cp provisioner: erase kept state: resolve provider: %w", err)
+	}
+	return p.deleteInstance(ctx, workspaceID, instanceID, provider, true)
+}
+
 // deleteInstance issues the control plane's workspace teardown for one named
 // instance: DELETE /cp/workspaces/:id?instance_id=...[&provider=...][&prune=true].
 func (p *CPProvisioner) deleteInstance(ctx context.Context, workspaceID, instanceID, provider string, prune bool) error {

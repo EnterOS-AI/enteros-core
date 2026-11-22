@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"errors"
+	"regexp"
 	"sync"
 	"testing"
 	"time"
@@ -45,7 +46,7 @@ func TestCPSweepOnce_StopSucceeds_ClearsInstanceID(t *testing.T) {
 	mock.ExpectQuery(`(?s)^\s*SELECT id::text\s+FROM workspaces\s+WHERE status = 'removed'\s+AND instance_id IS NOT NULL\s+AND instance_id != ''\s+AND updated_at < now\(\) - make_interval\(secs => \$2\)\s+ORDER BY updated_at DESC\s+LIMIT \$1`).
 		WithArgs(cpSweepLimit, cpSweepRemovedGrace.Seconds()).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("ws-uuid-1"))
-	mock.ExpectExec(`UPDATE workspaces SET instance_id = NULL, updated_at = now\(\) WHERE id = \$1`).
+	mock.ExpectExec(regexp.QuoteMeta(db.ClearInstanceIDKeepingStateSQL)).
 		WithArgs("ws-uuid-1").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 

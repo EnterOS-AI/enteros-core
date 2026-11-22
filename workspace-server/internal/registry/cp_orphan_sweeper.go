@@ -154,10 +154,12 @@ func cpSweepOnce(parent context.Context, reaper CPOrphanReaper) {
 		// PR); NULL'ing instance_id is the SSOT signal for "no live
 		// EC2 attached." The matching SELECT predicate above stays in
 		// sync with this UPDATE.
-		if _, updErr := db.DB.ExecContext(ctx,
-			`UPDATE workspaces SET instance_id = NULL, updated_at = now() WHERE id = $1`,
-			id,
-		); updErr != nil {
+		//
+		// Stop is a keep-state teardown, so the stopped instance's id is kept
+		// for the kept-state reaper (db.ClearInstanceIDKeepingStateSQL,
+		// molecule-core#5193): it is the only handle the control plane accepts
+		// for erasing the state this stop left behind.
+		if _, updErr := db.DB.ExecContext(ctx, db.ClearInstanceIDKeepingStateSQL, id); updErr != nil {
 			log.Printf("CP orphan sweeper: clear instance_id failed for %s: %v — next cycle will re-Stop (idempotent)", id, updErr)
 		}
 	}
