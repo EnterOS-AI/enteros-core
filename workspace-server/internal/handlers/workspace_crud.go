@@ -788,7 +788,8 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 	// stay in this handler.
 	// internal#734: the user can ask to erase saved data (browser profile /
 	// cookies / downloads / agent memory) on delete. Opt-in — default keeps the
-	// data on its volume for the orphan-sweeper grace. Only a genuine
+	// data on its volume for registry.KeptStateRetention (24 h), after which the
+	// kept-state reaper erases it (molecule-core#5193). Only a genuine
 	// permanent-delete reaches here (restart/reconcile use other paths), so this
 	// is the one place prune may be requested.
 	//
@@ -962,14 +963,24 @@ func destructiveDeleteCounts(ctx context.Context, id string) (childCount int) {
 // Best-effort by contract. Teardown has already succeeded by the time we get
 // here, so a DB error must not fail the delete; it is logged and left to the
 // sweeper. Defensive against a nil global handle, matching cpSweepOnce.
-func (h *WorkspaceHandler) clearWorkspaceInstanceIDAfterStop(ctx context.Context, wsID string) {
+//
+// erased says whether the stop also erased the workspace's state. A keep-state
+// stop (a plain delete, an org-import reconcile) leaves the state on the
+// substrate, so the stopped instance's id moves to kept_state_instance_id: the
+// control plane erases a workspace only through a teardown that names that id,
+// and the kept-state reaper (registry/cp_kept_state_reaper.go) uses it to erase
+// the state once the retention has passed (molecule-core#5193). Without it the
+// state stayed for good — on Kubernetes an identity claim against the
+// namespace's persistentvolumeclaims quota.
+func (h *WorkspaceHandler) clearWorkspaceInstanceIDAfterStop(ctx context.Context, wsID string, erased bool) {
 	if db.DB == nil {
 		return
 	}
-	if _, err := db.DB.ExecContext(ctx,
-		`UPDATE workspaces SET instance_id = NULL, updated_at = now() WHERE id = $1`,
-		wsID,
-	); err != nil {
+	stmt := db.ClearInstanceIDKeepingStateSQL
+	if erased {
+		stmt = db.ClearInstanceIDStateErasedSQL
+	}
+	if _, err := db.DB.ExecContext(ctx, stmt, wsID); err != nil {
 		log.Printf("CascadeDelete %s clear instance_id failed: %v — leaving row for orphan sweeper", wsID, err)
 	}
 }
@@ -1181,7 +1192,7 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 		// failure branch above deliberately returns with instance_id intact —
 		// that is the durable "possible leak, go re-drive it" signal the
 		// sweeper exists to consume, and it must stay.
-		h.clearWorkspaceInstanceIDAfterStop(cleanupCtx, wsID)
+		h.clearWorkspaceInstanceIDAfterStop(cleanupCtx, wsID, erase)
 		if h.provisioner != nil {
 			if err := h.provisioner.RemoveVolume(cleanupCtx, wsID); err != nil {
 				log.Printf("CascadeDelete %s volume removal warning: %v", wsID, err)

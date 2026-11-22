@@ -778,6 +778,17 @@ func main() {
 		})
 	}
 
+	// CP-mode kept-state reaper (molecule-core#5193). A plain delete keeps the
+	// workspace's state on the substrate (on Kubernetes its identity claim, seed
+	// Secret and Service); this erases it once it has been kept for
+	// registry.KeptStateRetention, so plain deletes can no longer fill the
+	// tenant namespace's persistentvolumeclaims quota.
+	if cpProv != nil {
+		go supervised.RunWithRecover(ctx, "cp-kept-state-reaper", func(c context.Context) {
+			registry.StartCPKeptStateReaper(c, cpProv)
+		})
+	}
+
 	// CP-mode instance-state reconciler — authoritative provider-liveness pass
 	// for SaaS workspaces (core#2261). Every other liveness sweep keys off
 	// a PROXY (Redis TTL, agent heartbeat, local Docker, or

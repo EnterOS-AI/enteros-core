@@ -681,15 +681,19 @@ What the three forms of the call do:
 
 | Query | Row | Light objects (CronJobs, run Secret) | Volume, seed Secret, Service, pods |
 |---|---|---|---|
-| `confirm=true` | kept, `status: removed` | deleted | **kept** |
+| `confirm=true` | kept, `status: removed` | deleted | **kept for 24 hours**, then erased |
 | `confirm=true&erase_data=true` | kept, `status: removed` | deleted | deleted |
 | `confirm=true&purge=true` | deleted, with its runs, tokens and logs | deleted | deleted |
 
-**A plain delete keeps the agent's volume, and nothing in this API removes it
-afterwards.** The volume counts against the tenant's volume quota (25 by
-default) for good. A removed agent answers `410` to every later delete, including one with
-`purge=true`, so the choice has to be made on the first call. An integration
-that creates agents should always purge the ones it deletes.
+**A plain delete keeps the agent's volume for 24 hours.** The platform then
+erases it (and the seed Secret and Service) on its own: the tenant's kept-state
+reaper runs every minute and erases what a plain delete kept once 24 hours have
+passed (molecule-core#5193; on AWS the control plane's volume sweep gives the
+same 24 hours). Until then the volume counts against the tenant's volume quota
+(25 by default). A removed agent answers `410` to every later delete, including
+one with `purge=true`, so an erase cannot be asked for after the fact. An
+integration that creates agents should always purge the ones it deletes, so
+their volumes go at once.
 
 Answers:
 
@@ -700,7 +704,7 @@ Answers:
 | `404` | `{"error":"workspace not found"}` | no such agent; also the answer to a second purge, so treat it as already deleted |
 | `409` | `{"status":"confirmation_required", "children": …}` | the agent has sub-workspaces and `confirm=true` was not sent |
 | `410` | `{"error":"workspace removed"}` | the agent was deleted without a purge earlier |
-| `500` | `{"error": …}` | a teardown step failed. The agent is already marked removed, so a retry answers `410`; the platform stops any compute that is left within about five minutes, and the volume stays until an operator removes it |
+| `500` | `{"error": …}` | a teardown step failed. The agent is already marked removed, so a retry answers `410`; the platform stops any compute that is left within about five minutes, and erases the volume 24 hours later |
 
 Timing. The delete is safe at any moment, including while the agent is being
 enabled, parked, opened or restarted, and while one of its runs is in progress

@@ -34,6 +34,14 @@ const deleteEraseWS = "dddddddd-000a-0000-0000-000000000000"
 // broadcasts, per-table purge deletes) fail against the mock and are logged.
 func deleteLeafOnCP(t *testing.T, query string, purges bool) (*trackingCPProv, string) {
 	t.Helper()
+	return deleteLeafOnCPExpecting(t, query, purges, nil)
+}
+
+// deleteLeafOnCPExpecting is deleteLeafOnCP with extra statements the caller
+// requires the delete to issue after it marks the row removed (and before the
+// purge, when there is one).
+func deleteLeafOnCPExpecting(t *testing.T, query string, purges bool, expect func(sqlmock.Sqlmock)) (*trackingCPProv, string) {
+	t.Helper()
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
@@ -49,6 +57,9 @@ func deleteLeafOnCP(t *testing.T, query string, purges bool) (*trackingCPProv, s
 		WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	mock.ExpectExec("UPDATE workspaces SET status =").
 		WillReturnResult(sqlmock.NewResult(1, 1))
+	if expect != nil {
+		expect(mock)
+	}
 	if purges {
 		mock.ExpectExec(`DELETE FROM workspaces WHERE id = ANY`).
 			WillReturnResult(sqlmock.NewResult(1, 1))

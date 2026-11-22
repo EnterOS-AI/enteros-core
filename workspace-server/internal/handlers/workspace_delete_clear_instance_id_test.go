@@ -55,7 +55,7 @@ func TestClearWorkspaceInstanceIDAfterStop_NullsTheField(t *testing.T) {
 		WithArgs("ws-cleared").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	h.clearWorkspaceInstanceIDAfterStop(context.Background(), "ws-cleared")
+	h.clearWorkspaceInstanceIDAfterStop(context.Background(), "ws-cleared", false)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("delete path must clear instance_id after a confirmed stop: %v", err)
@@ -77,7 +77,7 @@ func TestClearWorkspaceInstanceIDAfterStop_DBErrorIsNonFatal(t *testing.T) {
 		WillReturnError(errors.New("connection reset"))
 
 	// Must not panic and must not propagate.
-	h.clearWorkspaceInstanceIDAfterStop(context.Background(), "ws-dberr")
+	h.clearWorkspaceInstanceIDAfterStop(context.Background(), "ws-dberr", false)
 
 	if !strings.Contains(buf.String(), "clear instance_id") {
 		t.Fatalf("a failed clear must be logged for operators; got %q", buf.String())
@@ -92,5 +92,5 @@ func TestClearWorkspaceInstanceIDAfterStop_NilDBIsSafe(t *testing.T) {
 	t.Cleanup(func() { db.DB = prev })
 
 	h := &WorkspaceHandler{}
-	h.clearWorkspaceInstanceIDAfterStop(context.Background(), "ws-nildb") // must not panic
+	h.clearWorkspaceInstanceIDAfterStop(context.Background(), "ws-nildb", false) // must not panic
 }
