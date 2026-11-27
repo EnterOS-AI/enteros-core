@@ -5427,3 +5427,195 @@ def test_process_once_bp403_fallback_refuses_unapproved_pr(monkeypatch):
     rc = mq.process_once(dry_run=False)
     assert rc == 0
     assert calls["merge_attempts"] == 0
+
+
+def test_process_once_does_not_hold_pr_on_self_status_405_race(monkeypatch):
+    """core#5324: wildcard-BP 405 with queue self-status present and all real
+    gates still green defers without applying merge-queue-hold."""
+    calls = {"hold": None, "merge_attempts": 0}
+    main_sha = "b" * 40
+    head_sha = "a" * 40
+
+    monkeypatch.setattr(mq, "OWNER", "molecule-ai")
+    monkeypatch.setattr(mq, "NAME", "molecule-core")
+    monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
+    monkeypatch.setattr(mq, "QUEUE_LABEL", "merge-queue")
+    monkeypatch.setattr(mq, "HOLD_LABEL", "merge-queue-hold")
+    monkeypatch.setattr(mq, "AUTO_DISCOVER", True)
+    monkeypatch.setattr(mq, "OPT_OUT_LABELS", {"merge-queue-hold", "do-not-auto-merge", "wip"})
+    monkeypatch.setattr(mq, "REVIEWER_SET", REVIEWERS)
+    monkeypatch.setattr(
+        mq,
+        "get_branch_protection",
+        lambda branch: mq.BranchProtection(
+            required_contexts=["*"],
+            required_approvals=1,
+            block_on_rejected_reviews=True,
+        ),
+    )
+    monkeypatch.setattr(mq, "get_branch_head", lambda branch: main_sha)
+
+    def fake_combined(sha, *, prefer_live=False):
+        if sha == main_sha:
+            return {"state": "success", "statuses": [{"context": "CI / all-required (push)", "status": "success"}]}
+        return {
+            "state": "pending",
+            "statuses": [
+                {"context": "CI / all-required (pull_request)", "status": "success"},
+                {"context": "gitea-merge-queue / queue (pull_request_review)", "status": "pending"},
+            ],
+        }
+
+    monkeypatch.setattr(mq, "get_combined_status", fake_combined)
+    monkeypatch.setattr(
+        mq,
+        "list_candidate_issues",
+        lambda *, auto_discover: [
+            {"number": 5347, "pull_request": {}, "labels": [], "created_at": "2026-11-26T00:00:00Z"},
+        ],
+    )
+    monkeypatch.setattr(
+        mq,
+        "get_pull",
+        lambda n: {
+            "state": "open",
+            "number": n,
+            "mergeable": True,
+            "base": {"ref": "main", "repo_id": 1},
+            "head": {"sha": head_sha, "repo_id": 1},
+            "labels": [],
+        },
+    )
+    monkeypatch.setattr(mq, "get_pull_commits", lambda n: [{"sha": main_sha}, {"sha": head_sha}])
+    monkeypatch.setattr(
+        mq,
+        "get_pull_reviews",
+        lambda n: [
+            {
+                "state": "APPROVED",
+                "user": {"login": "agent-researcher"},
+                "official": True,
+                "stale": False,
+                "dismissed": False,
+                "commit_id": head_sha,
+            }
+        ],
+    )
+
+    def fake_merge(pr_number, *, dry_run, head_commit_id=None):
+        calls["merge_attempts"] += 1
+        raise mq.MergePermissionError(
+            "POST /repos/molecule-ai/molecule-core/pulls/5347/merge -> "
+            'HTTP 405: {"message":"Not all required status checks successful"}'
+        )
+
+    monkeypatch.setattr(mq, "merge_pull", fake_merge)
+    monkeypatch.setattr(mq, "add_label_by_name", lambda pr, lbl, *, dry_run: calls.__setitem__("hold", (pr, lbl)))
+    monkeypatch.setattr(mq, "post_comment", lambda *a, **k: None)
+
+    rc = mq.process_once(dry_run=False)
+    assert rc == 0
+    assert calls["merge_attempts"] == 1
+    assert calls["hold"] is None
+
+
+def test_process_once_still_holds_when_real_gate_regressed_on_405(monkeypatch):
+    """Negative control for core#5324: if a real check fails on live re-read,
+    405 MUST still apply merge-queue-hold."""
+    calls = {"hold": None, "merge_attempts": 0}
+    main_sha = "b" * 40
+    head_sha = "a" * 40
+
+    monkeypatch.setattr(mq, "OWNER", "molecule-ai")
+    monkeypatch.setattr(mq, "NAME", "molecule-core")
+    monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
+    monkeypatch.setattr(mq, "QUEUE_LABEL", "merge-queue")
+    monkeypatch.setattr(mq, "HOLD_LABEL", "merge-queue-hold")
+    monkeypatch.setattr(mq, "AUTO_DISCOVER", True)
+    monkeypatch.setattr(mq, "OPT_OUT_LABELS", {"merge-queue-hold", "do-not-auto-merge", "wip"})
+    monkeypatch.setattr(mq, "REVIEWER_SET", REVIEWERS)
+    monkeypatch.setattr(
+        mq,
+        "get_branch_protection",
+        lambda branch: mq.BranchProtection(
+            required_contexts=["*"],
+            required_approvals=1,
+            block_on_rejected_reviews=True,
+        ),
+    )
+    monkeypatch.setattr(mq, "get_branch_head", lambda branch: main_sha)
+
+    def fake_combined(sha, *, prefer_live=False):
+        if sha == main_sha:
+            return {"state": "success", "statuses": [{"context": "CI / all-required (push)", "status": "success"}]}
+        if not prefer_live:
+            return {
+                "state": "pending",
+                "statuses": [
+                    {"context": "CI / all-required (pull_request)", "status": "success"},
+                    {"context": "gitea-merge-queue / queue (pull_request_review)", "status": "pending"},
+                ],
+            }
+        # First prefer_live read (premerge check) passes; post-405 diagnostic sees failure.
+        calls.setdefault("live_reads", 0)
+        calls["live_reads"] += 1
+        real_state = "success" if calls["live_reads"] == 1 else "failure"
+        return {
+            "state": real_state,
+            "statuses": [
+                {"context": "CI / all-required (pull_request)", "status": real_state},
+                {"context": "gitea-merge-queue / queue (pull_request_review)", "status": "pending"},
+            ],
+        }
+
+    monkeypatch.setattr(mq, "get_combined_status", fake_combined)
+    monkeypatch.setattr(
+        mq,
+        "list_candidate_issues",
+        lambda *, auto_discover: [
+            {"number": 5347, "pull_request": {}, "labels": [], "created_at": "2026-11-26T00:00:00Z"},
+        ],
+    )
+    monkeypatch.setattr(
+        mq,
+        "get_pull",
+        lambda n: {
+            "state": "open",
+            "number": n,
+            "mergeable": True,
+            "base": {"ref": "main", "repo_id": 1},
+            "head": {"sha": head_sha, "repo_id": 1},
+            "labels": [],
+        },
+    )
+    monkeypatch.setattr(mq, "get_pull_commits", lambda n: [{"sha": main_sha}, {"sha": head_sha}])
+    monkeypatch.setattr(
+        mq,
+        "get_pull_reviews",
+        lambda n: [
+            {
+                "state": "APPROVED",
+                "user": {"login": "agent-researcher"},
+                "official": True,
+                "stale": False,
+                "dismissed": False,
+                "commit_id": head_sha,
+            }
+        ],
+    )
+
+    def fake_merge(pr_number, *, dry_run, head_commit_id=None):
+        calls["merge_attempts"] += 1
+        raise mq.MergePermissionError(
+            "POST /repos/molecule-ai/molecule-core/pulls/5347/merge -> "
+            'HTTP 405: {"message":"Not all required status checks successful"}'
+        )
+
+    monkeypatch.setattr(mq, "merge_pull", fake_merge)
+    monkeypatch.setattr(mq, "add_label_by_name", lambda pr, lbl, *, dry_run: calls.__setitem__("hold", (pr, lbl)))
+    monkeypatch.setattr(mq, "post_comment", lambda *a, **k: None)
+
+    rc = mq.process_once(dry_run=False)
+    assert rc == 0
+    assert calls["merge_attempts"] == 1
+    assert calls["hold"] == (5347, "merge-queue-hold")

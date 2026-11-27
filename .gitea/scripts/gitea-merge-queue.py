@@ -2715,6 +2715,44 @@ def merge_pull(
             raise  # re-raise other ApiErrors unchanged
 
 
+def is_self_status_only_405_race(
+    exc: Exception,
+    head_sha: str,
+    *,
+    bp_required_contexts: list[str],
+    required_contexts: list[str],
+    enforced_file_contexts: list[str],
+) -> bool:
+    """True only when a wildcard-BP merge 405 happened with self-status active
+    and every real required/enforced/critical check still green on live Gitea.
+
+    Under wildcard branch protection, a review-triggered run's own
+    ``gitea-merge-queue / queue`` status can still lag as unsettled inside
+    Gitea's merge check despite ``reassert_queue_runner_status`` (core#5324).
+    Do not stamp ``merge-queue-hold`` when nothing product-related failed.
+    """
+    msg = str(exc)
+    if re.search(r"-> HTTP 405(?:\D|$)", msg) is None:
+        return False
+    if "Not all required status checks successful" not in msg:
+        return False
+    if not any(_is_glob(c) for c in bp_required_contexts):
+        return False
+    try:
+        live_status = get_combined_status(head_sha, prefer_live=True)
+        latest = latest_statuses_by_context(live_status.get("statuses") or [])
+        if not any(_SELF_STATUS_RE.fullmatch(ctx) for ctx in latest):
+            return False
+        regressions = live_premerge_status_regressions(
+            head_sha,
+            required_contexts=required_contexts,
+            enforced_file_contexts=enforced_file_contexts,
+        )
+        return regressions == []
+    except ApiError:
+        return False
+
+
 def live_premerge_status_regressions(
     head_sha: str,
     *,
@@ -2970,6 +3008,20 @@ def process_once(*, dry_run: bool = False) -> int:
                     head_commit_id=head_sha,
                 )
             except MergePermissionError as exc:
+                if is_self_status_only_405_race(
+                    exc,
+                    head_sha,
+                    bp_required_contexts=bp.required_contexts,
+                    required_contexts=contexts,
+                    enforced_file_contexts=enforced_file_contexts,
+                ):
+                    print(
+                        f"::notice::PR #{pr_number} DEFERRED without hold: "
+                        "protected merge returned 405 while in-flight queue-runner "
+                        "self-status is active and all required checks remain green "
+                        "(core#5324); leaving unheld for standing merge-train tick"
+                    )
+                    continue
                 # Normal merge refusal (HTTP 403/404/405). Never bypass it.
                 # HOLD this PR and CONTINUE scanning only when the durable
                 # HOLD_LABEL write succeeds. If the scoped token lacks

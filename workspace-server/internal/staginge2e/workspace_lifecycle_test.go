@@ -190,6 +190,7 @@ func TestWorkspaceLifecycle_Staging(t *testing.T) {
 		// exited, so /hibernate's online|degraded precondition is met and the
 		// subtest is independently meaningful rather than cascading.
 		waitForWorkspaceOnlineRoutable(t, tenantHost, token, orgID, wsID, 15*time.Minute, "hibernate_wake baseline")
+		waitForWorkspaceIdle(t, tenantHost, token, orgID, wsID, 2*time.Minute, "hibernate_wake idle")
 
 		// hibernate (force, since a fresh online ws may carry no active tasks
 		// but we don't want a transient active_tasks>0 to 409 the test).
@@ -289,6 +290,39 @@ func waitForWorkspaceStatus(t *testing.T, host, token, orgID, wsID, want string,
 		time.Sleep(10 * time.Second)
 	}
 	t.Fatalf("%s: workspace %s never reached status=%q within %s (last=%q)", why, wsID, want, timeout, last)
+}
+
+// waitForWorkspaceIdle polls GET /workspaces/:id until 2 consecutive samples
+// show status="online" and active_tasks=0 so force-hibernate does not race an
+// in-flight A2A delivery that wakes the hibernated workspace ~140 ms later
+// (core#5346).
+func waitForWorkspaceIdle(t *testing.T, host, token, orgID, wsID string, timeout time.Duration, why string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	u := "https://" + host + "/workspaces/" + wsID
+	var lastSt string
+	var lastTasks int
+	consecutive := 0
+	for time.Now().Before(deadline) {
+		hs, body := doTenantJSON(t, "GET", u, token, orgID, "")
+		idle, st, tasks := workspaceIdleFromBody(hs, body)
+		if st != lastSt || tasks != lastTasks {
+			t.Logf("    [%s] status=%q active_tasks=%d", why, st, tasks)
+			lastSt = st
+			lastTasks = tasks
+		}
+		if idle {
+			consecutive++
+			if consecutive >= 2 {
+				return
+			}
+		} else {
+			consecutive = 0
+		}
+		time.Sleep(2 * time.Second)
+	}
+	t.Fatalf("%s: workspace %s never settled idle (online, active_tasks=0) within %s (last status=%q active_tasks=%d)",
+		why, wsID, timeout, lastSt, lastTasks)
 }
 
 // waitForWorkspaceOnlineRoutable polls until status=online AND url is non-empty.
@@ -689,7 +723,7 @@ func registerTenantCleanup(t *testing.T, cfg stagingCfg, slug string) {
 
 func adminDeleteTenant(t *testing.T, cfg stagingCfg, slug string) {
 	t.Helper()
-	if err := deleteTenantAndVerify(cfg, slug, 3*time.Minute, 5*time.Second); err != nil {
+	if err := deleteTenantAndVerify(cfg, slug, 6*time.Minute, 5*time.Second); err != nil {
 		// Cleanup is part of the live contract. A green functional assertion
 		// with a leaked tenant is not a passing E2E, so fail the test closed.
 		t.Errorf("teardown failed for exact tenant %s: %v", slug, err)
@@ -717,7 +751,7 @@ func deleteTenantAndVerify(cfg stagingCfg, slug string, timeout, pollInterval ti
 		return fmt.Errorf("cleanup timeout and poll interval must be positive")
 	}
 
-	requestTimeout := 30 * time.Second
+	requestTimeout := 90 * time.Second
 	if timeout < requestTimeout {
 		requestTimeout = timeout
 	}
@@ -758,6 +792,13 @@ func deleteTenantAndVerify(cfg stagingCfg, slug string, timeout, pollInterval ti
 				}
 			case status == http.StatusConflict || status == http.StatusRequestTimeout ||
 				status == http.StatusTooManyRequests || status >= http.StatusInternalServerError:
+				// Treat an in-flight org purge as progress (core#5346); if the
+				// concurrent purge already finished removing the tenant, pass now.
+				if isActivePurgeInProgress(status, lastDetail) {
+					if absent, verifyErr := exactTenantAbsent(client, cfg, slug); verifyErr == nil && absent {
+						return nil
+					}
+				}
 				// Retry below. A 409 is expected while a just-completed test still
 				// has an active lifecycle operation; transport/5xx/429 failures are
 				// also bounded rather than converted into a false green.

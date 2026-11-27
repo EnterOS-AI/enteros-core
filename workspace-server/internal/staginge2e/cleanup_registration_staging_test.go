@@ -259,3 +259,48 @@ func TestDeleteTenantAndVerifyAcceptsAlreadyAbsentTenant(t *testing.T) {
 		t.Fatalf("calls DELETE=%d identity=%d, want 1 each", deleteCalls, identityCalls)
 	}
 }
+
+func TestDeleteTenantAndVerifyTreatsActivePurge500AsInProgressAndConfirmsAbsence(t *testing.T) {
+	const (
+		slug  = "e2e-cleanup-active-purge"
+		token = "test-admin-token"
+	)
+
+	var deleteCalls, identityCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete && r.URL.Path == "/cp/admin/tenants/"+slug:
+			deleteCalls++
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":"purge: another purge is active for this organization"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/cp/admin/tenants/"+slug+"/boot-events":
+			identityCalls++
+			if identityCalls == 1 {
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, `{"slug":"`+slug+`","events":[]}`)
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"error":"org not found","slug":"`+slug+`"}`)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	if err := deleteTenantAndVerify(
+		stagingCfg{cpBase: server.URL, adminToken: token},
+		slug,
+		250*time.Millisecond,
+		time.Millisecond,
+	); err != nil {
+		t.Fatalf("active-purge recovery: %v", err)
+	}
+	if deleteCalls != 2 {
+		t.Fatalf("DELETE calls = %d, want 2", deleteCalls)
+	}
+	if identityCalls != 2 {
+		t.Fatalf("identity calls = %d, want 2 (first present while purging, second absent)", identityCalls)
+	}
+}
